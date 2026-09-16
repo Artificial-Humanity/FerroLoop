@@ -1,5 +1,15 @@
+# Rust build artifacts
+/target
+/target-musl
+**/*.rs.bk
+*.pdb
+
 # Working notes live in the umbrella `Notes/` repo, which is private.
 # `notes` here is a symlink to ../Notes/FerroLoop and must stay untracked.
 # ⚠ NO TRAILING SLASH. Git reads `notes/` as "directory only", and a symlink is not a
 # directory, so `notes/` would silently fail to ignore it and the link would be committed.
 /notes
+
+# OS and editor cruft
+.DS_Store
+Thumbs.db
