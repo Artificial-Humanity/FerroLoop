@@ -55,6 +55,7 @@ The compiled binary will be located at `target/release/ferroloop`.
 * [AGENTS.md](AGENTS.md) — Working rules, core stack matrix, and environment conventions for agents and contributors.
 * [WORKFLOW.md](WORKFLOW.md) — Development workflow, review requirements, and commit conventions.
 * [PERSONA.md](PERSONA.md) — Developer persona and domain expertise (Ferris).
+* [docs/README.md](docs/README.md) — Index of the public documentation directory.
 
 ---
 
