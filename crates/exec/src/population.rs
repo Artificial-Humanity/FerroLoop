@@ -169,25 +169,46 @@ mod tests {
         assert!(got[0].is_absolute(), "got {got:?}");
     }
 
+    // Builds its fixture inside the real cwd (via `tempdir_in`) instead of
+    // chdir-ing the process into it. `cargo test` runs test threads in
+    // parallel and cwd is process-global state, so a test that calls
+    // `std::env::set_current_dir` is racing every other test that ever
+    // reads the cwd — inert today only because nothing else does yet.
     #[test]
     fn glob_absolutizes_paths_even_when_given_a_relative_root() {
-        let d = tree();
-        let abs_root = d.path();
-        // Create a relative path reference: go up to parent, then into the temp dir name
-        let rel_root = PathBuf::from(abs_root.file_name().unwrap());
         let cwd = std::env::current_dir().unwrap();
+        let d = tempfile::Builder::new().tempdir_in(&cwd).unwrap();
+        fs::create_dir_all(d.path().join("src/deep")).unwrap();
+        fs::write(d.path().join("src/a.rs"), "").unwrap();
+        fs::write(d.path().join("src/deep/b.rs"), "").unwrap();
 
-        // Change to the parent directory temporarily
-        let parent = abs_root.parent().unwrap();
-        std::env::set_current_dir(parent).unwrap();
+        // A root relative to the (unmodified) real cwd exercises the same
+        // `!root.is_absolute()` branch with no global mutation.
+        let rel_root = d.path().strip_prefix(&cwd).unwrap();
+        assert!(!rel_root.is_absolute(), "fixture root must be relative: {rel_root:?}");
 
         let sel = Selector::Glob { pattern: "src/**/*.rs".into() };
-        let result = resolve(&rel_root, &sel, &NoChanges);
-
-        std::env::set_current_dir(&cwd).unwrap();
-        let got = result.unwrap();
+        let got = resolve(rel_root, &sel, &NoChanges).unwrap();
         assert_eq!(got.len(), 2);
         assert!(got.iter().all(|p| p.is_absolute()), "glob with relative root returned relative paths: {got:?}");
+    }
+
+    // Carried over from Task 6's review: the Command branch got the same
+    // absolute-path fix as Glob and Changed, but only those two got tests.
+    #[test]
+    fn command_selector_absolutizes_paths_even_when_given_a_relative_root() {
+        let cwd = std::env::current_dir().unwrap();
+        let d = tempfile::Builder::new().tempdir_in(&cwd).unwrap();
+        fs::write(d.path().join("a.rs"), "").unwrap();
+
+        let rel_root = d.path().strip_prefix(&cwd).unwrap();
+        assert!(!rel_root.is_absolute(), "fixture root must be relative: {rel_root:?}");
+
+        let sel = Selector::Command { program: "sh".into(), args: vec!["-c".into(), "echo a.rs".into()] };
+        let got = resolve(rel_root, &sel, &NoChanges).unwrap();
+        assert_eq!(got.len(), 1, "got {got:?}");
+        assert!(got[0].is_absolute(), "command selector with relative root returned relative paths: {got:?}");
+        assert!(got[0].ends_with("a.rs"), "got {got:?}");
     }
 
     struct RelativeChanges;

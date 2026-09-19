@@ -13,6 +13,6 @@ globset.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
+# Not test-only: `run_command_gate`'s FileList delivery writes the resolved
+# population to a NamedTempFile at run time, not just in tests.
 tempfile.workspace = true
