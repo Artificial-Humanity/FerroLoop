@@ -41,6 +41,7 @@ pub trait Store {
     fn list_gates(&self, project: ProjectId) -> Result<Vec<GateDef>, StoreError>;
     fn update_gate(&mut self, def: &GateDef) -> Result<(), StoreError>;
 
+    /// Stores a transition, keyed by `(project, name)`. Overwrites any existing transition with the same key (upsert semantics).
     fn add_transition(&mut self, t: Transition) -> Result<(), StoreError>;
     fn get_transition(
         &self,
