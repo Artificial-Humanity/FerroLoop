@@ -45,25 +45,51 @@ impl RedbStore {
         Ok(Self { db })
     }
 
-    /// Atomically increments and returns a named counter. Used both for the
-    /// entity id sequence and for the append-only log sequences, so that a
-    /// reopened database never reuses a number it already handed out.
-    fn bump(&self, counter: &str) -> Result<u64, StoreError> {
+    /// Bumps `counter` and writes `build(id)` as JSON into `table` under
+    /// that id, both inside **one** write transaction that commits once.
+    ///
+    /// This is the fix for a real gap: an earlier version of this store
+    /// bumped the counter in its own transaction (committing immediately)
+    /// and then wrote the row in a second, separate transaction. If the
+    /// process died or the row write failed in between, the counter's
+    /// commit had already landed — the id was burned permanently with no
+    /// row ever written for it. That never violated the "ids are never
+    /// reused" rule the trait actually requires, but it is a silent,
+    /// unrecoverable side effect riding along on a call that reported
+    /// failure. Doing both steps against the same `WriteTransaction` and
+    /// committing once means they can only ever land together or not at
+    /// all: an error anywhere before `commit()` drops the transaction
+    /// (`redb::WriteTransaction`'s `Drop` aborts automatically when it
+    /// wasn't completed), which discards the counter bump along with
+    /// everything else.
+    ///
+    /// `Table` (the write-side handle) only offers `get` via the
+    /// `ReadableTable` trait — `get_owned` is an inherent method on
+    /// `ReadOnlyTable` and does not exist here. `u64`'s `SelfType` is an
+    /// owned `u64` regardless, so the borrowed guard is fine to read and
+    /// drop within this expression.
+    fn bump_and_put<T: serde::Serialize>(
+        &self,
+        counter: &str,
+        table: TableDefinition<u64, &str>,
+        build: impl FnOnce(u64) -> T,
+    ) -> Result<u64, StoreError> {
         let tx = self.db.begin_write().map_err(backend)?;
-        let next;
+        let id;
         {
-            let mut t = tx.open_table(META).map_err(backend)?;
-            // `Table` (the write-side handle) only offers `get` via the
-            // `ReadableTable` trait — `get_owned` is an inherent method on
-            // `ReadOnlyTable` and does not exist here. `u64`'s `SelfType` is
-            // an owned `u64` regardless, so the borrowed guard is fine to
-            // read and drop within this expression.
-            let current = t.get(counter).map_err(backend)?.map(|v| v.value()).unwrap_or(0);
-            next = current + 1;
-            t.insert(counter, next).map_err(backend)?;
+            let mut meta = tx.open_table(META).map_err(backend)?;
+            let current = meta.get(counter).map_err(backend)?.map(|v| v.value()).unwrap_or(0);
+            id = current + 1;
+            meta.insert(counter, id).map_err(backend)?;
+        }
+        let value = build(id);
+        let json = serde_json::to_string(&value).map_err(backend)?;
+        {
+            let mut t = tx.open_table(table).map_err(backend)?;
+            t.insert(id, json.as_str()).map_err(backend)?;
         }
         tx.commit().map_err(backend)?;
-        Ok(next)
+        Ok(id)
     }
 
     fn put_json<T: serde::Serialize>(
@@ -116,9 +142,11 @@ impl RedbStore {
 
 impl Store for RedbStore {
     fn add_project(&mut self, root: &str) -> Result<ProjectId, StoreError> {
-        let id = ProjectId(self.bump(NEXT_ID)?);
-        self.put_json(PROJECTS, id.0, &Project { id, root: root.to_string() })?;
-        Ok(id)
+        let id = self.bump_and_put(NEXT_ID, PROJECTS, |id| Project {
+            id: ProjectId(id),
+            root: root.to_string(),
+        })?;
+        Ok(ProjectId(id))
     }
 
     fn get_project(&self, id: ProjectId) -> Result<Option<Project>, StoreError> {
@@ -140,9 +168,8 @@ impl Store for RedbStore {
         authored_at_commit: &str,
         authored_by: &str,
     ) -> Result<GateId, StoreError> {
-        let id = GateId(self.bump(NEXT_ID)?);
-        let def = GateDef {
-            id,
+        let id = self.bump_and_put(NEXT_ID, GATES, |id| GateDef {
+            id: GateId(id),
             project,
             name: name.to_string(),
             kind,
@@ -151,9 +178,8 @@ impl Store for RedbStore {
             authored_at_commit: authored_at_commit.to_string(),
             authored_by: authored_by.to_string(),
             last_pass_commit: None,
-        };
-        self.put_json(GATES, id.0, &def)?;
-        Ok(id)
+        })?;
+        Ok(GateId(id))
     }
 
     fn get_gate(&self, id: GateId) -> Result<Option<GateDef>, StoreError> {
@@ -199,10 +225,13 @@ impl Store for RedbStore {
     }
 
     fn add_record(&mut self, project: ProjectId, title: &str) -> Result<RecordId, StoreError> {
-        let id = RecordId(self.bump(NEXT_ID)?);
-        let rec = Record { id, project, title: title.to_string(), state: State::Todo };
-        self.put_json(RECORDS, id.0, &rec)?;
-        Ok(id)
+        let id = self.bump_and_put(NEXT_ID, RECORDS, |id| Record {
+            id: RecordId(id),
+            project,
+            title: title.to_string(),
+            state: State::Todo,
+        })?;
+        Ok(RecordId(id))
     }
 
     fn get_record(&self, id: RecordId) -> Result<Option<Record>, StoreError> {
@@ -216,13 +245,13 @@ impl Store for RedbStore {
     }
 
     fn append_gate_run(&mut self, run: GateRun) -> Result<(), StoreError> {
-        let seq = self.bump(NEXT_RUN)?;
-        self.put_json(GATE_RUNS, seq, &run)
+        self.bump_and_put(NEXT_RUN, GATE_RUNS, |_seq| run)?;
+        Ok(())
     }
 
     fn append_attempt(&mut self, attempt: Attempt) -> Result<(), StoreError> {
-        let seq = self.bump(NEXT_ATTEMPT)?;
-        self.put_json(ATTEMPTS, seq, &attempt)
+        self.bump_and_put(NEXT_ATTEMPT, ATTEMPTS, |_seq| attempt)?;
+        Ok(())
     }
 
     fn gate_runs(&self, gate: GateId) -> Result<Vec<GateRun>, StoreError> {
@@ -340,5 +369,76 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].verdict, verdict);
         assert_eq!(runs[0].verdict.population(), Some(3));
+    }
+
+    /// Fix round 1: pins that the counter bump and the row write inside
+    /// `bump_and_put` commit as one unit. If they didn't, a failed insert
+    /// would still leave the counter advanced — a burned id with no row.
+    ///
+    /// There is no seam in the public `Store` API to make the *second*
+    /// half of a normal insert fail deterministically and cheaply: every
+    /// concrete type this store serializes (`Project`, `GateDef`, `Record`,
+    /// `GateRun`, `Attempt`) always serializes via `serde_json` without
+    /// error, and redb's own size ceiling (`MAX_VALUE_LENGTH`, 3 GiB) is
+    /// too large to hit in a fast test. So this test reaches for the same
+    /// private field `RedbStore::open` itself would build (`db`, visible to
+    /// this module) and pre-corrupts the on-disk `gates` table with a
+    /// mismatched value type *before* constructing the store — bypassing
+    /// `RedbStore::open`, which eagerly opens every table itself and would
+    /// fail immediately if it went through the normal path. This makes
+    /// `add_gate`'s meta-counter bump succeed and its second `open_table`
+    /// call fail with a genuine `redb::TableTypeMismatch`, inside the same
+    /// still-uncommitted write transaction — the same commit boundary a
+    /// real row-write failure would cross.
+    #[test]
+    fn a_failed_insert_does_not_advance_the_shared_id_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+
+        let db = redb::Database::create(&path).unwrap();
+        {
+            // Same table name as `GATES`, wrong value type. Opening it later
+            // under the real `GATES` definition (`TableDefinition<u64,
+            // &str>`) will fail with `TableTypeMismatch`, not silently
+            // coerce.
+            const WRONG_GATES: TableDefinition<u64, u64> = TableDefinition::new("gates");
+            let tx = db.begin_write().unwrap();
+            {
+                tx.open_table(WRONG_GATES).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+
+        // Bypasses `RedbStore::open` deliberately: it would try to open the
+        // real `GATES` definition itself and fail right there, before we
+        // ever get to call `add_gate`.
+        let mut store = RedbStore { db };
+
+        let failed = store.add_gate(
+            ProjectId(1),
+            "fmt",
+            GateKind::Command(fl_core::model::CommandSpec {
+                program: "true".into(),
+                args: vec![],
+                delivery: fl_core::model::PopulationDelivery::Args,
+                timeout_secs: 5,
+                pass_codes: vec![0],
+            }),
+            Selector::Glob { pattern: "**/*.rs".into() },
+            1,
+            "abc",
+            "owner",
+        );
+        assert!(
+            failed.is_err(),
+            "expected the mismatched `gates` table to reject the write"
+        );
+
+        // `add_project` shares the same `next_id` counter and writes to an
+        // unrelated, correctly-typed table. If the failed `add_gate` call
+        // above had left its counter bump committed, this would come back
+        // as 2, not 1.
+        let id = store.add_project("/p").unwrap();
+        assert_eq!(id.get(), 1, "a failed insert must not burn an id");
     }
 }
