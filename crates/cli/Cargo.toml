@@ -1,0 +1,23 @@
+[package]
+name = "fl-cli"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "flctl"
+path = "src/main.rs"
+
+[dependencies]
+fl-core = { path = "../core" }
+fl-store = { path = "../store" }
+fl-exec = { path = "../exec" }
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd.workspace = true
+predicates.workspace = true
