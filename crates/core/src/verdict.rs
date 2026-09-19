@@ -11,6 +11,41 @@ pub enum FailReason {
     Stale,
 }
 
+/// A population that was actually examined: strictly positive.
+///
+/// The inner value is private, so the only way to produce one is
+/// [`Population::new`], which refuses zero. That closes the route
+/// `#[non_exhaustive]` cannot: `#[non_exhaustive]` stops construction and
+/// exhaustive matching from outside `fl-core`, but a struct-variant field
+/// inherits the enum's visibility, so external code holding a `&mut
+/// Verdict::Pass` could otherwise write straight through the `population`
+/// field. With `population` typed as `Population` instead of `u64`, that
+/// same external assignment can only substitute another `Population` — and
+/// no `Population` holding zero can exist, because its field is private to
+/// this module and every path to one (the constructor, and `Verdict`'s
+/// `Deserialize`, which builds it through the same constructor) validates
+/// first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct Population(u64);
+
+impl Population {
+    /// Build a `Population`, refusing zero: a gate that examined nothing
+    /// has no population to report.
+    pub fn new(value: u64) -> Option<Self> {
+        if value == 0 {
+            None
+        } else {
+            Some(Population(value))
+        }
+    }
+
+    /// The examined count.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// Private raw mirror for controlled deserialization.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -24,11 +59,15 @@ enum VerdictRaw {
 ///
 /// ⚠ Every variant is `#[non_exhaustive]`, so no crate outside `fl-core` can
 /// build one with struct syntax. The constructors below and deserialization
-/// are the only ways in, and they are where the empty-population rule is enforced.
+/// are the only ways in, and they are where the empty-population rule is
+/// enforced. `Pass` additionally types its `population` field as
+/// [`Population`], whose own private field seals the one route
+/// `#[non_exhaustive]` leaves open: mutation through a `&mut Verdict::Pass`
+/// obtained from a match. See [`Population`] for why that route is closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum Verdict {
     #[non_exhaustive]
-    Pass { population: u64 },
+    Pass { population: Population },
     #[non_exhaustive]
     Fail { population: u64, reason: FailReason },
     #[non_exhaustive]
@@ -43,12 +82,12 @@ impl<'de> Deserialize<'de> for Verdict {
         let raw = VerdictRaw::deserialize(deserializer)?;
         match raw {
             VerdictRaw::Pass { population } => {
-                if population == 0 {
-                    return Err(de::Error::custom(
+                let population = Population::new(population).ok_or_else(|| {
+                    de::Error::custom(
                         "cannot deserialize Pass over zero population: \
                         no gate examined nothing can pass",
-                    ));
-                }
+                    )
+                })?;
                 Ok(Verdict::Pass { population })
             }
             VerdictRaw::Fail { population, reason } => {
@@ -66,11 +105,11 @@ impl Verdict {
     /// examined nothing tells you nothing, and a no-op and a no-run must not
     /// produce the same answer.
     pub fn from_predicate(passed: bool, population: u64) -> Self {
-        if population == 0 {
+        let Some(nonzero) = Population::new(population) else {
             return Verdict::Fail { population: 0, reason: FailReason::EmptyPopulation };
-        }
+        };
         if passed {
-            Verdict::Pass { population }
+            Verdict::Pass { population: nonzero }
         } else {
             Verdict::Fail { population, reason: FailReason::Predicate }
         }
@@ -92,7 +131,8 @@ impl Verdict {
 
     pub fn population(&self) -> Option<u64> {
         match self {
-            Verdict::Pass { population } | Verdict::Fail { population, .. } => Some(*population),
+            Verdict::Pass { population } => Some(population.get()),
+            Verdict::Fail { population, .. } => Some(*population),
             Verdict::Error { .. } => None,
         }
     }
@@ -120,7 +160,10 @@ mod tests {
 
     #[test]
     fn a_true_predicate_over_a_real_population_passes() {
-        assert_eq!(Verdict::from_predicate(true, 4), Verdict::Pass { population: 4 });
+        assert_eq!(
+            Verdict::from_predicate(true, 4),
+            Verdict::Pass { population: Population::new(4).unwrap() }
+        );
     }
 
     #[test]
@@ -168,7 +211,7 @@ mod tests {
         let v =
             serde_json::from_str::<Verdict>(r#"{"Pass":{"population":4}}"#)
                 .expect("valid pass");
-        assert_eq!(v, Verdict::Pass { population: 4 });
+        assert_eq!(v, Verdict::Pass { population: Population::new(4).unwrap() });
         assert!(v.is_pass());
     }
 
@@ -217,6 +260,27 @@ mod tests {
     fn roundtrip_error_through_json() {
         let original = Verdict::error("test failure");
         let serialized = serde_json::to_string(&original).expect("serialize");
+        let deserialized =
+            serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
+        assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn population_refuses_zero() {
+        assert_eq!(Population::new(0), None);
+    }
+
+    #[test]
+    fn population_reports_back_a_positive_value() {
+        let p = Population::new(7).expect("7 is a valid population");
+        assert_eq!(p.get(), 7);
+    }
+
+    #[test]
+    fn pass_serializes_to_the_exact_wire_form_and_back() {
+        let original = Verdict::from_predicate(true, 3);
+        let serialized = serde_json::to_string(&original).expect("serialize");
+        assert_eq!(serialized, r#"{"Pass":{"population":3}}"#);
         let deserialized =
             serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
         assert_eq!(original, deserialized);
