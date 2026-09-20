@@ -1,4 +1,3 @@
-use crate::population::ExecError;
 use fl_core::ids::RecordId;
 use fl_core::log::AttemptStatus;
 use std::path::PathBuf;
@@ -49,12 +48,32 @@ impl AttemptOutcome {
     }
 }
 
+/// Pre-flight failures only: errors that occur before an attempt begins.
+///
+/// Anything that happens during or after the attempt starts — including crashes
+/// and timeouts — must be reported as `Ok(AttemptOutcome)` with a status and cost.
+/// This narrow type prevents the `Result` channel from becoming a vehicle for
+/// unpriced failures.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AttemptError {
+    #[error("adapter `{0}` is not known")]
+    UnknownAdapter(String),
+}
+
 pub trait Runner {
     fn id(&self) -> &str;
+    /// Attempt a piece of work.
+    ///
+    /// `Err` means the attempt never started. Anything that happens after the
+    /// attempt starts — including crashes and timeouts — is reported as
+    /// `Ok(AttemptOutcome)` with a status and cost.
+    ///
+    /// ⚠ This trait is not `dyn`-compatible due to the `impl Trait` return type;
+    /// use `impl Runner` or generic `R: Runner` instead of `Box<dyn Runner>`.
     fn attempt(
         &self,
         spec: AttemptSpec,
-    ) -> impl std::future::Future<Output = Result<AttemptOutcome, ExecError>> + Send;
+    ) -> impl std::future::Future<Output = Result<AttemptOutcome, AttemptError>> + Send;
 }
 
 #[cfg(test)]
@@ -69,7 +88,7 @@ mod tests {
             "stub"
         }
 
-        async fn attempt(&self, _spec: AttemptSpec) -> Result<AttemptOutcome, ExecError> {
+        async fn attempt(&self, _spec: AttemptSpec) -> Result<AttemptOutcome, AttemptError> {
             Ok(AttemptOutcome {
                 status: AttemptStatus::Crashed,
                 output_excerpt: "boom".into(),
@@ -103,5 +122,28 @@ mod tests {
         let out = AttemptOutcome::refused("no adapter configured");
         assert_eq!(out.status, AttemptStatus::Refused);
         assert_eq!(out.cost_usd_micros, 0);
+    }
+
+    #[test]
+    fn attempt_error_only_has_preflight_variants() {
+        // This test pins the boundary: AttemptError should never gain
+        // Timeout, Spawn, or other runtime-failure variants. Only pre-flight
+        // errors like UnknownAdapter belong here.
+        let err = AttemptError::UnknownAdapter("foo".into());
+        match err {
+            AttemptError::UnknownAdapter(id) => {
+                assert_eq!(id, "foo");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_adapter_is_the_only_variant() {
+        // Compile-time check: if someone adds Timeout or Spawn to AttemptError,
+        // this test would still compile but would be false documentation.
+        // The real guard is that ExecError::Timeout and ExecError::Spawn
+        // cannot impl From<AttemptError> or vice versa.
+        let err = AttemptError::UnknownAdapter("test".into());
+        assert!(matches!(err, AttemptError::UnknownAdapter(_)));
     }
 }

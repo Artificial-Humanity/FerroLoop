@@ -15,8 +15,6 @@ pub enum ExecError {
     Spawn(String, String),
     #[error("command `{0}` exceeded its {1}s timeout")]
     Timeout(String, u64),
-    #[error("adapter `{0}` is not known")]
-    UnknownAdapter(String),
 }
 
 /// Paths that differ from a base ref. Separated behind a trait so population
