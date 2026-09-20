@@ -1,0 +1,21 @@
+# Fix-wave finding 3 (crates/cli/src/cmd/gate.rs, `SetProgram`): `gate
+# set-program` rewrites a command gate's program in place with no
+# re-authoring and no new commit stamp — the exact shape of a person
+# weakening a reproduction by hand and having it read as a legitimate
+# repair. It stays available to this repo's own tests (the four required
+# integration tests in crates/cli/tests/findings.rs call it directly) but is
+# refused in a production build.
+#
+# The mechanism: Cargo sets every variable in this table for every process
+# *it* launches from this checkout — `cargo build`, `cargo run`, `cargo
+# test` — and a spawned child (such as the `flctl` binary a `cargo test`
+# integration test invokes as a subprocess) inherits it by ordinary process
+# environment inheritance. A `flctl` binary run any other way — the
+# distributed release artifact, copied out of `target/` and executed
+# directly, which is the only way a production build is ever run — never
+# sees this variable, because nothing set it in that process's environment.
+#
+# Deliberately not named in any --help text or shipped documentation: see
+# crates/cli/src/cmd/gate.rs for the refusal this guards.
+[env]
+FL_SET_PROGRAM_TEST_HOOK = "1"

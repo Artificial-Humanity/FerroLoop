@@ -50,8 +50,8 @@ pub enum Cmd {
     /// re-authoring and no new commit stamp. This is how a test simulates a
     /// repair without a model in the loop — and, just as directly, how a
     /// person could weaken a reproduction by hand and have it read as a
-    /// legitimate fix. Spec §12 records that as an open question; this
-    /// command does not resolve it, only makes it possible.
+    /// legitimate fix. Refused outside this repo's own test harness: there
+    /// is no production route to this command.
     SetProgram {
         id: u64,
         #[arg(long)]
@@ -162,6 +162,29 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             return Ok(report.verdict.exit_code());
         }
         Cmd::SetProgram { id, program } => {
+            // ⚠⚠ Fix-wave finding 3: an honest sentence in --help is not a
+            // guard. This rewrites a gate's command in place with no
+            // re-authoring and no new commit stamp, so accepting it in a
+            // production build would hand out an unearned green light — a
+            // finding closed, `git log` unchanged, no repair made. The
+            // check below is a repo-internal test hook, set only by this
+            // checkout's own `.cargo/config.toml` for processes Cargo
+            // itself launches (`cargo build`/`run`/`test`); a `flctl`
+            // binary run any other way — including the only way a
+            // production build is ever run, as a standalone artifact
+            // outside Cargo's process tree — never has it set. Deliberately
+            // not named in --help or in any shipped documentation.
+            if std::env::var_os("FL_SET_PROGRAM_TEST_HOOK").is_none() {
+                bail!(
+                    "`gate set-program` is refused: it is a testing affordance, not a \
+                     production command. Rewriting a gate's program in place, with no \
+                     re-authoring and no new commit stamp, is exactly how a red gate could be \
+                     turned green by hand and read as a legitimate repair. There is no \
+                     production route to this command — to change what a gate runs, author a \
+                     new gate with `gate add` against the current commit, so the change is \
+                     provenanced like any other."
+                );
+            }
             let Some(mut g) = store.get_gate(GateId(id))? else {
                 bail!(
                     "no gate with id {id}. Use `flctl gate list --project <id>` to see gates that exist."
