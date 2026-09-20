@@ -313,13 +313,15 @@ mod tests {
     // population is appended to the command's own argv (that is the entire
     // point of `Args` delivery — see
     // `the_command_receives_every_path_the_framework_resolved` above), so
-    // the child actually spawned is `sleep 30 <path-to-a.txt>`. GNU
-    // coreutils' `sleep` treats every positional argument as a time
-    // interval and rejects a non-numeric one immediately: `sleep 30
-    // /tmp/xyz/a.txt` exits 1 in a few milliseconds with "invalid time
-    // interval", never sleeps, and the gate observes an ordinary nonzero
-    // exit (`Fail { reason: Predicate }`), not a timeout — verified
-    // directly against the system `sleep` binary before making this change.
+    // the child actually spawned is `sleep 30 <path-to-a.txt>`. This
+    // system's `sleep` (uutils coreutils 0.8.0 — same vendor as the `wc`
+    // used elsewhere in this file, confirmed with `sleep --version`) treats
+    // every positional argument as a time interval and rejects a
+    // non-numeric one immediately: `sleep 30 /tmp/xyz/a.txt` exits 1 in a
+    // few milliseconds with "invalid time interval", never sleeps, and the
+    // gate observes an ordinary nonzero exit (`Fail { reason: Predicate }`),
+    // not a timeout — verified directly against the installed binary before
+    // making this change.
     // `Stdin` delivery keeps the population off `sleep`'s argv (it goes to
     // the child's stdin instead, which `sleep` never reads), so `sleep 30`
     // runs as written and the 1s deadline is what actually ends it.
@@ -347,6 +349,38 @@ mod tests {
         );
         assert_eq!(out.verdict, Verdict::from_predicate(true, 2));
         assert!(out.output_excerpt.trim().starts_with('2'), "got {}", out.output_excerpt);
+    }
+
+    // Task 7 review, Important 2: rule 1 ("the framework enumerates, the
+    // command never does") is only actually verified for a delivery mode if
+    // the command reads back what it was handed and we check that against
+    // the framework's own count — not just that some plausible-looking
+    // verdict came back. `Args` and `Stdin` had that end-to-end check;
+    // `FileList` did not, so a command reading a stale/wrong/empty
+    // FL_POPULATION_FILE could have shipped silently green. This command
+    // reads $FL_POPULATION_FILE itself and reports the line count it
+    // actually saw, so a wrong file (or no file) shows up as a wrong number
+    // or a shell error, not a false pass.
+    #[test]
+    fn filelist_delivery_hands_the_command_a_list_file_with_every_path() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a.txt"), "x").unwrap();
+        fs::write(d.path().join("b.txt"), "x").unwrap();
+        fs::write(d.path().join("c.txt"), "x").unwrap();
+        let pop = vec![
+            d.path().join("a.txt"),
+            d.path().join("b.txt"),
+            d.path().join("c.txt"),
+        ];
+
+        let out = run_command_gate(
+            d.path(),
+            &spec("sh", &["-c", "wc -l < \"$FL_POPULATION_FILE\""], PopulationDelivery::FileList),
+            &pop,
+            1,
+        );
+        assert_eq!(out.verdict, Verdict::from_predicate(true, 3), "got {:?}", out.verdict);
+        assert_eq!(out.output_excerpt.trim(), "3", "got {}", out.output_excerpt);
     }
 
     // Not in the brief's required list. This is the drain proof the brief
