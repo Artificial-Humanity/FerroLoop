@@ -238,6 +238,11 @@ impl Store for RedbStore {
         self.get_json(RECORDS, id.0)
     }
 
+    fn list_records(&self, project: ProjectId) -> Result<Vec<Record>, StoreError> {
+        let all: Vec<Record> = self.all_json(RECORDS)?;
+        Ok(all.into_iter().filter(|r| r.project == project).collect())
+    }
+
     fn set_record_state(&mut self, id: RecordId, state: State) -> Result<(), StoreError> {
         let mut rec: Record = self.get_record(id)?.ok_or(StoreError::NoSuchRecord(id))?;
         rec.state = state;

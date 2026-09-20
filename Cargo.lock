@@ -196,6 +196,7 @@ dependencies = [
  "fl-exec",
  "fl-store",
  "predicates",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

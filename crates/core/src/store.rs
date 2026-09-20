@@ -51,6 +51,7 @@ pub trait Store {
 
     fn add_record(&mut self, project: ProjectId, title: &str) -> Result<RecordId, StoreError>;
     fn get_record(&self, id: RecordId) -> Result<Option<Record>, StoreError>;
+    fn list_records(&self, project: ProjectId) -> Result<Vec<Record>, StoreError>;
     fn set_record_state(&mut self, id: RecordId, state: State) -> Result<(), StoreError>;
 
     fn append_gate_run(&mut self, run: GateRun) -> Result<(), StoreError>;
@@ -164,6 +165,10 @@ impl Store for MemStore {
         Ok(self.records.get(&id.0).cloned())
     }
 
+    fn list_records(&self, project: ProjectId) -> Result<Vec<Record>, StoreError> {
+        Ok(self.records.values().filter(|r| r.project == project).cloned().collect())
+    }
+
     fn set_record_state(&mut self, id: RecordId, state: State) -> Result<(), StoreError> {
         let rec = self.records.get_mut(&id.0).ok_or(StoreError::NoSuchRecord(id))?;
         rec.state = state;
@@ -220,6 +225,19 @@ mod tests {
     fn a_missing_project_is_none_and_not_an_error() {
         let s = MemStore::default();
         assert!(s.get_project(ProjectId(42)).unwrap().is_none());
+    }
+
+    #[test]
+    fn list_records_returns_only_the_named_projects_records() {
+        let mut s = MemStore::default();
+        let p1 = project(&mut s);
+        let p2 = s.add_project("/tmp/q").unwrap();
+        let r1 = s.add_record(p1, "fix the thing").unwrap();
+        let _r2 = s.add_record(p2, "unrelated").unwrap();
+        let recs = s.list_records(p1).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].id, r1);
+        assert_eq!(recs[0].title, "fix the thing");
     }
 
     #[test]
