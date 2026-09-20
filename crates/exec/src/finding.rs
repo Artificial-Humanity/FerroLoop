@@ -248,6 +248,7 @@ mod tests {
         // An Error is not a failure. It proves nothing either way.
         let err = attach_reproduction(&mut s, f, g).unwrap_err();
         assert!(matches!(err, FindingExecError::ReproductionErrored { .. }), "got {err}");
+        assert_eq!(s.get_finding(f).unwrap().unwrap().state, FindingState::Raised);
     }
 
     // ⚠⚠ REQUIRED TEST 7 (spec §10): a repair that breaks a neighbour does
