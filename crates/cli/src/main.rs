@@ -28,21 +28,37 @@ enum Command {
     Record(cmd::record::Cmd),
 }
 
+/// Resolve the store path from `--db`, then `$FL_DB`, then the XDG data
+/// directory, then `~/.local/share`.
+///
+/// ⚠ Every tier ends the same way: the parent directory of the resolved path
+/// is created if it does not exist. Earlier this only happened on the
+/// `$XDG_DATA_HOME`/`$HOME` branch, so setting `$FL_DB` (or `--db`) to a path
+/// whose directory did not exist yet fell straight through to a raw redb I/O
+/// error — the same class of silent inconsistency this task's actionable-
+/// refusal rule exists to close, just moved one layer down into the
+/// database open call instead of being refused here. Rather than add a
+/// fourth distinct refusal message for that case, every tier now gets the
+/// same treatment `$XDG_DATA_HOME`/`$HOME` already had: create the directory
+/// that will hold the store. `--db path/to/db` and `$FL_DB=path/to/db`
+/// behave identically to each other and to the XDG fallback again.
 fn db_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(p) = explicit {
-        return Ok(p);
+    let path = if let Some(p) = explicit {
+        p
+    } else if let Ok(p) = std::env::var("FL_DB") {
+        PathBuf::from(p)
+    } else {
+        let base = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+            .context("neither --db, $FL_DB, $XDG_DATA_HOME nor $HOME is set, so there is nowhere to put the store")?;
+        base.join("fl").join("fl.redb")
+    };
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
     }
-    if let Ok(p) = std::env::var("FL_DB") {
-        return Ok(PathBuf::from(p));
-    }
-    let base = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .context("neither --db, $FL_DB, $XDG_DATA_HOME nor $HOME is set, so there is nowhere to put the store")?;
-    let dir = base.join("fl");
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("could not create {}", dir.display()))?;
-    Ok(dir.join("fl.redb"))
+    Ok(path)
 }
 
 fn main() {
