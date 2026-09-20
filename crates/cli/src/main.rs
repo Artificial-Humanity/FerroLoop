@@ -28,6 +28,8 @@ enum Command {
     Record(cmd::record::Cmd),
     /// Evaluate a transition's gates and exit per the check contract.
     Check(cmd::check::Cmd),
+    #[command(subcommand)]
+    Finding(cmd::finding::Cmd),
 }
 
 /// Resolve the store path from `--db`, then `$FL_DB`, then the XDG data
@@ -85,5 +87,6 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Transition(c) => cmd::transition::run(&mut store, c),
         Command::Record(c) => cmd::record::run(&mut store, c),
         Command::Check(c) => cmd::check::run(&mut store, c),
+        Command::Finding(c) => cmd::finding::run(&mut store, c),
     }
 }
