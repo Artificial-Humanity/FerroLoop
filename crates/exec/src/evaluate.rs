@@ -7,7 +7,7 @@ use fl_core::model::{GateDef, GateKind, Regret, Selector, Transition};
 use fl_core::stale::{Staleness, apply_staleness, is_stale};
 use fl_core::store::Store;
 use fl_core::verdict::Verdict;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct GateReport {
@@ -55,7 +55,18 @@ impl TransitionReport {
 /// meaning anything.
 ///
 /// So: test the gate's **selector** against the changed paths directly.
-fn staleness_for(root: &Path, def: &GateDef, head: &str) -> bool {
+///
+/// `population` is the result of resolving `def.selector` once, handed in by
+/// the caller rather than recomputed here: for a `Selector::Command`, a
+/// second `resolve()` call would run the user's own command a second time
+/// per gate per evaluation, which is both a cost and an idempotency hazard
+/// this function has no business creating.
+fn staleness_for(
+    root: &Path,
+    def: &GateDef,
+    head: &str,
+    population: &Result<Vec<PathBuf>, ExecError>,
+) -> bool {
     if def.authored_at_commit == head {
         return false;
     }
@@ -81,13 +92,28 @@ fn staleness_for(root: &Path, def: &GateDef, head: &str) -> bool {
                 .any(|p| p.strip_prefix(root).map(|rel| m.is_match(rel)).unwrap_or(false))
         }
         // ⚠ `Changed` and `Command` define their population by RUNNING
-        // something, so there is no pattern to test a vanished path against.
-        // The live intersection is the honest best available here, and it
-        // **cannot see a deletion**. Recorded rather than hidden: if this
-        // matters later, those selector kinds need a different mechanism, not
+        // something, so there is no pattern to test a vanished path against;
+        // this falls back to intersecting the changed set with the already-
+        // resolved population instead.
+        //
+        // That fallback is not blind to every deletion the way `Glob`'s
+        // live-tree walk is. For `Selector::Changed` specifically, the
+        // population is itself a `git diff --name-only` result (between the
+        // selector's own `base` and `head`), which — per this function's own
+        // measured premise above — does list deleted paths. So a deletion is
+        // visible here whenever it falls inside a window the intersection
+        // can see. What it can still miss: churn that nets to no visible
+        // diff over the selector's own window, e.g. a file deleted and
+        // recreated (or the reverse) entirely within `[selector.base,
+        // authored_at_commit]`, which leaves no residue in `diff(base,
+        // head)` even though the gate's own `[authored_at_commit, head]`
+        // window did change. For `Selector::Command`, the population is
+        // whatever the command chooses to print, so nothing general can be
+        // promised about it either way. Recorded rather than hidden: if this
+        // matters later, these selector kinds need a targeted mechanism, not
         // a cleverer intersection.
         _ => {
-            let Ok(population) = resolve(root, &def.selector, &Git) else {
+            let Ok(population) = population.as_ref() else {
                 return true;
             };
             population.iter().any(|p| changed.contains(p))
@@ -130,11 +156,16 @@ pub fn evaluate_transition(
             )));
         };
 
-        let (raw, excerpt, duration_ms) = match resolve(root, &def.selector, &Git) {
+        // Resolved once. `staleness_for`'s fallback branch reuses this same
+        // result instead of calling `resolve` again — a second call would
+        // run a `Selector::Command` gate's own command a second time per
+        // evaluation.
+        let population_result = resolve(root, &def.selector, &Git);
+
+        let (raw, excerpt, duration_ms) = match &population_result {
             Ok(population) => match &def.kind {
                 GateKind::Command(spec) => {
-                    let out =
-                        run_command_gate(root, spec, &population, def.min_population);
+                    let out = run_command_gate(root, spec, population, def.min_population);
                     (out.verdict, out.output_excerpt, out.duration_ms)
                 }
                 GateKind::Agent(spec) => (
@@ -150,7 +181,7 @@ pub fn evaluate_transition(
             Err(e) => (Verdict::error(e.to_string()), e.to_string(), 0),
         };
 
-        let stale = staleness_for(root, &def, &head);
+        let stale = staleness_for(root, &def, &head, &population_result);
         let (verdict, staleness) = apply_staleness(raw, stale, transition.regret);
 
         store
@@ -345,5 +376,39 @@ mod tests {
         let p = setup(&mut s, d.path(), "true", "src/**/*.rs", Regret::Low);
         let err = evaluate_transition(&mut s, p, "nonexistent", None).unwrap_err();
         assert!(err.to_string().contains("nonexistent"), "got {err}");
+    }
+
+    // ⚠⚠ The empty-population rule one level up, pinned directly rather than
+    // only asserted in a doc comment. Nothing in `fl-core` forbids
+    // constructing a `Transition` with no gates, so this must not be left to
+    // be "discovered" and "fixed" by someone reading `passed()` cold.
+    #[test]
+    fn a_transition_with_no_gates_has_not_been_verified() {
+        let r = TransitionReport { transition: "launch".into(), regret: Regret::Low, gates: vec![] };
+        assert!(!r.passed(), "an empty gate list ran nothing and must not read as a pass");
+    }
+
+    // A transition can name a gate id that was never stored (never created,
+    // or deleted out from under it). That must be refused by name, the same
+    // as an unknown transition, never silently treated as passing because
+    // the loop over `transition.gates` had nothing to iterate distinctly.
+    #[test]
+    fn a_transition_naming_a_gate_that_does_not_exist_is_refused() {
+        let d = repo_with(&[("src/a.rs", "x")]);
+        let mut s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let dangling = GateId(9999);
+        s.add_transition(Transition {
+            project: p,
+            name: "launch".into(),
+            from: State::Review,
+            to: State::Done,
+            regret: Regret::Low,
+            gates: vec![dangling],
+        })
+        .unwrap();
+
+        let err = evaluate_transition(&mut s, p, "launch", None).unwrap_err();
+        assert!(err.to_string().contains(&dangling.to_string()), "got {err}");
     }
 }
