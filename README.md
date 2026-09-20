@@ -33,7 +33,7 @@ FerroLoop is designed as a standalone Rust daemon with an accompanying CLI inter
 
 ### Prerequisites
 
-* Rust 1.80+ and Cargo
+* Rust 1.98+ (edition 2024) and Cargo
 
 ### Building from Source
 
@@ -46,12 +46,18 @@ cd FerroLoop
 cargo build --release
 ```
 
-The compiled binary will be located at `target/release/ferroloop`.
+The compiled binary will be located at `target/release/flctl` — the CLI's placeholder
+binary name; no product name has been ratified yet.
+
+To gate a real action with it end to end — registering a project, writing a gate, wiring
+it into a transition, and reading a refusal — see
+[docs/getting-started.md](docs/getting-started.md).
 
 ---
 
 ## Documentation
 
+* [docs/getting-started.md](docs/getting-started.md) — build the CLI and gate a real action, with real commands and their output.
 * [AGENTS.md](AGENTS.md) — Working rules, core stack matrix, and environment conventions for agents and contributors.
 * [WORKFLOW.md](WORKFLOW.md) — Development workflow, review requirements, and commit conventions.
 * [PERSONA.md](PERSONA.md) — Developer persona and domain expertise (Ferris).
