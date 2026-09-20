@@ -9,7 +9,9 @@ File naming in this directory follows
 
 ## Contents
 
-This index is the only file here so far. No anchor document exists yet.
+* [getting-started.md](getting-started.md) — build the CLI and gate a real action, with real commands and their output.
+
+No anchor document exists yet.
 
 ## Root documents
 
