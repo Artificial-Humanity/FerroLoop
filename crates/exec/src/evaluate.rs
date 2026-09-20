@@ -127,6 +127,107 @@ fn staleness_for(
     is_stale(touched, false)
 }
 
+/// The shared body behind [`run_single_gate`] and [`evaluate_transition`]'s
+/// per-gate loop: resolve the project root and the gate's selector against
+/// the live tree (once), run the gate, apply staleness under `regret`,
+/// append the [`GateRun`] tagged with `record`, and stamp `last_pass_commit`
+/// on a pass.
+///
+/// Not `pub`: the two callers reach it through [`run_single_gate`] (which
+/// fixes `regret` at [`Regret::Low`] and `record` at `None`, since a bare
+/// gate run is not a transition) and `evaluate_transition` (which supplies
+/// the transition's own regret and record). Extracted here so neither caller
+/// keeps its own copy of this logic.
+fn run_gate(
+    store: &mut dyn Store,
+    root: &Path,
+    head: &str,
+    def: &GateDef,
+    regret: Regret,
+    record: Option<RecordId>,
+) -> Result<GateReport, ExecError> {
+    // Resolved once. `staleness_for`'s fallback branch reuses this same
+    // result instead of calling `resolve` again — a second call would run a
+    // `Selector::Command` gate's own command a second time per evaluation.
+    let population_result = resolve(root, &def.selector, &Git);
+
+    let (raw, excerpt, duration_ms) = match &population_result {
+        Ok(population) => match &def.kind {
+            GateKind::Command(spec) => {
+                let out = run_command_gate(root, spec, population, def.min_population);
+                (out.verdict, out.output_excerpt, out.duration_ms)
+            }
+            GateKind::Agent(spec) => (
+                Verdict::error(format!(
+                    "agent gates are not implemented in milestone 1 \
+                     (gate `{}` asks adapter `{}`)",
+                    def.name, spec.adapter
+                )),
+                String::new(),
+                0,
+            ),
+        },
+        Err(e) => (Verdict::error(e.to_string()), e.to_string(), 0),
+    };
+
+    let stale = staleness_for(root, def, head, &population_result);
+    let (verdict, staleness) = apply_staleness(raw, stale, regret);
+
+    store
+        .append_gate_run(GateRun {
+            gate: def.id,
+            record,
+            commit: head.to_string(),
+            verdict: verdict.clone(),
+            population: verdict.population().unwrap_or(0),
+            output_excerpt: excerpt.clone(),
+            duration_ms,
+            cost_usd_micros: 0,
+        })
+        .map_err(|e| ExecError::Git(e.to_string()))?;
+
+    if verdict.is_pass() {
+        let mut updated = def.clone();
+        updated.last_pass_commit = Some(head.to_string());
+        let _ = store.update_gate(&updated);
+    }
+
+    Ok(GateReport {
+        gate: def.id,
+        name: def.name.clone(),
+        verdict,
+        staleness,
+        output_excerpt: excerpt,
+        duration_ms,
+    })
+}
+
+/// Run one gate against the live working tree, exactly once, and record the
+/// result.
+///
+/// Applies staleness at [`Regret::Low`] — a bare gate run is not a
+/// transition, so it warns and never fails for staleness alone — and tags
+/// the appended [`GateRun`] with no record. This is what `attach_reproduction`
+/// and `verify_finding` use to run a gate ad hoc, outside any transition.
+pub fn run_single_gate(
+    store: &mut dyn Store,
+    project: ProjectId,
+    gate: GateId,
+) -> Result<GateReport, ExecError> {
+    let proj = store
+        .get_project(project)
+        .map_err(|e| ExecError::Git(e.to_string()))?
+        .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
+    let root = Path::new(&proj.root);
+
+    let Some(def) = store.get_gate(gate).map_err(|e| ExecError::Git(e.to_string()))? else {
+        return Err(ExecError::BadSelector(format!("no gate with id {gate}")));
+    };
+
+    let head = Git::head(root)?;
+    run_gate(store, root, &head, &def, Regret::Low, None)
+}
+
 pub fn evaluate_transition(
     store: &mut dyn Store,
     project: ProjectId,
@@ -160,61 +261,8 @@ pub fn evaluate_transition(
             )));
         };
 
-        // Resolved once. `staleness_for`'s fallback branch reuses this same
-        // result instead of calling `resolve` again — a second call would
-        // run a `Selector::Command` gate's own command a second time per
-        // evaluation.
-        let population_result = resolve(root, &def.selector, &Git);
-
-        let (raw, excerpt, duration_ms) = match &population_result {
-            Ok(population) => match &def.kind {
-                GateKind::Command(spec) => {
-                    let out = run_command_gate(root, spec, population, def.min_population);
-                    (out.verdict, out.output_excerpt, out.duration_ms)
-                }
-                GateKind::Agent(spec) => (
-                    Verdict::error(format!(
-                        "agent gates are not implemented in milestone 1 \
-                         (gate `{}` asks adapter `{}`)",
-                        def.name, spec.adapter
-                    )),
-                    String::new(),
-                    0,
-                ),
-            },
-            Err(e) => (Verdict::error(e.to_string()), e.to_string(), 0),
-        };
-
-        let stale = staleness_for(root, &def, &head, &population_result);
-        let (verdict, staleness) = apply_staleness(raw, stale, transition.regret);
-
-        store
-            .append_gate_run(GateRun {
-                gate: def.id,
-                record,
-                commit: head.clone(),
-                verdict: verdict.clone(),
-                population: verdict.population().unwrap_or(0),
-                output_excerpt: excerpt.clone(),
-                duration_ms,
-                cost_usd_micros: 0,
-            })
-            .map_err(|e| ExecError::Git(e.to_string()))?;
-
-        if verdict.is_pass() {
-            let mut updated = def.clone();
-            updated.last_pass_commit = Some(head.clone());
-            let _ = store.update_gate(&updated);
-        }
-
-        reports.push(GateReport {
-            gate: def.id,
-            name: def.name.clone(),
-            verdict,
-            staleness,
-            output_excerpt: excerpt,
-            duration_ms,
-        });
+        let report = run_gate(store, root, &head, &def, transition.regret, record)?;
+        reports.push(report);
     }
 
     Ok(TransitionReport {
