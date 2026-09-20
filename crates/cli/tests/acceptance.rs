@@ -79,11 +79,20 @@ fn a_defect_present_before_the_run_stops_the_launch() {
     git(repo.path(), &["commit", "-qm", "defect"]);
 
     // The launch is refused, and the reason is the predicate and not staleness.
+    //
+    // ⚠ That second clause is asserted, not just claimed: `contains("Predicate")`
+    // pins the fail reason fl-core reports (`FailReason::Predicate`, printed via
+    // `{reason:?}` in `check.rs`). Without it, this test passed even with the
+    // predicate check in `command.rs` mutated to always succeed, because the
+    // same commit that breaks the config also moves the gate's population past
+    // its stamp, so staleness independently fails the transition (as `Stale`)
+    // at this `--regret high` transition. A green here must mean the predicate
+    // itself caught the defect, not that some other guard happened to.
     cli()
         .args(["check", "launch", "--project", "1"])
         .assert()
         .code(1)
-        .stdout(contains("FAIL").and(contains("config-parses")));
+        .stdout(contains("FAIL").and(contains("config-parses")).and(contains("Predicate")));
 }
 
 #[test]
