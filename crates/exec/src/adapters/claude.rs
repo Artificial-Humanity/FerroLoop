@@ -25,6 +25,7 @@
 
 use crate::runner::{AttemptError, AttemptOutcome, AttemptSpec, Runner};
 use fl_core::log::AttemptStatus;
+use std::io::ErrorKind;
 use std::process::Stdio;
 use std::time::Instant;
 use tokio::process::Command;
@@ -33,6 +34,32 @@ use tokio::time::{Duration, timeout};
 /// Output beyond this many bytes is dropped rather than stored. An attempt
 /// record is a note for a human and a later gate, not a full transcript.
 const EXCERPT_LIMIT: usize = 8192;
+
+/// How many times a spawn is retried after `ETXTBSY`
+/// (`ErrorKind::ExecutableFileBusy`) before it is reported as a refusal.
+///
+/// `ETXTBSY` means the kernel currently has the target file open for
+/// writing — anywhere, by any process — at the moment of `execve`. On Linux
+/// that state is guaranteed transient: it clears as soon as the writer
+/// closes its file descriptor, which is microseconds away, not seconds. A
+/// `fork()` occurring on another thread of this same process while this
+/// thread is between writing out a freshly-created executable and exec'ing
+/// it duplicates the still-open write fd into the forked child, which then
+/// holds the target file busy until that child's own `execve` closes it
+/// (`O_CLOEXEC` only fires on exec, not on fork). That race is real in
+/// production too, not just in tests: nothing here promises the `claude`
+/// binary is never mid-replacement (package manager, deploy tool) at the
+/// instant of spawn. Retrying a handful of times with a short backoff turns
+/// a spurious, purely environmental "could not start" into a normal spawn,
+/// which is the honest outcome for a condition proven to self-clear. Any
+/// other spawn error is refused immediately, unretried, as before.
+const SPAWN_RETRY_LIMIT: u32 = 20;
+
+/// Backoff between spawn retries. `ETXTBSY`'s window is microseconds wide,
+/// so this only needs to be small; it is not tuned against a measured
+/// worst case, just kept well under a human-noticeable delay even at the
+/// retry ceiling (20 × 2ms = 40ms).
+const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(2);
 
 /// Drives the real `claude` CLI as a [`Runner`].
 pub struct ClaudeAdapter {
@@ -73,18 +100,27 @@ impl Runner for ClaudeAdapter {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
 
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                // A spawn failure is not a pre-flight error: the caller asked
-                // for an attempt, and "the binary is missing" is an answer
-                // about that attempt, not a reason to never have tried. It
-                // costs nothing and took no time, so it is reported the same
-                // way a zero-budget refusal is.
-                return Ok(AttemptOutcome::refused(format!(
-                    "could not start `{}`: {e}",
-                    self.binary
-                )));
+        let mut retries = 0u32;
+        let child = loop {
+            match cmd.spawn() {
+                Ok(c) => break c,
+                Err(e) if e.kind() == ErrorKind::ExecutableFileBusy && retries < SPAWN_RETRY_LIMIT => {
+                    // See `SPAWN_RETRY_LIMIT`'s doc comment: this is a
+                    // known-transient race, not a real refusal.
+                    retries += 1;
+                    tokio::time::sleep(SPAWN_RETRY_DELAY).await;
+                }
+                Err(e) => {
+                    // A spawn failure is not a pre-flight error: the caller
+                    // asked for an attempt, and "the binary is missing" is
+                    // an answer about that attempt, not a reason to never
+                    // have tried. It costs nothing and took no time, so it
+                    // is reported the same way a zero-budget refusal is.
+                    return Ok(AttemptOutcome::refused(format!(
+                        "could not start `{}`: {e}",
+                        self.binary
+                    )));
+                }
             }
         };
 
