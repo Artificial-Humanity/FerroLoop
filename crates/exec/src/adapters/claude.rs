@@ -117,7 +117,18 @@ impl Runner for ClaudeAdapter {
             Ok(Ok(out)) => {
                 let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
                 text.push_str(&String::from_utf8_lossy(&out.stderr));
-                text.truncate(EXCERPT_LIMIT);
+                // Truncate on a `char` boundary, not a raw byte offset:
+                // `String::truncate` panics if the cut point lands inside a
+                // multi-byte UTF-8 sequence, and `String::from_utf8_lossy`
+                // gives no guarantee that EXCERPT_LIMIT falls on one. Same
+                // rule as `command.rs`'s `excerpt()`.
+                if text.len() > EXCERPT_LIMIT {
+                    let mut end = EXCERPT_LIMIT;
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                }
                 let status = if out.status.success() {
                     AttemptStatus::Completed
                 } else {
@@ -207,6 +218,35 @@ mod tests {
     #[test]
     fn the_adapter_identifies_itself() {
         assert_eq!(ClaudeAdapter::new("claude".into()).id(), "claude");
+    }
+
+    // The only path that emits real process output (`Completed`/`Crashed`
+    // via a successful spawn) was previously untested. Real `claude` output
+    // routinely contains multi-byte UTF-8 (checkmarks, box-drawing), so a
+    // naive `text.truncate(EXCERPT_LIMIT)` has a real chance of landing mid
+    // character and panicking. U+2713 CHECK MARK is 3 bytes in UTF-8, and
+    // EXCERPT_LIMIT (8192) is not a multiple of 3 (8192 % 3 == 2), so 4000
+    // repeats (12,000 bytes) guarantee the byte-8192 cut point falls inside
+    // a character, not on a boundary.
+    #[tokio::test]
+    async fn a_completed_run_truncates_multibyte_output_without_panicking() {
+        let d = tempfile::tempdir().unwrap();
+        let stub = d.path().join("multibyte-output.sh");
+        let payload = "✓".repeat(4000);
+        let script = format!("#!/bin/sh\nprintf '%s' '{payload}'\n");
+        std::fs::write(&stub, script).unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let a = ClaudeAdapter::new(stub.to_string_lossy().into_owned());
+        let out = a.attempt(spec(d.path(), 5)).await.unwrap();
+        assert_eq!(out.status, AttemptStatus::Completed);
+        assert!(
+            out.output_excerpt.len() <= EXCERPT_LIMIT,
+            "got {} bytes",
+            out.output_excerpt.len()
+        );
     }
 
     // Exercises the real `claude` binary installed on the box. Not run by
