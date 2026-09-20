@@ -35,9 +35,30 @@ pub enum FindingExecError {
 }
 
 /// The report of a fix-completion check: the reproduction's own verdict,
-/// whatever neighbours regressed, and whether the finding closed.
+/// every neighbour that was actually evaluated, whichever of those
+/// regressed, and whether the finding closed.
+///
+/// ⚠⚠ `neighbours` carries **every** gate `verify_finding` ran to check for
+/// regressions — passing and failing alike, stale or fresh — because that is
+/// the complete set of gates this verification already executed. A caller
+/// that wants to display something about a passing neighbour (its
+/// staleness, for instance) reads it from here. It must never re-run a gate
+/// to recover information this struct could have carried instead: that is
+/// the exact defect this type was widened to close (Task 16b) — `finding
+/// verify` was invoking every qualifying neighbour gate twice, once inside
+/// `verify_finding` and once more at the CLI purely to re-derive what this
+/// struct now already holds.
+///
+/// `regressions` is kept as a convenience view: exactly the members of
+/// `neighbours` whose verdict did not pass. It is not additional data, and
+/// it is not re-run to produce — `verify_finding` filters it out of the same
+/// single pass over `neighbours`. It stays a first-class field (rather than
+/// a method) because `closed`/`exit_code()`'s contract is pinned by a
+/// reviewer's mutation testing and existing callers already read it as a
+/// field.
 pub struct FixReport {
     pub reproduction: GateReport,
+    pub neighbours: Vec<GateReport>,
     pub regressions: Vec<GateReport>,
     pub closed: bool,
 }
@@ -138,13 +159,16 @@ pub fn verify_finding(
         .map(|g| g.id)
         .collect();
 
-    let mut regressions = Vec::new();
+    // Every qualifying neighbour is run here, exactly once, whether it ends
+    // up passing or failing. `regressions` is derived from this same pass —
+    // not a second one — by filtering out whatever did not pass.
+    let mut neighbour_reports = Vec::new();
     for id in neighbours {
         let r = run_single_gate(store, f.project, id)?;
-        if !r.verdict.is_pass() {
-            regressions.push(r);
-        }
+        neighbour_reports.push(r);
     }
+    let regressions: Vec<GateReport> =
+        neighbour_reports.iter().filter(|r| !r.verdict.is_pass()).cloned().collect();
 
     let closed = reproduction.verdict.is_pass() && regressions.is_empty();
     if closed {
@@ -152,7 +176,7 @@ pub fn verify_finding(
         store.update_finding(&f).map_err(|e| FindingExecError::Store(e.to_string()))?;
     }
 
-    Ok(FixReport { reproduction, regressions, closed })
+    Ok(FixReport { reproduction, neighbours: neighbour_reports, regressions, closed })
 }
 
 #[cfg(test)]

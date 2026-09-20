@@ -9,7 +9,7 @@ use fl_core::store::Store;
 use fl_core::verdict::Verdict;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GateReport {
     pub gate: GateId,
     pub name: String,

@@ -4,7 +4,6 @@ use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::stale::Staleness;
 use fl_core::store::Store;
-use fl_exec::evaluate::run_single_gate;
 use fl_exec::finding::{attach_reproduction, verify_finding};
 use std::collections::BTreeSet;
 
@@ -106,39 +105,22 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 println!("REGRESSION\t{}\t{:?}{}", r.name, r.verdict, stale_note(r.staleness));
             }
 
-            // ⚠ Carried over from Task 15's review: `verify_finding`'s
-            // `FixReport` only ever carries the reproduction and whatever
-            // regressed — a neighbour that still passes is not returned at
-            // all, so a neighbour that passes but has not been re-validated
-            // since the code beneath it moved currently reads exactly like
-            // an ordinary pass: silently absent from the output. Surfacing
-            // it means re-deriving the same neighbour set `verify_finding`
-            // used (id != the reproduction's gate, and it has earned a
-            // `last_pass_commit`) and checking each one already-regressed
-            // gate is skipped so nothing is reported twice, and none of
-            // this feeds back into `closed` or the exit code: those stay
-            // exactly what `verify_finding` decided.
-            if let Some(f) = store.get_finding(id)?
-                && let Some(gate) = f.reproduction
-            {
-                let already_reported: BTreeSet<GateId> =
-                    report.regressions.iter().map(|r| r.gate).collect();
-                let neighbours: Vec<GateId> = store
-                    .list_gates(f.project)?
-                    .into_iter()
-                    .filter(|g| {
-                        g.id != gate
-                            && g.last_pass_commit.is_some()
-                            && !already_reported.contains(&g.id)
-                    })
-                    .map(|g| g.id)
-                    .collect();
-                for nid in neighbours {
-                    let r = run_single_gate(store, f.project, nid)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    if r.verdict.is_pass() && r.staleness != Staleness::Fresh {
-                        println!("NEIGHBOUR\t{}\tpasses{}", r.name, stale_note(r.staleness));
-                    }
+            // Task 16b: `verify_finding`'s `FixReport` now carries every
+            // neighbour it evaluated, not just the regressions, so a
+            // passing-but-stale neighbour is read straight out of the
+            // report instead of being re-derived and re-run here. Before
+            // this, `finding verify` invoked every qualifying neighbour
+            // gate — any gate with a `last_pass_commit`, whether or not it
+            // was stale, whether or not anything ended up printed for it —
+            // a second time purely to recover its staleness. That is not
+            // scoped to stale neighbours: a Fresh neighbour was run twice
+            // too, it simply never produced an extra line, so the doubled
+            // cost was invisible in the output. None of this feeds back
+            // into `closed` or the exit code: those stay exactly what
+            // `verify_finding` decided.
+            for r in &report.neighbours {
+                if r.verdict.is_pass() && r.staleness != Staleness::Fresh {
+                    println!("NEIGHBOUR\t{}\tpasses{}", r.name, stale_note(r.staleness));
                 }
             }
 
@@ -187,4 +169,31 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `stale_note` is a three-arm match with no prior test, and nothing
+    // else in the suite exercises its `StaleWarn` arm (only `Fresh`, via
+    // silence, and `StaleFail`, via the `(stale)` suffix on a REGRESSION
+    // line elsewhere).
+    #[test]
+    fn stale_note_is_empty_for_fresh() {
+        assert_eq!(stale_note(Staleness::Fresh), "");
+    }
+
+    #[test]
+    fn stale_note_names_the_moved_code_for_stale_warn() {
+        assert_eq!(
+            stale_note(Staleness::StaleWarn),
+            "  (stale: not re-validated since the code beneath it moved)"
+        );
+    }
+
+    #[test]
+    fn stale_note_is_the_short_form_for_stale_fail() {
+        assert_eq!(stale_note(Staleness::StaleFail), "  (stale)");
+    }
 }
