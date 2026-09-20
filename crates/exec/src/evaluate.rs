@@ -96,22 +96,26 @@ fn staleness_for(
         // this falls back to intersecting the changed set with the already-
         // resolved population instead.
         //
-        // That fallback is not blind to every deletion the way `Glob`'s
-        // live-tree walk is. For `Selector::Changed` specifically, the
-        // population is itself a `git diff --name-only` result (between the
-        // selector's own `base` and `head`), which — per this function's own
-        // measured premise above — does list deleted paths. So a deletion is
-        // visible here whenever it falls inside a window the intersection
-        // can see. What it can still miss: churn that nets to no visible
-        // diff over the selector's own window, e.g. a file deleted and
-        // recreated (or the reverse) entirely within `[selector.base,
-        // authored_at_commit]`, which leaves no residue in `diff(base,
-        // head)` even though the gate's own `[authored_at_commit, head]`
-        // window did change. For `Selector::Command`, the population is
-        // whatever the command chooses to print, so nothing general can be
-        // promised about it either way. Recorded rather than hidden: if this
-        // matters later, these selector kinds need a targeted mechanism, not
-        // a cleverer intersection.
+        // Measured 2026-09-20 in scratch repositories, not reasoned about —
+        // this comment has been wrong twice already on reasoning alone. For
+        // `Selector::Changed`, the population is `diff(selector.base,
+        // head)`. A plain, never-restored deletion shows up there the same
+        // as it does in `changed`, so it is not missed. The one confirmed
+        // miss: a file whose content is identical at `base` and `head` but
+        // differed at `authored_at_commit` in between — e.g. changed, then
+        // reverted after the gate's stamp. `diff(authored_at_commit, head)`
+        // lists that file; `diff(base, head)` does not, so the intersection
+        // never sees it (verified with raw `git diff --name-only` on both
+        // pairs). A delete followed by an identical recreate, entirely
+        // between `base` and `authored_at_commit`, is NOT an instance of
+        // this: both diffs agreed the file was unchanged when this was
+        // tested directly, so there was nothing there to miss. Beyond the
+        // revert-after-stamp case, this fallback's boundary is not
+        // characterised. For `Selector::Command`, the population is
+        // whatever the command prints, so nothing can be promised about it
+        // either way. Recorded rather than hidden: if this matters later,
+        // these selector kinds need a targeted mechanism, not a cleverer
+        // intersection.
         _ => {
             let Ok(population) = population.as_ref() else {
                 return true;
