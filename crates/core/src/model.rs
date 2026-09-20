@@ -126,6 +126,14 @@ mod tests {
 
     #[test]
     fn a_state_round_trips_through_its_wire_name() {
+        assert_eq!(State::from_wire("todo"), Some(State::Todo));
+        assert_eq!(State::Todo.as_wire(), "todo");
+        assert_eq!(State::from_wire("doing"), Some(State::Doing));
+        assert_eq!(State::Doing.as_wire(), "doing");
+        assert_eq!(State::from_wire("review"), Some(State::Review));
+        assert_eq!(State::Review.as_wire(), "review");
+        assert_eq!(State::from_wire("done"), Some(State::Done));
+        assert_eq!(State::Done.as_wire(), "done");
         assert_eq!(State::from_wire("needs_human"), Some(State::NeedsHuman));
         assert_eq!(State::NeedsHuman.as_wire(), "needs_human");
         assert_eq!(State::from_wire("nonsense"), None);
