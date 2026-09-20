@@ -52,8 +52,13 @@ impl AttemptOutcome {
 ///
 /// Anything that happens during or after the attempt starts — including crashes
 /// and timeouts — must be reported as `Ok(AttemptOutcome)` with a status and cost.
-/// This narrow type prevents the `Result` channel from becoming a vehicle for
-/// unpriced failures.
+///
+/// ⚠ This type blocks **accidental** propagation of runtime failures via the `?`
+/// operator on `ExecError` and `io::Error`. It does **not** prevent deliberate
+/// misuse: an adapter author can still report a runtime failure by formatting it
+/// into the `UnknownAdapter` string. The type enforces that you *must write it
+/// down deliberately*, not that you cannot do it. The real guard is the test suite
+/// and code review.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AttemptError {
     #[error("adapter `{0}` is not known")]
@@ -64,9 +69,12 @@ pub trait Runner {
     fn id(&self) -> &str;
     /// Attempt a piece of work.
     ///
-    /// `Err` means the attempt never started. Anything that happens after the
-    /// attempt starts — including crashes and timeouts — is reported as
-    /// `Ok(AttemptOutcome)` with a status and cost.
+    /// `Err` means the attempt never started (e.g., adapter not found). Anything
+    /// that happens after the attempt starts — including crashes and timeouts —
+    /// is reported as `Ok(AttemptOutcome)` with a status and cost.
+    ///
+    /// The `AttemptError` type blocks accidental `?`-propagation of `ExecError`
+    /// and `io::Error` into this channel. It does not prevent deliberate misuse.
     ///
     /// ⚠ This trait is not `dyn`-compatible due to the `impl Trait` return type;
     /// use `impl Runner` or generic `R: Runner` instead of `Box<dyn Runner>`.
@@ -125,25 +133,16 @@ mod tests {
     }
 
     #[test]
-    fn attempt_error_only_has_preflight_variants() {
-        // This test pins the boundary: AttemptError should never gain
-        // Timeout, Spawn, or other runtime-failure variants. Only pre-flight
-        // errors like UnknownAdapter belong here.
+    fn attempt_error_variant_exhaustiveness_is_enforced() {
+        // Non-wildcard match means adding a variant to AttemptError will fail
+        // to compile with E0004 (non-exhaustive patterns). This catches silent
+        // regressions where a runtime-failure variant (Timeout, Spawn, etc.)
+        // gets added to the enum.
         let err = AttemptError::UnknownAdapter("foo".into());
         match err {
             AttemptError::UnknownAdapter(id) => {
                 assert_eq!(id, "foo");
             }
         }
-    }
-
-    #[test]
-    fn unknown_adapter_is_the_only_variant() {
-        // Compile-time check: if someone adds Timeout or Spawn to AttemptError,
-        // this test would still compile but would be false documentation.
-        // The real guard is that ExecError::Timeout and ExecError::Spawn
-        // cannot impl From<AttemptError> or vice versa.
-        let err = AttemptError::UnknownAdapter("test".into());
-        assert!(matches!(err, AttemptError::UnknownAdapter(_)));
     }
 }
