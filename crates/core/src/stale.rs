@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn staleness_never_rescues_a_real_failure() {
         let failing = Verdict::from_predicate(false, 3);
-        let (v, _) = apply_staleness(failing.clone(), false, Regret::High);
+        let (v, _) = apply_staleness(failing.clone(), true, Regret::High);
         assert_eq!(v, failing);
     }
 
