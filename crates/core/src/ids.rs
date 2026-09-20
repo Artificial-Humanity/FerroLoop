@@ -22,3 +22,4 @@ macro_rules! id_type {
 id_type!(ProjectId);
 id_type!(RecordId);
 id_type!(GateId);
+id_type!(FindingId);
