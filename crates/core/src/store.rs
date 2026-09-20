@@ -1,9 +1,7 @@
 use crate::finding::{Finding, FindingState};
 use crate::ids::{FindingId, GateId, ProjectId, RecordId};
 use crate::log::{Attempt, GateRun};
-use crate::model::{
-    GateDef, GateKind, Project, Record, Selector, State, Transition,
-};
+use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
 use std::collections::BTreeMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -99,7 +97,13 @@ impl MemStore {
 impl Store for MemStore {
     fn add_project(&mut self, root: &str) -> Result<ProjectId, StoreError> {
         let id = ProjectId(self.next());
-        self.projects.insert(id.0, Project { id, root: root.to_string() });
+        self.projects.insert(
+            id.0,
+            Project {
+                id,
+                root: root.to_string(),
+            },
+        );
         Ok(id)
     }
 
@@ -144,7 +148,12 @@ impl Store for MemStore {
     }
 
     fn list_gates(&self, project: ProjectId) -> Result<Vec<GateDef>, StoreError> {
-        Ok(self.gates.values().filter(|g| g.project == project).cloned().collect())
+        Ok(self
+            .gates
+            .values()
+            .filter(|g| g.project == project)
+            .cloned()
+            .collect())
     }
 
     fn update_gate(&mut self, def: &GateDef) -> Result<(), StoreError> {
@@ -165,14 +174,22 @@ impl Store for MemStore {
         project: ProjectId,
         name: &str,
     ) -> Result<Option<Transition>, StoreError> {
-        Ok(self.transitions.get(&(project.0, name.to_string())).cloned())
+        Ok(self
+            .transitions
+            .get(&(project.0, name.to_string()))
+            .cloned())
     }
 
     fn add_record(&mut self, project: ProjectId, title: &str) -> Result<RecordId, StoreError> {
         let id = RecordId(self.next());
         self.records.insert(
             id.0,
-            Record { id, project, title: title.to_string(), state: State::Todo },
+            Record {
+                id,
+                project,
+                title: title.to_string(),
+                state: State::Todo,
+            },
         );
         Ok(id)
     }
@@ -182,11 +199,19 @@ impl Store for MemStore {
     }
 
     fn list_records(&self, project: ProjectId) -> Result<Vec<Record>, StoreError> {
-        Ok(self.records.values().filter(|r| r.project == project).cloned().collect())
+        Ok(self
+            .records
+            .values()
+            .filter(|r| r.project == project)
+            .cloned()
+            .collect())
     }
 
     fn set_record_state(&mut self, id: RecordId, state: State) -> Result<(), StoreError> {
-        let rec = self.records.get_mut(&id.0).ok_or(StoreError::NoSuchRecord(id))?;
+        let rec = self
+            .records
+            .get_mut(&id.0)
+            .ok_or(StoreError::NoSuchRecord(id))?;
         rec.state = state;
         Ok(())
     }
@@ -202,11 +227,21 @@ impl Store for MemStore {
     }
 
     fn gate_runs(&self, gate: GateId) -> Result<Vec<GateRun>, StoreError> {
-        Ok(self.runs.iter().filter(|r| r.gate == gate).cloned().collect())
+        Ok(self
+            .runs
+            .iter()
+            .filter(|r| r.gate == gate)
+            .cloned()
+            .collect())
     }
 
     fn attempts(&self, project: ProjectId) -> Result<Vec<Attempt>, StoreError> {
-        Ok(self.attempts.iter().filter(|a| a.project == project).cloned().collect())
+        Ok(self
+            .attempts
+            .iter()
+            .filter(|a| a.project == project)
+            .cloned()
+            .collect())
     }
 
     fn add_finding(&mut self, finding: Finding) -> Result<FindingId, StoreError> {
@@ -230,7 +265,12 @@ impl Store for MemStore {
     }
 
     fn list_findings(&self, project: ProjectId) -> Result<Vec<Finding>, StoreError> {
-        Ok(self.findings.values().filter(|f| f.project == project).cloned().collect())
+        Ok(self
+            .findings
+            .values()
+            .filter(|f| f.project == project)
+            .cloned()
+            .collect())
     }
 
     fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError> {
@@ -302,7 +342,15 @@ mod tests {
         let mut s = MemStore::default();
         let p = project(&mut s);
         let g = s
-            .add_gate(p, "fmt", sample_kind(), sample_selector(), 1, "abc", "owner")
+            .add_gate(
+                p,
+                "fmt",
+                sample_kind(),
+                sample_selector(),
+                1,
+                "abc",
+                "owner",
+            )
             .unwrap();
         s.append_gate_run(sample_run(g, "abc", 3)).unwrap();
         s.append_gate_run(sample_run(g, "def", 5)).unwrap();
@@ -317,7 +365,15 @@ mod tests {
         let mut s = MemStore::default();
         let p = project(&mut s);
         let g = s
-            .add_gate(p, "fmt", sample_kind(), sample_selector(), 1, "abc", "owner")
+            .add_gate(
+                p,
+                "fmt",
+                sample_kind(),
+                sample_selector(),
+                1,
+                "abc",
+                "owner",
+            )
             .unwrap();
         let mut def = s.get_gate(g).unwrap().unwrap();
         def.authored_at_commit = "def".into();
@@ -332,7 +388,9 @@ mod tests {
         let mut s = MemStore::default();
         let p = s.add_project("/p").unwrap();
         let r = s.add_record(p, "t").unwrap();
-        let id = s.add_finding(Finding::raise(p, r, "reviewer", "wrong on empty")).unwrap();
+        let id = s
+            .add_finding(Finding::raise(p, r, "reviewer", "wrong on empty"))
+            .unwrap();
         assert_ne!(id.get(), 0, "the store must replace the placeholder id");
         let back = s.get_finding(id).unwrap().unwrap();
         assert_eq!(back.id, id);
@@ -384,7 +442,9 @@ mod tests {
     }
 
     fn sample_selector() -> Selector {
-        Selector::Glob { pattern: "**/*.rs".into() }
+        Selector::Glob {
+            pattern: "**/*.rs".into(),
+        }
     }
 
     fn sample_run(gate: GateId, commit: &str, population: u64) -> GateRun {

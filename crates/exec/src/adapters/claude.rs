@@ -104,7 +104,9 @@ impl Runner for ClaudeAdapter {
         let child = loop {
             match cmd.spawn() {
                 Ok(c) => break c,
-                Err(e) if e.kind() == ErrorKind::ExecutableFileBusy && retries < SPAWN_RETRY_LIMIT => {
+                Err(e)
+                    if e.kind() == ErrorKind::ExecutableFileBusy && retries < SPAWN_RETRY_LIMIT =>
+                {
                     // See `SPAWN_RETRY_LIMIT`'s doc comment: this is a
                     // known-transient race, not a real refusal.
                     retries += 1;
@@ -205,7 +207,10 @@ mod tests {
         let a = ClaudeAdapter::new("definitely-not-a-real-program-9f3x".into());
         let out = a.attempt(spec(d.path(), 5)).await.unwrap();
         assert_eq!(out.status, AttemptStatus::Refused);
-        assert!(out.output_excerpt.contains("definitely-not-a-real-program-9f3x"));
+        assert!(
+            out.output_excerpt
+                .contains("definitely-not-a-real-program-9f3x")
+        );
     }
 
     // ⚠ The brief's own version of this test spawns the literal `sleep`

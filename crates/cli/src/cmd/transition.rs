@@ -34,7 +34,14 @@ pub enum Cmd {
 
 pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
     match cmd {
-        Cmd::Add { project, name, from, to, regret, gate } => {
+        Cmd::Add {
+            project,
+            name,
+            from,
+            to,
+            regret,
+            gate,
+        } => {
             let p = ProjectId(project);
             if store.get_project(p)?.is_none() {
                 bail!(

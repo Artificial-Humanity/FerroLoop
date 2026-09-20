@@ -56,7 +56,9 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
     };
 
     let rt = tokio::runtime::Runtime::new()?;
-    let outcome = rt.block_on(adapter.attempt(spec)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let outcome = rt
+        .block_on(adapter.attempt(spec))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // ⚠ Recorded whatever the outcome. A crash, a timeout and a refusal all
     // cost something, even when that something is only the wall clock.

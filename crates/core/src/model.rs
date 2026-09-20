@@ -149,7 +149,9 @@ mod tests {
                 timeout_secs: 60,
                 pass_codes: vec![0],
             }),
-            selector: Selector::Glob { pattern: "src/**/*.rs".into() },
+            selector: Selector::Glob {
+                pattern: "src/**/*.rs".into(),
+            },
             min_population: 1,
             authored_at_commit: "abc1234".into(),
             authored_by: "owner".into(),

@@ -16,7 +16,13 @@ use std::process::Command as Sys;
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
-        Sys::new("git").args(args).current_dir(dir).output().unwrap().status.success(),
+        Sys::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success(),
         "git {args:?} failed"
     );
 }
@@ -50,27 +56,56 @@ fn a_defect_present_before_the_run_stops_the_launch() {
     // `--arg -c` fails with "unexpected argument '-c' found"). The
     // `--arg=VALUE` form sidesteps clap's flag-vs-value sniffing and is
     // what actually reaches the process as an argv value.
-    cli().args(["project", "add", &repo.path().display().to_string()]).assert().success();
+    cli()
+        .args(["project", "add", &repo.path().display().to_string()])
+        .assert()
+        .success();
     cli()
         .args([
-            "gate", "add", "--project", "1", "--name", "config-parses",
-            "--kind", "command", "--glob", "config/*.json",
-            "--program", "python3", "--arg=-c",
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "config-parses",
+            "--kind",
+            "command",
+            "--glob",
+            "config/*.json",
+            "--program",
+            "python3",
+            "--arg=-c",
             "--arg=import json,sys;[json.load(open(p)) for p in sys.argv[1:]]",
-            "--authored-by", "acceptance",
+            "--authored-by",
+            "acceptance",
         ])
         .assert()
         .success();
     cli()
         .args([
-            "transition", "add", "--project", "1", "--name", "launch",
-            "--from", "review", "--to", "done", "--regret", "high", "--gate", "2",
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "high",
+            "--gate",
+            "2",
         ])
         .assert()
         .success();
 
     // The launch is allowed while the config is sound.
-    cli().args(["check", "launch", "--project", "1"]).assert().success();
+    cli()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .success();
 
     // Now the defect lands, exactly as it did in the story that started this:
     // present before the run, invisible until the run wasted hours.
@@ -92,7 +127,11 @@ fn a_defect_present_before_the_run_stops_the_launch() {
         .args(["check", "launch", "--project", "1"])
         .assert()
         .code(1)
-        .stdout(contains("FAIL").and(contains("config-parses")).and(contains("Predicate")));
+        .stdout(
+            contains("FAIL")
+                .and(contains("config-parses"))
+                .and(contains("Predicate")),
+        );
 }
 
 #[test]
@@ -114,19 +153,45 @@ fn deleting_the_only_config_does_not_turn_the_gate_green() {
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "valid config"]);
 
-    cli().args(["project", "add", &repo.path().display().to_string()]).assert().success();
+    cli()
+        .args(["project", "add", &repo.path().display().to_string()])
+        .assert()
+        .success();
     cli()
         .args([
-            "gate", "add", "--project", "1", "--name", "config-parses",
-            "--kind", "command", "--glob", "config/*.json",
-            "--program", "true", "--authored-by", "acceptance",
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "config-parses",
+            "--kind",
+            "command",
+            "--glob",
+            "config/*.json",
+            "--program",
+            "true",
+            "--authored-by",
+            "acceptance",
         ])
         .assert()
         .success();
     cli()
         .args([
-            "transition", "add", "--project", "1", "--name", "launch",
-            "--from", "review", "--to", "done", "--regret", "high", "--gate", "2",
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "high",
+            "--gate",
+            "2",
         ])
         .assert()
         .success();

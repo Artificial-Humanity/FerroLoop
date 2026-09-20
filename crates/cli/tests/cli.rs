@@ -15,17 +15,39 @@ fn cli(dir: &tempfile::TempDir) -> Command {
 #[test]
 fn a_project_can_be_added_and_listed() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d).args(["project", "add", "/tmp/x"]).assert().success();
-    cli(&d).args(["project", "list"]).assert().success().stdout(contains("/tmp/x"));
+    cli(&d)
+        .args(["project", "add", "/tmp/x"])
+        .assert()
+        .success();
+    cli(&d)
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(contains("/tmp/x"));
 }
 
 #[test]
 fn an_unknown_gate_kind_is_refused_with_an_actionable_message() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d).args(["project", "add", "/tmp/x"]).assert().success();
     cli(&d)
-        .args(["gate", "add", "--project", "1", "--name", "g", "--kind", "telepathy",
-               "--glob", "**/*.rs", "--program", "true"])
+        .args(["project", "add", "/tmp/x"])
+        .assert()
+        .success();
+    cli(&d)
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--kind",
+            "telepathy",
+            "--glob",
+            "**/*.rs",
+            "--program",
+            "true",
+        ])
         .assert()
         .failure()
         .stderr(contains("telepathy").and(contains("command")));
@@ -35,8 +57,20 @@ fn an_unknown_gate_kind_is_refused_with_an_actionable_message() {
 fn a_missing_project_is_refused_and_names_the_id() {
     let d = tempfile::tempdir().unwrap();
     cli(&d)
-        .args(["gate", "add", "--project", "99", "--name", "g", "--kind", "command",
-               "--glob", "**/*.rs", "--program", "true"])
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "99",
+            "--name",
+            "g",
+            "--kind",
+            "command",
+            "--glob",
+            "**/*.rs",
+            "--program",
+            "true",
+        ])
         .assert()
         .failure()
         .stderr(contains("99"));
@@ -45,17 +79,36 @@ fn a_missing_project_is_refused_and_names_the_id() {
 #[test]
 fn a_record_moves_between_states() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d).args(["project", "add", "/tmp/x"]).assert().success();
-    cli(&d).args(["record", "add", "--project", "1", "--title", "t"]).assert().success();
-    cli(&d).args(["record", "move", "2", "--to", "doing"]).assert().success();
-    cli(&d).args(["record", "list", "--project", "1"]).assert().success().stdout(contains("doing"));
+    cli(&d)
+        .args(["project", "add", "/tmp/x"])
+        .assert()
+        .success();
+    cli(&d)
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .success();
+    cli(&d)
+        .args(["record", "move", "2", "--to", "doing"])
+        .assert()
+        .success();
+    cli(&d)
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("doing"));
 }
 
 #[test]
 fn an_unknown_state_name_is_refused_and_lists_the_valid_ones() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d).args(["project", "add", "/tmp/x"]).assert().success();
-    cli(&d).args(["record", "add", "--project", "1", "--title", "t"]).assert().success();
+    cli(&d)
+        .args(["project", "add", "/tmp/x"])
+        .assert()
+        .success();
+    cli(&d)
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .success();
     cli(&d)
         .args(["record", "move", "2", "--to", "sideways"])
         .assert()
@@ -76,20 +129,29 @@ fn an_unknown_state_name_is_refused_and_lists_the_valid_ones() {
 fn a_missing_parent_directory_for_the_db_flag_is_created() {
     let d = tempfile::tempdir().unwrap();
     let nested = d.path().join("nested").join("deep").join("t.redb");
-    assert!(!nested.parent().unwrap().exists(), "fixture must start absent");
+    assert!(
+        !nested.parent().unwrap().exists(),
+        "fixture must start absent"
+    );
 
     let mut c = Command::cargo_bin("flctl").unwrap();
     c.arg("--db").arg(&nested);
     c.args(["project", "add", "/tmp/x"]).assert().success();
 
-    assert!(nested.exists(), "store file should have been created at {nested:?}");
+    assert!(
+        nested.exists(),
+        "store file should have been created at {nested:?}"
+    );
 }
 
 #[test]
 fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag() {
     let d = tempfile::tempdir().unwrap();
     let nested = d.path().join("nested").join("deep").join("t.redb");
-    assert!(!nested.parent().unwrap().exists(), "fixture must start absent");
+    assert!(
+        !nested.parent().unwrap().exists(),
+        "fixture must start absent"
+    );
 
     // `env_clear` scopes the controlled environment to this child process
     // only; it never touches this test process's own environment, so it
@@ -99,7 +161,10 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
     c.env("FL_DB", &nested);
     c.args(["project", "add", "/tmp/x"]).assert().success();
 
-    assert!(nested.exists(), "store file should have been created at {nested:?}");
+    assert!(
+        nested.exists(),
+        "store file should have been created at {nested:?}"
+    );
 }
 
 // Fix round 1 — Important 2: `transition` had no coverage at all, including
@@ -121,11 +186,24 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
 #[test]
 fn a_transition_can_be_added_and_shown() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d).args(["project", "add", "/tmp/x"]).assert().success();
+    cli(&d)
+        .args(["project", "add", "/tmp/x"])
+        .assert()
+        .success();
     cli(&d)
         .args([
-            "transition", "add", "--project", "1", "--name", "launch",
-            "--from", "review", "--to", "done", "--regret", "low",
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "low",
         ])
         .assert()
         .success()
@@ -141,9 +219,18 @@ fn a_transition_can_be_added_and_shown() {
     let json: serde_json::Value =
         serde_json::from_slice(&output).expect("`transition show` must print valid JSON");
 
-    let from = json["from"].as_str().expect("`from` must be a string").to_lowercase();
-    let to = json["to"].as_str().expect("`to` must be a string").to_lowercase();
-    let regret = json["regret"].as_str().expect("`regret` must be a string").to_lowercase();
+    let from = json["from"]
+        .as_str()
+        .expect("`from` must be a string")
+        .to_lowercase();
+    let to = json["to"]
+        .as_str()
+        .expect("`to` must be a string")
+        .to_lowercase();
+    let regret = json["regret"]
+        .as_str()
+        .expect("`regret` must be a string")
+        .to_lowercase();
     assert_eq!(from, "review", "got {json}");
     assert_eq!(to, "done", "got {json}");
     assert_eq!(regret, "low", "got {json}");
@@ -152,12 +239,26 @@ fn a_transition_can_be_added_and_shown() {
 #[test]
 fn a_transition_naming_a_nonexistent_gate_is_refused_and_names_the_id() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d).args(["project", "add", "/tmp/x"]).assert().success();
+    cli(&d)
+        .args(["project", "add", "/tmp/x"])
+        .assert()
+        .success();
     cli(&d)
         .args([
-            "transition", "add", "--project", "1", "--name", "launch",
-            "--from", "review", "--to", "done", "--regret", "low",
-            "--gate", "42",
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "low",
+            "--gate",
+            "42",
         ])
         .assert()
         .failure()

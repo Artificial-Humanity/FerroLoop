@@ -1,4 +1,4 @@
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Why a gate did not pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,9 +90,7 @@ impl<'de> Deserialize<'de> for Verdict {
                 })?;
                 Ok(Verdict::Pass { population })
             }
-            VerdictRaw::Fail { population, reason } => {
-                Ok(Verdict::Fail { population, reason })
-            }
+            VerdictRaw::Fail { population, reason } => Ok(Verdict::Fail { population, reason }),
             VerdictRaw::Error { detail } => Ok(Verdict::Error { detail }),
         }
     }
@@ -106,18 +104,28 @@ impl Verdict {
     /// produce the same answer.
     pub fn from_predicate(passed: bool, population: u64) -> Self {
         let Some(nonzero) = Population::new(population) else {
-            return Verdict::Fail { population: 0, reason: FailReason::EmptyPopulation };
+            return Verdict::Fail {
+                population: 0,
+                reason: FailReason::EmptyPopulation,
+            };
         };
         if passed {
-            Verdict::Pass { population: nonzero }
+            Verdict::Pass {
+                population: nonzero,
+            }
         } else {
-            Verdict::Fail { population, reason: FailReason::Predicate }
+            Verdict::Fail {
+                population,
+                reason: FailReason::Predicate,
+            }
         }
     }
 
     /// The gate itself broke. A broken instrument is not a clean bill of health.
     pub fn error(detail: impl Into<String>) -> Self {
-        Verdict::Error { detail: detail.into() }
+        Verdict::Error {
+            detail: detail.into(),
+        }
     }
 
     /// Force a failure for a reason the predicate cannot express, such as staleness.
@@ -154,7 +162,13 @@ mod tests {
     #[test]
     fn a_true_predicate_over_an_empty_population_does_not_pass() {
         let v = Verdict::from_predicate(true, 0);
-        assert_eq!(v, Verdict::Fail { population: 0, reason: FailReason::EmptyPopulation });
+        assert_eq!(
+            v,
+            Verdict::Fail {
+                population: 0,
+                reason: FailReason::EmptyPopulation
+            }
+        );
         assert!(!v.is_pass());
     }
 
@@ -162,7 +176,9 @@ mod tests {
     fn a_true_predicate_over_a_real_population_passes() {
         assert_eq!(
             Verdict::from_predicate(true, 4),
-            Verdict::Pass { population: Population::new(4).unwrap() }
+            Verdict::Pass {
+                population: Population::new(4).unwrap()
+            }
         );
     }
 
@@ -170,7 +186,10 @@ mod tests {
     fn a_false_predicate_fails_on_the_predicate_not_the_population() {
         assert_eq!(
             Verdict::from_predicate(false, 4),
-            Verdict::Fail { population: 4, reason: FailReason::Predicate }
+            Verdict::Fail {
+                population: 4,
+                reason: FailReason::Predicate
+            }
         );
     }
 
@@ -178,7 +197,10 @@ mod tests {
     fn a_false_predicate_over_an_empty_population_still_blames_the_population() {
         assert_eq!(
             Verdict::from_predicate(false, 0),
-            Verdict::Fail { population: 0, reason: FailReason::EmptyPopulation }
+            Verdict::Fail {
+                population: 0,
+                reason: FailReason::EmptyPopulation
+            }
         );
     }
 
@@ -199,8 +221,7 @@ mod tests {
 
     #[test]
     fn deserialization_rejects_pass_over_empty_population() {
-        let result =
-            serde_json::from_str::<Verdict>(r#"{"Pass":{"population":0}}"#);
+        let result = serde_json::from_str::<Verdict>(r#"{"Pass":{"population":0}}"#);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("cannot deserialize Pass"));
@@ -209,9 +230,13 @@ mod tests {
     #[test]
     fn deserialization_accepts_pass_over_real_population() {
         let v =
-            serde_json::from_str::<Verdict>(r#"{"Pass":{"population":4}}"#)
-                .expect("valid pass");
-        assert_eq!(v, Verdict::Pass { population: Population::new(4).unwrap() });
+            serde_json::from_str::<Verdict>(r#"{"Pass":{"population":4}}"#).expect("valid pass");
+        assert_eq!(
+            v,
+            Verdict::Pass {
+                population: Population::new(4).unwrap()
+            }
+        );
         assert!(v.is_pass());
     }
 
@@ -223,18 +248,24 @@ mod tests {
         .expect("valid fail");
         assert_eq!(
             v,
-            Verdict::Fail { population: 0, reason: FailReason::EmptyPopulation }
+            Verdict::Fail {
+                population: 0,
+                reason: FailReason::EmptyPopulation
+            }
         );
         assert!(!v.is_pass());
     }
 
     #[test]
     fn deserialization_accepts_error() {
-        let v = serde_json::from_str::<Verdict>(
-            r#"{"Error":{"detail":"test error"}}"#,
-        )
-        .expect("valid error");
-        assert_eq!(v, Verdict::Error { detail: "test error".to_string() });
+        let v = serde_json::from_str::<Verdict>(r#"{"Error":{"detail":"test error"}}"#)
+            .expect("valid error");
+        assert_eq!(
+            v,
+            Verdict::Error {
+                detail: "test error".to_string()
+            }
+        );
         assert!(!v.is_pass());
     }
 
@@ -242,8 +273,7 @@ mod tests {
     fn roundtrip_pass_through_json() {
         let original = Verdict::from_predicate(true, 5);
         let serialized = serde_json::to_string(&original).expect("serialize");
-        let deserialized =
-            serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
+        let deserialized = serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
         assert_eq!(original, deserialized);
     }
 
@@ -251,8 +281,7 @@ mod tests {
     fn roundtrip_fail_through_json() {
         let original = Verdict::fail_for(FailReason::Predicate, 3);
         let serialized = serde_json::to_string(&original).expect("serialize");
-        let deserialized =
-            serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
+        let deserialized = serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
         assert_eq!(original, deserialized);
     }
 
@@ -260,8 +289,7 @@ mod tests {
     fn roundtrip_error_through_json() {
         let original = Verdict::error("test failure");
         let serialized = serde_json::to_string(&original).expect("serialize");
-        let deserialized =
-            serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
+        let deserialized = serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
         assert_eq!(original, deserialized);
     }
 
@@ -281,8 +309,7 @@ mod tests {
         let original = Verdict::from_predicate(true, 3);
         let serialized = serde_json::to_string(&original).expect("serialize");
         assert_eq!(serialized, r#"{"Pass":{"population":3}}"#);
-        let deserialized =
-            serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
+        let deserialized = serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
         assert_eq!(original, deserialized);
     }
 }

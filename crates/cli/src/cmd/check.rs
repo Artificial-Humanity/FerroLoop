@@ -30,7 +30,9 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             Verdict::Pass { population, .. } => {
                 ("PASS".to_string(), format!("{} examined", population.get()))
             }
-            Verdict::Fail { population, reason, .. } => (
+            Verdict::Fail {
+                population, reason, ..
+            } => (
                 "FAIL".to_string(),
                 format!("{reason:?}, {population} examined"),
             ),

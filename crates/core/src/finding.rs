@@ -76,12 +76,7 @@ pub struct Finding {
 
 impl Finding {
     /// The id is a placeholder until the store assigns one.
-    pub fn raise(
-        project: ProjectId,
-        record: RecordId,
-        raised_by: &str,
-        claim: &str,
-    ) -> Self {
+    pub fn raise(project: ProjectId, record: RecordId, raised_by: &str, claim: &str) -> Self {
         Self {
             id: FindingId(0),
             project,
@@ -142,7 +137,12 @@ mod tests {
     use super::*;
 
     fn raised() -> Finding {
-        Finding::raise(ProjectId(1), RecordId(2), "reviewer", "off-by-one on an empty slice")
+        Finding::raise(
+            ProjectId(1),
+            RecordId(2),
+            "reviewer",
+            "off-by-one on an empty slice",
+        )
     }
 
     #[test]
@@ -158,7 +158,11 @@ mod tests {
         let mut f = raised();
         let err = f.assign("fixer").unwrap_err();
         assert!(matches!(err, FindingError::NoReproduction));
-        assert_eq!(f.state, FindingState::Raised, "the failed assign must not move it");
+        assert_eq!(
+            f.state,
+            FindingState::Raised,
+            "the failed assign must not move it"
+        );
     }
 
     #[test]
@@ -197,7 +201,10 @@ mod tests {
         f.withdraw("cannot be made concrete").unwrap();
         assert_eq!(f.state, FindingState::Withdrawn);
         assert_eq!(f.raised_by, "reviewer");
-        assert_eq!(f.withdrawn_reason.as_deref(), Some("cannot be made concrete"));
+        assert_eq!(
+            f.withdrawn_reason.as_deref(),
+            Some("cannot be made concrete")
+        );
     }
 
     #[test]

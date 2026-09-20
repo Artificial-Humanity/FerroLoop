@@ -1,12 +1,20 @@
 use assert_cmd::Command;
-use predicates::str::contains;
 use predicates::prelude::PredicateBooleanExt;
+use predicates::str::contains;
 use std::fs;
 use std::path::Path;
 use std::process::Command as Sys;
 
 fn git(dir: &Path, args: &[&str]) {
-    assert!(Sys::new("git").args(args).current_dir(dir).output().unwrap().status.success());
+    assert!(
+        Sys::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
 }
 
 struct F {
@@ -26,7 +34,11 @@ fn fixture() -> F {
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "first"]);
     let db = home.path().join("t.redb").display().to_string();
-    F { _home: home, repo, db }
+    F {
+        _home: home,
+        repo,
+        db,
+    }
 }
 
 impl F {
@@ -37,18 +49,32 @@ impl F {
     }
     fn gate(&self, name: &str, program: &str) {
         self.cli()
-            .args(["gate", "add", "--project", "1", "--name", name, "--kind", "command",
-                   "--glob", "src/**/*.rs", "--program", program])
+            .args([
+                "gate",
+                "add",
+                "--project",
+                "1",
+                "--name",
+                name,
+                "--kind",
+                "command",
+                "--glob",
+                "src/**/*.rs",
+                "--program",
+                program,
+            ])
             .assert()
             .success();
     }
     fn setup(&self) {
         self.cli()
             .args(["project", "add", &self.repo.path().display().to_string()])
-            .assert().success();
+            .assert()
+            .success();
         self.cli()
             .args(["record", "add", "--project", "1", "--title", "work"])
-            .assert().success();
+            .assert()
+            .success();
     }
 }
 
@@ -57,16 +83,23 @@ impl F {
 fn a_passing_gate_is_refused_as_a_reproduction() {
     let f = fixture();
     f.setup();
-    f.gate("green", "true");           // id 3
-    f.cli().args(["finding", "raise", "--record", "2", "--claim", "c", "--by", "rev"])
-        .assert().success();            // id 4
+    f.gate("green", "true"); // id 3
+    f.cli()
+        .args([
+            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success(); // id 4
     f.cli()
         .args(["finding", "reproduce", "4", "--gate", "3"])
         .assert()
         .failure()
         .stderr(contains("PASSES").and(contains("not a reproduction")));
-    f.cli().args(["finding", "list", "--project", "1"])
-        .assert().success().stdout(contains("raised"));
+    f.cli()
+        .args(["finding", "list", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("raised"));
 }
 
 // REQUIRED TEST 6 (spec §10), at the CLI.
@@ -74,8 +107,12 @@ fn a_passing_gate_is_refused_as_a_reproduction() {
 fn a_raised_finding_cannot_be_assigned() {
     let f = fixture();
     f.setup();
-    f.cli().args(["finding", "raise", "--record", "2", "--claim", "c", "--by", "rev"])
-        .assert().success();            // id 3
+    f.cli()
+        .args([
+            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success(); // id 3
     f.cli()
         .args(["finding", "assign", "3", "--to", "fixer"])
         .assert()
@@ -88,19 +125,35 @@ fn a_raised_finding_cannot_be_assigned() {
 fn a_repair_that_breaks_a_neighbour_does_not_close_the_finding() {
     let f = fixture();
     f.setup();
-    f.gate("neighbour", "true");        // id 3
-    f.gate("repro", "false");           // id 4
+    f.gate("neighbour", "true"); // id 3
+    f.gate("repro", "false"); // id 4
     // Give the neighbour a last_pass_commit.
     f.cli().args(["gate", "run", "3"]).assert().success();
 
-    f.cli().args(["finding", "raise", "--record", "2", "--claim", "c", "--by", "rev"])
-        .assert().success();            // id 5
-    f.cli().args(["finding", "reproduce", "5", "--gate", "4"]).assert().success();
-    f.cli().args(["finding", "assign", "5", "--to", "fixer"]).assert().success();
+    f.cli()
+        .args([
+            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success(); // id 5
+    f.cli()
+        .args(["finding", "reproduce", "5", "--gate", "4"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "assign", "5", "--to", "fixer"])
+        .assert()
+        .success();
 
     // The bad repair: the reproduction goes green, the neighbour goes red.
-    f.cli().args(["gate", "set-program", "4", "--program", "true"]).assert().success();
-    f.cli().args(["gate", "set-program", "3", "--program", "false"]).assert().success();
+    f.cli()
+        .args(["gate", "set-program", "4", "--program", "true"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["gate", "set-program", "3", "--program", "false"])
+        .assert()
+        .success();
 
     f.cli()
         .args(["finding", "verify", "5"])
@@ -113,15 +166,35 @@ fn a_repair_that_breaks_a_neighbour_does_not_close_the_finding() {
 fn a_clean_repair_closes_the_finding() {
     let f = fixture();
     f.setup();
-    f.gate("repro", "false");           // id 3
-    f.cli().args(["finding", "raise", "--record", "2", "--claim", "c", "--by", "rev"])
-        .assert().success();            // id 4
-    f.cli().args(["finding", "reproduce", "4", "--gate", "3"]).assert().success();
-    f.cli().args(["finding", "assign", "4", "--to", "fixer"]).assert().success();
-    f.cli().args(["gate", "set-program", "3", "--program", "true"]).assert().success();
-    f.cli().args(["finding", "verify", "4"]).assert().success().stdout(contains("CLOSED"));
-    f.cli().args(["finding", "list", "--project", "1"])
-        .assert().success().stdout(contains("fixed"));
+    f.gate("repro", "false"); // id 3
+    f.cli()
+        .args([
+            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success(); // id 4
+    f.cli()
+        .args(["finding", "reproduce", "4", "--gate", "3"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "assign", "4", "--to", "fixer"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["gate", "set-program", "3", "--program", "true"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "verify", "4"])
+        .assert()
+        .success()
+        .stdout(contains("CLOSED"));
+    f.cli()
+        .args(["finding", "list", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("fixed"));
 }
 
 // REQUIRED TEST 8 (spec §10), at the CLI.
@@ -130,11 +203,21 @@ fn a_withdrawal_is_counted_against_the_reviewer_and_is_readable() {
     let f = fixture();
     f.setup();
     for claim in ["a", "b"] {
-        f.cli().args(["finding", "raise", "--record", "2", "--claim", claim, "--by", "hasty"])
-            .assert().success();
+        f.cli()
+            .args([
+                "finding", "raise", "--record", "2", "--claim", claim, "--by", "hasty",
+            ])
+            .assert()
+            .success();
     }
-    f.cli().args(["finding", "withdraw", "3", "--reason", "not concrete"]).assert().success();
-    f.cli().args(["finding", "withdraw", "4", "--reason", "not concrete"]).assert().success();
+    f.cli()
+        .args(["finding", "withdraw", "3", "--reason", "not concrete"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "withdraw", "4", "--reason", "not concrete"])
+        .assert()
+        .success();
 
     f.cli()
         .args(["finding", "list", "--project", "1", "--state", "withdrawn"])

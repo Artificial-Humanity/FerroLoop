@@ -65,7 +65,10 @@ pub fn run_command_gate(
     }
 
     let mut cmd = Command::new(&spec.program);
-    cmd.args(&spec.args).current_dir(root).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(&spec.args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     let paths: Vec<String> = population.iter().map(|p| p.display().to_string()).collect();
     match spec.delivery {
@@ -209,7 +212,11 @@ fn wait_with_deadline(
     let stdout = stdout_handle.map(join_drain).unwrap_or_default();
     let stderr = stderr_handle.map(join_drain).unwrap_or_default();
 
-    Ok(Some(std::process::Output { status, stdout, stderr }))
+    Ok(Some(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 #[cfg(test)]
@@ -239,7 +246,10 @@ mod tests {
             &[],
             1,
         );
-        assert_eq!(out.verdict, Verdict::fail_for(FailReason::EmptyPopulation, 0));
+        assert_eq!(
+            out.verdict,
+            Verdict::fail_for(FailReason::EmptyPopulation, 0)
+        );
     }
 
     // REQUIRED TEST 2 (spec §9): the framework enumerates, not the command.
@@ -262,7 +272,11 @@ mod tests {
             1,
         );
         assert_eq!(out.verdict, Verdict::from_predicate(true, 3));
-        assert!(out.output_excerpt.contains("total"), "got {}", out.output_excerpt);
+        assert!(
+            out.output_excerpt.contains("total"),
+            "got {}",
+            out.output_excerpt
+        );
     }
 
     #[test]
@@ -275,7 +289,10 @@ mod tests {
             &[d.path().join("a.txt")],
             5,
         );
-        assert_eq!(out.verdict, Verdict::fail_for(FailReason::EmptyPopulation, 1));
+        assert_eq!(
+            out.verdict,
+            Verdict::fail_for(FailReason::EmptyPopulation, 1)
+        );
     }
 
     #[test]
@@ -298,11 +315,19 @@ mod tests {
         fs::write(d.path().join("a.txt"), "x").unwrap();
         let out = run_command_gate(
             d.path(),
-            &spec("definitely-not-a-real-program-9f3x", &[], PopulationDelivery::Args),
+            &spec(
+                "definitely-not-a-real-program-9f3x",
+                &[],
+                PopulationDelivery::Args,
+            ),
             &[d.path().join("a.txt")],
             1,
         );
-        assert!(matches!(out.verdict, Verdict::Error { .. }), "got {:?}", out.verdict);
+        assert!(
+            matches!(out.verdict, Verdict::Error { .. }),
+            "got {:?}",
+            out.verdict
+        );
         assert_eq!(out.verdict.exit_code(), 2);
     }
 
@@ -332,7 +357,11 @@ mod tests {
         let mut s = spec("sleep", &["30"], PopulationDelivery::Stdin);
         s.timeout_secs = 1;
         let out = run_command_gate(d.path(), &s, &[d.path().join("a.txt")], 1);
-        assert!(matches!(out.verdict, Verdict::Error { .. }), "got {:?}", out.verdict);
+        assert!(
+            matches!(out.verdict, Verdict::Error { .. }),
+            "got {:?}",
+            out.verdict
+        );
     }
 
     #[test]
@@ -348,7 +377,11 @@ mod tests {
             1,
         );
         assert_eq!(out.verdict, Verdict::from_predicate(true, 2));
-        assert!(out.output_excerpt.trim().starts_with('2'), "got {}", out.output_excerpt);
+        assert!(
+            out.output_excerpt.trim().starts_with('2'),
+            "got {}",
+            out.output_excerpt
+        );
     }
 
     // Task 7 review, Important 2: rule 1 ("the framework enumerates, the
@@ -375,11 +408,20 @@ mod tests {
 
         let out = run_command_gate(
             d.path(),
-            &spec("sh", &["-c", "wc -l < \"$FL_POPULATION_FILE\""], PopulationDelivery::FileList),
+            &spec(
+                "sh",
+                &["-c", "wc -l < \"$FL_POPULATION_FILE\""],
+                PopulationDelivery::FileList,
+            ),
             &pop,
             1,
         );
-        assert_eq!(out.verdict, Verdict::from_predicate(true, 3), "got {:?}", out.verdict);
+        assert_eq!(
+            out.verdict,
+            Verdict::from_predicate(true, 3),
+            "got {:?}",
+            out.verdict
+        );
         assert_eq!(out.output_excerpt.trim(), "3", "got {}", out.output_excerpt);
     }
 
@@ -436,17 +478,31 @@ mod tests {
         // is only reachable if `wc -l` ran to completion and reported exit
         // 0 within the 10s deadline, which it cannot do unless the drain
         // kept its pipes empty while it was still writing.
-        assert_eq!(out.verdict, Verdict::from_predicate(true, COUNT as u64), "got {:?}", out.verdict);
+        assert_eq!(
+            out.verdict,
+            Verdict::from_predicate(true, COUNT as u64),
+            "got {:?}",
+            out.verdict
+        );
         // The excerpt is capped at EXCERPT_LIMIT and this fixture's raw
         // output is well over that, so the excerpt itself is expected to be
         // a truncated prefix — not the "total" line, which is the very
         // last thing `wc -l` would have written.
-        assert_eq!(out.output_excerpt.len(), EXCERPT_LIMIT, "got {} bytes", out.output_excerpt.len());
+        assert_eq!(
+            out.output_excerpt.len(),
+            EXCERPT_LIMIT,
+            "got {} bytes",
+            out.output_excerpt.len()
+        );
         // This system's `wc` (uutils coreutils 0.8.0) right-justifies the
         // per-file count to a column width derived from the row count
         // (4000 files + 1 total line needs 4 digits), so a zero count reads
         // as 3 spaces of padding then "0" — verified against the live
         // binary rather than assumed from GNU wc's behaviour.
-        assert!(out.output_excerpt.starts_with("   0 "), "got {:?}", out.output_excerpt);
+        assert!(
+            out.output_excerpt.starts_with("   0 "),
+            "got {:?}",
+            out.output_excerpt
+        );
     }
 }

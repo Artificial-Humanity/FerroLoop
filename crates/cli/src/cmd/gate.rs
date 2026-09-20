@@ -126,7 +126,10 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 );
             };
             let Some(proj) = store.get_project(g.project)? else {
-                bail!("gate {id} belongs to project {}, which no longer exists.", g.project);
+                bail!(
+                    "gate {id} belongs to project {}, which no longer exists.",
+                    g.project
+                );
             };
             let head = fl_exec::git::Git::head(std::path::Path::new(&proj.root))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -147,7 +150,9 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 Verdict::Pass { population, .. } => {
                     ("PASS".to_string(), format!("{} examined", population.get()))
                 }
-                Verdict::Fail { population, reason, .. } => (
+                Verdict::Fail {
+                    population, reason, ..
+                } => (
                     "FAIL".to_string(),
                     format!("{reason:?}, {population} examined"),
                 ),
@@ -163,9 +168,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 );
             };
             let GateKind::Command(spec) = &mut g.kind else {
-                bail!(
-                    "gate {id} is not a command gate, so it has no `program` field to rewrite."
-                );
+                bail!("gate {id} is not a command gate, so it has no `program` field to rewrite.");
             };
             spec.program = program;
             store.update_gate(&g)?;

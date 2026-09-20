@@ -37,7 +37,11 @@ impl TransitionReport {
 
     /// The worst verdict wins: any error is 2, any failure is 1.
     pub fn exit_code(&self) -> i32 {
-        self.gates.iter().map(|g| g.verdict.exit_code()).max().unwrap_or(1)
+        self.gates
+            .iter()
+            .map(|g| g.verdict.exit_code())
+            .max()
+            .unwrap_or(1)
     }
 }
 
@@ -87,9 +91,11 @@ fn staleness_for(
                 // for anything. Stale, not fresh.
                 return true;
             };
-            changed
-                .iter()
-                .any(|p| p.strip_prefix(root).map(|rel| m.is_match(rel)).unwrap_or(false))
+            changed.iter().any(|p| {
+                p.strip_prefix(root)
+                    .map(|rel| m.is_match(rel))
+                    .unwrap_or(false)
+            })
         }
         // ⚠ `Changed` and `Command` define their population by RUNNING
         // something, so there is no pattern to test a vanished path against;
@@ -220,7 +226,10 @@ pub fn run_single_gate(
         .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
     let root = Path::new(&proj.root);
 
-    let Some(def) = store.get_gate(gate).map_err(|e| ExecError::Git(e.to_string()))? else {
+    let Some(def) = store
+        .get_gate(gate)
+        .map_err(|e| ExecError::Git(e.to_string()))?
+    else {
         return Err(ExecError::BadSelector(format!("no gate with id {gate}")));
     };
 
@@ -254,7 +263,9 @@ pub fn evaluate_transition(
     let mut reports = Vec::new();
 
     for gate_id in &transition.gates {
-        let Some(def) = store.get_gate(*gate_id).map_err(|e| ExecError::Git(e.to_string()))?
+        let Some(def) = store
+            .get_gate(*gate_id)
+            .map_err(|e| ExecError::Git(e.to_string()))?
         else {
             return Err(ExecError::BadSelector(format!(
                 "transition `{transition_name}` names gate {gate_id}, which does not exist"
@@ -284,7 +295,11 @@ mod tests {
     fn repo_with(files: &[(&str, &str)]) -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
-            Command::new("git").args(args).current_dir(d.path()).output().unwrap();
+            Command::new("git")
+                .args(args)
+                .current_dir(d.path())
+                .output()
+                .unwrap();
         };
         run(&["init", "-q"]);
         run(&["config", "user.email", "t@example.com"]);
@@ -323,7 +338,9 @@ mod tests {
                 p,
                 "g",
                 cmd(program),
-                Selector::Glob { pattern: pattern.into() },
+                Selector::Glob {
+                    pattern: pattern.into(),
+                },
                 1,
                 &head,
                 "tester",
@@ -392,13 +409,20 @@ mod tests {
 
         fs::remove_file(d.path().join("src/b.rs")).unwrap();
         let run = |args: &[&str]| {
-            Command::new("git").args(args).current_dir(d.path()).output().unwrap();
+            Command::new("git")
+                .args(args)
+                .current_dir(d.path())
+                .output()
+                .unwrap();
         };
         run(&["add", "-A"]);
         run(&["commit", "-qm", "delete b"]);
 
         let r = evaluate_transition(&mut s, p, "launch", None).unwrap();
-        assert!(!r.passed(), "a deletion inside the gate's own glob must make it stale");
+        assert!(
+            !r.passed(),
+            "a deletion inside the gate's own glob must make it stale"
+        );
         assert_eq!(r.gates[0].staleness, Staleness::StaleFail);
     }
 
@@ -411,13 +435,20 @@ mod tests {
 
         fs::write(d.path().join("docs.md"), "two").unwrap();
         let run = |args: &[&str]| {
-            Command::new("git").args(args).current_dir(d.path()).output().unwrap();
+            Command::new("git")
+                .args(args)
+                .current_dir(d.path())
+                .output()
+                .unwrap();
         };
         run(&["add", "-A"]);
         run(&["commit", "-qm", "docs only"]);
 
         let r = evaluate_transition(&mut s, p, "launch", None).unwrap();
-        assert!(r.passed(), "a gate whose own population did not move is fresh");
+        assert!(
+            r.passed(),
+            "a gate whose own population did not move is fresh"
+        );
         assert_eq!(r.gates[0].staleness, Staleness::Fresh);
     }
 
@@ -436,8 +467,15 @@ mod tests {
     // be "discovered" and "fixed" by someone reading `passed()` cold.
     #[test]
     fn a_transition_with_no_gates_has_not_been_verified() {
-        let r = TransitionReport { transition: "launch".into(), regret: Regret::Low, gates: vec![] };
-        assert!(!r.passed(), "an empty gate list ran nothing and must not read as a pass");
+        let r = TransitionReport {
+            transition: "launch".into(),
+            regret: Regret::Low,
+            gates: vec![],
+        };
+        assert!(
+            !r.passed(),
+            "an empty gate list ran nothing and must not read as a pass"
+        );
     }
 
     // A transition can name a gate id that was never stored (never created,

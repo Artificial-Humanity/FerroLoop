@@ -81,7 +81,11 @@ impl RedbStore {
         let id;
         {
             let mut meta = tx.open_table(META).map_err(backend)?;
-            let current = meta.get(counter).map_err(backend)?.map(|v| v.value()).unwrap_or(0);
+            let current = meta
+                .get(counter)
+                .map_err(backend)?
+                .map(|v| v.value())
+                .unwrap_or(0);
             id = current + 1;
             meta.insert(counter, id).map_err(backend)?;
         }
@@ -385,7 +389,9 @@ mod tests {
                         timeout_secs: 5,
                         pass_codes: vec![0],
                     }),
-                    fl_core::model::Selector::Glob { pattern: "**/*.rs".into() },
+                    fl_core::model::Selector::Glob {
+                        pattern: "**/*.rs".into(),
+                    },
                     1,
                     "abc",
                     "owner",
@@ -465,7 +471,9 @@ mod tests {
                 timeout_secs: 5,
                 pass_codes: vec![0],
             }),
-            Selector::Glob { pattern: "**/*.rs".into() },
+            Selector::Glob {
+                pattern: "**/*.rs".into(),
+            },
             1,
             "abc",
             "owner",
@@ -492,7 +500,8 @@ mod tests {
             let mut s = RedbStore::open(&path).unwrap();
             let p = s.add_project("/p").unwrap();
             let r = s.add_record(p, "t").unwrap();
-            s.add_finding(Finding::raise(p, r, "reviewer", "wrong on empty")).unwrap()
+            s.add_finding(Finding::raise(p, r, "reviewer", "wrong on empty"))
+                .unwrap()
         };
         assert_ne!(id.get(), 0, "the store must replace the placeholder id");
 

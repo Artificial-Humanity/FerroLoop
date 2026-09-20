@@ -76,7 +76,11 @@ mod tests {
 
     fn commit(dir: &Path, msg: &str) -> String {
         let run = |args: &[&str]| {
-            Command::new("git").args(args).current_dir(dir).output().unwrap();
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
         };
         run(&["add", "-A"]);
         run(&["commit", "-qm", msg]);

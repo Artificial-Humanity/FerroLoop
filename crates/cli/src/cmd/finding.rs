@@ -29,9 +29,7 @@ pub enum Cmd {
         to: String,
     },
     /// The reproduction must now pass, and every neighbour must still pass.
-    Verify {
-        finding: u64,
-    },
+    Verify { finding: u64 },
     Withdraw {
         finding: u64,
         #[arg(long)]
@@ -93,7 +91,10 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let report = verify_finding(store, id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
             if report.reproduction.verdict.is_pass() {
-                println!("REPRODUCTION\tpasses{}", stale_note(report.reproduction.staleness));
+                println!(
+                    "REPRODUCTION\tpasses{}",
+                    stale_note(report.reproduction.staleness)
+                );
             } else {
                 println!(
                     "REPRODUCTION\tstill fails: {:?}{}",
@@ -102,7 +103,12 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 );
             }
             for r in &report.regressions {
-                println!("REGRESSION\t{}\t{:?}{}", r.name, r.verdict, stale_note(r.staleness));
+                println!(
+                    "REGRESSION\t{}\t{:?}{}",
+                    r.name,
+                    r.verdict,
+                    stale_note(r.staleness)
+                );
             }
 
             // Task 16b: `verify_finding`'s `FixReport` now carries every
@@ -155,7 +161,13 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let all = store.list_findings(ProjectId(project))?;
             let mut raisers: BTreeSet<String> = Default::default();
             for f in all.iter().filter(|f| want.is_none_or(|w| f.state == w)) {
-                println!("{}\t{}\t{}\t{}", f.id, f.state.as_wire(), f.raised_by, f.claim);
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    f.id,
+                    f.state.as_wire(),
+                    f.raised_by,
+                    f.claim
+                );
                 raisers.insert(f.raised_by.clone());
             }
             // ⚠ Decision 27's cost, printed where it can be seen. A cost

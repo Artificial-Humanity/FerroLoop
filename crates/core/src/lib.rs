@@ -15,6 +15,6 @@ pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
-pub use stale::{apply_staleness, is_stale, Staleness};
+pub use stale::{Staleness, apply_staleness, is_stale};
 pub use store::{MemStore, Store, StoreError};
 pub use verdict::{FailReason, Population, Verdict};

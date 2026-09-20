@@ -119,7 +119,9 @@ pub fn attach_reproduction(
     }
 
     f.attach_reproduction(gate)?;
-    store.update_finding(&f).map_err(|e| FindingExecError::Store(e.to_string()))?;
+    store
+        .update_finding(&f)
+        .map_err(|e| FindingExecError::Store(e.to_string()))?;
     Ok(report)
 }
 
@@ -145,7 +147,9 @@ pub fn verify_finding(
     if f.state != FindingState::Assigned {
         return Err(FindingExecError::NotAssigned(finding, f.state.as_wire()));
     }
-    let gate = f.reproduction.ok_or(FindingExecError::NoReproduction(finding))?;
+    let gate = f
+        .reproduction
+        .ok_or(FindingExecError::NoReproduction(finding))?;
 
     let reproduction = run_single_gate(store, f.project, gate)?;
 
@@ -167,16 +171,26 @@ pub fn verify_finding(
         let r = run_single_gate(store, f.project, id)?;
         neighbour_reports.push(r);
     }
-    let regressions: Vec<GateReport> =
-        neighbour_reports.iter().filter(|r| !r.verdict.is_pass()).cloned().collect();
+    let regressions: Vec<GateReport> = neighbour_reports
+        .iter()
+        .filter(|r| !r.verdict.is_pass())
+        .cloned()
+        .collect();
 
     let closed = reproduction.verdict.is_pass() && regressions.is_empty();
     if closed {
         f.mark_fixed()?;
-        store.update_finding(&f).map_err(|e| FindingExecError::Store(e.to_string()))?;
+        store
+            .update_finding(&f)
+            .map_err(|e| FindingExecError::Store(e.to_string()))?;
     }
 
-    Ok(FixReport { reproduction, neighbours: neighbour_reports, regressions, closed })
+    Ok(FixReport {
+        reproduction,
+        neighbours: neighbour_reports,
+        regressions,
+        closed,
+    })
 }
 
 #[cfg(test)]
@@ -195,7 +209,11 @@ mod tests {
     fn repo() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         let run = |a: &[&str]| {
-            Command::new("git").args(a).current_dir(d.path()).output().unwrap();
+            Command::new("git")
+                .args(a)
+                .current_dir(d.path())
+                .output()
+                .unwrap();
         };
         run(&["init", "-q"]);
         run(&["config", "user.email", "t@example.com"]);
@@ -207,9 +225,13 @@ mod tests {
         d
     }
 
-    fn gate(s: &mut MemStore, p: ProjectId, root: &std::path::Path, name: &str, program: &str)
-        -> GateId
-    {
+    fn gate(
+        s: &mut MemStore,
+        p: ProjectId,
+        root: &std::path::Path,
+        name: &str,
+        program: &str,
+    ) -> GateId {
         let head = crate::git::Git::head(root).unwrap();
         s.add_gate(
             p,
@@ -221,7 +243,9 @@ mod tests {
                 timeout_secs: 10,
                 pass_codes: vec![0],
             }),
-            Selector::Glob { pattern: "src/**/*.rs".into() },
+            Selector::Glob {
+                pattern: "src/**/*.rs".into(),
+            },
             1,
             &head,
             "tester",
@@ -237,11 +261,19 @@ mod tests {
         let p = s.add_project(&d.path().display().to_string()).unwrap();
         let r = s.add_record(p, "t").unwrap();
         let g = gate(&mut s, p, d.path(), "already-green", "true");
-        let f = s.add_finding(Finding::raise(p, r, "reviewer", "claim")).unwrap();
+        let f = s
+            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .unwrap();
 
         let err = attach_reproduction(&mut s, f, g).unwrap_err();
-        assert!(matches!(err, FindingExecError::ReproductionPasses { .. }), "got {err}");
-        assert_eq!(s.get_finding(f).unwrap().unwrap().state, FindingState::Raised);
+        assert!(
+            matches!(err, FindingExecError::ReproductionPasses { .. }),
+            "got {err}"
+        );
+        assert_eq!(
+            s.get_finding(f).unwrap().unwrap().state,
+            FindingState::Raised
+        );
     }
 
     #[test]
@@ -251,7 +283,9 @@ mod tests {
         let p = s.add_project(&d.path().display().to_string()).unwrap();
         let r = s.add_record(p, "t").unwrap();
         let g = gate(&mut s, p, d.path(), "red", "false");
-        let f = s.add_finding(Finding::raise(p, r, "reviewer", "claim")).unwrap();
+        let f = s
+            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .unwrap();
 
         let report = attach_reproduction(&mut s, f, g).unwrap();
         assert!(!report.verdict.is_pass());
@@ -266,13 +300,27 @@ mod tests {
         let mut s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
         let r = s.add_record(p, "t").unwrap();
-        let g = gate(&mut s, p, d.path(), "broken", "definitely-not-a-real-program-9f3x");
-        let f = s.add_finding(Finding::raise(p, r, "reviewer", "claim")).unwrap();
+        let g = gate(
+            &mut s,
+            p,
+            d.path(),
+            "broken",
+            "definitely-not-a-real-program-9f3x",
+        );
+        let f = s
+            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .unwrap();
 
         // An Error is not a failure. It proves nothing either way.
         let err = attach_reproduction(&mut s, f, g).unwrap_err();
-        assert!(matches!(err, FindingExecError::ReproductionErrored { .. }), "got {err}");
-        assert_eq!(s.get_finding(f).unwrap().unwrap().state, FindingState::Raised);
+        assert!(
+            matches!(err, FindingExecError::ReproductionErrored { .. }),
+            "got {err}"
+        );
+        assert_eq!(
+            s.get_finding(f).unwrap().unwrap().state,
+            FindingState::Raised
+        );
     }
 
     // ⚠⚠ REQUIRED TEST 7 (spec §10): a repair that breaks a neighbour does
@@ -288,9 +336,17 @@ mod tests {
         let neighbour = gate(&mut s, p, d.path(), "neighbour", "true");
         let rep = gate(&mut s, p, d.path(), "reproduction", "false");
         let _ = crate::evaluate::run_single_gate(&mut s, p, neighbour).unwrap();
-        assert!(s.get_gate(neighbour).unwrap().unwrap().last_pass_commit.is_some());
+        assert!(
+            s.get_gate(neighbour)
+                .unwrap()
+                .unwrap()
+                .last_pass_commit
+                .is_some()
+        );
 
-        let f = s.add_finding(Finding::raise(p, r, "reviewer", "claim")).unwrap();
+        let f = s
+            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .unwrap();
         attach_reproduction(&mut s, f, rep).unwrap();
         let mut fin = s.get_finding(f).unwrap().unwrap();
         fin.assign("fixer").unwrap();
@@ -299,24 +355,36 @@ mod tests {
         // The "repair": the reproduction now passes, and the neighbour breaks.
         let mut rep_def = s.get_gate(rep).unwrap().unwrap();
         rep_def.kind = GateKind::Command(CommandSpec {
-            program: "true".into(), args: vec![], delivery: PopulationDelivery::Args,
-            timeout_secs: 10, pass_codes: vec![0],
+            program: "true".into(),
+            args: vec![],
+            delivery: PopulationDelivery::Args,
+            timeout_secs: 10,
+            pass_codes: vec![0],
         });
         s.update_gate(&rep_def).unwrap();
         let mut n_def = s.get_gate(neighbour).unwrap().unwrap();
         n_def.kind = GateKind::Command(CommandSpec {
-            program: "false".into(), args: vec![], delivery: PopulationDelivery::Args,
-            timeout_secs: 10, pass_codes: vec![0],
+            program: "false".into(),
+            args: vec![],
+            delivery: PopulationDelivery::Args,
+            timeout_secs: 10,
+            pass_codes: vec![0],
         });
         s.update_gate(&n_def).unwrap();
 
         let report = verify_finding(&mut s, f).unwrap();
-        assert!(report.reproduction.verdict.is_pass(), "the reproduction did pass");
+        assert!(
+            report.reproduction.verdict.is_pass(),
+            "the reproduction did pass"
+        );
         assert!(!report.closed, "a regression must keep it open");
         assert_eq!(report.regressions.len(), 1);
         assert_eq!(report.regressions[0].name, "neighbour");
         assert_eq!(report.exit_code(), 1);
-        assert_eq!(s.get_finding(f).unwrap().unwrap().state, FindingState::Assigned);
+        assert_eq!(
+            s.get_finding(f).unwrap().unwrap().state,
+            FindingState::Assigned
+        );
     }
 
     #[test]
@@ -329,7 +397,9 @@ mod tests {
         let rep = gate(&mut s, p, d.path(), "reproduction", "false");
         let _ = crate::evaluate::run_single_gate(&mut s, p, neighbour).unwrap();
 
-        let f = s.add_finding(Finding::raise(p, r, "reviewer", "claim")).unwrap();
+        let f = s
+            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .unwrap();
         attach_reproduction(&mut s, f, rep).unwrap();
         let mut fin = s.get_finding(f).unwrap().unwrap();
         fin.assign("fixer").unwrap();
@@ -337,15 +407,21 @@ mod tests {
 
         let mut rep_def = s.get_gate(rep).unwrap().unwrap();
         rep_def.kind = GateKind::Command(CommandSpec {
-            program: "true".into(), args: vec![], delivery: PopulationDelivery::Args,
-            timeout_secs: 10, pass_codes: vec![0],
+            program: "true".into(),
+            args: vec![],
+            delivery: PopulationDelivery::Args,
+            timeout_secs: 10,
+            pass_codes: vec![0],
         });
         s.update_gate(&rep_def).unwrap();
 
         let report = verify_finding(&mut s, f).unwrap();
         assert!(report.closed);
         assert_eq!(report.exit_code(), 0);
-        assert_eq!(s.get_finding(f).unwrap().unwrap().state, FindingState::Fixed);
+        assert_eq!(
+            s.get_finding(f).unwrap().unwrap().state,
+            FindingState::Fixed
+        );
     }
 
     #[test]
@@ -354,7 +430,9 @@ mod tests {
         let mut s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
         let r = s.add_record(p, "t").unwrap();
-        let f = s.add_finding(Finding::raise(p, r, "reviewer", "claim")).unwrap();
+        let f = s
+            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .unwrap();
         assert!(verify_finding(&mut s, f).is_err());
     }
 }

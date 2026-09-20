@@ -11,7 +11,13 @@ struct Fixture {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let ok = Sys::new("git").args(args).current_dir(dir).output().unwrap().status.success();
+    let ok = Sys::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap()
+        .status
+        .success();
     assert!(ok, "git {args:?} failed");
 }
 
@@ -27,7 +33,11 @@ fn fixture() -> Fixture {
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "first"]);
     let db = home.path().join("t.redb").display().to_string();
-    Fixture { _home: home, repo, db }
+    Fixture {
+        _home: home,
+        repo,
+        db,
+    }
 }
 
 impl Fixture {
@@ -44,13 +54,39 @@ impl Fixture {
             .assert()
             .success();
         self.cli()
-            .args(["gate", "add", "--project", "1", "--name", "g", "--kind", "command",
-                   "--glob", "src/**/*.rs", "--program", program])
+            .args([
+                "gate",
+                "add",
+                "--project",
+                "1",
+                "--name",
+                "g",
+                "--kind",
+                "command",
+                "--glob",
+                "src/**/*.rs",
+                "--program",
+                program,
+            ])
             .assert()
             .success();
         self.cli()
-            .args(["transition", "add", "--project", "1", "--name", "launch", "--from",
-                   "review", "--to", "done", "--regret", regret, "--gate", "2"])
+            .args([
+                "transition",
+                "add",
+                "--project",
+                "1",
+                "--name",
+                "launch",
+                "--from",
+                "review",
+                "--to",
+                "done",
+                "--regret",
+                regret,
+                "--gate",
+                "2",
+            ])
             .assert()
             .success();
     }
@@ -60,14 +96,21 @@ impl Fixture {
 fn a_passing_gate_exits_zero_and_prints_the_population() {
     let f = fixture();
     f.setup("true", "high");
-    f.cli().args(["check", "launch", "--project", "1"]).assert().success().stdout(contains("1"));
+    f.cli()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("1"));
 }
 
 #[test]
 fn a_failing_gate_exits_one() {
     let f = fixture();
     f.setup("false", "low");
-    f.cli().args(["check", "launch", "--project", "1"]).assert().code(1);
+    f.cli()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .code(1);
 }
 
 #[test]
@@ -91,7 +134,10 @@ fn a_commit_outside_the_population_leaves_a_high_regret_gate_fresh() {
     git(f.repo.path(), &["add", "-A"]);
     git(f.repo.path(), &["commit", "-qm", "docs only"]);
 
-    f.cli().args(["check", "launch", "--project", "1"]).assert().success();
+    f.cli()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .success();
 }
 
 // REQUIRED TEST 3 (spec §9), part two: a change inside the population makes
@@ -133,8 +179,17 @@ fn affirming_the_gate_clears_the_staleness() {
     fs::write(f.repo.path().join("src/a.rs"), "fn a() { let _ = 1; }").unwrap();
     git(f.repo.path(), &["add", "-A"]);
     git(f.repo.path(), &["commit", "-qm", "code changed"]);
-    f.cli().args(["check", "launch", "--project", "1"]).assert().code(1);
+    f.cli()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .code(1);
 
-    f.cli().args(["gate", "affirm", "2", "--by", "tester"]).assert().success();
-    f.cli().args(["check", "launch", "--project", "1"]).assert().success();
+    f.cli()
+        .args(["gate", "affirm", "2", "--by", "tester"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .success();
 }

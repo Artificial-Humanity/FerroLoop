@@ -81,13 +81,7 @@ pub fn resolve(
             // Absolutize paths returned by the trait impl, which may be relative
             out = out
                 .into_iter()
-                .map(|p| {
-                    if p.is_absolute() {
-                        p
-                    } else {
-                        abs_root.join(p)
-                    }
-                })
+                .map(|p| if p.is_absolute() { p } else { abs_root.join(p) })
                 .collect();
             out.sort();
             Ok(out)
@@ -138,31 +132,46 @@ mod tests {
     #[test]
     fn a_glob_finds_nested_matches_and_ignores_the_rest() {
         let d = tree();
-        let sel = Selector::Glob { pattern: "src/**/*.rs".into() };
+        let sel = Selector::Glob {
+            pattern: "src/**/*.rs".into(),
+        };
         let mut got = resolve(d.path(), &sel, &NoChanges).unwrap();
         got.sort();
-        assert_eq!(got.len(), 2, "expected src/a.rs and src/deep/b.rs, got {got:?}");
+        assert_eq!(
+            got.len(),
+            2,
+            "expected src/a.rs and src/deep/b.rs, got {got:?}"
+        );
         assert!(got.iter().all(|p| p.extension().unwrap() == "rs"));
     }
 
     #[test]
     fn a_glob_that_matches_nothing_resolves_to_an_empty_population_not_an_error() {
         let d = tree();
-        let sel = Selector::Glob { pattern: "nowhere/**/*.rs".into() };
+        let sel = Selector::Glob {
+            pattern: "nowhere/**/*.rs".into(),
+        };
         assert_eq!(resolve(d.path(), &sel, &NoChanges).unwrap().len(), 0);
     }
 
     #[test]
     fn an_invalid_glob_is_an_error_and_never_an_empty_population() {
         let d = tree();
-        let sel = Selector::Glob { pattern: "src/**/[".into() };
-        assert!(matches!(resolve(d.path(), &sel, &NoChanges), Err(ExecError::BadSelector(_))));
+        let sel = Selector::Glob {
+            pattern: "src/**/[".into(),
+        };
+        assert!(matches!(
+            resolve(d.path(), &sel, &NoChanges),
+            Err(ExecError::BadSelector(_))
+        ));
     }
 
     #[test]
     fn resolved_paths_are_absolute_so_a_command_can_be_run_from_anywhere() {
         let d = tree();
-        let sel = Selector::Glob { pattern: "src/a.rs".into() };
+        let sel = Selector::Glob {
+            pattern: "src/a.rs".into(),
+        };
         let got = resolve(d.path(), &sel, &NoChanges).unwrap();
         assert!(got[0].is_absolute(), "got {got:?}");
     }
@@ -183,12 +192,20 @@ mod tests {
         // A root relative to the (unmodified) real cwd exercises the same
         // `!root.is_absolute()` branch with no global mutation.
         let rel_root = d.path().strip_prefix(&cwd).unwrap();
-        assert!(!rel_root.is_absolute(), "fixture root must be relative: {rel_root:?}");
+        assert!(
+            !rel_root.is_absolute(),
+            "fixture root must be relative: {rel_root:?}"
+        );
 
-        let sel = Selector::Glob { pattern: "src/**/*.rs".into() };
+        let sel = Selector::Glob {
+            pattern: "src/**/*.rs".into(),
+        };
         let got = resolve(rel_root, &sel, &NoChanges).unwrap();
         assert_eq!(got.len(), 2);
-        assert!(got.iter().all(|p| p.is_absolute()), "glob with relative root returned relative paths: {got:?}");
+        assert!(
+            got.iter().all(|p| p.is_absolute()),
+            "glob with relative root returned relative paths: {got:?}"
+        );
     }
 
     // Carried over from Task 6's review: the Command branch got the same
@@ -200,12 +217,21 @@ mod tests {
         fs::write(d.path().join("a.rs"), "").unwrap();
 
         let rel_root = d.path().strip_prefix(&cwd).unwrap();
-        assert!(!rel_root.is_absolute(), "fixture root must be relative: {rel_root:?}");
+        assert!(
+            !rel_root.is_absolute(),
+            "fixture root must be relative: {rel_root:?}"
+        );
 
-        let sel = Selector::Command { program: "sh".into(), args: vec!["-c".into(), "echo a.rs".into()] };
+        let sel = Selector::Command {
+            program: "sh".into(),
+            args: vec!["-c".into(), "echo a.rs".into()],
+        };
         let got = resolve(rel_root, &sel, &NoChanges).unwrap();
         assert_eq!(got.len(), 1, "got {got:?}");
-        assert!(got[0].is_absolute(), "command selector with relative root returned relative paths: {got:?}");
+        assert!(
+            got[0].is_absolute(),
+            "command selector with relative root returned relative paths: {got:?}"
+        );
         assert!(got[0].ends_with("a.rs"), "got {got:?}");
     }
 
@@ -223,10 +249,15 @@ mod tests {
     #[test]
     fn changed_absolutizes_paths_returned_by_the_implementor() {
         let d = tree();
-        let sel = Selector::Changed { base: "main".into() };
+        let sel = Selector::Changed {
+            base: "main".into(),
+        };
         let got = resolve(d.path(), &sel, &RelativeChanges).unwrap();
         assert_eq!(got.len(), 2);
-        assert!(got.iter().all(|p| p.is_absolute()), "changed selector returned relative paths: {got:?}");
+        assert!(
+            got.iter().all(|p| p.is_absolute()),
+            "changed selector returned relative paths: {got:?}"
+        );
     }
 
     #[test]
@@ -239,10 +270,15 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&target, &link).unwrap();
 
-        let sel = Selector::Glob { pattern: "src/**/*.rs".into() };
+        let sel = Selector::Glob {
+            pattern: "src/**/*.rs".into(),
+        };
         let got = resolve(d.path(), &sel, &NoChanges).unwrap();
         // Should have src/a.rs and src/deep/b.rs, but NOT the symlink
         assert_eq!(got.len(), 2, "symlink should be excluded from glob results");
-        assert!(!got.iter().any(|p| p.ends_with("link.rs")), "symlink appeared in results: {got:?}");
+        assert!(
+            !got.iter().any(|p| p.ends_with("link.rs")),
+            "symlink appeared in results: {got:?}"
+        );
     }
 }

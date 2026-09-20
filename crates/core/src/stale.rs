@@ -61,7 +61,13 @@ mod tests {
     #[test]
     fn a_stale_gate_fails_at_a_high_regret_transition_whatever_it_returned() {
         let (v, s) = apply_staleness(Verdict::from_predicate(true, 7), true, Regret::High);
-        assert_eq!(v, Verdict::Fail { population: 7, reason: FailReason::Stale });
+        assert_eq!(
+            v,
+            Verdict::Fail {
+                population: 7,
+                reason: FailReason::Stale
+            }
+        );
         assert_eq!(s, Staleness::StaleFail);
     }
 
