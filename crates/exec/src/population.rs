@@ -25,7 +25,7 @@ pub trait ChangedPaths {
     fn changed_since(&self, root: &Path, base: &str) -> Result<Vec<PathBuf>, ExecError>;
 }
 
-fn matcher(pattern: &str) -> Result<GlobMatcher, ExecError> {
+pub(crate) fn matcher(pattern: &str) -> Result<GlobMatcher, ExecError> {
     Glob::new(pattern)
         .map(|g| g.compile_matcher())
         .map_err(|e| ExecError::BadSelector(format!("{pattern}: {e}")))
