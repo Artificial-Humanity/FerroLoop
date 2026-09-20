@@ -225,3 +225,73 @@ fn a_withdrawal_is_counted_against_the_reviewer_and_is_readable() {
         .success()
         .stdout(contains("hasty").and(contains("withdrawn: 2")));
 }
+
+// Fix-wave finding 2 (spec §7): a verify that ran no neighbours must never
+// be byte-identical to a verify that ran several, and REPRODUCTION must
+// carry its population the way `check` already does.
+#[test]
+fn verify_prints_the_reproduction_population_and_a_neighbour_summary_even_at_zero() {
+    let f = fixture();
+    f.setup();
+    f.gate("repro", "false"); // id 3
+    f.cli()
+        .args([
+            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success(); // id 4
+    f.cli()
+        .args(["finding", "reproduce", "4", "--gate", "3"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "assign", "4", "--to", "fixer"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["gate", "set-program", "3", "--program", "true"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "verify", "4"])
+        .assert()
+        .success()
+        .stdout(
+            contains("REPRODUCTION\tpasses over 1 items")
+                .and(contains("NEIGHBOURS\t0 checked, 0 regressed")),
+        );
+}
+
+// The other half: a neighbour that stays green must still be counted in the
+// NEIGHBOURS summary, not just neighbours that regress.
+#[test]
+fn verify_counts_a_checked_neighbour_even_when_it_stays_green() {
+    let f = fixture();
+    f.setup();
+    f.gate("neighbour", "true"); // id 3
+    f.gate("repro", "false"); // id 4
+    f.cli().args(["gate", "run", "3"]).assert().success();
+    f.cli()
+        .args([
+            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success(); // id 5
+    f.cli()
+        .args(["finding", "reproduce", "5", "--gate", "4"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "assign", "5", "--to", "fixer"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["gate", "set-program", "4", "--program", "true"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "verify", "5"])
+        .assert()
+        .success()
+        .stdout(contains("NEIGHBOURS\t1 checked, 0 regressed"));
+}

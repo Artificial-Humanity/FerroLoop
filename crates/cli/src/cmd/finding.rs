@@ -92,7 +92,8 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
 
             if report.reproduction.verdict.is_pass() {
                 println!(
-                    "REPRODUCTION\tpasses{}",
+                    "REPRODUCTION\tpasses over {} items{}",
+                    report.reproduction.verdict.population().unwrap_or(0),
                     stale_note(report.reproduction.staleness)
                 );
             } else {
@@ -102,6 +103,21 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                     stale_note(report.reproduction.staleness)
                 );
             }
+
+            // ⚠ Fix-wave finding 2 (spec §7): "a run that examined nothing
+            // must never be indistinguishable from a run that examined
+            // everything." Printed unconditionally, including at zero,
+            // because a verify that ran no neighbours and a verify that ran
+            // several must never produce byte-identical output. This line
+            // does not change `closed` or the exit code — it is visibility
+            // only, and zero neighbours is not itself a failure (the first
+            // finding in a fresh project has none, and must stay closable).
+            println!(
+                "NEIGHBOURS\t{} checked, {} regressed",
+                report.neighbours.len(),
+                report.regressions.len()
+            );
+
             for r in &report.regressions {
                 println!(
                     "REGRESSION\t{}\t{:?}{}",
@@ -124,8 +140,13 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             // cost was invisible in the output. None of this feeds back
             // into `closed` or the exit code: those stay exactly what
             // `verify_finding` decided.
+            //
+            // ⚠ Fix-wave finding 2 also completes what this left half-done:
+            // a stale-but-passing neighbour printed a note, but a *fresh*
+            // passing neighbour printed nothing at all — the majority case
+            // was invisible. Every evaluated neighbour now gets a line.
             for r in &report.neighbours {
-                if r.verdict.is_pass() && r.staleness != Staleness::Fresh {
+                if r.verdict.is_pass() {
                     println!("NEIGHBOUR\t{}\tpasses{}", r.name, stale_note(r.staleness));
                 }
             }
