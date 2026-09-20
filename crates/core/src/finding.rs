@@ -57,6 +57,10 @@ impl FindingState {
 /// reproduction has nowhere to go except concrete, or gone. There is also no
 /// acknowledgement state, because agreement carried no information and the
 /// step is removed rather than repaired (decision 25).
+///
+/// Re-assignment from one agent to another is deliberate (Decision 14): when a
+/// fixer is escalated, the reproduction remains valid; re-assigning avoids the
+/// cost of detach-and-reattach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     pub id: FindingId,
@@ -202,5 +206,18 @@ mod tests {
         f.withdraw("no").unwrap();
         assert!(f.attach_reproduction(GateId(9)).is_err());
         assert!(f.assign("fixer").is_err());
+    }
+
+    #[test]
+    fn a_finding_can_be_reassigned_to_a_different_actor() {
+        let mut f = raised();
+        f.attach_reproduction(GateId(9)).unwrap();
+        f.assign("fixer_one").unwrap();
+        assert_eq!(f.assigned_to.as_deref(), Some("fixer_one"));
+        assert_eq!(f.state, FindingState::Assigned);
+        f.assign("fixer_two").unwrap();
+        assert_eq!(f.assigned_to.as_deref(), Some("fixer_two"));
+        assert_eq!(f.state, FindingState::Assigned);
+        assert_eq!(f.reproduction, Some(GateId(9)), "reproduction stays intact");
     }
 }
