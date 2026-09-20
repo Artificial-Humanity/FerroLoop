@@ -30,6 +30,10 @@ enum Command {
     Check(cmd::check::Cmd),
     #[command(subcommand)]
     Finding(cmd::finding::Cmd),
+    /// Run one adapter attempt against a record and record the outcome.
+    Attempt(cmd::attempt::Cmd),
+    /// Report what a project's recorded attempts cost.
+    Stats(cmd::stats::Cmd),
 }
 
 /// Resolve the store path from `--db`, then `$FL_DB`, then the XDG data
@@ -88,5 +92,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Record(c) => cmd::record::run(&mut store, c),
         Command::Check(c) => cmd::check::run(&mut store, c),
         Command::Finding(c) => cmd::finding::run(&mut store, c),
+        Command::Attempt(c) => cmd::attempt::run(&mut store, c),
+        Command::Stats(c) => cmd::stats::run(&mut store, c),
     }
 }
