@@ -1,6 +1,7 @@
 //! redb persistence for the `fl-core` Store trait.
 
-use fl_core::ids::{GateId, ProjectId, RecordId};
+use fl_core::finding::{Finding, FindingState};
+use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
 use fl_core::store::{Store, StoreError};
@@ -14,6 +15,7 @@ const TRANSITIONS: TableDefinition<&str, &str> = TableDefinition::new("transitio
 const RECORDS: TableDefinition<u64, &str> = TableDefinition::new("records");
 const GATE_RUNS: TableDefinition<u64, &str> = TableDefinition::new("gate_runs");
 const ATTEMPTS: TableDefinition<u64, &str> = TableDefinition::new("attempts");
+const FINDINGS: TableDefinition<u64, &str> = TableDefinition::new("findings");
 
 const NEXT_ID: &str = "next_id";
 const NEXT_RUN: &str = "next_run";
@@ -40,6 +42,7 @@ impl RedbStore {
             tx.open_table(RECORDS).map_err(backend)?;
             tx.open_table(GATE_RUNS).map_err(backend)?;
             tx.open_table(ATTEMPTS).map_err(backend)?;
+            tx.open_table(FINDINGS).map_err(backend)?;
         }
         tx.commit().map_err(backend)?;
         Ok(Self { db })
@@ -268,6 +271,39 @@ impl Store for RedbStore {
         let all: Vec<Attempt> = self.all_json(ATTEMPTS)?;
         Ok(all.into_iter().filter(|a| a.project == project).collect())
     }
+
+    fn add_finding(&mut self, finding: Finding) -> Result<FindingId, StoreError> {
+        let id = self.bump_and_put(NEXT_ID, FINDINGS, |id| {
+            let mut finding = finding;
+            finding.id = FindingId(id);
+            finding
+        })?;
+        Ok(FindingId(id))
+    }
+
+    fn get_finding(&self, id: FindingId) -> Result<Option<Finding>, StoreError> {
+        self.get_json(FINDINGS, id.0)
+    }
+
+    fn update_finding(&mut self, finding: &Finding) -> Result<(), StoreError> {
+        if self.get_finding(finding.id)?.is_none() {
+            return Err(StoreError::NoSuchFinding(finding.id));
+        }
+        self.put_json(FINDINGS, finding.id.0, finding)
+    }
+
+    fn list_findings(&self, project: ProjectId) -> Result<Vec<Finding>, StoreError> {
+        let all: Vec<Finding> = self.all_json(FINDINGS)?;
+        Ok(all.into_iter().filter(|f| f.project == project).collect())
+    }
+
+    fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError> {
+        let all: Vec<Finding> = self.all_json(FINDINGS)?;
+        Ok(all
+            .into_iter()
+            .filter(|f| f.raised_by == actor && f.state == FindingState::Withdrawn)
+            .count() as u64)
+    }
 }
 
 #[cfg(test)]
@@ -445,5 +481,52 @@ mod tests {
         // as 2, not 1.
         let id = store.add_project("/p").unwrap();
         assert_eq!(id.get(), 1, "a failed insert must not burn an id");
+    }
+
+    #[test]
+    fn a_finding_survives_a_close_and_reopen_with_a_real_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+
+        let id = {
+            let mut s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let r = s.add_record(p, "t").unwrap();
+            s.add_finding(Finding::raise(p, r, "reviewer", "wrong on empty")).unwrap()
+        };
+        assert_ne!(id.get(), 0, "the store must replace the placeholder id");
+
+        let s = RedbStore::open(&path).unwrap();
+        let back = s.get_finding(id).unwrap().unwrap();
+        assert_eq!(back.id, id);
+        assert_eq!(back.state, FindingState::Raised);
+    }
+
+    #[test]
+    fn withdrawals_are_counted_against_whoever_raised_the_finding_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+
+        {
+            let mut s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let r = s.add_record(p, "t").unwrap();
+
+            for claim in ["a", "b"] {
+                let id = s.add_finding(Finding::raise(p, r, "hasty", claim)).unwrap();
+                let mut f = s.get_finding(id).unwrap().unwrap();
+                f.withdraw("not concrete").unwrap();
+                s.update_finding(&f).unwrap();
+            }
+            let id = s.add_finding(Finding::raise(p, r, "careful", "c")).unwrap();
+            let mut f = s.get_finding(id).unwrap().unwrap();
+            f.attach_reproduction(GateId(1)).unwrap();
+            s.update_finding(&f).unwrap();
+        }
+
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(s.withdrawals_by("hasty").unwrap(), 2);
+        assert_eq!(s.withdrawals_by("careful").unwrap(), 0);
+        assert_eq!(s.withdrawals_by("nobody").unwrap(), 0);
     }
 }

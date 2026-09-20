@@ -1,4 +1,5 @@
-use crate::ids::{GateId, ProjectId, RecordId};
+use crate::finding::{Finding, FindingState};
+use crate::ids::{FindingId, GateId, ProjectId, RecordId};
 use crate::log::{Attempt, GateRun};
 use crate::model::{
     GateDef, GateKind, Project, Record, Selector, State, Transition,
@@ -11,6 +12,8 @@ pub enum StoreError {
     NoSuchGate(GateId),
     #[error("no such record: {0}")]
     NoSuchRecord(RecordId),
+    #[error("no such finding: {0}")]
+    NoSuchFinding(FindingId),
     #[error("backend failure: {0}")]
     Backend(String),
 }
@@ -58,6 +61,18 @@ pub trait Store {
     fn append_attempt(&mut self, attempt: Attempt) -> Result<(), StoreError>;
     fn gate_runs(&self, gate: GateId) -> Result<Vec<GateRun>, StoreError>;
     fn attempts(&self, project: ProjectId) -> Result<Vec<Attempt>, StoreError>;
+
+    fn add_finding(&mut self, finding: Finding) -> Result<FindingId, StoreError>;
+    fn get_finding(&self, id: FindingId) -> Result<Option<Finding>, StoreError>;
+    fn update_finding(&mut self, finding: &Finding) -> Result<(), StoreError>;
+    fn list_findings(&self, project: ProjectId) -> Result<Vec<Finding>, StoreError>;
+
+    /// How many findings this actor raised and then withdrew.
+    ///
+    /// ⚠ Decision 27 puts a cost on a claim the reviewer cannot support. A
+    /// cost nobody can read is not a cost, so this is part of the trait and
+    /// not a report bolted on later.
+    fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError>;
 }
 
 /// An in-memory `Store` for tests. Deliberately lives in `fl-core` so the
@@ -71,6 +86,7 @@ pub struct MemStore {
     records: BTreeMap<u64, Record>,
     runs: Vec<GateRun>,
     attempts: Vec<Attempt>,
+    findings: BTreeMap<u64, Finding>,
 }
 
 impl MemStore {
@@ -192,6 +208,38 @@ impl Store for MemStore {
     fn attempts(&self, project: ProjectId) -> Result<Vec<Attempt>, StoreError> {
         Ok(self.attempts.iter().filter(|a| a.project == project).cloned().collect())
     }
+
+    fn add_finding(&mut self, finding: Finding) -> Result<FindingId, StoreError> {
+        let id = FindingId(self.next());
+        let mut finding = finding;
+        finding.id = id;
+        self.findings.insert(id.0, finding);
+        Ok(id)
+    }
+
+    fn get_finding(&self, id: FindingId) -> Result<Option<Finding>, StoreError> {
+        Ok(self.findings.get(&id.0).cloned())
+    }
+
+    fn update_finding(&mut self, finding: &Finding) -> Result<(), StoreError> {
+        if !self.findings.contains_key(&finding.id.0) {
+            return Err(StoreError::NoSuchFinding(finding.id));
+        }
+        self.findings.insert(finding.id.0, finding.clone());
+        Ok(())
+    }
+
+    fn list_findings(&self, project: ProjectId) -> Result<Vec<Finding>, StoreError> {
+        Ok(self.findings.values().filter(|f| f.project == project).cloned().collect())
+    }
+
+    fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError> {
+        Ok(self
+            .findings
+            .values()
+            .filter(|f| f.raised_by == actor && f.state == FindingState::Withdrawn)
+            .count() as u64)
+    }
 }
 
 #[cfg(test)]
@@ -277,6 +325,52 @@ mod tests {
         let back = s.get_gate(g).unwrap().unwrap();
         assert_eq!(back.authored_at_commit, "def");
         assert_eq!(back.name, "fmt");
+    }
+
+    #[test]
+    fn a_finding_round_trips_and_gets_a_real_id() {
+        let mut s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(p, "t").unwrap();
+        let id = s.add_finding(Finding::raise(p, r, "reviewer", "wrong on empty")).unwrap();
+        assert_ne!(id.get(), 0, "the store must replace the placeholder id");
+        let back = s.get_finding(id).unwrap().unwrap();
+        assert_eq!(back.id, id);
+        assert_eq!(back.state, FindingState::Raised);
+    }
+
+    #[test]
+    fn withdrawals_are_counted_against_whoever_raised_the_finding() {
+        let mut s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(p, "t").unwrap();
+
+        for claim in ["a", "b"] {
+            let id = s.add_finding(Finding::raise(p, r, "hasty", claim)).unwrap();
+            let mut f = s.get_finding(id).unwrap().unwrap();
+            f.withdraw("not concrete").unwrap();
+            s.update_finding(&f).unwrap();
+        }
+        let id = s.add_finding(Finding::raise(p, r, "careful", "c")).unwrap();
+        let mut f = s.get_finding(id).unwrap().unwrap();
+        f.attach_reproduction(GateId(1)).unwrap();
+        s.update_finding(&f).unwrap();
+
+        assert_eq!(s.withdrawals_by("hasty").unwrap(), 2);
+        assert_eq!(s.withdrawals_by("careful").unwrap(), 0);
+        assert_eq!(s.withdrawals_by("nobody").unwrap(), 0);
+    }
+
+    #[test]
+    fn findings_are_listed_per_project() {
+        let mut s = MemStore::default();
+        let a = s.add_project("/a").unwrap();
+        let b = s.add_project("/b").unwrap();
+        let ra = s.add_record(a, "t").unwrap();
+        let rb = s.add_record(b, "t").unwrap();
+        s.add_finding(Finding::raise(a, ra, "r", "one")).unwrap();
+        s.add_finding(Finding::raise(b, rb, "r", "two")).unwrap();
+        assert_eq!(s.list_findings(a).unwrap().len(), 1);
     }
 
     fn sample_kind() -> GateKind {
