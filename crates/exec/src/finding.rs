@@ -2,8 +2,9 @@ use crate::evaluate::{GateReport, run_single_gate};
 use crate::population::ExecError;
 use fl_core::finding::FindingState;
 use fl_core::ids::{FindingId, GateId};
+use fl_core::model::Selector;
 use fl_core::store::Store;
-use fl_core::verdict::Verdict;
+use fl_core::verdict::{FailReason, Verdict};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FindingExecError {
@@ -22,6 +23,19 @@ pub enum FindingExecError {
          A broken instrument proves nothing in either direction."
     )]
     ReproductionErrored { name: String, detail: String },
+    #[error(
+        "gate `{name}` examined nothing: its selector ({selector}) matched zero paths under \
+         `{root}`. That is not a reproduction — a check that looked at nothing cannot tell you \
+         whether the defect is present, and `EmptyPopulation` is refused as evidence for the \
+         same reason a passing gate is. Point the selector at files that exist under this \
+         project's root, then reproduce again: a reproduction must be observed failing over \
+         something."
+    )]
+    ReproductionEmptyPopulation {
+        name: String,
+        selector: String,
+        root: String,
+    },
     #[error("finding {0} is in state {1}, and only an assigned finding can be verified")]
     NotAssigned(FindingId, &'static str),
     #[error("finding {0} has no reproduction")]
@@ -80,6 +94,18 @@ impl FixReport {
     }
 }
 
+/// Render a selector the way a refusal message names it: readable, and
+/// specific enough that the person refused can go fix the thing named.
+fn describe_selector(selector: &Selector) -> String {
+    match selector {
+        Selector::Glob { pattern } => format!("glob `{pattern}`"),
+        Selector::Changed { base } => format!("changed-since `{base}`"),
+        Selector::Command { program, args } => {
+            format!("command `{program} {}`", args.join(" "))
+        }
+    }
+}
+
 /// Attach a reproduction to a finding, by RUNNING it first.
 ///
 /// ⚠⚠ The attachment is refused unless the gate is observed FAILING. This is
@@ -113,6 +139,28 @@ pub fn attach_reproduction(
             return Err(FindingExecError::ReproductionErrored {
                 name: def.name,
                 detail: detail.clone(),
+            });
+        }
+        // An empty-population fail examined nothing, so it is refused for
+        // the same reason a Pass is: it is not evidence the defect is
+        // present. This must be checked BEFORE the catch-all below, which
+        // would otherwise accept it as a legitimate reproduction — and
+        // because Verdict::Pass requires a non-zero population by
+        // construction, a finding reproduced this way could never close
+        // through any repair.
+        Verdict::Fail {
+            reason: FailReason::EmptyPopulation,
+            ..
+        } => {
+            let root = store
+                .get_project(f.project)
+                .map_err(|e| FindingExecError::Store(e.to_string()))?
+                .map(|p| p.root)
+                .unwrap_or_default();
+            return Err(FindingExecError::ReproductionEmptyPopulation {
+                name: def.name,
+                selector: describe_selector(&def.selector),
+                root,
             });
         }
         Verdict::Fail { .. } => {}
@@ -273,6 +321,67 @@ mod tests {
         assert_eq!(
             s.get_finding(f).unwrap().unwrap().state,
             FindingState::Raised
+        );
+    }
+
+    // ⚠⚠ CRITICAL fix-wave finding 1: a gate whose selector matches zero
+    // paths FAILS with `FailReason::EmptyPopulation`, not `Pass`. Before
+    // this test existed, `attach_reproduction`'s catch-all `Verdict::Fail {
+    // .. } => {}` accepted that as a reproduction — a check that examined
+    // nothing, accepted as evidence the defect is present. Because
+    // `Verdict::Pass` requires a non-zero population by construction, a
+    // finding reproduced this way could never close through any repair:
+    // `verify_finding` re-runs the same selector, which still matches
+    // nothing, which still fails `EmptyPopulation`, forever.
+    #[test]
+    fn a_reproduction_whose_selector_matches_nothing_is_refused_and_leaves_the_finding_raised() {
+        let d = repo();
+        let mut s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(p, "t").unwrap();
+        let head = crate::git::Git::head(d.path()).unwrap();
+        let g = s
+            .add_gate(
+                p,
+                "empty",
+                GateKind::Command(CommandSpec {
+                    program: "true".into(),
+                    args: vec![],
+                    delivery: PopulationDelivery::Args,
+                    timeout_secs: 10,
+                    pass_codes: vec![0],
+                }),
+                Selector::Glob {
+                    pattern: "nowhere/**/*.rs".into(),
+                },
+                1,
+                &head,
+                "tester",
+            )
+            .unwrap();
+        let f = s
+            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .unwrap();
+
+        let err = attach_reproduction(&mut s, f, g).unwrap_err();
+        assert!(
+            matches!(err, FindingExecError::ReproductionEmptyPopulation { .. }),
+            "got {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("empty"), "must name the gate: {msg}");
+        assert!(
+            msg.contains("nowhere/**/*.rs"),
+            "must name the selector: {msg}"
+        );
+        assert!(
+            msg.contains(&d.path().display().to_string()),
+            "must name the root it matched zero paths under: {msg}"
+        );
+        assert_eq!(
+            s.get_finding(f).unwrap().unwrap().state,
+            FindingState::Raised,
+            "a reproduction that examined nothing must not move the finding"
         );
     }
 
