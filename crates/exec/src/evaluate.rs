@@ -548,6 +548,9 @@ mod tests {
         fn get_transition(&self, _: ProjectId, _: &str) -> Result<Option<Transition>, StoreError> {
             Err(broken())
         }
+        fn list_transitions(&self, _: ProjectId) -> Result<Vec<Transition>, StoreError> {
+            Err(broken())
+        }
         fn add_record(&mut self, _: ProjectId, _: &str) -> Result<RecordId, StoreError> {
             Err(broken())
         }

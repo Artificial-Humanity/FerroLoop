@@ -62,6 +62,12 @@ pub trait Store {
         project: ProjectId,
         name: &str,
     ) -> Result<Option<Transition>, StoreError>;
+    /// Every transition a project declares.
+    ///
+    /// Needed because a transition is addressed by NAME, but a record move is
+    /// addressed by the (from, to) pair it performs — so the move has to ask
+    /// which declarations cover it.
+    fn list_transitions(&self, project: ProjectId) -> Result<Vec<Transition>, StoreError>;
 
     fn add_record(&mut self, project: ProjectId, title: &str) -> Result<RecordId, StoreError>;
     fn get_record(&self, id: RecordId) -> Result<Option<Record>, StoreError>;
@@ -191,6 +197,15 @@ impl Store for MemStore {
             .transitions
             .get(&(project.0, name.to_string()))
             .cloned())
+    }
+
+    fn list_transitions(&self, project: ProjectId) -> Result<Vec<Transition>, StoreError> {
+        Ok(self
+            .transitions
+            .values()
+            .filter(|t| t.project == project)
+            .cloned()
+            .collect())
     }
 
     fn add_record(&mut self, project: ProjectId, title: &str) -> Result<RecordId, StoreError> {

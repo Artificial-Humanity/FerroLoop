@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::fs;
 use std::path::Path;
@@ -202,4 +203,80 @@ fn affirming_the_gate_clears_the_staleness() {
         .args(["check", "launch", "--project", "1"])
         .assert()
         .success();
+}
+
+// C5: `check` refuses the transition, and `record move` performed the very
+// state change those gates exist to protect — reading nothing, running
+// nothing, and exiting 0. The product's whole claim is "gate an action
+// before it costs you"; this was the action, ungated.
+#[test]
+fn a_record_cannot_be_moved_through_a_transition_whose_gates_fail() {
+    let f = fixture();
+    f.setup("false", "high"); // gate 2 fails; transition `launch`: review -> done
+    f.cli()
+        .args(["record", "add", "--project", "1", "--title", "work"])
+        .assert()
+        .success(); // id 3
+    f.cli()
+        .args(["record", "move", "3", "--to", "review"])
+        .assert()
+        .success();
+
+    // `check` says no.
+    f.cli()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .code(1);
+
+    // So the move must say no too, in the same words and with the same code.
+    f.cli()
+        .args(["record", "move", "3", "--to", "done"])
+        .assert()
+        .code(1)
+        .stdout(contains("FAIL").and(contains("launch")));
+
+    // And the record must not have moved.
+    f.cli()
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("review"));
+}
+
+#[test]
+fn the_same_move_is_allowed_once_the_gate_passes() {
+    let f = fixture();
+    f.setup("true", "high");
+    f.cli()
+        .args(["record", "add", "--project", "1", "--title", "work"])
+        .assert()
+        .success(); // id 3
+    f.cli()
+        .args(["record", "move", "3", "--to", "review"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["record", "move", "3", "--to", "done"])
+        .assert()
+        .success()
+        .stdout(contains("done"));
+}
+
+// The other half, and the reason this is not simply "every move is gated":
+// a move no transition declares has nothing to bypass. `todo -> review` is
+// not declared here, so it proceeds — and says so, rather than implying a
+// check ran.
+#[test]
+fn a_move_no_transition_declares_is_allowed_and_says_it_was_not_gated() {
+    let f = fixture();
+    f.setup("false", "high"); // only `review -> done` is declared
+    f.cli()
+        .args(["record", "add", "--project", "1", "--title", "work"])
+        .assert()
+        .success(); // id 3
+    f.cli()
+        .args(["record", "move", "3", "--to", "doing"])
+        .assert()
+        .success()
+        .stdout(contains("ungated"));
 }

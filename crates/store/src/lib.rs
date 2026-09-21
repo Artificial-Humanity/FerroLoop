@@ -238,6 +238,23 @@ impl Store for RedbStore {
         Ok(Some(serde_json::from_str(v.value()).map_err(decode)?))
     }
 
+    fn list_transitions(&self, project: ProjectId) -> Result<Vec<Transition>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = tx.open_table(TRANSITIONS).map_err(backend)?;
+        let mut out = Vec::new();
+        for row in table.iter().map_err(backend)? {
+            let (_, v) = row.map_err(backend)?;
+            let t: Transition = serde_json::from_str(v.value()).map_err(decode)?;
+            // Filtered on the stored field rather than on the key's `{id}:`
+            // prefix: the key is a formatting convention, the field is the
+            // fact, and only one of the two is checked by the type system.
+            if t.project == project {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
     fn add_record(&mut self, project: ProjectId, title: &str) -> Result<RecordId, StoreError> {
         let id = self.bump_and_put(NEXT_ID, RECORDS, |id| Record {
             id: RecordId(id),
@@ -336,6 +353,49 @@ mod tests {
 
         let s = RedbStore::open(&path).unwrap();
         assert_eq!(s.get_project(id).unwrap().unwrap().root, "/tmp/p");
+    }
+
+    // `record move` asks which transitions cover a (from, to) pair, so this
+    // scan decides whether a move is gated at all. A scan that leaked another
+    // project's transitions would gate a move against the wrong repository's
+    // tree; one that dropped its own would let a gated move through ungated.
+    #[test]
+    fn list_transitions_returns_every_transition_of_one_project_and_no_others() {
+        use fl_core::model::{Regret, Transition};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let mut s = RedbStore::open(&path).unwrap();
+
+        for (project, name) in [(1u64, "launch"), (1, "ship"), (2, "launch")] {
+            s.add_transition(Transition {
+                project: ProjectId(project),
+                name: name.into(),
+                from: State::Review,
+                to: State::Done,
+                regret: Regret::High,
+                gates: vec![],
+            })
+            .unwrap();
+        }
+
+        let mut names: Vec<String> = s
+            .list_transitions(ProjectId(1))
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["launch".to_string(), "ship".to_string()]);
+        // Project 2 has a transition of the SAME name, so a scan that keyed
+        // on the name alone would return it here.
+        assert!(
+            s.list_transitions(ProjectId(1))
+                .unwrap()
+                .iter()
+                .all(|t| t.project == ProjectId(1))
+        );
+        assert_eq!(s.list_transitions(ProjectId(2)).unwrap().len(), 1);
+        assert_eq!(s.list_transitions(ProjectId(3)).unwrap().len(), 0);
     }
 
     #[test]
