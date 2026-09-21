@@ -54,10 +54,8 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let Some(to_state) = State::from_wire(&to) else {
                 bail!("`{to}` is not a state. Valid states are: {STATES}.");
             };
-            let regret_val = match regret.as_str() {
-                "low" => Regret::Low,
-                "high" => Regret::High,
-                _ => bail!("`{regret}` is not a regret level. Valid values are: {REGRETS}."),
+            let Some(regret_val) = Regret::from_wire(&regret) else {
+                bail!("`{regret}` is not a regret level. Valid values are: {REGRETS}.");
             };
             for g in &gate {
                 if store.get_gate(GateId(*g))?.is_none() {

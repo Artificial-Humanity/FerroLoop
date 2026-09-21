@@ -25,7 +25,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
     let mut total_cost = 0u64;
     let mut total_ms = 0u64;
     for a in &attempts {
-        *by_status.entry(format!("{:?}", a.status)).or_default() += 1;
+        *by_status.entry(a.status.as_wire().to_string()).or_default() += 1;
         total_cost += a.cost_usd_micros;
         total_ms += a.duration_ms;
     }

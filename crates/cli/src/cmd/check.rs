@@ -3,7 +3,6 @@ use clap::Args;
 use fl_core::ids::{ProjectId, RecordId};
 use fl_core::stale::Staleness;
 use fl_core::store::Store;
-use fl_core::verdict::Verdict;
 use fl_exec::evaluate::evaluate_transition;
 
 #[derive(Args)]
@@ -26,18 +25,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     for g in &report.gates {
-        let (label, detail) = match &g.verdict {
-            Verdict::Pass { population, .. } => {
-                ("PASS".to_string(), format!("{} examined", population.get()))
-            }
-            Verdict::Fail {
-                population, reason, ..
-            } => (
-                "FAIL".to_string(),
-                format!("{reason:?}, {population} examined"),
-            ),
-            Verdict::Error { detail, .. } => ("ERROR".to_string(), detail.clone()),
-        };
+        let (label, detail) = g.verdict.describe();
         let note = match g.staleness {
             Staleness::Fresh => "",
             Staleness::StaleWarn => "  (stale: the gate's population moved since it was stamped)",

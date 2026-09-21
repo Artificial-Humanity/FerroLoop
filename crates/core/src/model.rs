@@ -2,6 +2,7 @@ use crate::ids::{GateId, ProjectId, RecordId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum State {
     Todo,
     Doing,
@@ -38,15 +39,34 @@ impl State {
 /// Declared by the project. Telemetry audits the declaration but never
 /// changes it — irreversibility is half of regret and no measurement sees it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Regret {
     #[default]
     Low,
     High,
 }
 
+impl Regret {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Regret::Low => "low",
+            Regret::High => "high",
+        }
+    }
+
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "low" => Regret::Low,
+            "high" => Regret::High,
+            _ => return None,
+        })
+    }
+}
+
 /// How a gate names the things it must examine. Resolved fresh at run time
 /// and never persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Selector {
     Glob { pattern: String },
     Changed { base: String },
@@ -55,6 +75,7 @@ pub enum Selector {
 
 /// How the resolved population reaches a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PopulationDelivery {
     Args,
     Stdin,
@@ -78,6 +99,7 @@ pub struct AgentSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GateKind {
     Command(CommandSpec),
     Agent(AgentSpec),
@@ -181,5 +203,60 @@ mod tests {
         };
         assert_eq!(t.regret, Regret::High);
         assert_eq!(t.gates.len(), 2);
+    }
+
+    #[test]
+    fn a_states_serde_form_is_the_same_string_as_its_wire_name() {
+        // The two spellings must not drift. `as_wire` is what the CLI accepts
+        // and prints; the serde form is what lands in JSON and in the store.
+        for st in [
+            State::Todo,
+            State::Doing,
+            State::Review,
+            State::Done,
+            State::NeedsHuman,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&st).expect("serialize"),
+                format!("\"{}\"", st.as_wire()),
+                "{st:?} serializes to a different string than it prints"
+            );
+        }
+    }
+
+    #[test]
+    fn a_regrets_serde_form_is_the_same_string_as_its_wire_name() {
+        for r in [Regret::Low, Regret::High] {
+            assert_eq!(
+                serde_json::to_string(&r).expect("serialize"),
+                format!("\"{}\"", r.as_wire())
+            );
+            assert_eq!(Regret::from_wire(r.as_wire()), Some(r));
+        }
+        assert_eq!(Regret::from_wire("Low"), None);
+    }
+
+    #[test]
+    fn the_remaining_wire_enums_are_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&Selector::Glob {
+                pattern: "*.rs".into()
+            })
+            .expect("serialize"),
+            r#"{"glob":{"pattern":"*.rs"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PopulationDelivery::FileList).expect("serialize"),
+            r#""file_list""#
+        );
+        assert_eq!(
+            serde_json::to_string(&GateKind::Agent(AgentSpec {
+                adapter: "claude".into(),
+                question: "?".into(),
+                timeout_secs: 1,
+            }))
+            .expect("serialize"),
+            r#"{"agent":{"adapter":"claude","question":"?","timeout_secs":1}}"#
+        );
     }
 }

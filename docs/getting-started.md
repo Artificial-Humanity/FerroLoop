@@ -156,7 +156,7 @@ EOF
 $ git add -A && git commit -qm "broke the config"
 
 $ flctl --db /tmp/gs-demo/store.redb check launch --project 1
-FAIL	config-parses	Predicate, 1 examined	75ms  (stale)
+FAIL	config-parses	predicate, 1 examined	75ms  (stale)
 	| Traceback (most recent call last):
 	|   File "<string>", line 1, in <module>
 	|     import json,sys;[json.load(open(p)) for p in sys.argv[1:]]
@@ -180,7 +180,7 @@ $ echo "exit: $?"
 exit: 1
 ```
 
-The launch is refused. `FAIL` names the gate (`config-parses`) and the reason (`Predicate`
+The launch is refused. `FAIL` names the gate (`config-parses`) and the reason (`predicate`
 â€” the program ran over a real, non-empty population and returned non-zero), and the
 indented lines are the program's own output, so you can see exactly what it objected to.
 
@@ -215,7 +215,7 @@ EOF
 $ git add -A && git commit -qm "fixed the config, raised epochs"
 
 $ flctl --db /tmp/gs-demo/store.redb check launch --project 1
-FAIL	config-parses	Stale, 1 examined	25ms  (stale)
+FAIL	config-parses	stale, 1 examined	25ms  (stale)
 $ echo "exit: $?"
 exit: 1
 ```
@@ -250,7 +250,7 @@ $ rm config/settings.json
 $ git add -A && git commit -qm "removed the config"
 
 $ flctl --db /tmp/gs-demo/store.redb check launch --project 1
-FAIL	config-parses	EmptyPopulation, 0 examined	0ms  (stale)
+FAIL	config-parses	empty_population, 0 examined	0ms  (stale)
 	| population 0 is below the declared floor of 1
 $ echo "exit: $?"
 exit: 1
@@ -260,7 +260,7 @@ The gate's own program was `python3 -c '...'` over the files the glob matches â€
 no files left, that program never even ran; there was nothing to hand it. A command over
 zero inputs is trivially true (there's a reason `true` exits `0`), and if the tool read
 that as a pass, deleting the thing a gate checks would be a way to make the gate green
-instead of a way to fail it. `EmptyPopulation` is a distinct failure reason so this reads
+instead of a way to fail it. `empty_population` is a distinct failure reason so this reads
 as exactly what it is: nothing was examined, so nothing was verified, so the launch is not
 allowed. A no-run is not a pass, no matter what ran or didn't.
 

@@ -172,17 +172,13 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
 // refusal). Pin `add`, `show` round-tripping what was stored, and the
 // refusal naming the missing gate id.
 
-// Fix round 2: `from`/`to`/`regret` used to be pinned to their exact
-// PascalCase wire form (`"Review"`, `"Done"`, `"Low"`), which is an accident
-// of the bare `#[derive(Serialize)]` on `State`/`Regret` — not a designed
-// contract. That casing is the owner's open, undecided question (see the
-// parked Minor in Fix Round 1: `show` emits `"Todo"`/`"Low"` where text-mode
-// output prints `"todo"`/`"low"`). A CLI test must not quietly ratify one
-// side of that decision. So this parses the JSON and compares `from`/`to`/
-// `regret` case-insensitively, keeping the round-trip claim (wrong field,
-// wrong value, or missing output all still fail this test) without pinning
-// which casing wins. `name` has no such open question, so it stays an exact
-// match.
+// The casing question this test used to hold open is DECIDED (owner,
+// 2026-09-21): snake_case on the wire, everywhere. `from`/`to`/`regret` are
+// therefore pinned exactly again, and case-insensitively is no longer good
+// enough — a regression back to `"Review"` must fail here, not pass.
+// `fl-core` holds the matching claim that each enum's serde form and its
+// `as_wire` name are the same string; this test is the end-to-end half,
+// against the real binary.
 #[test]
 fn a_transition_can_be_added_and_shown() {
     let d = tempfile::tempdir().unwrap();
@@ -219,21 +215,9 @@ fn a_transition_can_be_added_and_shown() {
     let json: serde_json::Value =
         serde_json::from_slice(&output).expect("`transition show` must print valid JSON");
 
-    let from = json["from"]
-        .as_str()
-        .expect("`from` must be a string")
-        .to_lowercase();
-    let to = json["to"]
-        .as_str()
-        .expect("`to` must be a string")
-        .to_lowercase();
-    let regret = json["regret"]
-        .as_str()
-        .expect("`regret` must be a string")
-        .to_lowercase();
-    assert_eq!(from, "review", "got {json}");
-    assert_eq!(to, "done", "got {json}");
-    assert_eq!(regret, "low", "got {json}");
+    assert_eq!(json["from"].as_str(), Some("review"), "got {json}");
+    assert_eq!(json["to"].as_str(), Some("done"), "got {json}");
+    assert_eq!(json["regret"].as_str(), Some("low"), "got {json}");
 }
 
 #[test]

@@ -3,7 +3,6 @@ use clap::Subcommand;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
 use fl_core::store::Store;
-use fl_core::verdict::Verdict;
 use fl_exec::evaluate::run_single_gate;
 
 #[derive(Subcommand)]
@@ -146,18 +145,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             };
             let report = run_single_gate(store, g.project, GateId(id))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let (label, detail) = match &report.verdict {
-                Verdict::Pass { population, .. } => {
-                    ("PASS".to_string(), format!("{} examined", population.get()))
-                }
-                Verdict::Fail {
-                    population, reason, ..
-                } => (
-                    "FAIL".to_string(),
-                    format!("{reason:?}, {population} examined"),
-                ),
-                Verdict::Error { detail, .. } => ("ERROR".to_string(), detail.clone()),
-            };
+            let (label, detail) = report.verdict.describe();
             println!("{label}\t{}\t{detail}", g.name);
             return Ok(report.verdict.exit_code());
         }

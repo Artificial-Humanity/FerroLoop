@@ -75,7 +75,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         output_excerpt: outcome.output_excerpt.clone(),
     })?;
 
-    println!("{:?}\t{}ms", outcome.status, outcome.duration_ms);
+    println!("{}\t{}ms", outcome.status.as_wire(), outcome.duration_ms);
     if !outcome.output_excerpt.is_empty() {
         for line in outcome.output_excerpt.lines().take(40) {
             println!("\t| {line}");

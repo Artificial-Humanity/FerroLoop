@@ -98,8 +98,8 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 );
             } else {
                 println!(
-                    "REPRODUCTION\tstill fails: {:?}{}",
-                    report.reproduction.verdict,
+                    "REPRODUCTION\tstill fails: {}{}",
+                    report.reproduction.verdict.describe().1,
                     stale_note(report.reproduction.staleness)
                 );
             }
@@ -120,9 +120,9 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
 
             for r in &report.regressions {
                 println!(
-                    "REGRESSION\t{}\t{:?}{}",
+                    "REGRESSION\t{}\t{}{}",
                     r.name,
-                    r.verdict,
+                    r.verdict.describe().1,
                     stale_note(r.staleness)
                 );
             }

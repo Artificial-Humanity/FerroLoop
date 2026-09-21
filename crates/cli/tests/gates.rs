@@ -154,7 +154,7 @@ fn a_commit_inside_the_population_fails_a_high_regret_gate_as_stale() {
         .args(["check", "launch", "--project", "1"])
         .assert()
         .code(1)
-        .stdout(contains("Stale"));
+        .stdout(contains("stale"));
 }
 
 #[test]

@@ -15,6 +15,7 @@ pub enum FindingError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FindingState {
     Raised,
     Reproduced,
@@ -226,5 +227,22 @@ mod tests {
         assert_eq!(f.assigned_to.as_deref(), Some("fixer_two"));
         assert_eq!(f.state, FindingState::Assigned);
         assert_eq!(f.reproduction, Some(GateId(9)), "reproduction stays intact");
+    }
+
+    #[test]
+    fn a_finding_states_serde_form_is_the_same_string_as_its_wire_name() {
+        for st in [
+            FindingState::Raised,
+            FindingState::Reproduced,
+            FindingState::Assigned,
+            FindingState::Fixed,
+            FindingState::Withdrawn,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&st).expect("serialize"),
+                format!("\"{}\"", st.as_wire())
+            );
+            assert_eq!(FindingState::from_wire(st.as_wire()), Some(st));
+        }
     }
 }
