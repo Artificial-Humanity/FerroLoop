@@ -95,8 +95,9 @@ The `1` is the project's id. Everything below uses `--project 1`.
 
 ## 3. Write a gate
 
-A gate names a glob (the population it examines) and a program to run against every
-matching file. Here the population is every `config/*.json` file, and the program is
+A gate names a population — the things it must examine — and a program to run against
+them. A glob is one of three ways to name that population; [section 13](#13-three-ways-to-name-a-population)
+covers the other two. Here the population is every `config/*.json` file, and the program is
 `python3 -c '...'` — a validator that parses each one as JSON and fails loudly if it can't.
 
 ```
@@ -457,6 +458,100 @@ exit: 2
 Everything that crosses the boundary — printed text, stored bytes, JSON, and values you
 type back in — uses one snake_case spelling. The list in that refusal is generated from the
 same source the parser reads, so it can never offer you a value that would then be rejected.
+
+## 13. Three ways to name a population
+
+Every gate so far used `--glob`. There are three, and a gate must pick exactly one — there
+is no default, because a gate that does not say what it examines is the empty-population
+failure waiting to happen.
+
+```
+$ flctl --db /tmp/gs-demo/store.redb gate add --project 1 --name nameless --program true
+error: the following required arguments were not provided:
+  <--glob <GLOB>|--changed-since <REF>|--population-from <PROGRAM>>
+
+Usage: flctl gate add --project <PROJECT> --name <NAME> --program <PROGRAM> <--glob <GLOB>|--changed-since <REF>|--population-from <PROGRAM>>
+
+For more information, try '--help'.
+$ echo "exit: $?"
+exit: 2
+```
+
+**`--changed-since <REF>`** examines whatever differs from a git ref, so the gate's cost
+tracks the size of the change rather than the size of the repository:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb gate add \
+    --project 1 --name touched-recently --kind command --changed-since HEAD~1 \
+    --program python3 --arg=-c \
+    --arg="import json,sys;[json.load(open(p)) for p in sys.argv[1:] if p.endswith('.json')]" \
+    --authored-by you
+8	touched-recently	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
+
+$ flctl --db /tmp/gs-demo/store.redb gate run 8
+PASS	touched-recently	1 examined
+```
+
+⚠ Read that `1 examined` before you trust it. A `--changed-since` population shrinks when
+the change is small — which is the point — but it also shrinks to nothing when there is no
+change at all, and a gate over nothing fails. That is the same rule as everywhere else, and
+it is the reason this selector is safe to use: it cannot quietly examine less than it claims.
+
+**`--population-from <PROGRAM>`** takes the population from a program's stdout, one path per
+line, run in the project root. Use it when neither a glob nor a diff says what you mean —
+here, "the config files git actually tracks":
+
+```
+$ cat > list-configs.sh <<'EOF'
+#!/bin/sh
+git ls-files 'config/*.json'
+EOF
+$ chmod +x list-configs.sh
+
+$ flctl --db /tmp/gs-demo/store.redb gate add \
+    --project 1 --name listed-configs --kind command \
+    --population-from /tmp/gs-demo/project/list-configs.sh \
+    --program python3 --arg=-c \
+    --arg="import json,sys;[json.load(open(p)) for p in sys.argv[1:]]" \
+    --authored-by you
+9	listed-configs	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
+
+$ flctl --db /tmp/gs-demo/store.redb gate run 9
+PASS	listed-configs	1 examined
+```
+
+Pass arguments to it with `--population-arg`, repeatable, and remember the `=` form for a
+value that starts with `-`.
+
+### A lister that fails has not told you the population is empty
+
+This is the one trap worth spelling out, because the two outcomes look alike and mean
+opposite things. If the listing program exits non-zero, the population is **unknown** — not
+empty:
+
+```
+$ cat > broken-list.sh <<'EOF'
+#!/bin/sh
+echo "fatal: not a git repository" >&2
+exit 128
+EOF
+$ chmod +x broken-list.sh
+
+$ flctl --db /tmp/gs-demo/store.redb gate add \
+    --project 1 --name broken-lister --kind command \
+    --population-from /tmp/gs-demo/project/broken-list.sh --program true --authored-by you
+10	broken-lister	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
+
+$ flctl --db /tmp/gs-demo/store.redb gate run 10
+ERROR	broken-lister	population command `/tmp/gs-demo/project/broken-list.sh` exited 128, so the population is unknown, not empty: fatal: not a git repository
+$ echo "exit: $?"
+exit: 2
+```
+
+`ERROR` and exit `2`, not `empty_population` and exit `1`. The difference matters because
+the two send you to different places: `empty_population` says your file tree has nothing the
+gate covers, and would have had you hunting through `config/` for a file that was never the
+problem. This says your listing program broke, and hands you its own complaint to read.
 
 ## Where this leaves you
 

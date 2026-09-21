@@ -19,6 +19,19 @@ pub enum ExecError {
     Store(String),
     #[error("command `{0}` could not be run: {1}")]
     Spawn(String, String),
+    /// ⚠ A population command that exits non-zero has told you nothing about
+    /// the population, which is not the same as telling you it is empty.
+    /// Reporting it as an empty population would blame the file tree for a
+    /// fault in the listing program — the same shape as [`ExecError::Store`]
+    /// once announcing itself as `git failed:`.
+    #[error(
+        "population command `{program}` exited {code}, so the population is unknown, not empty: {stderr}"
+    )]
+    PopulationCommand {
+        program: String,
+        code: String,
+        stderr: String,
+    },
     #[error("command `{0}` exceeded its {1}s timeout")]
     Timeout(String, u64),
 }
@@ -98,6 +111,18 @@ pub fn resolve(
                 .current_dir(&abs_root)
                 .output()
                 .map_err(|e| ExecError::Spawn(program.clone(), e.to_string()))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(ExecError::PopulationCommand {
+                    program: program.clone(),
+                    code: output
+                        .status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "on a signal".into()),
+                    stderr: stderr.trim().to_string(),
+                });
+            }
             let text = String::from_utf8_lossy(&output.stdout);
             let mut out: Vec<PathBuf> = text
                 .lines()
@@ -133,6 +158,32 @@ mod tests {
         fn changed_since(&self, _root: &Path, _base: &str) -> Result<Vec<PathBuf>, ExecError> {
             Ok(vec![])
         }
+    }
+
+    // REPRODUCTION (C6): `Selector::Command` reads the program's stdout and
+    // never looks at its exit status, so a population command that FAILS
+    // resolves to zero paths. The gate then refuses with `empty_population`
+    // — the right answer for the wrong reason, and it points the reader at
+    // their file tree when the fault is in the listing program. An unknown
+    // population is not an empty one.
+    #[test]
+    fn a_population_command_that_fails_is_an_error_not_an_empty_population() {
+        let d = tree();
+        let sel = Selector::Command {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo 'fatal: not a git repository' >&2; exit 128".into(),
+            ],
+        };
+        let err = resolve(d.path(), &sel, &NoChanges)
+            .expect_err("a failed population command cannot report a population");
+        let msg = err.to_string();
+        assert!(msg.contains("128"), "does not name the exit status: {msg}");
+        assert!(
+            msg.contains("not a git repository"),
+            "does not carry the program's own complaint: {msg}"
+        );
     }
 
     #[test]
