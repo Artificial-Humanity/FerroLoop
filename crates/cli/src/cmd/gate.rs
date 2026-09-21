@@ -5,29 +5,56 @@ use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
 use fl_core::store::Store;
 use fl_exec::evaluate::run_single_gate;
 
+/// Declare a gate: a population to examine, and a program to run over it.
+///
+/// The population comes from exactly one of `--glob`, `--changed-since`
+/// or `--population-from`. There is no default: a gate that does not say
+/// what it examines is the empty-population failure waiting to happen.
+#[derive(clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("population")
+        .required(true)
+        .args(["glob", "changed_since", "population_from"])
+))]
+pub struct AddArgs {
+    #[arg(long)]
+    project: u64,
+    #[arg(long)]
+    name: String,
+    /// `command` or `agent`.
+    #[arg(long, default_value = "command")]
+    kind: String,
+    /// Population: every file matching this glob, walked from the project root.
+    #[arg(long)]
+    glob: Option<String>,
+    /// Population: every file that differs from this git ref.
+    #[arg(long, value_name = "REF")]
+    changed_since: Option<String>,
+    /// Population: the paths this program prints on stdout, one per line.
+    /// It runs in the project root, and a non-zero exit is an error — an
+    /// unknown population, never an empty one.
+    #[arg(long, value_name = "PROGRAM")]
+    population_from: Option<String>,
+    /// An argument for `--population-from`. Repeatable. Use the `--x=-v`
+    /// form for any value that starts with `-`.
+    #[arg(long, value_name = "VALUE", num_args = 0.., requires = "population_from")]
+    population_arg: Vec<String>,
+    /// The program the gate runs over the population it resolved.
+    #[arg(long)]
+    program: String,
+    #[arg(long, num_args = 0..)]
+    arg: Vec<String>,
+    #[arg(long, default_value_t = 1)]
+    min_population: u64,
+    #[arg(long, default_value_t = 300)]
+    timeout_secs: u64,
+    #[arg(long, default_value = "unknown")]
+    authored_by: String,
+}
+
 #[derive(Subcommand)]
 pub enum Cmd {
-    Add {
-        #[arg(long)]
-        project: u64,
-        #[arg(long)]
-        name: String,
-        /// `command` or `agent`.
-        #[arg(long, default_value = "command")]
-        kind: String,
-        #[arg(long)]
-        glob: String,
-        #[arg(long)]
-        program: String,
-        #[arg(long, num_args = 0..)]
-        arg: Vec<String>,
-        #[arg(long, default_value_t = 1)]
-        min_population: u64,
-        #[arg(long, default_value_t = 300)]
-        timeout_secs: u64,
-        #[arg(long, default_value = "unknown")]
-        authored_by: String,
-    },
+    Add(Box<AddArgs>),
     List {
         #[arg(long)]
         project: u64,
@@ -60,17 +87,21 @@ pub enum Cmd {
 
 pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
     match cmd {
-        Cmd::Add {
-            project,
-            name,
-            kind,
-            glob,
-            program,
-            arg,
-            min_population,
-            timeout_secs,
-            authored_by,
-        } => {
+        Cmd::Add(args) => {
+            let AddArgs {
+                project,
+                name,
+                kind,
+                glob,
+                changed_since,
+                population_from,
+                population_arg,
+                program,
+                arg,
+                min_population,
+                timeout_secs,
+                authored_by,
+            } = *args;
             if kind != "command" {
                 bail!(
                     "`{kind}` is not a gate kind. Milestone 1 implements `command`. \
@@ -98,7 +129,28 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                     timeout_secs,
                     pass_codes: vec![0],
                 }),
-                Selector::Glob { pattern: glob },
+                // clap's group guarantees exactly one of the three is set,
+                // so the final arm is unreachable rather than a default. A
+                // default here would be a gate quietly examining something
+                // other than what its author asked for.
+                match (glob, changed_since, population_from) {
+                    (Some(pattern), _, _) => Selector::Glob { pattern },
+                    (_, Some(base), _) => Selector::Changed { base },
+                    (_, _, Some(program)) => Selector::Command {
+                        program,
+                        args: population_arg,
+                    },
+                    // clap's `population` group already refuses this. Not
+                    // `unreachable!()`: a panic here would be a refusal with
+                    // no guidance, and its message would name the same three
+                    // flags a real refusal does — which is precisely what let
+                    // the test for that refusal pass on a crash.
+                    (None, None, None) => bail!(
+                        "gate `{name}` does not say what it examines. Give it one of \
+                         `--glob <PATTERN>`, `--changed-since <REF>` or \
+                         `--population-from <PROGRAM>`."
+                    ),
+                },
                 min_population,
                 &head,
                 &authored_by,
