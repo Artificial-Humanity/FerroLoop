@@ -17,7 +17,10 @@ Follow [AGENTS.md](AGENTS.md) for repository rules and git configuration.
 * Keep the owner's configured git author identity. Use [PERSONA.md](PERSONA.md)
   for the agent's co-author identity.
 * Follow the review cycle even without mechanical enforcement. `main` has no branch
-  protection or pre-push gate; CI runs after a push. Observe the git safeguards in
-  `AGENTS.md`.
+  protection and no pre-push gate. Observe the git safeguards in `AGENTS.md`.
+* CI runs the verification trio on every push and pull request:
+  [.github/workflows/verify.yml](.github/workflows/verify.yml). It **reports; it does not
+  block** — nothing stops a red branch from being merged, so read the run rather than
+  assuming it. Run the trio locally before pushing; CI is the second reader, not the first.
 * Use the workflow stated here. Do not reconstruct additional rules from retired
   workflows or git history; changes to the workflow belong to the owner.
