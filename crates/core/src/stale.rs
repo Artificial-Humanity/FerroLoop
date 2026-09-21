@@ -8,6 +8,19 @@ pub enum Staleness {
     StaleFail,
 }
 
+impl Staleness {
+    /// The marker appended to a printed line. One wording, in one place —
+    /// `check` and `finding verify` used to carry two different sentences for
+    /// `StaleWarn`, which is the same defect as two spellings of a wire name.
+    pub fn note(self) -> &'static str {
+        match self {
+            Staleness::Fresh => "",
+            Staleness::StaleWarn => "  (stale: the gate's population moved since it was stamped)",
+            Staleness::StaleFail => "  (stale)",
+        }
+    }
+}
+
 /// A gate is stale when the things it covers have moved and the gate has not.
 ///
 /// ⚠ Both inputs are computed over the gate's OWN population, never over the
@@ -91,5 +104,28 @@ mod tests {
         let (v, s) = apply_staleness(broken.clone(), true, Regret::High);
         assert_eq!(v, broken);
         assert_eq!(s, Staleness::StaleFail);
+    }
+
+    // ⚠ `note` is a three-arm match, and its `StaleWarn` arm is the one no
+    // integration test reaches. It used to exist twice with two different
+    // wordings — `check` said the population moved, `finding verify` said the
+    // code beneath it moved — which is the same defect as two spellings of a
+    // wire name. One wording now, pinned here.
+    #[test]
+    fn a_fresh_gate_gets_no_note() {
+        assert_eq!(Staleness::Fresh.note(), "");
+    }
+
+    #[test]
+    fn a_warning_names_what_moved_and_why_that_matters() {
+        assert_eq!(
+            Staleness::StaleWarn.note(),
+            "  (stale: the gate's population moved since it was stamped)"
+        );
+    }
+
+    #[test]
+    fn a_failing_staleness_gets_the_short_form() {
+        assert_eq!(Staleness::StaleFail.note(), "  (stale)");
     }
 }

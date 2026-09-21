@@ -181,6 +181,12 @@ impl Verdict {
     }
 }
 
+crate::wire::wire_tags!(Verdict as verdict_wire {
+    Verdict::Pass { .. } => "pass", Verdict::from_predicate(true, 1);
+    Verdict::Fail { .. } => "fail", Verdict::from_predicate(false, 1);
+    Verdict::Error { .. } => "error", Verdict::error("e");
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;

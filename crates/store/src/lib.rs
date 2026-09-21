@@ -567,10 +567,11 @@ mod tests {
         let err = s.get_record(RecordId(1)).expect_err("must refuse");
         let msg = err.to_string();
         assert!(msg.contains("unknown variant"), "got {msg}");
-        assert!(msg.contains("There is no migration"), "got {msg}");
+        assert!(msg.contains("there is no migration"), "got {msg}");
+        assert!(msg.contains("restore the file from a backup"), "got {msg}");
         assert!(
-            !matches!(err, StoreError::Backend(_)),
-            "a decode failure is not a backend failure: {err:?}"
+            matches!(err, StoreError::Decode(_)),
+            "a decode failure must be Decode, not merely not-Backend: {err:?}"
         );
     }
 }

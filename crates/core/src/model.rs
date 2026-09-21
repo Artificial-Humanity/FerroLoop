@@ -115,6 +115,36 @@ pub struct Record {
     pub state: State,
 }
 
+crate::wire::wire_tags!(Selector as selector_wire {
+    Selector::Glob { .. } => "glob", Selector::Glob { pattern: "*.rs".into() };
+    Selector::Changed { .. } => "changed", Selector::Changed { base: "main".into() };
+    Selector::Command { .. } => "command", Selector::Command {
+        program: "ls".into(),
+        args: Vec::new(),
+    };
+});
+
+crate::wire::wire_tags!(PopulationDelivery as population_delivery_wire {
+    PopulationDelivery::Args => "args", PopulationDelivery::Args;
+    PopulationDelivery::Stdin => "stdin", PopulationDelivery::Stdin;
+    PopulationDelivery::FileList => "file_list", PopulationDelivery::FileList;
+});
+
+crate::wire::wire_tags!(GateKind as gate_kind_wire {
+    GateKind::Command(_) => "command", GateKind::Command(CommandSpec {
+        program: "true".into(),
+        args: Vec::new(),
+        delivery: PopulationDelivery::Args,
+        timeout_secs: 1,
+        pass_codes: vec![0],
+    });
+    GateKind::Agent(_) => "agent", GateKind::Agent(AgentSpec {
+        adapter: "a".into(),
+        question: "q".into(),
+        timeout_secs: 1,
+    });
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;

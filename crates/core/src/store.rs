@@ -20,9 +20,11 @@ pub enum StoreError {
     /// complaint tells the reader what broke but not what to do.
     #[error(
         "a stored record could not be read: {0}. \
-         This usually means the store was written by a different version of \
-         this tool, whose wire format has since changed. There is no migration: \
-         start a new store, or keep using the version that wrote this one."
+         Two things produce this and the message cannot tell them apart. \
+         Either the store was written by a version of this tool whose wire \
+         format has since changed — there is no migration, so start a new \
+         store or keep using the version that wrote this one — or the stored \
+         bytes are damaged, in which case restore the file from a backup."
     )]
     Decode(String),
 }

@@ -1,7 +1,6 @@
 use anyhow::Result;
 use clap::Args;
 use fl_core::ids::{ProjectId, RecordId};
-use fl_core::stale::Staleness;
 use fl_core::store::Store;
 use fl_exec::evaluate::evaluate_transition;
 
@@ -26,11 +25,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
 
     for g in &report.gates {
         let (label, detail) = g.verdict.describe();
-        let note = match g.staleness {
-            Staleness::Fresh => "",
-            Staleness::StaleWarn => "  (stale: the gate's population moved since it was stamped)",
-            Staleness::StaleFail => "  (stale)",
-        };
+        let note = g.staleness.note();
         println!("{label}\t{}\t{detail}\t{}ms{note}", g.name, g.duration_ms);
         if !g.verdict.is_pass() && !g.output_excerpt.is_empty() {
             for line in g.output_excerpt.lines().take(20) {

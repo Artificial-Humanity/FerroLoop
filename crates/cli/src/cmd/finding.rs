@@ -2,7 +2,6 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
-use fl_core::stale::Staleness;
 use fl_core::store::Store;
 use fl_exec::finding::{attach_reproduction, verify_finding};
 use std::collections::BTreeSet;
@@ -41,18 +40,6 @@ pub enum Cmd {
         #[arg(long)]
         state: Option<String>,
     },
-}
-
-/// A short marker for a staleness reading, appended to a printed line. Text
-/// output here always uses `FindingState`/`Staleness`' own wire vocabulary,
-/// never a bespoke string, per the standing rule that casing on these wire
-/// forms is undecided and not this task's to settle.
-fn stale_note(s: Staleness) -> &'static str {
-    match s {
-        Staleness::Fresh => "",
-        Staleness::StaleWarn => "  (stale: not re-validated since the code beneath it moved)",
-        Staleness::StaleFail => "  (stale)",
-    }
 }
 
 pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
@@ -94,7 +81,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 println!(
                     "REPRODUCTION\tpasses over {} items{}",
                     report.reproduction.verdict.population().unwrap_or(0),
-                    stale_note(report.reproduction.staleness)
+                    report.reproduction.staleness.note()
                 );
             } else {
                 // ⚠ The LABEL is carried, not dropped. An ERROR is a broken
@@ -105,7 +92,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 let (label, detail) = report.reproduction.verdict.describe();
                 println!(
                     "REPRODUCTION\t{label}\t{detail}{}",
-                    stale_note(report.reproduction.staleness)
+                    report.reproduction.staleness.note()
                 );
             }
 
@@ -128,7 +115,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 println!(
                     "REGRESSION\t{}\t{label}\t{detail}{}",
                     r.name,
-                    stale_note(r.staleness)
+                    r.staleness.note()
                 );
             }
 
@@ -152,7 +139,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             // was invisible. Every evaluated neighbour now gets a line.
             for r in &report.neighbours {
                 if r.verdict.is_pass() {
-                    println!("NEIGHBOUR\t{}\tpasses{}", r.name, stale_note(r.staleness));
+                    println!("NEIGHBOUR\t{}\tpasses{}", r.name, r.staleness.note());
                 }
             }
 
@@ -179,8 +166,8 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 None => None,
                 Some(s) => Some(FindingState::from_wire(s).ok_or_else(|| {
                     anyhow::anyhow!(
-                        "`{s}` is not a finding state. Valid states are: \
-                         raised, reproduced, assigned, fixed, withdrawn."
+                        "`{s}` is not a finding state. Valid states are: {}.",
+                        FindingState::wire_values()
                     )
                 })?),
             };
@@ -207,31 +194,4 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         }
     }
     Ok(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // `stale_note` is a three-arm match with no prior test, and nothing
-    // else in the suite exercises its `StaleWarn` arm (only `Fresh`, via
-    // silence, and `StaleFail`, via the `(stale)` suffix on a REGRESSION
-    // line elsewhere).
-    #[test]
-    fn stale_note_is_empty_for_fresh() {
-        assert_eq!(stale_note(Staleness::Fresh), "");
-    }
-
-    #[test]
-    fn stale_note_names_the_moved_code_for_stale_warn() {
-        assert_eq!(
-            stale_note(Staleness::StaleWarn),
-            "  (stale: not re-validated since the code beneath it moved)"
-        );
-    }
-
-    #[test]
-    fn stale_note_is_the_short_form_for_stale_fail() {
-        assert_eq!(stale_note(Staleness::StaleFail), "  (stale)");
-    }
 }

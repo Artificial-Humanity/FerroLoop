@@ -86,18 +86,75 @@ macro_rules! wire_names {
 
             #[test]
             fn wire_values_lists_exactly_what_from_wire_accepts() {
+                // Reads every value the refusal offers and feeds it back to
+                // the parser. A refusal that names something `from_wire`
+                // rejects is worse than no refusal — it sends the reader to
+                // a value that will fail again.
                 let listed = $name::wire_values();
+                let offered: Vec<&str> = listed.split(", ").collect();
+                for value in &offered {
+                    assert!(
+                        $name::from_wire(value).is_some(),
+                        "a refusal offers `{value}`, which the parser rejects"
+                    );
+                }
                 for v in $name::ALL {
                     assert!(
-                        listed.split(", ").any(|s| s == v.as_wire()),
+                        offered.contains(&v.as_wire()),
                         "a refusal would not mention `{}`",
                         v.as_wire()
                     );
                 }
-                assert_eq!(listed.split(", ").count(), $name::ALL.len());
+                assert_eq!(offered.len(), $name::ALL.len());
+            }
+        }
+    };
+}
+
+/// The same guard for an enum that carries data, and so has no `as_wire`.
+///
+/// Its variants are not values a user types, so there is nothing to parse
+/// back — but the serialized **tag** still crosses the boundary, and it is
+/// what `gate show` prints. Each arm gives a pattern (which makes the
+/// generated match exhaustive, so a new variant is `E0004`), the tag it must
+/// serialize under, and a sample value to serialize.
+macro_rules! wire_tags {
+    ($name:ident as $tests:ident { $( $pat:pat => $wire:literal , $sample:expr );+ $(;)? }) => {
+        #[cfg(test)]
+        mod $tests {
+            #[allow(unused_imports)]
+            use super::*;
+
+            /// A variant absent from the list above makes this match
+            /// non-exhaustive: `E0004`, at compile time.
+            #[allow(dead_code)]
+            fn every_variant_is_listed(v: &$name) {
+                match v { $( $pat => (), )+ }
+            }
+
+            #[test]
+            fn every_variant_serializes_under_its_snake_case_tag() {
+                $(
+                    let value: $name = $sample;
+                    let json = serde_json::to_string(&value).expect("serialize");
+                    let tag = json
+                        .trim_start_matches('{')
+                        .split('"')
+                        .nth(1)
+                        .unwrap_or_else(|| panic!("not an externally tagged enum: {json}"));
+                    assert_eq!(tag, $wire, "wrong tag in {json}");
+                    assert!(
+                        !tag.is_empty()
+                            && tag.chars().all(|c| {
+                                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'
+                            }),
+                        "`{tag}` is not snake_case, so this variant has two spellings"
+                    );
+                )+
             }
         }
     };
 }
 
 pub(crate) use wire_names;
+pub(crate) use wire_tags;

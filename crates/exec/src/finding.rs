@@ -248,6 +248,7 @@ mod tests {
     use fl_core::ids::ProjectId;
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
     use fl_core::store::MemStore;
+    use fl_core::verdict::FailReason;
     use std::fs;
     use std::process::Command;
 
@@ -369,7 +370,18 @@ mod tests {
             "got {err}"
         );
         let msg = err.to_string();
-        assert!(msg.contains("empty"), "must name the gate: {msg}");
+        assert!(msg.contains("`empty`"), "must name the gate: {msg}");
+        // ⚠ The refusal must speak the wire spelling. It used to say
+        // `EmptyPopulation`, a Rust identifier the tool emits nowhere, which
+        // points the reader at a value that does not exist.
+        assert!(
+            msg.contains(FailReason::EmptyPopulation.as_wire()),
+            "must name the failure in its wire spelling: {msg}"
+        );
+        assert!(
+            !msg.contains("EmptyPopulation"),
+            "names a Rust identifier the tool never emits: {msg}"
+        );
         assert!(
             msg.contains("nowhere/**/*.rs"),
             "must name the selector: {msg}"
