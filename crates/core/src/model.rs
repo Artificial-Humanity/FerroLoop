@@ -19,6 +19,9 @@ crate::wire::wire_names!(State as state_wire {
     NeedsHuman => "needs_human",
 });
 
+// `transition add --from/--to` and `record move` take a state by name.
+crate::wire::wire_parse!(State as state_parse);
+
 /// How bad it is if this transition proceeds on a false pass.
 ///
 /// Declared by the project. Telemetry audits the declaration but never
@@ -35,6 +38,9 @@ crate::wire::wire_names!(Regret as regret_wire {
     Low => "low",
     High => "high",
 });
+
+// `transition add --regret` takes a regret by name.
+crate::wire::wire_parse!(Regret as regret_parse);
 
 /// How a gate names the things it must examine. Resolved fresh at run time
 /// and never persisted.

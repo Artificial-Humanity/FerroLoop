@@ -5,9 +5,12 @@
 //! of these at once: the JSON a command prints, the bytes in the store, the
 //! text a human reads, and the value the CLI accepts back.
 //!
-//! [`wire_names!`] generates `ALL`, `as_wire`, `from_wire` and `wire_values`
-//! from a single variant-to-string list, and generates the test that pins
-//! them. Two properties follow from that, and both are the point:
+//! The guard comes in two halves, because the boundary does. Every enum here
+//! is printed; only some are typed back in by a user.
+//!
+//! [`wire_names!`] is the printing half: `ALL` and `as_wire`, from a single
+//! variant-to-string list, plus the tests that pin them. Two properties
+//! follow, and both are the point:
 //!
 //! 1. **A new variant cannot skip the list.** The generated `as_wire` is a
 //!    `match` over the list, so a variant the list omits is a non-exhaustive
@@ -16,8 +19,14 @@
 //!    automatically, and the generated test walks `ALL` asserting that serde's
 //!    form and `as_wire` are the same string. A hand-listed test would have
 //!    shipped green; this one cannot.
+//!
+//! [`wire_parse!`] is the parsing half: `from_wire` and `wire_values`, for the
+//! enums a user types. It **repeats no spelling** — it derives both from `ALL`
+//! and `as_wire`, so the two directions cannot disagree about a variant even
+//! in principle. Add it to an enum the CLI accepts; leave it off one the CLI
+//! only prints, and that enum simply has no parser to go stale.
 
-/// Give an enum its wire form. See the module docs.
+/// The printing half. See the module docs.
 ///
 /// `$tests` names the generated test module — a module and a type share one
 /// namespace, so it cannot simply reuse the enum's name.
@@ -33,24 +42,6 @@ macro_rules! wire_names {
             /// that spells a Rust identifier, and the two would drift.
             pub fn as_wire(self) -> &'static str {
                 match self { $( Self::$variant => $wire, )+ }
-            }
-
-            pub fn from_wire(s: &str) -> Option<Self> {
-                Some(match s {
-                    $( $wire => Self::$variant, )+
-                    _ => return None,
-                })
-            }
-
-            /// The accepted values, for a refusal that tells the reader what
-            /// to type instead. Generated from the same list, so a refusal
-            /// cannot name a value the parser rejects.
-            pub fn wire_values() -> String {
-                Self::ALL
-                    .iter()
-                    .map(|v| v.as_wire())
-                    .collect::<Vec<_>>()
-                    .join(", ")
             }
         }
 
@@ -70,16 +61,63 @@ macro_rules! wire_names {
             }
 
             #[test]
-            fn every_wire_name_round_trips_and_is_snake_case() {
+            fn every_wire_name_is_snake_case_and_belongs_to_one_variant() {
                 for v in $name::ALL {
                     let w = v.as_wire();
-                    assert_eq!($name::from_wire(w), Some(*v), "{w} did not round trip");
                     assert!(
                         !w.is_empty()
                             && w.chars()
                                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
                         "`{w}` is not snake_case, so this variant has two spellings"
                     );
+                    // Two variants under one spelling is the same defect seen
+                    // from the other side: the name no longer identifies the
+                    // value, and any parser built on it must guess.
+                    assert_eq!(
+                        $name::ALL.iter().filter(|o| o.as_wire() == w).count(),
+                        1,
+                        "`{w}` names more than one variant"
+                    );
+                }
+            }
+        }
+    };
+}
+
+/// The parsing half, for an enum a user types back in. See the module docs.
+///
+/// Derived entirely from `ALL` and `as_wire`, so it adds no second list to
+/// keep in step. Requires [`wire_names!`] on the same enum.
+macro_rules! wire_parse {
+    ($name:ident as $tests:ident) => {
+        impl $name {
+            /// The inverse of `as_wire`. `None` is "no such value", which the
+            /// caller should refuse with `wire_values` in the message.
+            pub fn from_wire(s: &str) -> Option<Self> {
+                Self::ALL.iter().copied().find(|v| v.as_wire() == s)
+            }
+
+            /// The accepted values, for a refusal that tells the reader what
+            /// to type instead. Walks the same list `from_wire` walks, so a
+            /// refusal cannot name a value the parser rejects.
+            pub fn wire_values() -> String {
+                Self::ALL
+                    .iter()
+                    .map(|v| v.as_wire())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        }
+
+        #[cfg(test)]
+        mod $tests {
+            use super::$name;
+
+            #[test]
+            fn every_wire_name_round_trips() {
+                for v in $name::ALL {
+                    let w = v.as_wire();
+                    assert_eq!($name::from_wire(w), Some(*v), "{w} did not round trip");
                 }
                 assert_eq!($name::from_wire("no such value"), None);
             }
@@ -157,4 +195,5 @@ macro_rules! wire_tags {
 }
 
 pub(crate) use wire_names;
+pub(crate) use wire_parse;
 pub(crate) use wire_tags;
