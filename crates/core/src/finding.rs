@@ -42,6 +42,9 @@ crate::wire::wire_names!(FindingState as finding_state_wire {
     Withdrawn => "withdrawn",
 });
 
+// `finding list --state` takes a finding state by name.
+crate::wire::wire_parse!(FindingState as finding_state_parse);
+
 impl FindingState {
     pub fn is_terminal(self) -> bool {
         matches!(self, FindingState::Fixed | FindingState::Withdrawn)

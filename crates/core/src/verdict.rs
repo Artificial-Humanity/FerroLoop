@@ -345,21 +345,28 @@ mod tests {
         assert_eq!(original, deserialized);
     }
 
+    // `FailReason` is printed and stored, never typed in, so it carries no
+    // `from_wire`. Serde IS its parser — that is the direction a store
+    // written by an older build comes back through, so that is the
+    // direction the PascalCase refusal has to be asserted in.
     #[test]
-    fn every_fail_reason_round_trips_through_its_wire_name() {
+    fn every_fail_reason_reads_back_under_its_wire_name_and_no_other() {
         for (reason, wire) in [
             (FailReason::Predicate, "predicate"),
             (FailReason::EmptyPopulation, "empty_population"),
             (FailReason::Stale, "stale"),
         ] {
             assert_eq!(reason.as_wire(), wire);
-            assert_eq!(FailReason::from_wire(wire), Some(reason));
             assert_eq!(
                 serde_json::to_string(&reason).expect("serialize"),
                 format!("\"{wire}\"")
             );
+            assert_eq!(
+                serde_json::from_str::<FailReason>(&format!("\"{wire}\"")).expect("deserialize"),
+                reason
+            );
         }
-        assert_eq!(FailReason::from_wire("Predicate"), None);
+        assert!(serde_json::from_str::<FailReason>("\"Predicate\"").is_err());
     }
 
     #[test]
