@@ -26,7 +26,7 @@ pub enum FindingExecError {
     #[error(
         "gate `{name}` examined nothing: its selector ({selector}) matched zero paths under \
          `{root}`. That is not a reproduction — a check that looked at nothing cannot tell you \
-         whether the defect is present, and `EmptyPopulation` is refused as evidence for the \
+         whether the defect is present, and `empty_population` is refused as evidence for the \
          same reason a passing gate is. Point the selector at files that exist under this \
          project's root, then reproduce again: a reproduction must be observed failing over \
          something."

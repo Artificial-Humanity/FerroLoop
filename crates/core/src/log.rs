@@ -27,18 +27,12 @@ pub enum AttemptStatus {
     Refused,
 }
 
-impl AttemptStatus {
-    /// The wire name, which is also what `attempt` and `stats` print. See
-    /// [`crate::verdict::FailReason::as_wire`] for why this is not `Debug`.
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            AttemptStatus::Completed => "completed",
-            AttemptStatus::Timeout => "timeout",
-            AttemptStatus::Crashed => "crashed",
-            AttemptStatus::Refused => "refused",
-        }
-    }
-}
+crate::wire::wire_names!(AttemptStatus as attempt_status_wire {
+    Completed => "completed",
+    Timeout => "timeout",
+    Crashed => "crashed",
+    Refused => "refused",
+});
 
 /// One runner invocation. Append-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,24 +47,4 @@ pub struct Attempt {
     pub cost_usd_micros: u64,
     pub paths_touched: Vec<String>,
     pub output_excerpt: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_attempt_statuss_serde_form_is_the_same_string_as_its_wire_name() {
-        for st in [
-            AttemptStatus::Completed,
-            AttemptStatus::Timeout,
-            AttemptStatus::Crashed,
-            AttemptStatus::Refused,
-        ] {
-            assert_eq!(
-                serde_json::to_string(&st).expect("serialize"),
-                format!("\"{}\"", st.as_wire())
-            );
-        }
-    }
 }

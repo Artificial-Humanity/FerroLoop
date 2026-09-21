@@ -23,8 +23,6 @@ pub enum Cmd {
     },
 }
 
-const STATES: &str = "todo, doing, review, done, needs_human";
-
 pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add { project, title } => {
@@ -44,7 +42,10 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Move { id, to } => {
             let Some(state) = State::from_wire(&to) else {
-                bail!("`{to}` is not a state. Valid states are: {STATES}.");
+                bail!(
+                    "`{to}` is not a state. Valid states are: {}.",
+                    State::wire_values()
+                );
             };
             let r = RecordId(id);
             if store.get_record(r)?.is_none() {

@@ -154,7 +154,12 @@ fn a_commit_inside_the_population_fails_a_high_regret_gate_as_stale() {
         .args(["check", "launch", "--project", "1"])
         .assert()
         .code(1)
-        .stdout(contains("stale"));
+        // ⚠ Not `contains("stale")`. `check` appends a staleness NOTE —
+        // `  (stale)` — to the same line, so the bare word matches even when
+        // the gate failed for some other reason. Measured: mutating
+        // `stale.rs` to report `FailReason::Predicate` left `contains("stale")`
+        // green. Pin the reason FIELD, which only the reason can produce.
+        .stdout(contains("stale, 1 examined"));
 }
 
 #[test]
@@ -169,7 +174,12 @@ fn the_same_stale_gate_only_warns_at_low_regret() {
         .args(["check", "launch", "--project", "1"])
         .assert()
         .success()
-        .stdout(contains("stale"));
+        // At low regret the gate still PASSES and carries the note, so here
+        // the note is exactly what is being asserted. Spelled out because its
+        // high-regret sibling above means the opposite thing by the same word.
+        .stdout(contains(
+            "(stale: the gate's population moved since it was stamped)",
+        ));
 }
 
 #[test]

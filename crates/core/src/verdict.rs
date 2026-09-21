@@ -12,28 +12,11 @@ pub enum FailReason {
     Stale,
 }
 
-impl FailReason {
-    /// The wire name, which is also what a human reads. One spelling, so a
-    /// script that parses the text output and a script that parses the JSON
-    /// agree. Never render a `FailReason` with `Debug` — that spells a Rust
-    /// identifier, and the two would drift apart the moment one is renamed.
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            FailReason::Predicate => "predicate",
-            FailReason::EmptyPopulation => "empty_population",
-            FailReason::Stale => "stale",
-        }
-    }
-
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "predicate" => FailReason::Predicate,
-            "empty_population" => FailReason::EmptyPopulation,
-            "stale" => FailReason::Stale,
-            _ => return None,
-        })
-    }
-}
+crate::wire::wire_names!(FailReason as fail_reason_wire {
+    Predicate => "predicate",
+    EmptyPopulation => "empty_population",
+    Stale => "stale",
+});
 
 /// A population that was actually examined: strictly positive.
 ///

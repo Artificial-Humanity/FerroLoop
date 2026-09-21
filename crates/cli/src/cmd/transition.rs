@@ -4,9 +4,6 @@ use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{Regret, State, Transition};
 use fl_core::store::Store;
 
-const STATES: &str = "todo, doing, review, done, needs_human";
-const REGRETS: &str = "low, high";
-
 #[derive(Subcommand)]
 pub enum Cmd {
     Add {
@@ -49,13 +46,22 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 );
             }
             let Some(from_state) = State::from_wire(&from) else {
-                bail!("`{from}` is not a state. Valid states are: {STATES}.");
+                bail!(
+                    "`{from}` is not a state. Valid states are: {}.",
+                    State::wire_values()
+                );
             };
             let Some(to_state) = State::from_wire(&to) else {
-                bail!("`{to}` is not a state. Valid states are: {STATES}.");
+                bail!(
+                    "`{to}` is not a state. Valid states are: {}.",
+                    State::wire_values()
+                );
             };
             let Some(regret_val) = Regret::from_wire(&regret) else {
-                bail!("`{regret}` is not a regret level. Valid values are: {REGRETS}.");
+                bail!(
+                    "`{regret}` is not a regret level. Valid values are: {}.",
+                    Regret::wire_values()
+                );
             };
             for g in &gate {
                 if store.get_gate(GateId(*g))?.is_none() {

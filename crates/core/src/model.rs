@@ -11,28 +11,13 @@ pub enum State {
     NeedsHuman,
 }
 
-impl State {
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            State::Todo => "todo",
-            State::Doing => "doing",
-            State::Review => "review",
-            State::Done => "done",
-            State::NeedsHuman => "needs_human",
-        }
-    }
-
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "todo" => State::Todo,
-            "doing" => State::Doing,
-            "review" => State::Review,
-            "done" => State::Done,
-            "needs_human" => State::NeedsHuman,
-            _ => return None,
-        })
-    }
-}
+crate::wire::wire_names!(State as state_wire {
+    Todo => "todo",
+    Doing => "doing",
+    Review => "review",
+    Done => "done",
+    NeedsHuman => "needs_human",
+});
 
 /// How bad it is if this transition proceeds on a false pass.
 ///
@@ -46,22 +31,10 @@ pub enum Regret {
     High,
 }
 
-impl Regret {
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            Regret::Low => "low",
-            Regret::High => "high",
-        }
-    }
-
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "low" => Regret::Low,
-            "high" => Regret::High,
-            _ => return None,
-        })
-    }
-}
+crate::wire::wire_names!(Regret as regret_wire {
+    Low => "low",
+    High => "high",
+});
 
 /// How a gate names the things it must examine. Resolved fresh at run time
 /// and never persisted.
@@ -203,37 +176,6 @@ mod tests {
         };
         assert_eq!(t.regret, Regret::High);
         assert_eq!(t.gates.len(), 2);
-    }
-
-    #[test]
-    fn a_states_serde_form_is_the_same_string_as_its_wire_name() {
-        // The two spellings must not drift. `as_wire` is what the CLI accepts
-        // and prints; the serde form is what lands in JSON and in the store.
-        for st in [
-            State::Todo,
-            State::Doing,
-            State::Review,
-            State::Done,
-            State::NeedsHuman,
-        ] {
-            assert_eq!(
-                serde_json::to_string(&st).expect("serialize"),
-                format!("\"{}\"", st.as_wire()),
-                "{st:?} serializes to a different string than it prints"
-            );
-        }
-    }
-
-    #[test]
-    fn a_regrets_serde_form_is_the_same_string_as_its_wire_name() {
-        for r in [Regret::Low, Regret::High] {
-            assert_eq!(
-                serde_json::to_string(&r).expect("serialize"),
-                format!("\"{}\"", r.as_wire())
-            );
-            assert_eq!(Regret::from_wire(r.as_wire()), Some(r));
-        }
-        assert_eq!(Regret::from_wire("Low"), None);
     }
 
     #[test]

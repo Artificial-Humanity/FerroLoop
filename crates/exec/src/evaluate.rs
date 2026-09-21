@@ -190,7 +190,7 @@ fn run_gate(
             duration_ms,
             cost_usd_micros: 0,
         })
-        .map_err(|e| ExecError::Git(e.to_string()))?;
+        .map_err(|e| ExecError::Store(e.to_string()))?;
 
     if verdict.is_pass() {
         let mut updated = def.clone();
@@ -222,13 +222,13 @@ pub fn run_single_gate(
 ) -> Result<GateReport, ExecError> {
     let proj = store
         .get_project(project)
-        .map_err(|e| ExecError::Git(e.to_string()))?
+        .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
     let root = Path::new(&proj.root);
 
     let Some(def) = store
         .get_gate(gate)
-        .map_err(|e| ExecError::Git(e.to_string()))?
+        .map_err(|e| ExecError::Store(e.to_string()))?
     else {
         return Err(ExecError::BadSelector(format!("no gate with id {gate}")));
     };
@@ -245,13 +245,13 @@ pub fn evaluate_transition(
 ) -> Result<TransitionReport, ExecError> {
     let proj = store
         .get_project(project)
-        .map_err(|e| ExecError::Git(e.to_string()))?
+        .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
     let root = Path::new(&proj.root);
 
     let transition: Transition = store
         .get_transition(project, transition_name)
-        .map_err(|e| ExecError::Git(e.to_string()))?
+        .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| {
             ExecError::BadSelector(format!(
                 "project {project} declares no transition named `{transition_name}`. \
@@ -265,7 +265,7 @@ pub fn evaluate_transition(
     for gate_id in &transition.gates {
         let Some(def) = store
             .get_gate(*gate_id)
-            .map_err(|e| ExecError::Git(e.to_string()))?
+            .map_err(|e| ExecError::Store(e.to_string()))?
         else {
             return Err(ExecError::BadSelector(format!(
                 "transition `{transition_name}` names gate {gate_id}, which does not exist"

@@ -10,7 +10,11 @@ pub enum FindingError {
     NoReproduction,
     #[error("this finding already has a reproduction and it cannot be swapped")]
     AlreadyReproduced,
-    #[error("a finding in state {0:?} cannot make that move")]
+    #[error(
+        "a finding in state `{}` cannot make that move{}",
+        .0.as_wire(),
+        if .0.is_terminal() { ". That state is terminal: raise a new finding instead." } else { "" }
+    )]
     WrongState(FindingState),
 }
 
@@ -24,28 +28,15 @@ pub enum FindingState {
     Withdrawn,
 }
 
+crate::wire::wire_names!(FindingState as finding_state_wire {
+    Raised => "raised",
+    Reproduced => "reproduced",
+    Assigned => "assigned",
+    Fixed => "fixed",
+    Withdrawn => "withdrawn",
+});
+
 impl FindingState {
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            FindingState::Raised => "raised",
-            FindingState::Reproduced => "reproduced",
-            FindingState::Assigned => "assigned",
-            FindingState::Fixed => "fixed",
-            FindingState::Withdrawn => "withdrawn",
-        }
-    }
-
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "raised" => FindingState::Raised,
-            "reproduced" => FindingState::Reproduced,
-            "assigned" => FindingState::Assigned,
-            "fixed" => FindingState::Fixed,
-            "withdrawn" => FindingState::Withdrawn,
-            _ => return None,
-        })
-    }
-
     pub fn is_terminal(self) -> bool {
         matches!(self, FindingState::Fixed | FindingState::Withdrawn)
     }
@@ -227,22 +218,5 @@ mod tests {
         assert_eq!(f.assigned_to.as_deref(), Some("fixer_two"));
         assert_eq!(f.state, FindingState::Assigned);
         assert_eq!(f.reproduction, Some(GateId(9)), "reproduction stays intact");
-    }
-
-    #[test]
-    fn a_finding_states_serde_form_is_the_same_string_as_its_wire_name() {
-        for st in [
-            FindingState::Raised,
-            FindingState::Reproduced,
-            FindingState::Assigned,
-            FindingState::Fixed,
-            FindingState::Withdrawn,
-        ] {
-            assert_eq!(
-                serde_json::to_string(&st).expect("serialize"),
-                format!("\"{}\"", st.as_wire())
-            );
-            assert_eq!(FindingState::from_wire(st.as_wire()), Some(st));
-        }
     }
 }

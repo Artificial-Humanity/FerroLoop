@@ -97,9 +97,14 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                     stale_note(report.reproduction.staleness)
                 );
             } else {
+                // ⚠ The LABEL is carried, not dropped. An ERROR is a broken
+                // instrument and proves nothing in either direction, so
+                // narrating it as "still fails" would claim evidence the run
+                // did not produce. `check` and `gate run` print the same
+                // label for the same verdict.
+                let (label, detail) = report.reproduction.verdict.describe();
                 println!(
-                    "REPRODUCTION\tstill fails: {}{}",
-                    report.reproduction.verdict.describe().1,
+                    "REPRODUCTION\t{label}\t{detail}{}",
                     stale_note(report.reproduction.staleness)
                 );
             }
@@ -119,10 +124,10 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             );
 
             for r in &report.regressions {
+                let (label, detail) = r.verdict.describe();
                 println!(
-                    "REGRESSION\t{}\t{}{}",
+                    "REGRESSION\t{}\t{label}\t{detail}{}",
                     r.name,
-                    r.verdict.describe().1,
                     stale_note(r.staleness)
                 );
             }
