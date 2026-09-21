@@ -553,6 +553,68 @@ the two send you to different places: `empty_population` says your file tree has
 gate covers, and would have had you hunting through `config/` for a file that was never the
 problem. This says your listing program broke, and hands you its own complaint to read.
 
+## 14. Moving a record is the gated action
+
+`check` tells you whether a transition's gates pass. `record move` performs the state change
+those gates exist to protect — so it runs them, and refuses the move if they say no. Running
+`check` first is a convenience, not a requirement; the move does not trust you to have done it.
+
+A record starts in `todo`:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb record list --project 1
+3	todo	tune the learning rate
+```
+
+Only `review → done` is declared here, as the transition `launch` from
+[section 4](#4-wire-the-gate-into-a-transition). Nothing declares `todo → review`, so that
+move has nothing to bypass and proceeds — and says which it was, because "allowed" and "not
+checked" must not read the same:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb record move 3 --to review
+3	review	ungated: project 1 declares no transition from `todo` to `review`
+$ echo "exit: $?"
+exit: 0
+```
+
+`review → done` is a different matter. `launch` covers it, so `launch` runs:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb record move 3 --to done
+FAIL	launch	config-parses	stale, 1 examined	25ms  (stale)
+REFUSED	3	stays `review`
+$ echo "exit: $?"
+exit: 1
+```
+
+Refused, and for the staleness reason from [section 8](#8-staleness-and-gate-affirm) — the
+config has moved several times since the gate was last stamped. The exit code is the same `1`
+that `check` would have given, and the record has not moved:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb record list --project 1
+3	review	tune the learning rate
+```
+
+Look at the gate, affirm it, and the same move goes through:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
+2	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
+
+$ flctl --db /tmp/gs-demo/store.redb record move 3 --to done
+PASS	launch	config-parses	1 examined	25ms
+3	done
+$ echo "exit: $?"
+exit: 0
+```
+
+⚠ There is deliberately no `--force`. If a declared transition refuses a move you need to
+make, the fix is to change the declaration or fix the gate — both of which leave a record of
+what you decided. A bypass flag would leave none, and a gate you can wave through on the
+command line is a gate that will be waved through.
+
 ## Where this leaves you
 
 You now have both loops.
@@ -567,6 +629,9 @@ The review one: `record add` → `finding raise` → `finding reproduce` (refuse
 gate fails) → `finding assign` → `finding verify` (refused unless the reproduction passes
 *and* the neighbours still do) → closed by a program, or `finding withdraw`, counted
 against whoever raised it.
+
+And they meet at `record move`, which runs whatever transition declares the move it is
+asked to perform, and refuses on the same verdict `check` would have printed.
 
 They are the same machinery. A gate is what lets `check` refuse an action, and a gate is
 also the only thing that can tell you a fix worked — so a reproduction is just a gate that
