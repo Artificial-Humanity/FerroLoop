@@ -12,27 +12,67 @@ fn cli(dir: &tempfile::TempDir) -> Command {
     c
 }
 
+use std::path::Path;
+use std::process::Command as Sys;
+
+fn git(dir: &Path, args: &[&str]) {
+    assert!(
+        Sys::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "git {args:?} failed"
+    );
+}
+
+/// A real git working tree, not yet registered.
+///
+/// ⚠ These tests used to register the bare string `/tmp/x`, which is not a
+/// git tree and on most machines does not exist. That worked only because
+/// `project add` stored whatever string it was handed. Returns the TempDir:
+/// dropping it deletes the repo, so bind it for the test's duration.
+fn git_repo() -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "t"]);
+    std::fs::write(repo.path().join("a.rs"), "fn a() {}").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "first"]);
+    repo
+}
+
+/// The same tree, registered against this test's default store.
+fn project(d: &tempfile::TempDir) -> tempfile::TempDir {
+    let repo = git_repo();
+    cli(d)
+        .args(["project", "add", &repo.path().display().to_string()])
+        .assert()
+        .success();
+    repo
+}
+
 #[test]
 fn a_project_can_be_added_and_listed() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let repo = project(&d);
+    // `project add` stores the canonical root, not the string it was given,
+    // so a gate resolves the same tree from any working directory.
+    let canonical = repo.path().canonicalize().unwrap().display().to_string();
     cli(&d)
         .args(["project", "list"])
         .assert()
         .success()
-        .stdout(contains("/tmp/x"));
+        .stdout(contains(canonical));
 }
 
 #[test]
 fn an_unknown_gate_kind_is_refused_with_an_actionable_message() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let _repo = project(&d);
     cli(&d)
         .args([
             "gate",
@@ -79,10 +119,7 @@ fn a_missing_project_is_refused_and_names_the_id() {
 #[test]
 fn a_record_moves_between_states() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let _repo = project(&d);
     cli(&d)
         .args(["record", "add", "--project", "1", "--title", "t"])
         .assert()
@@ -101,10 +138,7 @@ fn a_record_moves_between_states() {
 #[test]
 fn an_unknown_state_name_is_refused_and_lists_the_valid_ones() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let _repo = project(&d);
     cli(&d)
         .args(["record", "add", "--project", "1", "--title", "t"])
         .assert()
@@ -136,7 +170,10 @@ fn a_missing_parent_directory_for_the_db_flag_is_created() {
 
     let mut c = Command::cargo_bin("flctl").unwrap();
     c.arg("--db").arg(&nested);
-    c.args(["project", "add", "/tmp/x"]).assert().success();
+    let repo = git_repo();
+    c.args(["project", "add", &repo.path().display().to_string()])
+        .assert()
+        .success();
 
     assert!(
         nested.exists(),
@@ -159,7 +196,16 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
     let mut c = Command::cargo_bin("flctl").unwrap();
     c.env_clear();
     c.env("FL_DB", &nested);
-    c.args(["project", "add", "/tmp/x"]).assert().success();
+    // PATH survives the clear: `project add` shells out to `git` to check
+    // that the root is a working tree, and a cleared PATH would make this
+    // test fail for a reason that has nothing to do with the store path.
+    if let Ok(path) = std::env::var("PATH") {
+        c.env("PATH", path);
+    }
+    let repo = git_repo();
+    c.args(["project", "add", &repo.path().display().to_string()])
+        .assert()
+        .success();
 
     assert!(
         nested.exists(),
@@ -182,10 +228,7 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
 #[test]
 fn a_transition_can_be_added_and_shown() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let _repo = project(&d);
     cli(&d)
         .args([
             "transition",
@@ -223,10 +266,7 @@ fn a_transition_can_be_added_and_shown() {
 #[test]
 fn a_transition_naming_a_nonexistent_gate_is_refused_and_names_the_id() {
     let d = tempfile::tempdir().unwrap();
-    cli(&d)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let _repo = project(&d);
     cli(&d)
         .args([
             "transition",
