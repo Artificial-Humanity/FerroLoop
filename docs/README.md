@@ -9,7 +9,8 @@ File naming in this directory follows
 
 ## Contents
 
-* [getting-started.md](getting-started.md) — build the CLI and gate a real action, with real commands and their output.
+* [getting-started.md](getting-started.md) — build the CLI, gate a real action, and take a
+  claim through the finding protocol, with real commands and their output.
 
 No anchor document exists yet.
 
