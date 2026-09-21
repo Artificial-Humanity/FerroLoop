@@ -1,0 +1,65 @@
+# The verification trio, run on every push and pull request.
+#
+# AGENTS.md requires `cargo test`, a warning-free `cargo clippy --all-targets`,
+# and integration checks to be green before work lands. Until this file existed
+# that was enforced by nothing at all, while WORKFLOW.md said "CI runs after a
+# push" — a documented guard that never ran, which is the exact defect this
+# project exists to catch.
+#
+# What this does NOT do: gate the merge. `main` has no branch protection, so a
+# red run here reports, it does not block. Read the result; do not assume it.
+#
+# No third-party actions are used. `actions/checkout` is GitHub's own; every
+# other step is a command from the toolchain, so the supply chain for a run is
+# the same one a local `cargo test` already trusts.
+name: verify
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+# Deliberately no global RUSTFLAGS: `-D warnings` there applies to
+# dependencies too, so an upstream crate's warning would fail this repo's
+# build for a reason nobody here can fix. The `-D warnings` that matters is
+# on the clippy step, scoped to this workspace.
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  trio:
+    name: test, clippy, fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record the toolchain this run used
+        run: |
+          rustup component add clippy rustfmt
+          rustc --version
+          cargo --version
+          git --version
+
+      # Formatting first: it is the cheapest to fail and the least ambiguous.
+      # `cargo fmt` is deliberately not in AGENTS.md's trio, but the tree is
+      # kept rustfmt-clean, so a drift here is worth seeing before a 2-minute
+      # compile.
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --workspace -- -D warnings
+
+      # Integration tests spawn the real `flctl` binary and drive real git
+      # repositories in temp directories, so this step covers AGENTS.md's
+      # "integration smoke checks" as well as the unit layer.
+      - name: cargo test --workspace
+        run: cargo test --workspace
