@@ -264,10 +264,215 @@ instead of a way to fail it. `empty_population` is a distinct failure reason so 
 as exactly what it is: nothing was examined, so nothing was verified, so the launch is not
 allowed. A no-run is not a pass, no matter what ran or didn't.
 
+## 10. The other half: a claim needs a reproduction
+
+Everything above is one person gating their own action. The rest of the tool is for the
+case where somebody *else* says your code is wrong.
+
+The rule is one sentence: **a claim is not actionable until a check fails because of it.**
+Not because reviewers are untrustworthy, but because agreement is free. Saying "good catch,
+fixing that now" costs nothing and proves nothing, and a repair generated from a claim's
+*wording* lands in the right file with the wrong content. A failing check is the only thing
+that can tell you the defect is real, and later, that it is gone.
+
+Findings attach to a **record** — a unit of work, the thing a finding is about.
+
+```
+$ flctl --db /tmp/gs-demo/store.redb record add --project 1 --title "tune the learning rate"
+3	tune the learning rate
+```
+
+Put a negative learning rate in the config and commit it, then have a reviewer raise a
+claim about it:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb finding raise --record 3 \
+    --claim "the validator accepts a negative learning_rate" --by reviewer
+4	raised	the validator accepts a negative learning_rate
+```
+
+`raised` is as far as that gets on its own. Try to hand it to somebody to fix:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb finding assign 4 --to fixer
+error: this finding has no reproduction, so it cannot be assigned. Attach a check that fails because of the defect, or withdraw the finding.
+$ echo "exit: $?"
+exit: 2
+```
+
+Two ways forward, and the refusal names both. Attach a reproduction, or withdraw it.
+
+### A passing gate is not a reproduction
+
+The obvious move is to point at a check you already have:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb finding reproduce 4 --gate 2
+error: gate `config-parses` currently PASSES over 1 items, so it is not a reproduction. A check that already passes cannot tell you whether the defect is absent or whether the check simply does not exercise it. Write one that fails because of the defect.
+$ echo "exit: $?"
+exit: 2
+```
+
+That refusal is the load-bearing one. A green check attached to a claim is worse than no
+check, because later it will go on being green and be read as proof the defect was fixed —
+when all it ever proved was that it never looked. So write a gate that fails *now*, for the
+reason in the claim:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb gate add \
+    --project 1 --name rate-positive --kind command --glob "config/*.json" \
+    --program python3 --arg=-c \
+    --arg="import json,sys;[sys.exit('learning_rate must be > 0') for p in sys.argv[1:] if json.load(open(p))['learning_rate'] <= 0]" \
+    --authored-by reviewer
+5	rate-positive	16bc83526da0269acbd3a135ab6317d98d7d670a
+
+$ flctl --db /tmp/gs-demo/store.redb gate run 5
+FAIL	rate-positive	predicate, 1 examined
+$ echo "exit: $?"
+exit: 1
+```
+
+It fails, so it is admissible:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb finding reproduce 4 --gate 5
+4	reproduced	gate 5 failed over 1 items
+
+$ flctl --db /tmp/gs-demo/store.redb finding assign 4 --to fixer
+4	assigned	fixer
+```
+
+A reproduction and a gate are the same object. The check written to prove a defect exists
+is the check that stays behind afterwards to prove it has not come back — which is why
+there is no separate concept for one.
+
+## 11. A repair that breaks something else is not done
+
+Say there is a second gate on the project, green today — the sort of check that exists
+because somebody once got bitten:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb gate add \
+    --project 1 --name epochs-present --kind command --glob "config/*.json" \
+    --program python3 --arg=-c \
+    --arg="import json,sys;[sys.exit('epochs is missing') for p in sys.argv[1:] if 'epochs' not in json.load(open(p))]" \
+    --authored-by you
+6	epochs-present	16bc83526da0269acbd3a135ab6317d98d7d670a
+
+$ flctl --db /tmp/gs-demo/store.redb gate run 6
+PASS	epochs-present	1 examined
+```
+
+Now the fixer rewrites the config, makes the learning rate positive, and drops `epochs` on
+the way past:
+
+```
+$ cat > config/settings.json <<'EOF'
+{
+  "learning_rate": 0.001
+}
+EOF
+$ git add -A && git commit -qm "fix: make the learning rate positive"
+
+$ flctl --db /tmp/gs-demo/store.redb finding verify 4
+REPRODUCTION	passes over 1 items  (stale: the gate's population moved since it was stamped)
+NEIGHBOURS	2 checked, 1 regressed
+REGRESSION	epochs-present	FAIL	predicate, 1 examined  (stale: the gate's population moved since it was stamped)
+NEIGHBOUR	config-parses	passes  (stale: the gate's population moved since it was stamped)
+OPEN	4	the repair is not done
+$ echo "exit: $?"
+exit: 1
+```
+
+The reported defect is genuinely fixed — `REPRODUCTION passes`. The finding still does not
+close. `verify` re-runs every other gate on the project that was passing before, and one of
+them isn't any more.
+
+This is the failure the whole protocol is built around: the most common defect in a review
+loop is not the original bug, it is the bug introduced by the fix to it — right file, wrong
+content, and nobody looks at the neighbours because the reported thing now works. Note that
+`NEIGHBOURS 2 checked, 0 regressed` and a run that checked nothing at all can never print
+the same line, so "no regressions" is always distinguishable from "no neighbours were run."
+
+Keep `epochs` this time:
+
+```
+$ cat > config/settings.json <<'EOF'
+{
+  "epochs": 12,
+  "learning_rate": 0.001
+}
+EOF
+$ git add -A && git commit -qm "fix: make the learning rate positive, keep epochs"
+
+$ flctl --db /tmp/gs-demo/store.redb finding verify 4
+REPRODUCTION	passes over 1 items  (stale: the gate's population moved since it was stamped)
+NEIGHBOURS	2 checked, 0 regressed
+NEIGHBOUR	config-parses	passes  (stale: the gate's population moved since it was stamped)
+NEIGHBOUR	epochs-present	passes  (stale: the gate's population moved since it was stamped)
+CLOSED	4
+$ echo "exit: $?"
+exit: 0
+```
+
+The finding closed because a program said so. Nobody was asked whether they were finished.
+
+## 12. A claim that cannot be reproduced gets withdrawn
+
+The other exit exists because a review that cannot kill its own findings just accumulates
+them. Some claims are taste, and taste has no failing check:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb finding raise --record 3 \
+    --claim "the config layout feels wrong" --by reviewer
+7	raised	the config layout feels wrong
+
+$ flctl --db /tmp/gs-demo/store.redb finding withdraw 7 \
+    --reason "no reproduction is possible: this is taste, not a defect"
+7	withdrawn	no reproduction is possible: this is taste, not a defect
+```
+
+Withdrawal is not free. It is counted, and it is counted against whoever raised the claim:
+
+```
+$ flctl --db /tmp/gs-demo/store.redb finding list --project 1
+4	fixed	reviewer	the validator accepts a negative learning_rate
+7	withdrawn	reviewer	the config layout feels wrong
+reviewer	withdrawn: 1
+```
+
+Both directions have a price. Raising something you cannot demonstrate shows up under your
+name; so the cheap move — raise everything, let the fixer sort it out — stops being cheap.
+
+One thing to know about the value passed to `--state`: it is the same spelling the tool
+prints, and nothing else is accepted.
+
+```
+$ flctl --db /tmp/gs-demo/store.redb finding list --project 1 --state Withdrawn
+error: `Withdrawn` is not a finding state. Valid states are: raised, reproduced, assigned, fixed, withdrawn.
+$ echo "exit: $?"
+exit: 2
+```
+
+Everything that crosses the boundary — printed text, stored bytes, JSON, and values you
+type back in — uses one snake_case spelling. The list in that refusal is generated from the
+same source the parser reads, so it can never offer you a value that would then be rejected.
+
 ## Where this leaves you
 
-You now have the whole loop: `project add` → `gate add` (a glob and a program) →
-`transition add --regret high` → `check` before the costly action, refused on a real
-defect, refused again on staleness, and refused a third way on a population that
-vanished. Point a gate's `--glob` and `--program` at whatever your own expensive action
-actually depends on, and wire it into a transition the same way.
+You now have both loops.
+
+The gating one: `project add` → `gate add` (a glob and a program) → `transition add
+--regret high` → `check` before the costly action, refused on a real defect, refused again
+on staleness, and refused a third way on a population that vanished. Point a gate's
+`--glob` and `--program` at whatever your own expensive action actually depends on, and
+wire it into a transition the same way.
+
+The review one: `record add` → `finding raise` → `finding reproduce` (refused unless the
+gate fails) → `finding assign` → `finding verify` (refused unless the reproduction passes
+*and* the neighbours still do) → closed by a program, or `finding withdraw`, counted
+against whoever raised it.
+
+They are the same machinery. A gate is what lets `check` refuse an action, and a gate is
+also the only thing that can tell you a fix worked — so a reproduction is just a gate that
+was written in response to a claim.
