@@ -1,6 +1,8 @@
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
+use std::path::Path;
+use std::process::Command as Sys;
 
 fn cli(db: &str) -> Command {
     let mut c = Command::cargo_bin("flctl").unwrap();
@@ -8,14 +10,45 @@ fn cli(db: &str) -> Command {
     c
 }
 
+fn git(dir: &Path, args: &[&str]) {
+    assert!(
+        Sys::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "git {args:?} failed"
+    );
+}
+
+/// A registered project, in a real git working tree.
+///
+/// ⚠ These tests used to register the bare string `/tmp/x`, which is not a
+/// git tree and on most machines does not exist at all. That worked only
+/// because `project add` stored whatever it was handed. Keep the repo alive
+/// for the test's duration — dropping the TempDir deletes it.
+fn project(db: &str) -> tempfile::TempDir {
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "t"]);
+    std::fs::write(repo.path().join("a.rs"), "fn a() {}").unwrap();
+    git(repo.path(), &["add", "-A"]);
+    git(repo.path(), &["commit", "-qm", "first"]);
+    cli(db)
+        .args(["project", "add", &repo.path().display().to_string()])
+        .assert()
+        .success();
+    repo
+}
+
 #[test]
 fn an_unknown_adapter_is_refused_and_names_the_ones_that_exist() {
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("t.redb").display().to_string();
-    cli(&db)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let _repo = project(&db);
     cli(&db)
         .args(["record", "add", "--project", "1", "--title", "t"])
         .assert()
@@ -31,10 +64,7 @@ fn an_unknown_adapter_is_refused_and_names_the_ones_that_exist() {
 fn a_refused_attempt_is_still_recorded_and_shows_up_in_stats() {
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("t.redb").display().to_string();
-    cli(&db)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let _repo = project(&db);
     cli(&db)
         .args(["record", "add", "--project", "1", "--title", "t"])
         .assert()
@@ -64,10 +94,7 @@ fn a_refused_attempt_is_still_recorded_and_shows_up_in_stats() {
 fn stats_over_a_project_with_no_attempts_says_so_rather_than_printing_nothing() {
     let d = tempfile::tempdir().unwrap();
     let db = d.path().join("t.redb").display().to_string();
-    cli(&db)
-        .args(["project", "add", "/tmp/x"])
-        .assert()
-        .success();
+    let _repo = project(&db);
     cli(&db)
         .args(["stats", "--project", "1"])
         .assert()

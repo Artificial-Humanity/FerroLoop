@@ -64,10 +64,25 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 );
             };
             for g in &gate {
-                if store.get_gate(GateId(*g))?.is_none() {
+                let Some(def) = store.get_gate(GateId(*g))? else {
                     bail!(
                         "transition `{name}` names gate {g}, which does not exist. \
                          Run `flctl gate list --project {project}` to see the ids that exist."
+                    );
+                };
+                // ⚠ Existence used to be the whole check. A gate belonging to
+                // another project would have been resolved against THIS
+                // project's working tree, enumerating a population from the
+                // wrong repository — and passing, since a glob that matches
+                // nothing here is just a small population somewhere else.
+                if def.project != p {
+                    bail!(
+                        "transition `{name}` is in project {project}, but gate {g} (`{}`) \
+                         belongs to project {}. A gate is resolved against its own project's \
+                         working tree, so wiring one across projects would examine the wrong \
+                         tree. Declare the gate in project {project} instead.",
+                        def.name,
+                        def.project
                     );
                 }
             }

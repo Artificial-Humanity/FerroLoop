@@ -252,3 +252,89 @@ fn a_population_argument_without_a_population_program_is_refused() {
         .failure()
         .stderr(contains("--population-from"));
 }
+
+// C3: `project add` stored whatever string it was handed. It never checked
+// that the path existed, let alone that it was a git working tree — while
+// docs/getting-started.md said in print: "A project is a git working tree.
+// The tool refuses anything that isn't one." A project registered this way
+// fails later, at `gate add`, with an error about git rather than about the
+// path that was wrong.
+#[test]
+fn a_project_root_that_is_not_a_directory_is_refused_at_registration() {
+    let f = fixture();
+    let missing = f.repo.path().join("no-such-directory");
+    f.cli()
+        .args(["project", "add", &missing.display().to_string()])
+        .assert()
+        .failure()
+        .stderr(contains("does not exist"));
+}
+
+#[test]
+fn a_project_root_that_is_not_a_git_working_tree_is_refused_at_registration() {
+    let f = fixture();
+    let plain = tempfile::tempdir().unwrap();
+    f.cli()
+        .args(["project", "add", &plain.path().display().to_string()])
+        .assert()
+        .failure()
+        .stderr(contains("git working tree").and(contains("provenance")));
+}
+
+// C4: `transition add --gate N` checked that gate N existed and never that it
+// belonged to the project being configured. A transition in project 1 could
+// name a gate in project 2, which would then be resolved against project 1's
+// working tree — a population enumerated from the wrong repository entirely.
+#[test]
+fn a_transition_cannot_name_a_gate_from_another_project() {
+    let f = fixture();
+    let other = tempfile::tempdir().unwrap();
+    git(other.path(), &["init", "-q"]);
+    git(other.path(), &["config", "user.email", "t@example.com"]);
+    git(other.path(), &["config", "user.name", "t"]);
+    fs::write(other.path().join("x.rs"), "fn x() {}").unwrap();
+    git(other.path(), &["add", "-A"]);
+    git(other.path(), &["commit", "-qm", "first"]);
+
+    f.project(); // project 1, f.repo
+    f.cli()
+        .args(["project", "add", &other.path().display().to_string()])
+        .assert()
+        .success(); // project 2
+    f.cli()
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "2",
+            "--name",
+            "theirs",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success(); // gate 3, in project 2
+
+    f.cli()
+        .args([
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "high",
+            "--gate",
+            "3",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("project 2").and(contains("project 1")));
+}
