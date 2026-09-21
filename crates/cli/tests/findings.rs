@@ -295,3 +295,53 @@ fn verify_counts_a_checked_neighbour_even_when_it_stays_green() {
         .success()
         .stdout(contains("NEIGHBOURS\t1 checked, 0 regressed"));
 }
+
+// ⚠ `finding verify` used to render the verdict with `describe().1`, throwing
+// away the label. A broken instrument then printed as "still fails", which
+// claims evidence the run never produced — the exact opposite of what
+// `ReproductionErrored` says ("a broken instrument proves nothing in either
+// direction"). `check` and `gate run` printed ERROR for the same verdict.
+// Nothing gated it, so a one-token revert restored it silently.
+#[test]
+fn verify_says_error_when_the_instrument_broke_and_fail_when_the_defect_is_real() {
+    let f = fixture();
+    f.setup();
+    let script = f.repo.path().join("repro.sh");
+    fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    f.gate("repro", &script.display().to_string()); // id 3
+    f.cli()
+        .args([
+            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success(); // id 4
+    f.cli()
+        .args(["finding", "reproduce", "4", "--gate", "3"])
+        .assert()
+        .success();
+    f.cli()
+        .args(["finding", "assign", "4", "--to", "fixer"])
+        .assert()
+        .success();
+
+    // The defect is still there: a real failure, and it says so.
+    f.cli()
+        .args(["finding", "verify", "4"])
+        .assert()
+        .code(1)
+        .stdout(contains("REPRODUCTION\tFAIL\tpredicate,").and(contains("examined")));
+
+    // Now break the instrument itself. This must NOT read as a failure.
+    fs::remove_file(&script).unwrap();
+    f.cli()
+        .args(["finding", "verify", "4"])
+        .assert()
+        .code(2)
+        .stdout(contains("REPRODUCTION\tERROR\t").and(contains("could not be run")))
+        .stdout(contains("still fails").not());
+}

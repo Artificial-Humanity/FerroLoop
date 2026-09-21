@@ -19,12 +19,20 @@ pub struct GateRun {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AttemptStatus {
     Completed,
     Timeout,
     Crashed,
     Refused,
 }
+
+crate::wire::wire_names!(AttemptStatus as attempt_status_wire {
+    Completed => "completed",
+    Timeout => "timeout",
+    Crashed => "crashed",
+    Refused => "refused",
+});
 
 /// One runner invocation. Append-only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

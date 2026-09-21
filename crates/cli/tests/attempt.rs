@@ -57,7 +57,7 @@ fn a_refused_attempt_is_still_recorded_and_shows_up_in_stats() {
         .args(["stats", "--project", "1"])
         .assert()
         .success()
-        .stdout(contains("Refused").and(contains("attempts: 1")));
+        .stdout(contains("refused").and(contains("attempts: 1")));
 }
 
 #[test]

@@ -11,6 +11,12 @@ pub enum ExecError {
     Walk(String, String),
     #[error("git failed: {0}")]
     Git(String),
+    /// ⚠ A store read or write failed. Kept separate from [`ExecError::Git`]
+    /// because it used to be folded into it, and a deserialization failure
+    /// then announced itself as `git failed:` from `check`, the flagship
+    /// command — a refusal naming the wrong cause.
+    #[error("{0}")]
+    Store(String),
     #[error("command `{0}` could not be run: {1}")]
     Spawn(String, String),
     #[error("command `{0}` exceeded its {1}s timeout")]

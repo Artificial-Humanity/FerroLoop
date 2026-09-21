@@ -29,6 +29,13 @@ fn backend(e: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
+/// Reading a stored value back into its type. Separate from [`backend`]
+/// because the remedy is different: a decode failure is a version mismatch,
+/// not a broken database.
+fn decode(e: impl std::fmt::Display) -> StoreError {
+    StoreError::Decode(e.to_string())
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let db = Database::create(path).map_err(backend)?;
@@ -128,7 +135,7 @@ impl RedbStore {
         let Some(v) = t.get_owned(key).map_err(backend)? else {
             return Ok(None);
         };
-        let parsed = serde_json::from_str(v.value()).map_err(backend)?;
+        let parsed = serde_json::from_str(v.value()).map_err(decode)?;
         Ok(Some(parsed))
     }
 
@@ -141,7 +148,7 @@ impl RedbStore {
         let mut out = Vec::new();
         for entry in t.iter().map_err(backend)? {
             let (_k, v) = entry.map_err(backend)?;
-            out.push(serde_json::from_str(v.value()).map_err(backend)?);
+            out.push(serde_json::from_str(v.value()).map_err(decode)?);
         }
         Ok(out)
     }
@@ -228,7 +235,7 @@ impl Store for RedbStore {
         let Some(v) = table.get_owned(key.as_str()).map_err(backend)? else {
             return Ok(None);
         };
-        Ok(Some(serde_json::from_str(v.value()).map_err(backend)?))
+        Ok(Some(serde_json::from_str(v.value()).map_err(decode)?))
     }
 
     fn add_record(&mut self, project: ProjectId, title: &str) -> Result<RecordId, StoreError> {
@@ -537,5 +544,34 @@ mod tests {
         assert_eq!(s.withdrawals_by("hasty").unwrap(), 2);
         assert_eq!(s.withdrawals_by("careful").unwrap(), 0);
         assert_eq!(s.withdrawals_by("nobody").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_record_written_in_an_older_wire_format_is_refused_with_a_remedy() {
+        // What a wire-format change looks like from the other side. The
+        // refusal must name the cause AND what to do, not just repeat what
+        // serde said. Written as raw JSON because the point is a value this
+        // build can no longer produce.
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("old.redb");
+        let s = RedbStore::open(&path).expect("open");
+        {
+            let tx = s.db.begin_write().expect("write tx");
+            {
+                let mut t = tx.open_table(RECORDS).expect("table");
+                t.insert(1u64, r#"{"id":1,"project":1,"title":"t","state":"Todo"}"#)
+                    .expect("insert");
+            }
+            tx.commit().expect("commit");
+        }
+        let err = s.get_record(RecordId(1)).expect_err("must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown variant"), "got {msg}");
+        assert!(msg.contains("there is no migration"), "got {msg}");
+        assert!(msg.contains("restore the file from a backup"), "got {msg}");
+        assert!(
+            matches!(err, StoreError::Decode(_)),
+            "a decode failure must be Decode, not merely not-Backend: {err:?}"
+        );
     }
 }

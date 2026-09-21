@@ -10,11 +10,22 @@ pub enum FindingError {
     NoReproduction,
     #[error("this finding already has a reproduction and it cannot be swapped")]
     AlreadyReproduced,
-    #[error("a finding in state {0:?} cannot make that move")]
+    #[error(
+        "a finding in state `{}` cannot make that move. {}",
+        .0.as_wire(),
+        if .0.is_terminal() {
+            "That state is terminal: raise a new finding instead."
+        } else {
+            "Check where the finding actually is with `finding list`, and take the step that \
+             state allows: a raised finding needs a reproduction, a reproduced one needs \
+             assigning, and an assigned one is closed by verifying the repair."
+        }
+    )]
     WrongState(FindingState),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FindingState {
     Raised,
     Reproduced,
@@ -23,28 +34,15 @@ pub enum FindingState {
     Withdrawn,
 }
 
+crate::wire::wire_names!(FindingState as finding_state_wire {
+    Raised => "raised",
+    Reproduced => "reproduced",
+    Assigned => "assigned",
+    Fixed => "fixed",
+    Withdrawn => "withdrawn",
+});
+
 impl FindingState {
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            FindingState::Raised => "raised",
-            FindingState::Reproduced => "reproduced",
-            FindingState::Assigned => "assigned",
-            FindingState::Fixed => "fixed",
-            FindingState::Withdrawn => "withdrawn",
-        }
-    }
-
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "raised" => FindingState::Raised,
-            "reproduced" => FindingState::Reproduced,
-            "assigned" => FindingState::Assigned,
-            "fixed" => FindingState::Fixed,
-            "withdrawn" => FindingState::Withdrawn,
-            _ => return None,
-        })
-    }
-
     pub fn is_terminal(self) -> bool {
         matches!(self, FindingState::Fixed | FindingState::Withdrawn)
     }
@@ -226,5 +224,21 @@ mod tests {
         assert_eq!(f.assigned_to.as_deref(), Some("fixer_two"));
         assert_eq!(f.state, FindingState::Assigned);
         assert_eq!(f.reproduction, Some(GateId(9)), "reproduction stays intact");
+    }
+
+    #[test]
+    fn a_wrong_state_refusal_names_a_remedy_in_both_branches() {
+        // ⚠ The non-terminal branch used to be the empty string, so the
+        // refusal named a cause and no action. It is not reachable today,
+        // which is exactly why it needs a test rather than a reader.
+        for st in FindingState::ALL {
+            let msg = FindingError::WrongState(*st).to_string();
+            assert!(msg.contains(st.as_wire()), "does not name the state: {msg}");
+            assert!(
+                msg.contains("raise a new finding") || msg.contains("finding list"),
+                "state `{}` gets a refusal with no remedy: {msg}",
+                st.as_wire()
+            );
+        }
     }
 }

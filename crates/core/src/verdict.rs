@@ -2,6 +2,7 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 
 /// Why a gate did not pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FailReason {
     /// The gate examined a real population and the predicate was false.
     Predicate,
@@ -10,6 +11,12 @@ pub enum FailReason {
     /// The gate's stamp is behind the code it covers, at a high-regret transition.
     Stale,
 }
+
+crate::wire::wire_names!(FailReason as fail_reason_wire {
+    Predicate => "predicate",
+    EmptyPopulation => "empty_population",
+    Stale => "stale",
+});
 
 /// A population that was actually examined: strictly positive.
 ///
@@ -48,7 +55,7 @@ impl Population {
 
 /// Private raw mirror for controlled deserialization.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "snake_case")]
 enum VerdictRaw {
     Pass { population: u64 },
     Fail { population: u64, reason: FailReason },
@@ -65,6 +72,7 @@ enum VerdictRaw {
 /// `#[non_exhaustive]` leaves open: mutation through a `&mut Verdict::Pass`
 /// obtained from a match. See [`Population`] for why that route is closed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Verdict {
     #[non_exhaustive]
     Pass { population: Population },
@@ -145,6 +153,24 @@ impl Verdict {
         }
     }
 
+    /// Render this verdict for a human: a label and a detail line.
+    ///
+    /// The single rendering used by every command that prints a verdict, so
+    /// `check`, `gate run` and `finding verify` cannot drift apart. The
+    /// detail never contains a Rust identifier — see [`FailReason::as_wire`].
+    pub fn describe(&self) -> (&'static str, String) {
+        match self {
+            Verdict::Pass { population, .. } => ("PASS", format!("{} examined", population.get())),
+            Verdict::Fail {
+                population, reason, ..
+            } => (
+                "FAIL",
+                format!("{}, {population} examined", reason.as_wire()),
+            ),
+            Verdict::Error { detail, .. } => ("ERROR", detail.clone()),
+        }
+    }
+
     /// The CLI contract: 0 pass, 1 fail, 2 broken instrument or misuse.
     pub fn exit_code(&self) -> i32 {
         match self {
@@ -154,6 +180,12 @@ impl Verdict {
         }
     }
 }
+
+crate::wire::wire_tags!(Verdict as verdict_wire {
+    Verdict::Pass { .. } => "pass", Verdict::from_predicate(true, 1);
+    Verdict::Fail { .. } => "fail", Verdict::from_predicate(false, 1);
+    Verdict::Error { .. } => "error", Verdict::error("e");
+});
 
 #[cfg(test)]
 mod tests {
@@ -221,7 +253,7 @@ mod tests {
 
     #[test]
     fn deserialization_rejects_pass_over_empty_population() {
-        let result = serde_json::from_str::<Verdict>(r#"{"Pass":{"population":0}}"#);
+        let result = serde_json::from_str::<Verdict>(r#"{"pass":{"population":0}}"#);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("cannot deserialize Pass"));
@@ -230,7 +262,7 @@ mod tests {
     #[test]
     fn deserialization_accepts_pass_over_real_population() {
         let v =
-            serde_json::from_str::<Verdict>(r#"{"Pass":{"population":4}}"#).expect("valid pass");
+            serde_json::from_str::<Verdict>(r#"{"pass":{"population":4}}"#).expect("valid pass");
         assert_eq!(
             v,
             Verdict::Pass {
@@ -243,7 +275,7 @@ mod tests {
     #[test]
     fn deserialization_accepts_fail_over_any_population() {
         let v = serde_json::from_str::<Verdict>(
-            r#"{"Fail":{"population":0,"reason":"EmptyPopulation"}}"#,
+            r#"{"fail":{"population":0,"reason":"empty_population"}}"#,
         )
         .expect("valid fail");
         assert_eq!(
@@ -258,7 +290,7 @@ mod tests {
 
     #[test]
     fn deserialization_accepts_error() {
-        let v = serde_json::from_str::<Verdict>(r#"{"Error":{"detail":"test error"}}"#)
+        let v = serde_json::from_str::<Verdict>(r#"{"error":{"detail":"test error"}}"#)
             .expect("valid error");
         assert_eq!(
             v,
@@ -308,8 +340,72 @@ mod tests {
     fn pass_serializes_to_the_exact_wire_form_and_back() {
         let original = Verdict::from_predicate(true, 3);
         let serialized = serde_json::to_string(&original).expect("serialize");
-        assert_eq!(serialized, r#"{"Pass":{"population":3}}"#);
+        assert_eq!(serialized, r#"{"pass":{"population":3}}"#);
         let deserialized = serde_json::from_str::<Verdict>(&serialized).expect("deserialize");
         assert_eq!(original, deserialized);
+    }
+
+    #[test]
+    fn every_fail_reason_round_trips_through_its_wire_name() {
+        for (reason, wire) in [
+            (FailReason::Predicate, "predicate"),
+            (FailReason::EmptyPopulation, "empty_population"),
+            (FailReason::Stale, "stale"),
+        ] {
+            assert_eq!(reason.as_wire(), wire);
+            assert_eq!(FailReason::from_wire(wire), Some(reason));
+            assert_eq!(
+                serde_json::to_string(&reason).expect("serialize"),
+                format!("\"{wire}\"")
+            );
+        }
+        assert_eq!(FailReason::from_wire("Predicate"), None);
+    }
+
+    #[test]
+    fn every_verdict_variant_serializes_under_its_snake_case_tag() {
+        assert_eq!(
+            serde_json::to_string(&Verdict::from_predicate(true, 2)).expect("serialize"),
+            r#"{"pass":{"population":2}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Verdict::fail_for(FailReason::Stale, 2)).expect("serialize"),
+            r#"{"fail":{"population":2,"reason":"stale"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Verdict::error("boom")).expect("serialize"),
+            r#"{"error":{"detail":"boom"}}"#
+        );
+    }
+
+    #[test]
+    fn the_old_pascal_case_wire_form_is_refused_rather_than_silently_accepted() {
+        // The casing moved. A store or a script still speaking the old form
+        // must be told so, not quietly reinterpreted.
+        assert!(serde_json::from_str::<Verdict>(r#"{"Pass":{"population":3}}"#).is_err());
+        assert!(
+            serde_json::from_str::<Verdict>(r#"{"fail":{"population":1,"reason":"Stale"}}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn describe_renders_a_verdict_for_a_human_without_leaking_rust_identifiers() {
+        assert_eq!(
+            Verdict::from_predicate(true, 4).describe(),
+            ("PASS", "4 examined".to_string())
+        );
+        assert_eq!(
+            Verdict::from_predicate(false, 4).describe(),
+            ("FAIL", "predicate, 4 examined".to_string())
+        );
+        assert_eq!(
+            Verdict::from_predicate(true, 0).describe(),
+            ("FAIL", "empty_population, 0 examined".to_string())
+        );
+        assert_eq!(
+            Verdict::error("no such command").describe(),
+            ("ERROR", "no such command".to_string())
+        );
     }
 }

@@ -1,5 +1,7 @@
 //! Pure domain model. No IO, no async, no clock, no network.
 
+mod wire;
+
 pub mod finding;
 pub mod ids;
 pub mod log;

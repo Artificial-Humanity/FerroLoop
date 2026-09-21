@@ -190,7 +190,7 @@ fn run_gate(
             duration_ms,
             cost_usd_micros: 0,
         })
-        .map_err(|e| ExecError::Git(e.to_string()))?;
+        .map_err(|e| ExecError::Store(e.to_string()))?;
 
     if verdict.is_pass() {
         let mut updated = def.clone();
@@ -222,13 +222,13 @@ pub fn run_single_gate(
 ) -> Result<GateReport, ExecError> {
     let proj = store
         .get_project(project)
-        .map_err(|e| ExecError::Git(e.to_string()))?
+        .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
     let root = Path::new(&proj.root);
 
     let Some(def) = store
         .get_gate(gate)
-        .map_err(|e| ExecError::Git(e.to_string()))?
+        .map_err(|e| ExecError::Store(e.to_string()))?
     else {
         return Err(ExecError::BadSelector(format!("no gate with id {gate}")));
     };
@@ -245,13 +245,13 @@ pub fn evaluate_transition(
 ) -> Result<TransitionReport, ExecError> {
     let proj = store
         .get_project(project)
-        .map_err(|e| ExecError::Git(e.to_string()))?
+        .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
     let root = Path::new(&proj.root);
 
     let transition: Transition = store
         .get_transition(project, transition_name)
-        .map_err(|e| ExecError::Git(e.to_string()))?
+        .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| {
             ExecError::BadSelector(format!(
                 "project {project} declares no transition named `{transition_name}`. \
@@ -265,7 +265,7 @@ pub fn evaluate_transition(
     for gate_id in &transition.gates {
         let Some(def) = store
             .get_gate(*gate_id)
-            .map_err(|e| ExecError::Git(e.to_string()))?
+            .map_err(|e| ExecError::Store(e.to_string()))?
         else {
             return Err(ExecError::BadSelector(format!(
                 "transition `{transition_name}` names gate {gate_id}, which does not exist"
@@ -286,8 +286,12 @@ pub fn evaluate_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fl_core::finding::Finding;
+    use fl_core::ids::{FindingId, ProjectId, RecordId};
+    use fl_core::log::{Attempt, GateRun};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Regret, Selector, State};
-    use fl_core::store::MemStore;
+    use fl_core::model::{GateDef, Project, Record, Transition};
+    use fl_core::store::{MemStore, Store, StoreError};
     use fl_core::verdict::FailReason;
     use std::fs;
     use std::process::Command;
@@ -500,5 +504,122 @@ mod tests {
 
         let err = evaluate_transition(&mut s, p, "launch", None).unwrap_err();
         assert!(err.to_string().contains(&dangling.to_string()), "got {err}");
+    }
+
+    /// A `Store` where every read fails, so the error a caller sees is the
+    /// only thing under test.
+    struct BrokenStore;
+
+    impl Store for BrokenStore {
+        fn add_project(&mut self, _: &str) -> Result<ProjectId, StoreError> {
+            Err(broken())
+        }
+        fn get_project(&self, _: ProjectId) -> Result<Option<Project>, StoreError> {
+            Err(broken())
+        }
+        fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
+            Err(broken())
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn add_gate(
+            &mut self,
+            _: ProjectId,
+            _: &str,
+            _: GateKind,
+            _: Selector,
+            _: u64,
+            _: &str,
+            _: &str,
+        ) -> Result<GateId, StoreError> {
+            Err(broken())
+        }
+        fn get_gate(&self, _: GateId) -> Result<Option<GateDef>, StoreError> {
+            Err(broken())
+        }
+        fn list_gates(&self, _: ProjectId) -> Result<Vec<GateDef>, StoreError> {
+            Err(broken())
+        }
+        fn update_gate(&mut self, _: &GateDef) -> Result<(), StoreError> {
+            Err(broken())
+        }
+        fn add_transition(&mut self, _: Transition) -> Result<(), StoreError> {
+            Err(broken())
+        }
+        fn get_transition(&self, _: ProjectId, _: &str) -> Result<Option<Transition>, StoreError> {
+            Err(broken())
+        }
+        fn add_record(&mut self, _: ProjectId, _: &str) -> Result<RecordId, StoreError> {
+            Err(broken())
+        }
+        fn get_record(&self, _: RecordId) -> Result<Option<Record>, StoreError> {
+            Err(broken())
+        }
+        fn list_records(&self, _: ProjectId) -> Result<Vec<Record>, StoreError> {
+            Err(broken())
+        }
+        fn set_record_state(&mut self, _: RecordId, _: State) -> Result<(), StoreError> {
+            Err(broken())
+        }
+        fn append_gate_run(&mut self, _: GateRun) -> Result<(), StoreError> {
+            Err(broken())
+        }
+        fn append_attempt(&mut self, _: Attempt) -> Result<(), StoreError> {
+            Err(broken())
+        }
+        fn gate_runs(&self, _: GateId) -> Result<Vec<GateRun>, StoreError> {
+            Err(broken())
+        }
+        fn attempts(&self, _: ProjectId) -> Result<Vec<Attempt>, StoreError> {
+            Err(broken())
+        }
+        fn add_finding(&mut self, _: Finding) -> Result<FindingId, StoreError> {
+            Err(broken())
+        }
+        fn get_finding(&self, _: FindingId) -> Result<Option<Finding>, StoreError> {
+            Err(broken())
+        }
+        fn update_finding(&mut self, _: &Finding) -> Result<(), StoreError> {
+            Err(broken())
+        }
+        fn list_findings(&self, _: ProjectId) -> Result<Vec<Finding>, StoreError> {
+            Err(broken())
+        }
+        fn withdrawals_by(&self, _: &str) -> Result<u64, StoreError> {
+            Err(broken())
+        }
+    }
+
+    fn broken() -> StoreError {
+        StoreError::Decode("unknown variant `Review`".into())
+    }
+
+    // ⚠ Six sites here used to wrap a `StoreError` in `ExecError::Git`, so a
+    // store failure announced itself as `git failed:` from `check` — the
+    // flagship command naming the wrong cause. A one-token revert restores
+    // that silently, which is why it is gated rather than trusted.
+    #[test]
+    fn a_store_failure_is_reported_as_a_store_failure_and_never_as_git() {
+        let mut store = BrokenStore;
+        let err = run_single_gate(&mut store, ProjectId(1), GateId(1))
+            .expect_err("a broken store cannot produce a gate report");
+        assert!(
+            matches!(err, ExecError::Store(_)),
+            "a store failure surfaced as {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(!msg.contains("git"), "blames git: {msg}");
+        assert!(msg.contains("unknown variant"), "loses the cause: {msg}");
+    }
+
+    #[test]
+    fn a_store_failure_during_a_transition_is_also_a_store_failure() {
+        let mut store = BrokenStore;
+        let err = evaluate_transition(&mut store, ProjectId(1), "launch", None)
+            .expect_err("a broken store cannot produce a transition report");
+        assert!(
+            matches!(err, ExecError::Store(_)),
+            "a store failure surfaced as {err:?}"
+        );
+        assert!(!err.to_string().contains("git"), "blames git: {err}");
     }
 }

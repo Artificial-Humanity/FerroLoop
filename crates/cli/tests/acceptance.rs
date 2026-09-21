@@ -115,7 +115,7 @@ fn a_defect_present_before_the_run_stops_the_launch() {
 
     // The launch is refused, and the reason is the predicate and not staleness.
     //
-    // ⚠ That second clause is asserted, not just claimed: `contains("Predicate")`
+    // ⚠ That second clause is asserted, not just claimed: `contains("predicate")`
     // pins the fail reason fl-core reports (`FailReason::Predicate`, printed via
     // `{reason:?}` in `check.rs`). Without it, this test passed even with the
     // predicate check in `command.rs` mutated to always succeed, because the
@@ -130,7 +130,7 @@ fn a_defect_present_before_the_run_stops_the_launch() {
         .stdout(
             contains("FAIL")
                 .and(contains("config-parses"))
-                .and(contains("Predicate")),
+                .and(contains("predicate")),
         );
 }
 
@@ -206,5 +206,5 @@ fn deleting_the_only_config_does_not_turn_the_gate_green() {
         .args(["check", "launch", "--project", "1"])
         .assert()
         .code(1)
-        .stdout(contains("EmptyPopulation"));
+        .stdout(contains("empty_population"));
 }

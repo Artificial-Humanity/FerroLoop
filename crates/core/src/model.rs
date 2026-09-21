@@ -2,6 +2,7 @@ use crate::ids::{GateId, ProjectId, RecordId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum State {
     Todo,
     Doing,
@@ -10,43 +11,35 @@ pub enum State {
     NeedsHuman,
 }
 
-impl State {
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            State::Todo => "todo",
-            State::Doing => "doing",
-            State::Review => "review",
-            State::Done => "done",
-            State::NeedsHuman => "needs_human",
-        }
-    }
-
-    pub fn from_wire(s: &str) -> Option<Self> {
-        Some(match s {
-            "todo" => State::Todo,
-            "doing" => State::Doing,
-            "review" => State::Review,
-            "done" => State::Done,
-            "needs_human" => State::NeedsHuman,
-            _ => return None,
-        })
-    }
-}
+crate::wire::wire_names!(State as state_wire {
+    Todo => "todo",
+    Doing => "doing",
+    Review => "review",
+    Done => "done",
+    NeedsHuman => "needs_human",
+});
 
 /// How bad it is if this transition proceeds on a false pass.
 ///
 /// Declared by the project. Telemetry audits the declaration but never
 /// changes it — irreversibility is half of regret and no measurement sees it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Regret {
     #[default]
     Low,
     High,
 }
 
+crate::wire::wire_names!(Regret as regret_wire {
+    Low => "low",
+    High => "high",
+});
+
 /// How a gate names the things it must examine. Resolved fresh at run time
 /// and never persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Selector {
     Glob { pattern: String },
     Changed { base: String },
@@ -55,6 +48,7 @@ pub enum Selector {
 
 /// How the resolved population reaches a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PopulationDelivery {
     Args,
     Stdin,
@@ -78,6 +72,7 @@ pub struct AgentSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GateKind {
     Command(CommandSpec),
     Agent(AgentSpec),
@@ -119,6 +114,36 @@ pub struct Record {
     pub title: String,
     pub state: State,
 }
+
+crate::wire::wire_tags!(Selector as selector_wire {
+    Selector::Glob { .. } => "glob", Selector::Glob { pattern: "*.rs".into() };
+    Selector::Changed { .. } => "changed", Selector::Changed { base: "main".into() };
+    Selector::Command { .. } => "command", Selector::Command {
+        program: "ls".into(),
+        args: Vec::new(),
+    };
+});
+
+crate::wire::wire_tags!(PopulationDelivery as population_delivery_wire {
+    PopulationDelivery::Args => "args", PopulationDelivery::Args;
+    PopulationDelivery::Stdin => "stdin", PopulationDelivery::Stdin;
+    PopulationDelivery::FileList => "file_list", PopulationDelivery::FileList;
+});
+
+crate::wire::wire_tags!(GateKind as gate_kind_wire {
+    GateKind::Command(_) => "command", GateKind::Command(CommandSpec {
+        program: "true".into(),
+        args: Vec::new(),
+        delivery: PopulationDelivery::Args,
+        timeout_secs: 1,
+        pass_codes: vec![0],
+    });
+    GateKind::Agent(_) => "agent", GateKind::Agent(AgentSpec {
+        adapter: "a".into(),
+        question: "q".into(),
+        timeout_secs: 1,
+    });
+});
 
 #[cfg(test)]
 mod tests {
@@ -181,5 +206,29 @@ mod tests {
         };
         assert_eq!(t.regret, Regret::High);
         assert_eq!(t.gates.len(), 2);
+    }
+
+    #[test]
+    fn the_remaining_wire_enums_are_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&Selector::Glob {
+                pattern: "*.rs".into()
+            })
+            .expect("serialize"),
+            r#"{"glob":{"pattern":"*.rs"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PopulationDelivery::FileList).expect("serialize"),
+            r#""file_list""#
+        );
+        assert_eq!(
+            serde_json::to_string(&GateKind::Agent(AgentSpec {
+                adapter: "claude".into(),
+                question: "?".into(),
+                timeout_secs: 1,
+            }))
+            .expect("serialize"),
+            r#"{"agent":{"adapter":"claude","question":"?","timeout_secs":1}}"#
+        );
     }
 }

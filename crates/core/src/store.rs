@@ -14,6 +14,19 @@ pub enum StoreError {
     NoSuchFinding(FindingId),
     #[error("backend failure: {0}")]
     Backend(String),
+    /// ⚠ A stored record could not be read back into its type. This is what a
+    /// wire-format change looks like from the other side, so the message names
+    /// that cause and the remedy — a refusal that only reports serde's
+    /// complaint tells the reader what broke but not what to do.
+    #[error(
+        "a stored record could not be read: {0}. \
+         Two things produce this and the message cannot tell them apart. \
+         Either the store was written by a version of this tool whose wire \
+         format has since changed — there is no migration, so start a new \
+         store or keep using the version that wrote this one — or the stored \
+         bytes are damaged, in which case restore the file from a backup."
+    )]
+    Decode(String),
 }
 
 /// Everything the engine needs from persistence. `fl-core` is generic over
