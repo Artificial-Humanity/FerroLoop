@@ -35,6 +35,37 @@ const SKIPPED: [&str; 2] = [
     "cargo build --release",
 ];
 
+/// Normalize, drop blanks, and collapse relayed program output to a marker.
+///
+/// ⚠ A line beginning with a tab and `| ` is not this project's output — it
+/// is the gate program's own, which `check` indents and relays verbatim. The
+/// guide's example validator is `python3`, so that excerpt is a CPython
+/// traceback, and CPython renders tracebacks differently between versions:
+/// this ran green locally on 3.14.4 and red in CI on 3.12, on nothing but
+/// frame formatting.
+///
+/// Pinning it would be pinning another project's output on a version this
+/// repository does not control. What is still checked: that the verdict line
+/// is exactly right, that the exit status is right, and that an excerpt was
+/// relayed at all when the page shows one. What is deliberately NOT checked
+/// is the excerpt's contents.
+fn collapse_relayed(lines: &[String], norm: &dyn Fn(&str) -> String) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in lines {
+        if line.starts_with("\t| ") || line.starts_with("\t|") {
+            if out.last().map(String::as_str) != Some("<RELAYED PROGRAM OUTPUT>") {
+                out.push("<RELAYED PROGRAM OUTPUT>".to_string());
+            }
+            continue;
+        }
+        let n = norm(line);
+        if !n.is_empty() {
+            out.push(n);
+        }
+    }
+    out
+}
+
 struct Step {
     command: String,
     expected: Vec<String>,
@@ -266,17 +297,8 @@ fn every_command_in_the_getting_started_guide_produces_the_output_it_prints() {
     let mut checked = 0usize;
     let mut failures = Vec::new();
     for (n, (step, (got, code))) in steps.iter().zip(actual.iter()).enumerate() {
-        let want: Vec<String> = step
-            .expected
-            .iter()
-            .map(|l| normalize(&rewrite(l), &root_str))
-            .filter(|l| !l.is_empty())
-            .collect();
-        let have: Vec<String> = got
-            .iter()
-            .map(|l| normalize(l, &root_str))
-            .filter(|l| !l.is_empty())
-            .collect();
+        let want = collapse_relayed(&step.expected, &|l| normalize(&rewrite(l), &root_str));
+        let have = collapse_relayed(got, &|l| normalize(l, &root_str));
         if want != have {
             failures.push(format!(
                 "command {n}: `{}`\n  the page prints:\n{}\n  it actually printed:\n{}",
