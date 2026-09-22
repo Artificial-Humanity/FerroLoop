@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command as Sys;
 
 fn cli(db: &str) -> Command {
-    let mut c = Command::cargo_bin("flctl").unwrap();
+    let mut c = Command::cargo_bin("fl").unwrap();
     c.arg("--db").arg(db);
     c
 }

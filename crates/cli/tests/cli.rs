@@ -7,7 +7,7 @@ fn db(dir: &tempfile::TempDir) -> String {
 }
 
 fn cli(dir: &tempfile::TempDir) -> Command {
-    let mut c = Command::cargo_bin("flctl").unwrap();
+    let mut c = Command::cargo_bin("fl").unwrap();
     c.arg("--db").arg(db(dir));
     c
 }
@@ -168,7 +168,7 @@ fn a_missing_parent_directory_for_the_db_flag_is_created() {
         "fixture must start absent"
     );
 
-    let mut c = Command::cargo_bin("flctl").unwrap();
+    let mut c = Command::cargo_bin("fl").unwrap();
     c.arg("--db").arg(&nested);
     let repo = git_repo();
     c.args(["project", "add", &repo.path().display().to_string()])
@@ -193,7 +193,7 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
     // `env_clear` scopes the controlled environment to this child process
     // only; it never touches this test process's own environment, so it
     // cannot race any other test reading or setting env vars in parallel.
-    let mut c = Command::cargo_bin("flctl").unwrap();
+    let mut c = Command::cargo_bin("fl").unwrap();
     c.env_clear();
     c.env("FL_DB", &nested);
     // PATH survives the clear: `project add` shells out to `git` to check

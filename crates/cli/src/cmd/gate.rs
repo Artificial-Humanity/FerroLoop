@@ -111,7 +111,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let p = ProjectId(project);
             let Some(proj) = store.get_project(p)? else {
                 bail!(
-                    "no project with id {project}. Run `flctl project list` to see the ids that exist."
+                    "no project with id {project}. Run `fl project list` to see the ids that exist."
                 );
             };
             let head = fl_exec::git::Git::head(std::path::Path::new(&proj.root)).map_err(|e| {
@@ -165,7 +165,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         Cmd::Show { id } => {
             let Some(g) = store.get_gate(GateId(id))? else {
                 bail!(
-                    "no gate with id {id}. Use `flctl gate list --project <id>` to see gates that exist."
+                    "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
                 );
             };
             println!("{}", serde_json::to_string_pretty(&g)?);
@@ -173,7 +173,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         Cmd::Affirm { id, by } => {
             let Some(mut g) = store.get_gate(GateId(id))? else {
                 bail!(
-                    "no gate with id {id}. Use `flctl gate list --project <id>` to see gates that exist."
+                    "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
                 );
             };
             let Some(proj) = store.get_project(g.project)? else {
@@ -192,7 +192,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         Cmd::Run { id } => {
             let Some(g) = store.get_gate(GateId(id))? else {
                 bail!(
-                    "no gate with id {id}. Use `flctl gate list --project <id>` to see gates that exist."
+                    "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
                 );
             };
             let report = run_single_gate(store, g.project, GateId(id))
@@ -209,7 +209,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             // finding closed, `git log` unchanged, no repair made. The
             // check below is a repo-internal test hook, set only by this
             // checkout's own `.cargo/config.toml` for processes Cargo
-            // itself launches (`cargo build`/`run`/`test`); a `flctl`
+            // itself launches (`cargo build`/`run`/`test`); a `fl`
             // binary run any other way — including the only way a
             // production build is ever run, as a standalone artifact
             // outside Cargo's process tree — never has it set. Deliberately
@@ -227,7 +227,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             }
             let Some(mut g) = store.get_gate(GateId(id))? else {
                 bail!(
-                    "no gate with id {id}. Use `flctl gate list --project <id>` to see gates that exist."
+                    "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
                 );
             };
             let GateKind::Command(spec) = &mut g.kind else {

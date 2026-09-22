@@ -43,7 +43,7 @@ fn fixture() -> F {
 
 impl F {
     fn cli(&self) -> Command {
-        let mut c = Command::cargo_bin("flctl").unwrap();
+        let mut c = Command::cargo_bin("fl").unwrap();
         c.arg("--db").arg(&self.db);
         c
     }

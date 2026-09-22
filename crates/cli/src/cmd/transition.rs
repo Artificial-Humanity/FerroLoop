@@ -42,7 +42,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let p = ProjectId(project);
             if store.get_project(p)?.is_none() {
                 bail!(
-                    "no project with id {project}. Run `flctl project list` to see the ids that exist."
+                    "no project with id {project}. Run `fl project list` to see the ids that exist."
                 );
             }
             let Some(from_state) = State::from_wire(&from) else {
@@ -67,7 +67,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 let Some(def) = store.get_gate(GateId(*g))? else {
                     bail!(
                         "transition `{name}` names gate {g}, which does not exist. \
-                         Run `flctl gate list --project {project}` to see the ids that exist."
+                         Run `fl gate list --project {project}` to see the ids that exist."
                     );
                 };
                 // ⚠ Existence used to be the whole check. A gate belonging to
@@ -102,7 +102,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let Some(t) = store.get_transition(p, &name)? else {
                 bail!(
                     "project {project} declares no transition named `{name}`. \
-                     Add it with `flctl transition add`, or name one of the existing ones."
+                     Add it with `fl transition add`, or name one of the existing ones."
                 );
             };
             println!("{}", serde_json::to_string_pretty(&t)?);
