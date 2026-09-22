@@ -4,8 +4,9 @@ This walks through gating one real action — a config file has to parse before 
 allowed to call a build "ready to launch" — from an empty database to a refused launch and
 back to an allowed one. Every command below was actually run to produce the output shown.
 
-The tool has no ratified name yet. Its binary is `flctl`; this document calls it "the tool"
-or `flctl` and nothing else.
+The product is **FerroLoop**. The command you type is `fl` — a short handle, the way
+Claude Code's is `claude`. This document uses "FerroLoop" in prose and `fl` in every
+transcript.
 
 **Versions this document's output came from:**
 
@@ -34,22 +35,22 @@ $ cargo build --release
     Finished `release` profile [optimized] target(s) in 0.82s
 ```
 
-The binary is at `target/release/flctl`.
+The binary is at `target/release/fl`.
 
 ```
-$ target/release/flctl --version
-flctl 0.1.0
+$ target/release/fl --version
+fl 0.1.0
 ```
 
 Every command below passes `--db <path>` explicitly so the walkthrough doesn't touch
-whatever store you already have. In real use you can skip it: `flctl` falls back to
+whatever store you already have. In real use you can skip it: `fl` falls back to
 `$FL_DB`, then an XDG data directory, creating whichever directory it lands on.
 
 ```
-$ flctl --help
+$ fl --help
 Gate an action before it costs you
 
-Usage: flctl [OPTIONS] <COMMAND>
+Usage: fl [OPTIONS] <COMMAND>
 
 Commands:
   project     
@@ -87,7 +88,7 @@ $ cat > config/settings.json <<'EOF'
 EOF
 $ git add -A && git commit -qm "initial config"
 
-$ flctl --db /tmp/gs-demo/store.redb project add /tmp/gs-demo/project
+$ fl --db /tmp/gs-demo/store.redb project add /tmp/gs-demo/project
 1	/tmp/gs-demo/project
 ```
 
@@ -101,7 +102,7 @@ covers the other two. Here the population is every `config/*.json` file, and the
 `python3 -c '...'` — a validator that parses each one as JSON and fails loudly if it can't.
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb gate add \
+$ fl --db /tmp/gs-demo/store.redb gate add \
     --project 1 --name config-parses --kind command --glob "config/*.json" \
     --program python3 --arg=-c \
     --arg="import json,sys;[json.load(open(p)) for p in sys.argv[1:]]" \
@@ -125,7 +126,7 @@ A transition names the states it moves between, the gates that must pass first, 
 anything the gate actually covers, that counts as a failure, not just a warning.
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb transition add \
+$ fl --db /tmp/gs-demo/store.redb transition add \
     --project 1 --name launch --from review --to done --regret high --gate 2
 launch
 ```
@@ -133,7 +134,7 @@ launch
 ## 5. Check before the costly action
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb check launch --project 1
+$ fl --db /tmp/gs-demo/store.redb check launch --project 1
 PASS	config-parses	1 examined	25ms
 $ echo "exit: $?"
 exit: 0
@@ -156,7 +157,7 @@ $ cat > config/settings.json <<'EOF'
 EOF
 $ git add -A && git commit -qm "broke the config"
 
-$ flctl --db /tmp/gs-demo/store.redb check launch --project 1
+$ fl --db /tmp/gs-demo/store.redb check launch --project 1
 FAIL	config-parses	predicate, 1 examined	75ms  (stale)
 	| Traceback (most recent call last):
 	|   File "<string>", line 1, in <module>
@@ -196,8 +197,8 @@ indented lines are the program's own output, so you can see exactly what it obje
 An exit-`2` example — asking for a transition that was never declared:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb check no-such-transition --project 1
-error: selector is not valid: project 1 declares no transition named `no-such-transition`. Add it with `flctl transition add`, or name one of the existing ones.
+$ fl --db /tmp/gs-demo/store.redb check no-such-transition --project 1
+error: selector is not valid: project 1 declares no transition named `no-such-transition`. Add it with `fl transition add`, or name one of the existing ones.
 $ echo "exit: $?"
 exit: 2
 ```
@@ -215,7 +216,7 @@ $ cat > config/settings.json <<'EOF'
 EOF
 $ git add -A && git commit -qm "fixed the config, raised epochs"
 
-$ flctl --db /tmp/gs-demo/store.redb check launch --project 1
+$ fl --db /tmp/gs-demo/store.redb check launch --project 1
 FAIL	config-parses	stale, 1 examined	25ms  (stale)
 $ echo "exit: $?"
 exit: 1
@@ -233,10 +234,10 @@ re-run anything and does not inspect the diff for you — it only re-stamps the 
 provenance. Run it after you've actually looked, not as a way to silence the warning.
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
+$ fl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
 2	18da2e3ac0ac4353119805fba23f143ee5215e88
 
-$ flctl --db /tmp/gs-demo/store.redb check launch --project 1
+$ fl --db /tmp/gs-demo/store.redb check launch --project 1
 PASS	config-parses	1 examined	25ms
 $ echo "exit: $?"
 exit: 0
@@ -250,7 +251,7 @@ Delete the only file the gate examines:
 $ rm config/settings.json
 $ git add -A && git commit -qm "removed the config"
 
-$ flctl --db /tmp/gs-demo/store.redb check launch --project 1
+$ fl --db /tmp/gs-demo/store.redb check launch --project 1
 FAIL	config-parses	empty_population, 0 examined	0ms  (stale)
 	| population 0 is below the declared floor of 1
 $ echo "exit: $?"
@@ -279,7 +280,7 @@ that can tell you the defect is real, and later, that it is gone.
 Findings attach to a **record** — a unit of work, the thing a finding is about.
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb record add --project 1 --title "tune the learning rate"
+$ fl --db /tmp/gs-demo/store.redb record add --project 1 --title "tune the learning rate"
 3	tune the learning rate
 ```
 
@@ -287,7 +288,7 @@ Put a negative learning rate in the config and commit it, then have a reviewer r
 claim about it:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb finding raise --record 3 \
+$ fl --db /tmp/gs-demo/store.redb finding raise --record 3 \
     --claim "the validator accepts a negative learning_rate" --by reviewer
 4	raised	the validator accepts a negative learning_rate
 ```
@@ -295,7 +296,7 @@ $ flctl --db /tmp/gs-demo/store.redb finding raise --record 3 \
 `raised` is as far as that gets on its own. Try to hand it to somebody to fix:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb finding assign 4 --to fixer
+$ fl --db /tmp/gs-demo/store.redb finding assign 4 --to fixer
 error: this finding has no reproduction, so it cannot be assigned. Attach a check that fails because of the defect, or withdraw the finding.
 $ echo "exit: $?"
 exit: 2
@@ -308,7 +309,7 @@ Two ways forward, and the refusal names both. Attach a reproduction, or withdraw
 The obvious move is to point at a check you already have:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb finding reproduce 4 --gate 2
+$ fl --db /tmp/gs-demo/store.redb finding reproduce 4 --gate 2
 error: gate `config-parses` currently PASSES over 1 items, so it is not a reproduction. A check that already passes cannot tell you whether the defect is absent or whether the check simply does not exercise it. Write one that fails because of the defect.
 $ echo "exit: $?"
 exit: 2
@@ -320,14 +321,14 @@ when all it ever proved was that it never looked. So write a gate that fails *no
 reason in the claim:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb gate add \
+$ fl --db /tmp/gs-demo/store.redb gate add \
     --project 1 --name rate-positive --kind command --glob "config/*.json" \
     --program python3 --arg=-c \
     --arg="import json,sys;[sys.exit('learning_rate must be > 0') for p in sys.argv[1:] if json.load(open(p))['learning_rate'] <= 0]" \
     --authored-by reviewer
 5	rate-positive	16bc83526da0269acbd3a135ab6317d98d7d670a
 
-$ flctl --db /tmp/gs-demo/store.redb gate run 5
+$ fl --db /tmp/gs-demo/store.redb gate run 5
 FAIL	rate-positive	predicate, 1 examined
 $ echo "exit: $?"
 exit: 1
@@ -336,10 +337,10 @@ exit: 1
 It fails, so it is admissible:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb finding reproduce 4 --gate 5
+$ fl --db /tmp/gs-demo/store.redb finding reproduce 4 --gate 5
 4	reproduced	gate 5 failed over 1 items
 
-$ flctl --db /tmp/gs-demo/store.redb finding assign 4 --to fixer
+$ fl --db /tmp/gs-demo/store.redb finding assign 4 --to fixer
 4	assigned	fixer
 ```
 
@@ -353,14 +354,14 @@ Say there is a second gate on the project, green today — the sort of check tha
 because somebody once got bitten:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb gate add \
+$ fl --db /tmp/gs-demo/store.redb gate add \
     --project 1 --name epochs-present --kind command --glob "config/*.json" \
     --program python3 --arg=-c \
     --arg="import json,sys;[sys.exit('epochs is missing') for p in sys.argv[1:] if 'epochs' not in json.load(open(p))]" \
     --authored-by you
 6	epochs-present	16bc83526da0269acbd3a135ab6317d98d7d670a
 
-$ flctl --db /tmp/gs-demo/store.redb gate run 6
+$ fl --db /tmp/gs-demo/store.redb gate run 6
 PASS	epochs-present	1 examined
 ```
 
@@ -375,7 +376,7 @@ $ cat > config/settings.json <<'EOF'
 EOF
 $ git add -A && git commit -qm "fix: make the learning rate positive"
 
-$ flctl --db /tmp/gs-demo/store.redb finding verify 4
+$ fl --db /tmp/gs-demo/store.redb finding verify 4
 REPRODUCTION	passes over 1 items  (stale: the gate's population moved since it was stamped)
 NEIGHBOURS	2 checked, 1 regressed
 REGRESSION	epochs-present	FAIL	predicate, 1 examined  (stale: the gate's population moved since it was stamped)
@@ -406,7 +407,7 @@ $ cat > config/settings.json <<'EOF'
 EOF
 $ git add -A && git commit -qm "fix: make the learning rate positive, keep epochs"
 
-$ flctl --db /tmp/gs-demo/store.redb finding verify 4
+$ fl --db /tmp/gs-demo/store.redb finding verify 4
 REPRODUCTION	passes over 1 items  (stale: the gate's population moved since it was stamped)
 NEIGHBOURS	2 checked, 0 regressed
 NEIGHBOUR	config-parses	passes  (stale: the gate's population moved since it was stamped)
@@ -424,11 +425,11 @@ The other exit exists because a review that cannot kill its own findings just ac
 them. Some claims are taste, and taste has no failing check:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb finding raise --record 3 \
+$ fl --db /tmp/gs-demo/store.redb finding raise --record 3 \
     --claim "the config layout feels wrong" --by reviewer
 7	raised	the config layout feels wrong
 
-$ flctl --db /tmp/gs-demo/store.redb finding withdraw 7 \
+$ fl --db /tmp/gs-demo/store.redb finding withdraw 7 \
     --reason "no reproduction is possible: this is taste, not a defect"
 7	withdrawn	no reproduction is possible: this is taste, not a defect
 ```
@@ -436,7 +437,7 @@ $ flctl --db /tmp/gs-demo/store.redb finding withdraw 7 \
 Withdrawal is not free. It is counted, and it is counted against whoever raised the claim:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb finding list --project 1
+$ fl --db /tmp/gs-demo/store.redb finding list --project 1
 4	fixed	reviewer	the validator accepts a negative learning_rate
 7	withdrawn	reviewer	the config layout feels wrong
 reviewer	withdrawn: 1
@@ -449,7 +450,7 @@ One thing to know about the value passed to `--state`: it is the same spelling t
 prints, and nothing else is accepted.
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb finding list --project 1 --state Withdrawn
+$ fl --db /tmp/gs-demo/store.redb finding list --project 1 --state Withdrawn
 error: `Withdrawn` is not a finding state. Valid states are: raised, reproduced, assigned, fixed, withdrawn.
 $ echo "exit: $?"
 exit: 2
@@ -466,11 +467,11 @@ is no default, because a gate that does not say what it examines is the empty-po
 failure waiting to happen.
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb gate add --project 1 --name nameless --program true
+$ fl --db /tmp/gs-demo/store.redb gate add --project 1 --name nameless --program true
 error: the following required arguments were not provided:
   <--glob <GLOB>|--changed-since <REF>|--population-from <PROGRAM>>
 
-Usage: flctl gate add --project <PROJECT> --name <NAME> --program <PROGRAM> <--glob <GLOB>|--changed-since <REF>|--population-from <PROGRAM>>
+Usage: fl gate add --project <PROJECT> --name <NAME> --program <PROGRAM> <--glob <GLOB>|--changed-since <REF>|--population-from <PROGRAM>>
 
 For more information, try '--help'.
 $ echo "exit: $?"
@@ -481,14 +482,14 @@ exit: 2
 tracks the size of the change rather than the size of the repository:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb gate add \
+$ fl --db /tmp/gs-demo/store.redb gate add \
     --project 1 --name touched-recently --kind command --changed-since HEAD~1 \
     --program python3 --arg=-c \
     --arg="import json,sys;[json.load(open(p)) for p in sys.argv[1:] if p.endswith('.json')]" \
     --authored-by you
 8	touched-recently	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
 
-$ flctl --db /tmp/gs-demo/store.redb gate run 8
+$ fl --db /tmp/gs-demo/store.redb gate run 8
 PASS	touched-recently	1 examined
 ```
 
@@ -508,7 +509,7 @@ git ls-files 'config/*.json'
 EOF
 $ chmod +x list-configs.sh
 
-$ flctl --db /tmp/gs-demo/store.redb gate add \
+$ fl --db /tmp/gs-demo/store.redb gate add \
     --project 1 --name listed-configs --kind command \
     --population-from /tmp/gs-demo/project/list-configs.sh \
     --program python3 --arg=-c \
@@ -516,7 +517,7 @@ $ flctl --db /tmp/gs-demo/store.redb gate add \
     --authored-by you
 9	listed-configs	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
 
-$ flctl --db /tmp/gs-demo/store.redb gate run 9
+$ fl --db /tmp/gs-demo/store.redb gate run 9
 PASS	listed-configs	1 examined
 ```
 
@@ -537,12 +538,12 @@ exit 128
 EOF
 $ chmod +x broken-list.sh
 
-$ flctl --db /tmp/gs-demo/store.redb gate add \
+$ fl --db /tmp/gs-demo/store.redb gate add \
     --project 1 --name broken-lister --kind command \
     --population-from /tmp/gs-demo/project/broken-list.sh --program true --authored-by you
 10	broken-lister	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
 
-$ flctl --db /tmp/gs-demo/store.redb gate run 10
+$ fl --db /tmp/gs-demo/store.redb gate run 10
 ERROR	broken-lister	population command `/tmp/gs-demo/project/broken-list.sh` exited 128, so the population is unknown, not empty: fatal: not a git repository
 $ echo "exit: $?"
 exit: 2
@@ -562,7 +563,7 @@ those gates exist to protect — so it runs them, and refuses the move if they s
 A record starts in `todo`:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb record list --project 1
+$ fl --db /tmp/gs-demo/store.redb record list --project 1
 3	todo	tune the learning rate
 ```
 
@@ -572,7 +573,7 @@ move has nothing to bypass and proceeds — and says which it was, because "allo
 checked" must not read the same:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb record move 3 --to review
+$ fl --db /tmp/gs-demo/store.redb record move 3 --to review
 3	review	ungated: project 1 declares no transition from `todo` to `review`
 $ echo "exit: $?"
 exit: 0
@@ -581,7 +582,7 @@ exit: 0
 `review → done` is a different matter. `launch` covers it, so `launch` runs:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb record move 3 --to done
+$ fl --db /tmp/gs-demo/store.redb record move 3 --to done
 FAIL	launch	config-parses	stale, 1 examined	25ms  (stale)
 REFUSED	3	stays `review`
 $ echo "exit: $?"
@@ -593,17 +594,17 @@ config has moved several times since the gate was last stamped. The exit code is
 that `check` would have given, and the record has not moved:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb record list --project 1
+$ fl --db /tmp/gs-demo/store.redb record list --project 1
 3	review	tune the learning rate
 ```
 
 Look at the gate, affirm it, and the same move goes through:
 
 ```
-$ flctl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
+$ fl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
 2	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
 
-$ flctl --db /tmp/gs-demo/store.redb record move 3 --to done
+$ fl --db /tmp/gs-demo/store.redb record move 3 --to done
 PASS	launch	config-parses	1 examined	25ms
 3	done
 $ echo "exit: $?"

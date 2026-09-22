@@ -48,7 +48,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let r = RecordId(record);
             let Some(rec) = store.get_record(r)? else {
                 bail!(
-                    "no record with id {record}. Use `flctl record list --project <id>` to see records that exist."
+                    "no record with id {record}. Use `fl record list --project <id>` to see records that exist."
                 );
             };
             let id = store.add_finding(Finding::raise(rec.project, r, &by, &claim))?;
@@ -66,7 +66,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let id = FindingId(finding);
             let Some(mut f) = store.get_finding(id)? else {
                 bail!(
-                    "no finding with id {finding}. Use `flctl finding list --project <id>` to see findings that exist."
+                    "no finding with id {finding}. Use `fl finding list --project <id>` to see findings that exist."
                 );
             };
             f.assign(&to).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -154,7 +154,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let id = FindingId(finding);
             let Some(mut f) = store.get_finding(id)? else {
                 bail!(
-                    "no finding with id {finding}. Use `flctl finding list --project <id>` to see findings that exist."
+                    "no finding with id {finding}. Use `fl finding list --project <id>` to see findings that exist."
                 );
             };
             f.withdraw(&reason).map_err(|e| anyhow::anyhow!("{e}"))?;

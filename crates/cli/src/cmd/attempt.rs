@@ -34,7 +34,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
     let id = RecordId(cmd.record);
     let Some(record) = store.get_record(id)? else {
         bail!(
-            "no record with id {}. Run `flctl record list` to see the ids that exist.",
+            "no record with id {}. Run `fl record list` to see the ids that exist.",
             cmd.record
         );
     };

@@ -33,7 +33,7 @@ fn a_defect_present_before_the_run_stops_the_launch() {
     let repo = tempfile::tempdir().unwrap();
     let db = home.path().join("t.redb").display().to_string();
     let cli = || {
-        let mut c = Command::cargo_bin("flctl").unwrap();
+        let mut c = Command::cargo_bin("fl").unwrap();
         c.arg("--db").arg(&db);
         c
     };
@@ -52,7 +52,7 @@ fn a_defect_present_before_the_run_stops_the_launch() {
     //
     // ⚠ `--arg` is `num_args = 0..`, so clap treats a bare `-c` token that
     // follows it as a new flag rather than a value (verified against
-    // `flctl gate add --help` and a live run: the two-token form
+    // `fl gate add --help` and a live run: the two-token form
     // `--arg -c` fails with "unexpected argument '-c' found"). The
     // `--arg=VALUE` form sidesteps clap's flag-vs-value sniffing and is
     // what actually reaches the process as an argv value.
@@ -140,7 +140,7 @@ fn deleting_the_only_config_does_not_turn_the_gate_green() {
     let repo = tempfile::tempdir().unwrap();
     let db = home.path().join("t.redb").display().to_string();
     let cli = || {
-        let mut c = Command::cargo_bin("flctl").unwrap();
+        let mut c = Command::cargo_bin("fl").unwrap();
         c.arg("--db").arg(&db);
         c
     };

@@ -8,9 +8,9 @@
 #
 # The mechanism: Cargo sets every variable in this table for every process
 # *it* launches from this checkout — `cargo build`, `cargo run`, `cargo
-# test` — and a spawned child (such as the `flctl` binary a `cargo test`
+# test` — and a spawned child (such as the `fl` binary a `cargo test`
 # integration test invokes as a subprocess) inherits it by ordinary process
-# environment inheritance. A `flctl` binary run any other way — the
+# environment inheritance. A `fl` binary run any other way — the
 # distributed release artifact, copied out of `target/` and executed
 # directly, which is the only way a production build is ever run — never
 # sees this variable, because nothing set it in that process's environment.

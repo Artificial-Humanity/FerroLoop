@@ -58,7 +58,7 @@ jobs:
       - name: cargo clippy --all-targets -- -D warnings
         run: cargo clippy --all-targets --workspace -- -D warnings
 
-      # Integration tests spawn the real `flctl` binary and drive real git
+      # Integration tests spawn the real `fl` binary and drive real git
       # repositories in temp directories, so this step covers AGENTS.md's
       # "integration smoke checks" as well as the unit layer.
       - name: cargo test --workspace

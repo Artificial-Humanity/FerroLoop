@@ -6,7 +6,7 @@ use fl_store::RedbStore;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "flctl", version, about = "Gate an action before it costs you")]
+#[command(name = "fl", version, about = "Gate an action before it costs you")]
 struct Cli {
     /// Path to the store. Falls back to $FL_DB, then the XDG data directory.
     #[arg(long, global = true)]

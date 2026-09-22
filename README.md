@@ -46,8 +46,9 @@ cd FerroLoop
 cargo build --release
 ```
 
-The compiled binary will be located at `target/release/flctl` — the CLI's placeholder
-binary name; no product name has been ratified yet.
+The compiled binary will be located at `target/release/fl`. **FerroLoop** names both the
+suite and this CLI; `fl` is the command you type, kept short deliberately — the same split
+as Claude Code and `claude`.
 
 To gate a real action with it end to end — registering a project, writing a gate, wiring
 it into a transition, and reading a refusal — see

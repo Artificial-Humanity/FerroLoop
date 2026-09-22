@@ -255,7 +255,7 @@ pub fn evaluate_transition(
         .ok_or_else(|| {
             ExecError::BadSelector(format!(
                 "project {project} declares no transition named `{transition_name}`. \
-                 Add it with `flctl transition add`, or name one of the existing ones."
+                 Add it with `fl transition add`, or name one of the existing ones."
             ))
         })?;
 

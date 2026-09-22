@@ -6,7 +6,7 @@ license.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "flctl"
+name = "fl"
 path = "src/main.rs"
 
 [dependencies]

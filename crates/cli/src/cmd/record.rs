@@ -30,7 +30,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let p = ProjectId(project);
             if store.get_project(p)?.is_none() {
                 bail!(
-                    "no project with id {project}. Run `flctl project list` to see the ids that exist."
+                    "no project with id {project}. Run `fl project list` to see the ids that exist."
                 );
             }
             let id = store.add_record(p, &title)?;
@@ -51,7 +51,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             let r = RecordId(id);
             let Some(record) = store.get_record(r)? else {
                 bail!(
-                    "no record with id {id}. Use `flctl record list --project <id>` to see records that exist."
+                    "no record with id {id}. Use `fl record list --project <id>` to see records that exist."
                 );
             };
 
