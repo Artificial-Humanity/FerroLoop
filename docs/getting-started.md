@@ -284,8 +284,23 @@ $ fl --db /tmp/gs-demo/store.redb record add --project 1 --title "tune the learn
 3	tune the learning rate
 ```
 
-Put a negative learning rate in the config and commit it, then have a reviewer raise a
-claim about it:
+Section 9 deleted the config, so put it back — this time with a learning rate that is
+negative, which is the defect a reviewer is about to claim:
+
+```
+$ cat > config/settings.json <<'EOF'
+{
+  "epochs": 12,
+  "learning_rate": -0.001
+}
+EOF
+$ git add -A && git commit -qm "restored the config"
+
+$ fl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
+2	16bc83526da0269acbd3a135ab6317d98d7d670a
+```
+
+Now have a reviewer raise a claim about it:
 
 ```
 $ fl --db /tmp/gs-demo/store.redb finding raise --record 3 \
