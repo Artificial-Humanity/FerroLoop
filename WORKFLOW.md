@@ -26,9 +26,9 @@ Follow [AGENTS.md](AGENTS.md) for repository rules and git configuration.
 * **A repository admin can bypass every rule above.** `enforce_admins` is off, so
   protection is a guard rail for the normal path, not a wall. Treat the pull request as
   the route because it is the workflow, not because git will stop you.
-* CI runs the verification trio on every push and pull request:
-  [.github/workflows/verify.yml](.github/workflows/verify.yml). On a pull request it now
-  **blocks the merge**; on a plain branch push it only reports. Run the trio locally
-  before pushing — CI is the second reader, not the first.
+* CI runs the verification trio on every pull request and on every push to `main`:
+  [.github/workflows/verify.yml](.github/workflows/verify.yml). On a pull request it
+  **blocks the merge**. A branch push with no pull request does not run CI. Run the trio
+  locally before pushing — CI is the second reader, not the first.
 * Use the workflow stated here. Do not reconstruct additional rules from retired
   workflows or git history; changes to the workflow belong to the owner.
