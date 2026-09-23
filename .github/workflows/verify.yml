@@ -1,4 +1,4 @@
-# The verification trio, run on every push and pull request.
+# The verification trio, run on every pull request and on every push to `main`.
 #
 # AGENTS.md requires `cargo test`, a warning-free `cargo clippy --all-targets`,
 # and integration checks to be green before work lands. Until this file existed
@@ -6,8 +6,13 @@
 # push" — a documented guard that never ran, which is the exact defect this
 # project exists to catch.
 #
-# What this does NOT do: gate the merge. `main` has no branch protection, so a
-# red run here reports, it does not block. Read the result; do not assume it.
+# On a pull request this run GATES the merge: branch protection requires the
+# `test, clippy, fmt` check by name, so renaming the job below silently breaks
+# the gate. The push to `main` runs the trio again on the merged result.
+#
+# A branch push alone does NOT trigger a run. Every branch lands through a pull
+# request, so running on both events ran the same commit twice. To check a
+# branch with no pull request yet, start the workflow by hand.
 #
 # No third-party actions are used. `actions/checkout` is GitHub's own; every
 # other step is a command from the toolchain, so the supply chain for a run is
@@ -16,7 +21,7 @@ name: verify
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
