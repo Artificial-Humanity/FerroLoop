@@ -215,8 +215,10 @@ rule and adds a test that holds it.
 
 * A handle is display only. It never appears on the wire, in a reference between items,
   or in JSON output. **Every stored reference is a full IRI.** *(Invariant)*
-* **Local handles** are sequential per project and per kind, stored in the local store as
-  a table from handle to IRI. Nothing depends on a handle. If the table is lost, every IRI
+* **Local handles** are sequential per store and per kind, stored in the local store as
+  a table from handle to IRI. *(Owner, 2026-09-24: per store, not per project, so that the
+  commands that name an item without naming its project keep working. `gate 3` and
+  `finding 3` can both exist; every command already names the kind.)* Nothing depends on a handle. If the table is lost, every IRI
   still works and only the short names are gone. A handle is never reused.
 * **GitHub handles** are `#41` for the configured repository and `owner/repo#41` for any
   other.
