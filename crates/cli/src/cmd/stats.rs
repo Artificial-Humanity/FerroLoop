@@ -14,14 +14,19 @@ pub struct Cmd {
 }
 
 impl Cmd {
-    /// The one item this command names.
+    /// The one item this command names, by `Ref` — the single source
+    /// `iris()` and `has_handle()` both derive from (Fix round 2, item 5).
+    fn refs(&self) -> Vec<&Ref> {
+        vec![&self.project]
+    }
+
     pub fn iris(&self) -> Vec<Iri> {
-        refs::iris(&[&self.project])
+        refs::iris(&self.refs())
     }
 
     /// Whether this command names its item by handle rather than IRI.
     pub fn has_handle(&self) -> bool {
-        refs::has_handle(&[&self.project])
+        refs::has_handle(&self.refs())
     }
 }
 

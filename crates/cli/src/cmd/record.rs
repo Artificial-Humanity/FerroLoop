@@ -28,23 +28,25 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    /// Every item this command names — a target state is not an id and
-    /// never appears here.
-    pub fn iris(&self) -> Vec<Iri> {
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added to a
+    /// variant here is picked up by both at once (Fix round 2, item 5). A
+    /// target state is not an id and never appears here.
+    fn refs(&self) -> Vec<&Ref> {
         match self {
-            Cmd::Add { project, .. } => refs::iris(&[project]),
-            Cmd::List { project } => refs::iris(&[project]),
-            Cmd::Move { id, .. } => refs::iris(&[id]),
+            Cmd::Add { project, .. } => vec![project],
+            Cmd::List { project } => vec![project],
+            Cmd::Move { id, .. } => vec![id],
         }
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
     }
 
     /// Whether this command names any item by handle rather than IRI.
     pub fn has_handle(&self) -> bool {
-        match self {
-            Cmd::Add { project, .. } => refs::has_handle(&[project]),
-            Cmd::List { project } => refs::has_handle(&[project]),
-            Cmd::Move { id, .. } => refs::has_handle(&[id]),
-        }
+        refs::has_handle(&self.refs())
     }
 }
 

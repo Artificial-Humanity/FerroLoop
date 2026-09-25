@@ -307,15 +307,11 @@ fn a_symlinked_config_root_binds_like_the_real_one() {
     assert!(!env.default_store().exists());
 }
 
-// Fix round 1 — Ruling (item 0): `--db`/`$FL_DB` CONFINE the command to the
-// one store they name. An IRI that store does not hold is `NotOwned` naming
-// only that store — never a search across every store any project happens
-// to be bound to in the config.
-#[test]
-fn an_explicit_db_confines_the_search_and_never_names_another_configured_store() {
-    let env = Env::new();
-    let (ra, rb, stores, _a, b) = two_bound_stores(&env);
-    env.fl(rb.path())
+/// A gate in `rb`'s store, and its full IRI, via a JSON dump so the id
+/// comes back literal rather than through `refs::show`'s handle
+/// preference.
+fn a_gate_iri_in(env: &Env, repo: &Path) -> String {
+    env.fl(repo)
         .args([
             "gate",
             "add",
@@ -330,17 +326,30 @@ fn an_explicit_db_confines_the_search_and_never_names_another_configured_store()
         ])
         .assert()
         .success();
-    let shown = env
-        .fl(rb.path())
-        .args(["gate", "show", "1"])
-        .output()
-        .unwrap();
+    let shown = env.fl(repo).args(["gate", "show", "1"]).output().unwrap();
     let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
-    let iri = json["id"].as_str().unwrap().to_string();
+    json["id"].as_str().unwrap().to_string()
+}
+
+// Fix round 1 — Ruling (item 0), extended in fix round 2 (items 2, 3):
+// `--db`/`$FL_DB` CONFINE the command to the one store they name. An IRI
+// that store does not hold is `NotOwned` naming only that store — never a
+// search across every store any project happens to be bound to in the
+// config — and looking it up must never CREATE that store file either.
+#[test]
+fn an_explicit_db_confines_the_search_and_never_names_another_configured_store() {
+    let env = Env::new();
+    let (ra, rb, stores, _a, b) = two_bound_stores(&env);
+    let iri = a_gate_iri_in(&env, rb.path());
 
     // `other.redb` is a THIRD path, not registered in the config at all —
     // confinement must hold whether or not it happens to overlap with a
-    // configured store.
+    // configured store, and it must not itself get created merely by being
+    // looked in (Fix round 2, item 2): `RedbStore::open` calls
+    // `Database::create`, so opening a nonexistent confined store to check
+    // whether it owns an id would leave a fresh, empty store file behind —
+    // exactly the "created a store while searching" bug item 3 already
+    // refuses for the config-binding tier, reappearing here for `--db`.
     let other = stores.path().join("other.redb");
     env.fl(ra.path())
         .args(["--db", other.to_str().unwrap(), "gate", "show", &iri])
@@ -349,6 +358,35 @@ fn an_explicit_db_confines_the_search_and_never_names_another_configured_store()
         .stderr(contains("no store holds"))
         .stderr(contains(other.to_str().unwrap()))
         .stderr(contains(b.to_str().unwrap()).not());
+    assert!(
+        !other.exists(),
+        "looking up an IRI created the confined --db store"
+    );
+}
+
+// Fix round 2, item 3: the $FL_DB confinement tier had no test of its own —
+// flipping `db_path`'s `$FL_DB` branch from `confined = true` to `false`
+// failed nothing. Mirrors the `--db` test above through `$FL_DB` instead,
+// including item 2's never-creates-the-store assertion.
+#[test]
+fn fl_db_confines_the_search_and_never_names_another_configured_store() {
+    let env = Env::new();
+    let (ra, rb, stores, _a, b) = two_bound_stores(&env);
+    let iri = a_gate_iri_in(&env, rb.path());
+
+    let other = stores.path().join("other-via-fl-db.redb");
+    env.fl(ra.path())
+        .env("FL_DB", &other)
+        .args(["gate", "show", &iri])
+        .assert()
+        .code(2)
+        .stderr(contains("no store holds"))
+        .stderr(contains(other.to_str().unwrap()))
+        .stderr(contains(b.to_str().unwrap()).not());
+    assert!(
+        !other.exists(),
+        "looking up an IRI created the confined $FL_DB store"
+    );
 }
 
 // Fix round 1 — Important 1: a handle resolves only in the store it was
@@ -359,28 +397,7 @@ fn an_explicit_db_confines_the_search_and_never_names_another_configured_store()
 fn a_handle_mixed_with_an_iri_held_by_a_different_store_is_refused() {
     let env = Env::new();
     let (ra, rb, _stores, _a, _b) = two_bound_stores(&env);
-    env.fl(rb.path())
-        .args([
-            "gate",
-            "add",
-            "--project",
-            "1",
-            "--name",
-            "in-b",
-            "--glob",
-            "*.rs",
-            "--program",
-            "true",
-        ])
-        .assert()
-        .success();
-    let shown = env
-        .fl(rb.path())
-        .args(["gate", "show", "1"])
-        .output()
-        .unwrap();
-    let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
-    let gate_iri = json["id"].as_str().unwrap().to_string();
+    let gate_iri = a_gate_iri_in(&env, rb.path());
 
     // From A (bound to a.redb): project "1" BY HANDLE — A's own project —
     // alongside a gate named BY IRI that only b.redb holds. The IRI search
@@ -407,15 +424,20 @@ fn a_handle_mixed_with_an_iri_held_by_a_different_store_is_refused() {
         .code(2)
         .stderr(contains("handle"));
 
-    // No transition exists in either store.
+    // No transition exists in either store — asserted on the refusal TEXT
+    // `transition show` prints for a missing transition, not just exit 2:
+    // every refusal exits 2, so that alone would not distinguish "the
+    // transition really isn't there" from some unrelated failure.
     env.fl(ra.path())
         .args(["transition", "show", "--project", "1", "--name", "launch"])
         .assert()
-        .code(2);
+        .code(2)
+        .stderr(contains("declares no transition named `launch`"));
     env.fl(rb.path())
         .args(["transition", "show", "--project", "1", "--name", "launch"])
         .assert()
-        .code(2);
+        .code(2)
+        .stderr(contains("declares no transition named `launch`"));
 }
 
 // Fix round 1 — Important 3: `choose_store` must never create a candidate
@@ -510,13 +532,17 @@ fn iris_in_one_command_held_by_different_stores_is_refused_naming_both() {
     // `--project` takes `gate_a_iri` here, not project A's own id or a
     // handle: `choose_store` only ever sees the flat `Vec<Iri>`
     // `Cmd::iris()` collects, so this is enough to drive its "two different
-    // stores" refusal without it — deliberately — being semantically a
-    // project. Using a real project HANDLE here instead would additionally
-    // trip the item-1 "handle held by a different store" refusal as soon as
-    // the IRI search moved the command to store B, masking whether THIS
-    // refusal (main.rs's own two-different-stores bail) still fires on its
-    // own — confirmed by mutating that bail away: the test still failed,
-    // but only because of item 1, not this one.
+    // stores" refusal without `--project` needing to be semantically a
+    // project. A HANDLE here instead would ALSO trip the item-1 "handle
+    // held by a different store" refusal once the IRI search moved the
+    // command to store B — a different refusal, for a different reason,
+    // that would make this test pass even if the one it means to pin broke.
+    // The exact-phrase assertion below exists for the same reason from the
+    // other direction: `NotOwned`'s message also names a store (or two),
+    // so asserting only that `stderr` contains both paths would stay green
+    // even if this bail were replaced by a `NotOwned` return — each store
+    // really does hold its own id, so that would be a wrong answer that
+    // reads as a pass.
     env.fl(ra.path())
         .args([
             "transition",
@@ -536,6 +562,8 @@ fn iris_in_one_command_held_by_different_stores_is_refused_naming_both() {
         ])
         .assert()
         .code(2)
+        .stderr(contains("two different stores"))
+        .stderr(contains("no store holds").not())
         .stderr(contains(a.to_str().unwrap()))
         .stderr(contains(b.to_str().unwrap()));
 }
@@ -585,6 +613,8 @@ fn an_id_owned_by_two_stores_at_once_is_refused_naming_both() {
         .args(["gate", "show", &iri])
         .assert()
         .code(2)
+        .stderr(contains("held by more than one store"))
+        .stderr(contains("no store holds").not())
         .stderr(contains(a.to_str().unwrap()))
         .stderr(contains(c.to_str().unwrap()));
 }

@@ -33,29 +33,29 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    /// Every item this command names: the project, and (for `Add`) every
-    /// `--gate` — a transition name is not an id and never appears here.
-    pub fn iris(&self) -> Vec<Iri> {
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added to a
+    /// variant here is picked up by both at once (Fix round 2, item 5): the
+    /// project, and (for `Add`) every `--gate` — a transition name is not
+    /// an id and never appears here.
+    fn refs(&self) -> Vec<&Ref> {
         match self {
             Cmd::Add { project, gate, .. } => {
-                let mut refs: Vec<&Ref> = vec![project];
-                refs.extend(gate.iter());
-                refs::iris(&refs)
+                let mut out: Vec<&Ref> = vec![project];
+                out.extend(gate.iter());
+                out
             }
-            Cmd::Show { project, .. } => refs::iris(&[project]),
+            Cmd::Show { project, .. } => vec![project],
         }
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
     }
 
     /// Whether this command names any item by handle rather than IRI.
     pub fn has_handle(&self) -> bool {
-        match self {
-            Cmd::Add { project, gate, .. } => {
-                let mut refs: Vec<&Ref> = vec![project];
-                refs.extend(gate.iter());
-                refs::has_handle(&refs)
-            }
-            Cmd::Show { project, .. } => refs::has_handle(&[project]),
-        }
+        refs::has_handle(&self.refs())
     }
 }
 

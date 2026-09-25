@@ -89,30 +89,31 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    /// Every item this command names, so a full IRI on the command line can
-    /// select the store that holds it (spec §2.6). A transition name or a
-    /// program string is not an id and never appears here.
-    pub fn iris(&self) -> Vec<Iri> {
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added to a
+    /// variant here is picked up by both at once (Fix round 2, item 5). A
+    /// transition name or a program string is not an id and never appears
+    /// here.
+    fn refs(&self) -> Vec<&Ref> {
         match self {
-            Cmd::Add(args) => refs::iris(&[&args.project]),
-            Cmd::List { project } => refs::iris(&[project]),
-            Cmd::Show { id } => refs::iris(&[id]),
-            Cmd::Affirm { id, .. } => refs::iris(&[id]),
-            Cmd::Run { id } => refs::iris(&[id]),
-            Cmd::SetProgram { id, .. } => refs::iris(&[id]),
+            Cmd::Add(args) => vec![&args.project],
+            Cmd::List { project } => vec![project],
+            Cmd::Show { id } => vec![id],
+            Cmd::Affirm { id, .. } => vec![id],
+            Cmd::Run { id } => vec![id],
+            Cmd::SetProgram { id, .. } => vec![id],
         }
+    }
+
+    /// Every item this command names, so a full IRI on the command line can
+    /// select the store that holds it (spec §2.6).
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
     }
 
     /// Whether this command names any item by handle rather than IRI.
     pub fn has_handle(&self) -> bool {
-        match self {
-            Cmd::Add(args) => refs::has_handle(&[&args.project]),
-            Cmd::List { project } => refs::has_handle(&[project]),
-            Cmd::Show { id } => refs::has_handle(&[id]),
-            Cmd::Affirm { id, .. } => refs::has_handle(&[id]),
-            Cmd::Run { id } => refs::has_handle(&[id]),
-            Cmd::SetProgram { id, .. } => refs::has_handle(&[id]),
-        }
+        refs::has_handle(&self.refs())
     }
 }
 

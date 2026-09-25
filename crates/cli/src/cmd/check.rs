@@ -17,22 +17,25 @@ pub struct Cmd {
 }
 
 impl Cmd {
-    /// Every item this command names — the transition name is not an id.
-    pub fn iris(&self) -> Vec<Iri> {
-        let mut refs: Vec<&Ref> = vec![&self.project];
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added here is
+    /// picked up by both at once (Fix round 2, item 5). The transition name
+    /// is not an id.
+    fn refs(&self) -> Vec<&Ref> {
+        let mut out: Vec<&Ref> = vec![&self.project];
         if let Some(r) = &self.record {
-            refs.push(r);
+            out.push(r);
         }
-        refs::iris(&refs)
+        out
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
     }
 
     /// Whether this command names any item by handle rather than IRI.
     pub fn has_handle(&self) -> bool {
-        let mut refs: Vec<&Ref> = vec![&self.project];
-        if let Some(r) = &self.record {
-            refs.push(r);
-        }
-        refs::has_handle(&refs)
+        refs::has_handle(&self.refs())
     }
 }
 

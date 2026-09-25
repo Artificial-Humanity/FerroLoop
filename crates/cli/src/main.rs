@@ -137,23 +137,43 @@ fn choose_store(
     if iris.is_empty() {
         return Ok(bound.to_path_buf());
     }
-    let mut candidates = vec![bound.to_path_buf()];
     if !confined {
+        let mut candidates = vec![bound.to_path_buf()];
         for e in entries {
             if !candidates.contains(&e.store) {
                 candidates.push(e.store.clone());
             }
         }
         // Never create a store while searching: only files that exist are
-        // stores. Not applied when confined: `bound` is then the one store
-        // this command was explicitly told to use, not a search candidate.
+        // stores.
         candidates.retain(|c| c.exists());
+        return choose_among(&candidates, iris);
     }
 
+    // ⚠ Fix round 2, item 2: confined mode has exactly one candidate —
+    // `bound` itself — but looking up an IRI must never create a store
+    // (`RedbStore::open` calls `Database::create`, which does). If `bound`
+    // does not exist yet, every id in `iris` is `NotOwned` by construction;
+    // report the first one, naming `bound` as searched, without ever
+    // opening it.
+    if !bound.exists() {
+        return Err(StoreError::NotOwned {
+            id: iris[0].clone(),
+            searched: vec![bound.display().to_string()],
+        }
+        .into());
+    }
+    choose_among(&[bound.to_path_buf()], iris)
+}
+
+/// The common search loop, over whatever candidate list the caller already
+/// decided on (confined: `[bound]`, unconfined: `bound` plus every
+/// configured store that exists).
+fn choose_among(candidates: &[PathBuf], iris: &[Iri]) -> Result<PathBuf> {
     let mut chosen: Option<PathBuf> = None;
     for id in iris {
         let mut owners = Vec::new();
-        for c in &candidates {
+        for c in candidates {
             // ⚠ A store that cannot be opened is an ERROR here, not a
             // "doesn't have it": skipping it would search less than it says.
             let s = RedbStore::open(c)

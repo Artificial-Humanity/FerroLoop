@@ -46,29 +46,28 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    /// Every item this command names — a claim, an assignee and a
-    /// withdrawal reason are strings, not ids.
-    pub fn iris(&self) -> Vec<Iri> {
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added to a
+    /// variant here is picked up by both at once (Fix round 2, item 5). A
+    /// claim, an assignee and a withdrawal reason are strings, not ids.
+    fn refs(&self) -> Vec<&Ref> {
         match self {
-            Cmd::Raise { record, .. } => refs::iris(&[record]),
-            Cmd::Reproduce { finding, gate } => refs::iris(&[finding, gate]),
-            Cmd::Assign { finding, .. } => refs::iris(&[finding]),
-            Cmd::Verify { finding } => refs::iris(&[finding]),
-            Cmd::Withdraw { finding, .. } => refs::iris(&[finding]),
-            Cmd::List { project, .. } => refs::iris(&[project]),
+            Cmd::Raise { record, .. } => vec![record],
+            Cmd::Reproduce { finding, gate } => vec![finding, gate],
+            Cmd::Assign { finding, .. } => vec![finding],
+            Cmd::Verify { finding } => vec![finding],
+            Cmd::Withdraw { finding, .. } => vec![finding],
+            Cmd::List { project, .. } => vec![project],
         }
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
     }
 
     /// Whether this command names any item by handle rather than IRI.
     pub fn has_handle(&self) -> bool {
-        match self {
-            Cmd::Raise { record, .. } => refs::has_handle(&[record]),
-            Cmd::Reproduce { finding, gate } => refs::has_handle(&[finding, gate]),
-            Cmd::Assign { finding, .. } => refs::has_handle(&[finding]),
-            Cmd::Verify { finding } => refs::has_handle(&[finding]),
-            Cmd::Withdraw { finding, .. } => refs::has_handle(&[finding]),
-            Cmd::List { project, .. } => refs::has_handle(&[project]),
-        }
+        refs::has_handle(&self.refs())
     }
 }
 

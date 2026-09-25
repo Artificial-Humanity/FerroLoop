@@ -1,4 +1,4 @@
-use crate::refs;
+use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::store::Catalog;
@@ -14,16 +14,22 @@ pub enum Cmd {
 }
 
 impl Cmd {
-    /// Neither variant names an existing item by id: `Add`'s `path` is a
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added to a
+    /// variant here is picked up by both at once (Fix round 2, item 5).
+    /// Neither variant names an existing item: `Add`'s `path` is a
     /// filesystem path for a project not yet registered, and `List` takes
     /// none at all.
-    pub fn iris(&self) -> Vec<Iri> {
+    fn refs(&self) -> Vec<&Ref> {
         Vec::new()
     }
 
-    /// Neither variant takes a `Ref` at all.
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
+    }
+
     pub fn has_handle(&self) -> bool {
-        false
+        refs::has_handle(&self.refs())
     }
 }
 
