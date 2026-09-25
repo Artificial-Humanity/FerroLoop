@@ -5,7 +5,7 @@ use fl_core::ids::{GateId, ProjectId, RecordId};
 use fl_core::log::GateRun;
 use fl_core::model::{GateDef, GateKind, Project, Regret, Selector, Transition};
 use fl_core::stale::{Staleness, apply_staleness, is_stale};
-use fl_core::store::{Catalog, Ledger};
+use fl_core::store::{Catalog, Ledger, StoreError, follow};
 use fl_core::verdict::Verdict;
 use std::path::{Path, PathBuf};
 
@@ -275,13 +275,22 @@ pub fn evaluate_transition(
     let mut reports = Vec::new();
 
     for gate_id in &transition.gates {
-        let Some(def) = catalog
-            .get_gate(gate_id)
-            .map_err(|e| ExecError::Store(e.to_string()))?
-        else {
-            return Err(ExecError::BadSelector(format!(
-                "transition `{transition_name}` names gate {gate_id}, which does not exist"
-            )));
+        let def = match follow(
+            &format!("transition `{transition_name}`"),
+            gate_id.iri(),
+            catalog.get_gate(gate_id),
+        ) {
+            Ok(def) => def,
+            // `NotOwned` carries no mention of the transition on its own —
+            // "no store holds it" says where nothing was found, not which
+            // reference sent us looking. `Dangling` already names both (it
+            // was built from `from` above), so it passes through unchanged.
+            Err(e @ StoreError::NotOwned { .. }) => {
+                return Err(ExecError::BadSelector(format!(
+                    "transition `{transition_name}` names gate {gate_id}: {e}"
+                )));
+            }
+            Err(e) => return Err(ExecError::Store(e.to_string())),
         };
 
         let report = run_gate(
@@ -507,24 +516,52 @@ mod tests {
     // or deleted out from under it). That must be refused by name, the same
     // as an unknown transition, never silently treated as passing because
     // the loop over `transition.gates` had nothing to iterate distinctly.
+    //
+    // Two different ways for a gate reference to fail to resolve, each
+    // refused with a different shape (spec §5): a gate id no store has ever
+    // minted is `NotOwned` — "never looked" — and the refusal is wrapped so
+    // it still names the transition. A gate id this same store holds, but
+    // under another kind, is `Dangling` — "gone" — and the refusal already
+    // names both the transition and "dangling" without any wrapping, since
+    // `follow` built it from the label `evaluate_transition` passed in.
     #[test]
     fn a_transition_naming_a_gate_that_does_not_exist_is_refused() {
         let d = repo_with(&[("src/a.rs", "x")]);
         let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let dangling = GateId(seq_iri(9999));
+
+        // A gate id that no store holds: "never looked" — NotOwned, with the
+        // transition named so the reader knows where the reference came from.
+        let stranger = GateId(seq_iri(9999));
         s.add_transition(Transition {
             project: p.clone(),
             name: "launch".into(),
             from: State::Review,
             to: State::Done,
             regret: Regret::Low,
-            gates: vec![dangling.clone()],
+            gates: vec![stranger.clone()],
         })
         .unwrap();
-
         let err = evaluate_transition(&s, &s, &p, "launch", None).unwrap_err();
-        assert!(err.to_string().contains(&dangling.to_string()), "got {err}");
+        assert!(
+            err.to_string().contains(stranger.iri().as_str()),
+            "got {err}"
+        );
+        assert!(err.to_string().contains("launch"), "got {err}");
+
+        // An id the store holds as another kind: "gone" — Dangling.
+        let record = s.add_record(&p, "t").unwrap();
+        s.add_transition(Transition {
+            project: p.clone(),
+            name: "ship".into(),
+            from: State::Review,
+            to: State::Done,
+            regret: Regret::Low,
+            gates: vec![GateId(record.0.clone())],
+        })
+        .unwrap();
+        let err = evaluate_transition(&s, &s, &p, "ship", None).unwrap_err();
+        assert!(err.to_string().contains("dangling"), "got {err}");
     }
 
     /// A store where every read fails, so the error a caller sees is the
@@ -600,6 +637,9 @@ mod tests {
             Err(broken())
         }
         fn withdrawals_by(&self, _: &str) -> Result<u64, StoreError> {
+            Err(broken())
+        }
+        fn add_alias(&self, _: &fl_core::Iri, _: fl_core::Iri) -> Result<(), StoreError> {
             Err(broken())
         }
     }

@@ -15,8 +15,13 @@ pub const FORMAT_VERSION: u64 = 2;
 const FORMAT_KEY: &str = "format_version";
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
-/// Every id this store ever minted → its kind's wire name. Append-only.
+/// Every id this store ever minted → its kind's wire name, OR the literal
+/// `"alias"` for an id minted by `add_alias`. `"alias"` is not a `Kind`: it
+/// is an index marker, so `check` must handle it before `Kind::from_wire`.
 const IDS: TableDefinition<&str, &str> = TableDefinition::new("ids");
+/// alias → primary, for every id `add_alias` minted. Never chains: `primary`
+/// is always resolved to a true primary before it is written here.
+const ALIASES: TableDefinition<&str, &str> = TableDefinition::new("aliases");
 const HANDLES: TableDefinition<(&str, u64), &str> = TableDefinition::new("handles");
 const HANDLE_OF: TableDefinition<&str, u64> = TableDefinition::new("handle_of");
 const PROJECTS: TableDefinition<&str, &str> = TableDefinition::new("projects");
@@ -88,6 +93,7 @@ impl RedbStore {
         }
         {
             tx.open_table(IDS).map_err(backend)?;
+            tx.open_table(ALIASES).map_err(backend)?;
             tx.open_table(HANDLES).map_err(backend)?;
             tx.open_table(HANDLE_OF).map_err(backend)?;
             tx.open_table(PROJECTS).map_err(backend)?;
@@ -171,12 +177,16 @@ impl RedbStore {
         Ok(id)
     }
 
-    /// The kind this store holds `id` under, or `NotOwned` naming this store.
+    /// The primary id and kind behind `id`, following one alias hop if `id`
+    /// names an alias rather than a primary. `"alias"` is an index marker in
+    /// `IDS`, not a `Kind`, so it is handled here before `Kind::from_wire`
+    /// ever sees it.
     ///
-    /// ⚠ Every method that takes an id asks this first — list methods too.
-    /// A list over a project this store never held is "didn't look", and an
-    /// empty list would say "looked, found nothing".
-    fn check(&self, id: &Iri) -> Result<Kind, StoreError> {
+    /// ⚠ Every method that takes an id asks this (via [`Self::check`] or
+    /// directly) first — list methods too. A list over a project this store
+    /// never held is "didn't look", and an empty list would say "looked,
+    /// found nothing".
+    fn locate(&self, id: &Iri) -> Result<(Iri, Kind), StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let ids = tx.open_table(IDS).map_err(backend)?;
         let Some(v) = ids.get(id.as_str()).map_err(backend)? else {
@@ -185,8 +195,30 @@ impl RedbStore {
                 searched: vec![self.label.clone()],
             });
         };
-        Kind::from_wire(v.value())
-            .ok_or_else(|| decode(format!("unknown kind `{}` for {id}", v.value())))
+        if v.value() == "alias" {
+            let aliases = tx.open_table(ALIASES).map_err(backend)?;
+            let Some(p) = aliases.get(id.as_str()).map_err(backend)? else {
+                return Err(decode(format!("alias `{id}` has no primary recorded")));
+            };
+            let primary = Iri::parse(p.value()).map_err(decode)?;
+            let Some(pk) = ids.get(primary.as_str()).map_err(backend)? else {
+                return Err(decode(format!(
+                    "alias `{id}` names {primary}, which this store does not hold"
+                )));
+            };
+            let kind = Kind::from_wire(pk.value())
+                .ok_or_else(|| decode(format!("unknown kind `{}` for {primary}", pk.value())))?;
+            return Ok((primary, kind));
+        }
+        let kind = Kind::from_wire(v.value())
+            .ok_or_else(|| decode(format!("unknown kind `{}` for {id}", v.value())))?;
+        Ok((id.clone(), kind))
+    }
+
+    /// The kind this store holds `id` under, or `NotOwned` naming this store.
+    /// An alias is owned too: this follows it to its primary's kind.
+    fn check(&self, id: &Iri) -> Result<Kind, StoreError> {
+        self.locate(id).map(|(_, kind)| kind)
     }
 
     /// Whether this store holds `id`. An I/O failure is an error, never
@@ -243,19 +275,22 @@ impl RedbStore {
     }
 
     /// Checks ownership first, so an id this store never held is `NotOwned`,
-    /// and an id it holds under another kind is `Ok(None)`.
+    /// and an id it holds under another kind is `Ok(None)`. `key` may be an
+    /// alias: `locate` resolves it to the primary the row is stored under,
+    /// which is what this reads — a lookup by alias answers as the primary
+    /// would (spec §2.5).
     fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         table: TableDefinition<&str, &str>,
         key: &Iri,
     ) -> Result<Option<T>, StoreError> {
-        self.check(key)?;
+        let (target, _kind) = self.locate(key)?;
         let tx = self.db.begin_read().map_err(backend)?;
         let t = tx.open_table(table).map_err(backend)?;
         // `ReadOnlyTable::get_owned` (unlike `Table::get`) keeps the read
         // transaction alive via a reference-counted guard, so the returned
         // value can outlive the local borrow of `t`.
-        let Some(v) = t.get_owned(key.as_str()).map_err(backend)? else {
+        let Some(v) = t.get_owned(target.as_str()).map_err(backend)? else {
             return Ok(None);
         };
         let parsed = serde_json::from_str(v.value()).map_err(decode)?;
@@ -409,6 +444,7 @@ impl Tracker for RedbStore {
             project: project.clone(),
             title: title.to_string(),
             state: State::Todo,
+            also_known_as: vec![],
         })?;
         Ok(RecordId(id))
     }
@@ -428,7 +464,11 @@ impl Tracker for RedbStore {
             .get_record(id)?
             .ok_or_else(|| StoreError::NoSuchRecord(id.clone()))?;
         rec.state = state;
-        self.put_json(RECORDS, id.iri(), &rec)
+        // Write under `rec.id`, not `id`: `id` may be an alias, and `rec.id`
+        // is always the primary (an alias never changes what a fetched item
+        // reports as its own id). Writing under an alias key would leave a
+        // stray row behind instead of updating the one that exists.
+        self.put_json(RECORDS, rec.id.iri(), &rec)
     }
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
@@ -465,6 +505,100 @@ impl Tracker for RedbStore {
             .into_iter()
             .filter(|f| f.raised_by == actor && f.state == FindingState::Withdrawn)
             .count() as u64)
+    }
+
+    /// Mint an alias, index it, and append it to the item's `also_known_as`
+    /// row — in ONE write transaction, for the same reason as
+    /// `insert_new_with_id`: a failure partway must leave neither the index
+    /// entry nor the row change behind.
+    fn add_alias(&self, primary: &Iri, alias: Iri) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+
+        let (resolved, kind) = {
+            let ids = tx.open_table(IDS).map_err(backend)?;
+            // `alias` must be unused, whether as a primary id or as another
+            // alias — both live in this one table.
+            if ids.get(alias.as_str()).map_err(backend)?.is_some() {
+                return Err(StoreError::AlreadyExists(alias));
+            }
+            let Some(pv) = ids.get(primary.as_str()).map_err(backend)? else {
+                return Err(StoreError::NotOwned {
+                    id: primary.clone(),
+                    searched: vec![self.label.clone()],
+                });
+            };
+            if pv.value() == "alias" {
+                // `primary` is itself an alias: resolve one more hop so
+                // `ALIASES` never chains.
+                let aliases = tx.open_table(ALIASES).map_err(backend)?;
+                let Some(p) = aliases.get(primary.as_str()).map_err(backend)? else {
+                    return Err(decode(format!("alias `{primary}` has no primary recorded")));
+                };
+                let resolved = Iri::parse(p.value()).map_err(decode)?;
+                let wire = ids
+                    .get(resolved.as_str())
+                    .map_err(backend)?
+                    .expect("an alias's recorded primary is owned")
+                    .value()
+                    .to_string();
+                let kind = Kind::from_wire(&wire)
+                    .ok_or_else(|| decode(format!("unknown kind `{wire}` for {resolved}")))?;
+                (resolved, kind)
+            } else {
+                let wire = pv.value().to_string();
+                let kind = Kind::from_wire(&wire)
+                    .ok_or_else(|| decode(format!("unknown kind `{wire}` for {primary}")))?;
+                (primary.clone(), kind)
+            }
+        };
+
+        let table = match kind {
+            Kind::Record => RECORDS,
+            Kind::Finding => FINDINGS,
+            other => {
+                return Err(StoreError::Backend(format!(
+                    "{resolved} is a {}, and only a record or finding can carry an alias",
+                    other.as_wire()
+                )));
+            }
+        };
+        {
+            let mut t = tx.open_table(table).map_err(backend)?;
+            let json = t
+                .get(resolved.as_str())
+                .map_err(backend)?
+                .expect("a Record or Finding kind means this table holds the row")
+                .value()
+                .to_string();
+            let updated = match kind {
+                Kind::Record => {
+                    let mut r: Record = serde_json::from_str(&json).map_err(decode)?;
+                    r.also_known_as.push(alias.clone());
+                    serde_json::to_string(&r).map_err(backend)?
+                }
+                Kind::Finding => {
+                    let mut f: Finding = serde_json::from_str(&json).map_err(decode)?;
+                    f.also_known_as.push(alias.clone());
+                    serde_json::to_string(&f).map_err(backend)?
+                }
+                _ => unreachable!("checked above"),
+            };
+            t.insert(resolved.as_str(), updated.as_str())
+                .map_err(backend)?;
+        }
+        {
+            let mut ids = tx.open_table(IDS).map_err(backend)?;
+            ids.insert(alias.as_str(), "alias").map_err(backend)?;
+        }
+        {
+            let mut aliases = tx.open_table(ALIASES).map_err(backend)?;
+            aliases
+                .insert(alias.as_str(), resolved.as_str())
+                .map_err(backend)?;
+        }
+
+        tx.commit().map_err(backend)?;
+        Ok(())
     }
 }
 

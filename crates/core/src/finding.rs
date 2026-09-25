@@ -1,4 +1,5 @@
 use crate::ids::{FindingId, GateId, ProjectId, RecordId, seq_iri};
+use crate::iri::Iri;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -73,6 +74,11 @@ pub struct Finding {
     pub state: FindingState,
     pub assigned_to: Option<String>,
     pub withdrawn_reason: Option<String>,
+    /// Other ids this finding answers to (spec §2.5). Empty until
+    /// `add_alias` names one. `#[serde(default)]` so a finding written
+    /// before aliases existed still reads.
+    #[serde(default)]
+    pub also_known_as: Vec<Iri>,
 }
 
 impl Finding {
@@ -89,6 +95,7 @@ impl Finding {
             state: FindingState::Raised,
             assigned_to: None,
             withdrawn_reason: None,
+            also_known_as: vec![],
         }
     }
 

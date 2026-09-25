@@ -44,6 +44,32 @@ pub enum StoreError {
          bytes are damaged, in which case restore the file from a backup."
     )]
     Decode(String),
+    /// ⚠ The store holds `to`, but not as the kind of item `from` expects. A
+    /// reference that never resolves is one failure; a reference that once
+    /// resolved and now points at the wrong kind is a different one, and the
+    /// difference matters to whoever is debugging it.
+    #[error(
+        "{from} refers to {to}, which is dangling: the store holds that id, but not as this kind of item"
+    )]
+    Dangling { from: String, to: Iri },
+}
+
+/// Follow a stored reference. `Ok(None)` from the owning store means the
+/// reference points at nothing of this kind: dangling. `NotOwned` passes
+/// through unchanged — "no store holds it" is not the same as "gone".
+pub fn follow<T>(
+    from: &str,
+    to: &Iri,
+    got: Result<Option<T>, StoreError>,
+) -> Result<T, StoreError> {
+    match got {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) => Err(StoreError::Dangling {
+            from: from.to_string(),
+            to: to.clone(),
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 /// Definitions: projects, gates, transitions. Rarely changed; each belongs
@@ -105,6 +131,13 @@ pub trait Tracker {
     /// cost nobody can read is not a cost, so this is part of the trait and
     /// not a report bolted on later.
     fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError>;
+
+    /// Name `primary` by `alias` as well (spec §2.5). A lookup by `alias`
+    /// then answers as `primary` would. `alias` must not already be used by
+    /// this store, whether as a primary id or as another alias — an id
+    /// space where identity is exact-string comparison has exactly one
+    /// namespace, and an insert into it never overwrites.
+    fn add_alias(&self, primary: &Iri, alias: Iri) -> Result<(), StoreError>;
 }
 
 /// Append-only evidence: gate runs and attempts.

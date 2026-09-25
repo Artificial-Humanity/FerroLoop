@@ -1,4 +1,5 @@
 use crate::ids::{GateId, ProjectId, RecordId};
+use crate::iri::Iri;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +120,11 @@ pub struct Record {
     pub project: ProjectId,
     pub title: String,
     pub state: State,
+    /// Other ids this record answers to (spec §2.5). Empty until `add_alias`
+    /// names one. `#[serde(default)]` so a record written before aliases
+    /// existed still reads.
+    #[serde(default)]
+    pub also_known_as: Vec<Iri>,
 }
 
 crate::wire::wire_tags!(Selector as selector_wire {

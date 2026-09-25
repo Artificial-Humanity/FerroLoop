@@ -2,8 +2,9 @@ use crate::evaluate::{GateReport, run_single_gate};
 use crate::population::ExecError;
 use fl_core::finding::FindingState;
 use fl_core::ids::{FindingId, GateId};
+use fl_core::iri::Iri;
 use fl_core::model::Selector;
-use fl_core::store::Roles;
+use fl_core::store::{Roles, StoreError, follow};
 use fl_core::verdict::{FailReason, Verdict};
 
 #[derive(Debug, thiserror::Error)]
@@ -92,6 +93,23 @@ impl FixReport {
             .unwrap_or(1);
         worst.max(1)
     }
+}
+
+/// Follow a stored reference belonging to a finding, the same way
+/// `evaluate_transition` follows a transition's gates: `NotOwned` is wrapped
+/// so the message names the finding, since bare `NotOwned` only says where
+/// nothing was found, not which stored reference sent us looking.
+/// `Dangling` already names `label` (it is built from it), so it passes
+/// through unchanged.
+fn follow_ref<T>(
+    label: String,
+    to: &Iri,
+    got: Result<Option<T>, StoreError>,
+) -> Result<T, FindingExecError> {
+    follow(&label, to, got).map_err(|e| match e {
+        StoreError::NotOwned { .. } => FindingExecError::Store(format!("{label}: {e}")),
+        other => FindingExecError::Store(other.to_string()),
+    })
 }
 
 /// Render a selector the way a refusal message names it: readable, and
@@ -203,10 +221,27 @@ pub fn verify_finding(
             f.state.as_wire(),
         ));
     }
+
+    // The finding's own stored references, followed explicitly so a
+    // dangling or never-owned project or reproduction is named as such —
+    // by the finding, not surfaced as whatever `run_single_gate` happens to
+    // say about a bare id it was handed.
+    follow_ref(
+        format!("finding {finding}'s project"),
+        f.project.iri(),
+        roles.catalog.get_project(&f.project),
+    )?;
+
     let gate = f
         .reproduction
         .clone()
         .ok_or_else(|| FindingExecError::NoReproduction(finding.clone()))?;
+
+    follow_ref(
+        format!("finding {finding}'s reproduction"),
+        gate.iri(),
+        roles.catalog.get_gate(&gate),
+    )?;
 
     let reproduction = run_single_gate(roles.catalog, roles.ledger, &f.project, &gate)?;
 

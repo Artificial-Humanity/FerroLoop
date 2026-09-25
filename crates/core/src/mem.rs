@@ -35,6 +35,9 @@ struct Inner {
     runs: Vec<GateRun>,
     attempts: Vec<Attempt>,
     findings: BTreeMap<Iri, Finding>,
+    /// alias → primary. `"alias"` is not a `Kind`: it is an index marker, so
+    /// an alias never enters `owned`. `check` follows it before deciding.
+    aliases: BTreeMap<Iri, Iri>,
 }
 
 impl Inner {
@@ -52,14 +55,32 @@ impl Inner {
     /// ⚠ Every method that takes an id asks this first — list methods too.
     /// A list over a project this store never held is "didn't look", and an
     /// empty list would say "looked, found nothing".
+    ///
+    /// Follows one alias hop: an alias is never in `owned`, so this looks it
+    /// up in `aliases` and reports the PRIMARY's kind. This is what makes an
+    /// alias "owned" for every other check in this module.
     fn check(&self, id: &Iri) -> Result<Kind, StoreError> {
-        self.owned
+        if let Some(kind) = self.owned.get(id) {
+            return Ok(*kind);
+        }
+        if let Some(kind) = self
+            .aliases
             .get(id)
-            .copied()
-            .ok_or_else(|| StoreError::NotOwned {
-                id: id.clone(),
-                searched: vec![LABEL.to_string()],
-            })
+            .and_then(|primary| self.owned.get(primary))
+        {
+            return Ok(*kind);
+        }
+        Err(StoreError::NotOwned {
+            id: id.clone(),
+            searched: vec![LABEL.to_string()],
+        })
+    }
+
+    /// `id` itself, or the primary it aliases. Used wherever a lookup needs
+    /// the key a row is actually stored under — `check` alone answers
+    /// ownership, not which key to read.
+    fn resolve(&self, id: &Iri) -> Iri {
+        self.aliases.get(id).cloned().unwrap_or_else(|| id.clone())
     }
 }
 
@@ -186,6 +207,7 @@ impl Tracker for MemStore {
                 project: project.clone(),
                 title: title.to_string(),
                 state: State::Todo,
+                also_known_as: vec![],
             },
         );
         Ok(id)
@@ -194,7 +216,8 @@ impl Tracker for MemStore {
     fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
         let s = self.inner.borrow();
         s.check(&id.0)?;
-        Ok(s.records.get(&id.0).cloned())
+        let target = s.resolve(&id.0);
+        Ok(s.records.get(&target).cloned())
     }
 
     fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError> {
@@ -210,9 +233,12 @@ impl Tracker for MemStore {
     fn set_record_state(&self, id: &RecordId, state: State) -> Result<(), StoreError> {
         let mut s = self.inner.borrow_mut();
         s.check(&id.0)?;
+        // `id` may be an alias: resolve to the primary key `records` is
+        // actually keyed by.
+        let target = s.resolve(&id.0);
         let rec = s
             .records
-            .get_mut(&id.0)
+            .get_mut(&target)
             .ok_or_else(|| StoreError::NoSuchRecord(id.clone()))?;
         rec.state = state;
         Ok(())
@@ -232,7 +258,8 @@ impl Tracker for MemStore {
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
         let s = self.inner.borrow();
         s.check(&id.0)?;
-        Ok(s.findings.get(&id.0).cloned())
+        let target = s.resolve(&id.0);
+        Ok(s.findings.get(&target).cloned())
     }
 
     fn update_finding(&self, finding: &Finding) -> Result<(), StoreError> {
@@ -263,6 +290,43 @@ impl Tracker for MemStore {
             .values()
             .filter(|f| f.raised_by == actor && f.state == FindingState::Withdrawn)
             .count() as u64)
+    }
+
+    fn add_alias(&self, primary: &Iri, alias: Iri) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        // `alias` must be unused, whether as a primary id or as another
+        // alias: this store has exactly one id namespace.
+        if s.owned.contains_key(&alias) || s.aliases.contains_key(&alias) {
+            return Err(StoreError::AlreadyExists(alias));
+        }
+        // `primary` may itself be an alias; resolve to the true primary so
+        // `aliases` never chains and the row update below finds the row.
+        let resolved = s.resolve(primary);
+        let kind = s.check(&resolved)?;
+        match kind {
+            Kind::Record => {
+                s.records
+                    .get_mut(&resolved)
+                    .expect("a Record kind means records holds this row")
+                    .also_known_as
+                    .push(alias.clone());
+            }
+            Kind::Finding => {
+                s.findings
+                    .get_mut(&resolved)
+                    .expect("a Finding kind means findings holds this row")
+                    .also_known_as
+                    .push(alias.clone());
+            }
+            other => {
+                return Err(StoreError::Backend(format!(
+                    "{resolved} is a {}, and only a record or finding can carry an alias",
+                    other.as_wire()
+                )));
+            }
+        }
+        s.aliases.insert(alias, resolved);
+        Ok(())
     }
 }
 

@@ -25,5 +25,5 @@ pub use model::{
     Selector, State, Transition,
 };
 pub use stale::{Staleness, apply_staleness, is_stale};
-pub use store::{Catalog, Handles, Ledger, Roles, StoreError, Tracker};
+pub use store::{Catalog, Handles, Ledger, Roles, StoreError, Tracker, follow};
 pub use verdict::{FailReason, Population, Verdict};

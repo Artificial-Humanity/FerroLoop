@@ -41,6 +41,8 @@ pub fn tracker<S: Catalog + Tracker, G>(make: impl Fn() -> (S, G)) {
         a_finding_round_trips_and_gets_a_real_id::<S>,
         withdrawals_are_counted_against_whoever_raised_the_finding::<S>,
         findings_are_listed_per_project::<S>,
+        an_alias_reaches_the_item_it_names::<S>,
+        an_alias_already_in_use_is_refused_and_names_it::<S>,
     ];
     assert!(
         !cases.is_empty(),
@@ -222,6 +224,32 @@ fn findings_are_listed_per_project<S: Catalog + Tracker>(s: &S) {
         .unwrap();
     s.add_finding(Finding::raise(b, rb, "r", "two")).unwrap();
     assert_eq!(s.list_findings(&a).unwrap().len(), 1);
+}
+
+pub fn an_alias_reaches_the_item_it_names<S: Catalog + Tracker>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    let old = Iri::parse("https://github.com/o/r/issues/41").unwrap();
+    s.add_alias(r.iri(), old.clone()).unwrap();
+    let via_alias = s.get_record(&RecordId(old.clone())).unwrap().unwrap();
+    assert_eq!(via_alias.id, r);
+    assert!(via_alias.also_known_as.contains(&old));
+}
+
+pub fn an_alias_already_in_use_is_refused_and_names_it<S: Catalog + Tracker>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let a = s.add_record(&p, "a").unwrap();
+    let b = s.add_record(&p, "b").unwrap();
+    let old = Iri::parse("https://github.com/o/r/issues/41").unwrap();
+    s.add_alias(a.iri(), old.clone()).unwrap();
+    let err = s.add_alias(b.iri(), old.clone()).unwrap_err();
+    assert!(
+        matches!(err, StoreError::AlreadyExists(ref i) if *i == old),
+        "{err:?}"
+    );
+    // An existing primary id cannot become an alias either.
+    let err = s.add_alias(b.iri(), a.0.clone()).unwrap_err();
+    assert!(matches!(err, StoreError::AlreadyExists(_)), "{err:?}");
 }
 
 fn the_logs_are_append_only_and_read_back_in_order<S: Catalog + Ledger>(s: &S) {
