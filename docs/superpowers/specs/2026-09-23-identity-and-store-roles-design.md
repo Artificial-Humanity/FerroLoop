@@ -320,7 +320,7 @@ reason in the pull request.
 FerroWire is the communication switchboard between agents, users, and system-generated
 messages. The owner, 2026-09-25: the store also holds an **agent registry** for it. It is
 reserved here and built with FerroWire, which the owner placed in the **second phase** — near,
-not a distant roadmap item.
+not a distant roadmap item — immediately after the GitHub work of §0.2.
 
 * **A fourth role.** The registry is a role a store backs, beside Catalog, Tracker and Ledger.
   *(Invariant)*
