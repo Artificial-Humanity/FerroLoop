@@ -189,12 +189,12 @@ impl Runner for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fl_core::ids::RecordId;
+    use fl_core::ids::{RecordId, seq_iri};
 
     fn spec(root: &std::path::Path, timeout: u64) -> AttemptSpec {
         AttemptSpec {
             project_root: root.to_path_buf(),
-            record: RecordId(1),
+            record: RecordId(seq_iri(1)),
             instruction: "say hello".into(),
             timeout_secs: timeout,
             budget_usd_micros: 1_000_000,

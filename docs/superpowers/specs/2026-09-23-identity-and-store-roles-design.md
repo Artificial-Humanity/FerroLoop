@@ -215,8 +215,10 @@ rule and adds a test that holds it.
 
 * A handle is display only. It never appears on the wire, in a reference between items,
   or in JSON output. **Every stored reference is a full IRI.** *(Invariant)*
-* **Local handles** are sequential per project and per kind, stored in the local store as
-  a table from handle to IRI. Nothing depends on a handle. If the table is lost, every IRI
+* **Local handles** are sequential per store and per kind, stored in the local store as
+  a table from handle to IRI. *(Owner, 2026-09-24: per store, not per project, so that the
+  commands that name an item without naming its project keep working. `gate 3` and
+  `finding 3` can both exist; every command already names the kind.)* Nothing depends on a handle. If the table is lost, every IRI
   still works and only the short names are gone. A handle is never reused.
 * **GitHub handles** are `#41` for the configured repository and `owner/repo#41` for any
   other.
@@ -312,6 +314,25 @@ stays accurate. All 172 existing tests carry over. No test is deleted without a 
 reason in the pull request.
 
 ---
+
+## 6a. Reserved: the agent registry (FerroWire)
+
+FerroWire is the communication switchboard between agents, users, and system-generated
+messages. The owner, 2026-09-25: the store also holds an **agent registry** for it. It is
+reserved here and built with FerroWire, which the owner placed in the **second phase** — near,
+not a distant roadmap item — immediately after the GitHub work of §0.2.
+
+* **A fourth role.** The registry is a role a store backs, beside Catalog, Tracker and Ledger.
+  *(Invariant)*
+* **An agent's id is an IRI**, minted like any other local id. *(Invariant)*
+* **An agent's address works like a handle.** It is the short name a person or agent types
+  (`Cyndi`), and it resolves to the agent's IRI. Addresses are **case-insensitive**: `Cyndi` and
+  `cyndi` are one agent. An address names an agent, not a session. *(Invariant — owner,
+  2026-09-02)* The IRI rules in §2.3 do not change for this.
+* **Not decided here:** what an agent record holds (vendor, capabilities, status and so on).
+  That is FerroWire's design. *(Open)*
+* **Cost of building it later:** a new kind and new tables bump the store format version, so
+  stores written before then are refused (§5.1). *(Release scope)*
 
 ## 7. Open questions
 

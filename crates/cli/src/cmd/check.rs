@@ -1,27 +1,62 @@
+use crate::refs::{self, Ref};
 use anyhow::Result;
 use clap::Args;
 use fl_core::ids::{ProjectId, RecordId};
-use fl_core::store::Store;
+use fl_core::{Iri, Kind};
 use fl_exec::evaluate::evaluate_transition;
+use fl_store::RedbStore;
 
 #[derive(Args)]
 pub struct Cmd {
     /// The transition to evaluate.
     pub transition: String,
     #[arg(long)]
-    pub project: u64,
+    pub project: Ref,
     #[arg(long)]
-    pub record: Option<u64>,
+    pub record: Option<Ref>,
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
-    let report = evaluate_transition(
+impl Cmd {
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added here is
+    /// picked up by both at once (Fix round 2, item 5). The transition name
+    /// is not an id.
+    fn refs(&self) -> Vec<&Ref> {
+        let mut out: Vec<&Ref> = vec![&self.project];
+        if let Some(r) = &self.record {
+            out.push(r);
+        }
+        out
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
+    }
+
+    /// Whether this command names any item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        refs::has_handle(&self.refs())
+    }
+}
+
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+    let project = ProjectId(refs::resolve(
         store,
-        ProjectId(cmd.project),
-        &cmd.transition,
-        cmd.record.map(RecordId),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+        store.label(),
+        Kind::Project,
+        &cmd.project,
+    )?);
+    let record = match &cmd.record {
+        Some(r) => Some(RecordId(refs::resolve(
+            store,
+            store.label(),
+            Kind::Record,
+            r,
+        )?)),
+        None => None,
+    };
+    let report = evaluate_transition(store, store, &project, &cmd.transition, record.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     for g in &report.gates {
         let (label, detail) = g.verdict.describe();

@@ -1,16 +1,19 @@
+use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
-use fl_core::store::Store;
-use fl_exec::finding::{attach_reproduction, verify_finding};
+use fl_core::store::{Roles, Tracker};
+use fl_core::{Iri, Kind};
+use fl_exec::finding::{FindingExecError, attach_reproduction, verify_finding};
+use fl_store::RedbStore;
 use std::collections::BTreeSet;
 
 #[derive(Subcommand)]
 pub enum Cmd {
     Raise {
         #[arg(long)]
-        record: u64,
+        record: Ref,
         #[arg(long)]
         claim: String,
         #[arg(long)]
@@ -18,64 +21,143 @@ pub enum Cmd {
     },
     /// Attach a reproduction. REFUSED unless the gate currently fails.
     Reproduce {
-        finding: u64,
+        finding: Ref,
         #[arg(long)]
-        gate: u64,
+        gate: Ref,
     },
     Assign {
-        finding: u64,
+        finding: Ref,
         #[arg(long = "to")]
         to: String,
     },
     /// The reproduction must now pass, and every neighbour must still pass.
-    Verify { finding: u64 },
+    Verify { finding: Ref },
     Withdraw {
-        finding: u64,
+        finding: Ref,
         #[arg(long)]
         reason: String,
     },
     List {
         #[arg(long)]
-        project: u64,
+        project: Ref,
         #[arg(long)]
         state: Option<String>,
     },
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+impl Cmd {
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added to a
+    /// variant here is picked up by both at once (Fix round 2, item 5). A
+    /// claim, an assignee and a withdrawal reason are strings, not ids.
+    fn refs(&self) -> Vec<&Ref> {
+        match self {
+            Cmd::Raise { record, .. } => vec![record],
+            Cmd::Reproduce { finding, gate } => vec![finding, gate],
+            Cmd::Assign { finding, .. } => vec![finding],
+            Cmd::Verify { finding } => vec![finding],
+            Cmd::Withdraw { finding, .. } => vec![finding],
+            Cmd::List { project, .. } => vec![project],
+        }
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
+    }
+
+    /// Whether this command names any item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        refs::has_handle(&self.refs())
+    }
+}
+
+/// The id `r` names, resolved to the finding's PRIMARY id when `r` is an
+/// alias, so what is printed back is the finding's handle rather than the
+/// alias typed. An id that names no finding is returned as given: the
+/// caller's own lookup refuses it, echoing what was typed.
+fn finding_id(store: &RedbStore, r: &Ref) -> Result<FindingId> {
+    let id = FindingId(refs::resolve(store, store.label(), Kind::Finding, r)?);
+    Ok(match store.get_finding(&id)? {
+        Some(f) => f.id,
+        None => id,
+    })
+}
+
+/// The finding `r` names, or a refusal that echoes what was typed.
+fn finding(store: &RedbStore, r: &Ref) -> Result<Finding> {
+    let Some(f) = store.get_finding(&finding_id(store, r)?)? else {
+        bail!(
+            "`{r}` is not a finding in the store at {}. Use \
+             `fl finding list --project <project>` to see findings that exist.",
+            store.label()
+        );
+    };
+    Ok(f)
+}
+
+/// Render a fl-exec refusal for a person. fl-exec knows items only by IRI,
+/// so the variants that name an item are re-spelled here with what the user
+/// typed (`finding`, and `gate` where the command took one). Every other
+/// variant names no id and passes through unchanged.
+fn explain(e: FindingExecError, finding: &Ref, gate: Option<&Ref>) -> anyhow::Error {
+    match e {
+        FindingExecError::NoSuchFinding(_) => anyhow::anyhow!("no finding {finding}"),
+        FindingExecError::NoSuchGate(_) => match gate {
+            Some(g) => anyhow::anyhow!("no gate {g}"),
+            None => anyhow::anyhow!("{e}"),
+        },
+        FindingExecError::NotAssigned(_, state) => anyhow::anyhow!(
+            "finding {finding} is in state {state}, and only an assigned finding can be verified"
+        ),
+        FindingExecError::NoReproduction(_) => {
+            anyhow::anyhow!("finding {finding} has no reproduction")
+        }
+        other => anyhow::anyhow!("{other}"),
+    }
+}
+
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Raise { record, claim, by } => {
-            let r = RecordId(record);
-            let Some(rec) = store.get_record(r)? else {
+            let r = RecordId(refs::resolve(store, store.label(), Kind::Record, &record)?);
+            let Some(rec) = store.get_record(&r)? else {
                 bail!(
-                    "no record with id {record}. Use `fl record list --project <id>` to see records that exist."
+                    "`{record}` is not a record in the store at {}. Use \
+                     `fl record list --project <project>` to see records that exist.",
+                    store.label()
                 );
             };
             let id = store.add_finding(Finding::raise(rec.project, r, &by, &claim))?;
-            println!("{id}\traised\t{claim}");
+            println!(
+                "{}\traised\t{claim}",
+                refs::show(store, Kind::Finding, id.iri())?
+            );
         }
         Cmd::Reproduce { finding, gate } => {
-            let report = attach_reproduction(store, FindingId(finding), GateId(gate))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let fid = finding_id(store, &finding)?;
+            let gid = GateId(refs::resolve(store, store.label(), Kind::Gate, &gate)?);
+            let report = attach_reproduction(Roles::single(store), &fid, &gid)
+                .map_err(|e| explain(e, &finding, Some(&gate)))?;
             println!(
-                "{finding}\treproduced\tgate {gate} failed over {} items",
+                "{}\treproduced\tgate {} failed over {} items",
+                refs::show(store, Kind::Finding, fid.iri())?,
+                refs::show(store, Kind::Gate, gid.iri())?,
                 report.verdict.population().unwrap_or(0)
             );
         }
-        Cmd::Assign { finding, to } => {
-            let id = FindingId(finding);
-            let Some(mut f) = store.get_finding(id)? else {
-                bail!(
-                    "no finding with id {finding}. Use `fl finding list --project <id>` to see findings that exist."
-                );
-            };
+        Cmd::Assign { finding: arg, to } => {
+            let mut f = finding(store, &arg)?;
             f.assign(&to).map_err(|e| anyhow::anyhow!("{e}"))?;
             store.update_finding(&f)?;
-            println!("{finding}\tassigned\t{to}");
+            println!(
+                "{}\tassigned\t{to}",
+                refs::show(store, Kind::Finding, f.id.iri())?
+            );
         }
         Cmd::Verify { finding } => {
-            let id = FindingId(finding);
-            let report = verify_finding(store, id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id = finding_id(store, &finding)?;
+            let report = verify_finding(Roles::single(store), &id)
+                .map_err(|e| explain(e, &finding, None))?;
 
             if report.reproduction.verdict.is_pass() {
                 println!(
@@ -143,23 +225,25 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 }
             }
 
+            let shown = refs::show(store, Kind::Finding, id.iri())?;
             if report.closed {
-                println!("CLOSED\t{finding}");
+                println!("CLOSED\t{shown}");
             } else {
-                println!("OPEN\t{finding}\tthe repair is not done");
+                println!("OPEN\t{shown}\tthe repair is not done");
             }
             return Ok(report.exit_code());
         }
-        Cmd::Withdraw { finding, reason } => {
-            let id = FindingId(finding);
-            let Some(mut f) = store.get_finding(id)? else {
-                bail!(
-                    "no finding with id {finding}. Use `fl finding list --project <id>` to see findings that exist."
-                );
-            };
+        Cmd::Withdraw {
+            finding: arg,
+            reason,
+        } => {
+            let mut f = finding(store, &arg)?;
             f.withdraw(&reason).map_err(|e| anyhow::anyhow!("{e}"))?;
             store.update_finding(&f)?;
-            println!("{finding}\twithdrawn\t{reason}");
+            println!(
+                "{}\twithdrawn\t{reason}",
+                refs::show(store, Kind::Finding, f.id.iri())?
+            );
         }
         Cmd::List { project, state } => {
             let want = match state.as_deref() {
@@ -171,12 +255,18 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                     )
                 })?),
             };
-            let all = store.list_findings(ProjectId(project))?;
+            let p = ProjectId(refs::resolve(
+                store,
+                store.label(),
+                Kind::Project,
+                &project,
+            )?);
+            let all = store.list_findings(&p)?;
             let mut raisers: BTreeSet<String> = Default::default();
             for f in all.iter().filter(|f| want.is_none_or(|w| f.state == w)) {
                 println!(
                     "{}\t{}\t{}\t{}",
-                    f.id,
+                    refs::show(store, Kind::Finding, f.id.iri())?,
                     f.state.as_wire(),
                     f.raised_by,
                     f.claim

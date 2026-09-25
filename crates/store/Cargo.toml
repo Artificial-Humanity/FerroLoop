@@ -11,6 +11,8 @@ redb.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+fl-core = { path = "../core", features = ["conformance"] }

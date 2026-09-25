@@ -2,8 +2,9 @@ use crate::evaluate::{GateReport, run_single_gate};
 use crate::population::ExecError;
 use fl_core::finding::FindingState;
 use fl_core::ids::{FindingId, GateId};
+use fl_core::iri::Iri;
 use fl_core::model::Selector;
-use fl_core::store::Store;
+use fl_core::store::{Roles, StoreError, follow};
 use fl_core::verdict::{FailReason, Verdict};
 
 #[derive(Debug, thiserror::Error)]
@@ -94,6 +95,23 @@ impl FixReport {
     }
 }
 
+/// Follow a stored reference belonging to a finding, the same way
+/// `evaluate_transition` follows a transition's gates: `NotOwned` is wrapped
+/// so the message names the finding, since bare `NotOwned` only says where
+/// nothing was found, not which stored reference sent us looking.
+/// `Dangling` already names `label` (it is built from it), so it passes
+/// through unchanged.
+fn follow_ref<T>(
+    label: String,
+    to: &Iri,
+    got: Result<Option<T>, StoreError>,
+) -> Result<T, FindingExecError> {
+    follow(&label, to, got).map_err(|e| match e {
+        StoreError::NotOwned { .. } => FindingExecError::Store(format!("{label}: {e}")),
+        other => FindingExecError::Store(other.to_string()),
+    })
+}
+
 /// Render a selector the way a refusal message names it: readable, and
 /// specific enough that the person refused can go fix the thing named.
 fn describe_selector(selector: &Selector) -> String {
@@ -114,20 +132,22 @@ fn describe_selector(selector: &Selector) -> String {
 /// like-evidence hole the whole protocol exists to close. An `Error` is
 /// refused too — a broken instrument proves nothing in either direction.
 pub fn attach_reproduction(
-    store: &mut dyn Store,
-    finding: FindingId,
-    gate: GateId,
+    roles: Roles<'_>,
+    finding: &FindingId,
+    gate: &GateId,
 ) -> Result<GateReport, FindingExecError> {
-    let mut f = store
+    let mut f = roles
+        .tracker
         .get_finding(finding)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
-        .ok_or(FindingExecError::NoSuchFinding(finding))?;
-    let def = store
+        .ok_or_else(|| FindingExecError::NoSuchFinding(finding.clone()))?;
+    let def = roles
+        .catalog
         .get_gate(gate)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
-        .ok_or(FindingExecError::NoSuchGate(gate))?;
+        .ok_or_else(|| FindingExecError::NoSuchGate(gate.clone()))?;
 
-    let report = run_single_gate(store, f.project, gate)?;
+    let report = run_single_gate(roles.catalog, roles.ledger, &f.project, gate)?;
     match &report.verdict {
         Verdict::Pass { population, .. } => {
             return Err(FindingExecError::ReproductionPasses {
@@ -152,8 +172,9 @@ pub fn attach_reproduction(
             reason: FailReason::EmptyPopulation,
             ..
         } => {
-            let root = store
-                .get_project(f.project)
+            let root = roles
+                .catalog
+                .get_project(&f.project)
                 .map_err(|e| FindingExecError::Store(e.to_string()))?
                 .map(|p| p.root)
                 .unwrap_or_default();
@@ -166,8 +187,9 @@ pub fn attach_reproduction(
         Verdict::Fail { .. } => {}
     }
 
-    f.attach_reproduction(gate)?;
-    store
+    f.attach_reproduction(gate.clone())?;
+    roles
+        .tracker
         .update_finding(&f)
         .map_err(|e| FindingExecError::Store(e.to_string()))?;
     Ok(report)
@@ -185,26 +207,49 @@ pub fn attach_reproduction(
 /// fixer keeps it, and the report names what is still wrong. There is no
 /// "failed" state — only a repair that is not done yet.
 pub fn verify_finding(
-    store: &mut dyn Store,
-    finding: FindingId,
+    roles: Roles<'_>,
+    finding: &FindingId,
 ) -> Result<FixReport, FindingExecError> {
-    let mut f = store
+    let mut f = roles
+        .tracker
         .get_finding(finding)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
-        .ok_or(FindingExecError::NoSuchFinding(finding))?;
+        .ok_or_else(|| FindingExecError::NoSuchFinding(finding.clone()))?;
     if f.state != FindingState::Assigned {
-        return Err(FindingExecError::NotAssigned(finding, f.state.as_wire()));
+        return Err(FindingExecError::NotAssigned(
+            finding.clone(),
+            f.state.as_wire(),
+        ));
     }
+
+    // The finding's own stored references, followed explicitly so a
+    // dangling or never-owned project or reproduction is named as such —
+    // by the finding, not surfaced as whatever `run_single_gate` happens to
+    // say about a bare id it was handed.
+    follow_ref(
+        format!("finding {finding}'s project"),
+        f.project.iri(),
+        roles.catalog.get_project(&f.project),
+    )?;
+
     let gate = f
         .reproduction
-        .ok_or(FindingExecError::NoReproduction(finding))?;
+        .clone()
+        .ok_or_else(|| FindingExecError::NoReproduction(finding.clone()))?;
 
-    let reproduction = run_single_gate(store, f.project, gate)?;
+    follow_ref(
+        format!("finding {finding}'s reproduction"),
+        gate.iri(),
+        roles.catalog.get_gate(&gate),
+    )?;
+
+    let reproduction = run_single_gate(roles.catalog, roles.ledger, &f.project, &gate)?;
 
     // The baseline is already on disk: a gate with a last_pass_commit passed
     // at some point, so a failure now is a regression rather than news.
-    let neighbours: Vec<_> = store
-        .list_gates(f.project)
+    let neighbours: Vec<_> = roles
+        .catalog
+        .list_gates(&f.project)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
         .into_iter()
         .filter(|g| g.id != gate && g.last_pass_commit.is_some())
@@ -215,8 +260,8 @@ pub fn verify_finding(
     // up passing or failing. `regressions` is derived from this same pass —
     // not a second one — by filtering out whatever did not pass.
     let mut neighbour_reports = Vec::new();
-    for id in neighbours {
-        let r = run_single_gate(store, f.project, id)?;
+    for id in &neighbours {
+        let r = run_single_gate(roles.catalog, roles.ledger, &f.project, id)?;
         neighbour_reports.push(r);
     }
     let regressions: Vec<GateReport> = neighbour_reports
@@ -228,7 +273,8 @@ pub fn verify_finding(
     let closed = reproduction.verdict.is_pass() && regressions.is_empty();
     if closed {
         f.mark_fixed()?;
-        store
+        roles
+            .tracker
             .update_finding(&f)
             .map_err(|e| FindingExecError::Store(e.to_string()))?;
     }
@@ -244,10 +290,11 @@ pub fn verify_finding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fl_core::MemStore;
     use fl_core::finding::{Finding, FindingState};
-    use fl_core::ids::ProjectId;
+    use fl_core::ids::{ProjectId, RecordId};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
-    use fl_core::store::MemStore;
+    use fl_core::store::{Catalog, Roles, Tracker};
     use fl_core::verdict::FailReason;
     use std::fs;
     use std::process::Command;
@@ -275,8 +322,8 @@ mod tests {
     }
 
     fn gate(
-        s: &mut MemStore,
-        p: ProjectId,
+        s: &MemStore,
+        p: &ProjectId,
         root: &std::path::Path,
         name: &str,
         program: &str,
@@ -306,21 +353,21 @@ mod tests {
     #[test]
     fn a_gate_that_currently_passes_is_refused_as_a_reproduction() {
         let d = repo();
-        let mut s = MemStore::default();
+        let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let r = s.add_record(p, "t").unwrap();
-        let g = gate(&mut s, p, d.path(), "already-green", "true");
+        let r = s.add_record(&p, "t").unwrap();
+        let g = gate(&s, &p, d.path(), "already-green", "true");
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
-        let err = attach_reproduction(&mut s, f, g).unwrap_err();
+        let err = attach_reproduction(Roles::single(&s), &f, &g).unwrap_err();
         assert!(
             matches!(err, FindingExecError::ReproductionPasses { .. }),
             "got {err}"
         );
         assert_eq!(
-            s.get_finding(f).unwrap().unwrap().state,
+            s.get_finding(&f).unwrap().unwrap().state,
             FindingState::Raised
         );
     }
@@ -337,13 +384,13 @@ mod tests {
     #[test]
     fn a_reproduction_whose_selector_matches_nothing_is_refused_and_leaves_the_finding_raised() {
         let d = repo();
-        let mut s = MemStore::default();
+        let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let r = s.add_record(p, "t").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
         let head = crate::git::Git::head(d.path()).unwrap();
         let g = s
             .add_gate(
-                p,
+                &p,
                 "empty",
                 GateKind::Command(CommandSpec {
                     program: "true".into(),
@@ -361,10 +408,10 @@ mod tests {
             )
             .unwrap();
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
-        let err = attach_reproduction(&mut s, f, g).unwrap_err();
+        let err = attach_reproduction(Roles::single(&s), &f, &g).unwrap_err();
         assert!(
             matches!(err, FindingExecError::ReproductionEmptyPopulation { .. }),
             "got {err}"
@@ -391,7 +438,7 @@ mod tests {
             "must name the root it matched zero paths under: {msg}"
         );
         assert_eq!(
-            s.get_finding(f).unwrap().unwrap().state,
+            s.get_finding(&f).unwrap().unwrap().state,
             FindingState::Raised,
             "a reproduction that examined nothing must not move the finding"
         );
@@ -400,17 +447,17 @@ mod tests {
     #[test]
     fn a_failing_gate_is_accepted_and_moves_the_finding_to_reproduced() {
         let d = repo();
-        let mut s = MemStore::default();
+        let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let r = s.add_record(p, "t").unwrap();
-        let g = gate(&mut s, p, d.path(), "red", "false");
+        let r = s.add_record(&p, "t").unwrap();
+        let g = gate(&s, &p, d.path(), "red", "false");
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
-        let report = attach_reproduction(&mut s, f, g).unwrap();
+        let report = attach_reproduction(Roles::single(&s), &f, &g).unwrap();
         assert!(!report.verdict.is_pass());
-        let back = s.get_finding(f).unwrap().unwrap();
+        let back = s.get_finding(&f).unwrap().unwrap();
         assert_eq!(back.state, FindingState::Reproduced);
         assert_eq!(back.reproduction, Some(g));
     }
@@ -418,28 +465,28 @@ mod tests {
     #[test]
     fn a_broken_gate_is_refused_as_a_reproduction_too() {
         let d = repo();
-        let mut s = MemStore::default();
+        let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let r = s.add_record(p, "t").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
         let g = gate(
-            &mut s,
-            p,
+            &s,
+            &p,
             d.path(),
             "broken",
             "definitely-not-a-real-program-9f3x",
         );
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
         // An Error is not a failure. It proves nothing either way.
-        let err = attach_reproduction(&mut s, f, g).unwrap_err();
+        let err = attach_reproduction(Roles::single(&s), &f, &g).unwrap_err();
         assert!(
             matches!(err, FindingExecError::ReproductionErrored { .. }),
             "got {err}"
         );
         assert_eq!(
-            s.get_finding(f).unwrap().unwrap().state,
+            s.get_finding(&f).unwrap().unwrap().state,
             FindingState::Raised
         );
     }
@@ -449,16 +496,16 @@ mod tests {
     #[test]
     fn a_regression_in_a_neighbour_keeps_the_finding_open_and_names_the_gate() {
         let d = repo();
-        let mut s = MemStore::default();
+        let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let r = s.add_record(p, "t").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
 
         // The neighbour passes first, so it earns a last_pass_commit.
-        let neighbour = gate(&mut s, p, d.path(), "neighbour", "true");
-        let rep = gate(&mut s, p, d.path(), "reproduction", "false");
-        let _ = crate::evaluate::run_single_gate(&mut s, p, neighbour).unwrap();
+        let neighbour = gate(&s, &p, d.path(), "neighbour", "true");
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let _ = crate::evaluate::run_single_gate(&s, &s, &p, &neighbour).unwrap();
         assert!(
-            s.get_gate(neighbour)
+            s.get_gate(&neighbour)
                 .unwrap()
                 .unwrap()
                 .last_pass_commit
@@ -466,15 +513,15 @@ mod tests {
         );
 
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
-        attach_reproduction(&mut s, f, rep).unwrap();
-        let mut fin = s.get_finding(f).unwrap().unwrap();
+        attach_reproduction(Roles::single(&s), &f, &rep).unwrap();
+        let mut fin = s.get_finding(&f).unwrap().unwrap();
         fin.assign("fixer").unwrap();
         s.update_finding(&fin).unwrap();
 
         // The "repair": the reproduction now passes, and the neighbour breaks.
-        let mut rep_def = s.get_gate(rep).unwrap().unwrap();
+        let mut rep_def = s.get_gate(&rep).unwrap().unwrap();
         rep_def.kind = GateKind::Command(CommandSpec {
             program: "true".into(),
             args: vec![],
@@ -483,7 +530,7 @@ mod tests {
             pass_codes: vec![0],
         });
         s.update_gate(&rep_def).unwrap();
-        let mut n_def = s.get_gate(neighbour).unwrap().unwrap();
+        let mut n_def = s.get_gate(&neighbour).unwrap().unwrap();
         n_def.kind = GateKind::Command(CommandSpec {
             program: "false".into(),
             args: vec![],
@@ -493,7 +540,7 @@ mod tests {
         });
         s.update_gate(&n_def).unwrap();
 
-        let report = verify_finding(&mut s, f).unwrap();
+        let report = verify_finding(Roles::single(&s), &f).unwrap();
         assert!(
             report.reproduction.verdict.is_pass(),
             "the reproduction did pass"
@@ -503,7 +550,7 @@ mod tests {
         assert_eq!(report.regressions[0].name, "neighbour");
         assert_eq!(report.exit_code(), 1);
         assert_eq!(
-            s.get_finding(f).unwrap().unwrap().state,
+            s.get_finding(&f).unwrap().unwrap().state,
             FindingState::Assigned
         );
     }
@@ -511,22 +558,22 @@ mod tests {
     #[test]
     fn a_clean_repair_closes_the_finding() {
         let d = repo();
-        let mut s = MemStore::default();
+        let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let r = s.add_record(p, "t").unwrap();
-        let neighbour = gate(&mut s, p, d.path(), "neighbour", "true");
-        let rep = gate(&mut s, p, d.path(), "reproduction", "false");
-        let _ = crate::evaluate::run_single_gate(&mut s, p, neighbour).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let neighbour = gate(&s, &p, d.path(), "neighbour", "true");
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let _ = crate::evaluate::run_single_gate(&s, &s, &p, &neighbour).unwrap();
 
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
-        attach_reproduction(&mut s, f, rep).unwrap();
-        let mut fin = s.get_finding(f).unwrap().unwrap();
+        attach_reproduction(Roles::single(&s), &f, &rep).unwrap();
+        let mut fin = s.get_finding(&f).unwrap().unwrap();
         fin.assign("fixer").unwrap();
         s.update_finding(&fin).unwrap();
 
-        let mut rep_def = s.get_gate(rep).unwrap().unwrap();
+        let mut rep_def = s.get_gate(&rep).unwrap().unwrap();
         rep_def.kind = GateKind::Command(CommandSpec {
             program: "true".into(),
             args: vec![],
@@ -536,11 +583,11 @@ mod tests {
         });
         s.update_gate(&rep_def).unwrap();
 
-        let report = verify_finding(&mut s, f).unwrap();
+        let report = verify_finding(Roles::single(&s), &f).unwrap();
         assert!(report.closed);
         assert_eq!(report.exit_code(), 0);
         assert_eq!(
-            s.get_finding(f).unwrap().unwrap().state,
+            s.get_finding(&f).unwrap().unwrap().state,
             FindingState::Fixed
         );
     }
@@ -548,12 +595,80 @@ mod tests {
     #[test]
     fn a_finding_that_was_never_assigned_cannot_be_verified() {
         let d = repo();
-        let mut s = MemStore::default();
+        let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let r = s.add_record(p, "t").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
-        assert!(verify_finding(&mut s, f).is_err());
+        assert!(verify_finding(Roles::single(&s), &f).is_err());
+    }
+
+    /// Brings a finding to `Assigned` through the normal flow, then hands
+    /// back the fresh copy so a test can corrupt one field and persist it
+    /// with `update_finding` — the only way to get a stored, cross-kind
+    /// dangling reference onto an already-assigned finding, since neither
+    /// `add_finding` nor `update_finding` checks that a reference resolves
+    /// to the kind it claims (that is exactly what `Dangling` is for).
+    fn assigned(s: &MemStore, p: &ProjectId, r: &RecordId, rep: &GateId) -> FindingId {
+        let f = s
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
+            .unwrap();
+        attach_reproduction(Roles::single(s), &f, rep).unwrap();
+        let mut fin = s.get_finding(&f).unwrap().unwrap();
+        fin.assign("fixer").unwrap();
+        s.update_finding(&fin).unwrap();
+        f
+    }
+
+    // Fix round 1, item 3: `verify_finding`'s two `follow_ref` calls (for
+    // `f.project` and `f.reproduction`) had no test — deleting either left
+    // the whole suite green. Each is pinned here by corrupting the
+    // finding's own stored reference, after it is legitimately `Assigned`,
+    // to an id this store holds as a DIFFERENT kind (a record's id, reused
+    // as a `ProjectId`/`GateId`) — never a stranger id, since that is
+    // exactly what `Dangling` means, as opposed to `NotOwned`.
+    #[test]
+    fn verify_finding_refuses_a_dangling_project_reference() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let f = assigned(&s, &p, &r, &rep);
+
+        let mut corrupted = s.get_finding(&f).unwrap().unwrap();
+        corrupted.project = ProjectId(r.0.clone());
+        s.update_finding(&corrupted).unwrap();
+
+        // `FixReport` (the `Ok` side) has no `Debug`, so `unwrap_err` cannot
+        // be used here.
+        let err = match verify_finding(Roles::single(&s), &f) {
+            Err(e) => e,
+            Ok(_) => panic!("a dangling project reference must be refused"),
+        };
+        assert!(err.to_string().contains("dangling"), "got {err}");
+        assert!(err.to_string().contains(&f.to_string()), "got {err}");
+    }
+
+    #[test]
+    fn verify_finding_refuses_a_dangling_reproduction_reference() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let f = assigned(&s, &p, &r, &rep);
+
+        let mut corrupted = s.get_finding(&f).unwrap().unwrap();
+        corrupted.reproduction = Some(GateId(r.0.clone()));
+        s.update_finding(&corrupted).unwrap();
+
+        let err = match verify_finding(Roles::single(&s), &f) {
+            Err(e) => e,
+            Ok(_) => panic!("a dangling reproduction reference must be refused"),
+        };
+        assert!(err.to_string().contains("dangling"), "got {err}");
+        assert!(err.to_string().contains(&f.to_string()), "got {err}");
     }
 }

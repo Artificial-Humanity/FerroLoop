@@ -1,16 +1,19 @@
+use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Args;
 use fl_core::ids::RecordId;
 use fl_core::log::{Attempt, AttemptStatus};
-use fl_core::store::Store;
+use fl_core::store::{Catalog, Ledger, Tracker};
+use fl_core::{Iri, Kind};
 use fl_exec::adapters::ClaudeAdapter;
 use fl_exec::runner::{AttemptSpec, Runner};
+use fl_store::RedbStore;
 
 const KNOWN_ADAPTERS: &str = "claude";
 
 #[derive(Args)]
 pub struct Cmd {
-    pub record: u64,
+    pub record: Ref,
     #[arg(long, default_value = "claude")]
     pub adapter: String,
     #[arg(long)]
@@ -24,32 +27,58 @@ pub struct Cmd {
     pub binary: String,
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+impl Cmd {
+    /// The one item this command names, by `Ref` — the single source
+    /// `iris()` and `has_handle()` both derive from (Fix round 2, item 5).
+    fn refs(&self) -> Vec<&Ref> {
+        vec![&self.record]
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
+    }
+
+    /// Whether this command names its item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        refs::has_handle(&self.refs())
+    }
+}
+
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     if cmd.adapter != "claude" {
         bail!(
             "`{}` is not a known adapter. Milestone 1 ships: {KNOWN_ADAPTERS}.",
             cmd.adapter
         );
     }
-    let id = RecordId(cmd.record);
-    let Some(record) = store.get_record(id)? else {
+    let id = RecordId(refs::resolve(
+        store,
+        store.label(),
+        Kind::Record,
+        &cmd.record,
+    )?);
+    let Some(record) = store.get_record(&id)? else {
         bail!(
-            "no record with id {}. Run `fl record list` to see the ids that exist.",
-            cmd.record
+            "`{}` is not a record in the store at {}. Run `fl record list --project <project>` \
+             to see the ones that exist.",
+            cmd.record,
+            store.label()
         );
     };
-    let Some(project) = store.get_project(record.project)? else {
+    let Some(project) = store.get_project(&record.project)? else {
         bail!(
             "record {} belongs to project {}, which no longer exists.",
             cmd.record,
-            record.project
+            refs::show(store, Kind::Project, record.project.iri())?
         );
     };
 
     let adapter = ClaudeAdapter::new(cmd.binary);
     let spec = AttemptSpec {
         project_root: std::path::PathBuf::from(&project.root),
-        record: id,
+        // The record's PRIMARY id, never the alias the person typed: every
+        // attempt against one record must name it the same way.
+        record: record.id.clone(),
         instruction: cmd.instruction.unwrap_or_else(|| record.title.clone()),
         timeout_secs: cmd.timeout_secs,
         budget_usd_micros: cmd.budget_usd_micros,
@@ -64,7 +93,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
     // cost something, even when that something is only the wall clock.
     store.append_attempt(Attempt {
         project: record.project,
-        record: id,
+        record: record.id,
         adapter: "claude".into(),
         status: outcome.status,
         duration_ms: outcome.duration_ms,

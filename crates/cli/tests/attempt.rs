@@ -6,7 +6,13 @@ use std::process::Command as Sys;
 
 fn cli(db: &str) -> Command {
     let mut c = Command::cargo_bin("fl").unwrap();
-    c.arg("--db").arg(db);
+    // Fix round 1 — Important 5: isolate from the developer's own
+    // ~/.config/fl/config.toml, which `fl` reads unconditionally even when
+    // --db confines which store it uses. `db`'s own parent directory is a
+    // scratch TempDir the caller already holds, so it doubles as an empty
+    // config home with no `fl/config.toml` inside it.
+    let home = Path::new(db).parent().expect("db has a parent directory");
+    c.env("XDG_CONFIG_HOME", home).arg("--db").arg(db);
     c
 }
 
@@ -54,7 +60,7 @@ fn an_unknown_adapter_is_refused_and_names_the_ones_that_exist() {
         .assert()
         .success();
     cli(&db)
-        .args(["attempt", "2", "--adapter", "telepathy"])
+        .args(["attempt", "1", "--adapter", "telepathy"])
         .assert()
         .failure()
         .stderr(contains("telepathy").and(contains("claude")));
@@ -74,7 +80,7 @@ fn a_refused_attempt_is_still_recorded_and_shows_up_in_stats() {
     cli(&db)
         .args([
             "attempt",
-            "2",
+            "1",
             "--adapter",
             "claude",
             "--budget-usd-micros",

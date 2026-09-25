@@ -8,7 +8,14 @@ fn db(dir: &tempfile::TempDir) -> String {
 
 fn cli(dir: &tempfile::TempDir) -> Command {
     let mut c = Command::cargo_bin("fl").unwrap();
-    c.arg("--db").arg(db(dir));
+    // Fix round 1 — Important 5: every `fl` invocation reads the user's
+    // config unconditionally (even `--db`, which only confines which store
+    // it uses — the config file is still read and validated), so every
+    // test that drives the real binary must not read the developer's own
+    // `~/.config/fl/config.toml`.
+    c.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--db")
+        .arg(db(dir));
     c
 }
 
@@ -125,7 +132,7 @@ fn a_record_moves_between_states() {
         .assert()
         .success();
     cli(&d)
-        .args(["record", "move", "2", "--to", "doing"])
+        .args(["record", "move", "1", "--to", "doing"])
         .assert()
         .success();
     cli(&d)
@@ -144,7 +151,7 @@ fn an_unknown_state_name_is_refused_and_lists_the_valid_ones() {
         .assert()
         .success();
     cli(&d)
-        .args(["record", "move", "2", "--to", "sideways"])
+        .args(["record", "move", "1", "--to", "sideways"])
         .assert()
         .failure()
         .stderr(contains("needs_human"));
@@ -169,7 +176,7 @@ fn a_missing_parent_directory_for_the_db_flag_is_created() {
     );
 
     let mut c = Command::cargo_bin("fl").unwrap();
-    c.arg("--db").arg(&nested);
+    c.env("XDG_CONFIG_HOME", d.path()).arg("--db").arg(&nested);
     let repo = git_repo();
     c.args(["project", "add", &repo.path().display().to_string()])
         .assert()
@@ -287,4 +294,76 @@ fn a_transition_naming_a_nonexistent_gate_is_refused_and_names_the_id() {
         .assert()
         .failure()
         .stderr(contains("42"));
+}
+
+#[test]
+fn an_iri_typed_in_uppercase_names_the_same_item() {
+    let d = tempfile::tempdir().unwrap();
+    let _repo = project(&d);
+    cli(&d)
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    // `gate show 1` prints the gate's JSON, whose `id` is the full IRI.
+    let shown = cli(&d).args(["gate", "show", "1"]).output().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let id = json["id"].as_str().unwrap().to_string();
+    cli(&d)
+        .args(["gate", "show", &id.to_uppercase()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn handle_input_at_the_edges_is_refused_by_name() {
+    let d = tempfile::tempdir().unwrap();
+    let _repo = project(&d);
+    // The whole refusal phrase, not the bare input: `0` or `7` alone would
+    // also match the temp directory in the store's path.
+    for (bad, refusal) in [
+        ("0", "there is no gate 0 in the store"),
+        ("7", "there is no gate 7 in the store"),
+        (
+            "99999999999999999999",
+            "`99999999999999999999` is too large to be a handle",
+        ),
+        ("3abc", "`3abc` is neither a handle"),
+    ] {
+        cli(&d)
+            .args(["gate", "show", bad])
+            .assert()
+            .code(2)
+            .stderr(contains(refusal));
+    }
+}
+
+#[test]
+fn a_list_over_a_project_that_does_not_exist_is_refused_not_empty() {
+    let d = tempfile::tempdir().unwrap();
+    let _repo = project(&d);
+    // A handle that does not exist is refused at the edge, by `resolve`.
+    cli(&d)
+        .args(["record", "list", "--project", "9"])
+        .assert()
+        .code(2)
+        .stderr(contains("there is no project 9 in the store"));
+    // An IRI goes through to the store, whose list refuses a project it
+    // never held — it must not print an empty list and exit 0.
+    let stranger = "urn:uuid:0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b";
+    cli(&d)
+        .args(["record", "list", "--project", stranger])
+        .assert()
+        .code(2)
+        .stderr(contains("no store holds").and(contains(stranger)));
 }

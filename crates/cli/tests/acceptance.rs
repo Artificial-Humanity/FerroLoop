@@ -34,7 +34,10 @@ fn a_defect_present_before_the_run_stops_the_launch() {
     let db = home.path().join("t.redb").display().to_string();
     let cli = || {
         let mut c = Command::cargo_bin("fl").unwrap();
-        c.arg("--db").arg(&db);
+        // Fix round 1 — Important 5: isolate from the developer's own
+        // ~/.config/fl/config.toml, which `fl` reads unconditionally even
+        // when --db confines which store it uses.
+        c.env("XDG_CONFIG_HOME", home.path()).arg("--db").arg(&db);
         c
     };
 
@@ -96,7 +99,7 @@ fn a_defect_present_before_the_run_stops_the_launch() {
             "--regret",
             "high",
             "--gate",
-            "2",
+            "1",
         ])
         .assert()
         .success();
@@ -141,7 +144,10 @@ fn deleting_the_only_config_does_not_turn_the_gate_green() {
     let db = home.path().join("t.redb").display().to_string();
     let cli = || {
         let mut c = Command::cargo_bin("fl").unwrap();
-        c.arg("--db").arg(&db);
+        // Fix round 1 — Important 5: isolate from the developer's own
+        // ~/.config/fl/config.toml, which `fl` reads unconditionally even
+        // when --db confines which store it uses.
+        c.env("XDG_CONFIG_HOME", home.path()).arg("--db").arg(&db);
         c
     };
 
@@ -191,7 +197,7 @@ fn deleting_the_only_config_does_not_turn_the_gate_green() {
             "--regret",
             "high",
             "--gate",
-            "2",
+            "1",
         ])
         .assert()
         .success();

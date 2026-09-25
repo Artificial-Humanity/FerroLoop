@@ -1,14 +1,17 @@
-use anyhow::{Result, bail};
+use crate::refs::{self, Ref};
+use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{Regret, State, Transition};
-use fl_core::store::Store;
+use fl_core::store::Catalog;
+use fl_core::{Iri, Kind};
+use fl_store::RedbStore;
 
 #[derive(Subcommand)]
 pub enum Cmd {
     Add {
         #[arg(long)]
-        project: u64,
+        project: Ref,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -19,17 +22,44 @@ pub enum Cmd {
         #[arg(long)]
         regret: String,
         #[arg(long = "gate", num_args = 0..)]
-        gate: Vec<u64>,
+        gate: Vec<Ref>,
     },
     Show {
         #[arg(long)]
-        project: u64,
+        project: Ref,
         #[arg(long)]
         name: String,
     },
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+impl Cmd {
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added to a
+    /// variant here is picked up by both at once (Fix round 2, item 5): the
+    /// project, and (for `Add`) every `--gate` — a transition name is not
+    /// an id and never appears here.
+    fn refs(&self) -> Vec<&Ref> {
+        match self {
+            Cmd::Add { project, gate, .. } => {
+                let mut out: Vec<&Ref> = vec![project];
+                out.extend(gate.iter());
+                out
+            }
+            Cmd::Show { project, .. } => vec![project],
+        }
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
+    }
+
+    /// Whether this command names any item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        refs::has_handle(&self.refs())
+    }
+}
+
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add {
             project,
@@ -39,10 +69,17 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             regret,
             gate,
         } => {
-            let p = ProjectId(project);
-            if store.get_project(p)?.is_none() {
+            let p = ProjectId(refs::resolve(
+                store,
+                store.label(),
+                Kind::Project,
+                &project,
+            )?);
+            if store.get_project(&p)?.is_none() {
                 bail!(
-                    "no project with id {project}. Run `fl project list` to see the ids that exist."
+                    "`{project}` is not a project in the store at {}. Run `fl project list` to \
+                     see the ones that exist.",
+                    store.label()
                 );
             }
             let Some(from_state) = State::from_wire(&from) else {
@@ -63,11 +100,16 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                     Regret::wire_values()
                 );
             };
+            let mut gates = Vec::with_capacity(gate.len());
             for g in &gate {
-                let Some(def) = store.get_gate(GateId(*g))? else {
+                let id = GateId(
+                    refs::resolve(store, store.label(), Kind::Gate, g)
+                        .with_context(|| format!("transition `{name}` names gate {g}"))?,
+                );
+                let Some(def) = store.get_gate(&id)? else {
                     bail!(
                         "transition `{name}` names gate {g}, which does not exist. \
-                         Run `fl gate list --project {project}` to see the ids that exist."
+                         Run `fl gate list --project {project}` to see the gates that exist."
                     );
                 };
                 // ⚠ Existence used to be the whole check. A gate belonging to
@@ -82,11 +124,11 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                          working tree, so wiring one across projects would examine the wrong \
                          tree. Declare the gate in project {project} instead.",
                         def.name,
-                        def.project
+                        refs::show(store, Kind::Project, def.project.iri())?
                     );
                 }
+                gates.push(id);
             }
-            let gates = gate.into_iter().map(GateId).collect();
             store.add_transition(Transition {
                 project: p,
                 name: name.clone(),
@@ -98,8 +140,13 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             println!("{name}");
         }
         Cmd::Show { project, name } => {
-            let p = ProjectId(project);
-            let Some(t) = store.get_transition(p, &name)? else {
+            let p = ProjectId(refs::resolve(
+                store,
+                store.label(),
+                Kind::Project,
+                &project,
+            )?);
+            let Some(t) = store.get_transition(&p, &name)? else {
                 bail!(
                     "project {project} declares no transition named `{name}`. \
                      Add it with `fl transition add`, or name one of the existing ones."

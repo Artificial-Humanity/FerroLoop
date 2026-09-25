@@ -1,4 +1,5 @@
-use crate::ids::{FindingId, GateId, ProjectId, RecordId};
+use crate::ids::{FindingId, GateId, ProjectId, RecordId, seq_iri};
+use crate::iri::Iri;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -73,13 +74,19 @@ pub struct Finding {
     pub state: FindingState,
     pub assigned_to: Option<String>,
     pub withdrawn_reason: Option<String>,
+    /// Other ids this finding answers to (spec §2.5). Empty until
+    /// `add_alias` names one. `#[serde(default)]` so a finding written
+    /// before aliases existed still reads.
+    #[serde(default)]
+    pub also_known_as: Vec<Iri>,
 }
 
 impl Finding {
-    /// The id is a placeholder until the store assigns one.
+    /// The id is a placeholder, `seq_iri(0)`: the store replaces it with the
+    /// id it mints.
     pub fn raise(project: ProjectId, record: RecordId, raised_by: &str, claim: &str) -> Self {
         Self {
-            id: FindingId(0),
+            id: FindingId(seq_iri(0)),
             project,
             record,
             raised_by: raised_by.to_string(),
@@ -88,6 +95,7 @@ impl Finding {
             state: FindingState::Raised,
             assigned_to: None,
             withdrawn_reason: None,
+            also_known_as: vec![],
         }
     }
 
@@ -139,8 +147,8 @@ mod tests {
 
     fn raised() -> Finding {
         Finding::raise(
-            ProjectId(1),
-            RecordId(2),
+            ProjectId(seq_iri(1)),
+            RecordId(seq_iri(2)),
             "reviewer",
             "off-by-one on an empty slice",
         )
@@ -169,9 +177,9 @@ mod tests {
     #[test]
     fn attaching_a_reproduction_makes_it_assignable() {
         let mut f = raised();
-        f.attach_reproduction(GateId(9)).unwrap();
+        f.attach_reproduction(GateId(seq_iri(9))).unwrap();
         assert_eq!(f.state, FindingState::Reproduced);
-        assert_eq!(f.reproduction, Some(GateId(9)));
+        assert_eq!(f.reproduction, Some(GateId(seq_iri(9))));
         f.assign("fixer").unwrap();
         assert_eq!(f.state, FindingState::Assigned);
     }
@@ -179,17 +187,17 @@ mod tests {
     #[test]
     fn a_reproduction_cannot_be_swapped_once_attached() {
         let mut f = raised();
-        f.attach_reproduction(GateId(9)).unwrap();
-        let err = f.attach_reproduction(GateId(10)).unwrap_err();
+        f.attach_reproduction(GateId(seq_iri(9))).unwrap();
+        let err = f.attach_reproduction(GateId(seq_iri(10))).unwrap_err();
         assert!(matches!(err, FindingError::AlreadyReproduced));
-        assert_eq!(f.reproduction, Some(GateId(9)));
+        assert_eq!(f.reproduction, Some(GateId(seq_iri(9))));
     }
 
     #[test]
     fn a_finding_cannot_be_fixed_before_it_is_assigned() {
         let mut f = raised();
         assert!(f.mark_fixed().is_err());
-        f.attach_reproduction(GateId(9)).unwrap();
+        f.attach_reproduction(GateId(seq_iri(9))).unwrap();
         assert!(f.mark_fixed().is_err(), "Reproduced is not Assigned");
         f.assign("fixer").unwrap();
         f.mark_fixed().unwrap();
@@ -212,21 +220,25 @@ mod tests {
     fn a_terminal_finding_stays_terminal() {
         let mut f = raised();
         f.withdraw("no").unwrap();
-        assert!(f.attach_reproduction(GateId(9)).is_err());
+        assert!(f.attach_reproduction(GateId(seq_iri(9))).is_err());
         assert!(f.assign("fixer").is_err());
     }
 
     #[test]
     fn a_finding_can_be_reassigned_to_a_different_actor() {
         let mut f = raised();
-        f.attach_reproduction(GateId(9)).unwrap();
+        f.attach_reproduction(GateId(seq_iri(9))).unwrap();
         f.assign("fixer_one").unwrap();
         assert_eq!(f.assigned_to.as_deref(), Some("fixer_one"));
         assert_eq!(f.state, FindingState::Assigned);
         f.assign("fixer_two").unwrap();
         assert_eq!(f.assigned_to.as_deref(), Some("fixer_two"));
         assert_eq!(f.state, FindingState::Assigned);
-        assert_eq!(f.reproduction, Some(GateId(9)), "reproduction stays intact");
+        assert_eq!(
+            f.reproduction,
+            Some(GateId(seq_iri(9))),
+            "reproduction stays intact"
+        );
     }
 
     #[test]

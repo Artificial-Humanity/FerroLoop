@@ -1,4 +1,5 @@
 use crate::ids::{GateId, ProjectId, RecordId};
+use crate::iri::Iri;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +120,11 @@ pub struct Record {
     pub project: ProjectId,
     pub title: String,
     pub state: State,
+    /// Other ids this record answers to (spec §2.5). Empty until `add_alias`
+    /// names one. `#[serde(default)]` so a record written before aliases
+    /// existed still reads.
+    #[serde(default)]
+    pub also_known_as: Vec<Iri>,
 }
 
 crate::wire::wire_tags!(Selector as selector_wire {
@@ -154,6 +160,7 @@ crate::wire::wire_tags!(GateKind as gate_kind_wire {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::seq_iri;
 
     #[test]
     fn a_state_round_trips_through_its_wire_name() {
@@ -178,8 +185,8 @@ mod tests {
     #[test]
     fn a_gate_definition_carries_its_provenance_and_its_floor() {
         let g = GateDef {
-            id: GateId(1),
-            project: ProjectId(1),
+            id: GateId(seq_iri(1)),
+            project: ProjectId(seq_iri(1)),
             name: "fmt".into(),
             kind: GateKind::Command(CommandSpec {
                 program: "cargo".into(),
@@ -203,12 +210,12 @@ mod tests {
     #[test]
     fn a_transition_names_its_gates_and_declares_its_regret() {
         let t = Transition {
-            project: ProjectId(1),
+            project: ProjectId(seq_iri(1)),
             name: "launch".into(),
             from: State::Review,
             to: State::Done,
             regret: Regret::High,
-            gates: vec![GateId(1), GateId(2)],
+            gates: vec![GateId(seq_iri(1)), GateId(seq_iri(2))],
         };
         assert_eq!(t.regret, Regret::High);
         assert_eq!(t.gates.len(), 2);

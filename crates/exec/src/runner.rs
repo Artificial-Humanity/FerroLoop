@@ -87,7 +87,7 @@ pub trait Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fl_core::ids::RecordId;
+    use fl_core::ids::{RecordId, seq_iri};
 
     struct Stub;
 
@@ -114,7 +114,7 @@ mod tests {
         let out = Stub
             .attempt(AttemptSpec {
                 project_root: std::path::PathBuf::from("/tmp"),
-                record: RecordId(1),
+                record: RecordId(seq_iri(1)),
                 instruction: "do the thing".into(),
                 timeout_secs: 5,
                 budget_usd_micros: 10_000,

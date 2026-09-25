@@ -1,6 +1,9 @@
+use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_core::store::Store;
+use fl_core::store::Catalog;
+use fl_core::{Iri, Kind};
+use fl_store::RedbStore;
 
 #[derive(Subcommand)]
 pub enum Cmd {
@@ -10,7 +13,38 @@ pub enum Cmd {
     List,
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+impl Cmd {
+    /// Every item this command names, by `Ref` — the single source `iris()`
+    /// and `has_handle()` both derive from, so a `Ref` field added to a
+    /// variant here is picked up by both at once (Fix round 2, item 5).
+    /// Neither variant names an existing item: `Add`'s `path` is a
+    /// filesystem path for a project not yet registered, and `List` takes
+    /// none at all.
+    fn refs(&self) -> Vec<&Ref> {
+        Vec::new()
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
+    }
+
+    pub fn has_handle(&self) -> bool {
+        refs::has_handle(&self.refs())
+    }
+
+    /// The directory `Add` registers. The store is chosen by ITS binding in
+    /// the config, not the current directory's: a project registered from
+    /// elsewhere must land in the store it is bound to (Final review, item
+    /// 2).
+    pub fn root(&self) -> Option<&std::path::Path> {
+        match self {
+            Cmd::Add { path } => Some(std::path::Path::new(path)),
+            Cmd::List => None,
+        }
+    }
+}
+
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add { path } => {
             // ⚠ This used to store the string unexamined, so a typo became a
@@ -38,11 +72,15 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 )
             })?;
             let id = store.add_project(&root)?;
-            println!("{id}\t{root}");
+            println!("{}\t{root}", refs::show(store, Kind::Project, id.iri())?);
         }
         Cmd::List => {
             for p in store.list_projects()? {
-                println!("{}\t{}", p.id, p.root);
+                println!(
+                    "{}\t{}",
+                    refs::show(store, Kind::Project, p.id.iri())?,
+                    p.root
+                );
             }
         }
     }

@@ -1,17 +1,43 @@
+use crate::refs::{self, Ref};
 use anyhow::Result;
 use clap::Args;
 use fl_core::ids::ProjectId;
-use fl_core::store::Store;
+use fl_core::store::Ledger;
+use fl_core::{Iri, Kind};
+use fl_store::RedbStore;
 use std::collections::BTreeMap;
 
 #[derive(Args)]
 pub struct Cmd {
     #[arg(long)]
-    pub project: u64,
+    pub project: Ref,
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
-    let attempts = store.attempts(ProjectId(cmd.project))?;
+impl Cmd {
+    /// The one item this command names, by `Ref` — the single source
+    /// `iris()` and `has_handle()` both derive from (Fix round 2, item 5).
+    fn refs(&self) -> Vec<&Ref> {
+        vec![&self.project]
+    }
+
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&self.refs())
+    }
+
+    /// Whether this command names its item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        refs::has_handle(&self.refs())
+    }
+}
+
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+    let project = ProjectId(refs::resolve(
+        store,
+        store.label(),
+        Kind::Project,
+        &cmd.project,
+    )?);
+    let attempts = store.attempts(&project)?;
 
     // ⚠ Printed even when it is zero. A report that prints nothing when it
     // found nothing is indistinguishable from a report that did not run.
