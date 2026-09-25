@@ -8,7 +8,14 @@ fn db(dir: &tempfile::TempDir) -> String {
 
 fn cli(dir: &tempfile::TempDir) -> Command {
     let mut c = Command::cargo_bin("fl").unwrap();
-    c.arg("--db").arg(db(dir));
+    // Fix round 1 — Important 5: every `fl` invocation reads the user's
+    // config unconditionally (even `--db`, which only confines which store
+    // it uses — the config file is still read and validated), so every
+    // test that drives the real binary must not read the developer's own
+    // `~/.config/fl/config.toml`.
+    c.env("XDG_CONFIG_HOME", dir.path())
+        .arg("--db")
+        .arg(db(dir));
     c
 }
 
@@ -169,7 +176,7 @@ fn a_missing_parent_directory_for_the_db_flag_is_created() {
     );
 
     let mut c = Command::cargo_bin("fl").unwrap();
-    c.arg("--db").arg(&nested);
+    c.env("XDG_CONFIG_HOME", d.path()).arg("--db").arg(&nested);
     let repo = git_repo();
     c.args(["project", "add", &repo.path().display().to_string()])
         .assert()

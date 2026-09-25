@@ -32,6 +32,11 @@ impl Cmd {
     pub fn iris(&self) -> Vec<Iri> {
         refs::iris(&[&self.record])
     }
+
+    /// Whether this command names its item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        refs::has_handle(&[&self.record])
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

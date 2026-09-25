@@ -58,6 +58,18 @@ impl Cmd {
             Cmd::List { project, .. } => refs::iris(&[project]),
         }
     }
+
+    /// Whether this command names any item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        match self {
+            Cmd::Raise { record, .. } => refs::has_handle(&[record]),
+            Cmd::Reproduce { finding, gate } => refs::has_handle(&[finding, gate]),
+            Cmd::Assign { finding, .. } => refs::has_handle(&[finding]),
+            Cmd::Verify { finding } => refs::has_handle(&[finding]),
+            Cmd::Withdraw { finding, .. } => refs::has_handle(&[finding]),
+            Cmd::List { project, .. } => refs::has_handle(&[project]),
+        }
+    }
 }
 
 fn finding_id(store: &RedbStore, r: &Ref) -> Result<FindingId> {

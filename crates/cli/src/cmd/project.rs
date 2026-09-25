@@ -20,6 +20,11 @@ impl Cmd {
     pub fn iris(&self) -> Vec<Iri> {
         Vec::new()
     }
+
+    /// Neither variant takes a `Ref` at all.
+    pub fn has_handle(&self) -> bool {
+        false
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

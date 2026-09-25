@@ -64,7 +64,7 @@ Commands:
   help        Print this message or the help of the given subcommand(s)
 
 Options:
-      --db <DB>  Path to the store. Falls back to $FL_DB, then the XDG data directory
+      --db <DB>  Path to the store. CONFINES the command to it: an IRI it does not hold is refused, not searched for elsewhere. Falls back to $FL_DB (same), then the project bound in ~/.config/fl/config.toml, then the XDG data directory
   -h, --help     Print help
   -V, --version  Print version
 ```

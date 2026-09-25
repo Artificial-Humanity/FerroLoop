@@ -1,4 +1,5 @@
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::{Path, PathBuf};
 use std::process::Command as Sys;
@@ -279,4 +280,311 @@ fn a_store_that_cannot_be_opened_during_an_iri_search_is_an_error_not_a_skip() {
         .code(2)
         .stderr(contains("could not open"))
         .stderr(contains(b.to_str().unwrap()));
+}
+
+// Fix round 1 — Important 2 (integration half): guard `bound`'s
+// canonicalization of a config entry's `root` (config.rs's unit test
+// `bound_resolves_a_symlinked_cwd_passed_directly` guards the `cwd` side;
+// Task 6's `a_symlinked_working_directory_binds_like_the_real_one` above
+// cannot guard either, since `std::env::current_dir()` already resolves a
+// symlinked process cwd before this binary ever sees it).
+#[cfg(unix)]
+#[test]
+fn a_symlinked_config_root_binds_like_the_real_one() {
+    let env = Env::new();
+    let repo = git_repo();
+    let stores = tempfile::tempdir().unwrap();
+    let a = stores.path().join("a.redb");
+    let links = tempfile::tempdir().unwrap();
+    let link = links.path().join("via-link");
+    std::os::unix::fs::symlink(repo.path(), &link).unwrap();
+    env.write_config(&bind(&link, &a));
+    env.fl(repo.path())
+        .args(["project", "list"])
+        .assert()
+        .success();
+    assert!(a.exists(), "a symlinked config root did not bind");
+    assert!(!env.default_store().exists());
+}
+
+// Fix round 1 — Ruling (item 0): `--db`/`$FL_DB` CONFINE the command to the
+// one store they name. An IRI that store does not hold is `NotOwned` naming
+// only that store — never a search across every store any project happens
+// to be bound to in the config.
+#[test]
+fn an_explicit_db_confines_the_search_and_never_names_another_configured_store() {
+    let env = Env::new();
+    let (ra, rb, stores, _a, b) = two_bound_stores(&env);
+    env.fl(rb.path())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "in-b",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    let shown = env
+        .fl(rb.path())
+        .args(["gate", "show", "1"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let iri = json["id"].as_str().unwrap().to_string();
+
+    // `other.redb` is a THIRD path, not registered in the config at all —
+    // confinement must hold whether or not it happens to overlap with a
+    // configured store.
+    let other = stores.path().join("other.redb");
+    env.fl(ra.path())
+        .args(["--db", other.to_str().unwrap(), "gate", "show", &iri])
+        .assert()
+        .code(2)
+        .stderr(contains("no store holds"))
+        .stderr(contains(other.to_str().unwrap()))
+        .stderr(contains(b.to_str().unwrap()).not());
+}
+
+// Fix round 1 — Important 1: a handle resolves only in the store it was
+// read from. Mixing one into a command whose IRI sends the search to a
+// DIFFERENT store than the bound one must refuse rather than silently
+// resolve the handle against that other store's numbering.
+#[test]
+fn a_handle_mixed_with_an_iri_held_by_a_different_store_is_refused() {
+    let env = Env::new();
+    let (ra, rb, _stores, _a, _b) = two_bound_stores(&env);
+    env.fl(rb.path())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "in-b",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    let shown = env
+        .fl(rb.path())
+        .args(["gate", "show", "1"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let gate_iri = json["id"].as_str().unwrap().to_string();
+
+    // From A (bound to a.redb): project "1" BY HANDLE — A's own project —
+    // alongside a gate named BY IRI that only b.redb holds. The IRI search
+    // sends this command to b.redb, which differs from A's bound store; the
+    // handle "1" must not be silently resolved against b.redb's numbering.
+    env.fl(ra.path())
+        .args([
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "low",
+            "--gate",
+            &gate_iri,
+        ])
+        .assert()
+        .code(2)
+        .stderr(contains("handle"));
+
+    // No transition exists in either store.
+    env.fl(ra.path())
+        .args(["transition", "show", "--project", "1", "--name", "launch"])
+        .assert()
+        .code(2);
+    env.fl(rb.path())
+        .args(["transition", "show", "--project", "1", "--name", "launch"])
+        .assert()
+        .code(2);
+}
+
+// Fix round 1 — Important 3: `choose_store` must never create a candidate
+// store merely by checking whether it owns an id.
+#[test]
+fn searching_for_an_iri_never_creates_a_candidate_store_that_does_not_exist() {
+    let env = Env::new();
+    let ra = git_repo();
+    let rb = git_repo();
+    let stores = tempfile::tempdir().unwrap();
+    let a = stores.path().join("a.redb");
+    let b = stores.path().join("b.redb"); // never created
+    env.write_config(&format!("{}{}", bind(ra.path(), &a), bind(rb.path(), &b)));
+    env.fl(ra.path())
+        .args(["project", "add", ra.path().to_str().unwrap()])
+        .assert()
+        .success();
+    assert!(a.exists());
+    assert!(!b.exists(), "fixture must start absent");
+
+    env.fl(ra.path())
+        .args(["gate", "show", STRANGER])
+        .assert()
+        .code(2);
+
+    assert!(
+        !b.exists(),
+        "searching created a store that was never opened before"
+    );
+}
+
+// Fix round 1 — Important 4a: IRIs in one command held by different stores.
+// `choose_store` treats every `Iri` `Cmd::iris()` collects the same way
+// regardless of which flag it came from — there is no `finding show`/`get`
+// in this CLI that could print a raw finding IRI (`finding list` always
+// prefers the RESOLVING store's own handle for it, unlike `gate show`'s
+// JSON dump, which always prints the literal id), so two gates — one from
+// each store, fed to `transition add`'s repeatable `--gate` — exercise
+// exactly the same refusal path a `finding reproduce` with a finding IRI
+// and a gate IRI would.
+#[test]
+fn iris_in_one_command_held_by_different_stores_is_refused_naming_both() {
+    let env = Env::new();
+    let (ra, rb, _stores, a, b) = two_bound_stores(&env);
+
+    env.fl(ra.path())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "in-a",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    let shown = env
+        .fl(ra.path())
+        .args(["gate", "show", "1"])
+        .output()
+        .unwrap();
+    let gate_a: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let gate_a_iri = gate_a["id"].as_str().unwrap().to_string();
+
+    env.fl(rb.path())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "in-b",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    let shown = env
+        .fl(rb.path())
+        .args(["gate", "show", "1"])
+        .output()
+        .unwrap();
+    let gate_b: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let gate_b_iri = gate_b["id"].as_str().unwrap().to_string();
+
+    // `--project` takes `gate_a_iri` here, not project A's own id or a
+    // handle: `choose_store` only ever sees the flat `Vec<Iri>`
+    // `Cmd::iris()` collects, so this is enough to drive its "two different
+    // stores" refusal without it — deliberately — being semantically a
+    // project. Using a real project HANDLE here instead would additionally
+    // trip the item-1 "handle held by a different store" refusal as soon as
+    // the IRI search moved the command to store B, masking whether THIS
+    // refusal (main.rs's own two-different-stores bail) still fires on its
+    // own — confirmed by mutating that bail away: the test still failed,
+    // but only because of item 1, not this one.
+    env.fl(ra.path())
+        .args([
+            "transition",
+            "add",
+            "--project",
+            &gate_a_iri,
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "low",
+            "--gate",
+            &gate_b_iri,
+        ])
+        .assert()
+        .code(2)
+        .stderr(contains(a.to_str().unwrap()))
+        .stderr(contains(b.to_str().unwrap()));
+}
+
+// Fix round 1 — Important 4b: one id owned by two stores at once.
+#[test]
+fn an_id_owned_by_two_stores_at_once_is_refused_naming_both() {
+    let env = Env::new();
+    let ra = git_repo();
+    let rc = git_repo();
+    let stores = tempfile::tempdir().unwrap();
+    let a = stores.path().join("a.redb");
+    let c = stores.path().join("c.redb");
+    env.write_config(&format!("{}{}", bind(ra.path(), &a), bind(rc.path(), &c)));
+    env.fl(ra.path())
+        .args(["project", "add", ra.path().to_str().unwrap()])
+        .assert()
+        .success();
+    env.fl(ra.path())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    let shown = env
+        .fl(ra.path())
+        .args(["gate", "show", "1"])
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let iri = json["id"].as_str().unwrap().to_string();
+
+    // Duplicate the store wholesale: c.redb now holds every id a.redb does,
+    // including this gate's.
+    std::fs::copy(&a, &c).unwrap();
+
+    env.fl(ra.path())
+        .args(["gate", "show", &iri])
+        .assert()
+        .code(2)
+        .stderr(contains(a.to_str().unwrap()))
+        .stderr(contains(c.to_str().unwrap()));
 }

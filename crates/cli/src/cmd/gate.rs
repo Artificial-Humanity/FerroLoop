@@ -102,6 +102,18 @@ impl Cmd {
             Cmd::SetProgram { id, .. } => refs::iris(&[id]),
         }
     }
+
+    /// Whether this command names any item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        match self {
+            Cmd::Add(args) => refs::has_handle(&[&args.project]),
+            Cmd::List { project } => refs::has_handle(&[project]),
+            Cmd::Show { id } => refs::has_handle(&[id]),
+            Cmd::Affirm { id, .. } => refs::has_handle(&[id]),
+            Cmd::Run { id } => refs::has_handle(&[id]),
+            Cmd::SetProgram { id, .. } => refs::has_handle(&[id]),
+        }
+    }
 }
 
 /// The gate `id` names, or a refusal that echoes what was typed.

@@ -263,6 +263,13 @@ fn every_command_in_the_getting_started_guide_produces_the_output_it_prints() {
         .env("PATH", &path)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        // Fix round 1 — Important 5: every command below passes `--db`
+        // explicitly (which only confines which store it uses), but `fl`
+        // reads and validates the user's config unconditionally — this
+        // script, unlike the other suites, does not clear its environment,
+        // so without this it would read the developer's own
+        // ~/.config/fl/config.toml.
+        .env("XDG_CONFIG_HOME", home.path())
         .output()
         .expect("the document's commands could not be run");
     let combined = String::from_utf8_lossy(&out.stdout).to_string();

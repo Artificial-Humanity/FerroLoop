@@ -6,7 +6,13 @@ use std::process::Command as Sys;
 
 fn cli(db: &str) -> Command {
     let mut c = Command::cargo_bin("fl").unwrap();
-    c.arg("--db").arg(db);
+    // Fix round 1 — Important 5: isolate from the developer's own
+    // ~/.config/fl/config.toml, which `fl` reads unconditionally even when
+    // --db confines which store it uses. `db`'s own parent directory is a
+    // scratch TempDir the caller already holds, so it doubles as an empty
+    // config home with no `fl/config.toml` inside it.
+    let home = Path::new(db).parent().expect("db has a parent directory");
+    c.env("XDG_CONFIG_HOME", home).arg("--db").arg(db);
     c
 }
 

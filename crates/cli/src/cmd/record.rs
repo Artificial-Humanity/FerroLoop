@@ -37,6 +37,15 @@ impl Cmd {
             Cmd::Move { id, .. } => refs::iris(&[id]),
         }
     }
+
+    /// Whether this command names any item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        match self {
+            Cmd::Add { project, .. } => refs::has_handle(&[project]),
+            Cmd::List { project } => refs::has_handle(&[project]),
+            Cmd::Move { id, .. } => refs::has_handle(&[id]),
+        }
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

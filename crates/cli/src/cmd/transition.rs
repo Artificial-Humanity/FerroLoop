@@ -45,6 +45,18 @@ impl Cmd {
             Cmd::Show { project, .. } => refs::iris(&[project]),
         }
     }
+
+    /// Whether this command names any item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        match self {
+            Cmd::Add { project, gate, .. } => {
+                let mut refs: Vec<&Ref> = vec![project];
+                refs.extend(gate.iter());
+                refs::has_handle(&refs)
+            }
+            Cmd::Show { project, .. } => refs::has_handle(&[project]),
+        }
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

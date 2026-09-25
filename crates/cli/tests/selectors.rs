@@ -13,7 +13,7 @@ use std::path::Path;
 use std::process::Command as Sys;
 
 struct F {
-    _home: tempfile::TempDir,
+    home: tempfile::TempDir,
     repo: tempfile::TempDir,
     db: String,
 }
@@ -43,17 +43,18 @@ fn fixture() -> F {
     git(repo.path(), &["add", "-A"]);
     git(repo.path(), &["commit", "-qm", "first"]);
     let db = home.path().join("t.redb").display().to_string();
-    F {
-        _home: home,
-        repo,
-        db,
-    }
+    F { home, repo, db }
 }
 
 impl F {
     fn cli(&self) -> Command {
         let mut c = Command::cargo_bin("fl").unwrap();
-        c.arg("--db").arg(&self.db);
+        // Fix round 1 — Important 5: isolate from the developer's own
+        // ~/.config/fl/config.toml, which `fl` reads unconditionally even
+        // when --db confines which store it uses.
+        c.env("XDG_CONFIG_HOME", self.home.path())
+            .arg("--db")
+            .arg(&self.db);
         c
     }
     fn project(&self) {

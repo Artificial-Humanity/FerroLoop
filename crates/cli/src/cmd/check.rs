@@ -25,6 +25,15 @@ impl Cmd {
         }
         refs::iris(&refs)
     }
+
+    /// Whether this command names any item by handle rather than IRI.
+    pub fn has_handle(&self) -> bool {
+        let mut refs: Vec<&Ref> = vec![&self.project];
+        if let Some(r) = &self.record {
+            refs.push(r);
+        }
+        refs::has_handle(&refs)
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
