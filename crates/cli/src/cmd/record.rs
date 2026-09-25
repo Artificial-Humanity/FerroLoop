@@ -1,10 +1,10 @@
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_core::Kind;
 use fl_core::ids::{ProjectId, RecordId};
 use fl_core::model::State;
 use fl_core::store::{Catalog, Roles, Tracker};
+use fl_core::{Iri, Kind};
 use fl_exec::record::{MoveOutcome, move_record};
 use fl_store::RedbStore;
 
@@ -25,6 +25,18 @@ pub enum Cmd {
         #[arg(long = "to")]
         to: String,
     },
+}
+
+impl Cmd {
+    /// Every item this command names — a target state is not an id and
+    /// never appears here.
+    pub fn iris(&self) -> Vec<Iri> {
+        match self {
+            Cmd::Add { project, .. } => refs::iris(&[project]),
+            Cmd::List { project } => refs::iris(&[project]),
+            Cmd::Move { id, .. } => refs::iris(&[id]),
+        }
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

@@ -1,10 +1,10 @@
 use crate::refs::{self, Ref};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
-use fl_core::Kind;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{Regret, State, Transition};
 use fl_core::store::Catalog;
+use fl_core::{Iri, Kind};
 use fl_store::RedbStore;
 
 #[derive(Subcommand)]
@@ -30,6 +30,21 @@ pub enum Cmd {
         #[arg(long)]
         name: String,
     },
+}
+
+impl Cmd {
+    /// Every item this command names: the project, and (for `Add`) every
+    /// `--gate` — a transition name is not an id and never appears here.
+    pub fn iris(&self) -> Vec<Iri> {
+        match self {
+            Cmd::Add { project, gate, .. } => {
+                let mut refs: Vec<&Ref> = vec![project];
+                refs.extend(gate.iter());
+                refs::iris(&refs)
+            }
+            Cmd::Show { project, .. } => refs::iris(&[project]),
+        }
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

@@ -1,10 +1,10 @@
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Args;
-use fl_core::Kind;
 use fl_core::ids::RecordId;
 use fl_core::log::{Attempt, AttemptStatus};
 use fl_core::store::{Catalog, Ledger, Tracker};
+use fl_core::{Iri, Kind};
 use fl_exec::adapters::ClaudeAdapter;
 use fl_exec::runner::{AttemptSpec, Runner};
 use fl_store::RedbStore;
@@ -25,6 +25,13 @@ pub struct Cmd {
     /// The binary to invoke. Override when it is not on PATH under this name.
     #[arg(long, default_value = "claude")]
     pub binary: String,
+}
+
+impl Cmd {
+    /// The one item this command names.
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&[&self.record])
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

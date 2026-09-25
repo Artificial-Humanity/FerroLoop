@@ -1,8 +1,8 @@
 use crate::refs;
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_core::Kind;
 use fl_core::store::Catalog;
+use fl_core::{Iri, Kind};
 use fl_store::RedbStore;
 
 #[derive(Subcommand)]
@@ -11,6 +11,15 @@ pub enum Cmd {
     Add { path: String },
     /// List registered projects.
     List,
+}
+
+impl Cmd {
+    /// Neither variant names an existing item by id: `Add`'s `path` is a
+    /// filesystem path for a project not yet registered, and `List` takes
+    /// none at all.
+    pub fn iris(&self) -> Vec<Iri> {
+        Vec::new()
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

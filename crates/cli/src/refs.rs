@@ -61,3 +61,15 @@ pub fn show(store: &impl Handles, kind: Kind, id: &Iri) -> Result<String> {
         None => id.to_string(),
     })
 }
+
+/// Every `Ref::Iri` among `refs`, in order. A handle is store-local and
+/// carries no ownership information, so it plays no part in choosing which
+/// store a command's items are searched for in (spec §2.6).
+pub fn iris(refs: &[&Ref]) -> Vec<Iri> {
+    refs.iter()
+        .filter_map(|r| match r {
+            Ref::Iri(i) => Some(i.clone()),
+            Ref::Handle(_) => None,
+        })
+        .collect()
+}

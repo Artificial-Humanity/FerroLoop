@@ -1,10 +1,10 @@
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_core::Kind;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{CommandSpec, GateDef, GateKind, PopulationDelivery, Selector};
 use fl_core::store::Catalog;
+use fl_core::{Iri, Kind};
 use fl_exec::evaluate::run_single_gate;
 use fl_store::RedbStore;
 
@@ -86,6 +86,22 @@ pub enum Cmd {
         #[arg(long)]
         program: String,
     },
+}
+
+impl Cmd {
+    /// Every item this command names, so a full IRI on the command line can
+    /// select the store that holds it (spec §2.6). A transition name or a
+    /// program string is not an id and never appears here.
+    pub fn iris(&self) -> Vec<Iri> {
+        match self {
+            Cmd::Add(args) => refs::iris(&[&args.project]),
+            Cmd::List { project } => refs::iris(&[project]),
+            Cmd::Show { id } => refs::iris(&[id]),
+            Cmd::Affirm { id, .. } => refs::iris(&[id]),
+            Cmd::Run { id } => refs::iris(&[id]),
+            Cmd::SetProgram { id, .. } => refs::iris(&[id]),
+        }
+    }
 }
 
 /// The gate `id` names, or a refusal that echoes what was typed.

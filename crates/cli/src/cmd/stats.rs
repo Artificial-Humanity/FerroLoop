@@ -1,9 +1,9 @@
 use crate::refs::{self, Ref};
 use anyhow::Result;
 use clap::Args;
-use fl_core::Kind;
 use fl_core::ids::ProjectId;
 use fl_core::store::Ledger;
+use fl_core::{Iri, Kind};
 use fl_store::RedbStore;
 use std::collections::BTreeMap;
 
@@ -11,6 +11,13 @@ use std::collections::BTreeMap;
 pub struct Cmd {
     #[arg(long)]
     pub project: Ref,
+}
+
+impl Cmd {
+    /// The one item this command names.
+    pub fn iris(&self) -> Vec<Iri> {
+        refs::iris(&[&self.project])
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

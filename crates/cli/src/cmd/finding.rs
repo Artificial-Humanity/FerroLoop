@@ -1,10 +1,10 @@
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_core::Kind;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::store::{Roles, Tracker};
+use fl_core::{Iri, Kind};
 use fl_exec::finding::{FindingExecError, attach_reproduction, verify_finding};
 use fl_store::RedbStore;
 use std::collections::BTreeSet;
@@ -43,6 +43,21 @@ pub enum Cmd {
         #[arg(long)]
         state: Option<String>,
     },
+}
+
+impl Cmd {
+    /// Every item this command names — a claim, an assignee and a
+    /// withdrawal reason are strings, not ids.
+    pub fn iris(&self) -> Vec<Iri> {
+        match self {
+            Cmd::Raise { record, .. } => refs::iris(&[record]),
+            Cmd::Reproduce { finding, gate } => refs::iris(&[finding, gate]),
+            Cmd::Assign { finding, .. } => refs::iris(&[finding]),
+            Cmd::Verify { finding } => refs::iris(&[finding]),
+            Cmd::Withdraw { finding, .. } => refs::iris(&[finding]),
+            Cmd::List { project, .. } => refs::iris(&[project]),
+        }
+    }
 }
 
 fn finding_id(store: &RedbStore, r: &Ref) -> Result<FindingId> {

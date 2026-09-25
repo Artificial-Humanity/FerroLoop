@@ -1,8 +1,8 @@
 use crate::refs::{self, Ref};
 use anyhow::Result;
 use clap::Args;
-use fl_core::Kind;
 use fl_core::ids::{ProjectId, RecordId};
+use fl_core::{Iri, Kind};
 use fl_exec::evaluate::evaluate_transition;
 use fl_store::RedbStore;
 
@@ -14,6 +14,17 @@ pub struct Cmd {
     pub project: Ref,
     #[arg(long)]
     pub record: Option<Ref>,
+}
+
+impl Cmd {
+    /// Every item this command names — the transition name is not an id.
+    pub fn iris(&self) -> Vec<Iri> {
+        let mut refs: Vec<&Ref> = vec![&self.project];
+        if let Some(r) = &self.record {
+            refs.push(r);
+        }
+        refs::iris(&refs)
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
