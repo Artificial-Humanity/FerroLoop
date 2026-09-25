@@ -9,11 +9,13 @@
 //! a file store, `()` for memory).
 
 use crate::finding::{Finding, FindingState};
+use crate::ids::{FindingId, GateId, Kind, ProjectId, seq_iri};
+use crate::iri::Iri;
 use crate::log::GateRun;
 use crate::model::{
     CommandSpec, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
-use crate::store::{Catalog, Ledger, Tracker};
+use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use crate::verdict::Verdict;
 
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
@@ -22,6 +24,10 @@ pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
         affirming_a_gate_moves_only_its_stamp::<S>,
         list_transitions_returns_every_transition_of_one_project_and_no_others::<S>,
     ];
+    assert!(
+        !cases.is_empty(),
+        "the catalog suite has no cases, so it would pass over nothing"
+    );
     for case in cases {
         let (s, _guard) = make();
         case(&s);
@@ -36,6 +42,10 @@ pub fn tracker<S: Catalog + Tracker, G>(make: impl Fn() -> (S, G)) {
         withdrawals_are_counted_against_whoever_raised_the_finding::<S>,
         findings_are_listed_per_project::<S>,
     ];
+    assert!(
+        !cases.is_empty(),
+        "the tracker suite has no cases, so it would pass over nothing"
+    );
     for case in cases {
         let (s, _guard) = make();
         case(&s);
@@ -44,15 +54,29 @@ pub fn tracker<S: Catalog + Tracker, G>(make: impl Fn() -> (S, G)) {
 
 pub fn ledger<S: Catalog + Ledger, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[the_logs_are_append_only_and_read_back_in_order::<S>];
+    assert!(
+        !cases.is_empty(),
+        "the ledger suite has no cases, so it would pass over nothing"
+    );
     for case in cases {
         let (s, _guard) = make();
         case(&s);
     }
 }
 
-/// Cases that need one store backing all three roles. Empty until Task 4.
-pub fn all_roles<S: Catalog + Tracker + Ledger, G>(make: impl Fn() -> (S, G)) {
-    let cases: &[fn(&S)] = &[];
+/// Cases that need one store backing all three roles, and its handles.
+pub fn all_roles<S: Catalog + Tracker + Ledger + Handles, G>(make: impl Fn() -> (S, G)) {
+    let cases: &[fn(&S)] = &[
+        an_id_this_store_never_held_is_not_owned_rather_than_absent::<S>,
+        a_list_over_a_project_this_store_never_held_is_refused_not_empty::<S>,
+        an_id_of_another_kind_is_owned_but_not_found::<S>,
+        handles_are_per_kind_and_start_at_one::<S>,
+        no_operation_gives_up_an_owned_id::<S>,
+    ];
+    assert!(
+        !cases.is_empty(),
+        "the all-roles suite has no cases, so it would pass over nothing"
+    );
     for case in cases {
         let (s, _guard) = make();
         case(&s);
@@ -95,9 +119,9 @@ fn list_transitions_returns_every_transition_of_one_project_and_no_others<S: Cat
     let p2 = s.add_project("/p2").unwrap();
     let p3 = s.add_project("/p3").unwrap();
 
-    for (project, name) in [(p1, "launch"), (p1, "ship"), (p2, "launch")] {
+    for (project, name) in [(&p1, "launch"), (&p1, "ship"), (&p2, "launch")] {
         s.add_transition(Transition {
-            project,
+            project: project.clone(),
             name: name.into(),
             from: State::Review,
             to: State::Done,
@@ -151,7 +175,11 @@ fn a_finding_round_trips_and_gets_a_real_id<S: Catalog + Tracker>(s: &S) {
     let id = s
         .add_finding(Finding::raise(p, r, "reviewer", "wrong on empty"))
         .unwrap();
-    assert_ne!(id.get(), 0, "the store must replace the placeholder id");
+    assert_ne!(
+        id,
+        FindingId(seq_iri(0)),
+        "the store must replace the placeholder id"
+    );
     let back = s.get_finding(&id).unwrap().unwrap();
     assert_eq!(back.id, id);
     assert_eq!(back.state, FindingState::Raised);
@@ -162,12 +190,16 @@ fn withdrawals_are_counted_against_whoever_raised_the_finding<S: Catalog + Track
     let r = s.add_record(&p, "t").unwrap();
 
     for claim in ["a", "b"] {
-        let id = s.add_finding(Finding::raise(p, r, "hasty", claim)).unwrap();
+        let id = s
+            .add_finding(Finding::raise(p.clone(), r.clone(), "hasty", claim))
+            .unwrap();
         let mut f = s.get_finding(&id).unwrap().unwrap();
         f.withdraw("not concrete").unwrap();
         s.update_finding(&f).unwrap();
     }
-    let id = s.add_finding(Finding::raise(p, r, "careful", "c")).unwrap();
+    let id = s
+        .add_finding(Finding::raise(p.clone(), r.clone(), "careful", "c"))
+        .unwrap();
     let mut f = s.get_finding(&id).unwrap().unwrap();
     let gate = s
         .add_gate(&p, "g", sample_kind(), sample_selector(), 1, "abc", "owner")
@@ -185,7 +217,8 @@ fn findings_are_listed_per_project<S: Catalog + Tracker>(s: &S) {
     let b = s.add_project("/b").unwrap();
     let ra = s.add_record(&a, "t").unwrap();
     let rb = s.add_record(&b, "t").unwrap();
-    s.add_finding(Finding::raise(a, ra, "r", "one")).unwrap();
+    s.add_finding(Finding::raise(a.clone(), ra, "r", "one"))
+        .unwrap();
     s.add_finding(Finding::raise(b, rb, "r", "two")).unwrap();
     assert_eq!(s.list_findings(&a).unwrap().len(), 1);
 }
@@ -203,12 +236,97 @@ fn the_logs_are_append_only_and_read_back_in_order<S: Catalog + Ledger>(s: &S) {
             "owner",
         )
         .unwrap();
-    s.append_gate_run(sample_run(g, "abc", 3)).unwrap();
-    s.append_gate_run(sample_run(g, "def", 5)).unwrap();
+    s.append_gate_run(sample_run(g.clone(), "abc", 3)).unwrap();
+    s.append_gate_run(sample_run(g.clone(), "def", 5)).unwrap();
     let runs = s.gate_runs(&g).unwrap();
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].commit, "abc");
     assert_eq!(runs[1].population, 5);
+}
+
+fn an_id_this_store_never_held_is_not_owned_rather_than_absent<S: Catalog + Tracker + Ledger>(
+    s: &S,
+) {
+    let stranger = GateId(stranger());
+    let err = s
+        .get_gate(&stranger)
+        .expect_err("an unheld id must not read as `None`");
+    assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+    assert!(err.to_string().contains(stranger.iri().as_str()), "{err}");
+}
+
+fn a_list_over_a_project_this_store_never_held_is_refused_not_empty<
+    S: Catalog + Tracker + Ledger,
+>(
+    s: &S,
+) {
+    let stranger = ProjectId(stranger());
+    for result in [
+        s.list_gates(&stranger).map(|v| v.len()),
+        s.list_transitions(&stranger).map(|v| v.len()),
+        s.list_records(&stranger).map(|v| v.len()),
+        s.list_findings(&stranger).map(|v| v.len()),
+        s.attempts(&stranger).map(|v| v.len()),
+    ] {
+        assert!(
+            matches!(result, Err(StoreError::NotOwned { .. })),
+            "{result:?}"
+        );
+    }
+}
+
+fn an_id_of_another_kind_is_owned_but_not_found<S: Catalog + Tracker + Ledger>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let as_gate = GateId(p.0.clone());
+    assert_eq!(s.get_gate(&as_gate).unwrap(), None);
+}
+
+fn handles_are_per_kind_and_start_at_one<S: Catalog + Tracker + Ledger + Handles>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let g = s
+        .add_gate(&p, "g", sample_kind(), sample_selector(), 1, "abc", "o")
+        .unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    assert_eq!(s.handle_of(Kind::Project, p.iri()).unwrap(), Some(1));
+    assert_eq!(s.handle_of(Kind::Gate, g.iri()).unwrap(), Some(1));
+    assert_eq!(s.handle_of(Kind::Record, r.iri()).unwrap(), Some(1));
+    assert_eq!(
+        s.resolve_handle(Kind::Gate, 1).unwrap().as_ref(),
+        Some(g.iri())
+    );
+    assert_eq!(s.resolve_handle(Kind::Gate, 2).unwrap(), None);
+    assert_eq!(s.resolve_handle(Kind::Finding, 0).unwrap(), None);
+}
+
+/// Spec §2.6 / the deletion ruling: ownership is membership, and nothing
+/// removes an entry. Every id minted along the way must still be owned at
+/// the end.
+fn no_operation_gives_up_an_owned_id<S: Catalog + Tracker + Ledger>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let g = s
+        .add_gate(&p, "g", sample_kind(), sample_selector(), 1, "abc", "o")
+        .unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    let f = s
+        .add_finding(Finding::raise(p.clone(), r.clone(), "a", "c"))
+        .unwrap();
+    let mut def = s.get_gate(&g).unwrap().unwrap();
+    def.authored_at_commit = "def".into();
+    s.update_gate(&def).unwrap();
+    s.set_record_state(&r, State::Doing).unwrap();
+    let mut fin = s.get_finding(&f).unwrap().unwrap();
+    fin.withdraw("x").unwrap();
+    s.update_finding(&fin).unwrap();
+    s.append_gate_run(sample_run(g.clone(), "abc", 1)).unwrap();
+    assert!(s.get_project(&p).unwrap().is_some());
+    assert!(s.get_gate(&g).unwrap().is_some());
+    assert!(s.get_record(&r).unwrap().is_some());
+    assert!(s.get_finding(&f).unwrap().is_some());
+}
+
+/// A well-formed id that no store in these tests ever mints.
+fn stranger() -> Iri {
+    Iri::parse("urn:uuid:0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b").unwrap()
 }
 
 fn sample_kind() -> GateKind {
@@ -227,7 +345,7 @@ fn sample_selector() -> Selector {
     }
 }
 
-fn sample_run(gate: crate::ids::GateId, commit: &str, population: u64) -> GateRun {
+fn sample_run(gate: GateId, commit: &str, population: u64) -> GateRun {
     GateRun {
         gate,
         record: None,

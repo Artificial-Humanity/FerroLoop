@@ -92,7 +92,10 @@ $ fl --db /tmp/gs-demo/store.redb project add /tmp/gs-demo/project
 1	/tmp/gs-demo/project
 ```
 
-The `1` is the project's id. Everything below uses `--project 1`.
+The `1` is the project's **handle**: a short name for it, local to this store. Everything
+below uses `--project 1`. Every item also has a full id, an IRI such as
+`urn:uuid:0199…`, which is what the store keeps and what every reference between items
+holds. A command accepts either; the handle is only there to be typed and read.
 
 ## 3. Write a gate
 
@@ -107,11 +110,13 @@ $ fl --db /tmp/gs-demo/store.redb gate add \
     --program python3 --arg=-c \
     --arg="import json,sys;[json.load(open(p)) for p in sys.argv[1:]]" \
     --authored-by "you"
-2	config-parses	324e0d5c85dbc9b6a914aa4d49e57f87b597414b
+1	config-parses	324e0d5c85dbc9b6a914aa4d49e57f87b597414b
 ```
 
-The `2` is the gate's id, and the hash after it is the commit the gate is stamped against
-— the commit that was HEAD when you authored it.
+The `1` is the gate's handle, and the hash after it is the commit the gate is stamped
+against — the commit that was HEAD when you authored it. Handles are counted per kind of
+item, so this is gate `1` although project `1` already exists. The gate's full id, the
+IRI, is the `id` field that `gate show 1` prints.
 
 ⚠ **A trap worth knowing before you hit it.** `--arg` takes any number of values, so
 `--arg -c` (two separate words) makes clap read `-c` as a new flag, not as `--arg`'s value,
@@ -127,7 +132,7 @@ anything the gate actually covers, that counts as a failure, not just a warning.
 
 ```
 $ fl --db /tmp/gs-demo/store.redb transition add \
-    --project 1 --name launch --from review --to done --regret high --gate 2
+    --project 1 --name launch --from review --to done --regret high --gate 1
 launch
 ```
 
@@ -198,7 +203,7 @@ An exit-`2` example — asking for a transition that was never declared:
 
 ```
 $ fl --db /tmp/gs-demo/store.redb check no-such-transition --project 1
-error: selector is not valid: project 1 declares no transition named `no-such-transition`. Add it with `fl transition add`, or name one of the existing ones.
+error: selector is not valid: the project at /tmp/gs-demo/project declares no transition named `no-such-transition`. Add it with `fl transition add`, or name one of the existing ones.
 $ echo "exit: $?"
 exit: 2
 ```
@@ -234,8 +239,8 @@ re-run anything and does not inspect the diff for you — it only re-stamps the 
 provenance. Run it after you've actually looked, not as a way to silence the warning.
 
 ```
-$ fl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
-2	18da2e3ac0ac4353119805fba23f143ee5215e88
+$ fl --db /tmp/gs-demo/store.redb gate affirm 1 --by you
+1	18da2e3ac0ac4353119805fba23f143ee5215e88
 
 $ fl --db /tmp/gs-demo/store.redb check launch --project 1
 PASS	config-parses	1 examined	25ms
@@ -281,7 +286,7 @@ Findings attach to a **record** — a unit of work, the thing a finding is about
 
 ```
 $ fl --db /tmp/gs-demo/store.redb record add --project 1 --title "tune the learning rate"
-3	tune the learning rate
+1	tune the learning rate
 ```
 
 Section 9 deleted the config, so put it back — this time with a learning rate that is
@@ -296,22 +301,22 @@ $ cat > config/settings.json <<'EOF'
 EOF
 $ git add -A && git commit -qm "restored the config"
 
-$ fl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
-2	16bc83526da0269acbd3a135ab6317d98d7d670a
+$ fl --db /tmp/gs-demo/store.redb gate affirm 1 --by you
+1	16bc83526da0269acbd3a135ab6317d98d7d670a
 ```
 
 Now have a reviewer raise a claim about it:
 
 ```
-$ fl --db /tmp/gs-demo/store.redb finding raise --record 3 \
+$ fl --db /tmp/gs-demo/store.redb finding raise --record 1 \
     --claim "the validator accepts a negative learning_rate" --by reviewer
-4	raised	the validator accepts a negative learning_rate
+1	raised	the validator accepts a negative learning_rate
 ```
 
 `raised` is as far as that gets on its own. Try to hand it to somebody to fix:
 
 ```
-$ fl --db /tmp/gs-demo/store.redb finding assign 4 --to fixer
+$ fl --db /tmp/gs-demo/store.redb finding assign 1 --to fixer
 error: this finding has no reproduction, so it cannot be assigned. Attach a check that fails because of the defect, or withdraw the finding.
 $ echo "exit: $?"
 exit: 2
@@ -324,7 +329,7 @@ Two ways forward, and the refusal names both. Attach a reproduction, or withdraw
 The obvious move is to point at a check you already have:
 
 ```
-$ fl --db /tmp/gs-demo/store.redb finding reproduce 4 --gate 2
+$ fl --db /tmp/gs-demo/store.redb finding reproduce 1 --gate 1
 error: gate `config-parses` currently PASSES over 1 items, so it is not a reproduction. A check that already passes cannot tell you whether the defect is absent or whether the check simply does not exercise it. Write one that fails because of the defect.
 $ echo "exit: $?"
 exit: 2
@@ -341,9 +346,9 @@ $ fl --db /tmp/gs-demo/store.redb gate add \
     --program python3 --arg=-c \
     --arg="import json,sys;[sys.exit('learning_rate must be > 0') for p in sys.argv[1:] if json.load(open(p))['learning_rate'] <= 0]" \
     --authored-by reviewer
-5	rate-positive	16bc83526da0269acbd3a135ab6317d98d7d670a
+2	rate-positive	16bc83526da0269acbd3a135ab6317d98d7d670a
 
-$ fl --db /tmp/gs-demo/store.redb gate run 5
+$ fl --db /tmp/gs-demo/store.redb gate run 2
 FAIL	rate-positive	predicate, 1 examined
 $ echo "exit: $?"
 exit: 1
@@ -352,11 +357,11 @@ exit: 1
 It fails, so it is admissible:
 
 ```
-$ fl --db /tmp/gs-demo/store.redb finding reproduce 4 --gate 5
-4	reproduced	gate 5 failed over 1 items
+$ fl --db /tmp/gs-demo/store.redb finding reproduce 1 --gate 2
+1	reproduced	gate 2 failed over 1 items
 
-$ fl --db /tmp/gs-demo/store.redb finding assign 4 --to fixer
-4	assigned	fixer
+$ fl --db /tmp/gs-demo/store.redb finding assign 1 --to fixer
+1	assigned	fixer
 ```
 
 A reproduction and a gate are the same object. The check written to prove a defect exists
@@ -374,9 +379,9 @@ $ fl --db /tmp/gs-demo/store.redb gate add \
     --program python3 --arg=-c \
     --arg="import json,sys;[sys.exit('epochs is missing') for p in sys.argv[1:] if 'epochs' not in json.load(open(p))]" \
     --authored-by you
-6	epochs-present	16bc83526da0269acbd3a135ab6317d98d7d670a
+3	epochs-present	16bc83526da0269acbd3a135ab6317d98d7d670a
 
-$ fl --db /tmp/gs-demo/store.redb gate run 6
+$ fl --db /tmp/gs-demo/store.redb gate run 3
 PASS	epochs-present	1 examined
 ```
 
@@ -391,12 +396,12 @@ $ cat > config/settings.json <<'EOF'
 EOF
 $ git add -A && git commit -qm "fix: make the learning rate positive"
 
-$ fl --db /tmp/gs-demo/store.redb finding verify 4
+$ fl --db /tmp/gs-demo/store.redb finding verify 1
 REPRODUCTION	passes over 1 items  (stale: the gate's population moved since it was stamped)
 NEIGHBOURS	2 checked, 1 regressed
 REGRESSION	epochs-present	FAIL	predicate, 1 examined  (stale: the gate's population moved since it was stamped)
 NEIGHBOUR	config-parses	passes  (stale: the gate's population moved since it was stamped)
-OPEN	4	the repair is not done
+OPEN	1	the repair is not done
 $ echo "exit: $?"
 exit: 1
 ```
@@ -422,12 +427,12 @@ $ cat > config/settings.json <<'EOF'
 EOF
 $ git add -A && git commit -qm "fix: make the learning rate positive, keep epochs"
 
-$ fl --db /tmp/gs-demo/store.redb finding verify 4
+$ fl --db /tmp/gs-demo/store.redb finding verify 1
 REPRODUCTION	passes over 1 items  (stale: the gate's population moved since it was stamped)
 NEIGHBOURS	2 checked, 0 regressed
 NEIGHBOUR	config-parses	passes  (stale: the gate's population moved since it was stamped)
 NEIGHBOUR	epochs-present	passes  (stale: the gate's population moved since it was stamped)
-CLOSED	4
+CLOSED	1
 $ echo "exit: $?"
 exit: 0
 ```
@@ -440,21 +445,21 @@ The other exit exists because a review that cannot kill its own findings just ac
 them. Some claims are taste, and taste has no failing check:
 
 ```
-$ fl --db /tmp/gs-demo/store.redb finding raise --record 3 \
+$ fl --db /tmp/gs-demo/store.redb finding raise --record 1 \
     --claim "the config layout feels wrong" --by reviewer
-7	raised	the config layout feels wrong
+2	raised	the config layout feels wrong
 
-$ fl --db /tmp/gs-demo/store.redb finding withdraw 7 \
+$ fl --db /tmp/gs-demo/store.redb finding withdraw 2 \
     --reason "no reproduction is possible: this is taste, not a defect"
-7	withdrawn	no reproduction is possible: this is taste, not a defect
+2	withdrawn	no reproduction is possible: this is taste, not a defect
 ```
 
 Withdrawal is not free. It is counted, and it is counted against whoever raised the claim:
 
 ```
 $ fl --db /tmp/gs-demo/store.redb finding list --project 1
-4	fixed	reviewer	the validator accepts a negative learning_rate
-7	withdrawn	reviewer	the config layout feels wrong
+1	fixed	reviewer	the validator accepts a negative learning_rate
+2	withdrawn	reviewer	the config layout feels wrong
 reviewer	withdrawn: 1
 ```
 
@@ -502,9 +507,9 @@ $ fl --db /tmp/gs-demo/store.redb gate add \
     --program python3 --arg=-c \
     --arg="import json,sys;[json.load(open(p)) for p in sys.argv[1:] if p.endswith('.json')]" \
     --authored-by you
-8	touched-recently	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
+4	touched-recently	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
 
-$ fl --db /tmp/gs-demo/store.redb gate run 8
+$ fl --db /tmp/gs-demo/store.redb gate run 4
 PASS	touched-recently	1 examined
 ```
 
@@ -530,9 +535,9 @@ $ fl --db /tmp/gs-demo/store.redb gate add \
     --program python3 --arg=-c \
     --arg="import json,sys;[json.load(open(p)) for p in sys.argv[1:]]" \
     --authored-by you
-9	listed-configs	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
+5	listed-configs	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
 
-$ fl --db /tmp/gs-demo/store.redb gate run 9
+$ fl --db /tmp/gs-demo/store.redb gate run 5
 PASS	listed-configs	1 examined
 ```
 
@@ -556,9 +561,9 @@ $ chmod +x broken-list.sh
 $ fl --db /tmp/gs-demo/store.redb gate add \
     --project 1 --name broken-lister --kind command \
     --population-from /tmp/gs-demo/project/broken-list.sh --program true --authored-by you
-10	broken-lister	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
+6	broken-lister	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
 
-$ fl --db /tmp/gs-demo/store.redb gate run 10
+$ fl --db /tmp/gs-demo/store.redb gate run 6
 ERROR	broken-lister	population command `/tmp/gs-demo/project/broken-list.sh` exited 128, so the population is unknown, not empty: fatal: not a git repository
 $ echo "exit: $?"
 exit: 2
@@ -579,7 +584,7 @@ A record starts in `todo`:
 
 ```
 $ fl --db /tmp/gs-demo/store.redb record list --project 1
-3	todo	tune the learning rate
+1	todo	tune the learning rate
 ```
 
 Only `review → done` is declared here, as the transition `launch` from
@@ -588,8 +593,8 @@ move has nothing to bypass and proceeds — and says which it was, because "allo
 checked" must not read the same:
 
 ```
-$ fl --db /tmp/gs-demo/store.redb record move 3 --to review
-3	review	ungated: project 1 declares no transition from `todo` to `review`
+$ fl --db /tmp/gs-demo/store.redb record move 1 --to review
+1	review	ungated: project 1 declares no transition from `todo` to `review`
 $ echo "exit: $?"
 exit: 0
 ```
@@ -597,9 +602,9 @@ exit: 0
 `review → done` is a different matter. `launch` covers it, so `launch` runs:
 
 ```
-$ fl --db /tmp/gs-demo/store.redb record move 3 --to done
+$ fl --db /tmp/gs-demo/store.redb record move 1 --to done
 FAIL	launch	config-parses	stale, 1 examined	25ms  (stale)
-REFUSED	3	stays `review`
+REFUSED	1	stays `review`
 $ echo "exit: $?"
 exit: 1
 ```
@@ -610,18 +615,18 @@ that `check` would have given, and the record has not moved:
 
 ```
 $ fl --db /tmp/gs-demo/store.redb record list --project 1
-3	review	tune the learning rate
+1	review	tune the learning rate
 ```
 
 Look at the gate, affirm it, and the same move goes through:
 
 ```
-$ fl --db /tmp/gs-demo/store.redb gate affirm 2 --by you
-2	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
+$ fl --db /tmp/gs-demo/store.redb gate affirm 1 --by you
+1	f8044e6e44d6af8fedb5805527d4fcf65e9ea6f8
 
-$ fl --db /tmp/gs-demo/store.redb record move 3 --to done
+$ fl --db /tmp/gs-demo/store.redb record move 1 --to done
 PASS	launch	config-parses	1 examined	25ms
-3	done
+1	done
 $ echo "exit: $?"
 exit: 0
 ```

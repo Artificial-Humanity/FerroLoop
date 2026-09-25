@@ -1,5 +1,6 @@
 use crate::finding::Finding;
-use crate::ids::{FindingId, GateId, ProjectId, RecordId};
+use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
+use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
 
@@ -11,6 +12,12 @@ pub enum StoreError {
     NoSuchRecord(RecordId),
     #[error("no such finding: {0}")]
     NoSuchFinding(FindingId),
+    /// ⚠ This store never held the id. It did not look anywhere else, so this
+    /// is never "not found" — `searched` says exactly where it looked.
+    #[error("no store holds {id} (searched: {})", searched.join(", "))]
+    NotOwned { id: Iri, searched: Vec<String> },
+    #[error("{0} already exists; an insert never overwrites")]
+    AlreadyExists(Iri),
     #[error("backend failure: {0}")]
     Backend(String),
     /// ⚠ The store could not be reached at all. This is "didn't look", and it
@@ -106,6 +113,13 @@ pub trait Ledger {
     fn append_attempt(&self, attempt: Attempt) -> Result<(), StoreError>;
     fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError>;
     fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError>;
+}
+
+/// Short names a person types and reads (spec §4). Display only: a handle
+/// never enters a stored item or the wire. Per store and per kind.
+pub trait Handles {
+    fn handle_of(&self, kind: Kind, id: &Iri) -> Result<Option<u64>, StoreError>;
+    fn resolve_handle(&self, kind: Kind, handle: u64) -> Result<Option<Iri>, StoreError>;
 }
 
 /// Binds each role to the store that backs it (spec §3.3). A store is the

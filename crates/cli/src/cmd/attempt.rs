@@ -1,5 +1,7 @@
+use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Args;
+use fl_core::Kind;
 use fl_core::ids::RecordId;
 use fl_core::log::{Attempt, AttemptStatus};
 use fl_core::store::{Catalog, Ledger, Tracker};
@@ -11,7 +13,7 @@ const KNOWN_ADAPTERS: &str = "claude";
 
 #[derive(Args)]
 pub struct Cmd {
-    pub record: u64,
+    pub record: Ref,
     #[arg(long, default_value = "claude")]
     pub adapter: String,
     #[arg(long)]
@@ -32,25 +34,32 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             cmd.adapter
         );
     }
-    let id = RecordId(cmd.record);
+    let id = RecordId(refs::resolve(
+        store,
+        store.label(),
+        Kind::Record,
+        &cmd.record,
+    )?);
     let Some(record) = store.get_record(&id)? else {
         bail!(
-            "no record with id {}. Run `fl record list` to see the ids that exist.",
-            cmd.record
+            "`{}` is not a record in the store at {}. Run `fl record list --project <project>` \
+             to see the ones that exist.",
+            cmd.record,
+            store.label()
         );
     };
     let Some(project) = store.get_project(&record.project)? else {
         bail!(
             "record {} belongs to project {}, which no longer exists.",
             cmd.record,
-            record.project
+            refs::show(store, Kind::Project, record.project.iri())?
         );
     };
 
     let adapter = ClaudeAdapter::new(cmd.binary);
     let spec = AttemptSpec {
         project_root: std::path::PathBuf::from(&project.root),
-        record: id,
+        record: id.clone(),
         instruction: cmd.instruction.unwrap_or_else(|| record.title.clone()),
         timeout_secs: cmd.timeout_secs,
         budget_usd_micros: cmd.budget_usd_micros,

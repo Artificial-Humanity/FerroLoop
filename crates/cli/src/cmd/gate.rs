@@ -1,7 +1,9 @@
+use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
+use fl_core::Kind;
 use fl_core::ids::{GateId, ProjectId};
-use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
+use fl_core::model::{CommandSpec, GateDef, GateKind, PopulationDelivery, Selector};
 use fl_core::store::Catalog;
 use fl_exec::evaluate::run_single_gate;
 use fl_store::RedbStore;
@@ -19,7 +21,7 @@ use fl_store::RedbStore;
 ))]
 pub struct AddArgs {
     #[arg(long)]
-    project: u64,
+    project: Ref,
     #[arg(long)]
     name: String,
     /// `command` or `agent`.
@@ -58,20 +60,20 @@ pub enum Cmd {
     Add(Box<AddArgs>),
     List {
         #[arg(long)]
-        project: u64,
+        project: Ref,
     },
     Show {
-        id: u64,
+        id: Ref,
     },
     /// Re-stamp a gate against HEAD: "I looked, and it still holds."
     Affirm {
-        id: u64,
+        id: Ref,
         #[arg(long, default_value = "unknown")]
         by: String,
     },
     /// Run one gate against the live working tree and print its verdict.
     Run {
-        id: u64,
+        id: Ref,
     },
     /// TESTING AFFORDANCE: rewrite a command gate's program in place, with no
     /// re-authoring and no new commit stamp. This is how a test simulates a
@@ -80,10 +82,23 @@ pub enum Cmd {
     /// legitimate fix. Refused outside this repo's own test harness: there
     /// is no production route to this command.
     SetProgram {
-        id: u64,
+        id: Ref,
         #[arg(long)]
         program: String,
     },
+}
+
+/// The gate `id` names, or a refusal that echoes what was typed.
+fn gate(store: &RedbStore, id: &Ref) -> Result<GateDef> {
+    let gid = GateId(refs::resolve(store, store.label(), Kind::Gate, id)?);
+    let Some(g) = store.get_gate(&gid)? else {
+        bail!(
+            "`{id}` is not a gate in the store at {}. Use `fl gate list --project <project>` \
+             to see gates that exist.",
+            store.label()
+        );
+    };
+    Ok(g)
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
@@ -109,10 +124,17 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                      `agent` is defined but not yet built."
                 );
             }
-            let p = ProjectId(project);
+            let p = ProjectId(refs::resolve(
+                store,
+                store.label(),
+                Kind::Project,
+                &project,
+            )?);
             let Some(proj) = store.get_project(&p)? else {
                 bail!(
-                    "no project with id {project}. Run `fl project list` to see the ids that exist."
+                    "`{project}` is not a project in the store at {}. Run `fl project list` to \
+                     see the ones that exist.",
+                    store.label()
                 );
             };
             let head = fl_exec::git::Git::head(std::path::Path::new(&proj.root)).map_err(|e| {
@@ -156,31 +178,37 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 &head,
                 &authored_by,
             )?;
-            println!("{id}\t{name}\t{head}");
+            println!(
+                "{}\t{name}\t{head}",
+                refs::show(store, Kind::Gate, id.iri())?
+            );
         }
         Cmd::List { project } => {
-            for g in store.list_gates(&ProjectId(project))? {
-                println!("{}\t{}\t{}", g.id, g.name, g.authored_at_commit);
+            let p = ProjectId(refs::resolve(
+                store,
+                store.label(),
+                Kind::Project,
+                &project,
+            )?);
+            for g in store.list_gates(&p)? {
+                println!(
+                    "{}\t{}\t{}",
+                    refs::show(store, Kind::Gate, g.id.iri())?,
+                    g.name,
+                    g.authored_at_commit
+                );
             }
         }
         Cmd::Show { id } => {
-            let Some(g) = store.get_gate(&GateId(id))? else {
-                bail!(
-                    "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
-                );
-            };
+            let g = gate(store, &id)?;
             println!("{}", serde_json::to_string_pretty(&g)?);
         }
         Cmd::Affirm { id, by } => {
-            let Some(mut g) = store.get_gate(&GateId(id))? else {
-                bail!(
-                    "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
-                );
-            };
+            let mut g = gate(store, &id)?;
             let Some(proj) = store.get_project(&g.project)? else {
                 bail!(
                     "gate {id} belongs to project {}, which no longer exists.",
-                    g.project
+                    refs::show(store, Kind::Project, g.project.iri())?
                 );
             };
             let head = fl_exec::git::Git::head(std::path::Path::new(&proj.root))
@@ -191,12 +219,8 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             println!("{id}\t{head}");
         }
         Cmd::Run { id } => {
-            let Some(g) = store.get_gate(&GateId(id))? else {
-                bail!(
-                    "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
-                );
-            };
-            let report = run_single_gate(store, store, &g.project, &GateId(id))
+            let g = gate(store, &id)?;
+            let report = run_single_gate(store, store, &g.project, &g.id)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (label, detail) = report.verdict.describe();
             println!("{label}\t{}\t{detail}", g.name);
@@ -226,11 +250,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                      provenanced like any other."
                 );
             }
-            let Some(mut g) = store.get_gate(&GateId(id))? else {
-                bail!(
-                    "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
-                );
-            };
+            let mut g = gate(store, &id)?;
             let GateKind::Command(spec) = &mut g.kind else {
                 bail!("gate {id} is not a command gate, so it has no `program` field to rewrite.");
             };

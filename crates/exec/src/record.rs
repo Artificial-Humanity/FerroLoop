@@ -169,7 +169,7 @@ mod tests {
             .unwrap();
         store
             .add_transition(Transition {
-                project: p,
+                project: p.clone(),
                 name: "launch".into(),
                 from: State::Todo,
                 to: State::Done,

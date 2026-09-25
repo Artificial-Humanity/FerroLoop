@@ -16,7 +16,7 @@ pub mod store;
 pub mod verdict;
 
 pub use finding::{Finding, FindingError, FindingState};
-pub use ids::{FindingId, GateId, ProjectId, RecordId};
+pub use ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 pub use iri::{Iri, IriError};
 pub use log::{Attempt, AttemptStatus, GateRun};
 pub use mem::MemStore;
@@ -25,5 +25,5 @@ pub use model::{
     Selector, State, Transition,
 };
 pub use stale::{Staleness, apply_staleness, is_stale};
-pub use store::{Catalog, Ledger, Roles, StoreError, Tracker};
+pub use store::{Catalog, Handles, Ledger, Roles, StoreError, Tracker};
 pub use verdict::{FailReason, Population, Verdict};

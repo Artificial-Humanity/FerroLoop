@@ -3,7 +3,7 @@ use crate::git::Git;
 use crate::population::{ExecError, resolve};
 use fl_core::ids::{GateId, ProjectId, RecordId};
 use fl_core::log::GateRun;
-use fl_core::model::{GateDef, GateKind, Regret, Selector, Transition};
+use fl_core::model::{GateDef, GateKind, Project, Regret, Selector, Transition};
 use fl_core::stale::{Staleness, apply_staleness, is_stale};
 use fl_core::store::{Catalog, Ledger};
 use fl_core::verdict::Verdict;
@@ -182,8 +182,8 @@ fn run_gate(
 
     ledger
         .append_gate_run(GateRun {
-            gate: def.id,
-            record: record.copied(),
+            gate: def.id.clone(),
+            record: record.cloned(),
             commit: head.to_string(),
             verdict: verdict.clone(),
             population: verdict.population().unwrap_or(0),
@@ -200,13 +200,27 @@ fn run_gate(
     }
 
     Ok(GateReport {
-        gate: def.id,
+        gate: def.id.clone(),
         name: def.name.clone(),
         verdict,
         staleness,
         output_excerpt: excerpt,
         duration_ms,
     })
+}
+
+/// The project `project` names. An id the store never held is the store's
+/// own `NotOwned`, propagated as it is: that refusal names where it looked,
+/// and "no project" would claim a search that never happened.
+fn project_of(catalog: &dyn Catalog, project: &ProjectId) -> Result<Project, ExecError> {
+    catalog
+        .get_project(project)
+        .map_err(|e| ExecError::Store(e.to_string()))?
+        .ok_or_else(|| {
+            ExecError::BadSelector(format!(
+                "{project} is held by this store, but it is not a project"
+            ))
+        })
 }
 
 /// Run one gate against the live working tree, exactly once, and record the
@@ -222,10 +236,7 @@ pub fn run_single_gate(
     project: &ProjectId,
     gate: &GateId,
 ) -> Result<GateReport, ExecError> {
-    let proj = catalog
-        .get_project(project)
-        .map_err(|e| ExecError::Store(e.to_string()))?
-        .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
+    let proj = project_of(catalog, project)?;
     let root = Path::new(&proj.root);
 
     let Some(def) = catalog
@@ -246,10 +257,7 @@ pub fn evaluate_transition(
     transition_name: &str,
     record: Option<&RecordId>,
 ) -> Result<TransitionReport, ExecError> {
-    let proj = catalog
-        .get_project(project)
-        .map_err(|e| ExecError::Store(e.to_string()))?
-        .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
+    let proj = project_of(catalog, project)?;
     let root = Path::new(&proj.root);
 
     let transition: Transition = catalog
@@ -257,8 +265,9 @@ pub fn evaluate_transition(
         .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| {
             ExecError::BadSelector(format!(
-                "project {project} declares no transition named `{transition_name}`. \
-                 Add it with `fl transition add`, or name one of the existing ones."
+                "the project at {} declares no transition named `{transition_name}`. \
+                 Add it with `fl transition add`, or name one of the existing ones.",
+                proj.root
             ))
         })?;
 
@@ -299,7 +308,7 @@ mod tests {
     use super::*;
     use fl_core::MemStore;
     use fl_core::finding::Finding;
-    use fl_core::ids::{FindingId, ProjectId, RecordId};
+    use fl_core::ids::{FindingId, ProjectId, RecordId, seq_iri};
     use fl_core::log::{Attempt, GateRun};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Regret, Selector, State};
     use fl_core::model::{GateDef, Project, Record, Transition};
@@ -364,7 +373,7 @@ mod tests {
             .unwrap();
         store
             .add_transition(Transition {
-                project: p,
+                project: p.clone(),
                 name: "launch".into(),
                 from: State::Review,
                 to: State::Done,
@@ -406,7 +415,7 @@ mod tests {
         let s = MemStore::default();
         let p = setup(&s, d.path(), "false", "src/**/*.rs", Regret::Low);
         let _ = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
-        let gate = s.list_gates(&p).unwrap()[0].id;
+        let gate = s.list_gates(&p).unwrap()[0].id.clone();
         let runs = s.gate_runs(&gate).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].population, 1);
@@ -503,14 +512,14 @@ mod tests {
         let d = repo_with(&[("src/a.rs", "x")]);
         let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
-        let dangling = GateId(9999);
+        let dangling = GateId(seq_iri(9999));
         s.add_transition(Transition {
-            project: p,
+            project: p.clone(),
             name: "launch".into(),
             from: State::Review,
             to: State::Done,
             regret: Regret::Low,
-            gates: vec![dangling],
+            gates: vec![dangling.clone()],
         })
         .unwrap();
 
@@ -621,7 +630,7 @@ mod tests {
     #[test]
     fn a_store_failure_is_reported_as_a_store_failure_and_never_as_git() {
         let store = BrokenStore;
-        let err = run_single_gate(&store, &store, &ProjectId(1), &GateId(1))
+        let err = run_single_gate(&store, &store, &ProjectId(seq_iri(1)), &GateId(seq_iri(1)))
             .expect_err("a broken store cannot produce a gate report");
         assert!(
             matches!(err, ExecError::Store(_)),
@@ -635,7 +644,7 @@ mod tests {
     #[test]
     fn a_store_failure_during_a_transition_is_also_a_store_failure() {
         let store = BrokenStore;
-        let err = evaluate_transition(&store, &store, &ProjectId(1), "launch", None)
+        let err = evaluate_transition(&store, &store, &ProjectId(seq_iri(1)), "launch", None)
             .expect_err("a broken store cannot produce a transition report");
         assert!(
             matches!(err, ExecError::Store(_)),

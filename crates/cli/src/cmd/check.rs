@@ -1,5 +1,7 @@
+use crate::refs::{self, Ref};
 use anyhow::Result;
 use clap::Args;
+use fl_core::Kind;
 use fl_core::ids::{ProjectId, RecordId};
 use fl_exec::evaluate::evaluate_transition;
 use fl_store::RedbStore;
@@ -9,21 +11,29 @@ pub struct Cmd {
     /// The transition to evaluate.
     pub transition: String,
     #[arg(long)]
-    pub project: u64,
+    pub project: Ref,
     #[arg(long)]
-    pub record: Option<u64>,
+    pub record: Option<Ref>,
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
-    let record = cmd.record.map(RecordId);
-    let report = evaluate_transition(
+    let project = ProjectId(refs::resolve(
         store,
-        store,
-        &ProjectId(cmd.project),
-        &cmd.transition,
-        record.as_ref(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+        store.label(),
+        Kind::Project,
+        &cmd.project,
+    )?);
+    let record = match &cmd.record {
+        Some(r) => Some(RecordId(refs::resolve(
+            store,
+            store.label(),
+            Kind::Record,
+            r,
+        )?)),
+        None => None,
+    };
+    let report = evaluate_transition(store, store, &project, &cmd.transition, record.as_ref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     for g in &report.gates {
         let (label, detail) = g.verdict.describe();

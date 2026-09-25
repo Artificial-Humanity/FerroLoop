@@ -83,15 +83,15 @@ impl F {
 fn a_passing_gate_is_refused_as_a_reproduction() {
     let f = fixture();
     f.setup();
-    f.gate("green", "true"); // id 3
+    f.gate("green", "true"); // gate 1
     f.cli()
         .args([
-            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
         ])
         .assert()
-        .success(); // id 4
+        .success(); // finding 1
     f.cli()
-        .args(["finding", "reproduce", "4", "--gate", "3"])
+        .args(["finding", "reproduce", "1", "--gate", "1"])
         .assert()
         .failure()
         .stderr(contains("PASSES").and(contains("not a reproduction")));
@@ -109,12 +109,12 @@ fn a_raised_finding_cannot_be_assigned() {
     f.setup();
     f.cli()
         .args([
-            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
         ])
         .assert()
-        .success(); // id 3
+        .success(); // finding 1
     f.cli()
-        .args(["finding", "assign", "3", "--to", "fixer"])
+        .args(["finding", "assign", "1", "--to", "fixer"])
         .assert()
         .failure()
         .stderr(contains("no reproduction").and(contains("withdraw")));
@@ -125,38 +125,38 @@ fn a_raised_finding_cannot_be_assigned() {
 fn a_repair_that_breaks_a_neighbour_does_not_close_the_finding() {
     let f = fixture();
     f.setup();
-    f.gate("neighbour", "true"); // id 3
-    f.gate("repro", "false"); // id 4
+    f.gate("neighbour", "true"); // gate 1
+    f.gate("repro", "false"); // gate 2
     // Give the neighbour a last_pass_commit.
-    f.cli().args(["gate", "run", "3"]).assert().success();
+    f.cli().args(["gate", "run", "1"]).assert().success();
 
     f.cli()
         .args([
-            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
         ])
         .assert()
-        .success(); // id 5
+        .success(); // finding 1
     f.cli()
-        .args(["finding", "reproduce", "5", "--gate", "4"])
+        .args(["finding", "reproduce", "1", "--gate", "2"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "assign", "5", "--to", "fixer"])
+        .args(["finding", "assign", "1", "--to", "fixer"])
         .assert()
         .success();
 
     // The bad repair: the reproduction goes green, the neighbour goes red.
     f.cli()
-        .args(["gate", "set-program", "4", "--program", "true"])
+        .args(["gate", "set-program", "2", "--program", "true"])
         .assert()
         .success();
     f.cli()
-        .args(["gate", "set-program", "3", "--program", "false"])
+        .args(["gate", "set-program", "1", "--program", "false"])
         .assert()
         .success();
 
     f.cli()
-        .args(["finding", "verify", "5"])
+        .args(["finding", "verify", "1"])
         .assert()
         .code(1)
         .stdout(contains("REGRESSION").and(contains("neighbour")));
@@ -166,27 +166,27 @@ fn a_repair_that_breaks_a_neighbour_does_not_close_the_finding() {
 fn a_clean_repair_closes_the_finding() {
     let f = fixture();
     f.setup();
-    f.gate("repro", "false"); // id 3
+    f.gate("repro", "false"); // gate 1
     f.cli()
         .args([
-            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
         ])
         .assert()
-        .success(); // id 4
+        .success(); // finding 1
     f.cli()
-        .args(["finding", "reproduce", "4", "--gate", "3"])
+        .args(["finding", "reproduce", "1", "--gate", "1"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "assign", "4", "--to", "fixer"])
+        .args(["finding", "assign", "1", "--to", "fixer"])
         .assert()
         .success();
     f.cli()
-        .args(["gate", "set-program", "3", "--program", "true"])
+        .args(["gate", "set-program", "1", "--program", "true"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "verify", "4"])
+        .args(["finding", "verify", "1"])
         .assert()
         .success()
         .stdout(contains("CLOSED"));
@@ -205,17 +205,17 @@ fn a_withdrawal_is_counted_against_the_reviewer_and_is_readable() {
     for claim in ["a", "b"] {
         f.cli()
             .args([
-                "finding", "raise", "--record", "2", "--claim", claim, "--by", "hasty",
+                "finding", "raise", "--record", "1", "--claim", claim, "--by", "hasty",
             ])
             .assert()
             .success();
     }
     f.cli()
-        .args(["finding", "withdraw", "3", "--reason", "not concrete"])
+        .args(["finding", "withdraw", "1", "--reason", "not concrete"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "withdraw", "4", "--reason", "not concrete"])
+        .args(["finding", "withdraw", "2", "--reason", "not concrete"])
         .assert()
         .success();
 
@@ -233,27 +233,27 @@ fn a_withdrawal_is_counted_against_the_reviewer_and_is_readable() {
 fn verify_prints_the_reproduction_population_and_a_neighbour_summary_even_at_zero() {
     let f = fixture();
     f.setup();
-    f.gate("repro", "false"); // id 3
+    f.gate("repro", "false"); // gate 1
     f.cli()
         .args([
-            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
         ])
         .assert()
-        .success(); // id 4
+        .success(); // finding 1
     f.cli()
-        .args(["finding", "reproduce", "4", "--gate", "3"])
+        .args(["finding", "reproduce", "1", "--gate", "1"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "assign", "4", "--to", "fixer"])
+        .args(["finding", "assign", "1", "--to", "fixer"])
         .assert()
         .success();
     f.cli()
-        .args(["gate", "set-program", "3", "--program", "true"])
+        .args(["gate", "set-program", "1", "--program", "true"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "verify", "4"])
+        .args(["finding", "verify", "1"])
         .assert()
         .success()
         .stdout(
@@ -268,29 +268,29 @@ fn verify_prints_the_reproduction_population_and_a_neighbour_summary_even_at_zer
 fn verify_counts_a_checked_neighbour_even_when_it_stays_green() {
     let f = fixture();
     f.setup();
-    f.gate("neighbour", "true"); // id 3
-    f.gate("repro", "false"); // id 4
-    f.cli().args(["gate", "run", "3"]).assert().success();
+    f.gate("neighbour", "true"); // gate 1
+    f.gate("repro", "false"); // gate 2
+    f.cli().args(["gate", "run", "1"]).assert().success();
     f.cli()
         .args([
-            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
         ])
         .assert()
-        .success(); // id 5
+        .success(); // finding 1
     f.cli()
-        .args(["finding", "reproduce", "5", "--gate", "4"])
+        .args(["finding", "reproduce", "1", "--gate", "2"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "assign", "5", "--to", "fixer"])
+        .args(["finding", "assign", "1", "--to", "fixer"])
         .assert()
         .success();
     f.cli()
-        .args(["gate", "set-program", "4", "--program", "true"])
+        .args(["gate", "set-program", "2", "--program", "true"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "verify", "5"])
+        .args(["finding", "verify", "1"])
         .assert()
         .success()
         .stdout(contains("NEIGHBOURS\t1 checked, 0 regressed"));
@@ -313,25 +313,25 @@ fn verify_says_error_when_the_instrument_broke_and_fail_when_the_defect_is_real(
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     }
-    f.gate("repro", &script.display().to_string()); // id 3
+    f.gate("repro", &script.display().to_string()); // gate 1
     f.cli()
         .args([
-            "finding", "raise", "--record", "2", "--claim", "c", "--by", "rev",
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
         ])
         .assert()
-        .success(); // id 4
+        .success(); // finding 1
     f.cli()
-        .args(["finding", "reproduce", "4", "--gate", "3"])
+        .args(["finding", "reproduce", "1", "--gate", "1"])
         .assert()
         .success();
     f.cli()
-        .args(["finding", "assign", "4", "--to", "fixer"])
+        .args(["finding", "assign", "1", "--to", "fixer"])
         .assert()
         .success();
 
     // The defect is still there: a real failure, and it says so.
     f.cli()
-        .args(["finding", "verify", "4"])
+        .args(["finding", "verify", "1"])
         .assert()
         .code(1)
         .stdout(contains("REPRODUCTION\tFAIL\tpredicate,").and(contains("examined")));
@@ -339,7 +339,7 @@ fn verify_says_error_when_the_instrument_broke_and_fail_when_the_defect_is_real(
     // Now break the instrument itself. This must NOT read as a failure.
     fs::remove_file(&script).unwrap();
     f.cli()
-        .args(["finding", "verify", "4"])
+        .args(["finding", "verify", "1"])
         .assert()
         .code(2)
         .stdout(contains("REPRODUCTION\tERROR\t").and(contains("could not be run")))

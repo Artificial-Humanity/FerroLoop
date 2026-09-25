@@ -1,5 +1,7 @@
+use crate::refs;
 use anyhow::{Result, bail};
 use clap::Subcommand;
+use fl_core::Kind;
 use fl_core::store::Catalog;
 use fl_store::RedbStore;
 
@@ -39,11 +41,15 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 )
             })?;
             let id = store.add_project(&root)?;
-            println!("{id}\t{root}");
+            println!("{}\t{root}", refs::show(store, Kind::Project, id.iri())?);
         }
         Cmd::List => {
             for p in store.list_projects()? {
-                println!("{}\t{}", p.id, p.root);
+                println!(
+                    "{}\t{}",
+                    refs::show(store, Kind::Project, p.id.iri())?,
+                    p.root
+                );
             }
         }
     }

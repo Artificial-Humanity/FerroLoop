@@ -21,3 +21,4 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process"
 tempfile = "3.27.0"
 assert_cmd = "2.2.2"
 predicates = "3.1.4"
+uuid = { version = "1.26", features = ["v7"] }

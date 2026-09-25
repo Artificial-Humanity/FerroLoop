@@ -96,7 +96,7 @@ fn a_defect_present_before_the_run_stops_the_launch() {
             "--regret",
             "high",
             "--gate",
-            "2",
+            "1",
         ])
         .assert()
         .success();
@@ -191,7 +191,7 @@ fn deleting_the_only_config_does_not_turn_the_gate_green() {
             "--regret",
             "high",
             "--gate",
-            "2",
+            "1",
         ])
         .assert()
         .success();

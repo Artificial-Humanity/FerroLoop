@@ -125,7 +125,7 @@ fn a_record_moves_between_states() {
         .assert()
         .success();
     cli(&d)
-        .args(["record", "move", "2", "--to", "doing"])
+        .args(["record", "move", "1", "--to", "doing"])
         .assert()
         .success();
     cli(&d)
@@ -144,7 +144,7 @@ fn an_unknown_state_name_is_refused_and_lists_the_valid_ones() {
         .assert()
         .success();
     cli(&d)
-        .args(["record", "move", "2", "--to", "sideways"])
+        .args(["record", "move", "1", "--to", "sideways"])
         .assert()
         .failure()
         .stderr(contains("needs_human"));
@@ -287,4 +287,57 @@ fn a_transition_naming_a_nonexistent_gate_is_refused_and_names_the_id() {
         .assert()
         .failure()
         .stderr(contains("42"));
+}
+
+#[test]
+fn an_iri_typed_in_uppercase_names_the_same_item() {
+    let d = tempfile::tempdir().unwrap();
+    let _repo = project(&d);
+    cli(&d)
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    // `gate show 1` prints the gate's JSON, whose `id` is the full IRI.
+    let shown = cli(&d).args(["gate", "show", "1"]).output().unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let id = json["id"].as_str().unwrap().to_string();
+    cli(&d)
+        .args(["gate", "show", &id.to_uppercase()])
+        .assert()
+        .success();
+}
+
+#[test]
+fn handle_input_at_the_edges_is_refused_by_name() {
+    let d = tempfile::tempdir().unwrap();
+    let _repo = project(&d);
+    for bad in ["0", "7", "99999999999999999999", "3abc"] {
+        cli(&d)
+            .args(["gate", "show", bad])
+            .assert()
+            .code(2)
+            .stderr(contains(bad));
+    }
+}
+
+#[test]
+fn a_list_over_a_project_that_does_not_exist_is_refused_not_empty() {
+    let d = tempfile::tempdir().unwrap();
+    let _repo = project(&d);
+    cli(&d)
+        .args(["record", "list", "--project", "9"])
+        .assert()
+        .code(2)
+        .stderr(contains("9"));
 }

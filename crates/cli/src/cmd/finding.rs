@@ -1,5 +1,7 @@
+use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
+use fl_core::Kind;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::store::{Roles, Tracker};
@@ -11,7 +13,7 @@ use std::collections::BTreeSet;
 pub enum Cmd {
     Raise {
         #[arg(long)]
-        record: u64,
+        record: Ref,
         #[arg(long)]
         claim: String,
         #[arg(long)]
@@ -19,64 +21,86 @@ pub enum Cmd {
     },
     /// Attach a reproduction. REFUSED unless the gate currently fails.
     Reproduce {
-        finding: u64,
+        finding: Ref,
         #[arg(long)]
-        gate: u64,
+        gate: Ref,
     },
     Assign {
-        finding: u64,
+        finding: Ref,
         #[arg(long = "to")]
         to: String,
     },
     /// The reproduction must now pass, and every neighbour must still pass.
-    Verify { finding: u64 },
+    Verify { finding: Ref },
     Withdraw {
-        finding: u64,
+        finding: Ref,
         #[arg(long)]
         reason: String,
     },
     List {
         #[arg(long)]
-        project: u64,
+        project: Ref,
         #[arg(long)]
         state: Option<String>,
     },
 }
 
+fn finding_id(store: &RedbStore, r: &Ref) -> Result<FindingId> {
+    Ok(FindingId(refs::resolve(
+        store,
+        store.label(),
+        Kind::Finding,
+        r,
+    )?))
+}
+
+/// The finding `r` names, or a refusal that echoes what was typed.
+fn finding(store: &RedbStore, r: &Ref) -> Result<Finding> {
+    let Some(f) = store.get_finding(&finding_id(store, r)?)? else {
+        bail!(
+            "`{r}` is not a finding in the store at {}. Use \
+             `fl finding list --project <project>` to see findings that exist.",
+            store.label()
+        );
+    };
+    Ok(f)
+}
+
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Raise { record, claim, by } => {
-            let r = RecordId(record);
+            let r = RecordId(refs::resolve(store, store.label(), Kind::Record, &record)?);
             let Some(rec) = store.get_record(&r)? else {
                 bail!(
-                    "no record with id {record}. Use `fl record list --project <id>` to see records that exist."
+                    "`{record}` is not a record in the store at {}. Use \
+                     `fl record list --project <project>` to see records that exist.",
+                    store.label()
                 );
             };
             let id = store.add_finding(Finding::raise(rec.project, r, &by, &claim))?;
-            println!("{id}\traised\t{claim}");
+            println!(
+                "{}\traised\t{claim}",
+                refs::show(store, Kind::Finding, id.iri())?
+            );
         }
         Cmd::Reproduce { finding, gate } => {
-            let report =
-                attach_reproduction(Roles::single(store), &FindingId(finding), &GateId(gate))
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let fid = finding_id(store, &finding)?;
+            let gid = GateId(refs::resolve(store, store.label(), Kind::Gate, &gate)?);
+            let report = attach_reproduction(Roles::single(store), &fid, &gid)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!(
                 "{finding}\treproduced\tgate {gate} failed over {} items",
                 report.verdict.population().unwrap_or(0)
             );
         }
-        Cmd::Assign { finding, to } => {
-            let id = FindingId(finding);
-            let Some(mut f) = store.get_finding(&id)? else {
-                bail!(
-                    "no finding with id {finding}. Use `fl finding list --project <id>` to see findings that exist."
-                );
-            };
+        Cmd::Assign { finding: arg, to } => {
+            let mut f = finding(store, &arg)?;
             f.assign(&to).map_err(|e| anyhow::anyhow!("{e}"))?;
             store.update_finding(&f)?;
-            println!("{finding}\tassigned\t{to}");
+            println!("{arg}\tassigned\t{to}");
         }
         Cmd::Verify { finding } => {
-            let id = FindingId(finding);
+            let id = finding_id(store, &finding)?;
             let report =
                 verify_finding(Roles::single(store), &id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -153,16 +177,14 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             }
             return Ok(report.exit_code());
         }
-        Cmd::Withdraw { finding, reason } => {
-            let id = FindingId(finding);
-            let Some(mut f) = store.get_finding(&id)? else {
-                bail!(
-                    "no finding with id {finding}. Use `fl finding list --project <id>` to see findings that exist."
-                );
-            };
+        Cmd::Withdraw {
+            finding: arg,
+            reason,
+        } => {
+            let mut f = finding(store, &arg)?;
             f.withdraw(&reason).map_err(|e| anyhow::anyhow!("{e}"))?;
             store.update_finding(&f)?;
-            println!("{finding}\twithdrawn\t{reason}");
+            println!("{arg}\twithdrawn\t{reason}");
         }
         Cmd::List { project, state } => {
             let want = match state.as_deref() {
@@ -174,12 +196,18 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                     )
                 })?),
             };
-            let all = store.list_findings(&ProjectId(project))?;
+            let p = ProjectId(refs::resolve(
+                store,
+                store.label(),
+                Kind::Project,
+                &project,
+            )?);
+            let all = store.list_findings(&p)?;
             let mut raisers: BTreeSet<String> = Default::default();
             for f in all.iter().filter(|f| want.is_none_or(|w| f.state == w)) {
                 println!(
                     "{}\t{}\t{}\t{}",
-                    f.id,
+                    refs::show(store, Kind::Finding, f.id.iri())?,
                     f.state.as_wire(),
                     f.raised_by,
                     f.claim

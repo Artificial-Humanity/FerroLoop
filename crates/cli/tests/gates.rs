@@ -86,7 +86,7 @@ impl Fixture {
                 "--regret",
                 regret,
                 "--gate",
-                "2",
+                "1",
             ])
             .assert()
             .success();
@@ -196,7 +196,7 @@ fn affirming_the_gate_clears_the_staleness() {
         .code(1);
 
     f.cli()
-        .args(["gate", "affirm", "2", "--by", "tester"])
+        .args(["gate", "affirm", "1", "--by", "tester"])
         .assert()
         .success();
     f.cli()
@@ -218,7 +218,7 @@ fn a_record_cannot_be_moved_through_a_transition_whose_gates_fail() {
         .assert()
         .success(); // id 3
     f.cli()
-        .args(["record", "move", "3", "--to", "review"])
+        .args(["record", "move", "1", "--to", "review"])
         .assert()
         .success();
 
@@ -230,7 +230,7 @@ fn a_record_cannot_be_moved_through_a_transition_whose_gates_fail() {
 
     // So the move must say no too, in the same words and with the same code.
     f.cli()
-        .args(["record", "move", "3", "--to", "done"])
+        .args(["record", "move", "1", "--to", "done"])
         .assert()
         .code(1)
         .stdout(contains("FAIL").and(contains("launch")));
@@ -252,11 +252,11 @@ fn the_same_move_is_allowed_once_the_gate_passes() {
         .assert()
         .success(); // id 3
     f.cli()
-        .args(["record", "move", "3", "--to", "review"])
+        .args(["record", "move", "1", "--to", "review"])
         .assert()
         .success();
     f.cli()
-        .args(["record", "move", "3", "--to", "done"])
+        .args(["record", "move", "1", "--to", "done"])
         .assert()
         .success()
         .stdout(contains("done"));
@@ -275,7 +275,7 @@ fn a_move_no_transition_declares_is_allowed_and_says_it_was_not_gated() {
         .assert()
         .success(); // id 3
     f.cli()
-        .args(["record", "move", "3", "--to", "doing"])
+        .args(["record", "move", "1", "--to", "doing"])
         .assert()
         .success()
         .stdout(contains("ungated"));

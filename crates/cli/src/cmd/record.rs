@@ -1,5 +1,7 @@
+use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
+use fl_core::Kind;
 use fl_core::ids::{ProjectId, RecordId};
 use fl_core::model::State;
 use fl_core::store::{Catalog, Roles, Tracker};
@@ -10,16 +12,16 @@ use fl_store::RedbStore;
 pub enum Cmd {
     Add {
         #[arg(long)]
-        project: u64,
+        project: Ref,
         #[arg(long)]
         title: String,
     },
     List {
         #[arg(long)]
-        project: u64,
+        project: Ref,
     },
     Move {
-        id: u64,
+        id: Ref,
         #[arg(long = "to")]
         to: String,
     },
@@ -28,18 +30,36 @@ pub enum Cmd {
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add { project, title } => {
-            let p = ProjectId(project);
+            let p = ProjectId(refs::resolve(
+                store,
+                store.label(),
+                Kind::Project,
+                &project,
+            )?);
             if store.get_project(&p)?.is_none() {
                 bail!(
-                    "no project with id {project}. Run `fl project list` to see the ids that exist."
+                    "`{project}` is not a project in the store at {}. Run `fl project list` to \
+                     see the ones that exist.",
+                    store.label()
                 );
             }
             let id = store.add_record(&p, &title)?;
-            println!("{id}\t{title}");
+            println!("{}\t{title}", refs::show(store, Kind::Record, id.iri())?);
         }
         Cmd::List { project } => {
-            for r in store.list_records(&ProjectId(project))? {
-                println!("{}\t{}\t{}", r.id, r.state.as_wire(), r.title);
+            let p = ProjectId(refs::resolve(
+                store,
+                store.label(),
+                Kind::Project,
+                &project,
+            )?);
+            for r in store.list_records(&p)? {
+                println!(
+                    "{}\t{}\t{}",
+                    refs::show(store, Kind::Record, r.id.iri())?,
+                    r.state.as_wire(),
+                    r.title
+                );
             }
         }
         Cmd::Move { id, to } => {
@@ -49,10 +69,12 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                     State::wire_values()
                 );
             };
-            let r = RecordId(id);
+            let r = RecordId(refs::resolve(store, store.label(), Kind::Record, &id)?);
             let Some(record) = store.get_record(&r)? else {
                 bail!(
-                    "no record with id {id}. Use `fl record list --project <id>` to see records that exist."
+                    "`{id}` is not a record in the store at {}. Use \
+                     `fl record list --project <project>` to see records that exist.",
+                    store.label()
                 );
             };
 
@@ -63,7 +85,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 println!(
                     "{id}\t{}\tungated: project {} declares no transition from `{}` to `{}`",
                     state.as_wire(),
-                    record.project,
+                    refs::show(store, Kind::Project, record.project.iri())?,
                     record.state.as_wire(),
                     state.as_wire()
                 );

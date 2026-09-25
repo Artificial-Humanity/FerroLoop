@@ -100,7 +100,7 @@ fn a_gate_can_examine_what_changed_since_a_ref() {
     // One file changed, so the gate examines exactly one — not the two in
     // the tree, which is what a glob would have found.
     f.cli()
-        .args(["gate", "run", "2"])
+        .args(["gate", "run", "1"])
         .assert()
         .success()
         .stdout(contains("PASS").and(contains("1 examined")));
@@ -128,7 +128,7 @@ fn a_gate_can_take_its_population_from_a_program() {
         .assert()
         .success();
     f.cli()
-        .args(["gate", "run", "2"])
+        .args(["gate", "run", "1"])
         .assert()
         .success()
         .stdout(contains("2 examined"));
@@ -165,7 +165,7 @@ fn a_population_program_that_fails_is_an_error_and_never_an_empty_population() {
         .assert()
         .success();
     f.cli()
-        .args(["gate", "run", "2"])
+        .args(["gate", "run", "1"])
         .assert()
         .code(2)
         .stdout(contains("ERROR"))
@@ -315,7 +315,7 @@ fn a_transition_cannot_name_a_gate_from_another_project() {
             "true",
         ])
         .assert()
-        .success(); // gate 3, in project 2
+        .success(); // gate 1, in project 2
 
     f.cli()
         .args([
@@ -332,7 +332,7 @@ fn a_transition_cannot_name_a_gate_from_another_project() {
             "--regret",
             "high",
             "--gate",
-            "3",
+            "1",
         ])
         .assert()
         .failure()

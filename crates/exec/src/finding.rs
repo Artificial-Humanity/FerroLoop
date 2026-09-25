@@ -122,12 +122,12 @@ pub fn attach_reproduction(
         .tracker
         .get_finding(finding)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
-        .ok_or(FindingExecError::NoSuchFinding(*finding))?;
+        .ok_or_else(|| FindingExecError::NoSuchFinding(finding.clone()))?;
     let def = roles
         .catalog
         .get_gate(gate)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
-        .ok_or(FindingExecError::NoSuchGate(*gate))?;
+        .ok_or_else(|| FindingExecError::NoSuchGate(gate.clone()))?;
 
     let report = run_single_gate(roles.catalog, roles.ledger, &f.project, gate)?;
     match &report.verdict {
@@ -169,7 +169,7 @@ pub fn attach_reproduction(
         Verdict::Fail { .. } => {}
     }
 
-    f.attach_reproduction(*gate)?;
+    f.attach_reproduction(gate.clone())?;
     roles
         .tracker
         .update_finding(&f)
@@ -196,13 +196,17 @@ pub fn verify_finding(
         .tracker
         .get_finding(finding)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
-        .ok_or(FindingExecError::NoSuchFinding(*finding))?;
+        .ok_or_else(|| FindingExecError::NoSuchFinding(finding.clone()))?;
     if f.state != FindingState::Assigned {
-        return Err(FindingExecError::NotAssigned(*finding, f.state.as_wire()));
+        return Err(FindingExecError::NotAssigned(
+            finding.clone(),
+            f.state.as_wire(),
+        ));
     }
     let gate = f
         .reproduction
-        .ok_or(FindingExecError::NoReproduction(*finding))?;
+        .clone()
+        .ok_or_else(|| FindingExecError::NoReproduction(finding.clone()))?;
 
     let reproduction = run_single_gate(roles.catalog, roles.ledger, &f.project, &gate)?;
 
@@ -319,7 +323,7 @@ mod tests {
         let r = s.add_record(&p, "t").unwrap();
         let g = gate(&s, &p, d.path(), "already-green", "true");
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
         let err = attach_reproduction(Roles::single(&s), &f, &g).unwrap_err();
@@ -369,7 +373,7 @@ mod tests {
             )
             .unwrap();
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
         let err = attach_reproduction(Roles::single(&s), &f, &g).unwrap_err();
@@ -413,7 +417,7 @@ mod tests {
         let r = s.add_record(&p, "t").unwrap();
         let g = gate(&s, &p, d.path(), "red", "false");
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
         let report = attach_reproduction(Roles::single(&s), &f, &g).unwrap();
@@ -437,7 +441,7 @@ mod tests {
             "definitely-not-a-real-program-9f3x",
         );
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
         // An Error is not a failure. It proves nothing either way.
@@ -474,7 +478,7 @@ mod tests {
         );
 
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
         attach_reproduction(Roles::single(&s), &f, &rep).unwrap();
         let mut fin = s.get_finding(&f).unwrap().unwrap();
@@ -527,7 +531,7 @@ mod tests {
         let _ = crate::evaluate::run_single_gate(&s, &s, &p, &neighbour).unwrap();
 
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
         attach_reproduction(Roles::single(&s), &f, &rep).unwrap();
         let mut fin = s.get_finding(&f).unwrap().unwrap();
@@ -560,7 +564,7 @@ mod tests {
         let p = s.add_project(&d.path().display().to_string()).unwrap();
         let r = s.add_record(&p, "t").unwrap();
         let f = s
-            .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
         assert!(verify_finding(Roles::single(&s), &f).is_err());
     }

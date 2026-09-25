@@ -54,7 +54,7 @@ fn an_unknown_adapter_is_refused_and_names_the_ones_that_exist() {
         .assert()
         .success();
     cli(&db)
-        .args(["attempt", "2", "--adapter", "telepathy"])
+        .args(["attempt", "1", "--adapter", "telepathy"])
         .assert()
         .failure()
         .stderr(contains("telepathy").and(contains("claude")));
@@ -74,7 +74,7 @@ fn a_refused_attempt_is_still_recorded_and_shows_up_in_stats() {
     cli(&db)
         .args([
             "attempt",
-            "2",
+            "1",
             "--adapter",
             "claude",
             "--budget-usd-micros",
