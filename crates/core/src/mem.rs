@@ -248,9 +248,14 @@ impl Tracker for MemStore {
         let mut s = self.inner.borrow_mut();
         s.check(&finding.project.0)?;
         s.check(&finding.record.0)?;
+        // `record` may have been given as an alias: resolve to the primary,
+        // so two findings raised against the same record always agree on
+        // which IRI names it.
+        let record_primary = s.resolve(&finding.record.0);
         let id = FindingId(s.mint(Kind::Finding));
         let mut finding = finding;
         finding.id = id.clone();
+        finding.record = RecordId(record_primary);
         s.findings.insert(id.0.clone(), finding);
         Ok(id)
     }
@@ -265,10 +270,19 @@ impl Tracker for MemStore {
     fn update_finding(&self, finding: &Finding) -> Result<(), StoreError> {
         let mut s = self.inner.borrow_mut();
         s.check(&finding.id.0)?;
-        if !s.findings.contains_key(&finding.id.0) {
+        // `finding.id` (what the caller passed) may be an alias: resolve to
+        // the primary key `findings` is actually keyed by, and pin the
+        // written row's own `id` to that primary too — even if the caller's
+        // struct still carries the alias — so an update through an alias
+        // lands on, and stays keyed by, the primary, never a second row
+        // under the alias.
+        let target = s.resolve(&finding.id.0);
+        if !s.findings.contains_key(&target) {
             return Err(StoreError::NoSuchFinding(finding.id.clone()));
         }
-        s.findings.insert(finding.id.0.clone(), finding.clone());
+        let mut stored = finding.clone();
+        stored.id = FindingId(target.clone());
+        s.findings.insert(target, stored);
         Ok(())
     }
 

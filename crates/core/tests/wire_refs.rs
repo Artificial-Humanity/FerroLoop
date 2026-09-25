@@ -121,11 +121,12 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
         project: p.clone(),
         title: "t".into(),
         state: State::Todo,
-        also_known_as: vec![],
+        also_known_as: vec![iri(5)],
     };
     let mut finding = Finding::raise(p.clone(), r.clone(), "a", "c");
     finding.id = f.clone();
     finding.reproduction = Some(g.clone());
+    finding.also_known_as = vec![iri(6)];
     let gate_run = GateRun {
         gate: g.clone(),
         record: Some(r.clone()),
@@ -151,8 +152,8 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
     assert_every_reference_refuses_a_handle("Project", &project, 1);
     assert_every_reference_refuses_a_handle("GateDef", &gate_def, 2);
     assert_every_reference_refuses_a_handle("Transition", &transition, 2);
-    assert_every_reference_refuses_a_handle("Record", &record, 2);
-    assert_every_reference_refuses_a_handle("Finding", &finding, 4);
+    assert_every_reference_refuses_a_handle("Record", &record, 3);
+    assert_every_reference_refuses_a_handle("Finding", &finding, 5);
     assert_every_reference_refuses_a_handle("GateRun", &gate_run, 2);
     assert_every_reference_refuses_a_handle("Attempt", &attempt, 2);
 }

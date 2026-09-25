@@ -292,7 +292,7 @@ mod tests {
     use super::*;
     use fl_core::MemStore;
     use fl_core::finding::{Finding, FindingState};
-    use fl_core::ids::ProjectId;
+    use fl_core::ids::{ProjectId, RecordId};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
     use fl_core::store::{Catalog, Roles, Tracker};
     use fl_core::verdict::FailReason;
@@ -602,5 +602,73 @@ mod tests {
             .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
         assert!(verify_finding(Roles::single(&s), &f).is_err());
+    }
+
+    /// Brings a finding to `Assigned` through the normal flow, then hands
+    /// back the fresh copy so a test can corrupt one field and persist it
+    /// with `update_finding` — the only way to get a stored, cross-kind
+    /// dangling reference onto an already-assigned finding, since neither
+    /// `add_finding` nor `update_finding` checks that a reference resolves
+    /// to the kind it claims (that is exactly what `Dangling` is for).
+    fn assigned(s: &MemStore, p: &ProjectId, r: &RecordId, rep: &GateId) -> FindingId {
+        let f = s
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
+            .unwrap();
+        attach_reproduction(Roles::single(s), &f, rep).unwrap();
+        let mut fin = s.get_finding(&f).unwrap().unwrap();
+        fin.assign("fixer").unwrap();
+        s.update_finding(&fin).unwrap();
+        f
+    }
+
+    // Fix round 1, item 3: `verify_finding`'s two `follow_ref` calls (for
+    // `f.project` and `f.reproduction`) had no test — deleting either left
+    // the whole suite green. Each is pinned here by corrupting the
+    // finding's own stored reference, after it is legitimately `Assigned`,
+    // to an id this store holds as a DIFFERENT kind (a record's id, reused
+    // as a `ProjectId`/`GateId`) — never a stranger id, since that is
+    // exactly what `Dangling` means, as opposed to `NotOwned`.
+    #[test]
+    fn verify_finding_refuses_a_dangling_project_reference() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let f = assigned(&s, &p, &r, &rep);
+
+        let mut corrupted = s.get_finding(&f).unwrap().unwrap();
+        corrupted.project = ProjectId(r.0.clone());
+        s.update_finding(&corrupted).unwrap();
+
+        // `FixReport` (the `Ok` side) has no `Debug`, so `unwrap_err` cannot
+        // be used here.
+        let err = match verify_finding(Roles::single(&s), &f) {
+            Err(e) => e,
+            Ok(_) => panic!("a dangling project reference must be refused"),
+        };
+        assert!(err.to_string().contains("dangling"), "got {err}");
+        assert!(err.to_string().contains(&f.to_string()), "got {err}");
+    }
+
+    #[test]
+    fn verify_finding_refuses_a_dangling_reproduction_reference() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let f = assigned(&s, &p, &r, &rep);
+
+        let mut corrupted = s.get_finding(&f).unwrap().unwrap();
+        corrupted.reproduction = Some(GateId(r.0.clone()));
+        s.update_finding(&corrupted).unwrap();
+
+        let err = match verify_finding(Roles::single(&s), &f) {
+            Err(e) => e,
+            Ok(_) => panic!("a dangling reproduction reference must be refused"),
+        };
+        assert!(err.to_string().contains("dangling"), "got {err}");
+        assert!(err.to_string().contains(&f.to_string()), "got {err}");
     }
 }

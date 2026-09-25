@@ -43,6 +43,10 @@ pub fn tracker<S: Catalog + Tracker, G>(make: impl Fn() -> (S, G)) {
         findings_are_listed_per_project::<S>,
         an_alias_reaches_the_item_it_names::<S>,
         an_alias_already_in_use_is_refused_and_names_it::<S>,
+        an_alias_on_a_finding_reaches_it::<S>,
+        add_alias_resolves_through_an_existing_alias_to_the_true_primary::<S>,
+        set_record_state_and_update_finding_through_an_alias_touch_the_primary_once::<S>,
+        a_finding_raised_against_a_record_alias_stores_the_primary::<S>,
     ];
     assert!(
         !cases.is_empty(),
@@ -250,6 +254,114 @@ pub fn an_alias_already_in_use_is_refused_and_names_it<S: Catalog + Tracker>(s: 
     // An existing primary id cannot become an alias either.
     let err = s.add_alias(b.iri(), a.0.clone()).unwrap_err();
     assert!(matches!(err, StoreError::AlreadyExists(_)), "{err:?}");
+}
+
+/// Aliases are not record-only: a `Finding` can carry one too (spec §2.5
+/// makes no distinction between the two aliasable kinds).
+pub fn an_alias_on_a_finding_reaches_it<S: Catalog + Tracker>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    let f = s
+        .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+        .unwrap();
+    let old = Iri::parse("https://github.com/o/r/issues/7").unwrap();
+    s.add_alias(f.iri(), old.clone()).unwrap();
+    let via_alias = s.get_finding(&FindingId(old.clone())).unwrap().unwrap();
+    assert_eq!(via_alias.id, f);
+    assert!(via_alias.also_known_as.contains(&old));
+}
+
+/// `add_alias`'s `primary` argument may itself already be an alias. This
+/// pins the one-hop resolution: the new alias reaches the item through
+/// `first`, but `ALIASES` never chains — the item ends up with BOTH names in
+/// its own `also_known_as`, addressed by the one true primary.
+pub fn add_alias_resolves_through_an_existing_alias_to_the_true_primary<S: Catalog + Tracker>(
+    s: &S,
+) {
+    let p = s.add_project("/p").unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    let first = Iri::parse("https://github.com/o/r/issues/8").unwrap();
+    let second = Iri::parse("https://github.com/o/r/issues/9").unwrap();
+    s.add_alias(r.iri(), first.clone()).unwrap();
+    s.add_alias(&first, second.clone()).unwrap();
+
+    let via_second = s.get_record(&RecordId(second.clone())).unwrap().unwrap();
+    assert_eq!(
+        via_second.id, r,
+        "second hop still reaches the true primary"
+    );
+    assert!(via_second.also_known_as.contains(&first));
+    assert!(via_second.also_known_as.contains(&second));
+}
+
+/// Fix round 1, item 1: `set_record_state` and `update_finding` both take an
+/// id/struct the caller may have addressed by alias. Either must land on —
+/// and stay keyed by — the primary: no phantom second row, no double count.
+pub fn set_record_state_and_update_finding_through_an_alias_touch_the_primary_once<
+    S: Catalog + Tracker,
+>(
+    s: &S,
+) {
+    let p = s.add_project("/p").unwrap();
+
+    let r = s.add_record(&p, "t").unwrap();
+    let r_alias = Iri::parse("https://github.com/o/r/issues/10").unwrap();
+    s.add_alias(r.iri(), r_alias.clone()).unwrap();
+    s.set_record_state(&RecordId(r_alias), State::Doing)
+        .unwrap();
+    assert_eq!(s.get_record(&r).unwrap().unwrap().state, State::Doing);
+    assert_eq!(
+        s.list_records(&p).unwrap().len(),
+        1,
+        "no phantom row under the alias"
+    );
+
+    let fid = s
+        .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
+        .unwrap();
+    let f_alias = Iri::parse("https://github.com/o/r/issues/11").unwrap();
+    s.add_alias(fid.iri(), f_alias.clone()).unwrap();
+    let mut f = s.get_finding(&FindingId(f_alias.clone())).unwrap().unwrap();
+    assert_eq!(
+        f.id, fid,
+        "get_finding via an alias already answers with the primary id"
+    );
+    // A caller that still addresses the update by the alias it looked the
+    // finding up with, rather than the primary `get_finding` returned.
+    f.id = FindingId(f_alias);
+    f.withdraw("closing").unwrap();
+    s.update_finding(&f).unwrap();
+
+    let back = s.get_finding(&fid).unwrap().unwrap();
+    assert_eq!(back.id, fid, "the stored item's id is always the primary");
+    assert_eq!(back.state, FindingState::Withdrawn);
+    assert_eq!(
+        s.list_findings(&p).unwrap().len(),
+        1,
+        "no phantom row under the alias"
+    );
+    assert_eq!(
+        s.withdrawals_by("reviewer").unwrap(),
+        1,
+        "counted once, not once per row"
+    );
+}
+
+/// Fix round 1, item 6: `add_finding` must store the referenced record's
+/// PRIMARY id, never whatever alias the caller happened to raise against
+/// (e.g. the CLI stores exactly what the user typed) — otherwise two
+/// findings against "the same" record could disagree on which IRI names it.
+pub fn a_finding_raised_against_a_record_alias_stores_the_primary<S: Catalog + Tracker>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    let alias = Iri::parse("https://github.com/o/r/issues/12").unwrap();
+    s.add_alias(r.iri(), alias.clone()).unwrap();
+
+    let fid = s
+        .add_finding(Finding::raise(p, RecordId(alias), "reviewer", "claim"))
+        .unwrap();
+    let f = s.get_finding(&fid).unwrap().unwrap();
+    assert_eq!(f.record, r, "the finding stores the record's primary id");
 }
 
 fn the_logs_are_append_only_and_read_back_in_order<S: Catalog + Ledger>(s: &S) {

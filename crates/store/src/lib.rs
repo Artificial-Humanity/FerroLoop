@@ -53,6 +53,35 @@ fn decode(e: impl std::fmt::Display) -> StoreError {
     StoreError::Decode(e.to_string())
 }
 
+/// One alias hop, given already-open `IDS` and `ALIASES` tables. Shared by
+/// [`RedbStore::locate`] (inside a read transaction) and `add_alias` (inside
+/// a write transaction) — both `Table` and `ReadOnlyTable` implement
+/// `ReadableTable`, so the same function serves either. `id` is already
+/// known to name an alias (its own `IDS` entry reads `"alias"`); this
+/// returns the primary it names and that primary's own kind, as a wire
+/// string.
+///
+/// A damaged store — an alias with no `ALIASES` row, or one naming a primary
+/// `IDS` no longer holds — is `Decode`, never a panic: on-disk corruption is
+/// not a bug this build can rule out by construction, so it must be reported
+/// the same way any other unreadable stored value is.
+fn alias_primary(
+    id: &Iri,
+    ids: &impl ReadableTable<&'static str, &'static str>,
+    aliases: &impl ReadableTable<&'static str, &'static str>,
+) -> Result<(Iri, String), StoreError> {
+    let Some(p) = aliases.get(id.as_str()).map_err(backend)? else {
+        return Err(decode(format!("alias `{id}` has no primary recorded")));
+    };
+    let primary = Iri::parse(p.value()).map_err(decode)?;
+    let Some(pk) = ids.get(primary.as_str()).map_err(backend)? else {
+        return Err(decode(format!(
+            "alias `{id}` names {primary}, which this store does not hold"
+        )));
+    };
+    Ok((primary, pk.value().to_string()))
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let label = path.display().to_string();
@@ -197,17 +226,9 @@ impl RedbStore {
         };
         if v.value() == "alias" {
             let aliases = tx.open_table(ALIASES).map_err(backend)?;
-            let Some(p) = aliases.get(id.as_str()).map_err(backend)? else {
-                return Err(decode(format!("alias `{id}` has no primary recorded")));
-            };
-            let primary = Iri::parse(p.value()).map_err(decode)?;
-            let Some(pk) = ids.get(primary.as_str()).map_err(backend)? else {
-                return Err(decode(format!(
-                    "alias `{id}` names {primary}, which this store does not hold"
-                )));
-            };
-            let kind = Kind::from_wire(pk.value())
-                .ok_or_else(|| decode(format!("unknown kind `{}` for {primary}", pk.value())))?;
+            let (primary, wire) = alias_primary(id, &ids, &aliases)?;
+            let kind = Kind::from_wire(&wire)
+                .ok_or_else(|| decode(format!("unknown kind `{wire}` for {primary}")))?;
             return Ok((primary, kind));
         }
         let kind = Kind::from_wire(v.value())
@@ -473,10 +494,14 @@ impl Tracker for RedbStore {
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         self.check(finding.project.iri())?;
-        self.check(finding.record.iri())?;
+        // `record` may be given as an alias (e.g. the CLI stores whatever
+        // the caller typed): resolve to the primary, so two findings raised
+        // against the same record always agree on which IRI names it.
+        let (record_primary, _) = self.locate(finding.record.iri())?;
         let id = self.insert_new(Kind::Finding, FINDINGS, |id| {
             let mut finding = finding;
             finding.id = FindingId(id);
+            finding.record = RecordId(record_primary);
             finding
         })?;
         Ok(FindingId(id))
@@ -487,10 +512,19 @@ impl Tracker for RedbStore {
     }
 
     fn update_finding(&self, finding: &Finding) -> Result<(), StoreError> {
-        if self.get_finding(&finding.id)?.is_none() {
+        let Some(mut stored) = self.get_finding(&finding.id)? else {
             return Err(StoreError::NoSuchFinding(finding.id.clone()));
-        }
-        self.put_json(FINDINGS, finding.id.iri(), finding)
+        };
+        // `stored.id` is always the primary: `get_finding` already resolved
+        // any alias before returning it. Take every other field from the
+        // caller's version, but keep the id pinned to the primary — even if
+        // `finding.id` (what the caller passed) is an alias — so an update
+        // through an alias still lands on, and stays keyed by, the primary,
+        // rather than writing a second row under the alias.
+        let primary = stored.id.clone();
+        stored = finding.clone();
+        stored.id = primary.clone();
+        self.put_json(FINDINGS, primary.iri(), &stored)
     }
 
     fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError> {
@@ -529,18 +563,10 @@ impl Tracker for RedbStore {
             };
             if pv.value() == "alias" {
                 // `primary` is itself an alias: resolve one more hop so
-                // `ALIASES` never chains.
+                // `ALIASES` never chains. Shares `locate`'s own alias-hop
+                // logic rather than re-implementing it.
                 let aliases = tx.open_table(ALIASES).map_err(backend)?;
-                let Some(p) = aliases.get(primary.as_str()).map_err(backend)? else {
-                    return Err(decode(format!("alias `{primary}` has no primary recorded")));
-                };
-                let resolved = Iri::parse(p.value()).map_err(decode)?;
-                let wire = ids
-                    .get(resolved.as_str())
-                    .map_err(backend)?
-                    .expect("an alias's recorded primary is owned")
-                    .value()
-                    .to_string();
+                let (resolved, wire) = alias_primary(primary, &ids, &aliases)?;
                 let kind = Kind::from_wire(&wire)
                     .ok_or_else(|| decode(format!("unknown kind `{wire}` for {resolved}")))?;
                 (resolved, kind)
