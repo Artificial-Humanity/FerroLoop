@@ -8,6 +8,9 @@ use fl_core::store::{Catalog, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 
+pub const FORMAT_VERSION: u64 = 1;
+const FORMAT_KEY: &str = "format_version";
+
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 const PROJECTS: TableDefinition<u64, &str> = TableDefinition::new("projects");
 const GATES: TableDefinition<u64, &str> = TableDefinition::new("gates");
@@ -23,6 +26,7 @@ const NEXT_ATTEMPT: &str = "next_attempt";
 
 pub struct RedbStore {
     db: Database,
+    label: String,
 }
 
 fn backend(e: impl std::fmt::Display) -> StoreError {
@@ -38,11 +42,43 @@ fn decode(e: impl std::fmt::Display) -> StoreError {
 
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let db = Database::create(path).map_err(backend)?;
-        // Create every table once so a read on a fresh database does not error.
+        let label = path.display().to_string();
+        let db = Database::create(path).map_err(|e| StoreError::Unreachable {
+            store: label.clone(),
+            cause: e.to_string(),
+        })?;
+
+        // ⚠ Read before writing. A missing version key must not read as
+        // "fresh": that would make an old store look empty — a vacuous pass.
+        let found = {
+            let tx = db.begin_read().map_err(backend)?;
+            match tx.open_table(META) {
+                Ok(meta) => Some(meta.get(FORMAT_KEY).map_err(backend)?.map(|v| v.value())),
+                Err(redb::TableError::TableDoesNotExist(_)) => None,
+                Err(e) => return Err(backend(e)),
+            }
+        };
+        match found {
+            // No META table at all: a brand-new file.
+            None => Self::create_tables(&db)?,
+            Some(Some(v)) if v == FORMAT_VERSION => {}
+            Some(v) => {
+                return Err(StoreError::FormatVersion {
+                    found: v,
+                    expected: FORMAT_VERSION,
+                });
+            }
+        }
+        Ok(Self { db, label })
+    }
+
+    fn create_tables(db: &Database) -> Result<(), StoreError> {
         let tx = db.begin_write().map_err(backend)?;
         {
-            tx.open_table(META).map_err(backend)?;
+            let mut meta = tx.open_table(META).map_err(backend)?;
+            meta.insert(FORMAT_KEY, FORMAT_VERSION).map_err(backend)?;
+        }
+        {
             tx.open_table(PROJECTS).map_err(backend)?;
             tx.open_table(GATES).map_err(backend)?;
             tx.open_table(TRANSITIONS).map_err(backend)?;
@@ -51,8 +87,11 @@ impl RedbStore {
             tx.open_table(ATTEMPTS).map_err(backend)?;
             tx.open_table(FINDINGS).map_err(backend)?;
         }
-        tx.commit().map_err(backend)?;
-        Ok(Self { db })
+        tx.commit().map_err(backend)
+    }
+
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// Bumps `counter` and writes `build(id)` as JSON into `table` under
@@ -347,6 +386,27 @@ mod tests {
     use fl_core::model::State;
     use fl_core::verdict::Verdict;
 
+    /// A store written before format versioning: tables, and no version key.
+    /// The table definitions are local and frozen: this fixture must keep
+    /// writing the OLD shape after Task 4 changes the live ones.
+    fn legacy_store(path: &std::path::Path) {
+        const OLD_META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+        const OLD_PROJECTS: TableDefinition<u64, &str> = TableDefinition::new("projects");
+        let db = redb::Database::create(path).unwrap();
+        let tx = db.begin_write().unwrap();
+        {
+            tx.open_table(OLD_META)
+                .unwrap()
+                .insert("next_id", 3u64)
+                .unwrap();
+            tx.open_table(OLD_PROJECTS)
+                .unwrap()
+                .insert(1u64, "{}")
+                .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
     #[test]
     fn a_project_survives_a_close_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -489,7 +549,10 @@ mod tests {
         // Bypasses `RedbStore::open` deliberately: it would try to open the
         // real `GATES` definition itself and fail right there, before we
         // ever get to call `add_gate`.
-        let store = RedbStore { db };
+        let store = RedbStore {
+            db,
+            label: path.display().to_string(),
+        };
 
         let failed = store.add_gate(
             &ProjectId(1),
@@ -602,6 +665,53 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = RedbStore::open(&dir.path().join("t.redb")).unwrap();
         (s, dir)
+    }
+
+    #[test]
+    fn a_store_from_before_format_versioning_is_refused_with_a_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.redb");
+        legacy_store(&path);
+        let err = RedbStore::open(&path)
+            .err()
+            .expect("an unversioned store must be refused");
+        assert!(
+            matches!(
+                err,
+                StoreError::FormatVersion {
+                    found: None,
+                    expected: FORMAT_VERSION
+                }
+            ),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("start a new store"), "no remedy: {msg}");
+    }
+
+    // Separate from the refusal above, so that "refuses everything" cannot pass
+    // as "refuses the old store".
+    #[test]
+    fn a_new_store_is_accepted_and_accepted_again_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.redb");
+        RedbStore::open(&path).unwrap();
+        RedbStore::open(&path).unwrap();
+    }
+
+    #[test]
+    fn a_store_already_open_is_unreachable_and_names_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let _held = RedbStore::open(&path).unwrap();
+        let err = RedbStore::open(&path)
+            .err()
+            .expect("a second open of a held store must fail");
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "{err}"
+        );
     }
 
     #[test]

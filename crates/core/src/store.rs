@@ -13,6 +13,17 @@ pub enum StoreError {
     NoSuchFinding(FindingId),
     #[error("backend failure: {0}")]
     Backend(String),
+    /// ⚠ The store could not be reached at all. This is "didn't look", and it
+    /// must never read as an empty store.
+    #[error("the store at {store} could not be opened: {cause}")]
+    Unreachable { store: String, cause: String },
+    #[error(
+        "the store holds format {}, and this version of fl reads format {expected}. \
+         There is no migration: start a new store, or keep using the version of fl \
+         that wrote this one.",
+        match found { Some(v) => v.to_string(), None => "none (written before format versioning)".to_string() }
+    )]
+    FormatVersion { found: Option<u64>, expected: u64 },
     /// ⚠ A stored record could not be read back into its type. This is what a
     /// wire-format change looks like from the other side, so the message names
     /// that cause and the remedy — a refusal that only reports serde's
