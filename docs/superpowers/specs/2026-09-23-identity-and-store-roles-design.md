@@ -315,6 +315,25 @@ reason in the pull request.
 
 ---
 
+## 6a. Reserved: the agent registry (FerroWire)
+
+FerroWire is the communication switchboard between agents, users, and system-generated
+messages. The owner, 2026-09-25: the store also holds an **agent registry** for it. It is
+reserved here and built with FerroWire, which the owner placed in the **second phase** — near,
+not a distant roadmap item.
+
+* **A fourth role.** The registry is a role a store backs, beside Catalog, Tracker and Ledger.
+  *(Invariant)*
+* **An agent's id is an IRI**, minted like any other local id. *(Invariant)*
+* **An agent's address works like a handle.** It is the short name a person or agent types
+  (`Cyndi`), and it resolves to the agent's IRI. Addresses are **case-insensitive**: `Cyndi` and
+  `cyndi` are one agent. An address names an agent, not a session. *(Invariant — owner,
+  2026-09-02)* The IRI rules in §2.3 do not change for this.
+* **Not decided here:** what an agent record holds (vendor, capabilities, status and so on).
+  That is FerroWire's design. *(Open)*
+* **Cost of building it later:** a new kind and new tables bump the store format version, so
+  stores written before then are refused (§5.1). *(Release scope)*
+
 ## 7. Open questions
 
 * **Escalation between the two tiers.** *(Open)* The owner: it "deserves further
