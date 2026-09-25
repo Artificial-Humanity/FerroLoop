@@ -2,7 +2,8 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{Regret, State, Transition};
-use fl_core::store::Store;
+use fl_core::store::Catalog;
+use fl_store::RedbStore;
 
 #[derive(Subcommand)]
 pub enum Cmd {
@@ -29,7 +30,7 @@ pub enum Cmd {
     },
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add {
             project,
@@ -40,7 +41,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             gate,
         } => {
             let p = ProjectId(project);
-            if store.get_project(p)?.is_none() {
+            if store.get_project(&p)?.is_none() {
                 bail!(
                     "no project with id {project}. Run `fl project list` to see the ids that exist."
                 );
@@ -64,7 +65,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 );
             };
             for g in &gate {
-                let Some(def) = store.get_gate(GateId(*g))? else {
+                let Some(def) = store.get_gate(&GateId(*g))? else {
                     bail!(
                         "transition `{name}` names gate {g}, which does not exist. \
                          Run `fl gate list --project {project}` to see the ids that exist."
@@ -99,7 +100,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Show { project, name } => {
             let p = ProjectId(project);
-            let Some(t) = store.get_transition(p, &name)? else {
+            let Some(t) = store.get_transition(&p, &name)? else {
                 bail!(
                     "project {project} declares no transition named `{name}`. \
                      Add it with `fl transition add`, or name one of the existing ones."

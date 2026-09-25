@@ -1,10 +1,10 @@
-//! redb persistence for the `fl-core` Store trait.
+//! redb persistence for the `fl-core` store roles.
 
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
-use fl_core::store::{Store, StoreError};
+use fl_core::store::{Catalog, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 
@@ -154,8 +154,8 @@ impl RedbStore {
     }
 }
 
-impl Store for RedbStore {
-    fn add_project(&mut self, root: &str) -> Result<ProjectId, StoreError> {
+impl Catalog for RedbStore {
+    fn add_project(&self, root: &str) -> Result<ProjectId, StoreError> {
         let id = self.bump_and_put(NEXT_ID, PROJECTS, |id| Project {
             id: ProjectId(id),
             root: root.to_string(),
@@ -163,7 +163,7 @@ impl Store for RedbStore {
         Ok(ProjectId(id))
     }
 
-    fn get_project(&self, id: ProjectId) -> Result<Option<Project>, StoreError> {
+    fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError> {
         self.get_json(PROJECTS, id.0)
     }
 
@@ -173,8 +173,8 @@ impl Store for RedbStore {
 
     #[allow(clippy::too_many_arguments)]
     fn add_gate(
-        &mut self,
-        project: ProjectId,
+        &self,
+        project: &ProjectId,
         name: &str,
         kind: GateKind,
         selector: Selector,
@@ -182,6 +182,7 @@ impl Store for RedbStore {
         authored_at_commit: &str,
         authored_by: &str,
     ) -> Result<GateId, StoreError> {
+        let project = *project;
         let id = self.bump_and_put(NEXT_ID, GATES, |id| GateDef {
             id: GateId(id),
             project,
@@ -196,23 +197,23 @@ impl Store for RedbStore {
         Ok(GateId(id))
     }
 
-    fn get_gate(&self, id: GateId) -> Result<Option<GateDef>, StoreError> {
+    fn get_gate(&self, id: &GateId) -> Result<Option<GateDef>, StoreError> {
         self.get_json(GATES, id.0)
     }
 
-    fn list_gates(&self, project: ProjectId) -> Result<Vec<GateDef>, StoreError> {
+    fn list_gates(&self, project: &ProjectId) -> Result<Vec<GateDef>, StoreError> {
         let all: Vec<GateDef> = self.all_json(GATES)?;
-        Ok(all.into_iter().filter(|g| g.project == project).collect())
+        Ok(all.into_iter().filter(|g| g.project == *project).collect())
     }
 
-    fn update_gate(&mut self, def: &GateDef) -> Result<(), StoreError> {
-        if self.get_gate(def.id)?.is_none() {
+    fn update_gate(&self, def: &GateDef) -> Result<(), StoreError> {
+        if self.get_gate(&def.id)?.is_none() {
             return Err(StoreError::NoSuchGate(def.id));
         }
         self.put_json(GATES, def.id.0, def)
     }
 
-    fn add_transition(&mut self, t: Transition) -> Result<(), StoreError> {
+    fn add_transition(&self, t: Transition) -> Result<(), StoreError> {
         let key = format!("{}:{}", t.project.0, t.name);
         let json = serde_json::to_string(&t).map_err(backend)?;
         let tx = self.db.begin_write().map_err(backend)?;
@@ -226,7 +227,7 @@ impl Store for RedbStore {
 
     fn get_transition(
         &self,
-        project: ProjectId,
+        project: &ProjectId,
         name: &str,
     ) -> Result<Option<Transition>, StoreError> {
         let key = format!("{}:{}", project.0, name);
@@ -238,7 +239,7 @@ impl Store for RedbStore {
         Ok(Some(serde_json::from_str(v.value()).map_err(decode)?))
     }
 
-    fn list_transitions(&self, project: ProjectId) -> Result<Vec<Transition>, StoreError> {
+    fn list_transitions(&self, project: &ProjectId) -> Result<Vec<Transition>, StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let table = tx.open_table(TRANSITIONS).map_err(backend)?;
         let mut out = Vec::new();
@@ -248,14 +249,17 @@ impl Store for RedbStore {
             // Filtered on the stored field rather than on the key's `{id}:`
             // prefix: the key is a formatting convention, the field is the
             // fact, and only one of the two is checked by the type system.
-            if t.project == project {
+            if t.project == *project {
                 out.push(t);
             }
         }
         Ok(out)
     }
+}
 
-    fn add_record(&mut self, project: ProjectId, title: &str) -> Result<RecordId, StoreError> {
+impl Tracker for RedbStore {
+    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
+        let project = *project;
         let id = self.bump_and_put(NEXT_ID, RECORDS, |id| Record {
             id: RecordId(id),
             project,
@@ -265,42 +269,22 @@ impl Store for RedbStore {
         Ok(RecordId(id))
     }
 
-    fn get_record(&self, id: RecordId) -> Result<Option<Record>, StoreError> {
+    fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
         self.get_json(RECORDS, id.0)
     }
 
-    fn list_records(&self, project: ProjectId) -> Result<Vec<Record>, StoreError> {
+    fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError> {
         let all: Vec<Record> = self.all_json(RECORDS)?;
-        Ok(all.into_iter().filter(|r| r.project == project).collect())
+        Ok(all.into_iter().filter(|r| r.project == *project).collect())
     }
 
-    fn set_record_state(&mut self, id: RecordId, state: State) -> Result<(), StoreError> {
-        let mut rec: Record = self.get_record(id)?.ok_or(StoreError::NoSuchRecord(id))?;
+    fn set_record_state(&self, id: &RecordId, state: State) -> Result<(), StoreError> {
+        let mut rec: Record = self.get_record(id)?.ok_or(StoreError::NoSuchRecord(*id))?;
         rec.state = state;
         self.put_json(RECORDS, id.0, &rec)
     }
 
-    fn append_gate_run(&mut self, run: GateRun) -> Result<(), StoreError> {
-        self.bump_and_put(NEXT_RUN, GATE_RUNS, |_seq| run)?;
-        Ok(())
-    }
-
-    fn append_attempt(&mut self, attempt: Attempt) -> Result<(), StoreError> {
-        self.bump_and_put(NEXT_ATTEMPT, ATTEMPTS, |_seq| attempt)?;
-        Ok(())
-    }
-
-    fn gate_runs(&self, gate: GateId) -> Result<Vec<GateRun>, StoreError> {
-        let all: Vec<GateRun> = self.all_json(GATE_RUNS)?;
-        Ok(all.into_iter().filter(|r| r.gate == gate).collect())
-    }
-
-    fn attempts(&self, project: ProjectId) -> Result<Vec<Attempt>, StoreError> {
-        let all: Vec<Attempt> = self.all_json(ATTEMPTS)?;
-        Ok(all.into_iter().filter(|a| a.project == project).collect())
-    }
-
-    fn add_finding(&mut self, finding: Finding) -> Result<FindingId, StoreError> {
+    fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         let id = self.bump_and_put(NEXT_ID, FINDINGS, |id| {
             let mut finding = finding;
             finding.id = FindingId(id);
@@ -309,20 +293,20 @@ impl Store for RedbStore {
         Ok(FindingId(id))
     }
 
-    fn get_finding(&self, id: FindingId) -> Result<Option<Finding>, StoreError> {
+    fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
         self.get_json(FINDINGS, id.0)
     }
 
-    fn update_finding(&mut self, finding: &Finding) -> Result<(), StoreError> {
-        if self.get_finding(finding.id)?.is_none() {
+    fn update_finding(&self, finding: &Finding) -> Result<(), StoreError> {
+        if self.get_finding(&finding.id)?.is_none() {
             return Err(StoreError::NoSuchFinding(finding.id));
         }
         self.put_json(FINDINGS, finding.id.0, finding)
     }
 
-    fn list_findings(&self, project: ProjectId) -> Result<Vec<Finding>, StoreError> {
+    fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError> {
         let all: Vec<Finding> = self.all_json(FINDINGS)?;
-        Ok(all.into_iter().filter(|f| f.project == project).collect())
+        Ok(all.into_iter().filter(|f| f.project == *project).collect())
     }
 
     fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError> {
@@ -331,6 +315,28 @@ impl Store for RedbStore {
             .into_iter()
             .filter(|f| f.raised_by == actor && f.state == FindingState::Withdrawn)
             .count() as u64)
+    }
+}
+
+impl Ledger for RedbStore {
+    fn append_gate_run(&self, run: GateRun) -> Result<(), StoreError> {
+        self.bump_and_put(NEXT_RUN, GATE_RUNS, |_seq| run)?;
+        Ok(())
+    }
+
+    fn append_attempt(&self, attempt: Attempt) -> Result<(), StoreError> {
+        self.bump_and_put(NEXT_ATTEMPT, ATTEMPTS, |_seq| attempt)?;
+        Ok(())
+    }
+
+    fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
+        let all: Vec<GateRun> = self.all_json(GATE_RUNS)?;
+        Ok(all.into_iter().filter(|r| r.gate == *gate).collect())
+    }
+
+    fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
+        let all: Vec<Attempt> = self.all_json(ATTEMPTS)?;
+        Ok(all.into_iter().filter(|a| a.project == *project).collect())
     }
 }
 
@@ -347,55 +353,12 @@ mod tests {
         let path = dir.path().join("t.redb");
 
         let id = {
-            let mut s = RedbStore::open(&path).unwrap();
+            let s = RedbStore::open(&path).unwrap();
             s.add_project("/tmp/p").unwrap()
         };
 
         let s = RedbStore::open(&path).unwrap();
-        assert_eq!(s.get_project(id).unwrap().unwrap().root, "/tmp/p");
-    }
-
-    // `record move` asks which transitions cover a (from, to) pair, so this
-    // scan decides whether a move is gated at all. A scan that leaked another
-    // project's transitions would gate a move against the wrong repository's
-    // tree; one that dropped its own would let a gated move through ungated.
-    #[test]
-    fn list_transitions_returns_every_transition_of_one_project_and_no_others() {
-        use fl_core::model::{Regret, Transition};
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("t.redb");
-        let mut s = RedbStore::open(&path).unwrap();
-
-        for (project, name) in [(1u64, "launch"), (1, "ship"), (2, "launch")] {
-            s.add_transition(Transition {
-                project: ProjectId(project),
-                name: name.into(),
-                from: State::Review,
-                to: State::Done,
-                regret: Regret::High,
-                gates: vec![],
-            })
-            .unwrap();
-        }
-
-        let mut names: Vec<String> = s
-            .list_transitions(ProjectId(1))
-            .unwrap()
-            .into_iter()
-            .map(|t| t.name)
-            .collect();
-        names.sort();
-        assert_eq!(names, vec!["launch".to_string(), "ship".to_string()]);
-        // Project 2 has a transition of the SAME name, so a scan that keyed
-        // on the name alone would return it here.
-        assert!(
-            s.list_transitions(ProjectId(1))
-                .unwrap()
-                .iter()
-                .all(|t| t.project == ProjectId(1))
-        );
-        assert_eq!(s.list_transitions(ProjectId(2)).unwrap().len(), 1);
-        assert_eq!(s.list_transitions(ProjectId(3)).unwrap().len(), 0);
+        assert_eq!(s.get_project(&id).unwrap().unwrap().root, "/tmp/p");
     }
 
     #[test]
@@ -404,11 +367,11 @@ mod tests {
         let path = dir.path().join("t.redb");
 
         let first = {
-            let mut s = RedbStore::open(&path).unwrap();
+            let s = RedbStore::open(&path).unwrap();
             s.add_project("/a").unwrap()
         };
         let second = {
-            let mut s = RedbStore::open(&path).unwrap();
+            let s = RedbStore::open(&path).unwrap();
             s.add_project("/b").unwrap()
         };
         assert_eq!(second.get(), first.get() + 1);
@@ -419,15 +382,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");
         let (p, r) = {
-            let mut s = RedbStore::open(&path).unwrap();
+            let s = RedbStore::open(&path).unwrap();
             let p = s.add_project("/p").unwrap();
-            let r = s.add_record(p, "t").unwrap();
-            s.set_record_state(r, State::Review).unwrap();
+            let r = s.add_record(&p, "t").unwrap();
+            s.set_record_state(&r, State::Review).unwrap();
             (p, r)
         };
         let s = RedbStore::open(&path).unwrap();
-        assert_eq!(s.get_record(r).unwrap().unwrap().state, State::Review);
-        assert_eq!(s.get_project(p).unwrap().unwrap().id, p);
+        assert_eq!(s.get_record(&r).unwrap().unwrap().state, State::Review);
+        assert_eq!(s.get_project(&p).unwrap().unwrap().id, p);
     }
 
     /// Beyond the brief: `Verdict`'s `Deserialize` is hand-written and rejects
@@ -443,11 +406,11 @@ mod tests {
 
         let verdict = Verdict::from_predicate(true, 3);
         let g = {
-            let mut s = RedbStore::open(&path).unwrap();
+            let s = RedbStore::open(&path).unwrap();
             let p = s.add_project("/p").unwrap();
             let g = s
                 .add_gate(
-                    p,
+                    &p,
                     "fmt",
                     fl_core::model::GateKind::Command(fl_core::model::CommandSpec {
                         program: "true".into(),
@@ -479,7 +442,7 @@ mod tests {
         };
 
         let s = RedbStore::open(&path).unwrap();
-        let runs = s.gate_runs(g).unwrap();
+        let runs = s.gate_runs(&g).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].verdict, verdict);
         assert_eq!(runs[0].verdict.population(), Some(3));
@@ -526,10 +489,10 @@ mod tests {
         // Bypasses `RedbStore::open` deliberately: it would try to open the
         // real `GATES` definition itself and fail right there, before we
         // ever get to call `add_gate`.
-        let mut store = RedbStore { db };
+        let store = RedbStore { db };
 
         let failed = store.add_gate(
-            ProjectId(1),
+            &ProjectId(1),
             "fmt",
             GateKind::Command(fl_core::model::CommandSpec {
                 program: "true".into(),
@@ -564,16 +527,16 @@ mod tests {
         let path = dir.path().join("t.redb");
 
         let id = {
-            let mut s = RedbStore::open(&path).unwrap();
+            let s = RedbStore::open(&path).unwrap();
             let p = s.add_project("/p").unwrap();
-            let r = s.add_record(p, "t").unwrap();
+            let r = s.add_record(&p, "t").unwrap();
             s.add_finding(Finding::raise(p, r, "reviewer", "wrong on empty"))
                 .unwrap()
         };
         assert_ne!(id.get(), 0, "the store must replace the placeholder id");
 
         let s = RedbStore::open(&path).unwrap();
-        let back = s.get_finding(id).unwrap().unwrap();
+        let back = s.get_finding(&id).unwrap().unwrap();
         assert_eq!(back.id, id);
         assert_eq!(back.state, FindingState::Raised);
     }
@@ -584,18 +547,18 @@ mod tests {
         let path = dir.path().join("t.redb");
 
         {
-            let mut s = RedbStore::open(&path).unwrap();
+            let s = RedbStore::open(&path).unwrap();
             let p = s.add_project("/p").unwrap();
-            let r = s.add_record(p, "t").unwrap();
+            let r = s.add_record(&p, "t").unwrap();
 
             for claim in ["a", "b"] {
                 let id = s.add_finding(Finding::raise(p, r, "hasty", claim)).unwrap();
-                let mut f = s.get_finding(id).unwrap().unwrap();
+                let mut f = s.get_finding(&id).unwrap().unwrap();
                 f.withdraw("not concrete").unwrap();
                 s.update_finding(&f).unwrap();
             }
             let id = s.add_finding(Finding::raise(p, r, "careful", "c")).unwrap();
-            let mut f = s.get_finding(id).unwrap().unwrap();
+            let mut f = s.get_finding(&id).unwrap().unwrap();
             f.attach_reproduction(GateId(1)).unwrap();
             s.update_finding(&f).unwrap();
         }
@@ -624,7 +587,7 @@ mod tests {
             }
             tx.commit().expect("commit");
         }
-        let err = s.get_record(RecordId(1)).expect_err("must refuse");
+        let err = s.get_record(&RecordId(1)).expect_err("must refuse");
         let msg = err.to_string();
         assert!(msg.contains("unknown variant"), "got {msg}");
         assert!(msg.contains("there is no migration"), "got {msg}");
@@ -633,5 +596,19 @@ mod tests {
             matches!(err, StoreError::Decode(_)),
             "a decode failure must be Decode, not merely not-Backend: {err:?}"
         );
+    }
+
+    fn fresh() -> (RedbStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = RedbStore::open(&dir.path().join("t.redb")).unwrap();
+        (s, dir)
+    }
+
+    #[test]
+    fn redb_store_meets_every_role_contract() {
+        fl_core::conformance::catalog(fresh);
+        fl_core::conformance::tracker(fresh);
+        fl_core::conformance::ledger(fresh);
+        fl_core::conformance::all_roles(fresh);
     }
 }

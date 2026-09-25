@@ -6,6 +6,7 @@ pub mod evaluate;
 pub mod finding;
 pub mod git;
 pub mod population;
+pub mod record;
 pub mod runner;
 pub use adapters::ClaudeAdapter;
 pub use command::{GateOutcome, run_command_gate};

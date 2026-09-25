@@ -1,8 +1,8 @@
 use anyhow::Result;
 use clap::Args;
 use fl_core::ids::{ProjectId, RecordId};
-use fl_core::store::Store;
 use fl_exec::evaluate::evaluate_transition;
+use fl_store::RedbStore;
 
 #[derive(Args)]
 pub struct Cmd {
@@ -14,12 +14,14 @@ pub struct Cmd {
     pub record: Option<u64>,
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+    let record = cmd.record.map(RecordId);
     let report = evaluate_transition(
         store,
-        ProjectId(cmd.project),
+        store,
+        &ProjectId(cmd.project),
         &cmd.transition,
-        cmd.record.map(RecordId),
+        record.as_ref(),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 

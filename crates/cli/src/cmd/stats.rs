@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Args;
 use fl_core::ids::ProjectId;
-use fl_core::store::Store;
+use fl_core::store::Ledger;
+use fl_store::RedbStore;
 use std::collections::BTreeMap;
 
 #[derive(Args)]
@@ -10,8 +11,8 @@ pub struct Cmd {
     pub project: u64,
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
-    let attempts = store.attempts(ProjectId(cmd.project))?;
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+    let attempts = store.attempts(&ProjectId(cmd.project))?;
 
     // ⚠ Printed even when it is zero. A report that prints nothing when it
     // found nothing is indistinguishable from a report that did not run.

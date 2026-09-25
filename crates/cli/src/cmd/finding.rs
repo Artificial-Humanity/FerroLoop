@@ -2,8 +2,9 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
-use fl_core::store::Store;
+use fl_core::store::{Roles, Tracker};
 use fl_exec::finding::{attach_reproduction, verify_finding};
+use fl_store::RedbStore;
 use std::collections::BTreeSet;
 
 #[derive(Subcommand)]
@@ -42,11 +43,11 @@ pub enum Cmd {
     },
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Raise { record, claim, by } => {
             let r = RecordId(record);
-            let Some(rec) = store.get_record(r)? else {
+            let Some(rec) = store.get_record(&r)? else {
                 bail!(
                     "no record with id {record}. Use `fl record list --project <id>` to see records that exist."
                 );
@@ -55,8 +56,9 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             println!("{id}\traised\t{claim}");
         }
         Cmd::Reproduce { finding, gate } => {
-            let report = attach_reproduction(store, FindingId(finding), GateId(gate))
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let report =
+                attach_reproduction(Roles::single(store), &FindingId(finding), &GateId(gate))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!(
                 "{finding}\treproduced\tgate {gate} failed over {} items",
                 report.verdict.population().unwrap_or(0)
@@ -64,7 +66,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Assign { finding, to } => {
             let id = FindingId(finding);
-            let Some(mut f) = store.get_finding(id)? else {
+            let Some(mut f) = store.get_finding(&id)? else {
                 bail!(
                     "no finding with id {finding}. Use `fl finding list --project <id>` to see findings that exist."
                 );
@@ -75,7 +77,8 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Verify { finding } => {
             let id = FindingId(finding);
-            let report = verify_finding(store, id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let report =
+                verify_finding(Roles::single(store), &id).map_err(|e| anyhow::anyhow!("{e}"))?;
 
             if report.reproduction.verdict.is_pass() {
                 println!(
@@ -152,7 +155,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Withdraw { finding, reason } => {
             let id = FindingId(finding);
-            let Some(mut f) = store.get_finding(id)? else {
+            let Some(mut f) = store.get_finding(&id)? else {
                 bail!(
                     "no finding with id {finding}. Use `fl finding list --project <id>` to see findings that exist."
                 );
@@ -171,7 +174,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                     )
                 })?),
             };
-            let all = store.list_findings(ProjectId(project))?;
+            let all = store.list_findings(&ProjectId(project))?;
             let mut raisers: BTreeSet<String> = Default::default();
             for f in all.iter().filter(|f| want.is_none_or(|w| f.state == w)) {
                 println!(

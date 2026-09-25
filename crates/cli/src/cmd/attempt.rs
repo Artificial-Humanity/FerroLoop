@@ -2,9 +2,10 @@ use anyhow::{Result, bail};
 use clap::Args;
 use fl_core::ids::RecordId;
 use fl_core::log::{Attempt, AttemptStatus};
-use fl_core::store::Store;
+use fl_core::store::{Catalog, Ledger, Tracker};
 use fl_exec::adapters::ClaudeAdapter;
 use fl_exec::runner::{AttemptSpec, Runner};
+use fl_store::RedbStore;
 
 const KNOWN_ADAPTERS: &str = "claude";
 
@@ -24,7 +25,7 @@ pub struct Cmd {
     pub binary: String,
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     if cmd.adapter != "claude" {
         bail!(
             "`{}` is not a known adapter. Milestone 1 ships: {KNOWN_ADAPTERS}.",
@@ -32,13 +33,13 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
         );
     }
     let id = RecordId(cmd.record);
-    let Some(record) = store.get_record(id)? else {
+    let Some(record) = store.get_record(&id)? else {
         bail!(
             "no record with id {}. Run `fl record list` to see the ids that exist.",
             cmd.record
         );
     };
-    let Some(project) = store.get_project(record.project)? else {
+    let Some(project) = store.get_project(&record.project)? else {
         bail!(
             "record {} belongs to project {}, which no longer exists.",
             cmd.record,

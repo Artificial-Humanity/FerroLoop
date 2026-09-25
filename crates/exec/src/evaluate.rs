@@ -5,7 +5,7 @@ use fl_core::ids::{GateId, ProjectId, RecordId};
 use fl_core::log::GateRun;
 use fl_core::model::{GateDef, GateKind, Regret, Selector, Transition};
 use fl_core::stale::{Staleness, apply_staleness, is_stale};
-use fl_core::store::Store;
+use fl_core::store::{Catalog, Ledger};
 use fl_core::verdict::Verdict;
 use std::path::{Path, PathBuf};
 
@@ -145,12 +145,13 @@ fn staleness_for(
 /// the transition's own regret and record). Extracted here so neither caller
 /// keeps its own copy of this logic.
 fn run_gate(
-    store: &mut dyn Store,
+    catalog: &dyn Catalog,
+    ledger: &dyn Ledger,
     root: &Path,
     head: &str,
     def: &GateDef,
     regret: Regret,
-    record: Option<RecordId>,
+    record: Option<&RecordId>,
 ) -> Result<GateReport, ExecError> {
     // Resolved once. `staleness_for`'s fallback branch reuses this same
     // result instead of calling `resolve` again — a second call would run a
@@ -179,10 +180,10 @@ fn run_gate(
     let stale = staleness_for(root, def, head, &population_result);
     let (verdict, staleness) = apply_staleness(raw, stale, regret);
 
-    store
+    ledger
         .append_gate_run(GateRun {
             gate: def.id,
-            record,
+            record: record.copied(),
             commit: head.to_string(),
             verdict: verdict.clone(),
             population: verdict.population().unwrap_or(0),
@@ -195,7 +196,7 @@ fn run_gate(
     if verdict.is_pass() {
         let mut updated = def.clone();
         updated.last_pass_commit = Some(head.to_string());
-        let _ = store.update_gate(&updated);
+        let _ = catalog.update_gate(&updated);
     }
 
     Ok(GateReport {
@@ -216,17 +217,18 @@ fn run_gate(
 /// the appended [`GateRun`] with no record. This is what `attach_reproduction`
 /// and `verify_finding` use to run a gate ad hoc, outside any transition.
 pub fn run_single_gate(
-    store: &mut dyn Store,
-    project: ProjectId,
-    gate: GateId,
+    catalog: &dyn Catalog,
+    ledger: &dyn Ledger,
+    project: &ProjectId,
+    gate: &GateId,
 ) -> Result<GateReport, ExecError> {
-    let proj = store
+    let proj = catalog
         .get_project(project)
         .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
     let root = Path::new(&proj.root);
 
-    let Some(def) = store
+    let Some(def) = catalog
         .get_gate(gate)
         .map_err(|e| ExecError::Store(e.to_string()))?
     else {
@@ -234,22 +236,23 @@ pub fn run_single_gate(
     };
 
     let head = Git::head(root)?;
-    run_gate(store, root, &head, &def, Regret::Low, None)
+    run_gate(catalog, ledger, root, &head, &def, Regret::Low, None)
 }
 
 pub fn evaluate_transition(
-    store: &mut dyn Store,
-    project: ProjectId,
+    catalog: &dyn Catalog,
+    ledger: &dyn Ledger,
+    project: &ProjectId,
     transition_name: &str,
-    record: Option<RecordId>,
+    record: Option<&RecordId>,
 ) -> Result<TransitionReport, ExecError> {
-    let proj = store
+    let proj = catalog
         .get_project(project)
         .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| ExecError::BadSelector(format!("no project with id {project}")))?;
     let root = Path::new(&proj.root);
 
-    let transition: Transition = store
+    let transition: Transition = catalog
         .get_transition(project, transition_name)
         .map_err(|e| ExecError::Store(e.to_string()))?
         .ok_or_else(|| {
@@ -263,8 +266,8 @@ pub fn evaluate_transition(
     let mut reports = Vec::new();
 
     for gate_id in &transition.gates {
-        let Some(def) = store
-            .get_gate(*gate_id)
+        let Some(def) = catalog
+            .get_gate(gate_id)
             .map_err(|e| ExecError::Store(e.to_string()))?
         else {
             return Err(ExecError::BadSelector(format!(
@@ -272,7 +275,15 @@ pub fn evaluate_transition(
             )));
         };
 
-        let report = run_gate(store, root, &head, &def, transition.regret, record)?;
+        let report = run_gate(
+            catalog,
+            ledger,
+            root,
+            &head,
+            &def,
+            transition.regret,
+            record,
+        )?;
         reports.push(report);
     }
 
@@ -286,12 +297,13 @@ pub fn evaluate_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fl_core::MemStore;
     use fl_core::finding::Finding;
     use fl_core::ids::{FindingId, ProjectId, RecordId};
     use fl_core::log::{Attempt, GateRun};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Regret, Selector, State};
     use fl_core::model::{GateDef, Project, Record, Transition};
-    use fl_core::store::{MemStore, Store, StoreError};
+    use fl_core::store::{Catalog, Ledger, StoreError, Tracker};
     use fl_core::verdict::FailReason;
     use std::fs;
     use std::process::Command;
@@ -329,7 +341,7 @@ mod tests {
     }
 
     fn setup(
-        store: &mut MemStore,
+        store: &MemStore,
         root: &std::path::Path,
         program: &str,
         pattern: &str,
@@ -339,7 +351,7 @@ mod tests {
         let p = store.add_project(&root.display().to_string()).unwrap();
         let g = store
             .add_gate(
-                p,
+                &p,
                 "g",
                 cmd(program),
                 Selector::Glob {
@@ -366,9 +378,9 @@ mod tests {
     #[test]
     fn a_passing_gate_over_a_real_population_passes_the_transition() {
         let d = repo_with(&[("src/a.rs", "fn a() {}")]);
-        let mut s = MemStore::default();
-        let p = setup(&mut s, d.path(), "true", "src/**/*.rs", Regret::Low);
-        let r = evaluate_transition(&mut s, p, "launch", None).unwrap();
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "src/**/*.rs", Regret::Low);
+        let r = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
         assert!(r.passed());
         assert_eq!(r.exit_code(), 0);
         assert_eq!(r.gates[0].verdict.population(), Some(1));
@@ -377,9 +389,9 @@ mod tests {
     #[test]
     fn a_selector_matching_nothing_fails_the_transition_and_exits_one() {
         let d = repo_with(&[("src/a.rs", "fn a() {}")]);
-        let mut s = MemStore::default();
-        let p = setup(&mut s, d.path(), "true", "nowhere/**/*.rs", Regret::Low);
-        let r = evaluate_transition(&mut s, p, "launch", None).unwrap();
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "nowhere/**/*.rs", Regret::Low);
+        let r = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
         assert!(!r.passed());
         assert_eq!(r.exit_code(), 1);
         assert_eq!(
@@ -391,11 +403,11 @@ mod tests {
     #[test]
     fn every_run_is_recorded_with_its_population_whatever_the_verdict() {
         let d = repo_with(&[("src/a.rs", "fn a() {}")]);
-        let mut s = MemStore::default();
-        let p = setup(&mut s, d.path(), "false", "src/**/*.rs", Regret::Low);
-        let _ = evaluate_transition(&mut s, p, "launch", None).unwrap();
-        let gate = s.list_gates(p).unwrap()[0].id;
-        let runs = s.gate_runs(gate).unwrap();
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "false", "src/**/*.rs", Regret::Low);
+        let _ = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
+        let gate = s.list_gates(&p).unwrap()[0].id;
+        let runs = s.gate_runs(&gate).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].population, 1);
         assert!(!runs[0].commit.is_empty());
@@ -408,8 +420,8 @@ mod tests {
     #[test]
     fn deleting_a_file_the_gate_covers_makes_it_stale() {
         let d = repo_with(&[("src/a.rs", "fn a() {}"), ("src/b.rs", "fn b() {}")]);
-        let mut s = MemStore::default();
-        let p = setup(&mut s, d.path(), "true", "src/**/*.rs", Regret::High);
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "src/**/*.rs", Regret::High);
 
         fs::remove_file(d.path().join("src/b.rs")).unwrap();
         let run = |args: &[&str]| {
@@ -422,7 +434,7 @@ mod tests {
         run(&["add", "-A"]);
         run(&["commit", "-qm", "delete b"]);
 
-        let r = evaluate_transition(&mut s, p, "launch", None).unwrap();
+        let r = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
         assert!(
             !r.passed(),
             "a deletion inside the gate's own glob must make it stale"
@@ -434,8 +446,8 @@ mod tests {
     #[test]
     fn a_change_outside_the_gates_glob_leaves_it_fresh() {
         let d = repo_with(&[("src/a.rs", "fn a() {}"), ("docs.md", "one")]);
-        let mut s = MemStore::default();
-        let p = setup(&mut s, d.path(), "true", "src/**/*.rs", Regret::High);
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "src/**/*.rs", Regret::High);
 
         fs::write(d.path().join("docs.md"), "two").unwrap();
         let run = |args: &[&str]| {
@@ -448,7 +460,7 @@ mod tests {
         run(&["add", "-A"]);
         run(&["commit", "-qm", "docs only"]);
 
-        let r = evaluate_transition(&mut s, p, "launch", None).unwrap();
+        let r = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
         assert!(
             r.passed(),
             "a gate whose own population did not move is fresh"
@@ -459,9 +471,9 @@ mod tests {
     #[test]
     fn an_unknown_transition_is_refused_and_not_treated_as_passing() {
         let d = repo_with(&[("src/a.rs", "x")]);
-        let mut s = MemStore::default();
-        let p = setup(&mut s, d.path(), "true", "src/**/*.rs", Regret::Low);
-        let err = evaluate_transition(&mut s, p, "nonexistent", None).unwrap_err();
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "src/**/*.rs", Regret::Low);
+        let err = evaluate_transition(&s, &s, &p, "nonexistent", None).unwrap_err();
         assert!(err.to_string().contains("nonexistent"), "got {err}");
     }
 
@@ -489,7 +501,7 @@ mod tests {
     #[test]
     fn a_transition_naming_a_gate_that_does_not_exist_is_refused() {
         let d = repo_with(&[("src/a.rs", "x")]);
-        let mut s = MemStore::default();
+        let s = MemStore::default();
         let p = s.add_project(&d.path().display().to_string()).unwrap();
         let dangling = GateId(9999);
         s.add_transition(Transition {
@@ -502,19 +514,19 @@ mod tests {
         })
         .unwrap();
 
-        let err = evaluate_transition(&mut s, p, "launch", None).unwrap_err();
+        let err = evaluate_transition(&s, &s, &p, "launch", None).unwrap_err();
         assert!(err.to_string().contains(&dangling.to_string()), "got {err}");
     }
 
-    /// A `Store` where every read fails, so the error a caller sees is the
+    /// A store where every read fails, so the error a caller sees is the
     /// only thing under test.
     struct BrokenStore;
 
-    impl Store for BrokenStore {
-        fn add_project(&mut self, _: &str) -> Result<ProjectId, StoreError> {
+    impl Catalog for BrokenStore {
+        fn add_project(&self, _: &str) -> Result<ProjectId, StoreError> {
             Err(broken())
         }
-        fn get_project(&self, _: ProjectId) -> Result<Option<Project>, StoreError> {
+        fn get_project(&self, _: &ProjectId) -> Result<Option<Project>, StoreError> {
             Err(broken())
         }
         fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
@@ -522,8 +534,8 @@ mod tests {
         }
         #[allow(clippy::too_many_arguments)]
         fn add_gate(
-            &mut self,
-            _: ProjectId,
+            &self,
+            _: &ProjectId,
             _: &str,
             _: GateKind,
             _: Selector,
@@ -533,61 +545,67 @@ mod tests {
         ) -> Result<GateId, StoreError> {
             Err(broken())
         }
-        fn get_gate(&self, _: GateId) -> Result<Option<GateDef>, StoreError> {
+        fn get_gate(&self, _: &GateId) -> Result<Option<GateDef>, StoreError> {
             Err(broken())
         }
-        fn list_gates(&self, _: ProjectId) -> Result<Vec<GateDef>, StoreError> {
+        fn list_gates(&self, _: &ProjectId) -> Result<Vec<GateDef>, StoreError> {
             Err(broken())
         }
-        fn update_gate(&mut self, _: &GateDef) -> Result<(), StoreError> {
+        fn update_gate(&self, _: &GateDef) -> Result<(), StoreError> {
             Err(broken())
         }
-        fn add_transition(&mut self, _: Transition) -> Result<(), StoreError> {
+        fn add_transition(&self, _: Transition) -> Result<(), StoreError> {
             Err(broken())
         }
-        fn get_transition(&self, _: ProjectId, _: &str) -> Result<Option<Transition>, StoreError> {
+        fn get_transition(&self, _: &ProjectId, _: &str) -> Result<Option<Transition>, StoreError> {
             Err(broken())
         }
-        fn list_transitions(&self, _: ProjectId) -> Result<Vec<Transition>, StoreError> {
+        fn list_transitions(&self, _: &ProjectId) -> Result<Vec<Transition>, StoreError> {
             Err(broken())
         }
-        fn add_record(&mut self, _: ProjectId, _: &str) -> Result<RecordId, StoreError> {
+    }
+
+    impl Tracker for BrokenStore {
+        fn add_record(&self, _: &ProjectId, _: &str) -> Result<RecordId, StoreError> {
             Err(broken())
         }
-        fn get_record(&self, _: RecordId) -> Result<Option<Record>, StoreError> {
+        fn get_record(&self, _: &RecordId) -> Result<Option<Record>, StoreError> {
             Err(broken())
         }
-        fn list_records(&self, _: ProjectId) -> Result<Vec<Record>, StoreError> {
+        fn list_records(&self, _: &ProjectId) -> Result<Vec<Record>, StoreError> {
             Err(broken())
         }
-        fn set_record_state(&mut self, _: RecordId, _: State) -> Result<(), StoreError> {
+        fn set_record_state(&self, _: &RecordId, _: State) -> Result<(), StoreError> {
             Err(broken())
         }
-        fn append_gate_run(&mut self, _: GateRun) -> Result<(), StoreError> {
+        fn add_finding(&self, _: Finding) -> Result<FindingId, StoreError> {
             Err(broken())
         }
-        fn append_attempt(&mut self, _: Attempt) -> Result<(), StoreError> {
+        fn get_finding(&self, _: &FindingId) -> Result<Option<Finding>, StoreError> {
             Err(broken())
         }
-        fn gate_runs(&self, _: GateId) -> Result<Vec<GateRun>, StoreError> {
+        fn update_finding(&self, _: &Finding) -> Result<(), StoreError> {
             Err(broken())
         }
-        fn attempts(&self, _: ProjectId) -> Result<Vec<Attempt>, StoreError> {
-            Err(broken())
-        }
-        fn add_finding(&mut self, _: Finding) -> Result<FindingId, StoreError> {
-            Err(broken())
-        }
-        fn get_finding(&self, _: FindingId) -> Result<Option<Finding>, StoreError> {
-            Err(broken())
-        }
-        fn update_finding(&mut self, _: &Finding) -> Result<(), StoreError> {
-            Err(broken())
-        }
-        fn list_findings(&self, _: ProjectId) -> Result<Vec<Finding>, StoreError> {
+        fn list_findings(&self, _: &ProjectId) -> Result<Vec<Finding>, StoreError> {
             Err(broken())
         }
         fn withdrawals_by(&self, _: &str) -> Result<u64, StoreError> {
+            Err(broken())
+        }
+    }
+
+    impl Ledger for BrokenStore {
+        fn append_gate_run(&self, _: GateRun) -> Result<(), StoreError> {
+            Err(broken())
+        }
+        fn append_attempt(&self, _: Attempt) -> Result<(), StoreError> {
+            Err(broken())
+        }
+        fn gate_runs(&self, _: &GateId) -> Result<Vec<GateRun>, StoreError> {
+            Err(broken())
+        }
+        fn attempts(&self, _: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
             Err(broken())
         }
     }
@@ -602,8 +620,8 @@ mod tests {
     // that silently, which is why it is gated rather than trusted.
     #[test]
     fn a_store_failure_is_reported_as_a_store_failure_and_never_as_git() {
-        let mut store = BrokenStore;
-        let err = run_single_gate(&mut store, ProjectId(1), GateId(1))
+        let store = BrokenStore;
+        let err = run_single_gate(&store, &store, &ProjectId(1), &GateId(1))
             .expect_err("a broken store cannot produce a gate report");
         assert!(
             matches!(err, ExecError::Store(_)),
@@ -616,8 +634,8 @@ mod tests {
 
     #[test]
     fn a_store_failure_during_a_transition_is_also_a_store_failure() {
-        let mut store = BrokenStore;
-        let err = evaluate_transition(&mut store, ProjectId(1), "launch", None)
+        let store = BrokenStore;
+        let err = evaluate_transition(&store, &store, &ProjectId(1), "launch", None)
             .expect_err("a broken store cannot produce a transition report");
         assert!(
             matches!(err, ExecError::Store(_)),

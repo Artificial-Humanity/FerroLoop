@@ -83,16 +83,16 @@ fn main() {
 
 fn run(cli: Cli) -> Result<i32> {
     let path = db_path(cli.db)?;
-    let mut store = RedbStore::open(&path)
+    let store = RedbStore::open(&path)
         .with_context(|| format!("could not open the store at {}", path.display()))?;
     match cli.command {
-        Command::Project(c) => cmd::project::run(&mut store, c),
-        Command::Gate(c) => cmd::gate::run(&mut store, c),
-        Command::Transition(c) => cmd::transition::run(&mut store, c),
-        Command::Record(c) => cmd::record::run(&mut store, c),
-        Command::Check(c) => cmd::check::run(&mut store, c),
-        Command::Finding(c) => cmd::finding::run(&mut store, c),
-        Command::Attempt(c) => cmd::attempt::run(&mut store, c),
-        Command::Stats(c) => cmd::stats::run(&mut store, c),
+        Command::Project(c) => cmd::project::run(&store, c),
+        Command::Gate(c) => cmd::gate::run(&store, c),
+        Command::Transition(c) => cmd::transition::run(&store, c),
+        Command::Record(c) => cmd::record::run(&store, c),
+        Command::Check(c) => cmd::check::run(&store, c),
+        Command::Finding(c) => cmd::finding::run(&store, c),
+        Command::Attempt(c) => cmd::attempt::run(&store, c),
+        Command::Stats(c) => cmd::stats::run(&store, c),
     }
 }

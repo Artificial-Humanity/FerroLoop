@@ -2,8 +2,9 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
-use fl_core::store::Store;
+use fl_core::store::Catalog;
 use fl_exec::evaluate::run_single_gate;
+use fl_store::RedbStore;
 
 /// Declare a gate: a population to examine, and a program to run over it.
 ///
@@ -85,7 +86,7 @@ pub enum Cmd {
     },
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add(args) => {
             let AddArgs {
@@ -109,7 +110,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 );
             }
             let p = ProjectId(project);
-            let Some(proj) = store.get_project(p)? else {
+            let Some(proj) = store.get_project(&p)? else {
                 bail!(
                     "no project with id {project}. Run `fl project list` to see the ids that exist."
                 );
@@ -120,7 +121,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                 )
             })?;
             let id = store.add_gate(
-                p,
+                &p,
                 &name,
                 GateKind::Command(CommandSpec {
                     program,
@@ -158,12 +159,12 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             println!("{id}\t{name}\t{head}");
         }
         Cmd::List { project } => {
-            for g in store.list_gates(ProjectId(project))? {
+            for g in store.list_gates(&ProjectId(project))? {
                 println!("{}\t{}\t{}", g.id, g.name, g.authored_at_commit);
             }
         }
         Cmd::Show { id } => {
-            let Some(g) = store.get_gate(GateId(id))? else {
+            let Some(g) = store.get_gate(&GateId(id))? else {
                 bail!(
                     "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
                 );
@@ -171,12 +172,12 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             println!("{}", serde_json::to_string_pretty(&g)?);
         }
         Cmd::Affirm { id, by } => {
-            let Some(mut g) = store.get_gate(GateId(id))? else {
+            let Some(mut g) = store.get_gate(&GateId(id))? else {
                 bail!(
                     "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
                 );
             };
-            let Some(proj) = store.get_project(g.project)? else {
+            let Some(proj) = store.get_project(&g.project)? else {
                 bail!(
                     "gate {id} belongs to project {}, which no longer exists.",
                     g.project
@@ -190,12 +191,12 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
             println!("{id}\t{head}");
         }
         Cmd::Run { id } => {
-            let Some(g) = store.get_gate(GateId(id))? else {
+            let Some(g) = store.get_gate(&GateId(id))? else {
                 bail!(
                     "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
                 );
             };
-            let report = run_single_gate(store, g.project, GateId(id))
+            let report = run_single_gate(store, store, &g.project, &GateId(id))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (label, detail) = report.verdict.describe();
             println!("{label}\t{}\t{detail}", g.name);
@@ -225,7 +226,7 @@ pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
                      provenanced like any other."
                 );
             }
-            let Some(mut g) = store.get_gate(GateId(id))? else {
+            let Some(mut g) = store.get_gate(&GateId(id))? else {
                 bail!(
                     "no gate with id {id}. Use `fl gate list --project <id>` to see gates that exist."
                 );

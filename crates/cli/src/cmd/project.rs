@@ -1,6 +1,7 @@
 use anyhow::{Result, bail};
 use clap::Subcommand;
-use fl_core::store::Store;
+use fl_core::store::Catalog;
+use fl_store::RedbStore;
 
 #[derive(Subcommand)]
 pub enum Cmd {
@@ -10,7 +11,7 @@ pub enum Cmd {
     List,
 }
 
-pub fn run(store: &mut impl Store, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Add { path } => {
             // ⚠ This used to store the string unexamined, so a typo became a
