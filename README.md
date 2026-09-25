@@ -60,22 +60,27 @@ it into a transition, and reading a refusal — see
 
 1. `--db <path>` on the command line.
 2. `$FL_DB`.
-3. The store bound to the current project in `~/.config/fl/config.toml` — the entry whose
-   `root` is the longest ancestor of the current directory.
-4. The default: `$XDG_DATA_HOME/fl/fl.redb`, or `~/.local/share/fl/fl.redb`.
+3. The store bound to the current project in `$XDG_CONFIG_HOME/fl/config.toml` (default
+   `~/.config/fl/config.toml`) — the entry whose `root` is the longest ancestor of the
+   current directory. For `fl project add <path>`, the project is `<path>`, not the current
+   directory.
+4. The default: `$XDG_DATA_HOME/fl/fl.redb`, or `~/.local/share/fl/fl.redb`. An empty or
+   relative `$XDG_DATA_HOME` is ignored, as is an empty or relative `$XDG_CONFIG_HOME`.
 
 Binding a project keeps its store path out of the repository — a store path belongs to a
 machine, and a public repository would publish it:
 
 ```toml
-# ~/.config/fl/config.toml
+# $XDG_CONFIG_HOME/fl/config.toml (default ~/.config/fl/config.toml)
 [[project]]
 root = "/home/you/code/app"
 store = "/home/you/.local/share/fl/app.redb"
 ```
 
 A full IRI on the command line (rather than a handle such as `3`) selects the store that
-holds it, searching the bound store and every store any project is bound to.
+holds it, searching the bound store and every store any project is bound to. `--db` and
+`$FL_DB` stop that search: they confine the command to the one store they name, and an IRI
+that store does not hold is refused, not looked for elsewhere.
 
 ---
 

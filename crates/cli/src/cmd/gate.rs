@@ -245,7 +245,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             g.authored_at_commit = head.clone();
             g.authored_by = by;
             store.update_gate(&g)?;
-            println!("{id}\t{head}");
+            println!("{}\t{head}", refs::show(store, Kind::Gate, g.id.iri())?);
         }
         Cmd::Run { id } => {
             let g = gate(store, &id)?;
@@ -285,7 +285,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             };
             spec.program = program;
             store.update_gate(&g)?;
-            println!("{id}\t{}", g.name);
+            println!("{}\t{}", refs::show(store, Kind::Gate, g.id.iri())?, g.name);
         }
     }
     Ok(0)

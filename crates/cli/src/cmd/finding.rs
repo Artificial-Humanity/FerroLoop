@@ -71,13 +71,16 @@ impl Cmd {
     }
 }
 
+/// The id `r` names, resolved to the finding's PRIMARY id when `r` is an
+/// alias, so what is printed back is the finding's handle rather than the
+/// alias typed. An id that names no finding is returned as given: the
+/// caller's own lookup refuses it, echoing what was typed.
 fn finding_id(store: &RedbStore, r: &Ref) -> Result<FindingId> {
-    Ok(FindingId(refs::resolve(
-        store,
-        store.label(),
-        Kind::Finding,
-        r,
-    )?))
+    let id = FindingId(refs::resolve(store, store.label(), Kind::Finding, r)?);
+    Ok(match store.get_finding(&id)? {
+        Some(f) => f.id,
+        None => id,
+    })
 }
 
 /// The finding `r` names, or a refusal that echoes what was typed.
@@ -136,7 +139,9 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             let report = attach_reproduction(Roles::single(store), &fid, &gid)
                 .map_err(|e| explain(e, &finding, Some(&gate)))?;
             println!(
-                "{finding}\treproduced\tgate {gate} failed over {} items",
+                "{}\treproduced\tgate {} failed over {} items",
+                refs::show(store, Kind::Finding, fid.iri())?,
+                refs::show(store, Kind::Gate, gid.iri())?,
                 report.verdict.population().unwrap_or(0)
             );
         }
@@ -144,7 +149,10 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             let mut f = finding(store, &arg)?;
             f.assign(&to).map_err(|e| anyhow::anyhow!("{e}"))?;
             store.update_finding(&f)?;
-            println!("{arg}\tassigned\t{to}");
+            println!(
+                "{}\tassigned\t{to}",
+                refs::show(store, Kind::Finding, f.id.iri())?
+            );
         }
         Cmd::Verify { finding } => {
             let id = finding_id(store, &finding)?;
@@ -217,10 +225,11 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 }
             }
 
+            let shown = refs::show(store, Kind::Finding, id.iri())?;
             if report.closed {
-                println!("CLOSED\t{finding}");
+                println!("CLOSED\t{shown}");
             } else {
-                println!("OPEN\t{finding}\tthe repair is not done");
+                println!("OPEN\t{shown}\tthe repair is not done");
             }
             return Ok(report.exit_code());
         }
@@ -231,7 +240,10 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             let mut f = finding(store, &arg)?;
             f.withdraw(&reason).map_err(|e| anyhow::anyhow!("{e}"))?;
             store.update_finding(&f)?;
-            println!("{arg}\twithdrawn\t{reason}");
+            println!(
+                "{}\twithdrawn\t{reason}",
+                refs::show(store, Kind::Finding, f.id.iri())?
+            );
         }
         Cmd::List { project, state } => {
             let want = match state.as_deref() {

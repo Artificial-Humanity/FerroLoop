@@ -76,6 +76,23 @@ impl Inner {
         })
     }
 
+    /// `check`, and then refuse an id held under any kind but `expected`
+    /// with `WrongKind`. Every method that takes a project (and
+    /// `add_finding`'s record) asks this rather than `check`: answering an
+    /// empty list for a gate's IRI would say "looked, found nothing" about
+    /// an item that was never a project.
+    fn check_kind(&self, id: &Iri, expected: Kind) -> Result<(), StoreError> {
+        let found = self.check(id)?;
+        if found != expected {
+            return Err(StoreError::WrongKind {
+                id: id.clone(),
+                expected,
+                found,
+            });
+        }
+        Ok(())
+    }
+
     /// `id` itself, or the primary it aliases. Used wherever a lookup needs
     /// the key a row is actually stored under — `check` alone answers
     /// ownership, not which key to read.
@@ -119,7 +136,7 @@ impl Catalog for MemStore {
         authored_by: &str,
     ) -> Result<GateId, StoreError> {
         let mut s = self.inner.borrow_mut();
-        s.check(&project.0)?;
+        s.check_kind(&project.0, Kind::Project)?;
         let id = GateId(s.mint(Kind::Gate));
         s.gates.insert(
             id.0.clone(),
@@ -146,7 +163,7 @@ impl Catalog for MemStore {
 
     fn list_gates(&self, project: &ProjectId) -> Result<Vec<GateDef>, StoreError> {
         let s = self.inner.borrow();
-        s.check(&project.0)?;
+        s.check_kind(&project.0, Kind::Project)?;
         Ok(s.gates
             .values()
             .filter(|g| g.project == *project)
@@ -166,7 +183,7 @@ impl Catalog for MemStore {
 
     fn add_transition(&self, t: Transition) -> Result<(), StoreError> {
         let mut s = self.inner.borrow_mut();
-        s.check(&t.project.0)?;
+        s.check_kind(&t.project.0, Kind::Project)?;
         s.transitions
             .insert((t.project.0.clone(), t.name.clone()), t);
         Ok(())
@@ -178,7 +195,7 @@ impl Catalog for MemStore {
         name: &str,
     ) -> Result<Option<Transition>, StoreError> {
         let s = self.inner.borrow();
-        s.check(&project.0)?;
+        s.check_kind(&project.0, Kind::Project)?;
         Ok(s.transitions
             .get(&(project.0.clone(), name.to_string()))
             .cloned())
@@ -186,7 +203,7 @@ impl Catalog for MemStore {
 
     fn list_transitions(&self, project: &ProjectId) -> Result<Vec<Transition>, StoreError> {
         let s = self.inner.borrow();
-        s.check(&project.0)?;
+        s.check_kind(&project.0, Kind::Project)?;
         Ok(s.transitions
             .values()
             .filter(|t| t.project == *project)
@@ -198,7 +215,7 @@ impl Catalog for MemStore {
 impl Tracker for MemStore {
     fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
         let mut s = self.inner.borrow_mut();
-        s.check(&project.0)?;
+        s.check_kind(&project.0, Kind::Project)?;
         let id = RecordId(s.mint(Kind::Record));
         s.records.insert(
             id.0.clone(),
@@ -222,7 +239,7 @@ impl Tracker for MemStore {
 
     fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError> {
         let s = self.inner.borrow();
-        s.check(&project.0)?;
+        s.check_kind(&project.0, Kind::Project)?;
         Ok(s.records
             .values()
             .filter(|r| r.project == *project)
@@ -246,8 +263,8 @@ impl Tracker for MemStore {
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         let mut s = self.inner.borrow_mut();
-        s.check(&finding.project.0)?;
-        s.check(&finding.record.0)?;
+        s.check_kind(&finding.project.0, Kind::Project)?;
+        s.check_kind(&finding.record.0, Kind::Record)?;
         // `record` may have been given as an alias: resolve to the primary,
         // so two findings raised against the same record always agree on
         // which IRI names it.
@@ -280,15 +297,19 @@ impl Tracker for MemStore {
         if !s.findings.contains_key(&target) {
             return Err(StoreError::NoSuchFinding(finding.id.clone()));
         }
+        // The stored `also_known_as` is kept and the caller's ignored (see
+        // the trait): only `add_alias` adds a name.
+        let also_known_as = s.findings[&target].also_known_as.clone();
         let mut stored = finding.clone();
         stored.id = FindingId(target.clone());
+        stored.also_known_as = also_known_as;
         s.findings.insert(target, stored);
         Ok(())
     }
 
     fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError> {
         let s = self.inner.borrow();
-        s.check(&project.0)?;
+        s.check_kind(&project.0, Kind::Project)?;
         Ok(s.findings
             .values()
             .filter(|f| f.project == *project)
@@ -365,7 +386,7 @@ impl Ledger for MemStore {
 
     fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
         let s = self.inner.borrow();
-        s.check(&project.0)?;
+        s.check_kind(&project.0, Kind::Project)?;
         Ok(s.attempts
             .iter()
             .filter(|a| a.project == *project)

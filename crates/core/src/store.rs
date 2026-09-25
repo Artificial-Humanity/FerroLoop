@@ -13,9 +13,35 @@ pub enum StoreError {
     #[error("no such finding: {0}")]
     NoSuchFinding(FindingId),
     /// ⚠ This store never held the id. It did not look anywhere else, so this
-    /// is never "not found" — `searched` says exactly where it looked.
-    #[error("no store holds {id} (searched: {})", searched.join(", "))]
+    /// is never "not found" — `searched` says exactly where it looked. An
+    /// EMPTY `searched` means there was no store to look in at all, and the
+    /// message says so rather than printing an empty list that reads like a
+    /// search that ran.
+    #[error(
+        "no store holds {id} ({})",
+        if searched.is_empty() {
+            "no store exists yet, so there was nothing to search".to_string()
+        } else {
+            format!("searched: {}", searched.join(", "))
+        }
+    )]
     NotOwned { id: Iri, searched: Vec<String> },
+    /// ⚠ The store holds `id`, but as a different kind of item than the
+    /// method needs — a gate's IRI passed where a project is expected. This
+    /// is neither "nothing there" (an empty list would claim the store
+    /// looked at the right item and found nothing) nor `NotOwned` (the store
+    /// does hold it).
+    #[error(
+        "{id} is a {} in this store, not a {}, so it cannot be used where a {} is needed",
+        found.as_wire(),
+        expected.as_wire(),
+        expected.as_wire()
+    )]
+    WrongKind {
+        id: Iri,
+        expected: Kind,
+        found: Kind,
+    },
     #[error("{0} already exists; an insert never overwrites")]
     AlreadyExists(Iri),
     #[error("backend failure: {0}")]
@@ -78,6 +104,11 @@ pub fn follow<T>(
 /// ⚠ There is no method that stores a population, and adding one would break
 /// the design. A population is enumerated fresh from the working tree at run
 /// time so it cannot go stale in the store.
+///
+/// ⚠ Every method here, in [`Tracker`] and in [`Ledger`] that takes a
+/// `ProjectId` refuses an id this store holds under another kind with
+/// [`StoreError::WrongKind`] — never an empty answer. `add_finding` does the
+/// same for its record.
 pub trait Catalog {
     fn add_project(&self, root: &str) -> Result<ProjectId, StoreError>;
     fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError>;
@@ -122,6 +153,15 @@ pub trait Tracker {
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError>;
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError>;
+    /// Replace a stored finding with `finding`, keyed by its primary id even
+    /// when `finding.id` is an alias.
+    ///
+    /// ⚠ `also_known_as` is NOT taken from `finding`: the stored list is
+    /// kept and the caller's is ignored. Only `add_alias` adds a name, and it
+    /// updates the alias index and this list together. A caller holding a
+    /// copy read before an `add_alias` would otherwise erase that alias from
+    /// the list while the index still resolves it; a caller that edited the
+    /// list would add a name the index cannot resolve.
     fn update_finding(&self, finding: &Finding) -> Result<(), StoreError>;
     fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError>;
 

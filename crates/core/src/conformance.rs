@@ -18,20 +18,44 @@ use crate::model::{
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use crate::verdict::Verdict;
 
+/// Run every case in `cases` against a fresh store from `make`.
+///
+/// ⚠ `expected` is the number of cases the suite is DECLARED to have, kept
+/// beside each list by hand. A floor of "at least one case" would fail only
+/// if every case were deleted; an exact count fails as soon as one is. If
+/// you add or remove a case on purpose, update the count beside that list
+/// in the same change.
+fn run_suite<S, G>(suite: &str, expected: usize, cases: &[fn(&S)], make: impl Fn() -> (S, G)) {
+    assert_eq!(
+        cases.len(),
+        expected,
+        "the {suite} suite lists {} cases but declares {expected}. A case was added or \
+         removed: if that was deliberate, update the count beside the list; if not, \
+         restore the case",
+        cases.len()
+    );
+    for case in cases {
+        let (s, _guard) = make();
+        case(&s);
+    }
+}
+
+/// How many cases [`catalog`] runs. Update deliberately — see [`run_suite`].
+const CATALOG_CASES: usize = 3;
+/// How many cases [`tracker`] runs. Update deliberately — see [`run_suite`].
+const TRACKER_CASES: usize = 12;
+/// How many cases [`ledger`] runs. Update deliberately — see [`run_suite`].
+const LEDGER_CASES: usize = 1;
+/// How many cases [`all_roles`] runs. Update deliberately — see [`run_suite`].
+const ALL_ROLES_CASES: usize = 8;
+
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
         a_project_round_trips::<S>,
         affirming_a_gate_moves_only_its_stamp::<S>,
         list_transitions_returns_every_transition_of_one_project_and_no_others::<S>,
     ];
-    assert!(
-        !cases.is_empty(),
-        "the catalog suite has no cases, so it would pass over nothing"
-    );
-    for case in cases {
-        let (s, _guard) = make();
-        case(&s);
-    }
+    run_suite("catalog", CATALOG_CASES, cases, make);
 }
 
 pub fn tracker<S: Catalog + Tracker, G>(make: impl Fn() -> (S, G)) {
@@ -47,27 +71,14 @@ pub fn tracker<S: Catalog + Tracker, G>(make: impl Fn() -> (S, G)) {
         add_alias_resolves_through_an_existing_alias_to_the_true_primary::<S>,
         set_record_state_and_update_finding_through_an_alias_touch_the_primary_once::<S>,
         a_finding_raised_against_a_record_alias_stores_the_primary::<S>,
+        update_finding_keeps_the_stored_aliases_whatever_the_caller_holds::<S>,
     ];
-    assert!(
-        !cases.is_empty(),
-        "the tracker suite has no cases, so it would pass over nothing"
-    );
-    for case in cases {
-        let (s, _guard) = make();
-        case(&s);
-    }
+    run_suite("tracker", TRACKER_CASES, cases, make);
 }
 
 pub fn ledger<S: Catalog + Ledger, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[the_logs_are_append_only_and_read_back_in_order::<S>];
-    assert!(
-        !cases.is_empty(),
-        "the ledger suite has no cases, so it would pass over nothing"
-    );
-    for case in cases {
-        let (s, _guard) = make();
-        case(&s);
-    }
+    run_suite("ledger", LEDGER_CASES, cases, make);
 }
 
 /// Cases that need one store backing all three roles, and its handles.
@@ -77,17 +88,12 @@ pub fn all_roles<S: Catalog + Tracker + Ledger + Handles, G>(make: impl Fn() -> 
         a_list_over_a_project_this_store_never_held_is_refused_not_empty::<S>,
         a_finding_on_a_record_this_store_never_held_is_refused::<S>,
         an_id_of_another_kind_is_owned_but_not_found::<S>,
+        an_id_of_another_kind_where_a_project_or_record_is_needed_is_refused_as_the_wrong_kind::<S>,
         handles_are_per_kind_and_start_at_one::<S>,
+        an_id_has_no_handle_under_any_kind_but_its_own::<S>,
         no_operation_gives_up_an_owned_id::<S>,
     ];
-    assert!(
-        !cases.is_empty(),
-        "the all-roles suite has no cases, so it would pass over nothing"
-    );
-    for case in cases {
-        let (s, _guard) = make();
-        case(&s);
-    }
+    run_suite("all-roles", ALL_ROLES_CASES, cases, make);
 }
 
 fn a_project_round_trips<S: Catalog>(s: &S) {
@@ -364,6 +370,48 @@ pub fn a_finding_raised_against_a_record_alias_stores_the_primary<S: Catalog + T
     assert_eq!(f.record, r, "the finding stores the record's primary id");
 }
 
+/// Final review, item 12: `update_finding` keeps the STORED
+/// `also_known_as` and ignores the caller's. A caller holding a copy read
+/// before an `add_alias` must not erase that alias from the item while the
+/// alias index still resolves it; a caller that edits the list must not add
+/// a name the index cannot resolve.
+pub fn update_finding_keeps_the_stored_aliases_whatever_the_caller_holds<S: Catalog + Tracker>(
+    s: &S,
+) {
+    let p = s.add_project("/p").unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    let fid = s
+        .add_finding(Finding::raise(p, r, "reviewer", "claim"))
+        .unwrap();
+
+    // Read BEFORE the alias exists: this copy's `also_known_as` is empty.
+    let mut stale = s.get_finding(&fid).unwrap().unwrap();
+    let alias = Iri::parse("https://github.com/o/r/issues/13").unwrap();
+    s.add_alias(fid.iri(), alias.clone()).unwrap();
+
+    stale.withdraw("closing").unwrap();
+    let invented = Iri::parse("https://github.com/o/r/issues/14").unwrap();
+    stale.also_known_as.push(invented.clone());
+    s.update_finding(&stale).unwrap();
+
+    let back = s.get_finding(&fid).unwrap().unwrap();
+    assert_eq!(
+        back.state,
+        FindingState::Withdrawn,
+        "the caller's other fields are written"
+    );
+    assert_eq!(
+        back.also_known_as,
+        vec![alias.clone()],
+        "the stored aliases are kept and the caller's list is ignored"
+    );
+    assert_eq!(
+        s.get_finding(&FindingId(alias)).unwrap().unwrap().id,
+        fid,
+        "the alias still resolves"
+    );
+}
+
 fn the_logs_are_append_only_and_read_back_in_order<S: Catalog + Ledger>(s: &S) {
     let p = s.add_project("/tmp/p").unwrap();
     let g = s
@@ -502,6 +550,119 @@ fn an_id_of_another_kind_is_owned_but_not_found<S: Catalog + Tracker + Ledger>(s
     assert_eq!(s.get_gate(&as_gate).unwrap(), None);
 }
 
+/// Asserts that every result is `WrongKind` for `id`, naming `expected` and
+/// `found`. Each result is labelled with the method that produced it, so a
+/// failure says which method answered for an item of the wrong kind.
+fn assert_all_wrong_kind(
+    id: &Iri,
+    expected: Kind,
+    found: Kind,
+    results: Vec<(&str, Result<(), StoreError>)>,
+) {
+    assert!(
+        !results.is_empty(),
+        "no methods were asked, so nothing was checked"
+    );
+    for (method, result) in results {
+        match result {
+            Err(StoreError::WrongKind {
+                id: ref got,
+                expected: e,
+                found: f,
+            }) if got == id && e == expected && f == found => {}
+            other => panic!(
+                "{method} answered {other:?} for a {} passed as a {}; it must be WrongKind",
+                found.as_wire(),
+                expected.as_wire()
+            ),
+        }
+    }
+}
+
+// Final review, item 1: an id this store DOES hold, but as another kind,
+// passed where a project (or `add_finding`'s record) is needed. An empty
+// list would claim the store looked at a project and found nothing in it;
+// `NotOwned` would claim the store never held the id. Both are false, so
+// every project-taking method must answer `WrongKind`, and act on nothing.
+fn an_id_of_another_kind_where_a_project_or_record_is_needed_is_refused_as_the_wrong_kind<
+    S: Catalog + Tracker + Ledger + Handles,
+>(
+    s: &S,
+) {
+    let p = s.add_project("/p").unwrap();
+    let g = s
+        .add_gate(&p, "g", sample_kind(), sample_selector(), 1, "abc", "o")
+        .unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    let as_project = ProjectId(g.0.clone());
+    assert_all_wrong_kind(
+        g.iri(),
+        Kind::Project,
+        Kind::Gate,
+        vec![
+            ("list_gates", s.list_gates(&as_project).map(drop)),
+            (
+                "list_transitions",
+                s.list_transitions(&as_project).map(drop),
+            ),
+            ("list_records", s.list_records(&as_project).map(drop)),
+            ("list_findings", s.list_findings(&as_project).map(drop)),
+            ("attempts", s.attempts(&as_project).map(drop)),
+            (
+                "get_transition",
+                s.get_transition(&as_project, "launch").map(drop),
+            ),
+            (
+                "add_gate",
+                s.add_gate(
+                    &as_project,
+                    "g",
+                    sample_kind(),
+                    sample_selector(),
+                    1,
+                    "abc",
+                    "o",
+                )
+                .map(drop),
+            ),
+            (
+                "add_transition",
+                s.add_transition(Transition {
+                    project: as_project.clone(),
+                    name: "launch".into(),
+                    from: State::Review,
+                    to: State::Done,
+                    regret: Regret::High,
+                    gates: vec![],
+                }),
+            ),
+            ("add_record", s.add_record(&as_project, "t").map(drop)),
+            (
+                "add_finding (project)",
+                s.add_finding(Finding::raise(as_project.clone(), r.clone(), "a", "c"))
+                    .map(drop),
+            ),
+        ],
+    );
+    // The project is right, so only the record's kind can refuse this.
+    assert_all_wrong_kind(
+        g.iri(),
+        Kind::Record,
+        Kind::Gate,
+        vec![(
+            "add_finding (record)",
+            s.add_finding(Finding::raise(p.clone(), RecordId(g.0.clone()), "a", "c"))
+                .map(drop),
+        )],
+    );
+    // Nothing was minted by any refused `add_*`: each kind's next handle is
+    // still free.
+    assert_eq!(s.resolve_handle(Kind::Gate, 2).unwrap(), None);
+    assert_eq!(s.resolve_handle(Kind::Record, 2).unwrap(), None);
+    assert_eq!(s.resolve_handle(Kind::Finding, 1).unwrap(), None);
+    assert!(s.list_transitions(&p).unwrap().is_empty());
+}
+
 fn handles_are_per_kind_and_start_at_one<S: Catalog + Tracker + Ledger + Handles>(s: &S) {
     let p = s.add_project("/p").unwrap();
     let g = s
@@ -517,6 +678,51 @@ fn handles_are_per_kind_and_start_at_one<S: Catalog + Tracker + Ledger + Handles
     );
     assert_eq!(s.resolve_handle(Kind::Gate, 2).unwrap(), None);
     assert_eq!(s.resolve_handle(Kind::Finding, 0).unwrap(), None);
+}
+
+// Final review, item 11: `refs::show` prints a handle only when
+// `handle_of(kind, id)` answers `Some`, so an id held under another kind must
+// answer `None` — never the handle it has under its OWN kind. Every id below
+// has handle 1 under its own kind, so a store that ignored `kind` would
+// answer `Some(1)` in every row that must be `None`.
+fn an_id_has_no_handle_under_any_kind_but_its_own<S: Catalog + Tracker + Ledger + Handles>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let g = s
+        .add_gate(&p, "g", sample_kind(), sample_selector(), 1, "abc", "o")
+        .unwrap();
+    let r = s.add_record(&p, "t").unwrap();
+    let f = s
+        .add_finding(Finding::raise(p.clone(), r.clone(), "a", "c"))
+        .unwrap();
+    let held = [
+        (Kind::Project, p.0),
+        (Kind::Gate, g.0),
+        (Kind::Record, r.0),
+        (Kind::Finding, f.0),
+    ];
+    for own in Kind::ALL {
+        assert!(
+            held.iter().any(|(k, _)| k == own),
+            "no id of kind {} was minted, so its row was never checked",
+            own.as_wire()
+        );
+    }
+    for (own, id) in &held {
+        assert_eq!(
+            s.handle_of(*own, id).unwrap(),
+            Some(1),
+            "{id} as its own kind"
+        );
+        for other in Kind::ALL.iter().filter(|k| *k != own) {
+            assert_eq!(
+                s.handle_of(*other, id).unwrap(),
+                None,
+                "a {} id has no {} handle",
+                own.as_wire(),
+                other.as_wire()
+            );
+        }
+    }
 }
 
 /// Spec §2.6 / the deletion ruling: ownership is membership, and nothing

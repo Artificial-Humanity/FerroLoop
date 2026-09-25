@@ -76,7 +76,9 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     let adapter = ClaudeAdapter::new(cmd.binary);
     let spec = AttemptSpec {
         project_root: std::path::PathBuf::from(&project.root),
-        record: id.clone(),
+        // The record's PRIMARY id, never the alias the person typed: every
+        // attempt against one record must name it the same way.
+        record: record.id.clone(),
         instruction: cmd.instruction.unwrap_or_else(|| record.title.clone()),
         timeout_secs: cmd.timeout_secs,
         budget_usd_micros: cmd.budget_usd_micros,
@@ -91,7 +93,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     // cost something, even when that something is only the wall clock.
     store.append_attempt(Attempt {
         project: record.project,
-        record: id,
+        record: record.id,
         adapter: "claude".into(),
         status: outcome.status,
         duration_ms: outcome.duration_ms,

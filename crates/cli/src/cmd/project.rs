@@ -31,6 +31,17 @@ impl Cmd {
     pub fn has_handle(&self) -> bool {
         refs::has_handle(&self.refs())
     }
+
+    /// The directory `Add` registers. The store is chosen by ITS binding in
+    /// the config, not the current directory's: a project registered from
+    /// elsewhere must land in the store it is bound to (Final review, item
+    /// 2).
+    pub fn root(&self) -> Option<&std::path::Path> {
+        match self {
+            Cmd::Add { path } => Some(std::path::Path::new(path)),
+            Cmd::List => None,
+        }
+    }
 }
 
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {

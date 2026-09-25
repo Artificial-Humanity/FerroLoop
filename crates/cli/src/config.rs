@@ -32,9 +32,22 @@ struct File {
 /// Pure and dependency-free so it can be unit-tested without touching this
 /// process's own environment.
 fn base_dir(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
-    xdg_config_home
-        .filter(|p| p.is_absolute())
-        .or_else(|| home.map(|h| h.join(".config")))
+    xdg_base(xdg_config_home, home, ".config")
+}
+
+/// The XDG data base directory, by the same rule as [`base_dir`]:
+/// `xdg_data_home` if it is an ABSOLUTE path, else `home/.local/share`. An
+/// empty or relative `$XDG_DATA_HOME` is treated as unset (Final review,
+/// item 5) — used as-is it would put the store under the current directory.
+pub fn data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    xdg_base(xdg_data_home, home, ".local/share")
+}
+
+/// The one rule both XDG bases follow: the variable if it is absolute, else
+/// `home` joined with the spec's default for that base.
+fn xdg_base(var: Option<PathBuf>, home: Option<PathBuf>, default: &str) -> Option<PathBuf> {
+    var.filter(|p| p.is_absolute())
+        .or_else(|| home.map(|h| h.join(default)))
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -148,6 +161,31 @@ mod tests {
             Some(PathBuf::from("/abs/config")),
             "an absolute XDG_CONFIG_HOME must still win"
         );
+    }
+
+    #[test]
+    fn an_empty_or_relative_xdg_data_home_falls_back_to_home() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            data_dir(Some(PathBuf::from("")), home.clone()),
+            Some(PathBuf::from("/home/u/.local/share")),
+            "an empty XDG_DATA_HOME must be treated as unset"
+        );
+        assert_eq!(
+            data_dir(Some(PathBuf::from("relative/data")), home.clone()),
+            Some(PathBuf::from("/home/u/.local/share")),
+            "a relative XDG_DATA_HOME must be treated as unset"
+        );
+        assert_eq!(
+            data_dir(Some(PathBuf::from("/abs/data")), home.clone()),
+            Some(PathBuf::from("/abs/data")),
+            "an absolute XDG_DATA_HOME must still win"
+        );
+        assert_eq!(
+            data_dir(None, home),
+            Some(PathBuf::from("/home/u/.local/share"))
+        );
+        assert_eq!(data_dir(Some(PathBuf::from("rel")), None), None);
     }
 
     #[cfg(unix)]

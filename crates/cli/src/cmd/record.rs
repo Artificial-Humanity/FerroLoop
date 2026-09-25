@@ -103,10 +103,13 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
 
             let report = move_record(Roles::single(store), &record, state)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+            // What the person reads back: the record's handle (or its
+            // primary IRI), never the alias or IRI they typed.
+            let shown = refs::show(store, Kind::Record, record.id.iri())?;
 
             if let MoveOutcome::Ungated = report.outcome {
                 println!(
-                    "{id}\t{}\tungated: project {} declares no transition from `{}` to `{}`",
+                    "{shown}\t{}\tungated: project {} declares no transition from `{}` to `{}`",
                     state.as_wire(),
                     refs::show(store, Kind::Project, record.project.iri())?,
                     record.state.as_wire(),
@@ -141,13 +144,18 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 }
             }
 
+            // Every variant by name: a new outcome must be a compile error
+            // here, not something a catch-all prints as "moved".
             match report.outcome {
                 MoveOutcome::Refused { code } => {
-                    println!("REFUSED\t{id}\tstays `{}`", record.state.as_wire());
+                    println!("REFUSED\t{shown}\tstays `{}`", record.state.as_wire());
                     return Ok(code);
                 }
-                _ => {
-                    println!("{id}\t{}", state.as_wire());
+                MoveOutcome::Moved => {
+                    println!("{shown}\t{}", state.as_wire());
+                }
+                MoveOutcome::Ungated => {
+                    unreachable!("an ungated move returns above, before any transition is printed")
                 }
             }
         }

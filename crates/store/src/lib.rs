@@ -242,6 +242,23 @@ impl RedbStore {
         self.locate(id).map(|(_, kind)| kind)
     }
 
+    /// `check`, and then refuse an id held under any kind but `expected`
+    /// with `WrongKind`. Every method that takes a project (and
+    /// `add_finding`'s record) asks this rather than `check`: answering an
+    /// empty list for a gate's IRI would say "looked, found nothing" about
+    /// an item that was never a project.
+    fn check_kind(&self, id: &Iri, expected: Kind) -> Result<(), StoreError> {
+        let found = self.check(id)?;
+        if found != expected {
+            return Err(StoreError::WrongKind {
+                id: id.clone(),
+                expected,
+                found,
+            });
+        }
+        Ok(())
+    }
+
     /// Whether this store holds `id`. An I/O failure is an error, never
     /// `false`: "could not look" is not "not mine".
     pub fn owns(&self, id: &Iri) -> Result<bool, StoreError> {
@@ -375,7 +392,7 @@ impl Catalog for RedbStore {
         authored_at_commit: &str,
         authored_by: &str,
     ) -> Result<GateId, StoreError> {
-        self.check(project.iri())?;
+        self.check_kind(project.iri(), Kind::Project)?;
         let id = self.insert_new(Kind::Gate, GATES, |id| GateDef {
             id: GateId(id),
             project: project.clone(),
@@ -395,7 +412,7 @@ impl Catalog for RedbStore {
     }
 
     fn list_gates(&self, project: &ProjectId) -> Result<Vec<GateDef>, StoreError> {
-        self.check(project.iri())?;
+        self.check_kind(project.iri(), Kind::Project)?;
         let all: Vec<GateDef> = self.all_json(GATES)?;
         Ok(all.into_iter().filter(|g| g.project == *project).collect())
     }
@@ -408,7 +425,7 @@ impl Catalog for RedbStore {
     }
 
     fn add_transition(&self, t: Transition) -> Result<(), StoreError> {
-        self.check(t.project.iri())?;
+        self.check_kind(t.project.iri(), Kind::Project)?;
         let json = serde_json::to_string(&t).map_err(backend)?;
         let tx = self.db.begin_write().map_err(backend)?;
         {
@@ -426,7 +443,7 @@ impl Catalog for RedbStore {
         project: &ProjectId,
         name: &str,
     ) -> Result<Option<Transition>, StoreError> {
-        self.check(project.iri())?;
+        self.check_kind(project.iri(), Kind::Project)?;
         let tx = self.db.begin_read().map_err(backend)?;
         let table = tx.open_table(TRANSITIONS).map_err(backend)?;
         let Some(v) = table
@@ -439,7 +456,7 @@ impl Catalog for RedbStore {
     }
 
     fn list_transitions(&self, project: &ProjectId) -> Result<Vec<Transition>, StoreError> {
-        self.check(project.iri())?;
+        self.check_kind(project.iri(), Kind::Project)?;
         let tx = self.db.begin_read().map_err(backend)?;
         let table = tx.open_table(TRANSITIONS).map_err(backend)?;
         let mut out = Vec::new();
@@ -459,7 +476,7 @@ impl Catalog for RedbStore {
 
 impl Tracker for RedbStore {
     fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
-        self.check(project.iri())?;
+        self.check_kind(project.iri(), Kind::Project)?;
         let id = self.insert_new(Kind::Record, RECORDS, |id| Record {
             id: RecordId(id),
             project: project.clone(),
@@ -475,7 +492,7 @@ impl Tracker for RedbStore {
     }
 
     fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError> {
-        self.check(project.iri())?;
+        self.check_kind(project.iri(), Kind::Project)?;
         let all: Vec<Record> = self.all_json(RECORDS)?;
         Ok(all.into_iter().filter(|r| r.project == *project).collect())
     }
@@ -493,11 +510,18 @@ impl Tracker for RedbStore {
     }
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
-        self.check(finding.project.iri())?;
+        self.check_kind(finding.project.iri(), Kind::Project)?;
         // `record` may be given as an alias (e.g. the CLI stores whatever
         // the caller typed): resolve to the primary, so two findings raised
         // against the same record always agree on which IRI names it.
-        let (record_primary, _) = self.locate(finding.record.iri())?;
+        let (record_primary, record_kind) = self.locate(finding.record.iri())?;
+        if record_kind != Kind::Record {
+            return Err(StoreError::WrongKind {
+                id: finding.record.iri().clone(),
+                expected: Kind::Record,
+                found: record_kind,
+            });
+        }
         let id = self.insert_new(Kind::Finding, FINDINGS, |id| {
             let mut finding = finding;
             finding.id = FindingId(id);
@@ -521,14 +545,19 @@ impl Tracker for RedbStore {
         // `finding.id` (what the caller passed) is an alias — so an update
         // through an alias still lands on, and stays keyed by, the primary,
         // rather than writing a second row under the alias.
+        //
+        // The stored `also_known_as` is kept and the caller's ignored (see
+        // the trait): only `add_alias` adds a name.
         let primary = stored.id.clone();
+        let also_known_as = std::mem::take(&mut stored.also_known_as);
         stored = finding.clone();
         stored.id = primary.clone();
+        stored.also_known_as = also_known_as;
         self.put_json(FINDINGS, primary.iri(), &stored)
     }
 
     fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError> {
-        self.check(project.iri())?;
+        self.check_kind(project.iri(), Kind::Project)?;
         let all: Vec<Finding> = self.all_json(FINDINGS)?;
         Ok(all.into_iter().filter(|f| f.project == *project).collect())
     }
@@ -590,12 +619,19 @@ impl Tracker for RedbStore {
         };
         {
             let mut t = tx.open_table(table).map_err(backend)?;
-            let json = t
-                .get(resolved.as_str())
-                .map_err(backend)?
-                .expect("a Record or Finding kind means this table holds the row")
-                .value()
-                .to_string();
+            // `IDS` says this id is a record or finding, but that does not
+            // put its row here: a damaged store can hold the index entry
+            // without the row. That is `Decode`, like `alias_primary`'s
+            // damaged cases — never a panic.
+            let json = match t.get(resolved.as_str()).map_err(backend)? {
+                Some(v) => v.value().to_string(),
+                None => {
+                    return Err(decode(format!(
+                        "{resolved} is indexed as a {}, but this store holds no row for it",
+                        kind.as_wire()
+                    )));
+                }
+            };
             let updated = match kind {
                 Kind::Record => {
                     let mut r: Record = serde_json::from_str(&json).map_err(decode)?;
@@ -646,7 +682,7 @@ impl Ledger for RedbStore {
     }
 
     fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
-        self.check(project.iri())?;
+        self.check_kind(project.iri(), Kind::Project)?;
         let all: Vec<Attempt> = self.all_log(ATTEMPTS)?;
         Ok(all.into_iter().filter(|a| a.project == *project).collect())
     }
@@ -1053,6 +1089,32 @@ mod tests {
         assert!(
             matches!(err, StoreError::Decode(_)),
             "a decode failure must be Decode, not merely not-Backend: {err:?}"
+        );
+    }
+
+    // Final review, item 7: `IDS` naming an id as a record whose row is
+    // missing is on-disk damage, and `add_alias` must report it as `Decode`
+    // — as `alias_primary` reports its own damaged cases — never panic.
+    #[test]
+    fn add_alias_on_an_indexed_record_whose_row_is_missing_is_decode_not_a_panic() {
+        let (s, _d) = fresh();
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        {
+            let tx = s.db.begin_write().unwrap();
+            tx.open_table(RECORDS)
+                .unwrap()
+                .remove(r.iri().as_str())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let alias = Iri::parse("https://github.com/o/r/issues/15").unwrap();
+        let err = s.add_alias(r.iri(), alias.clone()).unwrap_err();
+        assert!(matches!(err, StoreError::Decode(_)), "{err:?}");
+        assert!(err.to_string().contains(r.iri().as_str()), "{err}");
+        assert!(
+            !s.owns(&alias).unwrap(),
+            "a refused add_alias must not index the alias"
         );
     }
 

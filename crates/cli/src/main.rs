@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 struct Cli {
     /// Path to the store. CONFINES the command to it: an IRI it does not
     /// hold is refused, not searched for elsewhere. Falls back to $FL_DB
-    /// (same), then the project bound in ~/.config/fl/config.toml, then the
-    /// XDG data directory.
+    /// (same), then the project bound in $XDG_CONFIG_HOME/fl/config.toml
+    /// (default ~/.config/fl/config.toml), then the XDG data directory.
     #[arg(long, global = true)]
     db: Option<PathBuf>,
 
@@ -58,6 +58,17 @@ impl Command {
         }
     }
 
+    /// The directory whose binding in the config picks the store, when it
+    /// is not the current directory: `project add <path>` registers `<path>`,
+    /// so the store bound to `<path>` is the one it belongs in (Final
+    /// review, item 2). Every other command works on the current project.
+    fn project_root(&self) -> Option<&Path> {
+        match self {
+            Command::Project(c) => c.root(),
+            _ => None,
+        }
+    }
+
     /// Whether the chosen subcommand names any item by handle rather than
     /// IRI, dispatched to its own `has_handle()` (Fix round 1, item 1).
     fn has_handle(&self) -> bool {
@@ -75,9 +86,15 @@ impl Command {
 }
 
 /// Resolve the store path from `--db`, then `$FL_DB`, then the project
-/// bound to `cwd` in the user's config, then the XDG data directory, then
+/// bound to `locus` in the user's config, then the XDG data directory, then
 /// `~/.local/share` — and whether that tier CONFINES the command to this
-/// one store.
+/// one store. `locus` is the current directory, except for `project add`,
+/// where it is the directory being registered.
+///
+/// `$XDG_DATA_HOME` follows the rule `config::path` applies to
+/// `$XDG_CONFIG_HOME`: an empty or relative value is ignored, never used
+/// as-is — used as-is, it would put the store relative to whatever
+/// directory the command happened to run in.
 ///
 /// ⚠ Ruling (Fix round 1, item 0): `--db` and `$FL_DB` CONFINE the command
 /// to exactly the store they name. An IRI that store does not hold is
@@ -100,19 +117,20 @@ impl Command {
 fn db_path(
     explicit: Option<PathBuf>,
     entries: &[config::Entry],
-    cwd: &Path,
+    locus: &Path,
 ) -> Result<(PathBuf, bool)> {
     let (path, confined) = if let Some(p) = explicit {
         (p, true)
     } else if let Ok(p) = std::env::var("FL_DB") {
         (PathBuf::from(p), true)
-    } else if let Some(p) = config::bound(entries, cwd)? {
+    } else if let Some(p) = config::bound(entries, locus)? {
         (p, false)
     } else {
-        let base = std::env::var("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-            .context("neither --db, $FL_DB, a project bound in the config nor $XDG_DATA_HOME/$HOME is set, so there is nowhere to put the store")?;
+        let base = config::data_dir(
+            std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
+        .context("neither --db, $FL_DB, a project bound in the config, an absolute $XDG_DATA_HOME nor $HOME is set, so there is nowhere to put the store")?;
         (base.join("fl").join("fl.redb"), false)
     };
     if let Some(dir) = path.parent() {
@@ -225,7 +243,11 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let cwd = std::env::current_dir().context("could not determine the current directory")?;
     let entries = config::load(config::path().as_deref())?;
-    let (bound, confined) = db_path(cli.db, &entries, &cwd)?;
+    let locus = match cli.command.project_root() {
+        Some(root) => cwd.join(root),
+        None => cwd.clone(),
+    };
+    let (bound, confined) = db_path(cli.db, &entries, &locus)?;
     let iris = cli.command.iris();
     let path = choose_store(&bound, &entries, &iris, confined)?;
     // ⚠ Fix round 1, item 1: a handle resolves only in the store it was

@@ -618,3 +618,168 @@ fn an_id_owned_by_two_stores_at_once_is_refused_naming_both() {
         .stderr(contains(a.to_str().unwrap()))
         .stderr(contains(c.to_str().unwrap()));
 }
+
+/// One repo registered in the default store of `env`, run from the repo.
+fn registered(env: &Env) -> tempfile::TempDir {
+    let repo = git_repo();
+    env.fl(repo.path())
+        .args(["project", "add", repo.path().to_str().unwrap()])
+        .assert()
+        .success();
+    repo
+}
+
+// Final review, item 1: an IRI the store holds as a GATE, passed as
+// `--project`, must be refused (exit 2) — never listed as an empty project,
+// and never reported as `attempts: 0`.
+#[test]
+fn a_gate_iri_passed_as_a_project_is_refused_not_listed_as_empty() {
+    let env = Env::new();
+    let repo = registered(&env);
+    let gate = a_gate_iri_in(&env, repo.path());
+    for cmd in [
+        &["record", "list"][..],
+        &["finding", "list"][..],
+        &["gate", "list"][..],
+        &["stats"][..],
+    ] {
+        env.fl(repo.path())
+            .args(cmd)
+            .args(["--project", &gate])
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(contains(gate.as_str()).and(contains("not a project")));
+    }
+}
+
+// Final review, item 2: `project add <path>` registers `<path>` in the
+// store the config binds `<path>` to — not the store bound to the directory
+// the command happens to run in.
+#[test]
+fn project_add_uses_the_store_bound_to_the_path_not_the_current_directory() {
+    let env = Env::new();
+    let (ra, rb) = (git_repo(), git_repo());
+    let stores = tempfile::tempdir().unwrap();
+    let (a, b) = (stores.path().join("a.redb"), stores.path().join("b.redb"));
+    env.write_config(&format!("{}{}", bind(ra.path(), &a), bind(rb.path(), &b)));
+    // `a` exists (and holds nothing), so "not written there" is a check on a
+    // store that was really there to be written.
+    env.fl(ra.path())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout("");
+    assert!(a.exists());
+
+    env.fl(ra.path())
+        .args(["project", "add", rb.path().to_str().unwrap()])
+        .assert()
+        .success();
+
+    let root = rb.path().canonicalize().unwrap();
+    let root = root.to_str().unwrap();
+    env.fl(rb.path())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout(contains(root));
+    env.fl(ra.path())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout("");
+    assert!(!env.default_store().exists(), "the default store was used");
+}
+
+// Final review, item 5: an empty or relative `$XDG_DATA_HOME` is ignored,
+// as `$XDG_CONFIG_HOME`'s is — used as-is it would create the store under
+// whatever directory the command ran in.
+#[test]
+fn an_empty_or_relative_xdg_data_home_falls_back_to_home_not_the_cwd() {
+    for value in ["", "relative/data"] {
+        let env = Env::new();
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        env.fl(cwd.path())
+            .env("XDG_DATA_HOME", value)
+            .env("HOME", home.path())
+            .args(["project", "list"])
+            .assert()
+            .success();
+        assert!(
+            home.path().join(".local/share/fl/fl.redb").exists(),
+            "XDG_DATA_HOME={value:?}: the store is not under $HOME/.local/share"
+        );
+        assert_eq!(
+            std::fs::read_dir(cwd.path()).unwrap().count(),
+            0,
+            "XDG_DATA_HOME={value:?}: something was created in the current directory"
+        );
+    }
+}
+
+// Final review, item 6: with no store anywhere, `NotOwned` must say that no
+// store exists yet — not print `(searched: )`, an empty list that reads
+// like a search that ran.
+#[test]
+fn an_iri_on_a_fresh_install_says_no_store_exists_yet() {
+    let env = Env::new();
+    let cwd = tempfile::tempdir().unwrap();
+    env.fl(cwd.path())
+        .args(["gate", "show", STRANGER])
+        .assert()
+        .code(2)
+        .stderr(
+            contains(STRANGER)
+                .and(contains("no store exists yet"))
+                .and(contains("searched: )").not()),
+        );
+}
+
+// Final review, item 9: success output names an item by its handle when it
+// has one, even when the person typed its full IRI.
+#[test]
+fn gate_affirm_by_iri_prints_the_handle_not_the_iri() {
+    let env = Env::new();
+    let repo = registered(&env);
+    let gate = a_gate_iri_in(&env, repo.path());
+    assert!(gate.starts_with("urn:uuid:"), "fixture: {gate}");
+    env.fl(repo.path())
+        .args(["gate", "affirm", &gate, "--by", "tester"])
+        .assert()
+        .success()
+        .stdout(predicates::str::starts_with("1\t").and(contains("urn:uuid:").not()));
+}
+
+// Final review, item 8: an attempt names its record by the record's PRIMARY
+// id, even when the person typed an alias.
+#[test]
+fn an_attempt_through_a_record_alias_stores_the_primary() {
+    use fl_core::store::{Catalog, Ledger, Tracker};
+    let env = Env::new();
+    let repo = registered(&env);
+    env.fl(repo.path())
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .success();
+    let alias = "https://github.com/o/r/issues/41";
+    let (project, record) = {
+        let s = fl_store::RedbStore::open(&env.default_store()).unwrap();
+        let project = s.list_projects().unwrap().remove(0).id;
+        let record = s.list_records(&project).unwrap().remove(0).id;
+        s.add_alias(record.iri(), fl_core::Iri::parse(alias).unwrap())
+            .unwrap();
+        (project, record)
+    };
+    // A zero budget is refused before anything is spawned, and still
+    // recorded.
+    env.fl(repo.path())
+        .args(["attempt", alias, "--budget-usd-micros", "0"])
+        .assert()
+        .code(1);
+    let s = fl_store::RedbStore::open(&env.default_store()).unwrap();
+    let attempts = s.attempts(&project).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].record, record, "the attempt stored the alias");
+}
