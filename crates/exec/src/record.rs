@@ -26,6 +26,15 @@ fn store_err(e: impl std::fmt::Display) -> ExecError {
 
 /// Move a record, running every transition that covers `(record.state, to)`.
 ///
+/// ⚠ This used to be `set_record_state` and nothing else. `check` would
+/// refuse the transition and `record move` would perform the very state
+/// change those gates exist to protect — reading nothing, running nothing,
+/// exiting 0. A gate that the guarded action does not consult is decoration.
+///
+/// A transition is addressed by name; a move is addressed by the pair it
+/// performs. So the move asks which declarations cover (from, to) and runs
+/// every one of them.
+///
 /// ⚠⚠ Evidence before state (spec §3.5, Invariant). The gate runs are
 /// appended to the ledger inside `evaluate_transition`; only after every one
 /// of them is written does the tracker state change. A crash in between
