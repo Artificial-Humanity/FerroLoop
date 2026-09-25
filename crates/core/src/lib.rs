@@ -4,6 +4,7 @@ mod wire;
 
 pub mod finding;
 pub mod ids;
+pub mod iri;
 pub mod log;
 pub mod model;
 pub mod stale;
@@ -12,6 +13,7 @@ pub mod verdict;
 
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{FindingId, GateId, ProjectId, RecordId};
+pub use iri::{Iri, IriError};
 pub use log::{Attempt, AttemptStatus, GateRun};
 pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
