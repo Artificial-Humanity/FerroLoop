@@ -9,11 +9,11 @@
 //! a file store, `()` for memory).
 
 use crate::finding::{Finding, FindingState};
-use crate::ids::{FindingId, GateId, Kind, ProjectId, seq_iri};
+use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
 use crate::log::GateRun;
 use crate::model::{
-    CommandSpec, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
+    CommandSpec, GateDef, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use crate::verdict::Verdict;
@@ -69,6 +69,7 @@ pub fn all_roles<S: Catalog + Tracker + Ledger + Handles, G>(make: impl Fn() -> 
     let cases: &[fn(&S)] = &[
         an_id_this_store_never_held_is_not_owned_rather_than_absent::<S>,
         a_list_over_a_project_this_store_never_held_is_refused_not_empty::<S>,
+        a_finding_on_a_record_this_store_never_held_is_refused::<S>,
         an_id_of_another_kind_is_owned_but_not_found::<S>,
         handles_are_per_kind_and_start_at_one::<S>,
         no_operation_gives_up_an_owned_id::<S>,
@@ -244,15 +245,82 @@ fn the_logs_are_append_only_and_read_back_in_order<S: Catalog + Ledger>(s: &S) {
     assert_eq!(runs[1].population, 5);
 }
 
+/// Asserts that every result is `NotOwned` and names `id`. Each result is
+/// labelled with the method that produced it, so a failure says which
+/// method answered for an id its store never held.
+fn assert_all_not_owned(id: &Iri, results: Vec<(&str, Result<(), StoreError>)>) {
+    assert!(
+        !results.is_empty(),
+        "no methods were asked, so nothing was checked"
+    );
+    for (method, result) in results {
+        match result {
+            Err(e @ StoreError::NotOwned { .. }) => {
+                assert!(e.to_string().contains(id.as_str()), "{method}: {e}");
+            }
+            other => panic!("{method} answered {other:?} for an id its store never held"),
+        }
+    }
+}
+
+// ⚠ Every method that takes an id must refuse a stranger with `NotOwned`,
+// never answer `None`, and never act on it. One case per shape, so a store
+// that skips the check in any single method fails here by name.
 fn an_id_this_store_never_held_is_not_owned_rather_than_absent<S: Catalog + Tracker + Ledger>(
     s: &S,
 ) {
-    let stranger = GateId(stranger());
-    let err = s
-        .get_gate(&stranger)
-        .expect_err("an unheld id must not read as `None`");
-    assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
-    assert!(err.to_string().contains(stranger.iri().as_str()), "{err}");
+    let id = stranger();
+    let (p, g, r, f) = (
+        ProjectId(id.clone()),
+        GateId(id.clone()),
+        RecordId(id.clone()),
+        FindingId(id.clone()),
+    );
+    let gate_def = GateDef {
+        id: g.clone(),
+        project: p.clone(),
+        name: "g".into(),
+        kind: sample_kind(),
+        selector: sample_selector(),
+        min_population: 1,
+        authored_at_commit: "abc".into(),
+        authored_by: "o".into(),
+        last_pass_commit: None,
+    };
+    let mut finding = Finding::raise(p.clone(), r.clone(), "a", "c");
+    finding.id = f.clone();
+    assert_all_not_owned(
+        &id,
+        vec![
+            ("get_project", s.get_project(&p).map(drop)),
+            ("get_gate", s.get_gate(&g).map(drop)),
+            ("get_record", s.get_record(&r).map(drop)),
+            ("get_finding", s.get_finding(&f).map(drop)),
+            ("get_transition", s.get_transition(&p, "launch").map(drop)),
+            ("gate_runs", s.gate_runs(&g).map(drop)),
+            ("update_gate", s.update_gate(&gate_def)),
+            ("update_finding", s.update_finding(&finding)),
+            ("set_record_state", s.set_record_state(&r, State::Doing)),
+            (
+                "add_gate",
+                s.add_gate(&p, "g", sample_kind(), sample_selector(), 1, "abc", "o")
+                    .map(drop),
+            ),
+            ("add_record", s.add_record(&p, "t").map(drop)),
+            ("add_finding", s.add_finding(finding.clone()).map(drop)),
+            (
+                "add_transition",
+                s.add_transition(Transition {
+                    project: p.clone(),
+                    name: "launch".into(),
+                    from: State::Review,
+                    to: State::Done,
+                    regret: Regret::High,
+                    gates: vec![],
+                }),
+            ),
+        ],
+    );
 }
 
 fn a_list_over_a_project_this_store_never_held_is_refused_not_empty<
@@ -260,19 +328,32 @@ fn a_list_over_a_project_this_store_never_held_is_refused_not_empty<
 >(
     s: &S,
 ) {
-    let stranger = ProjectId(stranger());
-    for result in [
-        s.list_gates(&stranger).map(|v| v.len()),
-        s.list_transitions(&stranger).map(|v| v.len()),
-        s.list_records(&stranger).map(|v| v.len()),
-        s.list_findings(&stranger).map(|v| v.len()),
-        s.attempts(&stranger).map(|v| v.len()),
-    ] {
-        assert!(
-            matches!(result, Err(StoreError::NotOwned { .. })),
-            "{result:?}"
-        );
-    }
+    let id = stranger();
+    let p = ProjectId(id.clone());
+    assert_all_not_owned(
+        &id,
+        vec![
+            ("list_gates", s.list_gates(&p).map(drop)),
+            ("list_transitions", s.list_transitions(&p).map(drop)),
+            ("list_records", s.list_records(&p).map(drop)),
+            ("list_findings", s.list_findings(&p).map(drop)),
+            ("attempts", s.attempts(&p).map(drop)),
+        ],
+    );
+}
+
+// The project is held, so only the record check can refuse this. A store
+// that checked the project alone would store a finding about a record it
+// never held.
+fn a_finding_on_a_record_this_store_never_held_is_refused<S: Catalog + Tracker + Ledger>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let id = stranger();
+    let finding = Finding::raise(p.clone(), RecordId(id.clone()), "a", "c");
+    assert_all_not_owned(&id, vec![("add_finding", s.add_finding(finding).map(drop))]);
+    assert!(
+        s.list_findings(&p).unwrap().is_empty(),
+        "nothing may be stored"
+    );
 }
 
 fn an_id_of_another_kind_is_owned_but_not_found<S: Catalog + Tracker + Ledger>(s: &S) {

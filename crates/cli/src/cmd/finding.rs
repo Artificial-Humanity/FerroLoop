@@ -5,7 +5,7 @@ use fl_core::Kind;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::store::{Roles, Tracker};
-use fl_exec::finding::{attach_reproduction, verify_finding};
+use fl_exec::finding::{FindingExecError, attach_reproduction, verify_finding};
 use fl_store::RedbStore;
 use std::collections::BTreeSet;
 
@@ -66,6 +66,27 @@ fn finding(store: &RedbStore, r: &Ref) -> Result<Finding> {
     Ok(f)
 }
 
+/// Render a fl-exec refusal for a person. fl-exec knows items only by IRI,
+/// so the variants that name an item are re-spelled here with what the user
+/// typed (`finding`, and `gate` where the command took one). Every other
+/// variant names no id and passes through unchanged.
+fn explain(e: FindingExecError, finding: &Ref, gate: Option<&Ref>) -> anyhow::Error {
+    match e {
+        FindingExecError::NoSuchFinding(_) => anyhow::anyhow!("no finding {finding}"),
+        FindingExecError::NoSuchGate(_) => match gate {
+            Some(g) => anyhow::anyhow!("no gate {g}"),
+            None => anyhow::anyhow!("{e}"),
+        },
+        FindingExecError::NotAssigned(_, state) => anyhow::anyhow!(
+            "finding {finding} is in state {state}, and only an assigned finding can be verified"
+        ),
+        FindingExecError::NoReproduction(_) => {
+            anyhow::anyhow!("finding {finding} has no reproduction")
+        }
+        other => anyhow::anyhow!("{other}"),
+    }
+}
+
 pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Raise { record, claim, by } => {
@@ -87,7 +108,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             let fid = finding_id(store, &finding)?;
             let gid = GateId(refs::resolve(store, store.label(), Kind::Gate, &gate)?);
             let report = attach_reproduction(Roles::single(store), &fid, &gid)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                .map_err(|e| explain(e, &finding, Some(&gate)))?;
             println!(
                 "{finding}\treproduced\tgate {gate} failed over {} items",
                 report.verdict.population().unwrap_or(0)
@@ -101,8 +122,8 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Verify { finding } => {
             let id = finding_id(store, &finding)?;
-            let report =
-                verify_finding(Roles::single(store), &id).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let report = verify_finding(Roles::single(store), &id)
+                .map_err(|e| explain(e, &finding, None))?;
 
             if report.reproduction.verdict.is_pass() {
                 println!(

@@ -345,3 +345,23 @@ fn verify_says_error_when_the_instrument_broke_and_fail_when_the_defect_is_real(
         .stdout(contains("REPRODUCTION\tERROR\t").and(contains("could not be run")))
         .stdout(contains("still fails").not());
 }
+
+// Human output names an item by what the user typed, never by its IRI. The
+// refusal for verifying an unassigned finding comes from fl-exec, which only
+// knows the IRI, so the CLI has to put the handle back.
+#[test]
+fn verifying_an_unassigned_finding_is_refused_by_its_handle_not_its_iri() {
+    let f = fixture();
+    f.setup();
+    f.cli()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success(); // finding 1
+    f.cli()
+        .args(["finding", "verify", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("finding 1 is in state raised").and(contains("urn:uuid:").not()));
+}

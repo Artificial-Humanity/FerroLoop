@@ -322,12 +322,22 @@ fn an_iri_typed_in_uppercase_names_the_same_item() {
 fn handle_input_at_the_edges_is_refused_by_name() {
     let d = tempfile::tempdir().unwrap();
     let _repo = project(&d);
-    for bad in ["0", "7", "99999999999999999999", "3abc"] {
+    // The whole refusal phrase, not the bare input: `0` or `7` alone would
+    // also match the temp directory in the store's path.
+    for (bad, refusal) in [
+        ("0", "there is no gate 0 in the store"),
+        ("7", "there is no gate 7 in the store"),
+        (
+            "99999999999999999999",
+            "`99999999999999999999` is too large to be a handle",
+        ),
+        ("3abc", "`3abc` is neither a handle"),
+    ] {
         cli(&d)
             .args(["gate", "show", bad])
             .assert()
             .code(2)
-            .stderr(contains(bad));
+            .stderr(contains(refusal));
     }
 }
 
@@ -335,9 +345,18 @@ fn handle_input_at_the_edges_is_refused_by_name() {
 fn a_list_over_a_project_that_does_not_exist_is_refused_not_empty() {
     let d = tempfile::tempdir().unwrap();
     let _repo = project(&d);
+    // A handle that does not exist is refused at the edge, by `resolve`.
     cli(&d)
         .args(["record", "list", "--project", "9"])
         .assert()
         .code(2)
-        .stderr(contains("9"));
+        .stderr(contains("there is no project 9 in the store"));
+    // An IRI goes through to the store, whose list refuses a project it
+    // never held — it must not print an empty list and exit 0.
+    let stranger = "urn:uuid:0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b";
+    cli(&d)
+        .args(["record", "list", "--project", stranger])
+        .assert()
+        .code(2)
+        .stderr(contains("no store holds").and(contains(stranger)));
 }
