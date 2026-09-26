@@ -5,6 +5,19 @@
 **Scope:** An optional layer that runs FerroLoop's gates on a pull request and
 records external instrument output to a review surface.
 
+⚠ **Updated 2026-09-26 by the GitHub tracker spec** (`2026-09-26-github-tracker-design.md`),
+sub-project 2 of the identity spec's plan. Three things in this document change; nothing else
+does:
+
+* **The App is no longer deferred** for the tracker. It is how agents write to GitHub Issues
+  with a bot identity (tracker spec §5). §2.7's reasons for deferring it still hold for
+  hosting, webhooks and the router.
+* **§2.1, the acceptance manifest, is built** by the tracker sub-project (tracker spec §4), so
+  that another machine can resolve the gate an issue names.
+* **GitHub can be the system of record.** In GitHub mode the tracker's items live in Issues,
+  so there is nothing to reconcile for them. §3.5's one-way reconciliation still holds for
+  **observations**, which remain roadmap.
+
 ---
 
 ## Reading this document
