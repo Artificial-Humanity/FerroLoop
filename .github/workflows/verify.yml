@@ -6,7 +6,7 @@
 # push" — a documented guard that never ran, which is the exact defect this
 # project exists to catch.
 #
-# On a pull request this run GATES the merge: branch protection requires the
+# On a pull request this run GATES the merge: the `main` ruleset requires the
 # `test, clippy, fmt` check by name, so renaming the job below silently breaks
 # the gate. The push to `main` runs the trio again on the merged result.
 #
