@@ -29,7 +29,7 @@ three roles — Catalog, Tracker, Ledger — and named four sub-projects. This i
 
 | role | mode A (this sub-project) |
 |---|---|
-| Catalog | the local store; or, on a machine that does not hold the project, the committed manifest |
+| Catalog | the local store — on a machine that does not author the project, a store the committed manifest was imported into |
 | Tracker | **GitHub Issues** |
 | Ledger | the local store |
 
@@ -52,6 +52,12 @@ GitHub mode is a permanently supported configuration. The local tracker stays th
 6. **Encoding:** a state label plus a metadata block in the issue body (§3), chosen over a
    bot-owned comment (N+1 reads per list) and over GitHub's native issue fields (not
    available to every repository).
+7. **Other machines import the manifest** into their local store (§4.2), chosen over a
+   read-only manifest catalog. Found while planning: a gate run writes a pass mark into the
+   catalog and a run into the ledger, and the ledger refuses a gate its store does not hold,
+   so a read-only catalog could not run a gate at all. The alternatives were to allow gate
+   runs only on the authoring machine, or to let the ledger hold rows for gates it does not
+   own; the second weakens the ledger's ownership check.
 
 ### 0.2 Out of scope
 
@@ -82,22 +88,26 @@ records its licence. Each must be compatible with Apache-2.0. No dependency may 
 runtime service or a program outside the binary. *(Invariant — the single-binary rule.)* A
 subprocess to the `gh` CLI was rejected on that rule.
 
-### 1.2 `ManifestCatalog` (in `fl-store`)
+### 1.2 Manifest import (in `fl-store`)
 
-A read-only `Catalog` over the committed manifest file (§4). It owns exactly the IRIs the file
-lists. Every write method refuses with a new `StoreError::ReadOnly`.
+`RedbStore` gains an import of the committed manifest (§4.2). It writes the manifest's project,
+gates and transitions under **their existing IRIs** and marks the project as imported, with the
+manifest's hash. The store then owns those IRIs, so the ledger and the pass marks work without
+change. There is no separate manifest catalog type.
 
 ### 1.3 Role binding
 
 The existing `Roles` value binds each role to a store. In GitHub mode:
 
-* **Catalog** — the local store if it holds the project, otherwise `ManifestCatalog`. On the
-  authoring machine both hold the gates; §4.5 says what happens when they disagree.
+* **Catalog** — the local store. On the authoring machine it holds the project as authored;
+  on any other machine it holds the project as imported. §4.3 and §4.5 say how each is kept
+  consistent with the manifest.
 * **Tracker** — `GithubTracker`.
 * **Ledger** — the local store.
 
-The engine code does not change: `move_record`, `attach_reproduction` and `verify_finding`
-already take `Roles`. The ledger write still precedes the tracker write, so the
+The engine's flows do not change shape: `move_record`, `attach_reproduction` and
+`verify_finding` already take `Roles`. The one engine change is §4.2's: a failed pass-mark
+write stops being discarded. The ledger write still precedes the tracker write, so the
 evidence-before-state rule of identity spec §3.5 holds across the two stores.
 *(Invariant, restated.)*
 
@@ -295,7 +305,8 @@ actor.
 `fl manifest export` writes `.fl/manifest.json` in the project root:
 
 * `format_version`;
-* the project IRI, every gate definition, and every transition of the project;
+* the project IRI, every gate definition, and every transition of the project. A gate's
+  `last_pass_commit` is **not** exported: it is a pass mark earned on one machine (§4.2);
 * a provenance stamp: the commit at export and the export time. It holds **no store path** —
   a store path is specific to a machine, and the repository can be public;
 * `content_sha256` over a canonical form of the content.
@@ -304,16 +315,35 @@ All gates are exported, not only those an issue names: the whole set is simpler,
 can become a reproduction. The export prints each gate it writes, because a gate command can
 name local paths and the file is about to enter the repository.
 
-### 4.2 Reading
+### 4.2 Import
 
-On a machine that does not hold the project, `ManifestCatalog` reads the file. A hash mismatch
-means a hand edit, and fl refuses the file. The store is the only place a gate is authored.
-*(Invariant.)*
+On a machine that does not author the project, `fl manifest import` reads the file and writes
+its project, gates and transitions into the local store, in one transaction, under their
+existing IRIs. The store records the project as **imported**, with the manifest's
+`content_sha256`.
+
+* **A hash mismatch** means a hand edit, and the import refuses the file. The store where the
+  project is authored is the only place a gate is authored. *(Invariant.)*
+* **An authoring store refuses an import** of its own project. It already holds the source.
+* **A re-import** replaces the definitions with the manifest's. A gate whose definition did not
+  change keeps its local pass mark; a gate whose definition changed loses it, because the mark
+  was earned by another definition. A re-import that would remove a gate the store holds is
+  refused, and names the gate: removing a gate removes a neighbour from every future verify.
+  *(Release scope.)*
+* **An imported definition cannot be edited locally.** The store refuses any gate update that
+  changes more than `last_pass_commit`, refuses `add_gate` and `add_transition` on an imported
+  project, and names the remedy: change it where it is authored, export, commit, import.
+  *(Invariant.)*
+* **Pass marks are local to each machine.** The ledger is local in mode A, so a neighbour
+  gate that passed on one machine and never ran on another is not a neighbour there.
+* **A failed pass-mark write is an ERROR.** The engine discards that error today
+  (`let _ = catalog.update_gate(..)` in `evaluate.rs`); a lost mark silently removes a
+  neighbour from later verifies, so the discard is removed. *(Invariant.)*
 
 ### 4.3 Stale detection
 
 Before fl writes a gate IRI into an issue — when it attaches a reproduction — it compares that
-gate in the store with the gate in the manifest. If they differ, or the gate is absent from the
+gate in the store with the gate in the manifest, ignoring `last_pass_commit`. If they differ, or the gate is absent from the
 manifest, fl refuses: *run `fl manifest export`, then commit*. *(Invariant.)*
 
 ### 4.4 The file must be committed
@@ -322,10 +352,12 @@ Before the same write, fl checks that the manifest is tracked by git and has no 
 and refuses otherwise. fl cannot check that the commit was pushed, and says so in the refusal's
 documentation. *(Release scope.)*
 
-### 4.5 Both catalogs on one machine
+### 4.5 The imported copy must match the manifest
 
-On the authoring machine the store and the manifest both own the gate's IRI. They must agree.
-A disagreement is the stale case of §4.3; fl never picks one of the two silently.
+On an importing machine, before fl runs a gate or writes a gate IRI into an issue, it compares
+the manifest's `content_sha256` with the hash recorded at import. If they differ, fl refuses:
+*run `fl manifest import`*. On the authoring machine the stale check of §4.3 applies instead.
+Either way, the store and the manifest must agree, and fl never picks one of the two silently.
 *(Invariant.)*
 
 ### 4.6 `CODEOWNERS`
@@ -399,8 +431,12 @@ The identity spec's principle carries over unchanged: every failure path disting
 | security finding, repository not `private` | refused |
 | visibility read fails | **ERROR** |
 | manifest hand-edited, stale, or uncommitted | refused, naming the remedy |
+| an import into the store that authors the project | refused |
+| a re-import that removes a gate | refused, naming the gate |
+| a local edit of an imported gate or transition | refused, naming the remedy |
+| a pass mark cannot be written | **ERROR** |
 
-New `StoreError` variants: `ReadOnly`, `Diverged`, `Conflict`, `NotAnFlItem`, `Moved`,
+New `StoreError` variants: `Imported`, `Diverged`, `Conflict`, `NotAnFlItem`, `Moved`,
 `RateLimited`, `RepositoryReplaced`. Their exact shape is the plan's.
 
 ---
@@ -456,7 +492,10 @@ clean round is not evidence.
 ### 8.4 Manifest
 
 A hand edit, a stale gate, a missing gate and an uncommitted file each give a refusal, and each
-refusal test fails when its refusal is removed.
+refusal test fails when its refusal is removed. So do: an import into the authoring store, a
+re-import that removes a gate, a local edit of an imported gate, and a manifest that changed
+since import. A re-import keeps the pass mark of an unchanged gate and drops the mark of a
+changed one. A pass-mark write that fails makes the gate run an ERROR.
 
 ### 8.5 Existing tests
 
