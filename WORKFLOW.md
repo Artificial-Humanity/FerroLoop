@@ -13,19 +13,20 @@ Follow [AGENTS.md](AGENTS.md) for repository rules and git configuration.
    trio on the pull request; the `test, clippy, fmt` check must pass before the merge
    button is available.
 5. The owner reviews and merges. Merging happens through the pull request. A direct
-   push to `main` is not the route, and branch protection refuses one.
+   push to `main` is not the route, and the ruleset refuses one.
 
 ## Commit identity and safeguards
 
 * Keep the owner's configured git author identity. Use [PERSONA.md](PERSONA.md)
   for the agent's co-author identity.
-* `main` is protected. A pull request is required, the `test, clippy, fmt` check must
-  pass, the branch must be current with `main`, and review conversations must be
-  resolved. Force-pushes and deletions are refused. There is no pre-push gate on the
-  local side — observe the git safeguards in `AGENTS.md`.
-* **A repository admin can bypass every rule above.** `enforce_admins` is off, so
-  protection is a guard rail for the normal path, not a wall. Treat the pull request as
-  the route because it is the workflow, not because git will stop you.
+* `main` is protected by the repository ruleset "Main Protection". A pull request is
+  required, the `test, clippy, fmt` check must pass, the branch must be current with
+  `main`, and review conversations must be resolved. No approving review is required,
+  because the owner authors and merges. Force-pushes and deletions are refused. There is
+  no pre-push gate on the local side — observe the git safeguards in `AGENTS.md`.
+* **The rules bind everyone, the owner included.** The ruleset has no bypass list, so
+  no account can push to `main` directly or merge with a red check. Changes to the
+  ruleset belong to the owner.
 * CI runs the verification trio on every pull request and on every push to `main`:
   [.github/workflows/verify.yml](.github/workflows/verify.yml). On a pull request it
   **blocks the merge**. A branch push with no pull request does not run CI. Run the trio
