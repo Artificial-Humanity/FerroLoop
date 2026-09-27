@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/store", "crates/exec", "crates/cli"]
+members = ["crates/core", "crates/store", "crates/exec", "crates/cli", "crates/github"]
 resolver = "3"
 
 [workspace.package]
@@ -24,3 +24,7 @@ predicates = "3.1.4"
 uuid = { version = "1.26", features = ["v7"] }
 toml = "1.1"
 sha2 = "0.10"
+ureq = { version = "3.4", features = ["json"] }
+ring = "0.17"
+base64 = "0.22"
+tiny_http = "0.12"
