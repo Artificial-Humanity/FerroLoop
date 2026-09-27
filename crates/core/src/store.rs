@@ -49,7 +49,7 @@ pub enum StoreError {
     /// a local edit would make this copy disagree with the manifest every
     /// other reader resolves.
     #[error(
-        "this store imported {id}'s project from a manifest, so it cannot {action} it. \
+        "{id}'s project was imported from a manifest, so this store cannot {action} it. \
          Change it in the store that authors the project, run `fl manifest export` there, \
          commit, then run `fl manifest import` here."
     )]

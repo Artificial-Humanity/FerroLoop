@@ -26,6 +26,15 @@ impl Git {
         git(root, &["rev-parse", "HEAD"])
     }
 
+    /// Whether `rel` (relative to `root`) is tracked and has no uncommitted
+    /// change. Untracked is `false`, not an error; a git that cannot answer
+    /// is an error, never `false`.
+    pub fn is_committed(root: &Path, rel: &str) -> Result<bool, ExecError> {
+        let tracked = !git(root, &["ls-files", "--", rel])?.is_empty();
+        let clean = git(root, &["status", "--porcelain", "--", rel])?.is_empty();
+        Ok(tracked && clean)
+    }
+
     /// Absolute paths that differ between two commits.
     pub fn changed_between(root: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>, ExecError> {
         let text = git(root, &["diff", "--name-only", from, to])?;
@@ -121,5 +130,35 @@ mod tests {
     fn a_non_repository_is_an_error_and_never_an_empty_answer() {
         let d = tempfile::tempdir().unwrap();
         assert!(matches!(Git::head(d.path()), Err(ExecError::Git(_))));
+    }
+
+    #[test]
+    fn is_committed_tells_untracked_modified_and_committed_apart() {
+        let d = repo();
+        fs::create_dir_all(d.path().join(".fl")).unwrap();
+        fs::write(d.path().join(".fl/manifest.json"), "{}").unwrap();
+        assert!(
+            !Git::is_committed(d.path(), ".fl/manifest.json").unwrap(),
+            "untracked"
+        );
+        commit(d.path(), "manifest");
+        assert!(
+            Git::is_committed(d.path(), ".fl/manifest.json").unwrap(),
+            "committed"
+        );
+        fs::write(d.path().join(".fl/manifest.json"), "{ }").unwrap();
+        assert!(
+            !Git::is_committed(d.path(), ".fl/manifest.json").unwrap(),
+            "modified"
+        );
+    }
+
+    #[test]
+    fn is_committed_outside_a_repository_is_an_error_not_false() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            Git::is_committed(d.path(), ".fl/manifest.json"),
+            Err(ExecError::Git(_))
+        ));
     }
 }

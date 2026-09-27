@@ -101,6 +101,14 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 );
             };
 
+            let gated = store
+                .list_transitions(&record.project)?
+                .iter()
+                .any(|t| t.from == record.state && t.to == state);
+            if gated {
+                crate::cmd::manifest::ensure_import_current(store, &record.project)?;
+            }
+
             let report = move_record(Roles::single(store), &record, state)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             // What the person reads back: the record's handle (or its
