@@ -1891,6 +1891,35 @@ mod tests {
         );
     }
 
+    /// Fix round 1: `current_ref`'s `Moved` branch (a node lookup answers a
+    /// repository id that is not the one this tracker is bound to — the
+    /// issue was transferred elsewhere) was unreachable, because the fake's
+    /// node lookup always answered under the bound repository. The fake's
+    /// `transferred_nodes` knob makes it answer as GitHub does for a
+    /// transferred issue: a different `repository.id`, and a URL under a
+    /// name this tracker does not own.
+    #[test]
+    fn a_transferred_records_reference_is_a_moved_error_naming_the_new_url() {
+        let fake = FakeGithub::start("acme/widgets");
+        let memory = MemStore::default();
+        let (t, _) = GithubTracker::open(client(&fake), "acme/widgets", &memory).unwrap();
+        let r = t.add_record(&p(), "t").unwrap();
+        t.add_finding(Finding::raise(p(), r, "a", "c")).unwrap();
+        fake.rename("acme/gadgets");
+        fake.reuse_name("acme/widgets");
+        let record_node_id = fake.issue(1).node_id;
+        fake.state().transferred_nodes.insert(record_node_id);
+        let (t, _) = GithubTracker::open(client(&fake), "acme/gadgets", &memory).unwrap();
+        let err = t.get_finding(&FindingId(t.issue_url(2))).unwrap_err();
+        match err {
+            StoreError::Moved { id, to } => {
+                assert_eq!(id.as_str(), "https://github.com/acme/widgets/issues/1");
+                assert_eq!(to, "https://github.com/elsewhere/transferred/issues/1");
+            }
+            other => panic!("expected Moved, got {other:?}"),
+        }
+    }
+
     /// The same suites the local stores pass (spec §8.1): the GitHub
     /// tracker over a `MemStore` catalog and ledger, checked by
     /// `CatalogChecked`, numbered by `KindRouted`.

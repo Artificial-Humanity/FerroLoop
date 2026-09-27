@@ -106,6 +106,11 @@ pub struct State {
     /// body. GitHub documents 201; this models a 2xx it has not been seen to
     /// send (unmeasured — Task 10's live test is the check). One-shot.
     pub create_answers_200_next: bool,
+    /// Node ids a `node(id: …)` lookup answers as living in ANOTHER
+    /// repository — simulating a transferred issue (spec's `Moved` case).
+    /// Modelled, not measured: this is the fake's guess at the shape of
+    /// GitHub's real answer; Task 10's live test is the check. Not one-shot.
+    pub transferred_nodes: BTreeSet<String>,
 }
 
 pub struct FakeGithub {
@@ -763,10 +768,23 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 .values()
                 .find(|i| i.node_id == id && !i.gone)
                 .map(|i| {
-                    json!({
-                        "url": format!("https://github.com/{}/issues/{}", s.bound().full_name, i.number),
-                        "repository": {"id": s.bound().node_id},
-                    })
+                    if s.transferred_nodes.contains(&i.node_id) {
+                        // A transferred issue: answered under a repository
+                        // this fake never otherwise models, with a node id
+                        // that is never the bound repository's.
+                        json!({
+                            "url": format!(
+                                "https://github.com/elsewhere/transferred/issues/{}",
+                                i.number
+                            ),
+                            "repository": {"id": "R_elsewhere"},
+                        })
+                    } else {
+                        json!({
+                            "url": format!("https://github.com/{}/issues/{}", s.bound().full_name, i.number),
+                            "repository": {"id": s.bound().node_id},
+                        })
+                    }
                 });
             match node {
                 Some(n) => answer(200, json!({"data": {"node": n}})),
