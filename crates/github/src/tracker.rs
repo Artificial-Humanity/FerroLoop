@@ -86,6 +86,23 @@ fn backend(msg: String) -> StoreError {
     StoreError::Backend(msg)
 }
 
+/// The resend inside `after_ambiguous_create` gets the "list before
+/// retrying" advice ONLY for a transport failure — the one case where fl
+/// genuinely cannot tell whether this second attempt is about to duplicate
+/// the first (fix round 1, item 5b). Any other error — a credential
+/// problem, say — is not about that ambiguity, and naming it "GitHub could
+/// not be reached" would misreport it; it passes through with its own
+/// variant untouched (fix round 2, item 3).
+fn wrap_resend_error(e: StoreError) -> StoreError {
+    match e {
+        e @ StoreError::Unreachable { .. } => backend(format!(
+            "GitHub could not be reached to retry an issue create a second time ({e}). List \
+             the repository's fl issues before retrying, so the retry makes no duplicate"
+        )),
+        other => other,
+    }
+}
+
 fn text(v: &Value, k: &str) -> Result<String, StoreError> {
     v.get(k)
         .and_then(Value::as_str)
@@ -365,7 +382,18 @@ impl GithubTracker {
     }
 
     /// The fl item `id` names, when it is of kind `want`.
-    fn item(&self, id: &Iri, want: ItemKind) -> Result<Found, StoreError> {
+    ///
+    /// `remember`: whether this read updates `seen` (fix round 2, item 1 —
+    /// the same rule `list` already follows, fix round 1 item 1). Only a
+    /// read the CALLER directly asked for and directly receives —
+    /// `get_record`, `get_finding` — may do that. `add_finding`'s own read
+    /// of the record it points at is a validity check, not a hand-off: the
+    /// caller never sees that record, so remembering it here would let
+    /// `add_finding` silently move the record's conflict baseline to
+    /// whatever GitHub says right now, without the caller ever having asked
+    /// to look at it — exactly what let `set_record_state`, called right
+    /// after, overwrite a retitle made by someone else in between.
+    fn item(&self, id: &Iri, want: ItemKind, remember: bool) -> Result<Found, StoreError> {
         let n = self.locate(id)?;
         match self.fetch(n)? {
             Fetched::Absent => Ok(Found::Absent),
@@ -378,7 +406,9 @@ impl GithubTracker {
                 }),
                 Read::Item { kind, meta, prose } => {
                     self.kinds.borrow_mut().insert(n, kind);
-                    self.remember(n, &meta, &prose, &issue.title);
+                    if remember {
+                        self.remember(n, &meta, &prose, &issue.title);
+                    }
                     Ok(if kind == want {
                         Found::Item(issue, meta, prose)
                     } else {
@@ -547,9 +577,13 @@ impl GithubTracker {
             .client
             .send_unchecked_json(Method::Post, &path, Some(&sent))
         {
+            // ⚠ A 201 PROVES the create landed (fix round 2, item 2): an
+            // unreadable body is never followed by a resend, only a search
+            // — resending here risks making exactly the duplicate this
+            // whole mechanism exists to avoid.
             Ok(r) if r.status == 201 => match IssueView::from_json(&r.body) {
                 Ok(issue) => issue,
-                Err(_) => self.after_ambiguous_create(kind, meta, &path, &sent)?,
+                Err(_) => self.after_unreadable_create(kind, meta)?,
             },
             // ⚠ An ambiguous failure may already have created the issue.
             // Look for the create key before sending again (spec §3.3).
@@ -571,8 +605,30 @@ impl GithubTracker {
         Ok(issue)
     }
 
+    /// Search for a create by its key, `settle` apart, up to three times.
+    /// `Ok(None)` when none of the three searches found it.
+    fn search_by_create_key(
+        &self,
+        kind: ItemKind,
+        key: &str,
+    ) -> Result<Option<IssueView>, StoreError> {
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(self.settle);
+            }
+            if let Some(found) = self.find_by_create_key(kind, key)? {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
     /// ⚠ The list GitHub serves may lag a create that just landed, so the
-    /// key is searched for three times, `settle` apart, before one resend.
+    /// key is searched for first; only when EVERY search misses is the
+    /// create sent again. Only for a FIRST-attempt failure where the create
+    /// may not have happened at all — a 5xx answer, or the connection
+    /// dropping before an answer arrived. See `after_unreadable_create` for
+    /// the case where it certainly did (fix round 2, item 2).
     fn after_ambiguous_create(
         &self,
         kind: ItemKind,
@@ -580,29 +636,21 @@ impl GithubTracker {
         path: &str,
         sent: &Value,
     ) -> Result<IssueView, StoreError> {
-        for attempt in 0..3 {
-            if attempt > 0 {
-                std::thread::sleep(self.settle);
-            }
-            if let Some(found) = self.find_by_create_key(kind, &meta.create_key)? {
-                return Ok(found);
-            }
+        if let Some(found) = self.search_by_create_key(kind, &meta.create_key)? {
+            return Ok(found);
         }
         // ⚠ A transport failure here gets the SAME advice as a bad status
         // (fix round 1, item 5b): the search already came up empty, so
         // fl cannot tell whether THIS attempt is about to duplicate an
         // issue the first attempt actually made — only a fresh list can
-        // settle that, same as a plain failed retry.
+        // settle that, same as a plain failed retry. Any OTHER kind of
+        // error (a credential problem, say) is not about that ambiguity at
+        // all, and passes through unchanged (fix round 2, item 3) —
+        // `wrap_resend_error` draws exactly that line.
         let r = self
             .client
             .send(Method::Post, path, Some(sent))
-            .map_err(|e| {
-                backend(format!(
-                    "GitHub could not be reached to retry an issue create a second time \
-                     ({e}). List the repository's fl issues before retrying, so the retry \
-                     makes no duplicate"
-                ))
-            })?;
+            .map_err(wrap_resend_error)?;
         if r.status != 201 {
             return Err(backend(format!(
                 "GitHub failed an issue create twice (the second answer was {}). List the \
@@ -611,6 +659,28 @@ impl GithubTracker {
             )));
         }
         IssueView::from_json(&r.body)
+    }
+
+    /// ⚠ A 201 proves the create landed (fix round 2, item 2): unlike a 5xx
+    /// answer or a dropped connection, there is no "may not have happened"
+    /// here. A miss on every search is never followed by a resend — that
+    /// would risk making exactly the duplicate this whole path exists to
+    /// avoid. The caller is told to list the repository's fl issues itself.
+    fn after_unreadable_create(
+        &self,
+        kind: ItemKind,
+        meta: &Meta,
+    ) -> Result<IssueView, StoreError> {
+        self.search_by_create_key(kind, &meta.create_key)?
+            .ok_or_else(|| {
+                backend(
+                    "GitHub answered 201 to an issue create, but its own body could not be \
+                     read, and the issue could not be found afterward by its create key \
+                     either. List the repository's fl issues before retrying, so the retry \
+                     makes no duplicate"
+                        .to_string(),
+                )
+            })
     }
 
     fn find_by_create_key(
@@ -800,7 +870,7 @@ impl Tracker for GithubTracker {
     }
 
     fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
-        match self.item(id.iri(), ItemKind::Record)? {
+        match self.item(id.iri(), ItemKind::Record, true)? {
             Found::Item(issue, meta, _) => self.record_from(&issue, &meta).map(Some),
             Found::OtherKind(_) | Found::Absent => Ok(None),
         }
@@ -831,7 +901,9 @@ impl Tracker for GithubTracker {
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         // The record must be an fl record of this repository (spec §3.1).
-        let record = match self.item(finding.record.iri(), ItemKind::Record)? {
+        // ⚠ `remember: false` (fix round 2, item 1): this is a validity
+        // check, not a read the caller receives the record from.
+        let record = match self.item(finding.record.iri(), ItemKind::Record, false)? {
             Found::Item(issue, _, _) => issue,
             Found::OtherKind(k) => {
                 return Err(StoreError::WrongKind {
@@ -864,7 +936,7 @@ impl Tracker for GithubTracker {
     }
 
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
-        match self.item(id.iri(), ItemKind::Finding)? {
+        match self.item(id.iri(), ItemKind::Finding, true)? {
             Found::Item(issue, meta, prose) => self.finding_from(&issue, &meta, &prose).map(Some),
             Found::OtherKind(_) | Found::Absent => Ok(None),
         }
@@ -1106,6 +1178,59 @@ mod tests {
         );
     }
 
+    /// Fix round 2, item 2: a 201 PROVES the create landed, even when its
+    /// own body cannot be read. If the create-key search then misses too
+    /// (GitHub's list index lagging indefinitely, say), the right answer is
+    /// to refuse and say so — never to send the create again, which would
+    /// make the very duplicate this whole mechanism exists to prevent.
+    #[test]
+    fn an_unreadable_201_whose_create_key_search_misses_is_refused_never_resent() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().unreadable_create_body_next = true;
+        fake.state().omit_from_list = Some(1);
+        let err = t.add_record(&p(), "t").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("List the repository's fl issues before retrying"),
+            "{err}"
+        );
+        assert_eq!(
+            fake.issue_count(),
+            1,
+            "the create landed even though it could not be found again — a resend would \
+             duplicate it"
+        );
+    }
+
+    /// Fix round 2, item 3: unit-level, no fake — `wrap_resend_error`'s own
+    /// contract. A `Credential` error is not about whether the resend's
+    /// write is ambiguous; it must keep its own variant, unlike a transport
+    /// failure (fix round 1, item 5b), which gets the retry advice. This
+    /// case is not provoked through the fake because the fake's create
+    /// route has no path that answers 401 specifically on a resend without
+    /// also changing what the first attempt saw — a knob built only to
+    /// force one match arm would test the knob, not the guard.
+    #[test]
+    fn the_resends_own_error_is_wrapped_only_when_it_is_a_transport_failure() {
+        let credential = StoreError::Credential("bad token".into());
+        match wrap_resend_error(credential) {
+            StoreError::Credential(msg) => assert_eq!(msg, "bad token"),
+            other => panic!("a non-transport error must pass through unchanged: {other:?}"),
+        }
+        let unreachable = StoreError::Unreachable {
+            store: "http://127.0.0.1:1".into(),
+            cause: "boom".into(),
+        };
+        match wrap_resend_error(unreachable) {
+            StoreError::Backend(msg) => assert!(
+                msg.contains("List the repository's fl issues before retrying"),
+                "{msg}"
+            ),
+            other => panic!("a transport failure must get the retry advice: {other:?}"),
+        }
+    }
+
     /// ⚠ The engine reads, runs gates, then writes. A finding withdrawn by
     /// someone else in between must not be marked fixed.
     #[test]
@@ -1173,6 +1298,43 @@ mod tests {
         );
     }
 
+    /// Control for the test below: with no `add_finding` in between, the
+    /// ordinary conflict check on the record alone already works. Isolates
+    /// that the next test's failure (without the fix) comes specifically
+    /// from `add_finding`'s own read of the record, not from anything else.
+    #[test]
+    fn a_web_retitle_alone_is_still_caught_as_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let _ = t.get_record(&r).unwrap().unwrap();
+        fake.web_edit(1, |i| i.title = "renamed by someone else".into());
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// Fix round 2, item 1: the reviewer's probe. `add_finding` reads the
+    /// record it points at (to check it exists and is a record) via the
+    /// same `item` a direct `get_record` uses. That read must not move the
+    /// record's `seen` baseline — it is a validity check, not something the
+    /// caller receives the record from. Without the fix, `add_finding`'s
+    /// read silently re-baselines `seen` to GitHub's CURRENT state, so the
+    /// `set_record_state` right after compares the current state against
+    /// itself, finds no difference, and overwrites the retitle instead of
+    /// refusing.
+    #[test]
+    fn add_finding_does_not_move_the_records_seen_baseline() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let _ = t.get_record(&r).unwrap().unwrap();
+        fake.web_edit(1, |i| i.title = "renamed by someone else".into());
+        t.add_finding(Finding::raise(p(), r.clone(), "a", "c"))
+            .unwrap();
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
     #[test]
     fn an_update_that_changes_nothing_sends_nothing() {
         let fake = FakeGithub::start("acme/widgets");
@@ -1194,6 +1356,27 @@ mod tests {
         assert!(t.list_records(&ProjectId(seq_iri(2))).unwrap().is_empty());
         fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 2));
         assert!(t.list_records(&p()).is_err(), "never a short list");
+    }
+
+    /// Fix round 2, item 4: the flip side of the test below — a list that
+    /// fits on a single page must not pay for the second-pass stability
+    /// check at all. Nothing can have shifted a page onto or off of itself.
+    #[test]
+    fn a_single_page_list_is_read_once() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record(&p(), "a").unwrap();
+        t.add_record(&p(), "b").unwrap();
+        let before = fake.state().requests.len();
+        assert_eq!(t.list_records(&p()).unwrap().len(), 2);
+        let issue_list_requests = fake.state().requests[before..]
+            .iter()
+            .filter(|r| r.starts_with("GET /repos/acme/widgets/issues?"))
+            .count();
+        assert_eq!(
+            issue_list_requests, 1,
+            "a single page must not be read twice"
+        );
     }
 
     /// Fix round 1, item 2: a list that needed more than one page is read a

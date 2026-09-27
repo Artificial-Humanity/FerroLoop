@@ -92,6 +92,12 @@ pub struct State {
     /// set changing while a multi-page read is under way (spec §3.7). Counts
     /// every list request across every `list()` call, both passes. One-shot.
     pub vanish_after_list_request: Option<(u32, u64)>,
+    /// This issue exists (and a direct `GET` of it succeeds), but every
+    /// issues-LIST answer omits it — simulating GitHub's list index lagging
+    /// a create indefinitely, so a create-key search can never find it. Not
+    /// one-shot: the point is that every one of the search's attempts
+    /// misses, not just the first.
+    pub omit_from_list: Option<u64>,
 }
 
 pub struct FakeGithub {
@@ -579,6 +585,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 .issues
                 .values()
                 .filter(|i| !i.gone && i.moved_to.is_none())
+                .filter(|i| s.omit_from_list != Some(i.number))
                 .filter(|i| want.iter().all(|w| i.labels.contains(w)))
                 .map(|i| s.issue_json(i))
                 .collect();

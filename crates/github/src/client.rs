@@ -66,7 +66,7 @@ impl Client {
     /// prove the write failed, so it must not be reported as a plain
     /// `Backend` error before that caller gets a chance to search for what
     /// it may have already created.
-    pub fn send_unchecked_json(
+    pub(crate) fn send_unchecked_json(
         &self,
         method: Method,
         path_or_url: &str,
