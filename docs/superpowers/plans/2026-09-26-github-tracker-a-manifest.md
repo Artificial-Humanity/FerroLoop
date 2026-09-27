@@ -18,7 +18,7 @@
 - Every failure path distinguishes "nothing" from "didn't look" (spec §7). A catch-all `_ =>` arm on a result that decides evidence is forbidden.
 - Wire and file formats are `snake_case` (decision 33).
 - No new dependency except `sha2 = "0.10"` in `fl-store`. Record its licence (MIT OR Apache-2.0) in the commit message.
-- The store's `FORMAT_VERSION` stays 2. The new `imports` table is additive: it is created by the first import, and its absence reads as "nothing imported" (Task 4 tests this).
+- A store that never imports stays at format 2 and still opens in older builds. The first import raises it to format 3 (`FORMAT_WITH_IMPORTS`) in the same transaction, so an older fl refuses it rather than ignoring the import mark. This build opens both (Task 4). This is the plan's ruling, not the spec's; the owner may reverse it.
 - Each fix is mutation-tested: revert the guard, watch its test go red, restore. Say so in the commit message.
 - Commits keep the owner's author identity and end with `Co-authored-by: Ferris <Ferris@artificialhumanity.io>`.
 - The repository is public. No machine paths, hostnames or lab-internal names in code, tests, docs or commit messages.
@@ -331,15 +331,15 @@ Also update the module doc comment's first paragraph to say that a case which on
 
 Apply this rule to each of the 19 case functions listed in Step 2 (not to `handles_are_per_kind_and_start_at_one`, and not to the `catalog` or `ledger` cases):
 
-1. Signature: `fn NAME<S: …>(s: &S)` becomes `fn NAME(b: &Bound<'_>)`. Keep `pub` where it was `pub`.
+1. Signature: `fn NAME<S: …>(s: &S)` becomes `fn NAME(roles: &Bound<'_>)`. Keep `pub` where it was `pub`. The parameter is `roles`, not `b`: two cases already have locals named `b` (`findings_are_listed_per_project`, `an_alias_already_in_use_is_refused_and_names_it`).
 2. Route each call on `s` to the role that declares the method:
 
 | methods | becomes |
 |---|---|
-| `add_project`, `get_project`, `list_projects`, `add_gate`, `get_gate`, `list_gates`, `update_gate`, `add_transition`, `get_transition`, `list_transitions` | `b.catalog.…` |
-| `add_record`, `get_record`, `list_records`, `set_record_state`, `add_finding`, `get_finding`, `update_finding`, `list_findings`, `withdrawals_by`, `add_alias` | `b.tracker.…` |
-| `append_gate_run`, `append_attempt`, `gate_runs`, `attempts` | `b.ledger.…` |
-| `handle_of`, `resolve_handle` | `b.handles.…` |
+| `add_project`, `get_project`, `list_projects`, `add_gate`, `get_gate`, `list_gates`, `update_gate`, `add_transition`, `get_transition`, `list_transitions` | `roles.catalog.…` |
+| `add_record`, `get_record`, `list_records`, `set_record_state`, `add_finding`, `get_finding`, `update_finding`, `list_findings`, `withdrawals_by`, `add_alias` | `roles.tracker.…` |
+| `append_gate_run`, `append_attempt`, `gate_runs`, `attempts` | `roles.ledger.…` |
+| `handle_of`, `resolve_handle` | `roles.handles.…` |
 
 Example — before:
 
@@ -355,11 +355,11 @@ fn a_record_state_change_is_visible_on_the_next_read<S: Catalog + Tracker>(s: &S
 after:
 
 ```rust
-fn a_record_state_change_is_visible_on_the_next_read(b: &Bound<'_>) {
-    let p = b.catalog.add_project("/tmp/p").unwrap();
-    let r = b.tracker.add_record(&p, "fix the thing").unwrap();
-    b.tracker.set_record_state(&r, State::Doing).unwrap();
-    assert_eq!(b.tracker.get_record(&r).unwrap().unwrap().state, State::Doing);
+fn a_record_state_change_is_visible_on_the_next_read(roles: &Bound<'_>) {
+    let p = roles.catalog.add_project("/tmp/p").unwrap();
+    let r = roles.tracker.add_record(&p, "fix the thing").unwrap();
+    roles.tracker.set_record_state(&r, State::Doing).unwrap();
+    assert_eq!(roles.tracker.get_record(&r).unwrap().unwrap().state, State::Doing);
 }
 ```
 
@@ -378,13 +378,13 @@ In `an_id_has_no_handle_under_any_kind_but_its_own`, replace the loop body's fir
 with:
 
 ```rust
-        let h = b
+        let h = roles
             .handles
             .handle_of(*own, id)
             .unwrap()
             .unwrap_or_else(|| panic!("{id} has no handle as its own kind"));
         assert_eq!(
-            b.handles.resolve_handle(*own, h).unwrap().as_ref(),
+            roles.handles.resolve_handle(*own, h).unwrap().as_ref(),
             Some(id),
             "{id}'s handle resolves back to it"
         );
@@ -397,6 +397,15 @@ and replace the comment above the function with:
 // `handle_of(kind, id)` answers `Some`, so an id held under another kind must
 // answer `None` — never the handle it has under its OWN kind. A store that
 // ignored `kind` would answer `Some` in every row that must be `None`.
+```
+
+Generalising that assertion removes the only check that a local store's first finding gets handle 1. Put it back in the local case: in `handles_are_per_kind_and_start_at_one` (which keeps its generic `<S>` form and its `s.` calls), after `let r = s.add_record(&p, "t").unwrap();` add
+
+```rust
+    let f = s
+        .add_finding(Finding::raise(p.clone(), r.clone(), "a", "c"))
+        .unwrap();
+    assert_eq!(s.handle_of(Kind::Finding, f.iri()).unwrap(), Some(1));
 ```
 
 - [ ] **Step 5: Update the two callers**
@@ -440,7 +449,9 @@ Expected: PASS. If a case fails, the routing table in Step 3 was misapplied in t
 
 - [ ] **Step 7: Check the population did not shrink**
 
-Run: `grep -c '^fn \|^pub fn ' crates/core/src/conformance.rs` before (on `main`) and after. The count of case functions must be equal: this task moves one case between suites and deletes none. Then run `cargo test -p fl-core mem_store_meets 2>&1 | tail -3` and confirm the test ran.
+Sum the declared case counts. Before: `CATALOG_CASES` 3 + `TRACKER_CASES` 12 + `LEDGER_CASES` 1 + `ALL_ROLES_CASES` 8 = 24. After: 3 + 12 + 1 + 7 + `LOCAL_HANDLES_CASES` 1 = 24. The totals must be equal: this task moves one case and deletes none. (A `grep -c '^fn '` count rises by two, because `run_bound` and `local_handles` are new top-level functions; that is expected.) Then run `cargo test -p fl-core mem_store_meets 2>&1 | tail -3` and confirm the test ran.
+
+**Notes for plan B (not work for this task).** `Bound` is only a set of references. A split binding passes `a_list_over_a_project_this_store_never_held_is_refused_not_empty` and the wrong-kind case only if plan B wraps the GitHub tracker in an adapter that checks project references against the catalog (spec §1.3). The wrong-kind case's closing assertions (`resolve_handle(Kind::Gate, 2)`, `(Kind::Record, 2)`, `(Kind::Finding, 1)` are `None`) hold under GitHub numbering as well — issue 2 does not exist and issue 1 is a record — but plan B must confirm that against its fake.
 
 - [ ] **Step 8: Trio and commit**
 
@@ -460,11 +471,13 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 
 ---
 
-### Task 3: The manifest format, its hash, and export
+### Task 3: The manifest format, its hash, export — and the manifest never makes a gate stale
 
 **Files:**
 - Create: `crates/store/src/manifest.rs`
 - Modify: `crates/store/src/lib.rs` (add `pub mod manifest;`)
+- Modify: `crates/core/src/lib.rs` (the `MANIFEST_PATH` constant, so `fl-exec` can use it without depending on `fl-store`)
+- Modify: `crates/exec/src/evaluate.rs` (`staleness_for` ignores the manifest file) and its `mod tests`
 - Modify: `Cargo.toml` (workspace dependency) and `crates/store/Cargo.toml`
 
 **Interfaces:**
@@ -472,22 +485,36 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 
 ```rust
 pub const MANIFEST_FORMAT: u64 = 1;
-pub const MANIFEST_PATH: &str = ".fl/manifest.json";
+pub use fl_core::MANIFEST_PATH; // ".fl/manifest.json", defined in fl-core
 pub struct Provenance { pub commit: String, pub exported_at_unix: u64 }
 pub struct Body { pub format_version: u64, pub provenance: Provenance, pub project: ProjectId,
                   pub gates: Vec<GateDef>, pub transitions: Vec<Transition> }
 pub struct Manifest { pub body: Body, pub content_sha256: String }
 pub enum ManifestError { Parse(String), Format { found: u64 }, HandEdited { recorded: String, found: String },
                          Inconsistent(String), AuthoringStore(ProjectId), NotAuthoring(ProjectId),
-                         WouldRemoveGate(GateId), WouldRemoveTransition(String), Store(StoreError) }
+                         WouldRemoveGate(GateId), RootTaken { root: String, other: ProjectId }, Store(StoreError) }
 pub enum Currency { Current, Differs, Absent }
 pub fn content_sha256(body: &Body) -> Result<String, ManifestError>;
 pub fn export(catalog: &dyn Catalog, project: &ProjectId, commit: &str, exported_at_unix: u64) -> Result<Manifest, ManifestError>;
 impl Manifest {
     pub fn to_json(&self) -> String;
     pub fn parse(text: &str) -> Result<Manifest, ManifestError>;
+    pub fn verify(&self) -> Result<(), ManifestError>; // hash + internal consistency
     pub fn currency_of(&self, def: &GateDef) -> Currency;
 }
+// fl-core
+pub const MANIFEST_PATH: &str = ".fl/manifest.json";
+```
+
+- [ ] **Step 0: Put `MANIFEST_PATH` in `fl-core`**
+
+In `crates/core/src/lib.rs`, after the `pub use` lines, add:
+
+```rust
+/// Where a project's committed manifest lives, relative to the project root
+/// (GitHub tracker spec §4.1). Here rather than in `fl-store` because the
+/// engine must recognise the file too: it never makes a gate stale.
+pub const MANIFEST_PATH: &str = ".fl/manifest.json";
 ```
 
 - [ ] **Step 1: Add the dependency**
@@ -515,8 +542,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub const MANIFEST_FORMAT: u64 = 1;
-/// Where the manifest lives, relative to the project root.
-pub const MANIFEST_PATH: &str = ".fl/manifest.json";
+pub use fl_core::MANIFEST_PATH;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -549,10 +575,13 @@ pub struct Manifest {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
-    #[error("the manifest is not valid: {0}")]
+    #[error(
+        "the manifest is not valid: {0}. Export it again from the store that authors the project"
+    )]
     Parse(String),
     #[error(
-        "the manifest is format {found}, and this version of fl reads format {MANIFEST_FORMAT}"
+        "the manifest is format {found}, and this version of fl reads format \
+         {MANIFEST_FORMAT}. Use a version of fl that reads format {found}"
     )]
     Format { found: u64 },
     #[error(
@@ -561,7 +590,10 @@ pub enum ManifestError {
          from there"
     )]
     HandEdited { recorded: String, found: String },
-    #[error("the manifest is inconsistent: {0}")]
+    #[error(
+        "the manifest is inconsistent: {0}. Export it again from the store that authors the \
+         project"
+    )]
     Inconsistent(String),
     #[error(
         "this store authors project {0}, so it cannot import it: it already holds the source"
@@ -574,14 +606,15 @@ pub enum ManifestError {
     NotAuthoring(ProjectId),
     #[error(
         "the manifest no longer lists gate {0}, which this store holds. A re-import would \
-         remove a neighbour from every later verify, so it is refused"
+         remove a neighbour from every later verify, so it is refused. Restore the gate in \
+         the store that authors the project and export again"
     )]
     WouldRemoveGate(GateId),
     #[error(
-        "the manifest no longer lists transition `{0}`, which this store holds. A re-import \
-         would turn a gated move into an ungated one, so it is refused"
+        "project {other} in this store already uses the root {root}. Import into a store \
+         bound to another checkout, or use that project"
     )]
-    WouldRemoveTransition(String),
+    RootTaken { root: String, other: ProjectId },
     #[error(transparent)]
     Store(#[from] StoreError),
 }
@@ -635,10 +668,14 @@ pub fn export(
         transitions,
     };
     let content_sha256 = content_sha256(&body)?;
-    Ok(Manifest {
+    let m = Manifest {
         body,
         content_sha256,
-    })
+    };
+    // An export never writes a file its own parse would refuse — for
+    // example a transition naming a gate of another project.
+    m.check_consistent()?;
+    Ok(m)
 }
 
 impl Manifest {
@@ -667,15 +704,22 @@ impl Manifest {
         }
         let m: Manifest =
             serde_json::from_value(loose).map_err(|e| ManifestError::Parse(e.to_string()))?;
-        let found = content_sha256(&m.body)?;
-        if found != m.content_sha256 {
+        m.verify()?;
+        Ok(m)
+    }
+
+    /// The hash and the internal consistency. `parse` calls it, and so does
+    /// the store's import: a `Manifest` can be built by hand (its fields are
+    /// public), and the store must not trust one it did not check.
+    pub fn verify(&self) -> Result<(), ManifestError> {
+        let found = content_sha256(&self.body)?;
+        if found != self.content_sha256 {
             return Err(ManifestError::HandEdited {
-                recorded: m.content_sha256,
+                recorded: self.content_sha256.clone(),
                 found,
             });
         }
-        m.check_consistent()?;
-        Ok(m)
+        self.check_consistent()
     }
 
     fn check_consistent(&self) -> Result<(), ManifestError> {
@@ -850,6 +894,47 @@ mod tests {
         assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
     }
 
+    /// Re-hash after a hand change, so only `check_consistent` can refuse.
+    fn rehashed(mut m: Manifest) -> Manifest {
+        m.content_sha256 = content_sha256(&m.body).unwrap();
+        m
+    }
+
+    #[test]
+    fn a_gate_of_another_project_is_refused() {
+        let (s, p, g1, _) = store();
+        let mut m = export(&s, &p, "abc", 7).unwrap();
+        let g = m.body.gates.iter_mut().find(|g| g.id == g1).unwrap();
+        g.project = ProjectId(fl_core::ids::seq_iri(999));
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
+    }
+
+    #[test]
+    fn a_pass_mark_in_the_file_is_refused() {
+        let (s, p, _, _) = store();
+        let mut m = export(&s, &p, "abc", 7).unwrap();
+        m.body.gates[0].last_pass_commit = Some("abc".into());
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
+    }
+
+    #[test]
+    fn a_gate_or_transition_listed_twice_is_refused() {
+        let (s, p, _, _) = store();
+        let mut m = export(&s, &p, "abc", 7).unwrap();
+        let dup = m.body.gates[0].clone();
+        m.body.gates.push(dup);
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
+
+        let mut m = export(&s, &p, "abc", 7).unwrap();
+        let dup = m.body.transitions[0].clone();
+        m.body.transitions.push(dup);
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
+    }
+
     #[test]
     fn currency_ignores_the_pass_mark_and_sees_every_other_change() {
         let (s, p, g1, _) = store();
@@ -870,7 +955,7 @@ Add `pub mod manifest;` near the top of `crates/store/src/lib.rs` (after the `us
 - [ ] **Step 3: Run the tests**
 
 Run: `cargo test -p fl-store manifest`
-Expected: PASS, 7 tests. (The module is new, so there is no red step for the file as a whole; Step 4 supplies the red step for each refusal.)
+Expected: PASS, 10 tests. (The module is new, so there is no red step for the file as a whole; Step 4 supplies the red step for each refusal.)
 
 - [ ] **Step 4: Mutation checks**
 
@@ -879,17 +964,75 @@ One at a time, confirm each test goes red, then restore:
 - Delete `g.last_pass_commit = None;` in `export` → `a_pass_mark_is_never_exported` FAILS.
 - Delete the `for g in &t.gates { … }` loop in `check_consistent` → `a_transition_naming_an_unlisted_gate…` FAILS.
 - Delete `bare.last_pass_commit = None;` in `currency_of` → `currency_ignores_the_pass_mark…` FAILS.
+- Delete the `g.project != *p` check → `a_gate_of_another_project_is_refused` FAILS.
+
+- [ ] **Step 4b: The manifest file never makes a gate stale**
+
+Found in review: a gate whose selector covers `.fl/manifest.json` (`**/*.json`, `**/*`, a `changed-since` gate) went stale at every export, and the prescribed remedy — affirm, export, commit — staled it again, because the manifest commit always lands after the new stamp. The manifest's content is governed by the currency checks (spec §4.3, §4.5), so its changes are not evidence that a gate's population moved.
+
+Append to `mod tests` in `crates/exec/src/evaluate.rs`:
+
+```rust
+    #[test]
+    fn committing_the_manifest_never_makes_a_gate_stale() {
+        let d = repo_with(&[("cfg/a.json", "{}")]);
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "**/*.json", Regret::High);
+        let manifest = d.path().join(fl_core::MANIFEST_PATH);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, "{}").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "manifest"][..]] {
+            assert!(Command::new("git").args(args).current_dir(d.path()).status().unwrap().success());
+        }
+        let r = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
+        assert!(r.passed(), "{:?}", r.gates[0].verdict);
+        assert_eq!(r.gates[0].staleness, Staleness::Fresh);
+    }
+```
+
+Run `cargo test -p fl-exec committing_the_manifest` — FAIL (`Staleness::StaleFail`, and the high-regret transition fails).
+
+In `staleness_for`, replace
+
+```rust
+    let Ok(changed) = Git::changed_between(root, &def.authored_at_commit, head) else {
+        // A stamp we cannot resolve is treated as stale. An unreadable
+        // provenance is not evidence of freshness.
+        return true;
+    };
+```
+
+with
+
+```rust
+    let Ok(mut changed) = Git::changed_between(root, &def.authored_at_commit, head) else {
+        // A stamp we cannot resolve is treated as stale. An unreadable
+        // provenance is not evidence of freshness.
+        return true;
+    };
+    // ⚠ The committed manifest changes on every export, and its content is
+    // governed by the currency checks, not by staleness (GitHub tracker spec
+    // §4.3, §4.5). Counting it here staled every gate whose selector covers
+    // it, and the remedy — affirm, export, commit — staled it again.
+    let manifest = root.join(fl_core::MANIFEST_PATH);
+    changed.retain(|p| *p != manifest);
+```
+
+Run it again — PASS. Mutation: delete the `retain` line → FAIL. Import `Staleness` in the test module if it is not already in scope (`use fl_core::stale::Staleness;`). The population itself is unchanged: a JSON linter over `**/*.json` still examines the manifest.
 
 - [ ] **Step 5: Trio and commit**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/store/Cargo.toml crates/store/src/lib.rs crates/store/src/manifest.rs
+git add Cargo.toml Cargo.lock crates/core/src/lib.rs crates/store/Cargo.toml \
+        crates/store/src/lib.rs crates/store/src/manifest.rs crates/exec/src/evaluate.rs
 git commit -m "feat(store): the manifest format, its hash, and export
 
 A project's gates and transitions, pass marks cleared, sorted, and hashed
-with SHA-256 over the body's compact JSON. parse refuses a hand edit, a
-future format, and an internally inconsistent file. New dependency: sha2
-0.10 (MIT OR Apache-2.0). Each refusal mutation-tested.
+with SHA-256 over the body's compact JSON. parse and verify refuse a hand
+edit, a future format, and an internally inconsistent file; export
+refuses to write one. The manifest file never makes a gate stale: its
+content is governed by the currency checks. New dependency: sha2 0.10
+(MIT OR Apache-2.0). Each refusal mutation-tested.
 
 Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 ```
@@ -911,7 +1054,9 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 StoreError::Imported { id: Iri, action: &'static str }
 // fl-store
 pub struct ImportReport { pub project: ProjectId, pub gates_added: usize,
-                          pub gates_changed: usize, pub gates_unchanged: usize, pub transitions: usize }
+                          pub gates_changed: usize, pub gates_unchanged: usize, pub transitions: usize,
+                          pub root_moved: Option<(String, String)> } // (old root, new root)
+pub const FORMAT_WITH_IMPORTS: u64 = 3;
 impl RedbStore {
     pub fn import_manifest(&self, m: &Manifest, root: &str) -> Result<ImportReport, ManifestError>;
     pub fn imported_hash(&self, project: &ProjectId) -> Result<Option<String>, StoreError>;
@@ -929,9 +1074,9 @@ In `crates/core/src/store.rs`, add to `StoreError` after `AlreadyExists`:
     /// a local edit would make this copy disagree with the manifest every
     /// other reader resolves.
     #[error(
-        "{id} belongs to a project this store imported from a manifest, so this store \
-         cannot {action} it. Change it in the store that authors the project, run \
-         `fl manifest export` there, commit, then run `fl manifest import` here."
+        "this store imported {id}'s project from a manifest, so it cannot {action} it. \
+         Change it in the store that authors the project, run `fl manifest export` there, \
+         commit, then run `fl manifest import` here."
     )]
     Imported { id: Iri, action: &'static str },
 ```
@@ -1073,6 +1218,92 @@ Append to `mod tests` in `crates/store/src/lib.rs`:
     }
 
     #[test]
+    fn an_import_refuses_a_manifest_it_did_not_verify() {
+        let (a, _ga, p, _, _) = authoring();
+        let mut m = a.export_manifest(&p, "c1", 7).unwrap();
+        m.body.gates[0].name = "edited".into();
+        let (b, _gb) = fresh();
+        let err = b.import_manifest(&m, "/x").unwrap_err();
+        assert!(matches!(err, ManifestError::HandEdited { .. }), "{err}");
+        assert!(!b.owns(p.iri()).unwrap(), "nothing may be written");
+    }
+
+    #[test]
+    fn a_fresh_import_onto_a_root_another_project_uses_is_refused() {
+        let (a, _ga, p, _, _) = authoring();
+        let (b, _gb) = fresh();
+        let local = b.add_project("/x").unwrap();
+        let err = b
+            .import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            .unwrap_err();
+        assert!(
+            matches!(err, ManifestError::RootTaken { ref other, .. } if *other == local),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_reimport_from_another_checkout_moves_the_root_and_says_so() {
+        let (a, _ga, p, _, _) = authoring();
+        let (b, _gb) = fresh();
+        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        assert_eq!(b.import_manifest(&m, "/one").unwrap().root_moved, None);
+        let report = b.import_manifest(&m, "/two").unwrap();
+        assert_eq!(report.root_moved, Some(("/one".into(), "/two".into())));
+        assert_eq!(b.get_project(&p).unwrap().unwrap().root, "/two");
+    }
+
+    #[test]
+    fn a_reimport_mirrors_the_manifests_transitions() {
+        let (a, _ga, p, _, _) = authoring();
+        let (b, _gb) = fresh();
+        let first = a.export_manifest(&p, "c1", 7).unwrap();
+        b.import_manifest(&first, "/x").unwrap();
+        let mut body = first.body.clone();
+        body.transitions.clear();
+        let without = Manifest {
+            content_sha256: content_sha256(&body).unwrap(),
+            body,
+        };
+        b.import_manifest(&without, "/x").unwrap();
+        assert!(b.list_transitions(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_hash_of_a_project_this_store_never_held_is_not_owned() {
+        let (s, _g) = fresh();
+        let err = s
+            .imported_hash(&ProjectId(seq_iri(42)))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_store_that_imported_is_format_3_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.redb");
+        let (a, _ga, p, _, _) = authoring();
+        {
+            let b = RedbStore::open(&path).unwrap();
+            b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+                .unwrap();
+        }
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
+            Some(FORMAT_WITH_IMPORTS),
+            "an older fl must refuse this store rather than ignore its imports"
+        );
+        drop(meta);
+        drop(tx);
+        drop(db);
+        let b = RedbStore::open(&path).unwrap();
+        assert!(b.imported_hash(&p).unwrap().is_some());
+    }
+
+    #[test]
     fn a_reimport_that_removes_a_gate_is_refused_and_changes_nothing() {
         let (a, _ga, p, g1, g2) = authoring();
         let (b, _gb) = fresh();
@@ -1158,25 +1389,43 @@ and reduce the body of `insert_new_with_id` (keep its doc comment) to:
         Ok(id)
 ```
 
-Run `cargo test -p fl-store redb_store_meets` to confirm the refactor is green before going on (the new tests still do not compile; run with `--lib` after temporarily commenting them out, or proceed to Step 5 and run everything there).
+Do not run the tests here: the Step 2 tests still do not compile. Step 6 runs everything, including `a_failed_insert_does_not_advance_the_shared_id_counter`, which covers this refactor.
 
 - [ ] **Step 5: Add the table, `imported_hash`, the guards, export and import**
 
-Add the table beside the others:
+Add the table and the format beside the others:
 
 ```rust
 /// project → the `content_sha256` of the manifest it was imported from.
-/// ⚠ Additive, so `FORMAT_VERSION` stays 2: the first import creates it,
-/// and a store without it has imported nothing (GitHub tracker spec §4.2).
+/// Created by the first import; a store without it has imported nothing
+/// (GitHub tracker spec §4.2).
 const IMPORTS: TableDefinition<&str, &str> = TableDefinition::new("imports");
+
+/// ⚠ The format of a store that holds an import. The first import raises
+/// the store from 2 to 3 in the same transaction, so an older fl — which
+/// knows nothing of imports and would let a person edit an imported gate —
+/// REFUSES the store with `FormatVersion` instead of ignoring the mark.
+/// This build opens both. A store that never imports stays 2 and still
+/// opens in older builds.
+pub const FORMAT_WITH_IMPORTS: u64 = 3;
 ```
+
+In `RedbStore::open`, change the accepting arm to:
+
+```rust
+            Some(Some(v)) if v == FORMAT_VERSION || v == FORMAT_WITH_IMPORTS => {}
+```
+
+Leave `create_tables` writing `FORMAT_VERSION`, and leave the refusal's `expected: FORMAT_VERSION` as it is (the existing test `a_store_from_before_format_versioning_is_refused_with_a_remedy` pins it).
 
 Add to `impl RedbStore`:
 
 ```rust
     /// The hash of the manifest `project` was imported from, or `None` if
-    /// this store authors it.
+    /// this store authors it. A project this store never held is `NotOwned`:
+    /// `None` would read as "authored here".
     pub fn imported_hash(&self, project: &ProjectId) -> Result<Option<String>, StoreError> {
+        self.check_kind(project.iri(), Kind::Project)?;
         let tx = self.db.begin_read().map_err(backend)?;
         let table = match tx.open_table(IMPORTS) {
             Ok(t) => t,
@@ -1225,6 +1474,8 @@ Add to `impl RedbStore`:
     /// IRIs, and mark the project imported — in ONE write transaction.
     /// Everything that can refuse is decided before anything is written.
     pub fn import_manifest(&self, m: &Manifest, root: &str) -> Result<ImportReport, ManifestError> {
+        // A `Manifest` can be built by hand; the store checks it itself.
+        m.verify()?;
         let body = &m.body;
         let project = &body.project;
 
@@ -1244,6 +1495,25 @@ Add to `impl RedbStore`:
         if held_project && self.imported_hash(project)?.is_none() {
             return Err(ManifestError::AuthoringStore(project.clone()));
         }
+        // Another project on the same root would give one checkout two
+        // sets of gates and two handles, with nothing said.
+        for other in self.list_projects()? {
+            if other.id != *project && other.root == root {
+                return Err(ManifestError::RootTaken {
+                    root: root.to_string(),
+                    other: other.id,
+                });
+            }
+        }
+        let root_moved = match held_project {
+            true => {
+                let held = self
+                    .get_project(project)?
+                    .ok_or_else(|| ManifestError::Inconsistent(format!("{project} vanished")))?;
+                (held.root != root).then(|| (held.root, root.to_string()))
+            }
+            false => None,
+        };
 
         let held_gates = if held_project {
             self.list_gates(project)?
@@ -1255,13 +1525,17 @@ Add to `impl RedbStore`:
                 return Err(ManifestError::WouldRemoveGate(g.id.clone()));
             }
         }
-        if held_project {
-            for t in self.list_transitions(project)? {
-                if !body.transitions.iter().any(|m| m.name == t.name) {
-                    return Err(ManifestError::WouldRemoveTransition(t.name));
-                }
-            }
-        }
+        // Transitions mirror the manifest: one it no longer lists is
+        // removed. (Neither side has a command that removes one today.)
+        let stale_transitions: Vec<String> = if held_project {
+            self.list_transitions(project)?
+                .into_iter()
+                .filter(|t| !body.transitions.iter().any(|m| m.name == t.name))
+                .map(|t| t.name)
+                .collect()
+        } else {
+            vec![]
+        };
 
         let mut report = ImportReport {
             project: project.clone(),
@@ -1269,6 +1543,7 @@ Add to `impl RedbStore`:
             gates_changed: 0,
             gates_unchanged: 0,
             transitions: body.transitions.len(),
+            root_moved,
         };
         // (definition to write, whether it is new to this store)
         let mut writes: Vec<(&GateDef, bool)> = Vec::new();
@@ -1307,8 +1582,10 @@ Add to `impl RedbStore`:
         }
 
         let tx = self.db.begin_write().map_err(backend)?;
-        if !held_project {
-            index_new(&tx, project.iri(), Kind::Project)?;
+        if !held_project || report.root_moved.is_some() {
+            if !held_project {
+                index_new(&tx, project.iri(), Kind::Project)?;
+            }
             let json = serde_json::to_string(&Project {
                 id: project.clone(),
                 root: root.to_string(),
@@ -1331,6 +1608,11 @@ Add to `impl RedbStore`:
         }
         {
             let mut table = tx.open_table(TRANSITIONS).map_err(backend)?;
+            for name in &stale_transitions {
+                table
+                    .remove((project.iri().as_str(), name.as_str()))
+                    .map_err(backend)?;
+            }
             for t in &body.transitions {
                 let json = serde_json::to_string(t).map_err(backend)?;
                 table
@@ -1341,6 +1623,10 @@ Add to `impl RedbStore`:
         tx.open_table(IMPORTS)
             .map_err(backend)?
             .insert(project.iri().as_str(), m.content_sha256.as_str())
+            .map_err(backend)?;
+        tx.open_table(META)
+            .map_err(backend)?
+            .insert(FORMAT_KEY, FORMAT_WITH_IMPORTS)
             .map_err(backend)?;
         tx.commit().map_err(backend)?;
         Ok(report)
@@ -1358,6 +1644,9 @@ pub struct ImportReport {
     pub gates_changed: usize,
     pub gates_unchanged: usize,
     pub transitions: usize,
+    /// `(old, new)` when a re-import came from another checkout. The
+    /// project's gates now run over the new root, and the CLI says so.
+    pub root_moved: Option<(String, String)>,
 }
 ```
 
@@ -1395,7 +1684,7 @@ Guards, in `impl Catalog for RedbStore`:
 - [ ] **Step 6: Run the tests**
 
 Run: `cargo test -p fl-store`
-Expected: PASS, including the seven new tests and the conformance test.
+Expected: PASS, including the 13 new tests and the conformance test.
 
 - [ ] **Step 7: Mutation checks**
 
@@ -1405,6 +1694,11 @@ One at a time, confirm red, then restore:
 - Remove the `WouldRemoveGate` loop → `a_reimport_that_removes_a_gate…` FAILS.
 - Remove `bare.last_pass_commit = None;` in the import → `a_reimport_keeps_the_mark…` FAILS (the unchanged gate is counted as changed and loses its mark).
 - Remove the `AuthoringStore` check → `the_authoring_store_refuses…` FAILS.
+- Remove `m.verify()?;` from the import → `an_import_refuses_a_manifest_it_did_not_verify` FAILS.
+- Remove the `RootTaken` loop → `a_fresh_import_onto_a_root…` FAILS.
+- Remove the `META` write in the import → `a_store_that_imported_is_format_3…` FAILS.
+- Remove the `stale_transitions` removal → `a_reimport_mirrors…` FAILS.
+- Remove `self.check_kind(…)` from `imported_hash` → `imported_hash_of_a_project…` FAILS.
 
 - [ ] **Step 8: Trio and commit**
 
@@ -1413,10 +1707,12 @@ git add crates/core/src/store.rs crates/store/src/lib.rs
 git commit -m "feat(store): import a manifest under its own IRIs, and guard imported definitions
 
 One write transaction writes the project, gates, transitions and the
-import mark; every refusal is decided first. An imported gate may earn a
-local pass mark and nothing else; a re-import keeps the mark of an
-unchanged gate, drops a changed one's, and refuses to remove a gate or a
-transition. The imports table is additive, so FORMAT_VERSION stays 2.
+import mark, and raises the store to format 3 so an older fl refuses it
+rather than ignoring the mark. Every refusal is decided first, and the
+store re-verifies the manifest itself. An imported gate may earn a local
+pass mark and nothing else; a re-import keeps the mark of an unchanged
+gate, drops a changed one's, refuses to remove a gate, mirrors the
+transitions, and moves the root when it came from another checkout.
 Each guard mutation-tested.
 
 Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
@@ -1431,7 +1727,8 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 - Create: `crates/cli/src/cmd/manifest.rs`
 - Modify: `crates/cli/src/cmd/mod.rs`, `crates/cli/src/main.rs` (new `Manifest` subcommand in `Command`, `iris`, `has_handle`, `project_root`, dispatch)
 - Modify: `crates/cli/src/cmd/gate.rs` (`Run`), `crates/cli/src/cmd/check.rs`, `crates/cli/src/cmd/record.rs` (`Move`), `crates/cli/src/cmd/finding.rs` (`Reproduce`, `Verify`) — one guard call each
-- Create: `crates/cli/tests/manifest.rs`
+- Create: `crates/cli/tests/manifest.rs`, `docs/sharing-gates.md`
+- Modify: `docs/getting-started.md` (the `fl --help` transcript, and one linking sentence)
 
 **Interfaces:**
 - Consumes: Task 4's `RedbStore::{export_manifest, import_manifest, imported_hash}`, Task 3's `Manifest::{parse, to_json, currency_of}`, `MANIFEST_PATH`.
@@ -1560,7 +1857,7 @@ fn authored() -> (Machine, tempfile::TempDir) {
         .args(["manifest", "export", "--project", "1"])
         .assert()
         .success()
-        .stdout(contains("rs").and(contains("true")));
+        .stdout(contains("\trs\ttrue"));
     git(r.path(), &["add", "-A"]);
     git(r.path(), &["commit", "-qm", "manifest"]);
     (m, r)
@@ -1698,6 +1995,114 @@ fn a_manifest_that_moved_on_since_import_stops_the_gate_until_reimport() {
         .success();
 }
 
+/// An importing machine whose working-tree manifest moved on since import.
+fn stale_import() -> (Machine, tempfile::TempDir, Machine, tempfile::TempDir) {
+    let (author, r) = authored();
+    let other = Machine::new();
+    let c = clone_of(r.path());
+    other.fl(c.path()).args(["manifest", "import"]).assert().success();
+    std::fs::write(r.path().join("b.rs"), "fn b() {}").unwrap();
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-qm", "more"]);
+    author.fl(r.path()).args(["gate", "affirm", "1"]).assert().success();
+    author.fl(r.path()).args(["manifest", "export", "--project", "1"]).assert().success();
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-qm", "re-export"]);
+    git(c.path(), &["pull", "-q"]);
+    (author, r, other, c)
+}
+
+#[test]
+fn a_gated_move_is_refused_on_a_stale_import_and_an_ungated_one_is_not() {
+    let (_a, _r, other, c) = stale_import();
+    other
+        .fl(c.path())
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .success();
+    // todo → review: no transition covers it, so no gate runs.
+    other
+        .fl(c.path())
+        .args(["record", "move", "1", "--to", "review"])
+        .assert()
+        .success();
+    // review → done: `ship` covers it.
+    other
+        .fl(c.path())
+        .args(["record", "move", "1", "--to", "done"])
+        .assert()
+        .failure()
+        .stderr(contains("fl manifest import"));
+}
+
+#[test]
+fn reproduce_and_verify_are_refused_on_a_stale_import() {
+    let (_a, _r, other, c) = stale_import();
+    other
+        .fl(c.path())
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .success();
+    other
+        .fl(c.path())
+        .args(["finding", "raise", "--record", "1", "--claim", "c", "--by", "r"])
+        .assert()
+        .success();
+    other
+        .fl(c.path())
+        .args(["finding", "reproduce", "1", "--gate", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("fl manifest import"));
+    other
+        .fl(c.path())
+        .args(["finding", "verify", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("fl manifest import"));
+}
+
+#[test]
+fn check_refuses_a_gate_or_transition_added_since_export() {
+    let (m, r) = authored();
+    m.fl(r.path())
+        .args(["gate", "add", "--project", "1", "--name", "late", "--glob", "*.rs", "--program", "true"])
+        .assert()
+        .success();
+    m.fl(r.path())
+        .args(["manifest", "check", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("not in the manifest"));
+
+    let (m, r) = authored();
+    m.fl(r.path())
+        .args(["transition", "add", "--project", "1", "--name", "late", "--from", "todo",
+               "--to", "doing", "--regret", "low", "--gate", "1"])
+        .assert()
+        .success();
+    m.fl(r.path())
+        .args(["manifest", "check", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("transitions changed"));
+}
+
+#[test]
+fn a_reimport_from_another_checkout_says_the_root_moved() {
+    let (_author, r) = authored();
+    let other = Machine::new();
+    let c1 = clone_of(r.path());
+    let c2 = clone_of(r.path());
+    other.fl(c1.path()).args(["manifest", "import"]).assert().success();
+    other
+        .fl(c2.path())
+        .args(["manifest", "import"])
+        .assert()
+        .success()
+        .stdout(contains("moved"));
+}
+
 #[test]
 fn a_missing_manifest_on_an_importing_machine_is_refused_by_path() {
     let (_author, r) = authored();
@@ -1714,7 +2119,6 @@ fn a_missing_manifest_on_an_importing_machine_is_refused_by_path() {
 }
 ```
 
-Add `use predicates::prelude::PredicateBooleanExt;` at the top for `.and(...)`.
 
 Run: `cargo test -p fl-cli --test manifest`
 Expected: FAIL — `manifest` is not a subcommand.
@@ -1828,6 +2232,16 @@ pub fn ensure_publishable(
         ensure_import_current(store, project)?;
     } else {
         let m = read(&root)?;
+        // ⚠ A manifest for another project would otherwise pass vacuously
+        // for a project with no gates.
+        if m.body.project != *project {
+            bail!(
+                "{} is the manifest of project {}, not of {project}. Run `fl manifest export`, \
+                 then commit.",
+                root.join(MANIFEST_PATH).display(),
+                m.body.project
+            );
+        }
         let gates = match gate {
             Some(g) => vec![
                 store
@@ -1848,6 +2262,23 @@ pub fn ensure_publishable(
                     "gate `{}` is not in the manifest. Run `fl manifest export`, then commit.",
                     g.name
                 ),
+            }
+        }
+        // The whole project, not only its gates: a transition added or
+        // changed since export would otherwise never reach another machine.
+        if gate.is_none() {
+            let now = store.export_manifest(project, "", 0)?;
+            if now.body.gates.len() != m.body.gates.len() {
+                bail!(
+                    "the manifest lists a gate this store no longer holds. Run \
+                     `fl manifest export`, then commit."
+                );
+            }
+            if now.body.transitions != m.body.transitions {
+                bail!(
+                    "the project's transitions changed since the manifest was exported. Run \
+                     `fl manifest export`, then commit."
+                );
             }
         }
     }
@@ -1903,6 +2334,9 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             })?;
             let m = read(&root)?;
             let report = store.import_manifest(&m, &root.display().to_string())?;
+            if let Some((old, new)) = &report.root_moved {
+                println!("moved\tthe project's gates now run over {new}, not {old}");
+            }
             println!(
                 "imported\t{}\tgates: {} added, {} changed, {} unchanged\ttransitions: {}",
                 refs::show(store, Kind::Project, report.project.iri())?,
@@ -1938,16 +2372,30 @@ Add one call, `crate::cmd::manifest::ensure_import_current(store, &<project>)?;`
 |---|---|---|
 | `cmd/gate.rs` | `Cmd::Run`, after `let g = gate(store, &id)?;` | `g.project` |
 | `cmd/check.rs` | `run`, before `evaluate_transition` | `project` |
-| `cmd/record.rs` | `Cmd::Move`, after the record is read, before `move_record` | `record.project` |
+| `cmd/record.rs` | `Cmd::Move`, after the record is read, before `move_record` — only when gated (below) | `record.project` |
 | `cmd/finding.rs` | `Cmd::Reproduce`, after `finding_id` | `finding(store, &finding)?.project` |
 | `cmd/finding.rs` | `Cmd::Verify`, after `finding_id` | `finding(store, &finding)?.project` |
 
-For the two `finding.rs` sites, read the finding once into a local (`let f = finding(store, &finding)?;`) and pass `&f.project`.
+For the two `finding.rs` sites, read the finding once into a local and pass `&f.project`. Both arms bind a field named `finding`, which shadows the module's `fn finding`, so call it by path: `let f = self::finding(store, &finding)?;`. A finding that does not exist now gets that function's "is not a finding in the store" refusal before `attach_reproduction`/`verify_finding` run; `explain`'s `NoSuchFinding` arm stays as a guard for a finding that disappears in between.
+
+For `record move`, guard only a move that a transition covers — an ungated move runs no gate, so a stale manifest must not refuse it (spec §4.5 is about running gates):
+
+```rust
+            let gated = store
+                .list_transitions(&record.project)?
+                .iter()
+                .any(|t| t.from == record.state && t.to == state);
+            if gated {
+                crate::cmd::manifest::ensure_import_current(store, &record.project)?;
+            }
+```
 
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test -p fl-cli --test manifest`
-Expected: PASS, 8 tests. Then `cargo test --workspace` — PASS, including `getting_started` (its commands do not touch manifests, so `VERIFIED_COMMANDS` does not change).
+Expected: PASS, 12 tests.
+
+Then `cargo test --workspace`. ⚠ `getting_started` FAILS here, and that is expected: the guide's first command is `fl --help`, whose transcript lists every subcommand, and `manifest` is new. Give the variant a doc comment in `main.rs` — `/// Share a project's gates through a committed manifest.` — and add its line to the `fl --help` transcript in `docs/getting-started.md`, after `stats` and before `help`, padded like its neighbours: `  manifest    Share a project's gates through a committed manifest`. Re-run; PASS, with `VERIFIED_COMMANDS` still 65.
 
 - [ ] **Step 6: Mutation checks**
 
@@ -1956,10 +2404,16 @@ One at a time, confirm red, then restore:
 - Remove the `is_committed` check → `an_uncommitted_manifest_is_refused_by_check` FAILS.
 - Remove the guard call in `cmd/gate.rs` → `a_manifest_edited_after_import…` FAILS.
 - Remove the guard call in `cmd/check.rs` → `a_manifest_that_moved_on…` FAILS.
+- Remove the guard call in `cmd/record.rs` → `a_gated_move_is_refused…` FAILS; make it unconditional → the same test FAILS on the ungated move.
+- Remove either guard call in `cmd/finding.rs` → `reproduce_and_verify_are_refused…` FAILS.
+- Remove the transitions comparison in `ensure_publishable` → `check_refuses_a_gate_or_transition…` FAILS.
+- Remove the `m.body.project != *project` check → no CLI test catches it; confirm with a unit probe or accept, and say which in the commit message.
 
 - [ ] **Step 7: Document the commands**
 
-In `docs/getting-started.md`, add a short section "Sharing gates with another machine" after the last section. Use prose and `text` code blocks only (not `sh`), so `crates/cli/tests/getting_started.rs` does not execute it and `VERIFIED_COMMANDS` stays at 65. Cover: export, commit, import on the other machine, `manifest check`, and the two refusals (edited by hand; changed since import). Before committing, run `cargo test -p fl-cli --test getting_started` and confirm the count is unchanged; if the parser picked the section up, change the fence.
+Do NOT add this to `docs/getting-started.md`. That guide promises that every command in it was run to produce the output shown, and its test (`crates/cli/tests/getting_started.rs`) runs every block whose first line starts with `$ `; it recognises only bare fences, so a ```` ```text ```` block would open a phantom block rather than be skipped.
+
+Create `docs/sharing-gates.md` instead: prose, with commands in inline code, and no `$ ` transcripts. Cover: why a manifest exists (another machine resolves the gate an issue names); `fl manifest export`, then commit; `fl manifest import` on the other machine; `fl manifest check`; what is refused and the remedy for each (edited by hand; changed since import; not committed; a gate changed since export; an imported gate edited locally); that pass marks stay on each machine; that a store which imports becomes format 3; and that `crates/cli/tests/manifest.rs` is the executed version of this page. Add one sentence at the end of `docs/getting-started.md`'s last section linking to it, in prose (no `$ ` line). Re-run `cargo test -p fl-cli --test getting_started`.
 
 - [ ] **Step 8: Trio and commit**
 
@@ -1967,7 +2421,7 @@ In `docs/getting-started.md`, add a short section "Sharing gates with another ma
 git add crates/exec/src/git.rs crates/cli/src/cmd/manifest.rs crates/cli/src/cmd/mod.rs \
         crates/cli/src/main.rs crates/cli/src/cmd/gate.rs crates/cli/src/cmd/check.rs \
         crates/cli/src/cmd/record.rs crates/cli/src/cmd/finding.rs crates/cli/tests/manifest.rs \
-        docs/getting-started.md
+        docs/getting-started.md docs/sharing-gates.md
 git commit -m "feat(cli): fl manifest export, import and check; imported gates run only when current
 
 Export prints every gate with what it runs before writing the file.
