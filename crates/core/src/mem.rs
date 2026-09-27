@@ -38,6 +38,8 @@ struct Inner {
     /// alias → primary. `"alias"` is not a `Kind`: it is an index marker, so
     /// an alias never enters `owned`. `check` follows it before deciding.
     aliases: BTreeMap<Iri, Iri>,
+    /// configured `owner/repo` (lowercase) → the repository's `node_id`.
+    bindings: BTreeMap<String, String>,
 }
 
 impl Inner {
@@ -209,6 +211,10 @@ impl Catalog for MemStore {
             .filter(|t| t.project == *project)
             .cloned()
             .collect())
+    }
+
+    fn kind_of(&self, id: &Iri) -> Result<Kind, StoreError> {
+        self.inner.borrow().check(id)
     }
 }
 
@@ -406,6 +412,24 @@ impl Handles for MemStore {
 
     fn resolve_handle(&self, kind: Kind, handle: u64) -> Result<Option<Iri>, StoreError> {
         Ok(self.inner.borrow().handles.get(&(kind, handle)).cloned())
+    }
+}
+
+impl crate::store::Bindings for MemStore {
+    fn bound_node_id(&self, repo: &str) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .inner
+            .borrow()
+            .bindings
+            .get(&repo.to_ascii_lowercase())
+            .cloned())
+    }
+    fn bind_node_id(&self, repo: &str, node_id: &str) -> Result<(), StoreError> {
+        self.inner
+            .borrow_mut()
+            .bindings
+            .insert(repo.to_ascii_lowercase(), node_id.to_string());
+        Ok(())
     }
 }
 

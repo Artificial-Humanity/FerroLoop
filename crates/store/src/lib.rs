@@ -41,6 +41,10 @@ const ATTEMPTS: TableDefinition<u64, &str> = TableDefinition::new("attempts");
 /// Created by the first import; a store without it has imported nothing
 /// (GitHub tracker spec §4.2).
 const IMPORTS: TableDefinition<&str, &str> = TableDefinition::new("imports");
+/// configured `owner/repo` (lowercase) → the repository's `node_id`.
+/// Additive like `imports`: created by the first bind, and a store without
+/// it has bound nothing. An older fl ignores it, and cannot use GitHub mode.
+const GITHUB_BINDINGS: TableDefinition<&str, &str> = TableDefinition::new("github_bindings");
 
 /// ⚠ The format of a store that holds an import. The first import raises
 /// the store from 2 to 3 in the same transaction, so an older fl — which
@@ -742,6 +746,10 @@ impl Catalog for RedbStore {
         }
         Ok(out)
     }
+
+    fn kind_of(&self, id: &Iri) -> Result<Kind, StoreError> {
+        self.check(id)
+    }
 }
 
 impl Tracker for RedbStore {
@@ -979,6 +987,30 @@ impl Handles for RedbStore {
             return Ok(None);
         };
         Iri::parse(v.value()).map(Some).map_err(decode)
+    }
+}
+
+impl fl_core::store::Bindings for RedbStore {
+    fn bound_node_id(&self, repo: &str) -> Result<Option<String>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(GITHUB_BINDINGS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let found = table
+            .get(repo.to_ascii_lowercase().as_str())
+            .map_err(backend)?
+            .map(|v| v.value().to_string());
+        Ok(found)
+    }
+    fn bind_node_id(&self, repo: &str, node_id: &str) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        tx.open_table(GITHUB_BINDINGS)
+            .map_err(backend)?
+            .insert(repo.to_ascii_lowercase().as_str(), node_id)
+            .map_err(backend)?;
+        tx.commit().map_err(backend)
     }
 }
 
@@ -1765,5 +1797,22 @@ mod tests {
         assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
         assert!(!b.owns(p.iri()).unwrap(), "nothing may be written");
         assert_eq!(b.get_gate(&local_gate).unwrap().unwrap().project, q);
+    }
+
+    #[test]
+    fn a_binding_survives_a_reopen_and_a_fresh_store_has_none() {
+        use fl_core::store::Bindings;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            assert_eq!(s.bound_node_id("acme/widgets").unwrap(), None);
+            s.bind_node_id("Acme/Widgets", "R_1").unwrap();
+        }
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(
+            s.bound_node_id("ACME/widgets").unwrap().as_deref(),
+            Some("R_1")
+        );
     }
 }

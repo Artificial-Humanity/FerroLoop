@@ -55,23 +55,24 @@ pub struct Bound<'a> {
     pub handles: &'a dyn Handles,
 }
 
-/// Something that can hand out a [`Bound`] for one case. Owns its stores
-/// and any guard (a temp directory, a fake server) for the case's lifetime.
+/// Hands one case its `Bound`. A callback rather than a return value, so a
+/// fixture can build adapters that live only for the call — a split
+/// binding's `CatalogChecked` borrows two stores the fixture owns.
 pub trait Fixture {
-    fn bound(&self) -> Bound<'_>;
+    fn with(&self, f: &mut dyn FnMut(&Bound<'_>));
 }
 
 /// One store backing every role, plus a guard to keep alive.
 pub struct Single<S, G>(pub S, pub G);
 
 impl<S: Catalog + Tracker + Ledger + Handles, G> Fixture for Single<S, G> {
-    fn bound(&self) -> Bound<'_> {
-        Bound {
+    fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
+        f(&Bound {
             catalog: &self.0,
             tracker: &self.0,
             ledger: &self.0,
             handles: &self.0,
-        }
+        });
     }
 }
 
@@ -92,7 +93,7 @@ fn run_bound<F: Fixture>(
     );
     for case in cases {
         let fixture = make();
-        case(&fixture.bound());
+        fixture.with(&mut |b| case(b));
     }
 }
 

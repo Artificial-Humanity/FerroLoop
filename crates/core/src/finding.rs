@@ -79,6 +79,11 @@ pub struct Finding {
     /// before aliases existed still reads.
     #[serde(default)]
     pub also_known_as: Vec<Iri>,
+    /// Marked when the finding is raised, and never changed after (GitHub
+    /// tracker spec §6). A finding stored before the mark existed reads as
+    /// not security.
+    #[serde(default)]
+    pub security: bool,
 }
 
 impl Finding {
@@ -96,6 +101,7 @@ impl Finding {
             assigned_to: None,
             withdrawn_reason: None,
             also_known_as: vec![],
+            security: false,
         }
     }
 
@@ -239,6 +245,16 @@ mod tests {
             Some(GateId(seq_iri(9))),
             "reproduction stays intact"
         );
+    }
+
+    #[test]
+    fn a_finding_stored_before_the_security_mark_reads_as_not_security() {
+        let f = Finding::raise(ProjectId(seq_iri(1)), RecordId(seq_iri(2)), "a", "c");
+        let mut v = serde_json::to_value(&f).unwrap();
+        v.as_object_mut().unwrap().remove("security");
+        let back: Finding = serde_json::from_value(v).unwrap();
+        assert!(!back.security);
+        assert!(!f.security, "raise never marks a finding security");
     }
 
     #[test]
