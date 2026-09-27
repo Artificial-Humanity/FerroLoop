@@ -66,6 +66,9 @@ const STATE_EVENTS: [&str; 5] = ["labeled", "unlabeled", "closed", "reopened", "
 struct Window {
     events: BTreeMap<u64, String>,
     edits: BTreeSet<String>,
+    /// The edit history's `totalCount`, which does not depend on the order
+    /// GitHub lists the entries in.
+    edits_total: u64,
 }
 
 /// What `repair` did.
@@ -762,6 +765,14 @@ impl GithubTracker {
         // Classify first, so a missing, deleted or moved issue keeps its
         // outcome — its timeline would answer 404, 410 or 301 instead.
         match self.fetch(n)? {
+            // Before the window: GitHub's edit history does not answer for
+            // a pull request's number.
+            Fetched::Found(i) if i.is_pull_request => {
+                return Err(StoreError::NotAnFlItem {
+                    id,
+                    what: "a pull request".into(),
+                });
+            }
             Fetched::Found(_) => {}
             Fetched::Absent => return Err(missing()),
             Fetched::Gone => return Err(StoreError::Deleted(id)),
@@ -843,6 +854,12 @@ impl GithubTracker {
         }
         let back = IssueView::from_json(&r.body)?;
         check_written(&back, &title, &labels, &body, state, reason)?;
+        // ⚠ Modelled, not measured: the timeline and the edit history are
+        // taken to show fl's own write as soon as GitHub answers the PATCH.
+        // If they lag, fl's own events can fall after `after` — a foreign
+        // write landing late is then missed here, and fl's late events land
+        // inside the NEXT write's window as foreign. Task 10's live test
+        // checks it.
         let after = self.window(n)?;
         // ⚠ Before `remember`: a write that crossed someone else's must not
         // become the baseline the next write is compared with.
@@ -859,14 +876,21 @@ impl GithubTracker {
             .client
             .get_all(&self.path(&format!("/issues/{n}/timeline?per_page=100")))?
         {
-            let kind = e.get("event").and_then(Value::as_str).unwrap_or("");
+            // ⚠ No `event` field is not "not a state event": fl cannot tell
+            // what it was, so it cannot rule it out.
+            let kind = e.get("event").and_then(Value::as_str).ok_or_else(|| {
+                backend(format!(
+                    "GitHub sent a timeline item on issue {n} without an `event` kind, so fl \
+                     cannot tell whether someone else changed the issue; retry"
+                ))
+            })?;
             if !STATE_EVENTS.contains(&kind) {
                 continue;
             }
             let id = e.get("id").and_then(Value::as_u64).ok_or_else(|| {
                 backend(format!(
                     "a `{kind}` event on issue {n} has no id, so fl cannot tell it from its own \
-                     write"
+                     write; retry"
                 ))
             })?;
             events.insert(id, kind.to_string());
@@ -878,23 +902,76 @@ impl GithubTracker {
             .expect("a full name is owner/name");
         let data = self.client.graphql(
             "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, \
-             name: $name) { issue(number: $number) { userContentEdits(last: 100) { nodes { id } \
-             } } } }",
+             name: $name) { issue(number: $number) { userContentEdits(last: 100) { totalCount \
+             nodes { id } } } } }",
             json!({"owner": owner, "name": name, "number": n}),
         )?;
-        let nodes = data
-            .pointer("/repository/issue/userContentEdits/nodes")
-            .and_then(Value::as_array)
+        // `issue: null` (with a NOT_FOUND error) is an answer: GitHub's
+        // GraphQL finds no issue at that number. Say what it is instead.
+        if data
+            .pointer("/repository/issue")
+            .is_some_and(Value::is_null)
+        {
+            return Err(self.not_in_graphql(n)?);
+        }
+        let history = data
+            .pointer("/repository/issue/userContentEdits")
             .ok_or_else(|| {
                 backend(format!(
-                    "GitHub's edit history for issue {n} came back without `nodes`"
+                    "GitHub's edit history for issue {n} came back without \
+                     `userContentEdits`; retry"
                 ))
             })?;
-        let edits = nodes
-            .iter()
-            .filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_string))
-            .collect();
-        Ok(Window { events, edits })
+        let (Some(nodes), Some(edits_total)) = (
+            history.get("nodes").and_then(Value::as_array),
+            history.get("totalCount").and_then(Value::as_u64),
+        ) else {
+            return Err(backend(format!(
+                "GitHub's edit history for issue {n} came back without `nodes` or \
+                 `totalCount`; retry"
+            )));
+        };
+        // ⚠ A node without an id is not "no edit": dropping it would count
+        // one edit short, and could hide someone else's.
+        let edits =
+            nodes
+                .iter()
+                .map(|x| {
+                    x.get("id").and_then(Value::as_str).map(str::to_string).ok_or_else(|| {
+                    backend(format!(
+                        "GitHub's edit history for issue {n} has an entry without an id, so \
+                         fl cannot count the edits; retry"
+                    ))
+                })
+                })
+                .collect::<Result<_, _>>()?;
+        Ok(Window {
+            events,
+            edits,
+            edits_total,
+        })
+    }
+
+    /// Why GitHub's GraphQL finds no issue `n`, which its REST API served a
+    /// moment ago: read it again and name what it is now.
+    fn not_in_graphql(&self, n: u64) -> Result<StoreError, StoreError> {
+        let id = self.issue_url(n);
+        Ok(match self.fetch(n)? {
+            Fetched::Found(i) if i.is_pull_request => StoreError::NotAnFlItem {
+                id,
+                what: "a pull request".into(),
+            },
+            Fetched::Gone => StoreError::Deleted(id),
+            Fetched::Moved(to) => StoreError::Moved { id, to },
+            Fetched::Absent => backend(format!(
+                "issue {n} was there a moment ago, and GitHub now answers that it does not \
+                 exist; read it again before retrying"
+            )),
+            Fetched::Found(_) => backend(format!(
+                "GitHub's edit history does not find issue {n}, which its REST API still \
+                 serves; retry"
+            )),
+        })
     }
 
     /// ⚠ Detection, not prevention (spec §3.3): GitHub has no conditional
@@ -940,13 +1017,35 @@ impl GithubTracker {
                 _ => foreign.push(format!("a `{kind}` event")),
             }
         }
-        let new_edits = after.edits.difference(&before.edits).count();
+        // ⚠ Modelled, not measured: `totalCount` is taken to count every
+        // entry, and `last: 100` to list the NEWEST hundred (oldest first).
+        // Counting by `totalCount` does not depend on that order; the ids
+        // are a second count that cannot over-count under either order, so
+        // the larger of the two is taken. A history that SHRANK (someone
+        // deleted an entry) is someone else's change; a deletion offset by
+        // an edit in the same window is not seen. Task 10's live test
+        // checks both.
+        let by_ids = after.edits.difference(&before.edits).count();
+        let Some(by_total) = after.edits_total.checked_sub(before.edits_total) else {
+            return Err(StoreError::Conflict {
+                id: id.clone(),
+                detail: "GitHub shows changes fl did not make: an entry was deleted from the \
+                         body's edit history"
+                    .into(),
+            });
+        };
+        let new_edits = usize::try_from(by_total).unwrap_or(usize::MAX).max(by_ids);
         // ⚠ Modelled, not measured: a FIRST body edit is taken to add two
         // entries (the original, then the edit), and any later edit one.
         // Under that model every foreign edit is seen. If GitHub adds ONE
         // entry on a first edit, a foreign edit landing with fl's first edit
         // would be hidden — the live test (Task 10) measures exactly this.
-        let own_edits = match (old.body != new.body, before.edits.is_empty()) {
+        // ⚠ Modelled, not measured: the raw bodies are compared, so a
+        // rewrite that only turns CRLF into LF is taken to record an edit.
+        // If GitHub records none for it, `own_edits` is one too high and one
+        // foreign edit in the same window would be hidden. Task 10's live
+        // test checks it.
+        let own_edits = match (old.body != new.body, before.edits_total == 0) {
             (false, _) => 0,
             (true, true) => 2,
             (true, false) => 1,
@@ -979,6 +1078,12 @@ impl GithubTracker {
         self.ensure_labels()?;
         let n = self.locate(id)?;
         let classify = |fetched: Fetched| match fetched {
+            // Before the window: GitHub's edit history does not answer for
+            // a pull request's number.
+            Fetched::Found(i) if i.is_pull_request => Err(StoreError::NotAnFlItem {
+                id: id.clone(),
+                what: "a pull request".into(),
+            }),
             Fetched::Found(i) => Ok(i),
             Fetched::Absent => Err(StoreError::NotAnFlItem {
                 id: id.clone(),
@@ -992,19 +1097,14 @@ impl GithubTracker {
         classify(self.fetch(n)?)?;
         let before = self.window(n)?;
         let issue = classify(self.fetch(n)?)?;
-        if issue.is_pull_request {
-            return Err(StoreError::NotAnFlItem {
-                id: id.clone(),
-                what: "a pull request".into(),
-            });
-        }
-        let restore = |detail: String| StoreError::Diverged {
-            id: id.clone(),
-            detail: format!(
-                "{detail}. A repair rewrites from the block, so restore the block from the \
-                 issue's edit history first — or, if the issue was never fl's, remove its fl \
-                 labels instead of repairing it"
-            ),
+        // ⚠ Not `Diverged`: its message says to run `fl github repair`,
+        // which is the command refusing here.
+        let restore = |detail: String| {
+            backend(format!(
+                "{id} cannot be repaired: {detail}. A repair rewrites from the block, so \
+                 restore the block from the issue's edit history first — or, if the issue was \
+                 never fl's, remove its fl labels instead of repairing it"
+            ))
         };
         let (_, meta) =
             meta::parse_body(&issue.body).map_err(|e| restore(format!("its body {e}")))?;
@@ -1048,23 +1148,42 @@ impl GithubTracker {
             reason,
         )?;
         let after = self.window(n)?;
-        self.check_window(id, &before, &after, &issue, &back)?;
+        // ⚠ The repair has landed either way, so the comment naming who ran
+        // it is posted BEFORE a conflict is returned: a rerun would find the
+        // issue consistent and post nothing, losing the record.
+        let crossed = self.check_window(id, &before, &after, &issue, &back);
         let note = json!({"body": format!(
             "`fl github repair`: the fl labels and the open/closed status were rewritten from \
              fl's record (state `{}`) by {by}.",
             meta.state
         )});
-        let c = self.client.send(
+        let comment_failed = match self.client.send(
             Method::Post,
             &self.path(&format!("/issues/{n}/comments")),
             Some(&note),
-        )?;
-        if c.status != 201 {
-            return Err(backend(format!(
-                "the repair of {id} was written, but GitHub answered {} to the comment that \
-                 records who ran it; add that comment by hand",
-                c.status
-            )));
+        ) {
+            Ok(c) if c.status == 201 => None,
+            Ok(c) => Some(format!("GitHub answered {}", c.status)),
+            Err(e) => Some(e.to_string()),
+        };
+        match (crossed, comment_failed) {
+            (Err(StoreError::Conflict { id, detail }), Some(why)) => {
+                return Err(StoreError::Conflict {
+                    id,
+                    detail: format!(
+                        "{detail}; and the comment recording that {by} ran the repair was not \
+                         posted ({why}) — add that comment by hand"
+                    ),
+                });
+            }
+            (Err(e), _) => return Err(e),
+            (Ok(()), Some(why)) => {
+                return Err(backend(format!(
+                    "the repair of {id} was written, but the comment that records who ran it \
+                     was not posted ({why}); add that comment by hand"
+                )));
+            }
+            (Ok(()), None) => {}
         }
         Ok(Repaired {
             number: n,
@@ -2377,6 +2496,155 @@ mod tests {
         fake.web_edit(1, |i| i.body = "someone rewrote it".into());
         let err = t.repair(r.iri(), "owner").unwrap_err();
         assert!(err.to_string().contains("restore the block"), "{err}");
+        assert!(
+            !err.to_string().contains("fl github repair"),
+            "the refusal must not say to run the command that refused: {err}"
+        );
+    }
+
+    /// Fix round 1, item 1: GitHub's edit history answers `issue: null` for
+    /// a pull request's number, so a pull request is refused BEFORE the
+    /// window is opened.
+    #[test]
+    fn a_pull_request_is_refused_before_the_window() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let n = fake.plain_issue(&["fl:record"], true);
+        fake.state().requests.clear();
+        let is_pr = |e: &StoreError| matches!(e, StoreError::NotAnFlItem { what, .. } if what == "a pull request");
+        let err = t
+            .set_record_state(&RecordId(t.issue_url(n)), State::Doing)
+            .unwrap_err();
+        assert!(is_pr(&err), "{err:?}");
+        let err = t.repair(&t.issue_url(n), "owner").unwrap_err();
+        assert!(is_pr(&err), "{err:?}");
+        let requests = fake.state().requests.clone();
+        assert!(
+            !requests.iter().any(|q| q.contains("/timeline")),
+            "{requests:?}"
+        );
+    }
+
+    /// Fix round 1, item 1: when GitHub's GraphQL finds no issue at a
+    /// number, the window says what the number is now — never "came back
+    /// without `nodes`".
+    #[test]
+    fn a_window_graphql_cannot_find_names_what_the_number_is() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let n = fake.plain_issue(&["fl:record"], true);
+        let err = t
+            .window(n)
+            .err()
+            .expect("a pull request has no edit history");
+        assert!(
+            matches!(&err, StoreError::NotAnFlItem { what, .. } if what == "a pull request"),
+            "{err:?}"
+        );
+    }
+
+    /// Fix round 1, item 2a: an entry without an id is not "no edit".
+    #[test]
+    fn an_edit_history_entry_without_an_id_is_an_error_not_a_short_count() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().null_edit_node_next = true;
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("without an id") && msg.contains("retry"),
+            "{msg}"
+        );
+    }
+
+    /// Fix round 1, item 2b: if `last: 100` lists the OLDEST entries, the
+    /// ids never show a new edit; `totalCount` still counts it.
+    #[test]
+    fn a_foreign_edit_the_listed_ids_do_not_show_is_counted_by_the_total() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        t.set_record_state(&r, State::Doing).unwrap();
+        fake.state().edit_nodes_cap = Some(2);
+        t.set_record_state(&r, State::Review).unwrap();
+        fake.state().foreign_edit_on_next_patch = true;
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// A history that shrank inside fl's window was changed by someone
+    /// else: fl never deletes an entry. The ids are hidden, so only the
+    /// total can see it.
+    #[test]
+    fn an_edit_history_that_shrank_inside_fls_write_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().edit_nodes_cap = Some(0);
+        t.set_record_state(&r, State::Doing).unwrap();
+        t.set_record_state(&r, State::Review).unwrap();
+        fake.state().delete_edits_on_next_patch = 3;
+        let err = t.set_record_state(&r, State::Done).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// Fix round 1, item 3: the SECOND read is the one fl changes. A label
+    /// someone adds between the first read and the window is in that read,
+    /// so fl's write keeps it and does not count it as foreign.
+    #[test]
+    fn a_write_landing_before_the_window_is_kept_not_overwritten() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().foreign_label_on_next_timeline = true;
+        t.set_record_state(&r, State::Doing).unwrap();
+        assert_eq!(
+            fake.issue(1).labels,
+            vec!["bug", "fl:record", "fl:record/doing"]
+        );
+    }
+
+    /// Fix round 1, item 4: the repair landed even though it crossed
+    /// another write, so the record of who ran it is still posted.
+    #[test]
+    fn a_repair_that_crossed_another_write_still_records_who_ran_it() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels = vec!["bug".into()]);
+        fake.state().foreign_label_on_next_patch = true;
+        let err = t.repair(r.iri(), "owner").unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+        let comments = fake.issue(1).comments;
+        assert!(
+            comments.iter().any(|c| c.contains("by owner")),
+            "{comments:?}"
+        );
+    }
+
+    /// Fix round 1, items 6 and 7: a timeline item fl cannot classify is an
+    /// error naming a remedy, never skipped.
+    #[test]
+    fn a_timeline_item_without_a_kind_or_an_id_is_an_error() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().odd_timeline_item_next = Some(json!({"id": 99}));
+        let msg = t
+            .set_record_state(&r, State::Doing)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("without an `event`") && msg.contains("retry"),
+            "{msg}"
+        );
+        fake.state().odd_timeline_item_next = Some(json!({"event": "labeled"}));
+        let msg = t
+            .set_record_state(&r, State::Doing)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("has no id") && msg.contains("retry"), "{msg}");
     }
 
     /// The same suites the local stores pass (spec §8.1): the GitHub

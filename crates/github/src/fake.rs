@@ -111,6 +111,24 @@ pub struct State {
     /// Modelled, not measured: this is the fake's guess at the shape of
     /// GitHub's real answer; Task 10's live test is the check. Not one-shot.
     pub transferred_nodes: BTreeSet<String>,
+    /// On the next timeline read, before answering, someone else adds the
+    /// label `bug` to that issue (with its `labeled` event) — a write landing
+    /// between fl's first read and its window. One-shot.
+    pub foreign_label_on_next_timeline: bool,
+    /// The next timeline answer carries this raw item as well — a malformed
+    /// event, which GitHub has not been seen to send. One-shot.
+    pub odd_timeline_item_next: Option<Value>,
+    /// The next edit-history answer carries a `null` node as well. One-shot.
+    pub null_edit_node_next: bool,
+    /// When set, the edit-history `nodes` show only the OLDEST this many
+    /// entries, while `totalCount` stays true — what `last: 100` returns if
+    /// GitHub orders the history newest-first (modelled, not measured; Task
+    /// 10's live test is the check). Not one-shot.
+    pub edit_nodes_cap: Option<usize>,
+    /// Inside the next PATCH, someone deletes this many entries from the
+    /// issue's body edit history (GitHub lets a person delete a revision).
+    /// One-shot.
+    pub delete_edits_on_next_patch: usize,
 }
 
 pub struct FakeGithub {
@@ -673,12 +691,23 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                         .push(("Location".into(), i.moved_to.clone().unwrap_or_default()));
                     a
                 }
-                Some(i) => {
-                    let items = i
+                Some(_) => {
+                    let n: u64 = n.parse().unwrap_or(0);
+                    if std::mem::take(&mut s.foreign_label_on_next_timeline) {
+                        let e = s.tick();
+                        s.labels.insert("bug".into());
+                        let i = s.issues.get_mut(&n).unwrap();
+                        i.labels.push("bug".into());
+                        i.events.push((e, "labeled".into()));
+                    }
+                    let mut items: Vec<Value> = s.issues[&n]
                         .events
                         .iter()
                         .map(|(id, kind)| json!({"id": id, "event": kind}))
                         .collect();
+                    if let Some(odd) = s.odd_timeline_item_next.take() {
+                        items.push(odd);
+                    }
                     s.page(&path, &q, items)
                 }
             }
@@ -715,6 +744,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     let e = format!("E_{}", s.tick());
                     s.issues.get_mut(&n).unwrap().edits.push(e);
                 }
+            }
+            for _ in 0..std::mem::take(&mut s.delete_edits_on_next_patch) {
+                s.issues.get_mut(&n).unwrap().edits.pop();
             }
             let old = s.issues[&n].clone();
             let mut new = old.clone();
@@ -798,14 +830,34 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     .pointer("/variables/number")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                let nodes: Vec<Value> = s
+                // A pull request, or a missing, deleted or transferred issue,
+                // answers `issue: null` with a NOT_FOUND error (the
+                // reviewer's reading of GitHub, unmeasured; Task 10's live
+                // test is the check).
+                let Some(i) = s
                     .issues
                     .get(&n)
-                    .map(|i| i.edits.iter().map(|e| json!({"id": e})).collect())
-                    .unwrap_or_default();
+                    .filter(|i| !i.pull_request && !i.gone && i.moved_to.is_none())
+                else {
+                    return answer(
+                        200,
+                        json!({"data": {"repository": {"issue": null}}, "errors": [{"type": "NOT_FOUND"}]}),
+                    );
+                };
+                let shown = s.edit_nodes_cap.unwrap_or(usize::MAX);
+                let mut nodes: Vec<Value> = i
+                    .edits
+                    .iter()
+                    .take(shown)
+                    .map(|e| json!({"id": e}))
+                    .collect();
+                let total = i.edits.len();
+                if std::mem::take(&mut s.null_edit_node_next) {
+                    nodes.push(Value::Null);
+                }
                 return answer(
                     200,
-                    json!({"data": {"repository": {"issue": {"userContentEdits": {"nodes": nodes}}}}}),
+                    json!({"data": {"repository": {"issue": {"userContentEdits": {"totalCount": total, "nodes": nodes}}}}}),
                 );
             }
             let id = v
