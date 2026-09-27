@@ -71,6 +71,12 @@ pub struct State {
     pub fail_before_create: bool,
     pub foreign_label_on_next_patch: bool,
     pub foreign_edit_on_next_patch: bool,
+    /// The next request answers 502 with an HTML body — what a load
+    /// balancer sends, not GitHub's JSON. One-shot.
+    pub html_502_next: bool,
+    /// The next installation lookup answers 301 with this `Location`,
+    /// which is off the API's own origin. One-shot.
+    pub off_origin_redirect_next: Option<String>,
 }
 
 pub struct FakeGithub {
@@ -123,9 +129,15 @@ impl FakeGithub {
                     let _ = std::io::Write::write_all(&mut w, b"HTTP/9 broken\r\n\r\n");
                     continue;
                 }
-                let mut resp = tiny_http::Response::from_string(answer.body.to_string())
+                let content_type = if answer.raw_body.is_some() {
+                    "text/html"
+                } else {
+                    "application/json"
+                };
+                let text = answer.raw_body.unwrap_or_else(|| answer.body.to_string());
+                let mut resp = tiny_http::Response::from_string(text)
                     .with_status_code(answer.status)
-                    .with_header(header("Content-Type", "application/json"));
+                    .with_header(header("Content-Type", content_type));
                 for (k, v) in answer.headers {
                     resp = resp.with_header(header(&k, &v));
                 }
@@ -178,6 +190,9 @@ fn header(k: &str, v: &str) -> tiny_http::Header {
 pub(crate) struct Answer {
     status: u16,
     body: Value,
+    /// When set, this exact text is sent instead of `body.to_string()` — for
+    /// answers that are not JSON at all (an HTML 502 from a load balancer).
+    raw_body: Option<String>,
     headers: Vec<(String, String)>,
     hang_up: bool,
 }
@@ -186,6 +201,19 @@ fn answer(status: u16, body: Value) -> Answer {
     Answer {
         status,
         body,
+        raw_body: None,
+        headers: vec![],
+        hang_up: false,
+    }
+}
+
+/// An answer whose body is not JSON at all (spec's reading of what a load
+/// balancer, not GitHub itself, sends on a 502/504).
+fn raw_answer(status: u16, body: &str) -> Answer {
+    Answer {
+        status,
+        body: Value::Null,
+        raw_body: Some(body.to_string()),
         headers: vec![],
         hang_up: false,
     }
@@ -285,6 +313,11 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             .push(("x-ratelimit-reset".into(), "1700000000".into()));
         return a;
     }
+    // What a load balancer sends on a 502, never GitHub itself: an HTML page,
+    // not JSON. The caller must still see the status.
+    if std::mem::take(&mut s.html_502_next) {
+        return raw_answer(502, "<html>bad gateway</html>");
+    }
     let (path, q) = split(url);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     match (method, parts.as_slice()) {
@@ -319,6 +352,11 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     401,
                     json!({"message": "A JSON web token could not be decoded"}),
                 );
+            }
+            if let Some(to) = s.off_origin_redirect_next.take() {
+                let mut a = answer(301, json!({"message": "Moved Permanently"}));
+                a.headers.push(("Location".into(), to));
+                return a;
             }
             let name = format!("{o}/{r}").to_ascii_lowercase();
             if s.repo_named(&name).is_none()

@@ -197,14 +197,23 @@ pub(crate) fn send(
     let reset = header("x-ratelimit-reset");
     let retry_after = header("retry-after");
     let text = resp.body_mut().read_to_string().map_err(unreachable)?;
+    // The status is classified BEFORE the body is required to parse: GitHub's
+    // load balancers answer a 502/504 with an HTML page, and a 401 or 429 can
+    // be non-JSON too. Only a 2xx must be JSON — anything else that fails to
+    // parse becomes `Value::Null` so the caller still sees the real status.
+    let is_2xx = (200..300).contains(&status);
     let body = if text.trim().is_empty() {
         Value::Null
     } else {
-        serde_json::from_str(&text).map_err(|e| {
-            StoreError::Backend(format!(
-                "GitHub answered {method:?} {url} with a body that is not JSON ({e})"
-            ))
-        })?
+        match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) if is_2xx => {
+                return Err(StoreError::Backend(format!(
+                    "GitHub answered {method:?} {url} with a body that is not JSON ({e})"
+                )));
+            }
+            Err(_) => Value::Null,
+        }
     };
     let message = body
         .get("message")
@@ -305,6 +314,24 @@ mod tests {
             .send(Method::Get, "/repos/acme/widgets", None)
             .unwrap();
         assert_eq!(r.status, 500);
+    }
+
+    #[test]
+    fn a_502_with_an_html_body_is_still_a_reply_the_caller_must_judge() {
+        // GitHub's own answers are JSON; a load balancer's 502/504 is not.
+        // The status must still reach the caller rather than being read as
+        // a JSON-parse failure.
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().html_502_next = true;
+        let r = client(&fake)
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap();
+        assert_eq!(r.status, 502);
+        assert!(
+            r.body.is_null(),
+            "a non-JSON body becomes null: {:?}",
+            r.body
+        );
     }
 
     #[test]

@@ -372,6 +372,24 @@ mod tests {
     }
 
     #[test]
+    fn the_app_refuses_to_follow_a_redirect_off_the_apis_own_origin() {
+        // A second fake stands in for wherever an off-origin redirect could
+        // point: the JWT must never reach it.
+        let elsewhere = FakeGithub::start("acme/widgets");
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().off_origin_redirect_next = Some(format!("{}/steal", elsewhere.url()));
+        let app =
+            AppCredentials::new(&fake.url(), 42, &throwaway_key(true), "acme/widgets").unwrap();
+        let err = app.token().unwrap_err();
+        assert!(err.to_string().contains("off its own origin"), "{err}");
+        assert!(
+            elsewhere.state().requests.is_empty(),
+            "the off-origin target must never be contacted: {:?}",
+            elsewhere.state().requests
+        );
+    }
+
+    #[test]
     fn an_app_not_installed_on_the_repository_is_named_as_such() {
         let fake = FakeGithub::start("acme/widgets");
         fake.state().installations.clear();
