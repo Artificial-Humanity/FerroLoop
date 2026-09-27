@@ -5,6 +5,7 @@ pub mod client;
 pub mod creds;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
+pub mod meta;
 
 pub use client::{Client, DEFAULT_API, Method, Reply};
 pub use creds::{AppCredentials, Credentials, EnvToken};
