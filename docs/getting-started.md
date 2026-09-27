@@ -31,7 +31,7 @@ From a checkout of this repository:
 
 ```
 $ cargo build --release
-   Compiling fl-cli v0.1.0 (/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop/crates/cli)
+   Compiling fl-cli v0.1.0 (/path/to/FerroLoop/crates/cli)
     Finished `release` profile [optimized] target(s) in 0.82s
 ```
 
