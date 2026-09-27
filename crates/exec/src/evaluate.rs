@@ -74,11 +74,17 @@ fn staleness_for(
     if def.authored_at_commit == head {
         return false;
     }
-    let Ok(changed) = Git::changed_between(root, &def.authored_at_commit, head) else {
+    let Ok(mut changed) = Git::changed_between(root, &def.authored_at_commit, head) else {
         // A stamp we cannot resolve is treated as stale. An unreadable
         // provenance is not evidence of freshness.
         return true;
     };
+    // ⚠ The committed manifest changes on every export, and its content is
+    // governed by the currency checks, not by staleness (GitHub tracker spec
+    // §4.3, §4.5). Counting it here staled every gate whose selector covers
+    // it, and the remedy — affirm, export, commit — staled it again.
+    let manifest = root.join(fl_core::MANIFEST_PATH);
+    changed.retain(|p| *p != manifest);
     if changed.is_empty() {
         return false;
     }
@@ -770,5 +776,28 @@ mod tests {
             "a store failure surfaced as {err:?}"
         );
         assert!(!err.to_string().contains("git"), "blames git: {err}");
+    }
+
+    #[test]
+    fn committing_the_manifest_never_makes_a_gate_stale() {
+        let d = repo_with(&[("cfg/a.json", "{}")]);
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "**/*.json", Regret::High);
+        let manifest = d.path().join(fl_core::MANIFEST_PATH);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, "{}").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "manifest"][..]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(d.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let r = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
+        assert!(r.passed(), "{:?}", r.gates[0].verdict);
+        assert_eq!(r.gates[0].staleness, Staleness::Fresh);
     }
 }

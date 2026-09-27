@@ -27,3 +27,8 @@ pub use model::{
 pub use stale::{Staleness, apply_staleness, is_stale};
 pub use store::{Catalog, Handles, Ledger, Roles, StoreError, Tracker, follow};
 pub use verdict::{FailReason, Population, Verdict};
+
+/// Where a project's committed manifest lives, relative to the project root
+/// (GitHub tracker spec §4.1). Here rather than in `fl-store` because the
+/// engine must recognise the file too: it never makes a gate stale.
+pub const MANIFEST_PATH: &str = ".fl/manifest.json";

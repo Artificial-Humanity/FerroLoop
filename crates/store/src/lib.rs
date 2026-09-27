@@ -9,6 +9,8 @@ use fl_core::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 
+pub mod manifest;
+
 /// Format 2: ids are IRIs, with an ownership index and per-kind handles.
 /// Format 1 keyed every table by a `u64` id from one shared counter.
 pub const FORMAT_VERSION: u64 = 2;
