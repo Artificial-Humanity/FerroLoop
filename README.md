@@ -87,6 +87,7 @@ that store does not hold is refused, not looked for elsewhere.
 ## Documentation
 
 * [docs/getting-started.md](docs/getting-started.md) — build the CLI and gate a real action, with real commands and their output.
+* [docs/github-tracker.md](docs/github-tracker.md) — keep a project's records and findings in a GitHub repository's Issues: binding, credentials, repair, conflicts and limits.
 * [AGENTS.md](AGENTS.md) — Working rules, core stack matrix, and environment conventions for agents and contributors.
 * [WORKFLOW.md](WORKFLOW.md) — Development workflow, review requirements, and commit conventions.
 * [PERSONA.md](PERSONA.md) — Developer persona and domain expertise (Ferris).
