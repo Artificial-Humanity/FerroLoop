@@ -854,12 +854,13 @@ impl GithubTracker {
         }
         let back = IssueView::from_json(&r.body)?;
         check_written(&back, &title, &labels, &body, state, reason)?;
-        // ⚠ Modelled, not measured: the timeline and the edit history are
-        // taken to show fl's own write as soon as GitHub answers the PATCH.
-        // If they lag, fl's own events can fall after `after` — a foreign
-        // write landing late is then missed here, and fl's late events land
-        // inside the NEXT write's window as foreign. Task 10's live test
-        // checks it.
+        // ⚠ Modelled: the timeline and the edit history are taken to show
+        // fl's own write as soon as GitHub answers the PATCH. If they lag,
+        // fl's own events can fall after `after` — a foreign write landing
+        // late is then missed here, and fl's late events land inside the
+        // NEXT write's window as foreign. Checked by the live test
+        // `the_edit_history_and_timeline_counts_match_fls_model` (tests/live.rs), which reads
+        // at once after each fl write and again two seconds later.
         let after = self.window(n)?;
         // ⚠ Before `remember`: a write that crossed someone else's must not
         // become the baseline the next write is compared with.
@@ -1017,14 +1018,17 @@ impl GithubTracker {
                 _ => foreign.push(format!("a `{kind}` event")),
             }
         }
-        // ⚠ Modelled, not measured: `totalCount` is taken to count every
-        // entry, and `last: 100` to list the NEWEST hundred (oldest first).
-        // Counting by `totalCount` does not depend on that order; the ids
-        // are a second count that cannot over-count under either order, so
-        // the larger of the two is taken. A history that SHRANK (someone
-        // deleted an entry) is someone else's change; a deletion offset by
-        // an edit in the same window is not seen. Task 10's live test
-        // checks both.
+        // ⚠ Modelled: `totalCount` is taken to count every entry — checked
+        // on every read by the live test
+        // `the_edit_history_and_timeline_counts_match_fls_model`.
+        // `last: 100` is taken to list the NEWEST hundred (oldest first) —
+        // unmeasured; no live test checks it yet (it needs more than a
+        // hundred entries). Counting by `totalCount` does not depend on that
+        // order; the ids are a second count that cannot over-count under
+        // either order, so the larger of the two is taken. A history that
+        // SHRANK (someone deleted an entry) is someone else's change; a
+        // deletion offset by an edit in the same window is not seen —
+        // unmeasured; no live test checks it yet.
         let by_ids = after.edits.difference(&before.edits).count();
         let Some(by_total) = after.edits_total.checked_sub(before.edits_total) else {
             return Err(StoreError::Conflict {
@@ -1035,16 +1039,19 @@ impl GithubTracker {
             });
         };
         let new_edits = usize::try_from(by_total).unwrap_or(usize::MAX).max(by_ids);
-        // ⚠ Modelled, not measured: a FIRST body edit is taken to add two
-        // entries (the original, then the edit), and any later edit one.
-        // Under that model every foreign edit is seen. If GitHub adds ONE
-        // entry on a first edit, a foreign edit landing with fl's first edit
-        // would be hidden — the live test (Task 10) measures exactly this.
-        // ⚠ Modelled, not measured: the raw bodies are compared, so a
-        // rewrite that only turns CRLF into LF is taken to record an edit.
-        // If GitHub records none for it, `own_edits` is one too high and one
-        // foreign edit in the same window would be hidden. Task 10's live
-        // test checks it.
+        // ⚠ Modelled: a FIRST body edit is taken to add two entries (the
+        // original, then the edit), and any later edit one. Under that model
+        // every foreign edit is seen. If GitHub adds ONE entry on a first
+        // edit, a foreign edit landing with fl's first edit would be hidden.
+        // Checked by exact count in the live test
+        // `the_edit_history_and_timeline_counts_match_fls_model`.
+        // ⚠ Modelled: the raw bodies are compared, so a rewrite that only
+        // turns CRLF into LF is taken to record an edit. If GitHub records
+        // none for it, `own_edits` is one too high and one foreign edit in
+        // the same window would be hidden. Partly measured: the live test
+        // `the_edit_history_and_timeline_counts_match_fls_model` prints whether GitHub
+        // records an entry for a CRLF-only rewrite (it does not assert it),
+        // and checks that an fl write after one is not a conflict.
         let own_edits = match (old.body != new.body, before.edits_total == 0) {
             (false, _) => 0,
             (true, true) => 2,

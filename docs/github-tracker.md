@@ -49,7 +49,8 @@ contact GitHub.
 `--db` and `$FL_DB` cannot be combined with a GitHub binding for a command that uses it. The
 repository's identity (see [Identity](#identity)) and the project's catalog live in the store
 the config entry names, and `--db` would pair GitHub with another store's catalog; such a
-command is refused and says to drop `--db` and unset `$FL_DB`. The catalog commands keep
+command is refused before any store is searched, created or opened, and the refusal says to
+drop `--db` and unset `$FL_DB`. The catalog commands keep
 `--db` as before. `fl github` needs a binding, and refuses without one, `--db` or not.
 
 ## Credentials
@@ -60,7 +61,8 @@ a token from the environment. A missing or unusable source is refused, naming th
 
 **`credential = "env"`** reads `FL_GITHUB_TOKEN`, then `GITHUB_TOKEN`, from the environment;
 an empty value counts as unset. fl writes as whoever owns the token: a personal token writes
-as that person, and `GITHUB_TOKEN` inside GitHub Actions writes as the Actions bot. A
+as that person. Running inside GitHub Actions with its own `GITHUB_TOKEN` is untested: what fl
+writes as there, and whether `fl github whoami` works with that token, are not yet checked. A
 `GITHUB_TOKEN` already set for other tools is used when `FL_GITHUB_TOKEN` is not, so set
 `FL_GITHUB_TOKEN` when the two should differ. The token needs to read the repository and to
 read and write its issues.
@@ -173,6 +175,9 @@ any disagreement as diverged.
 The detection rests on a model of what GitHub records, and parts of that model are not yet
 measured against GitHub itself:
 
+- **The total count.** fl counts edits by the edit history's total count, and takes that
+  count to include every entry.
+
 - **The first-edit blind spot.** fl takes the first edit of an issue's body to add two
   entries to its edit history (the original, then the edit) and every later edit to add one.
   If GitHub records a first edit as one entry, then someone else's body edit that lands in the
@@ -181,14 +186,20 @@ measured against GitHub itself:
   counts by the total, which does not depend on the order GitHub lists them in, and uses the
   entries only as a second count. An entry deleted and another added in the same window
   cancel out and are not seen.
-- **Lag and line endings.** fl takes the timeline and the edit history to show its own write
-  as soon as GitHub answers it, and takes a body rewrite that only changes line endings to
-  count as an edit. If either is wrong, someone else's change in the same window can be
-  missed.
+- **Lag.** fl takes the timeline and the edit history to show its own write as soon as
+  GitHub answers it. If they lag, someone else's change landing just after fl's write can be
+  missed, and fl's own late events can land in its next write's window, where they are
+  reported as a spurious conflict.
+- **Line endings.** fl takes a body rewrite that only changes line endings to count as an
+  edit. If GitHub records none for it, someone else's edit in the same window can be missed.
 
-The live tests (below) measure the first-edit model and the one-event-per-label-change model
-directly, and count lost updates under concurrent writers over repeated rounds. The ordering,
-the lag and the line-ending cases are not yet measured by them.
+The live tests (below) check the total count on every read, the first-edit model, one
+timeline event for each label added or removed, each close, each reopen and each retitle,
+and the lag, by reading at once after each of fl's writes and again two seconds later. They
+also count lost updates under concurrent writers over repeated rounds. For line endings they
+print whether GitHub records an entry for a rewrite that changes only line endings, and check
+that an fl write after one is not a conflict. The order past a hundred entries, and a deleted
+entry offset by a new one, are not yet measured.
 
 ## Security findings
 
@@ -208,7 +219,8 @@ a security finding that nobody marked.
 An item's id is its issue's URL, `https://github.com/acme/widgets/issues/41`. Its handle is
 the issue number, which may be typed `41` or `#41`; records and findings share issue numbers,
 so `fl record` refuses the number of a finding. `owner/repo#41` names issue 41 of that
-repository, and is refused as not held by this tracker unless it is the bound one. Projects
+repository, and is refused as not held by this tracker unless it names the bound one — by its
+current name, or by an old name that still reaches it after a rename. Projects
 and gates keep their local handles.
 
 **A renamed repository.** fl records the repository's GitHub node id in the local store the
@@ -226,16 +238,20 @@ repository is refused as not owned, and the message says why.
 one as moved, naming where it went; neither is "not found".
 
 **Aliases.** An item's other ids are kept in its block. Finding an item by an alias is a full
-scan of every fl issue in the repository: correct, and one full list per lookup. GitHub's
-search is not used, because its index lags and promises no complete result.
+scan: fl lists every fl record and every fl finding in the repository — two lists, each read
+twice when it is longer than one page — and compares every block. It is correct, and costly;
+adding an alias makes the same scan to check the alias is not already in use. GitHub's search
+is not used, because its index lags and promises no complete result.
 
 ## Creates
 
 Each create carries a key fl mints, stored in the block. If GitHub's answer to a create is
 lost — a server error, or the connection dropping before an answer — the issue may exist
 anyway, so fl searches the repository's fl issues for that key, up to three times a couple of
-seconds apart, before it sends the create once more. If that second attempt fails too, the
-error says to list the repository's fl issues before retrying.
+seconds apart, before it sends the create once more. If that second attempt is answered with
+a server error, or its connection drops, the error says to list the repository's fl issues
+before retrying. An error GitHub states outright — a rate limit, a refused credential, a
+rejected request — is reported as itself, without that advice.
 
 Once GitHub has answered a create with success, fl never sends it again, even if the answer's
 body could not be read: the issue exists. If fl then cannot find it by its key either, it
@@ -247,9 +263,12 @@ duplicate. `fl record list` and `fl finding list`, or GitHub's issue list filter
 
 - **Rate limits are reported, not waited out.** When GitHub's limit is spent, the command
   fails, naming when it resets if GitHub said.
-- **Each write is several requests.** It reads the issue twice, and the timeline and the edit
-  history twice each — once before the write and once after — besides the write itself. That
-  is input to the rate-limit work of sub-project 3.
+- **Each update and each repair is several requests.** It reads the issue twice, and the
+  timeline and the edit history twice each — once before the write and once after — besides
+  the write itself; a repair also posts its comment. A create has no such window: once per
+  command fl reads the repository's labels, creating any that are missing, and then sends the
+  create; a finding's create first reads the record it names. These costs are input to a
+  later rate-limit design.
 - **Lists read every page**, oldest issue first, a hundred to a page. A page that fails fails
   the list, never shortening it. A list longer than one page is read twice, and the two reads
   must agree: GitHub pages by offset, so an issue leaving the list mid-read could otherwise
@@ -280,15 +299,16 @@ duplicate. `fl record list` and `fl finding list`, or GitHub's issue list filter
 The tests that run in CI use an in-process fake GitHub. It proves the structure, not how
 GitHub behaves, so three more tests in `crates/github/tests/live.rs` run against GitHub
 itself: a round trip of a record and a finding; ten rounds of two writers adding to the same
-finding at once, which require no update ever to be lost silently; and a direct count of the
-edit history and the timeline against the model conflict detection rests on. They are
-ignored by default, and each fails at once, naming `FL_GITHUB_LIVE_REPO`, if it is not set.
+finding at once, which require no update ever to be lost silently; and exact counts of the
+edit history and the timeline against the model conflict detection rests on, as
+[Conflicts](#conflicts) lists. They are ignored by default, and each fails at once, naming
+`FL_GITHUB_LIVE_REPO`, if it is not set.
 
 Run them only against a **private, throwaway** repository: they create issues and never delete
 them, and they refuse a repository that is not private. Set `FL_GITHUB_TOKEN` in the
-environment (from a secret store, not typed where shell history keeps it), or set
+environment (from a secret store, not typed where shell history keeps it), or set both
 `FL_GITHUB_APP_ID` and `FL_GITHUB_APP_KEY` — the App's id and the path of its private key —
-to write as the App, then:
+to write as the App; one without the other is refused, never a fallback to the token. Then:
 
 ```text
 FL_GITHUB_LIVE_REPO=acme/fl-live cargo test -p fl-github --test live -- --ignored --nocapture --test-threads=1

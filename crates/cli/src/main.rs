@@ -389,6 +389,17 @@ fn run(cli: Cli) -> Result<i32> {
                 .unwrap_or_else(|| "the config".into())
         );
     }
+    // A bound project's node binding and catalog live in the store its
+    // config entry names; `--db` would pair GitHub with another catalog.
+    // ⚠ Before `db_path`, `choose_store` and any open: a refused command
+    // must create no directory or store, and an IRI it names must not be
+    // refused as not owned by the `--db` store first.
+    if binding.is_some() && explicit.is_some() && needs_tracker {
+        bail!(
+            "this project's tracker is bound to GitHub in the config, so it uses the store its \
+             config entry names. Drop --db (and unset $FL_DB) for this command"
+        );
+    }
     let (bound, confined) = db_path(explicit, configured)?;
     let mut iris = cli.command.iris();
     // A GitHub issue URL is the tracker's to resolve: no local store holds
@@ -413,14 +424,6 @@ fn run(cli: Cli) -> Result<i32> {
     }
     let store = RedbStore::open(&path)
         .with_context(|| format!("could not open the store at {}", path.display()))?;
-    // A bound project's node binding and catalog live in the store its
-    // config entry names; `--db` would pair GitHub with another catalog.
-    if binding.is_some() && confined && needs_tracker {
-        bail!(
-            "this project's tracker is bound to GitHub in the config, so it uses the store its \
-             config entry names. Drop --db (and unset $FL_DB) for this command"
-        );
-    }
     let github = match (&binding, needs_tracker) {
         (Some(b), true) => Some(open_github(b, cfg.github.as_ref(), &store)?),
         _ => None,

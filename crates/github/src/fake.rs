@@ -2,7 +2,8 @@
 //!
 //! ⚠ It proves structure, not integration (spec §8.4): it agrees with fl
 //! because both were written from the same reading of GitHub's docs. The
-//! live tests are the check against GitHub itself.
+//! live tests (`tests/live.rs`) check part of that reading against GitHub
+//! itself; a behaviour below that no live test checks says so.
 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,12 +105,12 @@ pub struct State {
     pub broken_create_body_next: bool,
     /// The create lands and is answered 200, not 201, with the issue as its
     /// body. GitHub documents 201; this models a 2xx it has not been seen to
-    /// send (unmeasured — Task 10's live test is the check). One-shot.
+    /// send (unmeasured; no live test checks it yet). One-shot.
     pub create_answers_200_next: bool,
     /// Node ids a `node(id: …)` lookup answers as living in ANOTHER
     /// repository — simulating a transferred issue (spec's `Moved` case).
-    /// Modelled, not measured: this is the fake's guess at the shape of
-    /// GitHub's real answer; Task 10's live test is the check. Not one-shot.
+    /// Modelled: this is the fake's guess at the shape of GitHub's real
+    /// answer (unmeasured; no live test checks it yet). Not one-shot.
     pub transferred_nodes: BTreeSet<String>,
     /// On the next timeline read, before answering, someone else adds the
     /// label `bug` to that issue (with its `labeled` event) — a write landing
@@ -122,8 +123,8 @@ pub struct State {
     pub null_edit_node_next: bool,
     /// When set, the edit-history `nodes` show only the OLDEST this many
     /// entries, while `totalCount` stays true — what `last: 100` returns if
-    /// GitHub orders the history newest-first (modelled, not measured; Task
-    /// 10's live test is the check). Not one-shot.
+    /// GitHub orders the history newest-first (modelled; unmeasured; no
+    /// live test checks it yet). Not one-shot.
     pub edit_nodes_cap: Option<usize>,
     /// Inside the next PATCH, someone deletes this many entries from the
     /// issue's body edit history (GitHub lets a person delete a revision).
@@ -798,9 +799,10 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 new.events.push((e, k.into()));
             }
             if old.body != new.body {
-                // ⚠ Modelled, not measured: GitHub is taken to record the
-                // original body as an entry at the FIRST edit, so a first
-                // edit adds two entries. The live test (Task 10) checks it.
+                // ⚠ Modelled: GitHub is taken to record the original body
+                // as an entry at the FIRST edit, so a first edit adds two
+                // entries. Checked by the live test
+                // `the_edit_history_and_timeline_counts_match_fls_model`.
                 if new.edits.is_empty() {
                     let e = format!("E_{}", s.tick());
                     new.edits.push(e);
@@ -819,7 +821,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         // repository's CURRENT name and node id. An unknown or deleted id
         // answers 200 with `data.node` null AND a NOT_FOUND error — an
         // answer, not a failure (spec's reading of GitHub's GraphQL error
-        // shape).
+        // shape; unmeasured; no live test checks it yet).
         ("POST", ["graphql"]) => {
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             // An issue's body edit history (Task 6), checked FIRST: it is
@@ -832,8 +834,8 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     .unwrap_or(0);
                 // A pull request, or a missing, deleted or transferred issue,
                 // answers `issue: null` with a NOT_FOUND error (the
-                // reviewer's reading of GitHub, unmeasured; Task 10's live
-                // test is the check).
+                // reviewer's reading of GitHub; unmeasured; no live test
+                // checks it yet).
                 let Some(i) = s
                     .issues
                     .get(&n)

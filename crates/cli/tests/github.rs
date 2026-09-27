@@ -228,6 +228,35 @@ fn db_cannot_be_combined_with_a_github_binding() {
         .stderr(contains("Drop --db"));
 }
 
+/// The refusal comes before any store is searched, created or opened: an
+/// IRI is not refused as not owned first, and the `--db` path — and its
+/// directory — is never created.
+#[test]
+fn db_with_a_github_binding_is_refused_before_any_store_is_touched() {
+    let g = fixture();
+    let dir = g.home.path().join("absent");
+    let db = dir.join("other.redb");
+    g.fl()
+        .arg("--db")
+        .arg(&db)
+        .args([
+            "record",
+            "list",
+            "--project",
+            "urn:uuid:00000000-0000-7000-8000-000000000001",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("Drop --db"));
+    assert!(!db.exists(), "the refused command created {}", db.display());
+    assert!(
+        !dir.exists(),
+        "the refused command created {}",
+        dir.display()
+    );
+    assert!(g.fake.state().requests.is_empty());
+}
+
 #[test]
 fn a_renamed_repository_is_announced_on_stderr() {
     let g = fixture();
