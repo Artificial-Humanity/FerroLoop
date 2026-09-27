@@ -231,6 +231,20 @@ impl FakeGithub {
         s.repos[0].full_name = full_name.to_string();
     }
 
+    /// Someone creates a new repository at `name`, which ends its redirect.
+    pub fn reuse_name(&self, name: &str) {
+        let mut s = self.state();
+        s.redirects.remove(&name.to_ascii_lowercase());
+        let id = s.repos.len() as u64 + 1;
+        s.repos.push(Repo {
+            id,
+            node_id: format!("R_{id}"),
+            full_name: name.into(),
+            visibility: "public".into(),
+            has_issues: true,
+        });
+    }
+
     pub fn issue(&self, n: u64) -> Issue {
         self.state().issues[&n].clone()
     }
@@ -732,14 +746,36 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             s.issues.insert(n, new);
             answer(200, s.issue_json(&s.issues[&n]))
         }
-        // A lookup of an unknown node: GitHub answers 200 with `data.node`
-        // null AND a NOT_FOUND error — an answer, not a failure (spec's
-        // reading of GitHub's GraphQL error shape). Tasks 5-7 extend this
-        // arm with real node lookups.
-        ("POST", ["graphql"]) => answer(
-            200,
-            json!({"data": {"node": null}, "errors": [{"type": "NOT_FOUND"}]}),
-        ),
+        // A node lookup by id (Task 5): the fake's issues all belong to its
+        // one bound repository, so a match is answered under that
+        // repository's CURRENT name and node id. An unknown or deleted id
+        // answers 200 with `data.node` null AND a NOT_FOUND error — an
+        // answer, not a failure (spec's reading of GitHub's GraphQL error
+        // shape).
+        ("POST", ["graphql"]) => {
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let id = v
+                .pointer("/variables/id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let node = s
+                .issues
+                .values()
+                .find(|i| i.node_id == id && !i.gone)
+                .map(|i| {
+                    json!({
+                        "url": format!("https://github.com/{}/issues/{}", s.bound().full_name, i.number),
+                        "repository": {"id": s.bound().node_id},
+                    })
+                });
+            match node {
+                Some(n) => answer(200, json!({"data": {"node": n}})),
+                None => answer(
+                    200,
+                    json!({"data": {"node": null}, "errors": [{"type": "NOT_FOUND"}]}),
+                ),
+            }
+        }
         _ => answer(
             404,
             json!({"message": format!("the fake does not serve {method} {path}")}),

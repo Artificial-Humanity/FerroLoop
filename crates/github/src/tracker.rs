@@ -774,6 +774,12 @@ impl GithubTracker {
                 detail: "it changed after fl read it and before fl wrote it".into(),
             });
         }
+        // A reference written under an old name is rewritten on the next
+        // write (spec §2.4).
+        if let Some(r) = meta.record.as_mut() {
+            let current = self.current_ref(r)?;
+            r.id = current;
+        }
         let mut title = issue.title.clone();
         change(&mut meta, &mut prose, &mut title)?;
         let labels = meta::labels_after(&issue.labels, kind, &meta.state);
@@ -858,10 +864,38 @@ impl GithubTracker {
         })
     }
 
-    /// A finding's record reference. Task 5 resolves a URL that is not under
-    /// this repository's current name by its node id (spec §2.3).
+    /// A finding's record reference (spec §2.3). A URL under this
+    /// repository's CURRENT name is trusted: the repository itself is bound
+    /// by node id at open. Any other URL is resolved by the reference's node
+    /// id — never by the URL, because an old name may now reach another
+    /// repository.
     fn current_ref(&self, r: &RecordRef) -> Result<Iri, StoreError> {
-        Ok(r.id.clone())
+        if let Some((name, _)) = meta::parse_issue_url(&r.id)
+            && name.eq_ignore_ascii_case(&self.repo.full_name)
+        {
+            return Ok(r.id.clone());
+        }
+        let data = self.client.graphql(
+            "query($id: ID!) { node(id: $id) { ... on Issue { url repository { id } } } }",
+            json!({ "id": r.node_id }),
+        )?;
+        let node = data
+            .get("node")
+            .filter(|n| !n.is_null())
+            .ok_or_else(|| StoreError::Deleted(r.id.clone()))?;
+        let url = node
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| backend("GitHub answered a node lookup without `url`".into()))?;
+        if node.pointer("/repository/id").and_then(Value::as_str)
+            != Some(self.repo.node_id.as_str())
+        {
+            return Err(StoreError::Moved {
+                id: r.id.clone(),
+                to: url.to_string(),
+            });
+        }
+        Iri::parse(url).map_err(|e| backend(format!("GitHub sent an issue URL fl cannot use: {e}")))
     }
 
     /// Which kind issue `n` holds. `None` only when no issue `n` exists; a
@@ -1781,5 +1815,133 @@ mod tests {
             .add_finding(Finding::raise(p(), RecordId(t.issue_url(99)), "a", "c"))
             .unwrap_err();
         assert!(matches!(err, StoreError::NoSuchRecord(_)), "{err:?}");
+    }
+
+    #[test]
+    fn a_renamed_repository_is_followed_with_a_notice_and_its_old_urls_still_resolve() {
+        let fake = FakeGithub::start("acme/widgets");
+        let memory = MemStore::default();
+        let (t, _) = GithubTracker::open(client(&fake), "acme/widgets", &memory).unwrap();
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.rename("acme/gadgets");
+        let (t, notice) = GithubTracker::open(client(&fake), "acme/widgets", &memory).unwrap();
+        assert_eq!(
+            notice,
+            Some(Notice::Renamed {
+                from: "acme/widgets".into(),
+                to: "acme/gadgets".into()
+            })
+        );
+        let back = t.get_record(&r).unwrap().unwrap();
+        assert_eq!(
+            back.id.iri().as_str(),
+            "https://github.com/acme/gadgets/issues/1"
+        );
+    }
+
+    #[test]
+    fn a_reused_old_name_is_refused_at_open_and_an_old_url_says_why_it_is_not_owned() {
+        let fake = FakeGithub::start("acme/widgets");
+        let memory = MemStore::default();
+        let (t, _) = GithubTracker::open(client(&fake), "acme/widgets", &memory).unwrap();
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.rename("acme/gadgets");
+        fake.reuse_name("acme/widgets");
+        let err = GithubTracker::open(client(&fake), "acme/widgets", &memory)
+            .err()
+            .unwrap();
+        assert!(
+            matches!(err, StoreError::RepositoryReplaced { .. }),
+            "{err:?}"
+        );
+        let (t, _) = GithubTracker::open(client(&fake), "acme/gadgets", &memory).unwrap();
+        let err = t.get_record(&r).unwrap_err();
+        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("now names a different repository"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_findings_record_reference_follows_its_node_id_and_the_next_write_rewrites_it() {
+        let fake = FakeGithub::start("acme/widgets");
+        let memory = MemStore::default();
+        let (t, _) = GithubTracker::open(client(&fake), "acme/widgets", &memory).unwrap();
+        let r = t.add_record(&p(), "t").unwrap();
+        t.add_finding(Finding::raise(p(), r, "a", "c")).unwrap();
+        fake.rename("acme/gadgets");
+        fake.reuse_name("acme/widgets");
+        let (t, _) = GithubTracker::open(client(&fake), "acme/gadgets", &memory).unwrap();
+        let mut f = t.get_finding(&FindingId(t.issue_url(2))).unwrap().unwrap();
+        assert_eq!(
+            f.record.iri().as_str(),
+            "https://github.com/acme/gadgets/issues/1"
+        );
+        assert!(
+            fake.issue(2).body.contains("acme/widgets/issues/1"),
+            "not yet rewritten"
+        );
+        f.withdraw("x").unwrap();
+        t.update_finding(&f).unwrap();
+        let body = fake.issue(2).body;
+        assert!(
+            body.contains("acme/gadgets/issues/1") && !body.contains("acme/widgets/issues/1"),
+            "{body}"
+        );
+    }
+
+    /// The same suites the local stores pass (spec §8.1): the GitHub
+    /// tracker over a `MemStore` catalog and ledger, checked by
+    /// `CatalogChecked`, numbered by `KindRouted`.
+    mod contract {
+        use super::*;
+        use fl_core::conformance::{self, Bound, Fixture};
+        use fl_core::store::{CatalogChecked, KindRouted};
+
+        struct Split {
+            catalog: MemStore,
+            tracker: GithubTracker,
+            _fake: FakeGithub,
+        }
+
+        impl Fixture for Split {
+            fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
+                let checked = CatalogChecked {
+                    catalog: &self.catalog,
+                    tracker: &self.tracker,
+                };
+                let handles = KindRouted {
+                    catalog: &self.catalog,
+                    tracker: &self.tracker,
+                };
+                f(&Bound {
+                    catalog: &self.catalog,
+                    tracker: &checked,
+                    ledger: &self.catalog,
+                    handles: &handles,
+                });
+            }
+        }
+
+        fn split() -> Split {
+            let fake = FakeGithub::start("acme/widgets");
+            let tracker = open(&fake);
+            Split {
+                catalog: MemStore::default(),
+                tracker,
+                _fake: fake,
+            }
+        }
+
+        #[test]
+        fn the_github_tracker_meets_the_tracker_contract() {
+            conformance::tracker(split);
+        }
+
+        #[test]
+        fn the_github_tracker_meets_the_all_roles_contract() {
+            conformance::all_roles(split);
+        }
     }
 }
