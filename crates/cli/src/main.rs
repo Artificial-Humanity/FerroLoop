@@ -109,6 +109,48 @@ impl Command {
     }
 }
 
+/// The host `$FL_GITHUB_API_URL` sends the GitHub credential to, if fl may
+/// send it there: `https`, or `http` to this machine (`127.0.0.1`,
+/// `localhost`, `[::1]`).
+///
+/// ⚠ Read with the parser the request itself uses (`http::Uri`, through
+/// ureq), never by string prefix: `http://127.0.0.1:1@example.com` starts
+/// like loopback, but its host is `example.com`. An authority carrying `@`
+/// (a user name or password) is refused under any scheme, and so is
+/// anything that does not parse.
+fn api_override_host(url: &str) -> Result<String> {
+    let refuse = |why: String| {
+        anyhow::anyhow!(
+            "$FL_GITHUB_API_URL is `{url}`: {why}. fl sends the GitHub credential there, so it \
+             must be https://, or http:// to this machine (127.0.0.1, localhost or [::1]). \
+             Unset it to use GitHub"
+        )
+    };
+    let uri: ureq::http::Uri = url
+        .parse()
+        .map_err(|e| refuse(format!("it is not a URL ({e})")))?;
+    let Some(authority) = uri.authority() else {
+        return Err(refuse("it names no host".to_string()));
+    };
+    if authority.as_str().contains('@') {
+        return Err(refuse(
+            "it carries a user name or password before the host".to_string(),
+        ));
+    }
+    let host = authority.host();
+    // `host()` keeps the brackets on an IPv6 address: `[::1]`.
+    match uri.scheme_str() {
+        Some("https") => {}
+        Some("http") if matches!(host, "127.0.0.1" | "localhost" | "[::1]") => {}
+        _ => {
+            return Err(refuse(format!(
+                "its host `{host}` is not this machine, and it is not https"
+            )));
+        }
+    }
+    Ok(host.to_string())
+}
+
 fn open_github(
     b: &config::TrackerBinding,
     app: Option<&config::GithubApp>,
@@ -119,20 +161,8 @@ fn open_github(
         // ⚠ For tests. The credential goes wherever this points, so only
         // https, or plain http to this machine, is accepted — and said.
         Ok(url) => {
-            let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
-                .iter()
-                .any(|p| {
-                    url == *p
-                        || url.starts_with(&format!("{p}:"))
-                        || url.starts_with(&format!("{p}/"))
-                });
-            if !url.starts_with("https://") && !loopback {
-                bail!(
-                    "$FL_GITHUB_API_URL is `{url}`; fl sends the GitHub credential there, so it \
-                     must be https://, or http:// to this machine. Unset it to use GitHub"
-                );
-            }
-            eprintln!("notice: $FL_GITHUB_API_URL is set; talking to {url}, not GitHub");
+            let host = api_override_host(&url)?;
+            eprintln!("notice: $FL_GITHUB_API_URL is set; talking to {host}, not GitHub");
             url
         }
     };
@@ -161,11 +191,18 @@ fn open_github(
     Ok(tracker)
 }
 
-/// Resolve the store path from `--db`, then `$FL_DB`, then the project
-/// bound to `locus` in the user's config, then the XDG data directory, then
-/// `~/.local/share` — and whether that tier CONFINES the command to this
-/// one store. `locus` is the current directory, except for `project add`,
-/// where it is the directory being registered.
+/// The store `--db`, then `$FL_DB`, names, if either does. Either one
+/// CONFINES the command to that store (see [`db_path`]).
+fn explicit_db(flag: Option<PathBuf>) -> Option<PathBuf> {
+    flag.or_else(|| std::env::var("FL_DB").ok().map(PathBuf::from))
+}
+
+/// Resolve the store path from `explicit` (`--db`, then `$FL_DB`), then
+/// `configured` — the store the config binds to the project at the locus —
+/// then the XDG data directory, then `~/.local/share`, and whether that tier
+/// CONFINES the command to this one store. The locus is the current
+/// directory, except for `project add`, where it is the directory being
+/// registered.
 ///
 /// `$XDG_DATA_HOME` follows the rule `config::path` applies to
 /// `$XDG_CONFIG_HOME`: an empty or relative value is ignored, never used
@@ -190,16 +227,10 @@ fn open_github(
 /// same treatment `$XDG_DATA_HOME`/`$HOME` already had: create the directory
 /// that will hold the store. `--db path/to/db` and `$FL_DB=path/to/db`
 /// behave identically to each other and to the XDG fallback again.
-fn db_path(
-    explicit: Option<PathBuf>,
-    entries: &[config::Entry],
-    locus: &Path,
-) -> Result<(PathBuf, bool)> {
+fn db_path(explicit: Option<PathBuf>, configured: Option<PathBuf>) -> Result<(PathBuf, bool)> {
     let (path, confined) = if let Some(p) = explicit {
         (p, true)
-    } else if let Ok(p) = std::env::var("FL_DB") {
-        (PathBuf::from(p), true)
-    } else if let Some(p) = config::bound(entries, locus)? {
+    } else if let Some(p) = configured {
         (p, false)
     } else {
         let base = config::data_dir(
@@ -325,8 +356,21 @@ fn run(cli: Cli) -> Result<i32> {
         Some(root) => cwd.join(root),
         None => cwd.clone(),
     };
-    let (bound, confined) = db_path(cli.db, entries, &locus)?;
-    let binding = config::bound_entry(entries, &locus)?.and_then(|e| e.tracker);
+    let needs_tracker = cli.command.needs_tracker();
+    let explicit = explicit_db(cli.db);
+    // The project's config entry, read once, and only when something needs
+    // it: without `--db`/`$FL_DB` it picks the store; for a command that
+    // needs the tracker it names the tracker. `--db`/`$FL_DB` with any other
+    // command never reads it, so an ambiguous config cannot block that
+    // escape hatch — but a tracker command with an ambiguous config is
+    // refused, because it cannot know its tracker.
+    let entry = if explicit.is_none() || needs_tracker {
+        config::bound_entry(entries, &locus)?
+    } else {
+        None
+    };
+    let (bound, confined) = db_path(explicit, entry.as_ref().map(|e| e.store.clone()))?;
+    let binding = entry.and_then(|e| e.tracker);
     let mut iris = cli.command.iris();
     // A GitHub issue URL is the tracker's to resolve: no local store holds
     // one, and searching them would refuse it as NotOwned (spec §2.2).
@@ -352,13 +396,13 @@ fn run(cli: Cli) -> Result<i32> {
         .with_context(|| format!("could not open the store at {}", path.display()))?;
     // A bound project's node binding and catalog live in the store its
     // config entry names; `--db` would pair GitHub with another catalog.
-    if binding.is_some() && confined && cli.command.needs_tracker() {
+    if binding.is_some() && confined && needs_tracker {
         bail!(
             "this project's tracker is bound to GitHub in the config, so it uses the store its \
              config entry names. Drop --db (and unset $FL_DB) for this command"
         );
     }
-    let github = match (&binding, cli.command.needs_tracker()) {
+    let github = match (&binding, needs_tracker) {
         (Some(b), true) => Some(open_github(b, cfg.github.as_ref(), &store)?),
         _ => None,
     };
@@ -397,5 +441,39 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Attempt(c) => cmd::attempt::run(&ctx, c),
         Command::Stats(c) => cmd::stats::run(&store, c),
         Command::Manifest(c) => cmd::manifest::run(&store, c),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_api_override_is_refused_unless_https_or_this_machine() {
+        for url in [
+            "http://127.0.0.1:1@example.com",
+            "http://localhost:x@example.com/",
+            "https://user@ghe.example/api/v3",
+            "http://127.0.0.1.example.com",
+            "http://example.com",
+            "ftp://127.0.0.1/",
+            "127.0.0.1:8080",
+            "",
+        ] {
+            let err = api_override_host(url).expect_err(url);
+            assert!(format!("{err:#}").contains("https://"), "{url}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn an_api_override_to_https_or_this_machine_is_accepted_naming_the_host() {
+        for (url, host) in [
+            ("http://127.0.0.1:43227", "127.0.0.1"),
+            ("http://localhost:43227", "localhost"),
+            ("http://[::1]:43227/", "[::1]"),
+            ("https://ghe.example/api/v3", "ghe.example"),
+        ] {
+            assert_eq!(api_override_host(url).unwrap(), host, "{url}");
+        }
     }
 }

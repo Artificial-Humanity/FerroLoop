@@ -114,17 +114,14 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
                 e.store.display()
             );
         }
-        if let Some(t) = &e.tracker {
-            let ok = t.github.split('/').count() == 2
-                && t.github.split('/').all(|p| !p.is_empty())
-                && !t.github.contains(char::is_whitespace);
-            if !ok {
-                bail!(
-                    "{}: `github = \"{}\"` must name a repository as `owner/repo`",
-                    path.display(),
-                    t.github
-                );
-            }
+        if let Some(t) = &e.tracker
+            && !is_owner_repo(&t.github)
+        {
+            bail!(
+                "{}: `github = \"{}\"` must name a repository as `owner/repo`",
+                path.display(),
+                t.github
+            );
         }
     }
     if let Some(app) = &file.github
@@ -142,6 +139,15 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
     })
 }
 
+/// Whether `s` names a repository as `owner/repo`: exactly two non-empty
+/// parts and no whitespace. The config's `github = …` and a typed
+/// `owner/repo#41` follow the same rule.
+pub fn is_owner_repo(s: &str) -> bool {
+    s.split('/').count() == 2
+        && s.split('/').all(|p| !p.is_empty())
+        && !s.contains(char::is_whitespace)
+}
+
 /// Canonicalize `path`. A path that does not exist is not an error here —
 /// `Ok(None)` — that is simply a project root (or a `cwd`) not yet created.
 /// Any OTHER failure, such as a permission error partway down the tree, IS
@@ -154,11 +160,6 @@ fn canonicalize(path: &Path) -> Result<Option<PathBuf>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e).with_context(|| format!("could not resolve {}", path.display())),
     }
-}
-
-/// The store bound to the project containing `cwd`.
-pub fn bound(entries: &[Entry], cwd: &Path) -> Result<Option<PathBuf>> {
-    Ok(bound_entry(entries, cwd)?.map(|e| e.store))
 }
 
 /// The config entry for the project containing `cwd`: the entry whose root
@@ -199,11 +200,18 @@ pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
     if distinct.len() > 1 {
         let names = winners
             .iter()
-            .map(|(_, e)| format!("{} -> {}", e.root.display(), e.store.display()))
+            .map(|(_, e)| {
+                let tracker = match &e.tracker {
+                    Some(t) => format!("github:{}", t.github),
+                    None => "the store's own tracker".to_string(),
+                };
+                format!("{} -> {} -> {tracker}", e.root.display(), e.store.display())
+            })
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
-            "the project at {} is bound to more than one store or tracker in the config: {names}",
+            "the project at {} is bound to more than one store or tracker in the config: \
+             {names}. Remove all but one of these entries",
             cwd.display()
         );
     }
@@ -213,6 +221,98 @@ pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `load` over a config file holding `text`.
+    fn load_text(text: &str) -> Result<Config> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        load(Some(&path))
+    }
+
+    fn entry_with(github: &str) -> String {
+        format!(
+            "[[project]]\nroot = \"/r\"\nstore = \"/s.redb\"\n\
+             tracker = {{ github = \"{github}\", credential = \"env\" }}\n"
+        )
+    }
+
+    #[test]
+    fn a_tracker_must_name_a_repository_as_owner_slash_repo() {
+        for bad in [
+            "acme",
+            "acme/",
+            "/widgets",
+            "acme/widgets/x",
+            "ac me/widgets",
+            "",
+        ] {
+            let err = load_text(&entry_with(bad)).expect_err(bad);
+            assert!(
+                format!("{err:#}").contains("must name a repository as `owner/repo`"),
+                "{bad}: {err:#}"
+            );
+        }
+        let cfg = load_text(&entry_with("acme/widgets")).unwrap();
+        assert_eq!(
+            cfg.projects[0].tracker,
+            Some(TrackerBinding {
+                github: "acme/widgets".into(),
+                credential: Credential::Env,
+            })
+        );
+    }
+
+    #[test]
+    fn a_relative_private_key_is_refused() {
+        let err = load_text("[github]\napp_id = 1\nprivate_key = \"key.pem\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`private_key` must be an absolute path"),
+            "{err:#}"
+        );
+        let cfg = load_text("[github]\napp_id = 1\nprivate_key = \"/k/key.pem\"\n").unwrap();
+        assert_eq!(cfg.github.unwrap().app_id, 1);
+    }
+
+    #[test]
+    fn two_entries_differing_only_by_tracker_are_refused_naming_each_tracker() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PathBuf::from("/tmp/fl-config-test-same.redb");
+        let entries = vec![
+            Entry {
+                root: root.path().to_path_buf(),
+                store: store.clone(),
+                tracker: None,
+            },
+            Entry {
+                root: root.path().to_path_buf(),
+                store,
+                tracker: Some(TrackerBinding {
+                    github: "acme/widgets".into(),
+                    credential: Credential::Env,
+                }),
+            },
+        ];
+        let msg = format!("{:#}", bound_entry(&entries, root.path()).unwrap_err());
+        assert!(msg.contains("-> github:acme/widgets"), "{msg}");
+        assert!(msg.contains("-> the store's own tracker"), "{msg}");
+        assert!(msg.contains("Remove all but one of these entries"), "{msg}");
+    }
+
+    #[test]
+    fn identical_entries_are_not_a_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let e = Entry {
+            root: root.path().to_path_buf(),
+            store: PathBuf::from("/tmp/fl-config-test-same.redb"),
+            tracker: Some(TrackerBinding {
+                github: "acme/widgets".into(),
+                credential: Credential::Env,
+            }),
+        };
+        let got = bound_entry(&[e.clone(), e], root.path()).unwrap().unwrap();
+        assert_eq!(got.tracker.unwrap().github, "acme/widgets");
+    }
 
     #[test]
     fn an_empty_or_relative_xdg_config_home_falls_back_to_home() {
@@ -281,7 +381,7 @@ mod tests {
             store: store.clone(),
             tracker: None,
         }];
-        let got = bound(&entries, &link).unwrap();
+        let got = bound_entry(&entries, &link).unwrap().map(|e| e.store);
         assert_eq!(got, Some(store));
     }
 
@@ -300,7 +400,7 @@ mod tests {
                 tracker: None,
             },
         ];
-        let err = bound(&entries, root.path()).unwrap_err();
+        let err = bound_entry(&entries, root.path()).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("fl-config-test-one.redb") && msg.contains("fl-config-test-two.redb"),

@@ -265,7 +265,11 @@ fn an_unknown_tracker_key_is_refused_not_ignored() {
     );
     assert!(cfg.contains("extra = 1"), "the edit must land");
     fs::write(&path, cfg).unwrap();
-    g.fl().args(["project", "list"]).assert().failure();
+    g.fl()
+        .args(["project", "list"])
+        .assert()
+        .failure()
+        .stderr(contains("extra"));
 }
 
 #[test]
@@ -276,5 +280,123 @@ fn an_unbound_project_keeps_its_local_tracker() {
         .args(["record", "add", "--project", "1", "--title", "t"])
         .assert()
         .success();
+    assert!(g.fake.state().requests.is_empty());
+}
+
+#[test]
+fn an_api_override_with_a_user_name_before_the_host_is_refused() {
+    let g = fixture();
+    g.project();
+    // Starts like loopback, but the host is after the `@`. Refused before
+    // any request. The real host is a closed port on this machine (and
+    // `.invalid` never resolves), so even a broken guard contacts nothing
+    // off it; the guard's unit tests cover the same shapes with a public
+    // host.
+    for url in [
+        "http://127.0.0.1:1@127.0.0.2:1",
+        "http://localhost:x@127.0.0.2:1/",
+    ] {
+        g.fl()
+            .env("FL_GITHUB_API_URL", url)
+            .args(["record", "list", "--project", "1"])
+            .assert()
+            .failure()
+            .stderr(contains("user name or password"));
+    }
+    g.fl()
+        .env("FL_GITHUB_API_URL", "http://127.0.0.1.invalid")
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("is not this machine"));
+    assert!(g.fake.state().requests.is_empty());
+}
+
+#[test]
+fn an_api_override_to_localhost_is_accepted_and_announced() {
+    let g = fixture();
+    g.project();
+    let url = g.fake.url().replace("127.0.0.1", "localhost");
+    g.fl()
+        .env("FL_GITHUB_API_URL", &url)
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .success()
+        .stderr(contains("talking to localhost, not GitHub"));
+}
+
+#[test]
+fn an_app_credential_without_a_github_section_is_refused() {
+    let g = fixture();
+    let path = g.home.path().join("config/fl/config.toml");
+    let cfg = fs::read_to_string(&path)
+        .unwrap()
+        .replace("credential = \"env\"", "credential = \"app\"");
+    assert!(cfg.contains("credential = \"app\""), "the edit must land");
+    fs::write(&path, cfg).unwrap();
+    g.project();
+    g.fl()
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("needs a `[github]` section"));
+    assert!(g.fake.state().requests.is_empty());
+}
+
+/// The fixture's config with a second entry for the same root and store
+/// but no tracker: the project's tracker is ambiguous.
+fn make_ambiguous(g: &G) {
+    let path = g.home.path().join("config/fl/config.toml");
+    let cfg = fs::read_to_string(&path).unwrap();
+    let local = cfg
+        .lines()
+        .filter(|l| !l.starts_with("tracker"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{cfg}{local}\n")).unwrap();
+}
+
+#[test]
+fn db_still_escapes_an_ambiguous_config_for_a_command_that_needs_no_tracker() {
+    let g = fixture();
+    make_ambiguous(&g);
+    let db = g.home.path().join("other.redb");
+    g.fl()
+        .arg("--db")
+        .arg(&db)
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    g.fl()
+        .arg("--db")
+        .arg(&db)
+        .args(["project", "list"])
+        .assert()
+        .success();
+    g.fl()
+        .env("FL_DB", &db)
+        .args(["project", "list"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn a_tracker_command_with_an_ambiguous_config_is_refused_even_with_db() {
+    let g = fixture();
+    make_ambiguous(&g);
+    let db = g.home.path().join("other.redb");
+    g.fl()
+        .arg("--db")
+        .arg(&db)
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    g.fl()
+        .arg("--db")
+        .arg(&db)
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("more than one store or tracker"));
     assert!(g.fake.state().requests.is_empty());
 }
