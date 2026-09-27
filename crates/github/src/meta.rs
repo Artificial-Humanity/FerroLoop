@@ -593,6 +593,70 @@ mod tests {
         assert_eq!(title_of("short\nrest"), "short");
     }
 
+    /// Fix round 1, guard 1: `read_item`'s "exactly one kind label" check
+    /// (`let [kind] = kinds.as_slice() else …`).
+    #[test]
+    fn zero_or_two_kind_labels_are_diverged_naming_the_kind_labels() {
+        let m = meta(ItemKind::Record, "todo");
+        let two_kinds = issue(
+            &["fl:record", "fl:finding", "fl:record/todo"],
+            "open",
+            &render_body("", &m),
+        );
+        let err = read_item(&two_kinds).unwrap_err().to_string();
+        assert!(
+            err.contains("fl:record") && err.contains("fl:finding") && err.contains('2'),
+            "{err}"
+        );
+
+        let no_kind = issue(&["fl:record/todo"], "open", &render_body("", &m));
+        assert!(
+            matches!(read_item(&no_kind), Err(StoreError::Diverged { .. })),
+            "a state label with no kind label must still diverge"
+        );
+    }
+
+    /// Fix round 1, guard 2: `read_item`'s stray-label check
+    /// (`if !stray.is_empty() { … }`).
+    #[test]
+    fn a_stray_label_is_diverged_naming_it() {
+        let m = meta(ItemKind::Record, "todo");
+        let i = issue(
+            &["fl:record", "fl:record/todo", "fl:finding/raised"],
+            "open",
+            &render_body("", &m),
+        );
+        let err = read_item(&i).unwrap_err().to_string();
+        assert!(err.contains("fl:finding/raised"), "{err}");
+    }
+
+    /// Fix round 1, guard 3a: `#[serde(deny_unknown_fields)]` on `Meta`
+    /// itself — an unknown top-level field in the block is damaged.
+    #[test]
+    fn an_unknown_top_level_field_in_the_block_is_damaged() {
+        let m = meta(ItemKind::Record, "todo");
+        let body = render_body("", &m);
+        assert!(body.contains('{'), "{body}");
+        let bad = body.replacen('{', "{\"extra\":1,", 1);
+        assert!(matches!(parse_body(&bad), Err(BodyError::Damaged(_))));
+    }
+
+    /// Fix round 1, guard 3b: `#[serde(deny_unknown_fields)]` on
+    /// `RecordRef` — an unknown field nested inside `record` is damaged
+    /// too, independently of `Meta`'s own guard.
+    #[test]
+    fn an_unknown_field_inside_record_is_damaged() {
+        let mut m = meta(ItemKind::Finding, "raised");
+        m.record = Some(RecordRef {
+            id: Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000099").unwrap(),
+            node_id: "I_9".into(),
+        });
+        let body = render_body("", &m);
+        assert!(body.contains("\"record\":{"), "{body}");
+        let bad = body.replacen("\"record\":{", "\"record\":{\"extra\":1,", 1);
+        assert!(matches!(parse_body(&bad), Err(BodyError::Damaged(_))));
+    }
+
     #[test]
     fn only_a_github_issue_url_parses() {
         let ok = Iri::parse("https://github.com/Acme/Widgets/issues/41").unwrap();
