@@ -211,6 +211,10 @@ mod tests {
         let catalog = MemStore::default();
         let tracker = MemStore::default();
         let p = catalog.add_project("/p").unwrap();
+        // MemStore ids are sequential, so both stores would mint the same
+        // first id. Burn one in the tracker's store, so `tp` is an id the
+        // catalog does not hold.
+        tracker.add_project("/burned").unwrap();
         let tp = tracker.add_project("/q").unwrap();
         let r = tracker.add_record(&tp, "t").unwrap();
         let h = KindRouted {
@@ -219,6 +223,7 @@ mod tests {
         };
         assert_eq!(h.handle_of(Kind::Project, p.iri()).unwrap(), Some(1));
         assert_eq!(h.handle_of(Kind::Record, r.iri()).unwrap(), Some(1));
+        assert_ne!(p, tp, "the routing check below needs two different ids");
         // A project the TRACKER's store holds is not asked of the tracker.
         assert_eq!(h.handle_of(Kind::Project, tp.iri()).unwrap(), None);
         assert_eq!(h.resolve_handle(Kind::Record, 1).unwrap().as_ref(), Some(r.iri()));
@@ -229,7 +234,7 @@ mod tests {
         let s = MemStore::default();
         assert_eq!(s.bound_node_id("Acme/Widgets").unwrap(), None);
         s.bind_node_id("Acme/Widgets", "R_1").unwrap();
-        assert_eq!(s.bound_node_id("acme/widgets").unwrap().as_deref(), Some("R_1"));
+        assert_eq!(s.bound_node_id("ACME/widgets").unwrap().as_deref(), Some("R_1"));
     }
 }
 ```
@@ -241,6 +246,7 @@ Append to `crates/store/src/lib.rs`'s `mod tests`:
 ```rust
     #[test]
     fn a_binding_survives_a_reopen_and_a_fresh_store_has_none() {
+        use fl_core::store::Bindings;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("b.redb");
         {
@@ -271,7 +277,8 @@ In `crates/core/src/store.rs`, add to `StoreError` (after `Dangling`):
     /// (GitHub tracker spec §3.4). fl adopts neither side silently.
     #[error(
         "{id} is diverged: {detail}. Run `fl github repair {id} --by <name>` to rewrite its \
-         labels and status from fl's record."
+         labels and status from fl's record — or, if the issue was never fl's, remove its fl \
+         labels."
     )]
     Diverged { id: Iri, detail: String },
     /// ⚠ Another actor wrote the item while fl wrote it (spec §3.3). That
@@ -326,7 +333,7 @@ Add to `trait Catalog`:
     fn kind_of(&self, id: &Iri) -> Result<Kind, StoreError>;
 ```
 
-Implement it: in `crates/core/src/mem.rs` `impl Catalog for MemStore` — `self.inner.borrow().check(id)`; in `crates/store/src/lib.rs` `impl Catalog for RedbStore` — `self.check(id)`; in `crates/exec/src/evaluate.rs` — `StampRefused` delegates (`self.0.kind_of(id)`) and `BrokenStore` returns `Err(broken())`.
+Implement it: in `crates/core/src/mem.rs` `impl Catalog for MemStore` — `self.inner.borrow().check(id)`; in `crates/store/src/lib.rs` `impl Catalog for RedbStore` — `self.check(id)`; in `crates/exec/src/evaluate.rs` — `StampRefused` delegates (`self.0.kind_of(id)`) and `BrokenStore` returns `Err(broken())`. The evaluate test module needs `fl_core::{Iri, Kind}` in scope for those two impls.
 
 Add after `impl Roles`:
 
@@ -594,9 +601,14 @@ impl Client {
     pub fn send(&self, m: Method, path_or_url: &str, body: Option<&Value>) -> Result<Reply, StoreError>;
     pub fn get_all(&self, path: &str) -> Result<Vec<Value>, StoreError>;
     pub fn graphql(&self, query: &str, variables: Value) -> Result<Value, StoreError>;
+    pub fn identity(&self) -> Result<String, StoreError>;
 }
 // creds
-pub trait Credentials { fn token(&self) -> Result<String, StoreError>; fn describe(&self) -> String; }
+pub trait Credentials {
+    fn token(&self) -> Result<String, StoreError>;
+    fn describe(&self) -> String;
+    fn identity(&self, api: &str) -> Result<String, StoreError>;   // login, or `<slug>[bot]`
+}
 pub struct EnvToken; impl EnvToken { pub fn from_env() -> Result<Self, StoreError>; pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, StoreError>; }
 pub struct AppCredentials; impl AppCredentials {
     pub fn new(api: &str, app_id: u64, pem: &str, repo: &str) -> Result<Self, StoreError>;
@@ -767,14 +779,39 @@ impl Client {
                 reply.status
             )));
         }
-        if let Some(errors) = reply.body.get("errors").filter(|e| !e.is_null()) {
-            return Err(StoreError::Backend(format!(
-                "GitHub refused a GraphQL query: {errors}"
-            )));
+        // GitHub answers a lookup of a missing node with `null` data AND a
+        // NOT_FOUND error: that is an answer, not a failure. A rate limit
+        // arrives the same way, as a 200 with an error of type RATE_LIMITED.
+        if let Some(errors) = reply
+            .body
+            .get("errors")
+            .and_then(Value::as_array)
+            .filter(|e| !e.is_empty())
+        {
+            let kinds: Vec<&str> = errors
+                .iter()
+                .map(|e| e.get("type").and_then(Value::as_str).unwrap_or(""))
+                .collect();
+            if kinds.contains(&"RATE_LIMITED") {
+                return Err(StoreError::RateLimited {
+                    reset: "GitHub's GraphQL limit resets (it did not say when)".into(),
+                });
+            }
+            if !kinds.iter().all(|k| *k == "NOT_FOUND") {
+                return Err(StoreError::Backend(format!(
+                    "GitHub refused a GraphQL query: {}",
+                    Value::Array(errors.clone())
+                )));
+            }
         }
         reply.body.get("data").cloned().ok_or_else(|| {
             StoreError::Backend("GitHub answered a GraphQL query with no `data`".into())
         })
+    }
+
+    /// Who GitHub says fl writes as (spec §5.4).
+    pub fn identity(&self) -> Result<String, StoreError> {
+        self.creds.identity(&self.api)
     }
 
     fn url(&self, path_or_url: &str) -> Result<String, StoreError> {
@@ -960,6 +997,21 @@ mod tests {
     }
 
     #[test]
+    fn a_graphql_not_found_is_an_answer_and_a_graphql_rate_limit_is_an_error() {
+        let fake = FakeGithub::start("acme/widgets");
+        let c = client(&fake);
+        let data = c
+            .graphql("query($id: ID!) { node(id: $id) { ... on Issue { url } } }", serde_json::json!({"id": "I_404"}))
+            .unwrap();
+        assert!(data["node"].is_null());
+        fake.state().graphql_rate_limited = true;
+        let err = c
+            .graphql("query($id: ID!) { node(id: $id) { ... on Issue { url } } }", serde_json::json!({"id": "I_404"}))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
+    }
+
+    #[test]
     fn a_missing_page_fails_the_whole_list() {
         let fake = FakeGithub::start("acme/widgets");
         {
@@ -1003,8 +1055,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub trait Credentials {
     /// A bearer token for the next request.
     fn token(&self) -> Result<String, StoreError>;
-    /// Who fl writes as, for `fl github whoami`. Never the secret itself.
+    /// Where the credential comes from, for `fl github whoami`. Never the
+    /// secret itself.
     fn describe(&self) -> String;
+    /// Who GitHub says fl writes as: a user's login, or an App's
+    /// `<slug>[bot]` (spec §5.4).
+    fn identity(&self, api: &str) -> Result<String, StoreError>;
+}
+
+fn text_field(v: &Value, k: &str, what: &str) -> Result<String, StoreError> {
+    v.get(k)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| StoreError::Credential(format!("GitHub's answer about {what} has no `{k}`")))
 }
 
 /// The environment variables `credential = "env"` reads, in order.
@@ -1043,6 +1106,16 @@ impl Credentials for EnvToken {
     }
     fn describe(&self) -> String {
         format!("the token in ${}", self.var)
+    }
+    fn identity(&self, api: &str) -> Result<String, StoreError> {
+        let r = send(&agent(), Method::Get, &format!("{api}/user"), &self.token, None, api)?;
+        if r.status != 200 {
+            return Err(StoreError::Credential(format!(
+                "GitHub answered {} when fl asked whose token ${} is",
+                r.status, self.var
+            )));
+        }
+        text_field(&r.body, "login", "the token's user")
     }
 }
 
@@ -1108,7 +1181,21 @@ impl AppCredentials {
             .as_secs();
         let jwt = self.jwt(now)?;
         let url = format!("{}/repos/{}/installation", self.api, self.repo);
-        let found = send(&self.agent, Method::Get, &url, &jwt, None, &self.api)?;
+        let mut found = send(&self.agent, Method::Get, &url, &jwt, None, &self.api)?;
+        // After a rename GitHub redirects the old name. Follow ONE redirect,
+        // and only on this API's own origin: the JWT goes where it points.
+        if matches!(found.status, 301 | 302 | 307 | 308) {
+            let to = found
+                .location
+                .clone()
+                .filter(|l| l.starts_with(&format!("{}/", self.api)))
+                .ok_or_else(|| {
+                    StoreError::Credential(
+                        "GitHub redirected the App's installation lookup off its own origin".into(),
+                    )
+                })?;
+            found = send(&self.agent, Method::Get, &to, &jwt, None, &self.api)?;
+        }
         if found.status == 404 {
             return Err(StoreError::Credential(format!(
                 "the App {} is not installed on {}. Install it on that repository",
@@ -1152,6 +1239,20 @@ impl Credentials for AppCredentials {
     }
     fn describe(&self) -> String {
         format!("GitHub App {} (installation token)", self.app_id)
+    }
+    fn identity(&self, api: &str) -> Result<String, StoreError> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| StoreError::Credential("the system clock is before 1970".into()))?
+            .as_secs();
+        let r = send(&self.agent, Method::Get, &format!("{api}/app"), &self.jwt(now)?, None, api)?;
+        if r.status != 200 {
+            return Err(StoreError::Credential(format!(
+                "GitHub answered {} when fl asked which App {} is",
+                r.status, self.app_id
+            )));
+        }
+        Ok(format!("{}[bot]", text_field(&r.body, "slug", "the App")?))
     }
 }
 
@@ -1261,6 +1362,23 @@ mod tests {
     }
 
     #[test]
+    fn identity_names_the_user_or_the_apps_bot() {
+        let fake = FakeGithub::start("acme/widgets");
+        let env = EnvToken::from_lookup(|_| Some("t".into())).unwrap();
+        assert_eq!(env.identity(&fake.url()).unwrap(), crate::fake::USER_LOGIN);
+        let app = AppCredentials::new(&fake.url(), 42, &throwaway_key(true), "acme/widgets").unwrap();
+        assert_eq!(app.identity(&fake.url()).unwrap(), format!("{}[bot]", crate::fake::APP_SLUG));
+    }
+
+    #[test]
+    fn the_app_still_finds_its_installation_after_a_rename() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.rename("acme/gadgets");
+        let app = AppCredentials::new(&fake.url(), 42, &throwaway_key(true), "acme/widgets").unwrap();
+        assert_eq!(app.token().unwrap(), crate::fake::INSTALLATION_TOKEN);
+    }
+
+    #[test]
     fn an_app_not_installed_on_the_repository_is_named_as_such() {
         let fake = FakeGithub::start("acme/widgets");
         fake.state().installations.clear();
@@ -1286,11 +1404,12 @@ This task builds the fake's server, its state, and the repository, label, App an
 
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 pub const INSTALLATION_TOKEN: &str = "fake-installation-token";
+pub const USER_LOGIN: &str = "fake-user";
+pub const APP_SLUG: &str = "fake-app";
 
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -1340,9 +1459,14 @@ pub struct State {
     /// (path prefix, page number): that page answers 500.
     pub fail_page: Option<(String, u32)>,
     pub rate_limited: bool,
+    pub graphql_rate_limited: bool,
     pub fail_repo_read: bool,
     pub drop_labels: bool,
     pub fail_after_create: bool,
+    /// The create lands, then the connection breaks mid-answer.
+    pub hang_up_after_create: bool,
+    /// The create answers 502 and nothing lands.
+    pub fail_before_create: bool,
     pub foreign_label_on_next_patch: bool,
     pub foreign_edit_on_next_patch: bool,
 }
@@ -1386,8 +1510,17 @@ impl FakeGithub {
                     .map(|h| h.value.to_string())
                     .unwrap_or_default();
                 let mut body = String::new();
-                let _ = req.as_reader().read_to_string(&mut body);
+                let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
                 let answer = route(&mut st.lock().unwrap(), &method, &url, &auth, &body);
+                if answer.hang_up {
+                    // A broken answer after the server acted: the client
+                    // fails at once with a transport error. (Dropping the
+                    // request unanswered would make tiny_http answer 500;
+                    // a short body would hang the client until its timeout.)
+                    let mut w = req.into_writer();
+                    let _ = std::io::Write::write_all(&mut w, b"HTTP/9 broken\r\n\r\n");
+                    continue;
+                }
                 let mut resp = tiny_http::Response::from_string(answer.body.to_string())
                     .with_status_code(answer.status)
                     .with_header(header("Content-Type", "application/json"));
@@ -1431,6 +1564,7 @@ pub(crate) struct Answer {
     status: u16,
     body: Value,
     headers: Vec<(String, String)>,
+    hang_up: bool,
 }
 
 fn answer(status: u16, body: Value) -> Answer {
@@ -1438,6 +1572,7 @@ fn answer(status: u16, body: Value) -> Answer {
         status,
         body,
         headers: vec![],
+        hang_up: false,
     }
 }
 
@@ -1494,9 +1629,30 @@ impl State {
     }
 }
 
+/// The installation of the repository with id `repo`, keyed by the name it
+/// was installed under — which a rename does not change.
+fn installation(s: &State, repo: Option<u64>) -> Answer {
+    let installed = repo.and_then(|id| {
+        s.installations
+            .iter()
+            .find(|(name, _)| {
+                s.repos.iter().any(|r| r.id == id && r.full_name.eq_ignore_ascii_case(name))
+                    || s.redirects.get(*name) == Some(&id)
+            })
+            .map(|(_, inst)| *inst)
+    });
+    match installed {
+        Some(inst) => answer(200, json!({"id": inst})),
+        None => answer(404, json!({"message": "Not Found"})),
+    }
+}
+
 /// Every route the fake serves. Later tasks add arms above the final `_`.
 pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &str) -> Answer {
     s.requests.push(format!("{method} {url}"));
+    if method == "POST" && url == "/graphql" && std::mem::take(&mut s.graphql_rate_limited) {
+        return answer(200, json!({"data": null, "errors": [{"type": "RATE_LIMITED"}]}));
+    }
     if s.rate_limited {
         s.rate_limited = false;
         let mut a = answer(403, json!({"message": "API rate limit exceeded"}));
@@ -1535,10 +1691,27 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             if auth.trim_start_matches("Bearer ").split('.').count() != 3 {
                 return answer(401, json!({"message": "A JSON web token could not be decoded"}));
             }
-            match s.installations.get(&format!("{o}/{r}").to_ascii_lowercase()) {
-                Some(id) => answer(200, json!({"id": id})),
-                None => answer(404, json!({"message": "Not Found"})),
+            let name = format!("{o}/{r}").to_ascii_lowercase();
+            if s.repo_named(&name).is_none()
+                && let Some(id) = s.redirects.get(&name)
+            {
+                let mut a = answer(301, json!({"message": "Moved Permanently"}));
+                a.headers.push(("Location".into(), format!("{}/repositories/{id}/installation", s.base)));
+                return a;
             }
+            let current = s.repo_named(&name).map(|r| r.id);
+            installation(s, current)
+        }
+        ("GET", ["repositories", id, "installation"]) => {
+            let current = s.repos.iter().find(|r| r.id.to_string() == *id).map(|r| r.id);
+            installation(s, current)
+        }
+        ("GET", ["user"]) => answer(200, json!({"login": USER_LOGIN})),
+        ("GET", ["app"]) => {
+            if auth.trim_start_matches("Bearer ").split('.').count() != 3 {
+                return answer(401, json!({"message": "A JSON web token could not be decoded"}));
+            }
+            answer(200, json!({"slug": APP_SLUG}))
         }
         ("POST", ["app", "installations", _, "access_tokens"]) => {
             s.token_requests += 1;
@@ -1568,7 +1741,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
 - [ ] **Step 5: Run the tests**
 
 Run: `cargo test -p fl-github`
-Expected: PASS — 6 client tests and 5 credential tests. There is no red step for the new crate as a whole; Step 6 supplies it for each guard.
+Expected: PASS — 7 client tests and 7 credential tests. (`the_app_still_finds_its_installation_after_a_rename` and the GraphQL test need Task 5's `rename` and graphql route: write both fake pieces now, in this task — `rename` from Task 5 Step 1, and a `("POST", ["graphql"])` arm that answers `{"data": {"node": null}, "errors": [{"type": "NOT_FOUND"}]}` for an unknown node id — and let Tasks 5 and 6 extend them.) There is no red step for the new crate as a whole; Step 6 supplies it for each guard.
 
 - [ ] **Step 6: Mutation checks**
 
@@ -1577,6 +1750,8 @@ One at a time, confirm red, restore:
 - In `get_all`, `break` on a non-200 page instead of returning the error → `a_missing_page_fails…` FAILS.
 - Remove the `rate_limited` arm → `a_rate_limit_is_an_error…` FAILS.
 - Make `token()` skip the cache → `the_installation_token_is_fetched_once…` FAILS.
+- Remove the redirect-following block in `exchange` → `the_app_still_finds_its_installation…` FAILS.
+- Treat NOT_FOUND as an error in `graphql` → `a_graphql_not_found_is_an_answer…` FAILS.
 
 - [ ] **Step 7: Licences, trio, commit**
 
@@ -1617,8 +1792,8 @@ pub struct RecordRef { pub id: Iri, pub node_id: String }
 pub struct Meta { fl_format, kind, state, project, record, reproduction, raised_by, assigned_to,
                   security, withdrawn_reason, also_known_as, create_key }   // Meta::new(kind, state, project)
 pub struct IssueView { pub number, pub url: Iri, pub node_id, pub title, pub body, pub labels: Vec<String>,
-                       pub state: String, pub is_pull_request: bool }      // IssueView::from_json
-pub enum BodyError { Missing, Twice, Damaged(String), UnknownFormat(u64) }
+                       pub state: String, pub state_reason: Option<String>, pub is_pull_request: bool }
+pub enum BodyError { Missing, Damaged(String), UnknownFormat(u64) }
 pub enum Read { NotFl(String), Item { kind: ItemKind, meta: Meta, prose: String } }
 pub fn kind_label(ItemKind) -> String;          pub fn state_label(ItemKind, &str) -> String;
 pub fn all_labels() -> Vec<String>;              pub fn labels_after(&[String], ItemKind, &str) -> Vec<String>;
@@ -1761,6 +1936,7 @@ pub struct IssueView {
     pub body: String,
     pub labels: Vec<String>,
     pub state: String,
+    pub state_reason: Option<String>,
     pub is_pull_request: bool,
 }
 
@@ -1794,6 +1970,7 @@ impl IssueView {
                 })
                 .unwrap_or_default(),
             state: text("state")?,
+            state_reason: v.get("state_reason").and_then(Value::as_str).map(str::to_string),
             is_pull_request: v.get("pull_request").is_some_and(|p| !p.is_null()),
         })
     }
@@ -1866,7 +2043,6 @@ pub fn render_body(prose: &str, meta: &Meta) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BodyError {
     Missing,
-    Twice,
     Damaged(String),
     UnknownFormat(u64),
 }
@@ -1875,7 +2051,6 @@ impl std::fmt::Display for BodyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BodyError::Missing => write!(f, "has no fl block"),
-            BodyError::Twice => write!(f, "has more than one fl block"),
             BodyError::Damaged(why) => write!(f, "has a damaged fl block ({why})"),
             BodyError::UnknownFormat(n) => write!(
                 f,
@@ -1885,16 +2060,15 @@ impl std::fmt::Display for BodyError {
     }
 }
 
-/// The prose and the block. The block must be the last thing in the body.
+/// The prose and the block. The block is the LAST opener in the body: fl
+/// always writes it last, and anything before it — including a claim that
+/// quotes the opener — is prose. ⚠ Searching from the front would let one
+/// claim make its issue, and every list over the repository, unreadable.
 pub fn parse_body(body: &str) -> Result<(String, Meta), BodyError> {
     let body = body.replace("\r\n", "\n");
-    let mut starts = body.match_indices(META_OPEN);
-    let Some((at, _)) = starts.next() else {
+    let Some(at) = body.rfind(META_OPEN) else {
         return Err(BodyError::Missing);
     };
-    if starts.next().is_some() {
-        return Err(BodyError::Twice);
-    }
     let rest = &body[at + META_OPEN.len()..];
     let Some(end) = rest.find(META_CLOSE) else {
         return Err(BodyError::Damaged("the comment is never closed".into()));
@@ -1916,6 +2090,7 @@ pub fn parse_body(body: &str) -> Result<(String, Meta), BodyError> {
 
 /// What an issue is to fl.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // one value per read; boxing buys nothing
 pub enum Read {
     /// Not fl's: a pull request, or an issue with no `fl:` label (spec §3.5).
     NotFl(String),
@@ -2055,6 +2230,7 @@ mod tests {
             body: body.into(),
             labels: labels.iter().map(|s| s.to_string()).collect(),
             state: state.into(),
+            state_reason: None,
             is_pull_request: false,
         }
     }
@@ -2077,11 +2253,19 @@ mod tests {
         assert_eq!(back, m);
     }
 
+    /// Review Focus 3: a claim that quotes the block's opener is prose.
     #[test]
-    fn a_body_that_is_missing_doubled_damaged_or_newer_is_named() {
+    fn a_claim_quoting_the_opener_is_prose_and_the_block_still_reads() {
+        let m = meta(ItemKind::Finding, "raised");
+        let claim = "the parser breaks on <!-- fl:meta\n{\"x\":1}\n--> in a claim";
+        let (prose, back) = parse_body(&render_body(claim, &m)).unwrap();
+        assert_eq!((prose.as_str(), back), (claim, m));
+    }
+
+    #[test]
+    fn a_body_that_is_missing_damaged_or_newer_is_named() {
         let good = render_body("p", &meta(ItemKind::Record, "todo"));
         assert_eq!(parse_body("just prose"), Err(BodyError::Missing));
-        assert_eq!(parse_body(&format!("{good}\n{good}")), Err(BodyError::Twice));
         assert!(matches!(parse_body(&good.replace("\"kind\"", "\"kin\"")), Err(BodyError::Damaged(_))));
         assert!(matches!(parse_body(&format!("{good}\nmore")), Err(BodyError::Damaged(_))));
         assert_eq!(
@@ -2174,14 +2358,14 @@ Add `pub mod meta;` to `crates/github/src/lib.rs`.
 - [ ] **Step 2: Run the tests**
 
 Run: `cargo test -p fl-github meta`
-Expected: PASS, 11 tests.
+Expected: PASS, 12 tests.
 
 - [ ] **Step 3: Mutation checks**
 
 One at a time, confirm red, restore:
 - Remove the `<`/`>` escaping in `render_body` → `a_value_containing_comment_markers…` FAILS.
 - Remove the `issue.state != want` check → `two_state_labels_or_a_status…` FAILS.
-- Remove the `Twice` check → `a_body_that_is_missing_doubled…` FAILS.
+- Search with `find` instead of `rfind` → `a_claim_quoting_the_opener…` FAILS.
 - Make `labels_after` keep `fl:` labels → `every_state_has_a_label…` FAILS.
 
 - [ ] **Step 4: Trio and commit**
@@ -2279,6 +2463,9 @@ and these arms in `route`, above the final `_`:
 
 ```rust
         ("POST", ["repos", o, r, "issues"]) if s.is_bound(o, r) => {
+            if std::mem::take(&mut s.fail_before_create) {
+                return answer(502, json!({"message": "fake failure before the create"}));
+            }
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let n = s.next_number;
             s.next_number += 1;
@@ -2304,6 +2491,11 @@ and these arms in `route`, above the final `_`:
             s.issues.insert(n, issue);
             if std::mem::take(&mut s.fail_after_create) {
                 return answer(502, json!({"message": "fake failure after the create landed"}));
+            }
+            if std::mem::take(&mut s.hang_up_after_create) {
+                let mut a = answer(201, Value::Null);
+                a.hang_up = true;
+                return a;
             }
             answer(201, s.issue_json(&s.issues[&n]))
         }
@@ -2344,8 +2536,12 @@ and these arms in `route`, above the final `_`:
                 s.issues.get_mut(&n).unwrap().events.push((e, "labeled".into()));
             }
             if std::mem::take(&mut s.foreign_edit_on_next_patch) {
-                let e = format!("E_{}", s.tick());
-                s.issues.get_mut(&n).unwrap().edits.push(e);
+                // The fake's own rule: a FIRST edit also records the original.
+                let first = s.issues[&n].edits.is_empty();
+                for _ in 0..if first { 2 } else { 1 } {
+                    let e = format!("E_{}", s.tick());
+                    s.issues.get_mut(&n).unwrap().edits.push(e);
+                }
             }
             let old = s.issues[&n].clone();
             let mut new = old.clone();
@@ -2523,6 +2719,57 @@ mod tests {
     }
 
     #[test]
+    fn a_create_whose_answer_was_lost_is_found_not_duplicated() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().hang_up_after_create = true;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+    }
+
+    #[test]
+    fn a_create_that_failed_before_landing_is_sent_once_more() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().fail_before_create = true;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+    }
+
+    /// ⚠ The engine reads, runs gates, then writes. A finding withdrawn by
+    /// someone else in between must not be marked fixed.
+    #[test]
+    fn a_write_over_an_item_that_changed_since_fl_read_it_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let f = t.add_finding(Finding::raise(p(), r, "a", "c")).unwrap();
+        let mut stale = t.get_finding(&f).unwrap().unwrap();
+        fake.web_edit(2, |i| {
+            let (prose, mut m) = meta::parse_body(&i.body).unwrap();
+            m.state = "withdrawn".into();
+            m.withdrawn_reason = Some("someone else".into());
+            i.body = meta::render_body(&prose, &m);
+            i.labels = vec!["fl:finding".into(), "fl:finding/withdrawn".into()];
+            i.state = "closed".into();
+            i.state_reason = Some("not_planned".into());
+        });
+        stale.assigned_to = Some("fixer".into());
+        let err = t.update_finding(&stale).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+        assert!(fake.issue(2).labels.contains(&"fl:finding/withdrawn".to_string()), "untouched");
+    }
+
+    #[test]
+    fn an_update_that_changes_nothing_sends_nothing() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        t.set_record_state(&r, State::Todo).unwrap();
+        assert!(!fake.state().requests.iter().any(|q| q.starts_with("PATCH")));
+    }
+
+    #[test]
     fn a_list_reads_every_page_and_a_failed_page_fails_it() {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake);
@@ -2689,6 +2936,9 @@ impl std::fmt::Display for Notice {
     }
 }
 
+/// What fl last read or wrote of an item: its block, prose and title.
+type Seen = (Meta, String, String);
+
 pub struct GithubTracker {
     client: Client,
     repo: Repo,
@@ -2696,9 +2946,17 @@ pub struct GithubTracker {
     /// Kinds seen this process, by issue number, so a handle lookup does not
     /// read the issue again.
     kinds: RefCell<BTreeMap<u64, ItemKind>>,
+    /// ⚠ What this process last read of each item. The engine reads an
+    /// item, runs gates for minutes, then writes: a write refuses if the
+    /// item changed in between, so a finding withdrawn by someone else
+    /// during a verify cannot be marked fixed (spec §3.3).
+    seen: RefCell<BTreeMap<u64, Seen>>,
+    /// How long to wait between searches for an ambiguous create's key.
+    settle: std::time::Duration,
 }
 
 /// What an issue number reached.
+#[allow(clippy::large_enum_variant)] // one value per read; boxing buys nothing
 enum Fetched {
     Found(IssueView),
     Absent,
@@ -2707,6 +2965,7 @@ enum Fetched {
 }
 
 /// What an id reached, for one wanted kind.
+#[allow(clippy::large_enum_variant)]
 enum Found {
     Item(IssueView, Meta, String),
     OtherKind(ItemKind),
@@ -2756,10 +3015,26 @@ fn read_repo(client: &Client, name: &str) -> Result<Option<Repo>, StoreError> {
 
 /// ⚠ The response is the postcondition (spec §3.3): GitHub silently drops
 /// labels a caller may not set, so "no error" is not "written".
-fn check_written(back: &IssueView, labels: &[String], body: &str, state: &str) -> Result<(), StoreError> {
+fn check_written(
+    back: &IssueView,
+    title: &str,
+    labels: &[String],
+    body: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> Result<(), StoreError> {
     let want: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
     let got: BTreeSet<&str> = back.labels.iter().map(String::as_str).collect();
     let mut problems = Vec::new();
+    if back.title != title {
+        problems.push("the title came back different".to_string());
+    }
+    if reason.is_some() && back.state_reason.as_deref() != reason {
+        problems.push(format!(
+            "the issue came back closed as `{:?}`, not `{reason:?}`",
+            back.state_reason
+        ));
+    }
     if want != got {
         problems.push(format!("the labels came back as {got:?}, not {want:?}"));
     }
@@ -2815,6 +3090,8 @@ impl GithubTracker {
             repo,
             labels_ready: Cell::new(false),
             kinds: RefCell::new(BTreeMap::new()),
+            seen: RefCell::new(BTreeMap::new()),
+            settle: std::time::Duration::from_secs(2),
         };
         Ok((tracker, notice))
     }
@@ -2825,6 +3102,24 @@ impl GithubTracker {
 
     pub fn describe(&self) -> String {
         self.client.describe()
+    }
+
+    /// Who GitHub says fl writes as (spec §5.4).
+    pub fn identity(&self) -> Result<String, StoreError> {
+        self.client.identity()
+    }
+
+    /// Tests only: no pause between create-key searches.
+    #[doc(hidden)]
+    pub fn without_settle(mut self) -> Self {
+        self.settle = std::time::Duration::ZERO;
+        self
+    }
+
+    fn remember(&self, n: u64, meta: &Meta, prose: &str, title: &str) {
+        self.seen
+            .borrow_mut()
+            .insert(n, (meta.clone(), prose.to_string(), title.to_string()));
     }
 
     pub fn issue_url(&self, number: u64) -> Iri {
@@ -2843,8 +3138,13 @@ impl GithubTracker {
         format!("/repos/{}{rest}", self.repo.full_name)
     }
 
+    /// Oldest first: an issue created while a list is read lands on its last
+    /// page, and cannot shift an earlier page's issues onto the next one.
     fn list_path(&self, labels: &[String]) -> String {
-        self.path(&format!("/issues?state=all&per_page=100&labels={}", labels.join(",")))
+        self.path(&format!(
+            "/issues?state=all&sort=created&direction=asc&per_page=100&labels={}",
+            labels.join(",")
+        ))
     }
 
     /// Whether `id` is an issue of THIS repository (spec §2.2, §2.4). A URL
@@ -2932,6 +3232,7 @@ impl GithubTracker {
                 Read::NotFl(what) => Err(StoreError::NotAnFlItem { id: id.clone(), what }),
                 Read::Item { kind, meta, prose } => {
                     self.kinds.borrow_mut().insert(n, kind);
+                    self.remember(n, &meta, &prose, &issue.title);
                     Ok(if kind == want {
                         Found::Item(issue, meta, prose)
                     } else {
@@ -2951,11 +3252,22 @@ impl GithubTracker {
             labels.push(meta::state_label(kind, s));
         }
         let mut out = Vec::new();
+        let mut numbers = BTreeSet::new();
         for v in self.client.get_all(&self.list_path(&labels))? {
             let issue = IssueView::from_json(&v)?;
+            // Pages are read one by one; an issue seen twice is counted once.
+            if !numbers.insert(issue.number) {
+                continue;
+            }
             match meta::read_item(&issue)? {
                 Read::Item { kind: k, meta, prose } if k == kind => {
+                    // The label filter is taken to mean AND; the block is
+                    // checked too, so a looser filter cannot widen the list.
+                    if state.is_some_and(|st| meta.state != st) {
+                        continue;
+                    }
                     self.kinds.borrow_mut().insert(issue.number, k);
+                    self.remember(issue.number, &meta, &prose, &issue.title);
                     out.push((issue, meta, prose));
                 }
                 Read::Item { .. } => {
@@ -3040,14 +3352,22 @@ impl GithubTracker {
             }
             Err(e) => return Err(e),
         };
-        check_written(&issue, &labels, &body, "open")?;
+        check_written(&issue, title, &labels, &body, "open", None)?;
         self.kinds.borrow_mut().insert(issue.number, kind);
+        self.remember(issue.number, meta, prose, title);
         Ok(issue)
     }
 
+    /// ⚠ The list GitHub serves may lag a create that just landed, so the
+    /// key is searched for three times, `settle` apart, before one resend.
     fn after_ambiguous_create(&self, kind: ItemKind, meta: &Meta, path: &str, sent: &Value) -> Result<IssueView, StoreError> {
-        if let Some(found) = self.find_by_create_key(kind, &meta.create_key)? {
-            return Ok(found);
+        for attempt in 0..3 {
+            if attempt > 0 {
+                std::thread::sleep(self.settle);
+            }
+            if let Some(found) = self.find_by_create_key(kind, &meta.create_key)? {
+                return Ok(found);
+            }
         }
         let r = self.client.send(Method::Post, path, Some(sent))?;
         if r.status != 201 {
@@ -3102,11 +3422,26 @@ impl GithubTracker {
                 found: found.as_kind(),
             });
         }
+        // ⚠ The caller changed what it READ. If the item moved on since
+        // then, writing the caller's fields over it would lose the other
+        // change silently (spec §3.3).
+        if let Some((m, p, t)) = self.seen.borrow().get(&n)
+            && (m != &meta || p != &prose || t != &issue.title)
+        {
+            return Err(StoreError::Conflict {
+                id,
+                detail: "it changed after fl read it and before fl wrote it".into(),
+            });
+        }
         let mut title = issue.title.clone();
         change(&mut meta, &mut prose, &mut title)?;
         let labels = meta::labels_after(&issue.labels, kind, &meta.state);
         let (state, reason) = meta::projection(kind, &meta.state);
         let body = meta::render_body(&prose, &meta);
+        let same_labels = labels.iter().collect::<BTreeSet<_>>() == issue.labels.iter().collect::<BTreeSet<_>>();
+        if same_labels && body == issue.body.replace("\r\n", "\n") && title == issue.title && state == issue.state {
+            return Ok(()); // nothing to write, and nothing to record as an edit
+        }
         let mut sent = json!({"title": title, "body": body, "labels": labels, "state": state});
         if let Some(r) = reason {
             sent["state_reason"] = json!(r);
@@ -3119,7 +3454,9 @@ impl GithubTracker {
             )));
         }
         let back = IssueView::from_json(&r.body)?;
-        check_written(&back, &labels, &body, state)
+        check_written(&back, &title, &labels, &body, state, reason)?;
+        self.remember(n, &meta, &prose, &title);
+        Ok(())
     }
 
     fn record_from(&self, issue: &IssueView, meta: &Meta) -> Result<Record, StoreError> {
@@ -3172,21 +3509,26 @@ impl GithubTracker {
         Ok(r.id.clone())
     }
 
-    /// Which kind issue `n` holds, if it is an fl item.
+    /// Which kind issue `n` holds. `None` only when no issue `n` exists; a
+    /// deleted, moved or foreign issue is an error naming what it is, never
+    /// "not found" (spec §3.5, §3.6).
     fn kind_at(&self, n: u64) -> Result<Option<ItemKind>, StoreError> {
         if let Some(k) = self.kinds.borrow().get(&n) {
             return Ok(Some(*k));
         }
-        Ok(match self.fetch(n)? {
+        let id = self.issue_url(n);
+        match self.fetch(n)? {
             Fetched::Found(issue) => match meta::read_item(&issue)? {
                 Read::Item { kind, .. } => {
                     self.kinds.borrow_mut().insert(n, kind);
-                    Some(kind)
+                    Ok(Some(kind))
                 }
-                Read::NotFl(_) => None,
+                Read::NotFl(what) => Err(StoreError::NotAnFlItem { id, what }),
             },
-            Fetched::Absent | Fetched::Gone | Fetched::Moved(_) => None,
-        })
+            Fetched::Absent => Ok(None),
+            Fetched::Gone => Err(StoreError::Deleted(id)),
+            Fetched::Moved(to) => Err(StoreError::Moved { id, to }),
+        }
     }
 }
 
@@ -3303,11 +3645,12 @@ impl Tracker for GithubTracker {
             return Err(StoreError::AlreadyExists(alias));
         }
         let n = self.locate(primary)?;
-        let kind = self.kind_at(n)?.ok_or_else(|| StoreError::NotAnFlItem {
+        let missing = || StoreError::NotOwned {
             id: primary.clone(),
-            what: "not an fl item".into(),
-        })?;
-        self.update(n, kind, || StoreError::Deleted(primary.clone()), |meta, _, _| {
+            searched: vec![format!("{} (no issue {n})", self.label())],
+        };
+        let kind = self.kind_at(n)?.ok_or_else(missing)?;
+        self.update(n, kind, missing, |meta, _, _| {
             meta.also_known_as.push(alias.clone());
             Ok(())
         })
@@ -3340,7 +3683,7 @@ Add to `crates/github/src/lib.rs`: `pub mod tracker;` and `pub use tracker::{Git
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p fl-github`
-Expected: PASS, including the 13 new tracker tests.
+Expected: PASS, including the 17 new tracker tests.
 
 - [ ] **Step 5: Mutation checks**
 
@@ -3348,6 +3691,9 @@ One at a time, confirm red, restore:
 - Make `check_written` return `Ok(())` → `a_label_github_dropped…` FAILS.
 - In `create`, treat a 5xx as an error without `after_ambiguous_create` → `a_create_that_failed_after_landing…` FAILS (the retry needs the search, and the plain error ends the call).
 - Make `find_by_create_key` return `Ok(None)` → the same test FAILS with two issues.
+- Remove the `Err(StoreError::Unreachable { .. })` arm in `create` → `a_create_whose_answer_was_lost…` FAILS.
+- Remove the `seen` comparison in `update` → `a_write_over_an_item_that_changed…` FAILS.
+- Remove the no-op early return → `an_update_that_changes_nothing…` FAILS.
 - In `list`, `continue` past a diverged issue → `a_web_edit_that_disagrees…` FAILS.
 - Move the title check after the POST → `a_title_over_the_limit…` FAILS.
 - Make `alias_owner` return the first of several matches → add a test first: give two issues the same alias by editing their bodies with `fake.web_edit` (re-render each block with `meta::render_body` and the alias pushed into `also_known_as`), assert `get_record` of the alias is refused naming both numbers, then run the mutation.
@@ -3381,20 +3727,11 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 
 **Spec §2.3, as implemented here:** a reference's URL is trusted when it is under the bound repository's CURRENT name — the repository itself is bound by node id at open. Any other URL is resolved by the reference's `node_id` through one GraphQL lookup, never by the URL. This is the plan's reading of "never by URL"; it avoids a lookup per reference in the common case.
 
-- [ ] **Step 1: The fake follows renames and answers node lookups**
+- [ ] **Step 1: The fake reuses names and answers node lookups**
 
-Add to `impl FakeGithub`:
+`rename` and a `("POST", ["graphql"])` arm already exist (Task 2). Add to `impl FakeGithub`:
 
 ```rust
-    /// The repository is renamed; the old name redirects, as GitHub's does.
-    pub fn rename(&self, to: &str) {
-        let mut s = self.state();
-        let old = s.repos[0].full_name.to_ascii_lowercase();
-        let id = s.repos[0].id;
-        s.redirects.insert(old, id);
-        s.repos[0].full_name = to.into();
-    }
-
     /// Someone creates a new repository at `name`, which ends its redirect.
     pub fn reuse_name(&self, name: &str) {
         let mut s = self.state();
@@ -3409,7 +3746,7 @@ Add to `impl FakeGithub`:
     }
 ```
 
-and this arm to `route`:
+and make the `("POST", ["graphql"])` arm answer a node lookup — `null` with a NOT_FOUND error, as GitHub does, for an unknown or deleted issue:
 
 ```rust
         ("POST", ["graphql"]) => {
@@ -3425,7 +3762,10 @@ and this arm to `route`:
                         "repository": {"id": s.bound().node_id},
                     })
                 });
-            answer(200, json!({"data": {"node": node}}))
+            match node {
+                Some(n) => answer(200, json!({"data": {"node": n}})),
+                None => answer(200, json!({"data": {"node": null}, "errors": [{"type": "NOT_FOUND"}]})),
+            }
         }
 ```
 
@@ -3543,7 +3883,7 @@ Add to `mod tests` in `tracker.rs`:
     }
 ```
 
-Run: `cargo test -p fl-github tracker` — the three new tracker tests FAIL (the reference is not followed; the old URL stays), and the contract tests show which cases, if any, fail. Record the output.
+Run: `cargo test -p fl-github tracker`. `a_findings_record_reference_follows…` FAILS (the reference is not followed). The rename and reuse tests exercise Task 4's `owner` and `open` and are expected to PASS already: they pin that behaviour, and Step 5's mutations are their red evidence. The contract tests show which cases, if any, fail. Record the output.
 
 - [ ] **Step 3: Follow references by node id, and rewrite them on the next write**
 
@@ -3583,7 +3923,7 @@ Replace `current_ref` in `impl GithubTracker`:
     }
 ```
 
-In `update`, immediately after the `found != kind` check, add:
+In `update`, immediately AFTER the `seen` comparison (Task 4) and before `let mut title`, add — after it, because the comparison is against what fl read, and this rewrite is fl's own change:
 
 ```rust
         // A reference written under an old name is rewritten on the next
@@ -3666,6 +4006,12 @@ New arms:
         ("GET", ["repos", o, r, "issues", n, "timeline"]) if s.is_bound(o, r) => {
             match n.parse::<u64>().ok().and_then(|n| s.issues.get(&n)) {
                 None => answer(404, json!({"message": "Not Found"})),
+                Some(i) if i.gone => answer(410, json!({"message": "This issue was deleted"})),
+                Some(i) if i.moved_to.is_some() => {
+                    let mut a = answer(301, json!({"message": "Moved Permanently"}));
+                    a.headers.push(("Location".into(), i.moved_to.clone().unwrap_or_default()));
+                    a
+                }
                 Some(i) => {
                     let items = i
                         .events
@@ -3715,6 +4061,33 @@ Add to `mod tests` in `tracker.rs`:
         assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
     }
 
+    /// Under the model, a foreign FIRST edit adds two entries and fl's edit
+    /// one more: three is more than fl's two, so it is seen.
+    #[test]
+    fn a_foreign_first_edit_inside_fls_first_edit_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().foreign_edit_on_next_patch = true;
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_deleted_or_moved_issue_keeps_its_outcome_through_a_write() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let gone = t.add_record(&p(), "gone").unwrap();
+        let moved = t.add_record(&p(), "moved").unwrap();
+        fake.state().issues.get_mut(&1).unwrap().gone = true;
+        fake.state().issues.get_mut(&2).unwrap().moved_to =
+            Some(format!("{}/repositories/9/issues/1", fake.url()));
+        assert!(matches!(t.set_record_state(&gone, State::Doing), Err(StoreError::Deleted(_))));
+        assert!(matches!(t.set_record_state(&moved, State::Doing), Err(StoreError::Moved { .. })));
+        let absent = RecordId(t.issue_url(99));
+        assert!(matches!(t.set_record_state(&absent, State::Doing), Err(StoreError::NoSuchRecord(_))));
+    }
+
     #[test]
     fn fls_own_writes_are_never_a_conflict() {
         let fake = FakeGithub::start("acme/widgets");
@@ -3746,6 +4119,21 @@ Add to `mod tests` in `tracker.rs`:
         assert_eq!(issue.state, "open", "the block wins: a repair never closes what fl left open");
         assert!(issue.comments.iter().any(|c| c.contains("by owner")), "{:?}", issue.comments);
         assert_eq!(t.get_record(&r).unwrap().unwrap().state, State::Todo);
+    }
+
+    #[test]
+    fn repair_trusts_the_block_over_a_state_label() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| {
+            i.labels = vec!["fl:record".into(), "fl:record/done".into()];
+            i.state = "closed".into();
+        });
+        let done = t.repair(r.iri(), "owner").unwrap();
+        assert_eq!(done.state, "todo");
+        assert_eq!(fake.issue(1).labels, vec!["fl:record", "fl:record/todo"]);
+        assert_eq!(fake.issue(1).state, "open");
     }
 
     #[test]
@@ -3867,9 +4255,10 @@ Add to `impl GithubTracker`:
         }
         let new_edits = after.edits.difference(&before.edits).count();
         // ⚠ Modelled, not measured: a FIRST body edit is taken to add two
-        // entries (the original, then the edit). One foreign edit that lands
-        // with fl's first edit is therefore invisible — a stated blind spot
-        // (docs/github-tracker.md), and the live test checks the model.
+        // entries (the original, then the edit), and any later edit one.
+        // Under that model every foreign edit is seen. If GitHub adds ONE
+        // entry on a first edit, a foreign edit landing with fl's first edit
+        // would be hidden — the live test measures exactly this.
         let own_edits = match (old.body != new.body, before.edits.is_empty()) {
             (false, _) => 0,
             (true, true) => 2,
@@ -3894,6 +4283,14 @@ Add to `impl GithubTracker`:
     /// an item to a state the protocol did not reach.
     pub fn repair(&self, id: &Iri, by: &str) -> Result<Repaired, StoreError> {
         let n = self.locate(id)?;
+        // Classify first, so a missing, deleted or moved issue keeps its
+        // outcome; then open the window and read again inside it.
+        if let Fetched::Absent | Fetched::Gone | Fetched::Moved(_) = self.fetch(n)? {
+            return Err(StoreError::NotAnFlItem {
+                id: id.clone(),
+                what: "an issue that is missing, deleted or moved".into(),
+            });
+        }
         let before = self.window(n)?;
         let issue = match self.fetch(n)? {
             Fetched::Found(i) => i,
@@ -3916,7 +4313,8 @@ Add to `impl GithubTracker`:
             id: id.clone(),
             detail: format!(
                 "{detail}. A repair rewrites from the block, so restore the block from the \
-                 issue's edit history first"
+                 issue's edit history first — or, if the issue was never fl's, remove its fl \
+                 labels instead of repairing it"
             ),
         };
         let (_, meta) = meta::parse_body(&issue.body).map_err(|e| restore(format!("its body {e}")))?;
@@ -3941,7 +4339,7 @@ Add to `impl GithubTracker`:
             return Err(backend(format!("GitHub answered {} to the repair of {id}", r.status)));
         }
         let back = IssueView::from_json(&r.body)?;
-        check_written(&back, &labels, &issue.body.replace("\r\n", "\n"), state)?;
+        check_written(&back, &issue.title, &labels, &issue.body.replace("\r\n", "\n"), state, reason)?;
         let after = self.window(n)?;
         self.check_window(id, &before, &after, &issue, &back)?;
         let note = json!({"body": format!(
@@ -3965,12 +4363,28 @@ Add to `impl GithubTracker`:
     }
 ```
 
-In `update`: take `let before = self.window(n)?;` as the FIRST line after `ensure_labels` (before the fetch), and replace its final `check_written(&back, &labels, &body, state)` with:
+In `update`, the order becomes: fetch and classify (so an absent, deleted or moved issue keeps its outcome), THEN take the window, THEN read the issue again and use that second read as the state fl changes and compares — a write landing between the first read and the window is then inside the window. Concretely, right after the existing `let issue = match self.fetch(n)? { … };`:
 
 ```rust
-        check_written(&back, &labels, &body, state)?;
+        let before = self.window(n)?;
+        // Read again inside the window: the state fl changes is the state
+        // the window starts from.
+        let issue = match self.fetch(n)? {
+            Fetched::Found(i) => i,
+            Fetched::Absent => return Err(missing()),
+            Fetched::Gone => return Err(StoreError::Deleted(id)),
+            Fetched::Moved(to) => return Err(StoreError::Moved { id, to }),
+        };
+```
+
+(`missing` is `FnOnce`; call it in only one of the two matches — make the first match map `Absent` to `StoreError::NotOwned` for this repository's label, or change `missing` to `Fn`.) Then replace the final `check_written(…)?; self.remember(…); Ok(())` with:
+
+```rust
+        check_written(&back, &title, &labels, &body, state, reason)?;
         let after = self.window(n)?;
-        self.check_window(&id, &before, &after, &issue, &back)
+        self.check_window(&id, &before, &after, &issue, &back)?;
+        self.remember(n, &meta, &prose, &title);
+        Ok(())
 ```
 
 Export `Repaired` from `lib.rs` (`pub use tracker::{GithubTracker, Notice, Repaired, Repo};`).
@@ -3978,13 +4392,14 @@ Export `Repaired` from `lib.rs` (`pub use tracker::{GithubTracker, Notice, Repai
 - [ ] **Step 4: Run the tests**
 
 Run: `cargo test -p fl-github`
-Expected: PASS, including the contract tests, which now run with conflict detection on.
+Expected: PASS, including the contract tests, which now run with conflict detection on, and the 9 new tests.
 
 - [ ] **Step 5: Mutation checks**
 
 One at a time, confirm red, restore:
 - Make `check_window` return `Ok(())` → both conflict tests FAIL.
 - Set `own_edits` to `usize::from(old.body != new.body)` → `fls_own_writes_are_never_a_conflict` FAILS (the fake's first edit adds two entries).
+- Take the window BEFORE the first fetch again → `a_deleted_or_moved_issue_keeps_its_outcome…` FAILS.
 - In `repair`, write labels and status from the LABELS instead of the block (use the label's state) → `repair_rewrites…` FAILS.
 - Skip the comment → the same test FAILS.
 
@@ -4162,11 +4577,11 @@ pub fn load(path: Option<&Path>) -> Result<Config>;
 pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>>;
 // ctx
 pub struct Ctx<'a> { pub store: &'a RedbStore, pub tracker: &'a dyn Tracker, pub handles: &'a dyn Handles,
-                     pub tracker_label: String, pub github: Option<&'a GithubTracker> }
+                     pub tracker_label: String }          // Task 9 adds `github: Option<&'a GithubTracker>`
 impl Ctx<'_> { pub fn roles(&self) -> Roles<'_>; }
 ```
 
-`FL_GITHUB_API_URL` overrides the API origin (default `https://api.github.com`). It exists for tests; document it as such.
+`FL_GITHUB_API_URL` overrides the API origin (default `https://api.github.com`). It exists for tests. ⚠ The credential goes wherever it points, so it must be `https://`, or `http://` to a loopback address (`127.0.0.1`, `localhost`, `[::1]`); anything else is refused, and a notice is printed on stderr whenever it is set.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4299,9 +4714,43 @@ fn a_command_that_needs_no_tracker_never_contacts_github() {
         .args(["gate", "add", "--project", "1", "--name", "g", "--glob", "src/**/*.rs", "--program", "true"])
         .assert()
         .success();
+    g.fl()
+        .args(["transition", "add", "--project", "1", "--name", "ship", "--from", "review", "--to", "done", "--regret", "low", "--gate", "1"])
+        .assert()
+        .success();
     g.fl().args(["gate", "list", "--project", "1"]).assert().success();
     g.fl().args(["project", "list"]).assert().success();
+    g.fl().args(["check", "ship", "--project", "1"]).assert().success();
+    g.fl().args(["manifest", "export", "--project", "1"]).assert().success();
+    git(g.repo.path(), &["add", ".fl"]);
+    git(g.repo.path(), &["commit", "-qm", "manifest"]);
+    g.fl().args(["manifest", "check", "--project", "1"]).assert().success();
     assert!(g.fake.state().requests.is_empty(), "{:?}", g.fake.state().requests);
+}
+
+#[test]
+fn an_api_override_off_this_machine_is_refused() {
+    let g = fixture();
+    g.project();
+    g.fl()
+        .env("FL_GITHUB_API_URL", "http://example.com")
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("https://"));
+}
+
+#[test]
+fn db_cannot_be_combined_with_a_github_binding() {
+    let g = fixture();
+    g.project();
+    g.fl()
+        .arg("--db")
+        .arg(g.home.path().join("other.redb"))
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("Drop --db"));
 }
 
 #[test]
@@ -4336,7 +4785,10 @@ fn a_missing_credential_is_refused_naming_where_fl_looked() {
 fn an_unknown_tracker_key_is_refused_not_ignored() {
     let g = fixture();
     let path = g.home.path().join("config/fl/config.toml");
-    let cfg = fs::read_to_string(&path).unwrap().replace("github =", "gitlab =");
+    let cfg = fs::read_to_string(&path)
+        .unwrap()
+        .replace("credential = \"env\" }", "credential = \"env\", extra = 1 }");
+    assert!(cfg.contains("extra = 1"), "the edit must land");
     fs::write(&path, cfg).unwrap();
     g.fl().args(["project", "list"]).assert().failure();
 }
@@ -4427,7 +4879,7 @@ pub fn bound(entries: &[Entry], cwd: &Path) -> Result<Option<PathBuf>> {
 }
 ```
 
-Update this module's tests for `load` returning `Config` (`.projects`). Every existing assertion keeps its meaning.
+Update this module's tests for `load` returning `Config` (`.projects`), and give every `Entry` literal in them `tracker: None`. Every existing assertion keeps its meaning. Remove imports the compiler reports unused after the routing change (for example `Roles` and `Tracker` in `record.rs`), and run `cargo fmt`.
 
 - [ ] **Step 3: `Ctx`, `refs`, and the commands**
 
@@ -4439,7 +4891,6 @@ Create `crates/cli/src/ctx.rs`:
 //! bound to.
 
 use fl_core::store::{Handles, Roles, Tracker};
-use fl_github::GithubTracker;
 use fl_store::RedbStore;
 
 pub struct Ctx<'a> {
@@ -4450,7 +4901,6 @@ pub struct Ctx<'a> {
     pub handles: &'a dyn Handles,
     /// Where records and findings live, for messages.
     pub tracker_label: String,
-    pub github: Option<&'a GithubTracker>,
 }
 
 impl Ctx<'_> {
@@ -4464,7 +4914,21 @@ impl Ctx<'_> {
 }
 ```
 
-`crates/cli/src/refs.rs`: `resolve` and `show` take `store: &dyn Handles` instead of `&impl Handles` (every caller passing `store` still compiles), and `Ref::from_str` accepts a leading `#` on a handle:
+`crates/cli/src/refs.rs`: `resolve` and `show` take `store: &dyn Handles` instead of `&impl Handles` (every caller passing `store` still compiles). `Ref::from_str` reads `owner/repo#41` as that issue's URL (spec §2.1 — the tracker then answers `NotOwned` for another repository), before the other forms:
+
+```rust
+        if let Some((repo, n)) = s.split_once('#')
+            && repo.split('/').count() == 2
+            && !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Iri::parse(&format!("https://github.com/{repo}/issues/{n}"))
+                .map(Ref::Iri)
+                .map_err(|e| format!("`{s}` names an issue fl cannot address: {e}"));
+        }
+```
+
+and accepts a leading `#` on a handle:
 
 ```rust
         let digits = s.strip_prefix('#').unwrap_or(s);
@@ -4513,6 +4977,14 @@ Add `mod ctx;` and, in `run`:
 (replacing `let iris = cli.command.iris();`). After the store is opened:
 
 ```rust
+    // A bound project's node binding and catalog live in the store its
+    // config entry names; `--db` would pair GitHub with another catalog.
+    if binding.is_some() && confined && cli.command.needs_tracker() {
+        bail!(
+            "this project's tracker is bound to GitHub in the config, so it uses the store its \
+             config entry names. Drop --db (and unset $FL_DB) for this command"
+        );
+    }
     let github = match (&binding, cli.command.needs_tracker()) {
         (Some(b), true) => Some(open_github(b, cfg.github.as_ref(), &store)?),
         _ => None,
@@ -4527,7 +4999,6 @@ Add `mod ctx;` and, in `run`:
                 tracker: &checked,
                 handles: &routed,
                 tracker_label: format!("github:{}", gh.repo().full_name),
-                github: Some(gh),
             }
         }
         None => Ctx {
@@ -4535,7 +5006,6 @@ Add `mod ctx;` and, in `run`:
             tracker: &store,
             handles: &store,
             tracker_label: store.label().to_string(),
-            github: None,
         },
     };
 ```
@@ -4547,7 +5017,10 @@ and dispatch `Record`, `Finding`, `Attempt` and `Check` with `&ctx`. Add to `imp
     /// open the tracker, so a catalog command never contacts GitHub.
     fn needs_tracker(&self) -> bool {
         match self {
-            Command::Record(_) | Command::Finding(_) | Command::Attempt(_) | Command::Check(_) => true,
+            Command::Record(_) | Command::Finding(_) | Command::Attempt(_) => true,
+            // `check` is the CI gate: it touches the tracker only to resolve
+            // `--record`, and must not need GitHub otherwise.
+            Command::Check(c) => c.record.is_some(),
             Command::Project(_) | Command::Gate(_) | Command::Transition(_) | Command::Stats(_)
             | Command::Manifest(_) => false,
         }
@@ -4562,9 +5035,24 @@ fn open_github(
     app: Option<&config::GithubApp>,
     store: &RedbStore,
 ) -> Result<fl_github::GithubTracker> {
-    // For tests; the default is GitHub itself.
-    let api = std::env::var("FL_GITHUB_API_URL")
-        .unwrap_or_else(|_| fl_github::DEFAULT_API.to_string());
+    let api = match std::env::var("FL_GITHUB_API_URL") {
+        Err(_) => fl_github::DEFAULT_API.to_string(),
+        // ⚠ For tests. The credential goes wherever this points, so only
+        // https, or plain http to this machine, is accepted — and said.
+        Ok(url) => {
+            let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+                .iter()
+                .any(|p| url == *p || url.starts_with(&format!("{p}:")) || url.starts_with(&format!("{p}/")));
+            if !url.starts_with("https://") && !loopback {
+                bail!(
+                    "$FL_GITHUB_API_URL is `{url}`; fl sends the GitHub credential there, so it \
+                     must be https://, or http:// to this machine. Unset it to use GitHub"
+                );
+            }
+            eprintln!("notice: $FL_GITHUB_API_URL is set; talking to {url}, not GitHub");
+            url
+        }
+    };
     let creds: Box<dyn fl_github::Credentials> = match b.credential {
         config::Credential::Env => Box::new(fl_github::EnvToken::from_env()?),
         config::Credential::App => {
@@ -4595,7 +5083,9 @@ Run: `cargo test -p fl-cli` — PASS, every existing CLI suite included (the loc
 - [ ] **Step 6: Mutation checks**
 
 One at a time, confirm red, restore:
-- Make `needs_tracker` return `true` for every command → `a_command_that_needs_no_tracker…` FAILS.
+- Make `needs_tracker` return `true` for every command → `a_command_that_needs_no_tracker…` FAILS; make `Check(_) => true` → the same test FAILS on `check`.
+- Remove the loopback/https guard → `an_api_override_off_this_machine…` FAILS.
+- Remove the `--db` refusal → `db_cannot_be_combined…` FAILS.
 - Remove the `iris.retain(…)` line → `a_handle_may_carry_a_hash_and_an_issue_url…` FAILS (NotOwned).
 - Remove `deny_unknown_fields` from `TrackerBinding` → `an_unknown_tracker_key…` FAILS.
 - Accept only digits in `Ref::from_str` → the same `#1` test FAILS.
@@ -4726,7 +5216,11 @@ fn whoami_names_the_credential_and_the_repository() {
         .args(["github", "whoami"])
         .assert()
         .success()
-        .stdout(contains("$FL_GITHUB_TOKEN").and(contains("acme/widgets")));
+        .stdout(
+            contains(fl_github::fake::USER_LOGIN)
+                .and(contains("$FL_GITHUB_TOKEN"))
+                .and(contains("acme/widgets")),
+        );
 }
 
 #[test]
@@ -4821,7 +5315,8 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     };
     match cmd {
         Cmd::Whoami => {
-            println!("writes as\t{}", gh.describe());
+            println!("writes as\t{}", gh.identity()?);
+            println!("credential\t{}", gh.describe());
             println!("repository\t{}", gh.repo().full_name);
         }
         Cmd::Repair { id, by } => {
@@ -4837,6 +5332,8 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     Ok(0)
 }
 ```
+
+`ctx.rs`: add the field `pub github: Option<&'a fl_github::GithubTracker>,` (the GitHub tracker, for `fl github` and the publish check), and set it in `main.rs`'s two `Ctx` constructions: `github: Some(gh)` and `github: None`.
 
 `mod.rs`: `pub mod github;`. `main.rs`: a `Github` variant LAST in `Command`, with the doc comment `/// GitHub tracker: who fl writes as, and repair of a diverged issue.` and `#[command(subcommand)]`; its arms in `iris`, `has_handle` and dispatch (`cmd::github::run(&ctx, c)`); `Command::Github(_) => true` in `needs_tracker`; and, before the tracker is opened:
 
@@ -4897,7 +5394,36 @@ Run `cargo test -p fl-cli --test getting_started`; it fails on the `fl --help` t
 
 - [ ] **Step 5: Run the tests, mutation checks**
 
-Run: `cargo test --workspace` — PASS. Then, one at a time: remove the `ensure_publishable` call → `a_reproduction_is_refused_until…` FAILS; drop `f.security = security` → `a_security_finding_is_refused…` FAILS; remove the binding refusal → `fl_github_without_a_binding…` FAILS (a panic or a different message); remove the `def.project != *project` check → add a unit test in `manifest.rs` that names a gate of another project and asserts the refusal, then run the mutation against it.
+Run: `cargo test --workspace` — PASS. Then, one at a time: remove the `ensure_publishable` call → `a_reproduction_is_refused_until…` FAILS; drop `f.security = security` → `a_security_finding_is_refused…` FAILS; remove the binding refusal → `fl_github_without_a_binding…` FAILS (a panic or a different message); remove the `def.project != *project` check → the unit test below FAILS. Add it to `crates/cli/src/cmd/manifest.rs` first:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
+
+    #[test]
+    fn a_gate_of_another_project_is_refused_before_any_manifest_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let p1 = store.add_project("/one").unwrap();
+        let p2 = store.add_project("/two").unwrap();
+        let kind = GateKind::Command(CommandSpec {
+            program: "true".into(),
+            args: vec![],
+            delivery: PopulationDelivery::Args,
+            timeout_secs: 5,
+            pass_codes: vec![0],
+        });
+        let sel = Selector::Glob { pattern: "**/*".into() };
+        let g2 = store.add_gate(&p2, "g", kind, sel, 1, "c", "o").unwrap();
+        let err = ensure_publishable(&store, &p1, Some(&g2)).unwrap_err();
+        assert!(err.to_string().contains("belongs to project"), "{err}");
+    }
+}
+```
+
+(`tempfile` is already a dev-dependency of `fl-cli`.)
 
 - [ ] **Step 6: Trio and commit**
 
@@ -4965,7 +5491,18 @@ fn client() -> Client {
 }
 
 fn tracker() -> GithubTracker {
-    GithubTracker::open(client(), &repo(), &MemStore::default()).expect("open the live repository").0
+    // The repository first: its absence is the message a person needs.
+    let repo = repo();
+    let client = client();
+    let visibility = client
+        .send(fl_github::Method::Get, &format!("/repos/{repo}"), None)
+        .expect("read the live repository")
+        .body["visibility"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    assert_eq!(visibility, "private", "the live tests run only against a PRIVATE repository");
+    GithubTracker::open(client, &repo, &MemStore::default()).expect("open the live repository").0
 }
 
 fn project() -> ProjectId {
@@ -4998,7 +5535,7 @@ fn a_record_and_a_finding_round_trip_on_github() {
 #[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
 fn concurrent_writers_are_detected_never_silently_lost() {
     const ROUNDS: usize = 10;
-    let (mut clean, mut detected, mut lost) = (0, 0, 0);
+    let (mut clean, mut detected, mut lost, mut other) = (0, 0, 0, 0);
     for round in 0..ROUNDS {
         let t = tracker();
         let p = project();
@@ -5007,46 +5544,87 @@ fn concurrent_writers_are_detected_never_silently_lost() {
         let aliases: Vec<Iri> = (0..2)
             .map(|_| Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).unwrap())
             .collect();
+        // Both writers open, then wait at the barrier, so their writes overlap.
+        let gate = std::sync::Barrier::new(2);
         let results: Vec<Result<(), StoreError>> = std::thread::scope(|s| {
             let handles: Vec<_> = aliases
                 .iter()
                 .map(|a| {
-                    let (f, a) = (f.clone(), a.clone());
-                    s.spawn(move || tracker().add_alias(f.iri(), a))
+                    let (f, a, gate) = (f.clone(), a.clone(), &gate);
+                    s.spawn(move || {
+                        let t = tracker();
+                        gate.wait();
+                        t.add_alias(f.iri(), a)
+                    })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
+        // Let GitHub's reads catch up before judging what landed.
+        std::thread::sleep(std::time::Duration::from_secs(2));
         let back = t.get_finding(&f).unwrap().unwrap();
         let both_ok = results.iter().all(Result::is_ok);
         let any_conflict = results.iter().any(|r| matches!(r, Err(StoreError::Conflict { .. })));
         let all_present = aliases.iter().all(|a| back.also_known_as.contains(a));
         match (both_ok, any_conflict, all_present) {
             (true, _, true) => clean += 1,
-            (_, true, _) => detected += 1,
-            _ => lost += 1,
+            (true, _, false) => lost += 1,
+            (false, true, _) => detected += 1,
+            (false, false, _) => other += 1,
         }
         println!("round {round}: {results:?}");
     }
-    println!("clean {clean}, conflict detected {detected}, silently lost {lost}");
+    println!("clean {clean}, conflict detected {detected}, silently lost {lost}, other errors {other}");
     assert_eq!(lost, 0, "a lost update went undetected");
+    assert_eq!(other, 0, "a round failed for a reason other than a detected conflict");
 }
 
-/// Checks the model `check_window` rests on: a FIRST body edit adds two
-/// entries to the edit history, a later one adds one. If this fails, fix
-/// `check_window` and the fake together.
+/// Measures the model `check_window` rests on, EXACTLY: a first body edit
+/// adds two edit-history entries and a later one adds one, and each label
+/// change adds one timeline event. `check_window` only tolerates up to its
+/// model, so only a direct count can show the model is wrong. If this
+/// fails, fix `check_window` and the fake together.
 #[test]
 #[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
-fn fls_own_writes_are_not_conflicts_on_real_github() {
+fn the_edit_history_and_timeline_counts_match_fls_model() {
     let t = tracker();
+    let raw = client();
+    let repo = repo();
+    let (owner, name) = repo.split_once('/').unwrap();
     let r = t.add_record(&project(), "fl live test: edit history").unwrap();
-    for s in [State::Doing, State::Review, State::Doing] {
-        t.set_record_state(&r, s).expect("fl's own write must not read as a conflict");
-    }
+    let n: u64 = r.iri().as_str().rsplit('/').next().unwrap().parse().unwrap();
+    let edits = || {
+        raw.graphql(
+            "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { issue(number: $number) { userContentEdits(last: 100) { nodes { id } } } } }",
+            serde_json::json!({"owner": owner, "name": name, "number": n}),
+        )
+        .unwrap()["repository"]["issue"]["userContentEdits"]["nodes"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+    let labelled = || {
+        raw.get_all(&format!("/repos/{repo}/issues/{n}/timeline?per_page=100"))
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e["event"].as_str(), Some("labeled" | "unlabeled")))
+            .count()
+    };
+    let (e0, l0) = (edits(), labelled());
+    t.set_record_state(&r, State::Doing).unwrap(); // first edit; one label off, one on
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let (e1, l1) = (edits(), labelled());
+    t.set_record_state(&r, State::Review).unwrap(); // a later edit
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let (e2, l2) = (edits(), labelled());
+    println!("edits {e0} -> {e1} -> {e2}; label events {l0} -> {l1} -> {l2}");
+    assert_eq!(e1 - e0, 2, "a first body edit adds two entries (the model)");
+    assert_eq!(e2 - e1, 1, "a later body edit adds one entry (the model)");
+    assert_eq!((l1 - l0, l2 - l1), (2, 2), "each label change is one timeline event");
 }
 ```
 
-Then run `cargo test -p fl-github --test live` — the three tests are listed as ignored and nothing contacts GitHub. Run `cargo test -p fl-github --test live -- --ignored` with `FL_GITHUB_LIVE_REPO` unset and confirm each test FAILS with the message naming the variable (a live test that passes without running would be a vacuous pass).
+Then run `cargo test -p fl-github --test live` — the three tests are listed as ignored and nothing contacts GitHub. Run `cargo test -p fl-github --test live -- --ignored` with `FL_GITHUB_LIVE_REPO` unset (and no token set) and confirm each test FAILS with the message naming `FL_GITHUB_LIVE_REPO` (a live test that passes without running would be a vacuous pass). `serde_json` is already a dependency of `fl-github`, so the integration test can use it.
 
 - [ ] **Step 2: `docs/github-tracker.md`**
 
@@ -5060,7 +5638,7 @@ Write the page in the style of the existing `docs/` pages: prose, commands in in
 6. **Conflicts.** Detection, not prevention; what counts; the first-edit blind spot, stated plainly.
 7. **Security findings.** `--security`; only a `private` repository; visibility read every time; the limits (a repository made public later; an unmarked finding).
 8. **Identity.** Issue URLs, `#41` handles, a renamed repository (notice), a reused old name (refused), aliases by full scan (cost).
-9. **Limits.** Rate limits are reported, not waited out; `FL_GITHUB_API_URL` is for tests.
+9. **Limits.** Rate limits are reported, not waited out; `FL_GITHUB_API_URL` is for tests and accepts only https or this machine. A finding whose record reference predates a rename costs one lookup each time it is read, until it is next written (a terminal finding is never written again). Install the App on the bound repository only: its token is not narrowed further. An issue whose body holds fl's block is fl's, even with its labels removed — `repair` restores it; fl never adopts an issue without a block. A deliberately recreated repository at the bound name is refused, and there is no command yet to accept it.
 10. **The live tests.** How to run them, against a private throwaway repository.
 
 Add one line to `README.md` beside the other documentation links, pointing at the page.

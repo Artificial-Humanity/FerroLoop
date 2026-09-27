@@ -543,4 +543,6 @@ when the live test backs it.
   they agree, and the read then finds no divergence. Detecting a block edited by an identity
   other than fl's needs the edit history on every read. *(Open — Release scope: not detected.)*
 * **Alias scans at scale** (§2.5). *(Open)* — sub-project 3.
+* **Accepting a deliberately recreated repository.** §2.4 refuses a bound name that now reaches a
+  different repository, and no command accepts one that was recreated on purpose. *(Open.)*
 * **Escalation between the tiers**, **routing between trackers** — sub-project 4, unchanged.
