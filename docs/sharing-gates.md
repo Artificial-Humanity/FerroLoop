@@ -35,8 +35,12 @@ gates and transitions, but never manufactures a pass mark for a run that did not
 
 A gate imported this way cannot be edited locally — not its command, its population, or
 anything else that would make this copy disagree with the manifest every other reader
-resolves. The one exception is the pass mark itself, which a local `gate run` or `gate
-affirm` is free to set, because that mark is inherently local. Changing anything else is
+resolves. `gate affirm` is one of the edits this refuses: affirming re-stamps a gate's
+authorship, which belongs to whoever authors the project, not to whoever happens to run it
+elsewhere. The one thing that does update locally is the pass mark itself, and only by
+actually running the gate — through `gate run`, `check`, a gated `record move`, or `finding
+reproduce`/`verify` — because that mark is inherently local: it records what happened on
+*this* machine's working tree, not a re-authoring of the gate. Changing anything else is
 refused with a remedy: make the change in the store that authors the project, export again,
 commit, and import here.
 
