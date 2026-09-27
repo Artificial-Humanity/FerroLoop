@@ -1296,6 +1296,40 @@ impl GithubTracker {
             Fetched::Moved(to) => Err(StoreError::Moved { id, to }),
         }
     }
+
+    /// Spec §6: only a `private` repository may hold a security finding.
+    /// Read live, every time — visibility can change — and a failed read is
+    /// an ERROR: an unknown visibility is not a pass.
+    fn require_private(&self) -> Result<(), StoreError> {
+        let r = self.client.send(
+            Method::Get,
+            &format!("/repos/{}", self.repo.full_name),
+            None,
+        )?;
+        let refuse = |why: String| {
+            backend(format!(
+                "fl could not read the visibility of {} ({why}), so it will not write a \
+                 security finding there. Retry, or use a local tracker",
+                self.repo.full_name
+            ))
+        };
+        if r.status != 200 {
+            return Err(refuse(format!("GitHub answered {}", r.status)));
+        }
+        let visibility = r
+            .body
+            .get("visibility")
+            .and_then(Value::as_str)
+            .ok_or_else(|| refuse("the answer names no visibility".into()))?;
+        if visibility == "private" {
+            Ok(())
+        } else {
+            Err(StoreError::SecurityNotPrivate {
+                repo: self.repo.full_name.clone(),
+                visibility: visibility.to_string(),
+            })
+        }
+    }
 }
 
 impl Tracker for GithubTracker {
@@ -1351,6 +1385,9 @@ impl Tracker for GithubTracker {
             }
             Found::Absent => return Err(StoreError::NoSuchRecord(finding.record.clone())),
         };
+        if finding.security {
+            self.require_private()?;
+        }
         let mut meta = Meta::new(
             ItemKind::Finding,
             finding.state.as_wire(),
@@ -2645,6 +2682,58 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("has no id") && msg.contains("retry"), "{msg}");
+    }
+
+    fn raise_security(t: &GithubTracker) -> Result<FindingId, StoreError> {
+        let r = t.add_record(&p(), "t").unwrap();
+        let mut f = Finding::raise(p(), r, "a", "a secret-leaking defect");
+        f.security = true;
+        t.add_finding(f)
+    }
+
+    #[test]
+    fn a_security_finding_is_written_only_to_a_private_repository() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        raise_security(&t).unwrap();
+        assert!(fake.issue(2).body.contains("\"security\":true"));
+    }
+
+    #[test]
+    fn a_security_finding_on_a_public_or_internal_repository_is_refused_and_nothing_is_written() {
+        for visibility in ["public", "internal"] {
+            let fake = FakeGithub::start("acme/widgets");
+            let t = open(&fake);
+            fake.state().repos[0].visibility = visibility.into();
+            let err = raise_security(&t).unwrap_err();
+            assert!(
+                matches!(err, StoreError::SecurityNotPrivate { visibility: ref v, .. } if v == visibility),
+                "{err:?}"
+            );
+            assert_eq!(fake.issue_count(), 1, "only the record exists");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_visibility_refuses_a_security_finding() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().fail_repo_read = true;
+        let mut f = Finding::raise(p(), r, "a", "c");
+        f.security = true;
+        let err = t.add_finding(f).unwrap_err();
+        assert!(err.to_string().contains("visibility"), "{err}");
+        assert_eq!(fake.issue_count(), 1);
+    }
+
+    #[test]
+    fn a_finding_not_marked_security_may_go_to_a_public_repository() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().repos[0].visibility = "public".into();
+        let r = t.add_record(&p(), "t").unwrap();
+        t.add_finding(Finding::raise(p(), r, "a", "c")).unwrap();
     }
 
     /// The same suites the local stores pass (spec §8.1): the GitHub
