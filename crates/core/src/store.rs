@@ -44,6 +44,16 @@ pub enum StoreError {
     },
     #[error("{0} already exists; an insert never overwrites")]
     AlreadyExists(Iri),
+    /// ⚠ The item belongs to a project this store imported from a manifest
+    /// (GitHub tracker spec §4.2). Its definition is authored elsewhere, and
+    /// a local edit would make this copy disagree with the manifest every
+    /// other reader resolves.
+    #[error(
+        "this store imported {id}'s project from a manifest, so it cannot {action} it. \
+         Change it in the store that authors the project, run `fl manifest export` there, \
+         commit, then run `fl manifest import` here."
+    )]
+    Imported { id: Iri, action: &'static str },
     #[error("backend failure: {0}")]
     Backend(String),
     /// ⚠ The store could not be reached at all. This is "didn't look", and it

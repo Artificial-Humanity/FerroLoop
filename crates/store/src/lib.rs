@@ -11,6 +11,8 @@ use std::path::Path;
 
 pub mod manifest;
 
+use crate::manifest::{Manifest, ManifestError};
+
 /// Format 2: ids are IRIs, with an ownership index and per-kind handles.
 /// Format 1 keyed every table by a `u64` id from one shared counter.
 pub const FORMAT_VERSION: u64 = 2;
@@ -35,6 +37,18 @@ const FINDINGS: TableDefinition<&str, &str> = TableDefinition::new("findings");
 /// the store.
 const GATE_RUNS: TableDefinition<u64, &str> = TableDefinition::new("gate_runs");
 const ATTEMPTS: TableDefinition<u64, &str> = TableDefinition::new("attempts");
+/// project → the `content_sha256` of the manifest it was imported from.
+/// Created by the first import; a store without it has imported nothing
+/// (GitHub tracker spec §4.2).
+const IMPORTS: TableDefinition<&str, &str> = TableDefinition::new("imports");
+
+/// ⚠ The format of a store that holds an import. The first import raises
+/// the store from 2 to 3 in the same transaction, so an older fl — which
+/// knows nothing of imports and would let a person edit an imported gate —
+/// REFUSES the store with `FormatVersion` instead of ignoring the mark.
+/// This build opens both. A store that never imports stays 2 and still
+/// opens in older builds.
+pub const FORMAT_WITH_IMPORTS: u64 = 3;
 
 const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
@@ -42,6 +56,19 @@ const NEXT_ATTEMPT: &str = "next_attempt";
 pub struct RedbStore {
     db: Database,
     label: String,
+}
+
+/// What an import did, for the person who ran it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportReport {
+    pub project: ProjectId,
+    pub gates_added: usize,
+    pub gates_changed: usize,
+    pub gates_unchanged: usize,
+    pub transitions: usize,
+    /// `(old, new)` when a re-import came from another checkout. The
+    /// project's gates now run over the new root, and the CLI says so.
+    pub root_moved: Option<(String, String)>,
 }
 
 fn backend(e: impl std::fmt::Display) -> StoreError {
@@ -84,6 +111,39 @@ fn alias_primary(
     Ok((primary, pk.value().to_string()))
 }
 
+/// Index `id` as a new item of `kind` and give it the next handle, inside a
+/// write transaction the caller already holds. Refuses an id already
+/// indexed: an insert never overwrites. Shared by `insert_new_with_id` and
+/// `import_manifest`, so a minted id and an imported id are indexed the same
+/// way.
+fn index_new(tx: &redb::WriteTransaction, id: &Iri, kind: Kind) -> Result<(), StoreError> {
+    let mut ids = tx.open_table(IDS).map_err(backend)?;
+    if ids.get(id.as_str()).map_err(backend)?.is_some() {
+        return Err(StoreError::AlreadyExists(id.clone()));
+    }
+    ids.insert(id.as_str(), kind.as_wire()).map_err(backend)?;
+
+    let key = format!("next_handle:{}", kind.as_wire());
+    let mut meta = tx.open_table(META).map_err(backend)?;
+    let n = meta
+        .get(key.as_str())
+        .map_err(backend)?
+        .map(|v| v.value())
+        .unwrap_or(0)
+        + 1;
+    meta.insert(key.as_str(), n).map_err(backend)?;
+
+    tx.open_table(HANDLES)
+        .map_err(backend)?
+        .insert((kind.as_wire(), n), id.as_str())
+        .map_err(backend)?;
+    tx.open_table(HANDLE_OF)
+        .map_err(backend)?
+        .insert(id.as_str(), n)
+        .map_err(backend)?;
+    Ok(())
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let label = path.display().to_string();
@@ -105,7 +165,7 @@ impl RedbStore {
         match found {
             // No META table at all: a brand-new file.
             None => Self::create_tables(&db)?,
-            Some(Some(v)) if v == FORMAT_VERSION => {}
+            Some(Some(v)) if v == FORMAT_VERSION || v == FORMAT_WITH_IMPORTS => {}
             Some(v) => {
                 return Err(StoreError::FormatVersion {
                     found: v,
@@ -174,36 +234,11 @@ impl RedbStore {
     ) -> Result<Iri, StoreError> {
         let json = serde_json::to_string(&build(id.clone())).map_err(backend)?;
         let tx = self.db.begin_write().map_err(backend)?;
-        {
-            let mut ids = tx.open_table(IDS).map_err(backend)?;
-            if ids.get(id.as_str()).map_err(backend)?.is_some() {
-                return Err(StoreError::AlreadyExists(id));
-            }
-            ids.insert(id.as_str(), kind.as_wire()).map_err(backend)?;
-
-            let key = format!("next_handle:{}", kind.as_wire());
-            let mut meta = tx.open_table(META).map_err(backend)?;
-            let n = meta
-                .get(key.as_str())
-                .map_err(backend)?
-                .map(|v| v.value())
-                .unwrap_or(0)
-                + 1;
-            meta.insert(key.as_str(), n).map_err(backend)?;
-
-            tx.open_table(HANDLES)
-                .map_err(backend)?
-                .insert((kind.as_wire(), n), id.as_str())
-                .map_err(backend)?;
-            tx.open_table(HANDLE_OF)
-                .map_err(backend)?
-                .insert(id.as_str(), n)
-                .map_err(backend)?;
-            tx.open_table(table)
-                .map_err(backend)?
-                .insert(id.as_str(), json.as_str())
-                .map_err(backend)?;
-        }
+        index_new(&tx, &id, kind)?;
+        tx.open_table(table)
+            .map_err(backend)?
+            .insert(id.as_str(), json.as_str())
+            .map_err(backend)?;
         tx.commit().map_err(backend)?;
         Ok(id)
     }
@@ -364,6 +399,217 @@ impl RedbStore {
         }
         Ok(out)
     }
+
+    /// The hash of the manifest `project` was imported from, or `None` if
+    /// this store authors it. A project this store never held is `NotOwned`:
+    /// `None` would read as "authored here".
+    pub fn imported_hash(&self, project: &ProjectId) -> Result<Option<String>, StoreError> {
+        self.check_kind(project.iri(), Kind::Project)?;
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(IMPORTS) {
+            Ok(t) => t,
+            // The first import creates the table. Its absence is "nothing
+            // imported", read from a table that does not exist yet — not a
+            // failure to look.
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let hash = table
+            .get(project.iri().as_str())
+            .map_err(backend)?
+            .map(|v| v.value().to_string());
+        Ok(hash)
+    }
+
+    fn refuse_if_imported(
+        &self,
+        project: &ProjectId,
+        action: &'static str,
+    ) -> Result<(), StoreError> {
+        if self.imported_hash(project)?.is_some() {
+            return Err(StoreError::Imported {
+                id: project.iri().clone(),
+                action,
+            });
+        }
+        Ok(())
+    }
+
+    /// Export `project`, which this store must author.
+    pub fn export_manifest(
+        &self,
+        project: &ProjectId,
+        commit: &str,
+        exported_at_unix: u64,
+    ) -> Result<Manifest, ManifestError> {
+        self.check_kind(project.iri(), Kind::Project)?;
+        if self.imported_hash(project)?.is_some() {
+            return Err(ManifestError::NotAuthoring(project.clone()));
+        }
+        manifest::export(self, project, commit, exported_at_unix)
+    }
+
+    /// Write the manifest's project, gates and transitions under their own
+    /// IRIs, and mark the project imported — in ONE write transaction.
+    /// Everything that can refuse is decided before anything is written.
+    pub fn import_manifest(&self, m: &Manifest, root: &str) -> Result<ImportReport, ManifestError> {
+        // A `Manifest` can be built by hand; the store checks it itself.
+        m.verify()?;
+        let body = &m.body;
+        let project = &body.project;
+
+        let held_project = match self.locate(project.iri()) {
+            Ok((_, Kind::Project)) => true,
+            Ok((_, found)) => {
+                return Err(StoreError::WrongKind {
+                    id: project.iri().clone(),
+                    expected: Kind::Project,
+                    found,
+                }
+                .into());
+            }
+            Err(StoreError::NotOwned { .. }) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if held_project && self.imported_hash(project)?.is_none() {
+            return Err(ManifestError::AuthoringStore(project.clone()));
+        }
+        // Another project on the same root would give one checkout two
+        // sets of gates and two handles, with nothing said.
+        for other in self.list_projects()? {
+            if other.id != *project && other.root == root {
+                return Err(ManifestError::RootTaken {
+                    root: root.to_string(),
+                    other: other.id,
+                });
+            }
+        }
+        let root_moved = match held_project {
+            true => {
+                let held = self
+                    .get_project(project)?
+                    .ok_or_else(|| ManifestError::Inconsistent(format!("{project} vanished")))?;
+                (held.root != root).then(|| (held.root, root.to_string()))
+            }
+            false => None,
+        };
+
+        let held_gates = if held_project {
+            self.list_gates(project)?
+        } else {
+            vec![]
+        };
+        for g in &held_gates {
+            if !body.gates.iter().any(|m| m.id == g.id) {
+                return Err(ManifestError::WouldRemoveGate(g.id.clone()));
+            }
+        }
+        // Transitions mirror the manifest: one it no longer lists is
+        // removed. (Neither side has a command that removes one today.)
+        let stale_transitions: Vec<String> = if held_project {
+            self.list_transitions(project)?
+                .into_iter()
+                .filter(|t| !body.transitions.iter().any(|m| m.name == t.name))
+                .map(|t| t.name)
+                .collect()
+        } else {
+            vec![]
+        };
+
+        let mut report = ImportReport {
+            project: project.clone(),
+            gates_added: 0,
+            gates_changed: 0,
+            gates_unchanged: 0,
+            transitions: body.transitions.len(),
+            root_moved,
+        };
+        // (definition to write, whether it is new to this store)
+        let mut writes: Vec<(&GateDef, bool)> = Vec::new();
+        for g in &body.gates {
+            match self.locate(g.id.iri()) {
+                Err(StoreError::NotOwned { .. }) => {
+                    writes.push((g, true));
+                    report.gates_added += 1;
+                }
+                Ok((_, Kind::Gate)) => {
+                    let Some(held) = held_gates.iter().find(|h| h.id == g.id) else {
+                        return Err(ManifestError::Inconsistent(format!(
+                            "gate {} is held by this store under another project",
+                            g.id
+                        )));
+                    };
+                    let mut bare = held.clone();
+                    bare.last_pass_commit = None;
+                    if bare == *g {
+                        report.gates_unchanged += 1;
+                    } else {
+                        writes.push((g, false));
+                        report.gates_changed += 1;
+                    }
+                }
+                Ok((_, found)) => {
+                    return Err(StoreError::WrongKind {
+                        id: g.id.iri().clone(),
+                        expected: Kind::Gate,
+                        found,
+                    }
+                    .into());
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        let tx = self.db.begin_write().map_err(backend)?;
+        if !held_project || report.root_moved.is_some() {
+            if !held_project {
+                index_new(&tx, project.iri(), Kind::Project)?;
+            }
+            let json = serde_json::to_string(&Project {
+                id: project.clone(),
+                root: root.to_string(),
+            })
+            .map_err(backend)?;
+            tx.open_table(PROJECTS)
+                .map_err(backend)?
+                .insert(project.iri().as_str(), json.as_str())
+                .map_err(backend)?;
+        }
+        for (g, is_new) in &writes {
+            if *is_new {
+                index_new(&tx, g.id.iri(), Kind::Gate)?;
+            }
+            let json = serde_json::to_string(g).map_err(backend)?;
+            tx.open_table(GATES)
+                .map_err(backend)?
+                .insert(g.id.iri().as_str(), json.as_str())
+                .map_err(backend)?;
+        }
+        {
+            let mut table = tx.open_table(TRANSITIONS).map_err(backend)?;
+            for name in &stale_transitions {
+                table
+                    .remove((project.iri().as_str(), name.as_str()))
+                    .map_err(backend)?;
+            }
+            for t in &body.transitions {
+                let json = serde_json::to_string(t).map_err(backend)?;
+                table
+                    .insert((t.project.iri().as_str(), t.name.as_str()), json.as_str())
+                    .map_err(backend)?;
+            }
+        }
+        tx.open_table(IMPORTS)
+            .map_err(backend)?
+            .insert(project.iri().as_str(), m.content_sha256.as_str())
+            .map_err(backend)?;
+        tx.open_table(META)
+            .map_err(backend)?
+            .insert(FORMAT_KEY, FORMAT_WITH_IMPORTS)
+            .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(report)
+    }
 }
 
 impl Catalog for RedbStore {
@@ -395,6 +641,7 @@ impl Catalog for RedbStore {
         authored_by: &str,
     ) -> Result<GateId, StoreError> {
         self.check_kind(project.iri(), Kind::Project)?;
+        self.refuse_if_imported(project, "add a gate to")?;
         let id = self.insert_new(Kind::Gate, GATES, |id| GateDef {
             id: GateId(id),
             project: project.clone(),
@@ -420,14 +667,28 @@ impl Catalog for RedbStore {
     }
 
     fn update_gate(&self, def: &GateDef) -> Result<(), StoreError> {
-        if self.get_gate(&def.id)?.is_none() {
+        let Some(held) = self.get_gate(&def.id)? else {
             return Err(StoreError::NoSuchGate(def.id.clone()));
+        };
+        // An imported gate may earn a local pass mark and nothing else
+        // (GitHub tracker spec §4.2).
+        if self.imported_hash(&held.project)?.is_some() {
+            let (mut before, mut after) = (held, def.clone());
+            before.last_pass_commit = None;
+            after.last_pass_commit = None;
+            if before != after {
+                return Err(StoreError::Imported {
+                    id: def.id.iri().clone(),
+                    action: "change the definition of",
+                });
+            }
         }
         self.put_json(GATES, def.id.iri(), def)
     }
 
     fn add_transition(&self, t: Transition) -> Result<(), StoreError> {
         self.check_kind(t.project.iri(), Kind::Project)?;
+        self.refuse_if_imported(&t.project, "add a transition to")?;
         let json = serde_json::to_string(&t).map_err(backend)?;
         let tx = self.db.begin_write().map_err(backend)?;
         {
@@ -1201,5 +1462,265 @@ mod tests {
         fl_core::conformance::ledger(fresh);
         fl_core::conformance::all_roles(single);
         fl_core::conformance::local_handles(fresh);
+    }
+
+    use crate::manifest::{Manifest, ManifestError, content_sha256};
+    use fl_core::model::{Regret, Transition};
+
+    /// An authoring store with one project: gates `fmt` and `lint`, and a
+    /// transition over both. Returns the store's guard too.
+    fn authoring() -> (RedbStore, tempfile::TempDir, ProjectId, GateId, GateId) {
+        let (s, dir) = fresh();
+        let p = s.add_project("/author").unwrap();
+        let g1 = s
+            .add_gate(&p, "fmt", kind(), selector(), 1, "c1", "o")
+            .unwrap();
+        let g2 = s
+            .add_gate(&p, "lint", kind(), selector(), 1, "c1", "o")
+            .unwrap();
+        s.add_transition(Transition {
+            project: p.clone(),
+            name: "ship".into(),
+            from: State::Review,
+            to: State::Done,
+            regret: Regret::High,
+            gates: vec![g1.clone(), g2.clone()],
+        })
+        .unwrap();
+        (s, dir, p, g1, g2)
+    }
+
+    fn stamp(s: &RedbStore, g: &GateId, commit: &str) {
+        let mut def = s.get_gate(g).unwrap().unwrap();
+        def.last_pass_commit = Some(commit.into());
+        s.update_gate(&def).unwrap();
+    }
+
+    #[test]
+    fn an_import_writes_every_item_under_its_own_iri_and_marks_the_project() {
+        let (a, _ga, p, g1, g2) = authoring();
+        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let (b, _gb) = fresh();
+        let report = b.import_manifest(&m, "/elsewhere").unwrap();
+        assert_eq!((report.gates_added, report.transitions), (2, 1));
+        assert_eq!(b.get_project(&p).unwrap().unwrap().root, "/elsewhere");
+        assert_eq!(b.get_gate(&g1).unwrap(), a.get_gate(&g1).unwrap());
+        assert!(b.owns(g2.iri()).unwrap());
+        assert!(b.get_transition(&p, "ship").unwrap().is_some());
+        assert_eq!(b.imported_hash(&p).unwrap(), Some(m.content_sha256.clone()));
+        assert!(b.handle_of(Kind::Gate, g1.iri()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_store_that_never_imported_reads_as_nothing_imported() {
+        let (s, _g) = fresh();
+        let p = s.add_project("/p").unwrap();
+        assert_eq!(s.imported_hash(&p).unwrap(), None);
+    }
+
+    #[test]
+    fn the_authoring_store_refuses_to_import_its_own_project() {
+        let (a, _g, p, _, _) = authoring();
+        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let err = a.import_manifest(&m, "/author").unwrap_err();
+        assert!(matches!(err, ManifestError::AuthoringStore(_)), "{err}");
+    }
+
+    #[test]
+    fn an_importing_store_refuses_to_export() {
+        let (a, _ga, p, _, _) = authoring();
+        let (b, _gb) = fresh();
+        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            .unwrap();
+        let err = b.export_manifest(&p, "c1", 8).unwrap_err();
+        assert!(matches!(err, ManifestError::NotAuthoring(_)), "{err}");
+    }
+
+    #[test]
+    fn an_imported_gate_can_earn_a_pass_mark_but_cannot_be_edited() {
+        let (a, _ga, p, g1, _) = authoring();
+        let (b, _gb) = fresh();
+        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            .unwrap();
+        stamp(&b, &g1, "c1");
+        assert_eq!(
+            b.get_gate(&g1)
+                .unwrap()
+                .unwrap()
+                .last_pass_commit
+                .as_deref(),
+            Some("c1")
+        );
+
+        let mut edited = b.get_gate(&g1).unwrap().unwrap();
+        edited.name = "renamed".into();
+        let err = b.update_gate(&edited).unwrap_err();
+        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
+
+        let err = b
+            .add_gate(&p, "new", kind(), selector(), 1, "c1", "o")
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
+
+        let err = b
+            .add_transition(Transition {
+                project: p.clone(),
+                name: "other".into(),
+                from: State::Todo,
+                to: State::Doing,
+                regret: Regret::Low,
+                gates: vec![],
+            })
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Imported { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_reimport_keeps_the_mark_of_an_unchanged_gate_and_drops_a_changed_ones() {
+        let (a, _ga, p, g1, g2) = authoring();
+        let (b, _gb) = fresh();
+        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            .unwrap();
+        stamp(&b, &g1, "c1");
+        stamp(&b, &g2, "c1");
+
+        let mut changed = a.get_gate(&g2).unwrap().unwrap();
+        changed.authored_at_commit = "c2".into();
+        a.update_gate(&changed).unwrap();
+        let g3 = a
+            .add_gate(&p, "new", kind(), selector(), 1, "c2", "o")
+            .unwrap();
+
+        let report = b
+            .import_manifest(&a.export_manifest(&p, "c2", 8).unwrap(), "/x")
+            .unwrap();
+        assert_eq!(
+            (
+                report.gates_added,
+                report.gates_changed,
+                report.gates_unchanged
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            b.get_gate(&g1)
+                .unwrap()
+                .unwrap()
+                .last_pass_commit
+                .as_deref(),
+            Some("c1")
+        );
+        assert_eq!(b.get_gate(&g2).unwrap().unwrap().last_pass_commit, None);
+        assert_eq!(b.get_gate(&g2).unwrap().unwrap().authored_at_commit, "c2");
+        assert!(b.handle_of(Kind::Gate, g3.iri()).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_import_refuses_a_manifest_it_did_not_verify() {
+        let (a, _ga, p, _, _) = authoring();
+        let mut m = a.export_manifest(&p, "c1", 7).unwrap();
+        m.body.gates[0].name = "edited".into();
+        let (b, _gb) = fresh();
+        let err = b.import_manifest(&m, "/x").unwrap_err();
+        assert!(matches!(err, ManifestError::HandEdited { .. }), "{err}");
+        assert!(!b.owns(p.iri()).unwrap(), "nothing may be written");
+    }
+
+    #[test]
+    fn a_fresh_import_onto_a_root_another_project_uses_is_refused() {
+        let (a, _ga, p, _, _) = authoring();
+        let (b, _gb) = fresh();
+        let local = b.add_project("/x").unwrap();
+        let err = b
+            .import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            .unwrap_err();
+        assert!(
+            matches!(err, ManifestError::RootTaken { ref other, .. } if *other == local),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_reimport_from_another_checkout_moves_the_root_and_says_so() {
+        let (a, _ga, p, _, _) = authoring();
+        let (b, _gb) = fresh();
+        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        assert_eq!(b.import_manifest(&m, "/one").unwrap().root_moved, None);
+        let report = b.import_manifest(&m, "/two").unwrap();
+        assert_eq!(report.root_moved, Some(("/one".into(), "/two".into())));
+        assert_eq!(b.get_project(&p).unwrap().unwrap().root, "/two");
+    }
+
+    #[test]
+    fn a_reimport_mirrors_the_manifests_transitions() {
+        let (a, _ga, p, _, _) = authoring();
+        let (b, _gb) = fresh();
+        let first = a.export_manifest(&p, "c1", 7).unwrap();
+        b.import_manifest(&first, "/x").unwrap();
+        let mut body = first.body.clone();
+        body.transitions.clear();
+        let without = Manifest {
+            content_sha256: content_sha256(&body).unwrap(),
+            body,
+        };
+        b.import_manifest(&without, "/x").unwrap();
+        assert!(b.list_transitions(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn imported_hash_of_a_project_this_store_never_held_is_not_owned() {
+        let (s, _g) = fresh();
+        let err = s.imported_hash(&ProjectId(seq_iri(42))).unwrap_err();
+        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_store_that_imported_is_format_3_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.redb");
+        let (a, _ga, p, _, _) = authoring();
+        {
+            let b = RedbStore::open(&path).unwrap();
+            b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+                .unwrap();
+        }
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
+            Some(FORMAT_WITH_IMPORTS),
+            "an older fl must refuse this store rather than ignoring its imports"
+        );
+        drop(meta);
+        drop(tx);
+        drop(db);
+        let b = RedbStore::open(&path).unwrap();
+        assert!(b.imported_hash(&p).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_reimport_that_removes_a_gate_is_refused_and_changes_nothing() {
+        let (a, _ga, p, g1, g2) = authoring();
+        let (b, _gb) = fresh();
+        let first = a.export_manifest(&p, "c1", 7).unwrap();
+        b.import_manifest(&first, "/x").unwrap();
+
+        let mut body = first.body.clone();
+        body.gates.retain(|g| g.id != g2);
+        for t in &mut body.transitions {
+            t.gates.retain(|g| *g != g2);
+        }
+        let shrunk = Manifest {
+            content_sha256: content_sha256(&body).unwrap(),
+            body,
+        };
+        let err = b.import_manifest(&shrunk, "/x").unwrap_err();
+        assert!(
+            matches!(err, ManifestError::WouldRemoveGate(ref g) if *g == g2),
+            "{err}"
+        );
+        assert_eq!(b.imported_hash(&p).unwrap(), Some(first.content_sha256));
+        assert!(b.get_gate(&g1).unwrap().is_some());
     }
 }
