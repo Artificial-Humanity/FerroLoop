@@ -172,6 +172,41 @@ impl FakeGithub {
         s.redirects.insert(old, id);
         s.repos[0].full_name = full_name.to_string();
     }
+
+    pub fn issue(&self, n: u64) -> Issue {
+        self.state().issues[&n].clone()
+    }
+
+    pub fn issue_count(&self) -> usize {
+        self.state().issues.len()
+    }
+
+    /// A person changing an issue in the web interface, outside fl.
+    pub fn web_edit(&self, n: u64, f: impl FnOnce(&mut Issue)) {
+        let mut s = self.state();
+        let e = s.tick();
+        let issue = s.issues.get_mut(&n).expect("an issue to edit");
+        f(issue);
+        issue.events.push((e, "labeled".into()));
+    }
+
+    /// An issue fl did not make: `labels` as given, no block.
+    pub fn plain_issue(&self, labels: &[&str], pull_request: bool) -> u64 {
+        let mut s = self.state();
+        let n = s.next_number;
+        s.next_number += 1;
+        let issue = Issue {
+            number: n,
+            node_id: format!("I_{n}"),
+            title: "someone else's".into(),
+            labels: labels.iter().map(|l| l.to_string()).collect(),
+            state: "open".into(),
+            pull_request,
+            ..Issue::default()
+        };
+        s.issues.insert(n, issue);
+        n
+    }
 }
 
 impl Drop for FakeGithub {
@@ -230,7 +265,52 @@ fn split(url: &str) -> (String, BTreeMap<String, String>) {
     (path.to_string(), q)
 }
 
+fn str_list(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl State {
+    /// The repository every issue belongs to: the fake's first.
+    fn bound(&self) -> &Repo {
+        &self.repos[0]
+    }
+
+    /// `{o}/{r}` names the bound repository under its current name.
+    fn is_bound(&self, o: &str, r: &str) -> bool {
+        self.bound()
+            .full_name
+            .eq_ignore_ascii_case(&format!("{o}/{r}"))
+    }
+
+    fn tick(&mut self) -> u64 {
+        let e = self.next_event;
+        self.next_event += 1;
+        e
+    }
+
+    fn issue_json(&self, i: &Issue) -> Value {
+        let mut v = json!({
+            "number": i.number,
+            "node_id": i.node_id,
+            "html_url": format!("https://github.com/{}/issues/{}", self.bound().full_name, i.number),
+            "title": i.title,
+            "body": i.body,
+            "labels": i.labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
+            "state": i.state,
+            "state_reason": i.state_reason,
+        });
+        if i.pull_request {
+            v["pull_request"] = json!({"url": "pull"});
+        }
+        v
+    }
+
     fn repo_named(&self, name: &str) -> Option<&Repo> {
         self.repos
             .iter()
@@ -410,6 +490,161 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 }
                 None => answer(422, json!({"message": "name is missing"})),
             }
+        }
+        ("POST", ["repos", o, r, "issues"]) if s.is_bound(o, r) => {
+            if std::mem::take(&mut s.fail_before_create) {
+                return answer(502, json!({"message": "fake failure before the create"}));
+            }
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let n = s.next_number;
+            s.next_number += 1;
+            let mut labels = str_list(&v["labels"]);
+            if s.drop_labels {
+                labels.clear();
+            }
+            let mut events = Vec::new();
+            for l in &labels {
+                s.labels.insert(l.clone());
+                events.push((s.tick(), "labeled".to_string()));
+            }
+            let issue = Issue {
+                number: n,
+                node_id: format!("I_{n}"),
+                title: v["title"].as_str().unwrap_or("").into(),
+                body: v["body"].as_str().unwrap_or("").into(),
+                labels,
+                state: "open".into(),
+                events,
+                ..Issue::default()
+            };
+            s.issues.insert(n, issue);
+            if std::mem::take(&mut s.fail_after_create) {
+                return answer(
+                    502,
+                    json!({"message": "fake failure after the create landed"}),
+                );
+            }
+            if std::mem::take(&mut s.hang_up_after_create) {
+                let mut a = answer(201, Value::Null);
+                a.hang_up = true;
+                return a;
+            }
+            answer(201, s.issue_json(&s.issues[&n]))
+        }
+        ("GET", ["repos", o, r, "issues"]) if s.is_bound(o, r) => {
+            let want: Vec<String> = q
+                .get("labels")
+                .map(|l| l.split(',').map(str::to_string).collect())
+                .unwrap_or_default();
+            let items = s
+                .issues
+                .values()
+                .filter(|i| !i.gone && i.moved_to.is_none())
+                .filter(|i| want.iter().all(|w| i.labels.contains(w)))
+                .map(|i| s.issue_json(i))
+                .collect();
+            s.page(&path, &q, items)
+        }
+        ("GET", ["repos", o, r, "issues", n]) if s.is_bound(o, r) => {
+            match n.parse::<u64>().ok().and_then(|n| s.issues.get(&n)) {
+                None => answer(404, json!({"message": "Not Found"})),
+                Some(i) if i.gone => answer(410, json!({"message": "This issue was deleted"})),
+                Some(i) if i.moved_to.is_some() => {
+                    let mut a = answer(301, json!({"message": "Moved Permanently"}));
+                    a.headers
+                        .push(("Location".into(), i.moved_to.clone().unwrap_or_default()));
+                    a
+                }
+                Some(i) => answer(200, s.issue_json(i)),
+            }
+        }
+        ("PATCH", ["repos", o, r, "issues", n]) if s.is_bound(o, r) => {
+            let Some(n) = n.parse::<u64>().ok().filter(|n| s.issues.contains_key(n)) else {
+                return answer(404, json!({"message": "Not Found"}));
+            };
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            // A write by someone else that lands inside fl's window.
+            if std::mem::take(&mut s.foreign_label_on_next_patch) {
+                let e = s.tick();
+                s.issues
+                    .get_mut(&n)
+                    .unwrap()
+                    .events
+                    .push((e, "labeled".into()));
+            }
+            if std::mem::take(&mut s.foreign_edit_on_next_patch) {
+                // The fake's own rule: a FIRST edit also records the original.
+                let first = s.issues[&n].edits.is_empty();
+                for _ in 0..if first { 2 } else { 1 } {
+                    let e = format!("E_{}", s.tick());
+                    s.issues.get_mut(&n).unwrap().edits.push(e);
+                }
+            }
+            let old = s.issues[&n].clone();
+            let mut new = old.clone();
+            if let Some(t) = v.get("title").and_then(Value::as_str) {
+                new.title = t.into();
+            }
+            if let Some(b) = v.get("body").and_then(Value::as_str) {
+                new.body = b.into();
+            }
+            if let Some(ls) = v.get("labels") {
+                // GitHub silently keeps the old labels when the caller may
+                // not set them.
+                if !s.drop_labels {
+                    new.labels = str_list(ls);
+                }
+            }
+            if let Some(st) = v.get("state").and_then(Value::as_str) {
+                new.state = st.into();
+            }
+            new.state_reason = v
+                .get("state_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let mut kinds: Vec<&str> = Vec::new();
+            kinds.extend(
+                new.labels
+                    .iter()
+                    .filter(|l| !old.labels.contains(l))
+                    .map(|_| "labeled"),
+            );
+            kinds.extend(
+                old.labels
+                    .iter()
+                    .filter(|l| !new.labels.contains(l))
+                    .map(|_| "unlabeled"),
+            );
+            if old.state != new.state {
+                kinds.push(if new.state == "closed" {
+                    "closed"
+                } else {
+                    "reopened"
+                });
+            }
+            if old.title != new.title {
+                kinds.push("renamed");
+            }
+            for k in kinds {
+                let e = s.tick();
+                new.events.push((e, k.into()));
+            }
+            if old.body != new.body {
+                // ⚠ Modelled, not measured: GitHub is taken to record the
+                // original body as an entry at the FIRST edit, so a first
+                // edit adds two entries. The live test (Task 10) checks it.
+                if new.edits.is_empty() {
+                    let e = format!("E_{}", s.tick());
+                    new.edits.push(e);
+                }
+                let e = format!("E_{}", s.tick());
+                new.edits.push(e);
+            }
+            for l in &new.labels {
+                s.labels.insert(l.clone());
+            }
+            s.issues.insert(n, new);
+            answer(200, s.issue_json(&s.issues[&n]))
         }
         // A lookup of an unknown node: GitHub answers 200 with `data.node`
         // null AND a NOT_FOUND error — an answer, not a failure (spec's
