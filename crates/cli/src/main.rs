@@ -45,6 +45,9 @@ enum Command {
     /// Share a project's gates through a committed manifest.
     #[command(subcommand)]
     Manifest(cmd::manifest::Cmd),
+    /// GitHub tracker: who fl writes as, and repair of a diverged issue.
+    #[command(subcommand)]
+    Github(cmd::github::Cmd),
 }
 
 impl Command {
@@ -61,6 +64,7 @@ impl Command {
             Command::Attempt(c) => c.iris(),
             Command::Stats(c) => c.iris(),
             Command::Manifest(c) => c.iris(),
+            Command::Github(c) => c.iris(),
         }
     }
 
@@ -89,6 +93,7 @@ impl Command {
             Command::Attempt(c) => c.has_handle(),
             Command::Stats(c) => c.has_handle(),
             Command::Manifest(c) => c.has_handle(),
+            Command::Github(c) => c.has_handle(),
         }
     }
 
@@ -97,6 +102,7 @@ impl Command {
     fn needs_tracker(&self) -> bool {
         match self {
             Command::Record(_) | Command::Finding(_) | Command::Attempt(_) => true,
+            Command::Github(_) => true,
             // `check` is the CI gate: it touches the tracker only to resolve
             // `--record`, and must not need GitHub otherwise.
             Command::Check(c) => c.record.is_some(),
@@ -369,8 +375,21 @@ fn run(cli: Cli) -> Result<i32> {
     } else {
         None
     };
-    let (bound, confined) = db_path(explicit, entry.as_ref().map(|e| e.store.clone()))?;
+    let configured = entry.as_ref().map(|e| e.store.clone());
     let binding = entry.and_then(|e| e.tracker);
+    // Before any store's directory is created, searched or opened: `fl
+    // github` with `--db` still reads the entry (it needs the tracker), so
+    // this fires there too.
+    if matches!(cli.command, Command::Github(_)) && binding.is_none() {
+        bail!(
+            "`fl github` needs a tracker binding: add `tracker = {{ github = \"owner/repo\", \
+             credential = \"env\" }}` to this project's entry in {}",
+            config::path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "the config".into())
+        );
+    }
+    let (bound, confined) = db_path(explicit, configured)?;
     let mut iris = cli.command.iris();
     // A GitHub issue URL is the tracker's to resolve: no local store holds
     // one, and searching them would refuse it as NotOwned (spec §2.2).
@@ -421,6 +440,7 @@ fn run(cli: Cli) -> Result<i32> {
                 store: &store,
                 tracker: &checked,
                 handles: &routed,
+                github: Some(gh),
                 tracker_label: format!("github:{}", gh.repo().full_name),
             }
         }
@@ -428,6 +448,7 @@ fn run(cli: Cli) -> Result<i32> {
             store: &store,
             tracker: &store,
             handles: &store,
+            github: None,
             tracker_label: store.label().to_string(),
         },
     };
@@ -441,6 +462,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Attempt(c) => cmd::attempt::run(&ctx, c),
         Command::Stats(c) => cmd::stats::run(&store, c),
         Command::Manifest(c) => cmd::manifest::run(&store, c),
+        Command::Github(c) => cmd::github::run(&ctx, c),
     }
 }
 

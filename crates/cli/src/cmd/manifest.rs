@@ -97,6 +97,21 @@ pub fn ensure_publishable(
     project: &ProjectId,
     gate: Option<&GateId>,
 ) -> Result<()> {
+    // Both branches below: an importing store's check covers the manifest,
+    // not which project the named gate belongs to.
+    if let Some(g) = gate {
+        let def = store
+            .get_gate(g)?
+            .with_context(|| format!("{g} is held by this store, but it is not a gate"))?;
+        if def.project != *project {
+            bail!(
+                "gate `{}` belongs to project {}, not to {project}. Name a gate of the finding's \
+                 project",
+                def.name,
+                def.project
+            );
+        }
+    }
     let root = root_of(store, project)?;
     if store.imported_hash(project)?.is_some() {
         ensure_import_current(store, project)?;
@@ -265,4 +280,31 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
+
+    #[test]
+    fn a_gate_of_another_project_is_refused_before_any_manifest_is_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let p1 = store.add_project("/one").unwrap();
+        let p2 = store.add_project("/two").unwrap();
+        let kind = GateKind::Command(CommandSpec {
+            program: "true".into(),
+            args: vec![],
+            delivery: PopulationDelivery::Args,
+            timeout_secs: 5,
+            pass_codes: vec![0],
+        });
+        let sel = Selector::Glob {
+            pattern: "**/*".into(),
+        };
+        let g2 = store.add_gate(&p2, "g", kind, sel, 1, "c", "o").unwrap();
+        let err = ensure_publishable(&store, &p1, Some(&g2)).unwrap_err();
+        assert!(err.to_string().contains("belongs to project"), "{err}");
+    }
 }

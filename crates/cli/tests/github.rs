@@ -3,6 +3,7 @@
 
 use assert_cmd::Command;
 use fl_github::fake::FakeGithub;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -398,5 +399,214 @@ fn a_tracker_command_with_an_ambiguous_config_is_refused_even_with_db() {
         .assert()
         .failure()
         .stderr(contains("more than one store or tracker"));
+    assert!(g.fake.state().requests.is_empty());
+}
+
+#[test]
+fn a_finding_walks_raise_reproduce_assign_verify_through_github_issues() {
+    let g = fixture();
+    g.project();
+    fs::write(g.repo.path().join("bug"), "").unwrap();
+    g.fl()
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "no-bug",
+            "--glob",
+            "src/**/*.rs",
+            "--program",
+            "./check.sh",
+        ])
+        .assert()
+        .success();
+    g.fl()
+        .args(["manifest", "export", "--project", "1"])
+        .assert()
+        .success();
+    git(g.repo.path(), &["add", ".fl"]);
+    git(g.repo.path(), &["commit", "-qm", "manifest"]);
+    g.fl()
+        .args(["record", "add", "--project", "1", "--title", "work"])
+        .assert()
+        .success();
+    g.fl()
+        .args([
+            "finding",
+            "raise",
+            "--record",
+            "1",
+            "--claim",
+            "a bug exists",
+            "--by",
+            "rev",
+        ])
+        .assert()
+        .success()
+        .stdout(contains("2\traised"));
+    g.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .success();
+    g.fl()
+        .args(["finding", "assign", "2", "--to", "fixer"])
+        .assert()
+        .success();
+    fs::remove_file(g.repo.path().join("bug")).unwrap();
+    g.fl()
+        .args(["finding", "verify", "2"])
+        .assert()
+        .success()
+        .stdout(contains("CLOSED"));
+    let issue = g.fake.issue(2);
+    assert_eq!(
+        (issue.state.as_str(), issue.state_reason.as_deref()),
+        ("closed", Some("completed"))
+    );
+    assert!(issue.labels.contains(&"fl:finding/fixed".to_string()));
+}
+
+#[test]
+fn a_reproduction_is_refused_until_the_manifest_carries_the_gate() {
+    let g = fixture();
+    g.project();
+    fs::write(g.repo.path().join("bug"), "").unwrap();
+    g.fl()
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "no-bug",
+            "--glob",
+            "src/**/*.rs",
+            "--program",
+            "./check.sh",
+        ])
+        .assert()
+        .success();
+    g.fl()
+        .args(["record", "add", "--project", "1", "--title", "work"])
+        .assert()
+        .success();
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "rev",
+        ])
+        .assert()
+        .success();
+    g.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("manifest"));
+    assert!(
+        g.fake
+            .issue(2)
+            .labels
+            .contains(&"fl:finding/raised".to_string()),
+        "unchanged"
+    );
+}
+
+#[test]
+fn a_security_finding_is_refused_on_a_public_repository() {
+    let g = fixture();
+    g.project();
+    g.fl()
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .success();
+    g.fake.state().repos[0].visibility = "public".into();
+    g.fl()
+        .args([
+            "finding",
+            "raise",
+            "--record",
+            "1",
+            "--claim",
+            "c",
+            "--by",
+            "rev",
+            "--security",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("security finding"));
+    assert_eq!(g.fake.issue_count(), 1);
+}
+
+#[test]
+fn whoami_names_the_credential_and_the_repository() {
+    let g = fixture();
+    g.fl().args(["github", "whoami"]).assert().success().stdout(
+        contains(fl_github::fake::USER_LOGIN)
+            .and(contains("$FL_GITHUB_TOKEN"))
+            .and(contains("acme/widgets")),
+    );
+}
+
+#[test]
+fn a_web_edit_is_diverged_until_repaired() {
+    let g = fixture();
+    g.project();
+    g.fl()
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .success();
+    g.fake.web_edit(1, |i| {
+        i.labels = vec!["fl:record".into(), "fl:record/done".into()];
+        i.state = "closed".into();
+    });
+    g.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .failure()
+        .stderr(contains("fl github repair"));
+    g.fl()
+        .args(["github", "repair", "1", "--by", "owner"])
+        .assert()
+        .success()
+        .stdout(contains("repaired"));
+    g.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn fl_github_without_a_binding_is_refused_naming_the_config() {
+    let g = fixture_with(false);
+    g.fl()
+        .args(["github", "whoami"])
+        .assert()
+        .failure()
+        .stderr(contains("tracker"));
+}
+
+#[test]
+fn fl_github_without_a_binding_is_refused_even_with_db() {
+    let g = fixture_with(false);
+    let db = g.home.path().join("new/other.redb");
+    g.fl()
+        .arg("--db")
+        .arg(&db)
+        .args(["github", "whoami"])
+        .assert()
+        .failure()
+        .stderr(contains("needs a tracker binding"));
+    g.fl()
+        .env("FL_DB", &db)
+        .args(["github", "repair", "1", "--by", "owner"])
+        .assert()
+        .failure()
+        .stderr(contains("needs a tracker binding"));
+    assert!(
+        !g.home.path().join("new").exists(),
+        "refused before any store's directory is created"
+    );
     assert!(g.fake.state().requests.is_empty());
 }

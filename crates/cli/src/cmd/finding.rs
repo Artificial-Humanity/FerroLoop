@@ -17,6 +17,10 @@ pub enum Cmd {
         claim: String,
         #[arg(long)]
         by: String,
+        /// Mark the finding as a security finding. A GitHub tracker writes
+        /// one only to a private repository (GitHub tracker spec §6).
+        #[arg(long)]
+        security: bool,
     },
     /// Attach a reproduction. REFUSED unless the gate currently fails.
     Reproduce {
@@ -123,7 +127,12 @@ fn explain(e: FindingExecError, finding: &Ref, gate: Option<&Ref>) -> anyhow::Er
 pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     let store = ctx.store;
     match cmd {
-        Cmd::Raise { record, claim, by } => {
+        Cmd::Raise {
+            record,
+            claim,
+            by,
+            security,
+        } => {
             let r = RecordId(refs::resolve(
                 ctx.handles,
                 &ctx.tracker_label,
@@ -137,9 +146,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     ctx.tracker_label
                 );
             };
-            let id = ctx
-                .tracker
-                .add_finding(Finding::raise(rec.project, r, &by, &claim))?;
+            let mut f = Finding::raise(rec.project, r, &by, &claim);
+            f.security = security;
+            let id = ctx.tracker.add_finding(f)?;
             println!(
                 "{}\traised\t{claim}",
                 refs::show(ctx.handles, Kind::Finding, id.iri())?
@@ -155,6 +164,11 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 Kind::Gate,
                 &gate,
             )?);
+            // A gate IRI about to be written where another machine reads it
+            // must be in the committed manifest (spec §4.3–§4.5).
+            if ctx.github.is_some() {
+                crate::cmd::manifest::ensure_publishable(store, &f.project, Some(&gid))?;
+            }
             let report = attach_reproduction(ctx.roles(), &fid, &gid)
                 .map_err(|e| explain(e, &finding, Some(&gate)))?;
             println!(
