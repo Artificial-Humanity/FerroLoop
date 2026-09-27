@@ -75,6 +75,7 @@ impl Credentials for EnvToken {
             &self.token,
             None,
             api,
+            true,
         )?;
         if r.status != 200 {
             return Err(StoreError::Credential(format!(
@@ -153,7 +154,7 @@ impl AppCredentials {
             .as_secs();
         let jwt = self.jwt(now)?;
         let url = format!("{}/repos/{}/installation", self.api, self.repo);
-        let mut found = send(&self.agent, Method::Get, &url, &jwt, None, &self.api)?;
+        let mut found = send(&self.agent, Method::Get, &url, &jwt, None, &self.api, true)?;
         // After a rename GitHub redirects the old name. Follow ONE redirect,
         // and only on this API's own origin: the JWT goes where it points.
         if matches!(found.status, 301 | 302 | 307 | 308) {
@@ -166,7 +167,7 @@ impl AppCredentials {
                         "GitHub redirected the App's installation lookup off its own origin".into(),
                     )
                 })?;
-            found = send(&self.agent, Method::Get, &to, &jwt, None, &self.api)?;
+            found = send(&self.agent, Method::Get, &to, &jwt, None, &self.api, true)?;
         }
         if found.status == 404 {
             return Err(StoreError::Credential(format!(
@@ -184,7 +185,7 @@ impl AppCredentials {
                 ))
             })?;
         let url = format!("{}/app/installations/{id}/access_tokens", self.api);
-        let made = send(&self.agent, Method::Post, &url, &jwt, None, &self.api)?;
+        let made = send(&self.agent, Method::Post, &url, &jwt, None, &self.api, true)?;
         let token = (made.status == 201)
             .then(|| made.body.get("token").and_then(Value::as_str))
             .flatten()
@@ -224,6 +225,7 @@ impl Credentials for AppCredentials {
             &self.jwt(now)?,
             None,
             api,
+            true,
         )?;
         if r.status != 200 {
             return Err(StoreError::Credential(format!(

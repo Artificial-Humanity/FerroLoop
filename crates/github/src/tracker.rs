@@ -94,8 +94,11 @@ fn text(v: &Value, k: &str) -> Result<String, StoreError> {
 }
 
 /// `GET /repos/{name}`, following ONE redirect (a renamed or transferred
-/// repository answers 301). `Ok(None)` for 404.
-fn read_repo(client: &Client, name: &str) -> Result<Option<Repo>, StoreError> {
+/// repository answers 301). `Ok(None)` for 404. The `bool` is `has_issues` —
+/// carried alongside rather than on `Repo` itself, since only `open` needs
+/// it (spec §2.6): a repository with Issues turned off answers a 410 on
+/// every issue, which would otherwise be misread as "deleted".
+fn read_repo(client: &Client, name: &str) -> Result<Option<(Repo, bool)>, StoreError> {
     let mut reply = client.send(Method::Get, &format!("/repos/{name}"), None)?;
     if matches!(reply.status, 301 | 302 | 307 | 308) {
         let to = reply
@@ -105,10 +108,20 @@ fn read_repo(client: &Client, name: &str) -> Result<Option<Repo>, StoreError> {
         reply = client.send(Method::Get, &to, None)?;
     }
     match reply.status {
-        200 => Ok(Some(Repo {
-            full_name: text(&reply.body, "full_name")?,
-            node_id: text(&reply.body, "node_id")?,
-        })),
+        200 => Ok(Some((
+            Repo {
+                full_name: text(&reply.body, "full_name")?,
+                node_id: text(&reply.body, "node_id")?,
+            },
+            // Absent only from a GitHub answer this fl has never seen;
+            // treated as "on" rather than blocking a repository over a
+            // field that was never actually withheld.
+            reply
+                .body
+                .get("has_issues")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+        ))),
         404 => Ok(None),
         s => Err(backend(format!(
             "GitHub answered {s} when fl read the repository `{name}`; retry"
@@ -170,12 +183,22 @@ impl GithubTracker {
         configured: &str,
         memory: &dyn Bindings,
     ) -> Result<(Self, Option<Notice>), StoreError> {
-        let repo = read_repo(&client, configured)?.ok_or_else(|| {
+        let (repo, has_issues) = read_repo(&client, configured)?.ok_or_else(|| {
             backend(format!(
                 "the repository `{configured}` does not exist, or the credential cannot read \
                  it. Check the `github` binding and the credential"
             ))
         })?;
+        // ⚠ A repository with Issues turned off answers 410 on every issue —
+        // indistinguishable, at that point, from an issue GitHub deleted.
+        // Caught here, once, so `fetch` never has to guess which one it saw.
+        if !has_issues {
+            return Err(backend(format!(
+                "the repository `{}` has Issues turned off, so fl has nowhere to keep records \
+                 and findings. Turn Issues on for `{}`, or bind another repository",
+                repo.full_name, repo.full_name
+            )));
+        }
         match memory.bound_node_id(configured)? {
             None => memory.bind_node_id(configured, &repo.node_id)?,
             Some(bound) if bound != repo.node_id => {
@@ -245,7 +268,14 @@ impl GithubTracker {
     }
 
     /// Oldest first: an issue created while a list is read lands on its last
-    /// page, and cannot shift an earlier page's issues onto the next one.
+    /// page, so it cannot shift an earlier page's issues onto the next one.
+    /// ⚠ The opposite hazard remains, because GitHub's paging is by offset,
+    /// not a cursor: an issue LEAVING the filtered set mid-read (a label
+    /// removed, closed out from under a state filter) shifts every later
+    /// issue one position earlier, which can drop a live item from a page
+    /// already served — silently, with no error (spec §3.7). `list` catches
+    /// this itself, by re-reading and comparing issue numbers whenever more
+    /// than one page was needed.
     fn list_path(&self, labels: &[String]) -> String {
         self.path(&format!(
             "/issues?state=all&sort=created&direction=asc&per_page=100&labels={}",
@@ -264,7 +294,7 @@ impl GithubTracker {
             return Ok(Owner::Ours(n));
         }
         Ok(match read_repo(&self.client, &name)? {
-            Some(r) if r.node_id == self.repo.node_id => Owner::Ours(n),
+            Some((r, _)) if r.node_id == self.repo.node_id => Owner::Ours(n),
             Some(_) => Owner::Elsewhere(Some(format!("`{name}` now names a different repository"))),
             None => Owner::Elsewhere(None),
         })
@@ -295,7 +325,10 @@ impl GithubTracker {
     fn alias_owner(&self, alias: &Iri) -> Result<Option<u64>, StoreError> {
         let mut found = Vec::new();
         for kind in ItemKind::ALL {
-            for (issue, meta, _) in self.list(kind, None)? {
+            // ⚠ `remember: false` — see `list`'s doc comment. This scan is
+            // not the read the caller asked for; it must not overwrite what
+            // `seen` holds for an item it merely passes over.
+            for (issue, meta, _) in self.list(kind, None, false)? {
                 if meta.also_known_as.contains(alias) {
                     found.push(issue.number);
                 }
@@ -359,18 +392,55 @@ impl GithubTracker {
     /// Every fl item of `kind`, optionally in one state. ⚠ An issue carrying
     /// the kind's label that does not read as that kind is diverged, and the
     /// list fails — it is never dropped (spec §3.4, §5).
+    ///
+    /// `remember`: whether a returned item updates `seen` (fix round 1,
+    /// item 1). Only a read the CALLER directly asked for and directly
+    /// receives — `list_records`, `list_findings` — may do that. An
+    /// internal scan made in service of resolving something else (an alias,
+    /// a withdrawal count) must not: it would silently refresh `seen` for
+    /// items the caller never saw, which is exactly what let a stale write
+    /// made *through an alias* sail past the conflict check and overwrite
+    /// another actor's withdrawal.
     fn list(
         &self,
         kind: ItemKind,
         state: Option<&str>,
+        remember: bool,
     ) -> Result<Vec<(IssueView, Meta, String)>, StoreError> {
         let mut labels = vec![meta::kind_label(kind)];
         if let Some(s) = state {
             labels.push(meta::state_label(kind, s));
         }
+        let path = self.list_path(&labels);
+        let (raw, pages) = self.client.get_all_paged(&path)?;
+        if pages > 1 {
+            // ⚠ GitHub pages by offset, not a cursor (spec §3.7): an issue
+            // leaving the filtered set mid-read shifts every later issue
+            // back by one, which can drop a live item with no error. A
+            // second, independent read is compared by issue number; any
+            // difference means the set changed while fl was reading it, and
+            // the whole list is refused rather than returned short. A single
+            // page cannot have shifted anything onto or off of itself, so it
+            // costs nothing here.
+            let (again, _) = self.client.get_all_paged(&path)?;
+            let first: BTreeSet<u64> = raw
+                .iter()
+                .filter_map(|v| v.get("number").and_then(Value::as_u64))
+                .collect();
+            let second: BTreeSet<u64> = again
+                .iter()
+                .filter_map(|v| v.get("number").and_then(Value::as_u64))
+                .collect();
+            if first != second {
+                return Err(backend(format!(
+                    "the list of {} issues changed while fl read it; retry",
+                    kind.as_wire()
+                )));
+            }
+        }
         let mut out = Vec::new();
         let mut numbers = BTreeSet::new();
-        for v in self.client.get_all(&self.list_path(&labels))? {
+        for v in raw {
             let issue = IssueView::from_json(&v)?;
             // Pages are read one by one; an issue seen twice is counted once.
             if !numbers.insert(issue.number) {
@@ -388,7 +458,9 @@ impl GithubTracker {
                         continue;
                     }
                     self.kinds.borrow_mut().insert(issue.number, k);
-                    self.remember(issue.number, &meta, &prose, &issue.title);
+                    if remember {
+                        self.remember(issue.number, &meta, &prose, &issue.title);
+                    }
                     out.push((issue, meta, prose));
                 }
                 Read::Item { .. } => {
@@ -465,8 +537,20 @@ impl GithubTracker {
         let body = meta::render_body(prose, meta);
         let sent = json!({"title": title, "body": body, "labels": labels});
         let path = self.path("/issues");
-        let issue = match self.client.send(Method::Post, &path, Some(&sent)) {
-            Ok(r) if r.status == 201 => IssueView::from_json(&r.body)?,
+        // ⚠ `send_unchecked_json`, not `send`: a 201 whose own body cannot be
+        // read is exactly as ambiguous as a 5xx or a dropped connection
+        // (spec §3.3) — the write may have landed regardless of whether fl
+        // could read GitHub's answer to it. The strict `send` would report
+        // that case as a plain `Backend` error, ending the call as though
+        // nothing happened, when a duplicate may be one retry away.
+        let issue = match self
+            .client
+            .send_unchecked_json(Method::Post, &path, Some(&sent))
+        {
+            Ok(r) if r.status == 201 => match IssueView::from_json(&r.body) {
+                Ok(issue) => issue,
+                Err(_) => self.after_ambiguous_create(kind, meta, &path, &sent)?,
+            },
             // ⚠ An ambiguous failure may already have created the issue.
             // Look for the create key before sending again (spec §3.3).
             Ok(r) if r.status >= 500 => self.after_ambiguous_create(kind, meta, &path, &sent)?,
@@ -504,7 +588,21 @@ impl GithubTracker {
                 return Ok(found);
             }
         }
-        let r = self.client.send(Method::Post, path, Some(sent))?;
+        // ⚠ A transport failure here gets the SAME advice as a bad status
+        // (fix round 1, item 5b): the search already came up empty, so
+        // fl cannot tell whether THIS attempt is about to duplicate an
+        // issue the first attempt actually made — only a fresh list can
+        // settle that, same as a plain failed retry.
+        let r = self
+            .client
+            .send(Method::Post, path, Some(sent))
+            .map_err(|e| {
+                backend(format!(
+                    "GitHub could not be reached to retry an issue create a second time \
+                     ({e}). List the repository's fl issues before retrying, so the retry \
+                     makes no duplicate"
+                ))
+            })?;
         if r.status != 201 {
             return Err(backend(format!(
                 "GitHub failed an issue create twice (the second answer was {}). List the \
@@ -710,7 +808,7 @@ impl Tracker for GithubTracker {
 
     fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError> {
         let mut out = Vec::new();
-        for (issue, meta, _) in self.list(ItemKind::Record, None)? {
+        for (issue, meta, _) in self.list(ItemKind::Record, None, true)? {
             if meta.project == *project {
                 out.push(self.record_from(&issue, &meta)?);
             }
@@ -797,7 +895,7 @@ impl Tracker for GithubTracker {
 
     fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError> {
         let mut out = Vec::new();
-        for (issue, meta, prose) in self.list(ItemKind::Finding, None)? {
+        for (issue, meta, prose) in self.list(ItemKind::Finding, None, true)? {
             if meta.project == *project {
                 out.push(self.finding_from(&issue, &meta, &prose)?);
             }
@@ -806,7 +904,13 @@ impl Tracker for GithubTracker {
     }
 
     fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError> {
-        let withdrawn = self.list(ItemKind::Finding, Some(FindingState::Withdrawn.as_wire()))?;
+        // ⚠ `remember: false` — this is a count, not a read the caller
+        // receives items from; see `list`'s doc comment.
+        let withdrawn = self.list(
+            ItemKind::Finding,
+            Some(FindingState::Withdrawn.as_wire()),
+            false,
+        )?;
         Ok(withdrawn
             .iter()
             .filter(|(_, m, _)| m.raised_by.as_deref() == Some(actor))
@@ -964,6 +1068,44 @@ mod tests {
         assert_eq!(fake.issue_count(), 1, "exactly one issue");
     }
 
+    /// Fix round 1, item 5a: a 201 whose own body cannot be read as an issue
+    /// is exactly as ambiguous as a 5xx or a dropped connection (spec §3.3)
+    /// — the create may have landed regardless of whether fl could read
+    /// GitHub's answer to it.
+    #[test]
+    fn a_create_whose_201_body_is_unreadable_is_found_not_duplicated() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().unreadable_create_body_next = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+        assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
+    }
+
+    /// Fix round 1, item 5b: a transport failure on the SECOND create
+    /// attempt (after the create-key search already came up empty) must
+    /// carry the same "list the repository's fl issues before retrying"
+    /// remedy as a bad status there — losing that advice on this one path
+    /// would leave a caller no wiser about the risk of a duplicate.
+    #[test]
+    fn a_transport_failure_on_the_ambiguous_resend_still_names_the_remedy() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().fail_before_create = true;
+        fake.state().hang_up_after_create = true;
+        let err = t.add_record(&p(), "t").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("List the repository's fl issues before retrying"),
+            "{err}"
+        );
+        assert_eq!(
+            fake.issue_count(),
+            1,
+            "the resend's own create landed even though its answer did not"
+        );
+    }
+
     /// ⚠ The engine reads, runs gates, then writes. A finding withdrawn by
     /// someone else in between must not be marked fixed.
     #[test]
@@ -983,6 +1125,44 @@ mod tests {
             i.state_reason = Some("not_planned".into());
         });
         stale.assigned_to = Some("fixer".into());
+        let err = t.update_finding(&stale).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+        assert!(
+            fake.issue(2)
+                .labels
+                .contains(&"fl:finding/withdrawn".to_string()),
+            "untouched"
+        );
+    }
+
+    /// Fix round 1, item 1: the SAME race as the test above, but the stale
+    /// write is addressed by an ALIAS rather than the finding's own URL.
+    /// Resolving an alias scans every fl issue (`locate` → `alias_owner` →
+    /// `list`); that scan must not itself update `seen` for the issue it
+    /// finds, or it silently refreshes `seen` to the CURRENT (already
+    /// withdrawn) state right before the conflict check reads it — making
+    /// the check compare the current state against itself and pass, so the
+    /// stale write sails through and overwrites the withdrawal.
+    #[test]
+    fn a_stale_write_made_through_an_alias_is_still_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let f = t.add_finding(Finding::raise(p(), r, "a", "c")).unwrap();
+        let alias = Iri::parse("https://github.com/elsewhere/old/issues/9").unwrap();
+        t.add_alias(f.iri(), alias.clone()).unwrap();
+        let mut stale = t.get_finding(&f).unwrap().unwrap();
+        fake.web_edit(2, |i| {
+            let (prose, mut m) = meta::parse_body(&i.body).unwrap();
+            m.state = "withdrawn".into();
+            m.withdrawn_reason = Some("someone else".into());
+            i.body = meta::render_body(&prose, &m);
+            i.labels = vec!["fl:finding".into(), "fl:finding/withdrawn".into()];
+            i.state = "closed".into();
+            i.state_reason = Some("not_planned".into());
+        });
+        stale.assigned_to = Some("fixer".into());
+        stale.id = FindingId(alias);
         let err = t.update_finding(&stale).unwrap_err();
         assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
         assert!(
@@ -1014,6 +1194,53 @@ mod tests {
         assert!(t.list_records(&ProjectId(seq_iri(2))).unwrap().is_empty());
         fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 2));
         assert!(t.list_records(&p()).is_err(), "never a short list");
+    }
+
+    /// Fix round 1, item 2: a list that needed more than one page is read a
+    /// SECOND time to check the set of issue numbers is stable — a stable
+    /// list still succeeds, just at the cost of the extra read.
+    #[test]
+    fn a_stable_multi_page_list_is_read_twice_and_still_succeeds() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        for i in 0..5 {
+            t.add_record(&p(), &format!("r{i}")).unwrap();
+        }
+        fake.state().max_per_page = 2;
+        let before = fake.state().requests.len();
+        assert_eq!(t.list_records(&p()).unwrap().len(), 5);
+        let issue_list_requests = fake.state().requests[before..]
+            .iter()
+            .filter(|r| r.starts_with("GET /repos/acme/widgets/issues?"))
+            .count();
+        assert_eq!(
+            issue_list_requests, 6,
+            "3 pages needed for 5 records at 2 per page, read twice"
+        );
+    }
+
+    /// Fix round 1, item 2: GitHub pages by offset. An issue leaving the
+    /// filtered set between two page reads of the SAME pass shifts every
+    /// later issue back by one — which can drop a live item with no error
+    /// (spec §3.7). The second, independent read this fake's fix adds must
+    /// catch the mismatch rather than returning what looks like a complete
+    /// but short list.
+    #[test]
+    fn a_list_that_changes_shape_between_the_two_passes_is_an_error_not_a_short_list() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        for i in 0..5 {
+            t.add_record(&p(), &format!("r{i}")).unwrap();
+        }
+        fake.state().max_per_page = 2;
+        // Issue 1 vanishes right as the first pass's second page is served
+        // (its first page already went out with issue 1 still in it).
+        fake.state().vanish_after_list_request = Some((2, 1));
+        let err = t.list_records(&p()).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref m) if m.contains("changed while fl read it")),
+            "{err:?}"
+        );
     }
 
     /// The row of spec §8.2 that makes the others meaningful: a store that
@@ -1158,6 +1385,26 @@ mod tests {
         assert!(
             matches!(err, StoreError::RepositoryReplaced { .. }),
             "{err:?}"
+        );
+    }
+
+    /// Fix round 1, item 4: GitHub also answers 410 on every issue of a
+    /// repository that has Issues turned off — indistinguishable, at that
+    /// point, from an issue GitHub deleted. Caught once, at `open`, so
+    /// `fetch` never has to guess which one it saw.
+    #[test]
+    fn a_repository_with_issues_turned_off_is_refused_naming_the_remedy() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().repos[0].has_issues = false;
+        let memory = MemStore::default();
+        let err = GithubTracker::open(client(&fake), "acme/widgets", &memory)
+            .err()
+            .unwrap();
+        assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Issues") && msg.contains("acme/widgets"),
+            "{msg}"
         );
     }
 

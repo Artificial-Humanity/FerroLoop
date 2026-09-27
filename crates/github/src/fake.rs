@@ -19,6 +19,9 @@ pub struct Repo {
     pub node_id: String,
     pub full_name: String,
     pub visibility: String,
+    /// GitHub turns this off per-repository; a 410 on an issue can mean
+    /// either "deleted" or "this repository has no Issues at all".
+    pub has_issues: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -77,6 +80,18 @@ pub struct State {
     /// The next installation lookup answers 301 with this `Location`,
     /// which is off the API's own origin. One-shot.
     pub off_origin_redirect_next: Option<String>,
+    /// The create answers 201 with a body that cannot be read as an issue —
+    /// a garbled proxy answer, not GitHub's own. The issue is still created.
+    /// One-shot.
+    pub unreadable_create_body_next: bool,
+    /// How many requests the issues-LIST endpoint (not a single-issue GET)
+    /// has answered so far, this fake's lifetime.
+    pub list_issue_requests: u32,
+    /// (request number, issue number): right before answering that request
+    /// to the issues list, mark that issue `gone` — simulating the filtered
+    /// set changing while a multi-page read is under way (spec §3.7). Counts
+    /// every list request across every `list()` call, both passes. One-shot.
+    pub vanish_after_list_request: Option<(u32, u64)>,
 }
 
 pub struct FakeGithub {
@@ -100,6 +115,7 @@ impl FakeGithub {
                 node_id: "R_1".into(),
                 full_name: full_name.into(),
                 visibility: "private".into(),
+                has_issues: true,
             }],
             installations: BTreeMap::from([(full_name.to_ascii_lowercase(), 7)]),
             next_number: 1,
@@ -125,8 +141,16 @@ impl FakeGithub {
                     // fails at once with a transport error. (Dropping the
                     // request unanswered would make tiny_http answer 500;
                     // a short body would hang the client until its timeout.)
+                    // ⚠ The explicit `flush` is load-bearing: tiny_http's
+                    // writer sits on a `BufWriter`, and without a flush these
+                    // few bytes stay in that buffer — never reaching the
+                    // socket — until the writer's own `Drop` gets around to
+                    // it, which measurably (~30s) loses the race against
+                    // ureq's read, and the client blocks on its global
+                    // timeout instead of seeing the broken response at once.
                     let mut w = req.into_writer();
                     let _ = std::io::Write::write_all(&mut w, b"HTTP/9 broken\r\n\r\n");
+                    let _ = std::io::Write::flush(&mut w);
                     continue;
                 }
                 let content_type = if answer.raw_body.is_some() {
@@ -321,6 +345,7 @@ impl State {
         json!({
             "id": r.id, "node_id": r.node_id, "full_name": r.full_name,
             "visibility": r.visibility, "private": r.visibility == "private",
+            "has_issues": r.has_issues,
         })
     }
 
@@ -524,6 +549,11 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     json!({"message": "fake failure after the create landed"}),
                 );
             }
+            if std::mem::take(&mut s.unreadable_create_body_next) {
+                // The create landed, but the answer a caller actually reads
+                // back is garbage — a garbled proxy body, not GitHub's own.
+                return raw_answer(201, "not json at all");
+            }
             if std::mem::take(&mut s.hang_up_after_create) {
                 let mut a = answer(201, Value::Null);
                 a.hang_up = true;
@@ -532,6 +562,15 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             answer(201, s.issue_json(&s.issues[&n]))
         }
         ("GET", ["repos", o, r, "issues"]) if s.is_bound(o, r) => {
+            s.list_issue_requests += 1;
+            if let Some((request, issue)) = s.vanish_after_list_request
+                && s.list_issue_requests == request
+            {
+                s.vanish_after_list_request = None;
+                if let Some(i) = s.issues.get_mut(&issue) {
+                    i.gone = true;
+                }
+            }
             let want: Vec<String> = q
                 .get("labels")
                 .map(|l| l.split(',').map(str::to_string).collect())

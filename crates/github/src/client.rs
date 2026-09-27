@@ -56,15 +56,35 @@ impl Client {
     ) -> Result<Reply, StoreError> {
         let url = self.url(path_or_url)?;
         let token = self.creds.token()?;
-        send(&self.agent, method, &url, &token, body, &self.api)
+        send(&self.agent, method, &url, &token, body, &self.api, true)
     }
 
-    /// Every page of a list. ⚠ A failure on ANY page is an error, never a
-    /// short list (spec §3.7).
-    pub fn get_all(&self, path: &str) -> Result<Vec<Value>, StoreError> {
+    /// Like `send`, but a 2xx body that fails to parse as JSON becomes
+    /// `Value::Null` rather than an error, the same treatment `send` already
+    /// gives a non-2xx body. For a caller that must judge an ambiguous write
+    /// for itself (an issue create, spec §3.3): a garbled 201 body does not
+    /// prove the write failed, so it must not be reported as a plain
+    /// `Backend` error before that caller gets a chance to search for what
+    /// it may have already created.
+    pub fn send_unchecked_json(
+        &self,
+        method: Method,
+        path_or_url: &str,
+        body: Option<&Value>,
+    ) -> Result<Reply, StoreError> {
+        let url = self.url(path_or_url)?;
+        let token = self.creds.token()?;
+        send(&self.agent, method, &url, &token, body, &self.api, false)
+    }
+
+    /// Every page of a list, and how many requests it took. ⚠ A failure on
+    /// ANY page is an error, never a short list (spec §3.7).
+    pub fn get_all_paged(&self, path: &str) -> Result<(Vec<Value>, usize), StoreError> {
         let mut out = Vec::new();
         let mut next = Some(path.to_string());
+        let mut pages = 0usize;
         while let Some(page) = next {
+            pages += 1;
             let reply = self.send(Method::Get, &page, None)?;
             if reply.status != 200 {
                 return Err(StoreError::Backend(format!(
@@ -81,7 +101,13 @@ impl Client {
             out.extend(items);
             next = reply.link_next;
         }
-        Ok(out)
+        Ok((out, pages))
+    }
+
+    /// Every page of a list. ⚠ A failure on ANY page is an error, never a
+    /// short list (spec §3.7).
+    pub fn get_all(&self, path: &str) -> Result<Vec<Value>, StoreError> {
+        self.get_all_paged(path).map(|(items, _)| items)
     }
 
     /// One GraphQL query. An `errors` member is an error, never partial data.
@@ -163,6 +189,13 @@ fn headers<B>(rb: ureq::RequestBuilder<B>, auth: &str) -> ureq::RequestBuilder<B
 
 /// One request with a bearer token. Shared by `Client` and the App's token
 /// exchange, which signs with a JWT rather than a stored token.
+///
+/// `require_json_on_2xx`: when true (every caller except
+/// `Client::send_unchecked_json`), a 2xx body that fails to parse as JSON is
+/// itself an error, since a working GitHub answer is always JSON. The one
+/// exception is an issue create, which must be able to tell "the write
+/// failed" from "the write may have landed and only the answer was garbled"
+/// (spec §3.3) — that caller passes `false` and judges the body itself.
 pub(crate) fn send(
     agent: &ureq::Agent,
     method: Method,
@@ -170,6 +203,7 @@ pub(crate) fn send(
     token: &str,
     body: Option<&Value>,
     origin: &str,
+    require_json_on_2xx: bool,
 ) -> Result<Reply, StoreError> {
     let unreachable = |e: ureq::Error| StoreError::Unreachable {
         store: origin.to_string(),
@@ -201,13 +235,15 @@ pub(crate) fn send(
     // load balancers answer a 502/504 with an HTML page, and a 401 or 429 can
     // be non-JSON too. Only a 2xx must be JSON — anything else that fails to
     // parse becomes `Value::Null` so the caller still sees the real status.
+    // `require_json_on_2xx` lets one caller (an issue create) opt out of the
+    // 2xx rule too, so it can judge a garbled answer itself.
     let is_2xx = (200..300).contains(&status);
     let body = if text.trim().is_empty() {
         Value::Null
     } else {
         match serde_json::from_str(&text) {
             Ok(v) => v,
-            Err(e) if is_2xx => {
+            Err(e) if is_2xx && require_json_on_2xx => {
                 return Err(StoreError::Backend(format!(
                     "GitHub answered {method:?} {url} with a body that is not JSON ({e})"
                 )));
