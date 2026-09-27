@@ -1,12 +1,11 @@
+use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
-use fl_core::store::{Roles, Tracker};
 use fl_core::{Iri, Kind};
 use fl_exec::finding::{FindingExecError, attach_reproduction, verify_finding};
-use fl_store::RedbStore;
 use std::collections::BTreeSet;
 
 #[derive(Subcommand)]
@@ -75,21 +74,26 @@ impl Cmd {
 /// alias, so what is printed back is the finding's handle rather than the
 /// alias typed. An id that names no finding is returned as given: the
 /// caller's own lookup refuses it, echoing what was typed.
-fn finding_id(store: &RedbStore, r: &Ref) -> Result<FindingId> {
-    let id = FindingId(refs::resolve(store, store.label(), Kind::Finding, r)?);
-    Ok(match store.get_finding(&id)? {
+fn finding_id(ctx: &Ctx<'_>, r: &Ref) -> Result<FindingId> {
+    let id = FindingId(refs::resolve(
+        ctx.handles,
+        &ctx.tracker_label,
+        Kind::Finding,
+        r,
+    )?);
+    Ok(match ctx.tracker.get_finding(&id)? {
         Some(f) => f.id,
         None => id,
     })
 }
 
 /// The finding `r` names, or a refusal that echoes what was typed.
-fn finding(store: &RedbStore, r: &Ref) -> Result<Finding> {
-    let Some(f) = store.get_finding(&finding_id(store, r)?)? else {
+fn finding(ctx: &Ctx<'_>, r: &Ref) -> Result<Finding> {
+    let Some(f) = ctx.tracker.get_finding(&finding_id(ctx, r)?)? else {
         bail!(
             "`{r}` is not a finding in the store at {}. Use \
              `fl finding list --project <project>` to see findings that exist.",
-            store.label()
+            ctx.tracker_label
         );
     };
     Ok(f)
@@ -116,52 +120,65 @@ fn explain(e: FindingExecError, finding: &Ref, gate: Option<&Ref>) -> anyhow::Er
     }
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
+    let store = ctx.store;
     match cmd {
         Cmd::Raise { record, claim, by } => {
-            let r = RecordId(refs::resolve(store, store.label(), Kind::Record, &record)?);
-            let Some(rec) = store.get_record(&r)? else {
+            let r = RecordId(refs::resolve(
+                ctx.handles,
+                &ctx.tracker_label,
+                Kind::Record,
+                &record,
+            )?);
+            let Some(rec) = ctx.tracker.get_record(&r)? else {
                 bail!(
                     "`{record}` is not a record in the store at {}. Use \
                      `fl record list --project <project>` to see records that exist.",
-                    store.label()
+                    ctx.tracker_label
                 );
             };
-            let id = store.add_finding(Finding::raise(rec.project, r, &by, &claim))?;
+            let id = ctx
+                .tracker
+                .add_finding(Finding::raise(rec.project, r, &by, &claim))?;
             println!(
                 "{}\traised\t{claim}",
-                refs::show(store, Kind::Finding, id.iri())?
+                refs::show(ctx.handles, Kind::Finding, id.iri())?
             );
         }
         Cmd::Reproduce { finding, gate } => {
-            let f = self::finding(store, &finding)?;
+            let f = self::finding(ctx, &finding)?;
             crate::cmd::manifest::ensure_import_current(store, &f.project)?;
             let fid = f.id;
-            let gid = GateId(refs::resolve(store, store.label(), Kind::Gate, &gate)?);
-            let report = attach_reproduction(Roles::single(store), &fid, &gid)
+            let gid = GateId(refs::resolve(
+                ctx.handles,
+                store.label(),
+                Kind::Gate,
+                &gate,
+            )?);
+            let report = attach_reproduction(ctx.roles(), &fid, &gid)
                 .map_err(|e| explain(e, &finding, Some(&gate)))?;
             println!(
                 "{}\treproduced\tgate {} failed over {} items",
-                refs::show(store, Kind::Finding, fid.iri())?,
-                refs::show(store, Kind::Gate, gid.iri())?,
+                refs::show(ctx.handles, Kind::Finding, fid.iri())?,
+                refs::show(ctx.handles, Kind::Gate, gid.iri())?,
                 report.verdict.population().unwrap_or(0)
             );
         }
         Cmd::Assign { finding: arg, to } => {
-            let mut f = finding(store, &arg)?;
+            let mut f = finding(ctx, &arg)?;
             f.assign(&to).map_err(|e| anyhow::anyhow!("{e}"))?;
-            store.update_finding(&f)?;
+            ctx.tracker.update_finding(&f)?;
             println!(
                 "{}\tassigned\t{to}",
-                refs::show(store, Kind::Finding, f.id.iri())?
+                refs::show(ctx.handles, Kind::Finding, f.id.iri())?
             );
         }
         Cmd::Verify { finding } => {
-            let f = self::finding(store, &finding)?;
+            let f = self::finding(ctx, &finding)?;
             crate::cmd::manifest::ensure_import_current(store, &f.project)?;
             let id = f.id;
-            let report = verify_finding(Roles::single(store), &id)
-                .map_err(|e| explain(e, &finding, None))?;
+            let report =
+                verify_finding(ctx.roles(), &id).map_err(|e| explain(e, &finding, None))?;
 
             if report.reproduction.verdict.is_pass() {
                 println!(
@@ -229,7 +246,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 }
             }
 
-            let shown = refs::show(store, Kind::Finding, id.iri())?;
+            let shown = refs::show(ctx.handles, Kind::Finding, id.iri())?;
             if report.closed {
                 println!("CLOSED\t{shown}");
             } else {
@@ -241,12 +258,12 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             finding: arg,
             reason,
         } => {
-            let mut f = finding(store, &arg)?;
+            let mut f = finding(ctx, &arg)?;
             f.withdraw(&reason).map_err(|e| anyhow::anyhow!("{e}"))?;
-            store.update_finding(&f)?;
+            ctx.tracker.update_finding(&f)?;
             println!(
                 "{}\twithdrawn\t{reason}",
-                refs::show(store, Kind::Finding, f.id.iri())?
+                refs::show(ctx.handles, Kind::Finding, f.id.iri())?
             );
         }
         Cmd::List { project, state } => {
@@ -260,17 +277,17 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 })?),
             };
             let p = ProjectId(refs::resolve(
-                store,
+                ctx.handles,
                 store.label(),
                 Kind::Project,
                 &project,
             )?);
-            let all = store.list_findings(&p)?;
+            let all = ctx.tracker.list_findings(&p)?;
             let mut raisers: BTreeSet<String> = Default::default();
             for f in all.iter().filter(|f| want.is_none_or(|w| f.state == w)) {
                 println!(
                     "{}\t{}\t{}\t{}",
-                    refs::show(store, Kind::Finding, f.id.iri())?,
+                    refs::show(ctx.handles, Kind::Finding, f.id.iri())?,
                     f.state.as_wire(),
                     f.raised_by,
                     f.claim
@@ -280,7 +297,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             // ⚠ Decision 27's cost, printed where it can be seen. A cost
             // nobody reads is not a cost.
             for actor in raisers {
-                let n = store.withdrawals_by(&actor)?;
+                let n = ctx.tracker.withdrawals_by(&actor)?;
                 if n > 0 {
                     println!("{actor}\twithdrawn: {n}");
                 }

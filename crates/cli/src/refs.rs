@@ -14,8 +14,21 @@ pub enum Ref {
 impl std::str::FromStr for Ref {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-            return s
+        // `owner/repo#41` names that repository's issue (GitHub tracker spec
+        // §2.1). The tracker answers `NotOwned` for another repository.
+        if let Some((repo, n)) = s.split_once('#')
+            && repo.split('/').count() == 2
+            && !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Iri::parse(&format!("https://github.com/{repo}/issues/{n}"))
+                .map(Ref::Iri)
+                .map_err(|e| format!("`{s}` names an issue fl cannot address: {e}"));
+        }
+        // A handle may be written `#41`, as GitHub writes an issue number.
+        let digits = s.strip_prefix('#').unwrap_or(s);
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return digits
                 .parse::<u64>()
                 .map(Ref::Handle)
                 .map_err(|_| format!("`{s}` is too large to be a handle"));
@@ -41,7 +54,7 @@ impl std::fmt::Display for Ref {
 
 /// The id `r` names. A handle resolves only in `store`; an IRI is returned
 /// as given, and the store checks ownership when it is asked for the item.
-pub fn resolve(store: &impl Handles, label: &str, kind: Kind, r: &Ref) -> Result<Iri> {
+pub fn resolve(store: &dyn Handles, label: &str, kind: Kind, r: &Ref) -> Result<Iri> {
     match r {
         Ref::Iri(i) => Ok(i.clone()),
         Ref::Handle(n) => match store.resolve_handle(kind, *n)? {
@@ -55,7 +68,7 @@ pub fn resolve(store: &impl Handles, label: &str, kind: Kind, r: &Ref) -> Result
 }
 
 /// How a person reads an id: its handle, or the full IRI if it has none here.
-pub fn show(store: &impl Handles, kind: Kind, id: &Iri) -> Result<String> {
+pub fn show(store: &dyn Handles, kind: Kind, id: &Iri) -> Result<String> {
     Ok(match store.handle_of(kind, id)? {
         Some(n) => n.to_string(),
         None => id.to_string(),

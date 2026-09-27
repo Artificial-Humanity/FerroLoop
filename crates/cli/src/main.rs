@@ -1,10 +1,12 @@
 mod cmd;
 mod config;
+mod ctx;
 mod refs;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use fl_core::{Iri, StoreError};
+use ctx::Ctx;
+use fl_core::{CatalogChecked, Iri, KindRouted, StoreError};
 use fl_store::RedbStore;
 use std::path::{Path, PathBuf};
 
@@ -89,6 +91,74 @@ impl Command {
             Command::Manifest(c) => c.has_handle(),
         }
     }
+
+    /// Whether the command reads or writes records or findings. Only these
+    /// open the tracker, so a catalog command never contacts GitHub.
+    fn needs_tracker(&self) -> bool {
+        match self {
+            Command::Record(_) | Command::Finding(_) | Command::Attempt(_) => true,
+            // `check` is the CI gate: it touches the tracker only to resolve
+            // `--record`, and must not need GitHub otherwise.
+            Command::Check(c) => c.record.is_some(),
+            Command::Project(_)
+            | Command::Gate(_)
+            | Command::Transition(_)
+            | Command::Stats(_)
+            | Command::Manifest(_) => false,
+        }
+    }
+}
+
+fn open_github(
+    b: &config::TrackerBinding,
+    app: Option<&config::GithubApp>,
+    store: &RedbStore,
+) -> Result<fl_github::GithubTracker> {
+    let api = match std::env::var("FL_GITHUB_API_URL") {
+        Err(_) => fl_github::DEFAULT_API.to_string(),
+        // ⚠ For tests. The credential goes wherever this points, so only
+        // https, or plain http to this machine, is accepted — and said.
+        Ok(url) => {
+            let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+                .iter()
+                .any(|p| {
+                    url == *p
+                        || url.starts_with(&format!("{p}:"))
+                        || url.starts_with(&format!("{p}/"))
+                });
+            if !url.starts_with("https://") && !loopback {
+                bail!(
+                    "$FL_GITHUB_API_URL is `{url}`; fl sends the GitHub credential there, so it \
+                     must be https://, or http:// to this machine. Unset it to use GitHub"
+                );
+            }
+            eprintln!("notice: $FL_GITHUB_API_URL is set; talking to {url}, not GitHub");
+            url
+        }
+    };
+    let creds: Box<dyn fl_github::Credentials> = match b.credential {
+        config::Credential::Env => Box::new(fl_github::EnvToken::from_env()?),
+        config::Credential::App => {
+            let Some(app) = app else {
+                bail!(
+                    "`credential = \"app\"` needs a `[github]` section with `app_id` and \
+                     `private_key` in the config"
+                );
+            };
+            Box::new(fl_github::AppCredentials::from_file(
+                &api,
+                app.app_id,
+                &app.private_key,
+                &b.github,
+            )?)
+        }
+    };
+    let (tracker, notice) =
+        fl_github::GithubTracker::open(fl_github::Client::new(&api, creds), &b.github, store)?;
+    if let Some(n) = notice {
+        eprintln!("notice: {n}");
+    }
+    Ok(tracker)
 }
 
 /// Resolve the store path from `--db`, then `$FL_DB`, then the project
@@ -249,14 +319,21 @@ fn main() {
 
 fn run(cli: Cli) -> Result<i32> {
     let cwd = std::env::current_dir().context("could not determine the current directory")?;
-    let entries = config::load(config::path().as_deref())?;
+    let cfg = config::load(config::path().as_deref())?;
+    let entries = &cfg.projects;
     let locus = match cli.command.project_root() {
         Some(root) => cwd.join(root),
         None => cwd.clone(),
     };
-    let (bound, confined) = db_path(cli.db, &entries, &locus)?;
-    let iris = cli.command.iris();
-    let path = choose_store(&bound, &entries, &iris, confined)?;
+    let (bound, confined) = db_path(cli.db, entries, &locus)?;
+    let binding = config::bound_entry(entries, &locus)?.and_then(|e| e.tracker);
+    let mut iris = cli.command.iris();
+    // A GitHub issue URL is the tracker's to resolve: no local store holds
+    // one, and searching them would refuse it as NotOwned (spec §2.2).
+    if binding.is_some() {
+        iris.retain(|i| !fl_github::meta::is_issue_url(i));
+    }
+    let path = choose_store(&bound, entries, &iris, confined)?;
     // ⚠ Fix round 1, item 1: a handle resolves only in the store it was
     // read from. If an IRI elsewhere in this same command sent the search
     // to a DIFFERENT store than the bound one, a handle alongside it would
@@ -273,14 +350,51 @@ fn run(cli: Cli) -> Result<i32> {
     }
     let store = RedbStore::open(&path)
         .with_context(|| format!("could not open the store at {}", path.display()))?;
+    // A bound project's node binding and catalog live in the store its
+    // config entry names; `--db` would pair GitHub with another catalog.
+    if binding.is_some() && confined && cli.command.needs_tracker() {
+        bail!(
+            "this project's tracker is bound to GitHub in the config, so it uses the store its \
+             config entry names. Drop --db (and unset $FL_DB) for this command"
+        );
+    }
+    let github = match (&binding, cli.command.needs_tracker()) {
+        (Some(b), true) => Some(open_github(b, cfg.github.as_ref(), &store)?),
+        _ => None,
+    };
+    let (checked, routed);
+    let ctx = match &github {
+        Some(gh) => {
+            checked = CatalogChecked {
+                catalog: &store,
+                tracker: gh,
+            };
+            routed = KindRouted {
+                catalog: &store,
+                tracker: gh,
+            };
+            Ctx {
+                store: &store,
+                tracker: &checked,
+                handles: &routed,
+                tracker_label: format!("github:{}", gh.repo().full_name),
+            }
+        }
+        None => Ctx {
+            store: &store,
+            tracker: &store,
+            handles: &store,
+            tracker_label: store.label().to_string(),
+        },
+    };
     match cli.command {
         Command::Project(c) => cmd::project::run(&store, c),
         Command::Gate(c) => cmd::gate::run(&store, c),
         Command::Transition(c) => cmd::transition::run(&store, c),
-        Command::Record(c) => cmd::record::run(&store, c),
-        Command::Check(c) => cmd::check::run(&store, c),
-        Command::Finding(c) => cmd::finding::run(&store, c),
-        Command::Attempt(c) => cmd::attempt::run(&store, c),
+        Command::Record(c) => cmd::record::run(&ctx, c),
+        Command::Check(c) => cmd::check::run(&ctx, c),
+        Command::Finding(c) => cmd::finding::run(&ctx, c),
+        Command::Attempt(c) => cmd::attempt::run(&ctx, c),
         Command::Stats(c) => cmd::stats::run(&store, c),
         Command::Manifest(c) => cmd::manifest::run(&store, c),
     }

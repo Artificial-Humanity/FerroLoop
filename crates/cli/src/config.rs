@@ -16,6 +16,40 @@ use std::path::{Path, PathBuf};
 pub struct Entry {
     pub root: PathBuf,
     pub store: PathBuf,
+    /// `None`: the tracker is the local store.
+    #[serde(default)]
+    pub tracker: Option<TrackerBinding>,
+}
+
+/// A project's tracker when it is not the local store (GitHub tracker spec
+/// §1.4): `tracker = { github = "owner/repo", credential = "env" }`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrackerBinding {
+    pub github: String,
+    pub credential: Credential,
+}
+
+/// Where the GitHub credential comes from. One source, and no fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Credential {
+    App,
+    Env,
+}
+
+/// `[github]`: the App fl writes as when a binding says `credential = "app"`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubApp {
+    pub app_id: u64,
+    pub private_key: PathBuf,
+}
+
+#[derive(Debug, Default)]
+pub struct Config {
+    pub projects: Vec<Entry>,
+    pub github: Option<GithubApp>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +57,8 @@ pub struct Entry {
 struct File {
     #[serde(default)]
     project: Vec<Entry>,
+    #[serde(default)]
+    github: Option<GithubApp>,
 }
 
 /// The XDG config base directory: `xdg_config_home` if it is a non-empty,
@@ -58,11 +94,13 @@ pub fn path() -> Option<PathBuf> {
     Some(base.join("fl").join("config.toml"))
 }
 
-pub fn load(path: Option<&Path>) -> Result<Vec<Entry>> {
-    let Some(path) = path else { return Ok(vec![]) };
+pub fn load(path: Option<&Path>) -> Result<Config> {
+    let Some(path) = path else {
+        return Ok(Config::default());
+    };
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
     };
     let file: File = toml::from_str(&text)
@@ -76,8 +114,32 @@ pub fn load(path: Option<&Path>) -> Result<Vec<Entry>> {
                 e.store.display()
             );
         }
+        if let Some(t) = &e.tracker {
+            let ok = t.github.split('/').count() == 2
+                && t.github.split('/').all(|p| !p.is_empty())
+                && !t.github.contains(char::is_whitespace);
+            if !ok {
+                bail!(
+                    "{}: `github = \"{}\"` must name a repository as `owner/repo`",
+                    path.display(),
+                    t.github
+                );
+            }
+        }
     }
-    Ok(file.project)
+    if let Some(app) = &file.github
+        && !app.private_key.is_absolute()
+    {
+        bail!(
+            "{}: `private_key` must be an absolute path (got `{}`)",
+            path.display(),
+            app.private_key.display()
+        );
+    }
+    Ok(Config {
+        projects: file.project,
+        github: file.github,
+    })
 }
 
 /// Canonicalize `path`. A path that does not exist is not an error here —
@@ -94,15 +156,21 @@ fn canonicalize(path: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-/// The store bound to the project containing `cwd`: the entry whose root is
-/// the longest ancestor of `cwd`. Both sides are canonicalized, so a
+/// The store bound to the project containing `cwd`.
+pub fn bound(entries: &[Entry], cwd: &Path) -> Result<Option<PathBuf>> {
+    Ok(bound_entry(entries, cwd)?.map(|e| e.store))
+}
+
+/// The config entry for the project containing `cwd`: the entry whose root
+/// is the longest ancestor of `cwd`. Both sides are canonicalized, so a
 /// symlinked path binds like the real one.
 ///
-/// §2.6 binds a project to exactly one store. Two (or more) entries whose
-/// canonical `root` is identical — the longest match is therefore tied —
-/// but whose `store` differs are refused rather than silently picking one:
-/// nothing chose between them (Fix round 1, item 8).
-pub fn bound(entries: &[Entry], cwd: &Path) -> Result<Option<PathBuf>> {
+/// §2.6 binds a project to exactly one store, and a project has one
+/// tracker. Two (or more) entries whose canonical `root` is identical — the
+/// longest match is therefore tied — but whose `(store, tracker)` differs
+/// are refused rather than silently picking one: nothing chose between them
+/// (Fix round 1, item 8).
+pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
     let Some(cwd) = canonicalize(cwd)? else {
         return Ok(None);
     };
@@ -122,21 +190,24 @@ pub fn bound(entries: &[Entry], cwd: &Path) -> Result<Option<PathBuf>> {
         .iter()
         .filter(|(r, _)| r.components().count() == longest)
         .collect();
-    let mut distinct_stores: Vec<&PathBuf> = winners.iter().map(|(_, e)| &e.store).collect();
-    distinct_stores.sort();
-    distinct_stores.dedup();
-    if distinct_stores.len() > 1 {
+    let mut distinct: Vec<(&PathBuf, &Option<TrackerBinding>)> = Vec::new();
+    for (_, e) in &winners {
+        if !distinct.contains(&(&e.store, &e.tracker)) {
+            distinct.push((&e.store, &e.tracker));
+        }
+    }
+    if distinct.len() > 1 {
         let names = winners
             .iter()
             .map(|(_, e)| format!("{} -> {}", e.root.display(), e.store.display()))
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
-            "the project at {} is bound to more than one store in the config: {names}",
+            "the project at {} is bound to more than one store or tracker in the config: {names}",
             cwd.display()
         );
     }
-    Ok(Some(winners[0].1.store.clone()))
+    Ok(Some(winners[0].1.clone()))
 }
 
 #[cfg(test)]
@@ -208,6 +279,7 @@ mod tests {
         let entries = vec![Entry {
             root: real.path().to_path_buf(),
             store: store.clone(),
+            tracker: None,
         }];
         let got = bound(&entries, &link).unwrap();
         assert_eq!(got, Some(store));
@@ -220,10 +292,12 @@ mod tests {
             Entry {
                 root: root.path().to_path_buf(),
                 store: PathBuf::from("/tmp/fl-config-test-one.redb"),
+                tracker: None,
             },
             Entry {
                 root: root.path().to_path_buf(),
                 store: PathBuf::from("/tmp/fl-config-test-two.redb"),
+                tracker: None,
             },
         ];
         let err = bound(&entries, root.path()).unwrap_err();

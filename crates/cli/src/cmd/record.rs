@@ -1,12 +1,12 @@
+use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{ProjectId, RecordId};
 use fl_core::model::State;
-use fl_core::store::{Catalog, Roles, Tracker};
+use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
 use fl_exec::record::{MoveOutcome, move_record};
-use fl_store::RedbStore;
 
 #[derive(Subcommand)]
 pub enum Cmd {
@@ -50,11 +50,12 @@ impl Cmd {
     }
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
+    let store = ctx.store;
     match cmd {
         Cmd::Add { project, title } => {
             let p = ProjectId(refs::resolve(
-                store,
+                ctx.handles,
                 store.label(),
                 Kind::Project,
                 &project,
@@ -66,20 +67,23 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                     store.label()
                 );
             }
-            let id = store.add_record(&p, &title)?;
-            println!("{}\t{title}", refs::show(store, Kind::Record, id.iri())?);
+            let id = ctx.tracker.add_record(&p, &title)?;
+            println!(
+                "{}\t{title}",
+                refs::show(ctx.handles, Kind::Record, id.iri())?
+            );
         }
         Cmd::List { project } => {
             let p = ProjectId(refs::resolve(
-                store,
+                ctx.handles,
                 store.label(),
                 Kind::Project,
                 &project,
             )?);
-            for r in store.list_records(&p)? {
+            for r in ctx.tracker.list_records(&p)? {
                 println!(
                     "{}\t{}\t{}",
-                    refs::show(store, Kind::Record, r.id.iri())?,
+                    refs::show(ctx.handles, Kind::Record, r.id.iri())?,
                     r.state.as_wire(),
                     r.title
                 );
@@ -92,12 +96,17 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                     State::wire_values()
                 );
             };
-            let r = RecordId(refs::resolve(store, store.label(), Kind::Record, &id)?);
-            let Some(record) = store.get_record(&r)? else {
+            let r = RecordId(refs::resolve(
+                ctx.handles,
+                &ctx.tracker_label,
+                Kind::Record,
+                &id,
+            )?);
+            let Some(record) = ctx.tracker.get_record(&r)? else {
                 bail!(
                     "`{id}` is not a record in the store at {}. Use \
                      `fl record list --project <project>` to see records that exist.",
-                    store.label()
+                    ctx.tracker_label
                 );
             };
 
@@ -109,17 +118,17 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 crate::cmd::manifest::ensure_import_current(store, &record.project)?;
             }
 
-            let report = move_record(Roles::single(store), &record, state)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let report =
+                move_record(ctx.roles(), &record, state).map_err(|e| anyhow::anyhow!("{e}"))?;
             // What the person reads back: the record's handle (or its
             // primary IRI), never the alias or IRI they typed.
-            let shown = refs::show(store, Kind::Record, record.id.iri())?;
+            let shown = refs::show(ctx.handles, Kind::Record, record.id.iri())?;
 
             if let MoveOutcome::Ungated = report.outcome {
                 println!(
                     "{shown}\t{}\tungated: project {} declares no transition from `{}` to `{}`",
                     state.as_wire(),
-                    refs::show(store, Kind::Project, record.project.iri())?,
+                    refs::show(ctx.handles, Kind::Project, record.project.iri())?,
                     record.state.as_wire(),
                     state.as_wire()
                 );
