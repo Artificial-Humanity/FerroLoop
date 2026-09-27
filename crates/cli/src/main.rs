@@ -40,6 +40,9 @@ enum Command {
     Attempt(cmd::attempt::Cmd),
     /// Report what a project's recorded attempts cost.
     Stats(cmd::stats::Cmd),
+    /// Share a project's gates through a committed manifest.
+    #[command(subcommand)]
+    Manifest(cmd::manifest::Cmd),
 }
 
 impl Command {
@@ -55,6 +58,7 @@ impl Command {
             Command::Finding(c) => c.iris(),
             Command::Attempt(c) => c.iris(),
             Command::Stats(c) => c.iris(),
+            Command::Manifest(c) => c.iris(),
         }
     }
 
@@ -65,6 +69,7 @@ impl Command {
     fn project_root(&self) -> Option<&Path> {
         match self {
             Command::Project(c) => c.root(),
+            Command::Manifest(c) => c.root(),
             _ => None,
         }
     }
@@ -81,6 +86,7 @@ impl Command {
             Command::Finding(c) => c.has_handle(),
             Command::Attempt(c) => c.has_handle(),
             Command::Stats(c) => c.has_handle(),
+            Command::Manifest(c) => c.has_handle(),
         }
     }
 }
@@ -217,7 +223,8 @@ fn choose_among(candidates: &[PathBuf], iris: &[Iri]) -> Result<PathBuf> {
                 _ => chosen = Some(one.clone()),
             },
             many => bail!(
-                "{id} is held by more than one store: {}. Refusing to pick one.",
+                "{id} is held by more than one store: {}. Refusing to pick one. Name the store \
+                 to use with `--db <path>` (or `$FL_DB`).",
                 many.iter()
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>()
@@ -275,5 +282,6 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Finding(c) => cmd::finding::run(&store, c),
         Command::Attempt(c) => cmd::attempt::run(&store, c),
         Command::Stats(c) => cmd::stats::run(&store, c),
+        Command::Manifest(c) => cmd::manifest::run(&store, c),
     }
 }

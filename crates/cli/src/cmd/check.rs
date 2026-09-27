@@ -55,6 +55,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
         )?)),
         None => None,
     };
+    crate::cmd::manifest::ensure_import_current(store, &project)?;
     let report = evaluate_transition(store, store, &project, &cmd.transition, record.as_ref())
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 

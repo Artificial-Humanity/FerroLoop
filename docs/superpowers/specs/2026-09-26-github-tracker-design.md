@@ -59,6 +59,20 @@ GitHub mode is a permanently supported configuration. The local tracker stays th
    runs only on the authoring machine, or to let the ledger hold rows for gates it does not
    own; the second weakens the ledger's ownership check.
 
+### 0.1a Owner decisions, 2026-09-27
+
+8. **No downgrade import.** An older checkout whose manifest lacks a gate the store imported is
+   refused; the refusal says to check out a commit whose manifest lists it.
+9. **Anyone may run `fl github repair`.** It requires `--by <name>` and records it in a comment on
+   the issue. It rewrites only from the block, so it cannot move an item past the protocol.
+10. **The live test** runs against a private throwaway repository in the organization. The owner
+    registers the App and installs it there when the live test is ready; until then the live test
+    uses an environment token.
+11. **No dogfooding in this sub-project.** FerroLoop's own repository keeps its local tracker until
+    plan B is merged and the live test passes; then the owner decides.
+12. Plan A's two agent rulings are **kept**: the first import raises the store to format 3, and
+    transitions mirror the manifest on re-import.
+
 ### 0.2 Out of scope
 
 * The GitHub ledger (sub-project 3) and its rate-limit design.
@@ -171,6 +185,11 @@ Every reference that an issue's metadata block stores — a finding's record —
 `node_id` as well as the URL. fl resolves such a reference by `node_id` (one GraphQL `node`
 lookup), never by URL. *(Invariant.)* A rename, a transfer, or a reuse of the old name cannot
 then misdirect it.
+
+*As implemented (plan B, Task 5):* a URL under the bound repository's **current** name is
+trusted without a lookup, because the repository itself is bound by `node_id` at open (§2.4);
+every other URL is resolved by `node_id`. This avoids one lookup per reference in the common case
+and never trusts an old name.
 
 ### 2.4 Renamed and transferred repositories
 
@@ -436,8 +455,9 @@ The identity spec's principle carries over unchanged: every failure path disting
 | a local edit of an imported gate or transition | refused, naming the remedy |
 | a pass mark cannot be written | **ERROR** |
 
-New `StoreError` variants: `Imported`, `Diverged`, `Conflict`, `NotAnFlItem`, `Moved`,
-`RateLimited`, `RepositoryReplaced`. Their exact shape is the plan's.
+New `StoreError` variants: `Imported` (plan A); and `Deleted`, `Diverged`, `Conflict`,
+`NotAnFlItem`, `Moved`, `RateLimited`, `RepositoryReplaced`, `Credential`, `SecurityNotPrivate`
+(plan B). Their exact shape is the plans'.
 
 ---
 
@@ -523,4 +543,6 @@ when the live test backs it.
   they agree, and the read then finds no divergence. Detecting a block edited by an identity
   other than fl's needs the edit history on every read. *(Open — Release scope: not detected.)*
 * **Alias scans at scale** (§2.5). *(Open)* — sub-project 3.
+* **Accepting a deliberately recreated repository.** §2.4 refuses a bound name that now reaches a
+  different repository, and no command accepts one that was recreated on purpose. *(Open.)*
 * **Escalation between the tiers**, **routing between trackers** — sub-project 4, unchanged.

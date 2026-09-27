@@ -61,6 +61,7 @@ Commands:
   finding     
   attempt     Run one adapter attempt against a record and record the outcome
   stats       Report what a project's recorded attempts cost
+  manifest    Share a project's gates through a committed manifest
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -657,3 +658,8 @@ asked to perform, and refuses on the same verdict `check` would have printed.
 They are the same machinery. A gate is what lets `check` refuse an action, and a gate is
 also the only thing that can tell you a fix worked — so a reproduction is just a gate that
 was written in response to a claim.
+
+Everything above ran on one machine against one store. When a gate needs to be resolved from
+a different checkout — another machine, or a teammate's clone of the same repository — see
+[Sharing gates across machines](sharing-gates.md) for `fl manifest export`, `import` and
+`check`.

@@ -134,7 +134,9 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             );
         }
         Cmd::Reproduce { finding, gate } => {
-            let fid = finding_id(store, &finding)?;
+            let f = self::finding(store, &finding)?;
+            crate::cmd::manifest::ensure_import_current(store, &f.project)?;
+            let fid = f.id;
             let gid = GateId(refs::resolve(store, store.label(), Kind::Gate, &gate)?);
             let report = attach_reproduction(Roles::single(store), &fid, &gid)
                 .map_err(|e| explain(e, &finding, Some(&gate)))?;
@@ -155,7 +157,9 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             );
         }
         Cmd::Verify { finding } => {
-            let id = finding_id(store, &finding)?;
+            let f = self::finding(store, &finding)?;
+            crate::cmd::manifest::ensure_import_current(store, &f.project)?;
+            let id = f.id;
             let report = verify_finding(Roles::single(store), &id)
                 .map_err(|e| explain(e, &finding, None))?;
 
