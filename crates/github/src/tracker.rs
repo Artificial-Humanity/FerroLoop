@@ -577,13 +577,14 @@ impl GithubTracker {
             .client
             .send_unchecked_json(Method::Post, &path, Some(&sent))
         {
-            // ⚠ A 201 PROVES the create landed (fix round 2, item 2): an
-            // unreadable body is never followed by a resend, only a search
-            // — resending here risks making exactly the duplicate this
-            // whole mechanism exists to avoid.
-            Ok(r) if r.status == 201 => match IssueView::from_json(&r.body) {
+            // ⚠ ANY 2xx PROVES the create landed (fix round 2, item 2; fix
+            // round 4: not only 201, and a body that broke off counts as
+            // unreadable): an unreadable body is never followed by a
+            // resend, only a search — resending here risks making exactly
+            // the duplicate this whole mechanism exists to avoid.
+            Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
                 Ok(issue) => issue,
-                Err(_) => self.after_unreadable_create(kind, meta)?,
+                Err(_) => self.after_unreadable_create(kind, meta, r.status)?,
             },
             // ⚠ An ambiguous failure may already have created the issue.
             // Look for the create key before sending again (spec §3.3).
@@ -649,9 +650,9 @@ impl GithubTracker {
             .client
             .send_unchecked_json(Method::Post, path, Some(sent))
         {
-            Ok(r) if r.status == 201 => match IssueView::from_json(&r.body) {
+            Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
                 Ok(issue) => Ok(issue),
-                Err(_) => self.after_unreadable_create(kind, meta),
+                Err(_) => self.after_unreadable_create(kind, meta, r.status),
             },
             Ok(r) => Err(backend(format!(
                 "GitHub failed an issue create twice (the second answer was {}). List the \
@@ -672,7 +673,7 @@ impl GithubTracker {
         }
     }
 
-    /// ⚠ A 201 proves the create landed (fix round 2, item 2): unlike a 5xx
+    /// ⚠ A 2xx proves the create landed (fix round 2, item 2): unlike a 5xx
     /// answer or a dropped connection, there is no "may not have happened"
     /// here. A miss on every search is never followed by a resend — that
     /// would risk making exactly the duplicate this whole path exists to
@@ -681,6 +682,7 @@ impl GithubTracker {
         &self,
         kind: ItemKind,
         meta: &Meta,
+        status: u16,
     ) -> Result<IssueView, StoreError> {
         // ⚠ The create is certain here — GitHub already answered 2xx — so
         // the search's own failure (not just a miss) carries the same
@@ -691,20 +693,19 @@ impl GithubTracker {
             .search_by_create_key(kind, &meta.create_key)
             .map_err(|e| {
                 backend(format!(
-                    "GitHub answered 201 to an issue create, but its own body could not be \
-                     read, and searching for it afterward by its create key failed too ({e}). \
+                    "GitHub answered {status} to an issue create, but its own body could not \
+                     be read, and searching for it afterward by its create key failed too ({e}). \
                      List the repository's fl issues before retrying, so the retry makes no \
                      duplicate"
                 ))
             })?;
         found.ok_or_else(|| {
-            backend(
-                "GitHub answered 201 to an issue create, but its own body could not be \
+            backend(format!(
+                "GitHub answered {status} to an issue create, but its own body could not be \
                  read, and the issue could not be found afterward by its create key \
                  either. List the repository's fl issues before retrying, so the retry \
                  makes no duplicate"
-                    .to_string(),
-            )
+            ))
         })
     }
 
@@ -1700,6 +1701,60 @@ mod tests {
             1,
             "the create landed even though confirming it failed"
         );
+    }
+
+    fn issue_posts(fake: &FakeGithub) -> usize {
+        fake.state()
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
+            .count()
+    }
+
+    /// Fix round 4 (the reviewer's probe): a create answered 201 whose body
+    /// then breaks off is a create that landed — the status was read. It
+    /// used to surface as `Unreachable`, which took the resend path; with
+    /// the search missing too, that resend made a silent duplicate.
+    #[test]
+    fn a_201_whose_body_breaks_off_and_cannot_be_found_is_refused_never_resent() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().broken_create_body_next = true;
+        fake.state().omit_from_list = Some(1);
+        let err = t.add_record(&p(), "t").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("List the repository's fl issues before retrying"),
+            "{err}"
+        );
+        assert_eq!(fake.issue_count(), 1, "a resend would duplicate it");
+        assert_eq!(issue_posts(&fake), 1, "exactly one send");
+    }
+
+    /// Fix round 4: the same broken 201, with nothing making the list lag —
+    /// the search finds the issue the one send made.
+    #[test]
+    fn a_201_whose_body_breaks_off_is_found_by_its_create_key() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().broken_create_body_next = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+        assert_eq!(issue_posts(&fake), 1, "exactly one send");
+    }
+
+    /// Fix round 4: any 2xx answer to a create is a create that landed, not
+    /// only 201 — a 200 carrying the issue is the created issue.
+    #[test]
+    fn a_create_answered_200_with_the_issue_is_the_created_issue() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().create_answers_200_next = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+        assert_eq!(issue_posts(&fake), 1, "exactly one send");
     }
 
     #[test]

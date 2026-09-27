@@ -98,6 +98,14 @@ pub struct State {
     /// one-shot: the point is that every one of the search's attempts
     /// misses, not just the first.
     pub omit_from_list: Option<u64>,
+    /// The create lands and its answer's status line and headers arrive
+    /// (201), but its body breaks off partway, so it cannot be read in
+    /// full. One-shot.
+    pub broken_create_body_next: bool,
+    /// The create lands and is answered 200, not 201, with the issue as its
+    /// body. GitHub documents 201; this models a 2xx it has not been seen to
+    /// send (unmeasured — Task 10's live test is the check). One-shot.
+    pub create_answers_200_next: bool,
 }
 
 pub struct FakeGithub {
@@ -156,6 +164,26 @@ impl FakeGithub {
                     // timeout instead of seeing the broken response at once.
                     let mut w = req.into_writer();
                     let _ = std::io::Write::write_all(&mut w, b"HTTP/9 broken\r\n\r\n");
+                    let _ = std::io::Write::flush(&mut w);
+                    continue;
+                }
+                if answer.break_body {
+                    // A 2xx status line and headers, then a body that breaks
+                    // off: one chunk of a chunked body, then a chunk header
+                    // that is not a size. The client has read the status by
+                    // then, and fails at once on the body. (A `Content-Length`
+                    // promising bytes that never come would do the same only
+                    // once the socket closed, and tiny_http keeps it open for
+                    // the next request, so the client would wait out its
+                    // timeout.) The `flush` is load-bearing, as above.
+                    let mut w = req.into_writer();
+                    let head = format!(
+                        "HTTP/1.1 {} Created\r\nContent-Type: application/json\r\n\
+                         Transfer-Encoding: chunked\r\n\r\n9\r\n{{\"number\"\r\n\
+                         not-a-chunk-size\r\n",
+                        answer.status
+                    );
+                    let _ = std::io::Write::write_all(&mut w, head.as_bytes());
                     let _ = std::io::Write::flush(&mut w);
                     continue;
                 }
@@ -260,6 +288,8 @@ pub(crate) struct Answer {
     raw_body: Option<String>,
     headers: Vec<(String, String)>,
     hang_up: bool,
+    /// Send the status line and headers, then a body that cannot be read.
+    break_body: bool,
 }
 
 fn answer(status: u16, body: Value) -> Answer {
@@ -269,6 +299,7 @@ fn answer(status: u16, body: Value) -> Answer {
         raw_body: None,
         headers: vec![],
         hang_up: false,
+        break_body: false,
     }
 }
 
@@ -281,6 +312,7 @@ fn raw_answer(status: u16, body: &str) -> Answer {
         raw_body: Some(body.to_string()),
         headers: vec![],
         hang_up: false,
+        break_body: false,
     }
 }
 
@@ -564,6 +596,14 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 let mut a = answer(201, Value::Null);
                 a.hang_up = true;
                 return a;
+            }
+            if std::mem::take(&mut s.broken_create_body_next) {
+                let mut a = answer(201, Value::Null);
+                a.break_body = true;
+                return a;
+            }
+            if std::mem::take(&mut s.create_answers_200_next) {
+                return answer(200, s.issue_json(&s.issues[&n]));
             }
             answer(201, s.issue_json(&s.issues[&n]))
         }

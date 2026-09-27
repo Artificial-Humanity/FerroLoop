@@ -65,7 +65,9 @@ impl Client {
     /// for itself (an issue create, spec §3.3): a garbled 201 body does not
     /// prove the write failed, so it must not be reported as a plain
     /// `Backend` error before that caller gets a chance to search for what
-    /// it may have already created.
+    /// it may have already created. A 2xx whose body cannot be read in full
+    /// is the same case: `Value::Null`, not `Unreachable` — the status proves
+    /// the write landed.
     pub(crate) fn send_unchecked_json(
         &self,
         method: Method,
@@ -230,14 +232,30 @@ pub(crate) fn send(
     let remaining = header("x-ratelimit-remaining");
     let reset = header("x-ratelimit-reset");
     let retry_after = header("retry-after");
-    let text = resp.body_mut().read_to_string().map_err(unreachable)?;
+    let is_2xx = (200..300).contains(&status);
+    let text = match resp.body_mut().read_to_string() {
+        Ok(text) => text,
+        // ⚠ The status line was already read as 2xx: the write landed, and
+        // only its answer broke off (a truncated body, a read timeout). For
+        // the one caller that judges a create itself, that is a 2xx with an
+        // unreadable body — never `Unreachable`, which would read as "may
+        // not have happened" and could lead to a resend (spec §3.3).
+        Err(_) if is_2xx && !require_json_on_2xx => {
+            return Ok(Reply {
+                status,
+                body: Value::Null,
+                location,
+                link_next,
+            });
+        }
+        Err(e) => return Err(unreachable(e)),
+    };
     // The status is classified BEFORE the body is required to parse: GitHub's
     // load balancers answer a 502/504 with an HTML page, and a 401 or 429 can
     // be non-JSON too. Only a 2xx must be JSON — anything else that fails to
     // parse becomes `Value::Null` so the caller still sees the real status.
     // `require_json_on_2xx` lets one caller (an issue create) opt out of the
     // 2xx rule too, so it can judge a garbled answer itself.
-    let is_2xx = (200..300).contains(&status);
     let body = if text.trim().is_empty() {
         Value::Null
     } else {
