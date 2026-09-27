@@ -639,26 +639,37 @@ impl GithubTracker {
         if let Some(found) = self.search_by_create_key(kind, &meta.create_key)? {
             return Ok(found);
         }
-        // ⚠ A transport failure here gets the SAME advice as a bad status
-        // (fix round 1, item 5b): the search already came up empty, so
-        // fl cannot tell whether THIS attempt is about to duplicate an
-        // issue the first attempt actually made — only a fresh list can
-        // settle that, same as a plain failed retry. Any OTHER kind of
-        // error (a credential problem, say) is not about that ambiguity at
-        // all, and passes through unchanged (fix round 2, item 3) —
-        // `wrap_resend_error` draws exactly that line.
-        let r = self
+        // ⚠ `send_unchecked_json`, not `send` (fix round 3, item 1): the
+        // RULE applies to this resend exactly as it does to the first
+        // attempt in `create` — once GitHub answers 2xx here, the create
+        // has landed for certain, and an unreadable or non-issue body must
+        // route to `after_unreadable_create` (search only, never a third
+        // send), not surface as a plain parse error with no retry advice.
+        match self
             .client
-            .send(Method::Post, path, Some(sent))
-            .map_err(wrap_resend_error)?;
-        if r.status != 201 {
-            return Err(backend(format!(
+            .send_unchecked_json(Method::Post, path, Some(sent))
+        {
+            Ok(r) if r.status == 201 => match IssueView::from_json(&r.body) {
+                Ok(issue) => Ok(issue),
+                Err(_) => self.after_unreadable_create(kind, meta),
+            },
+            Ok(r) => Err(backend(format!(
                 "GitHub failed an issue create twice (the second answer was {}). List the \
                  repository's fl issues before retrying, so the retry makes no duplicate",
                 r.status
-            )));
+            ))),
+            // ⚠ A transport failure here gets the SAME advice as a bad
+            // status (fix round 1, item 5b): the search already came up
+            // empty, so fl cannot tell whether THIS attempt is about to
+            // duplicate an issue the first attempt actually made — only a
+            // fresh list can settle that, same as a plain failed retry.
+            // Any OTHER kind of error (a credential problem, say) is not
+            // about that ambiguity at all — GitHub never answered anything
+            // here, 2xx or otherwise — and passes through unchanged (fix
+            // round 2, item 3) — `wrap_resend_error` draws exactly that
+            // line, and only for a failure BEFORE any 2xx.
+            Err(e) => Err(wrap_resend_error(e)),
         }
-        IssueView::from_json(&r.body)
     }
 
     /// ⚠ A 201 proves the create landed (fix round 2, item 2): unlike a 5xx
@@ -671,16 +682,30 @@ impl GithubTracker {
         kind: ItemKind,
         meta: &Meta,
     ) -> Result<IssueView, StoreError> {
-        self.search_by_create_key(kind, &meta.create_key)?
-            .ok_or_else(|| {
-                backend(
+        // ⚠ The create is certain here — GitHub already answered 2xx — so
+        // the search's own failure (not just a miss) carries the same
+        // advice too (fix round 3, item 2): the client's generic "…;
+        // retry" on a failed page read would otherwise reach the caller
+        // with no hint that a resend is exactly what must NOT happen.
+        let found = self
+            .search_by_create_key(kind, &meta.create_key)
+            .map_err(|e| {
+                backend(format!(
                     "GitHub answered 201 to an issue create, but its own body could not be \
-                     read, and the issue could not be found afterward by its create key \
-                     either. List the repository's fl issues before retrying, so the retry \
-                     makes no duplicate"
-                        .to_string(),
-                )
-            })
+                     read, and searching for it afterward by its create key failed too ({e}). \
+                     List the repository's fl issues before retrying, so the retry makes no \
+                     duplicate"
+                ))
+            })?;
+        found.ok_or_else(|| {
+            backend(
+                "GitHub answered 201 to an issue create, but its own body could not be \
+                 read, and the issue could not be found afterward by its create key \
+                 either. List the repository's fl issues before retrying, so the retry \
+                 makes no duplicate"
+                    .to_string(),
+            )
+        })
     }
 
     fn find_by_create_key(
@@ -1588,6 +1613,92 @@ mod tests {
         assert!(
             msg.contains("Issues") && msg.contains("acme/widgets"),
             "{msg}"
+        );
+    }
+
+    /// Fix round 3, item 1: the reviewer's probe, positive case. Once the
+    /// RESEND itself lands with an unreadable 201, a fresh search finds the
+    /// issue it actually created (nothing here makes the fake's list lag),
+    /// so the call succeeds — exactly one issue, no third send. This is the
+    /// good outcome the RULE exists to reach; the test after this one
+    /// covers what happens when the search cannot help.
+    #[test]
+    fn a_resend_that_lands_with_an_unreadable_201_is_found_by_a_fresh_search() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().fail_before_create = true;
+        fake.state().unreadable_create_body_next = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+        let posts = fake
+            .state()
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
+            .count();
+        assert_eq!(posts, 2, "the first attempt and the resend, never a third");
+    }
+
+    /// Fix round 3, item 1 (Important): the RULE — once GitHub has answered
+    /// 2xx to a create, first send OR resend, every LATER failure is
+    /// refused with the advice and never leads to another send. Before the
+    /// fix, the resend used the strict `send`, so a 201 with an unreadable
+    /// body made `client.send` itself fail with a plain "…not JSON…"
+    /// `Backend` error that `wrap_resend_error`'s `other => other` arm let
+    /// straight through — no advice, even though the create had already
+    /// landed (the reviewer's probe: `fail_before_create` +
+    /// `unreadable_create_body_next` → that error, `issue_count == 1`).
+    /// Combined with `omit_from_list` here so the follow-up search also
+    /// cannot find it, reaching the refusal this test checks for.
+    #[test]
+    fn a_resend_that_lands_with_an_unreadable_201_and_cannot_be_found_is_refused_never_a_third_send()
+     {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().fail_before_create = true;
+        fake.state().unreadable_create_body_next = true;
+        fake.state().omit_from_list = Some(1);
+        let err = t.add_record(&p(), "t").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("List the repository's fl issues before retrying"),
+            "{err}"
+        );
+        assert_eq!(
+            fake.issue_count(),
+            1,
+            "the resend's own create landed even though it could not be confirmed"
+        );
+        let posts = fake
+            .state()
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
+            .count();
+        assert_eq!(posts, 2, "no third send");
+    }
+
+    /// Fix round 3, item 2 (Minor, same class): once a 201 proves the
+    /// create landed, a failure of the FOLLOW-UP SEARCH itself (not just a
+    /// miss) must also carry the advice — before the fix it passed through
+    /// with the client's generic "…; retry" text instead.
+    #[test]
+    fn a_search_that_itself_fails_after_an_unreadable_201_still_carries_the_advice() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().unreadable_create_body_next = true;
+        fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 1));
+        let err = t.add_record(&p(), "t").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("List the repository's fl issues before retrying"),
+            "{err}"
+        );
+        assert_eq!(
+            fake.issue_count(),
+            1,
+            "the create landed even though confirming it failed"
         );
     }
 
