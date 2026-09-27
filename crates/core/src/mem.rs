@@ -415,9 +415,11 @@ mod tests {
 
     #[test]
     fn mem_store_meets_every_role_contract() {
+        use crate::conformance::Single;
         crate::conformance::catalog(|| (MemStore::default(), ()));
-        crate::conformance::tracker(|| (MemStore::default(), ()));
+        crate::conformance::tracker(|| Single(MemStore::default(), ()));
         crate::conformance::ledger(|| (MemStore::default(), ()));
-        crate::conformance::all_roles(|| (MemStore::default(), ()));
+        crate::conformance::all_roles(|| Single(MemStore::default(), ()));
+        crate::conformance::local_handles(|| (MemStore::default(), ()));
     }
 }

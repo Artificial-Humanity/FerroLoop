@@ -1189,9 +1189,15 @@ mod tests {
 
     #[test]
     fn redb_store_meets_every_role_contract() {
+        use fl_core::conformance::Single;
+        let single = || {
+            let (s, g) = fresh();
+            Single(s, g)
+        };
         fl_core::conformance::catalog(fresh);
-        fl_core::conformance::tracker(fresh);
+        fl_core::conformance::tracker(single);
         fl_core::conformance::ledger(fresh);
-        fl_core::conformance::all_roles(fresh);
+        fl_core::conformance::all_roles(single);
+        fl_core::conformance::local_handles(fresh);
     }
 }
