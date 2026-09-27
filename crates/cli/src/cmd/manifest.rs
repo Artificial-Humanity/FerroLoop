@@ -5,7 +5,7 @@ use crate::refs::{self, Ref};
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{GateId, ProjectId};
-use fl_core::model::GateKind;
+use fl_core::model::{GateKind, Selector};
 use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
 use fl_exec::git::Git;
@@ -153,6 +153,14 @@ pub fn ensure_publishable(
         }
     }
     if !Git::is_committed(&root, MANIFEST_PATH).map_err(|e| anyhow::anyhow!("{e}"))? {
+        if Git::is_ignored(&root, MANIFEST_PATH).map_err(|e| anyhow::anyhow!("{e}"))? {
+            bail!(
+                "{} is ignored by git, so it can never be committed. Another machine can only \
+                 resolve a gate through a committed manifest: remove the pattern that ignores \
+                 it from .gitignore.",
+                root.join(MANIFEST_PATH).display()
+            );
+        }
         bail!(
             "{} is not committed. Another machine can only resolve a gate through a \
              committed manifest: commit it. (fl cannot tell whether the commit was pushed.)",
@@ -178,8 +186,9 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 .context("the system clock is before 1970")?
                 .as_secs();
             let m = store.export_manifest(&p, &head, now)?;
-            // ⚠ Every gate is printed with what it runs: a gate command can
-            // name a local path, and this file is about to be committed.
+            // ⚠ Every gate is printed with what it runs, and what it
+            // examines: either can name a local path, and this file is
+            // about to be committed.
             for g in &m.body.gates {
                 let runs = match &g.kind {
                     GateKind::Command(c) => format!("{} {}", c.program, c.args.join(" ")),
@@ -191,6 +200,12 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                     g.name,
                     runs.trim_end()
                 );
+                let population = match &g.selector {
+                    Selector::Glob { pattern } => format!("glob {pattern}"),
+                    Selector::Changed { base } => format!("changed since {base}"),
+                    Selector::Command { program, args } => format!("{program} {}", args.join(" ")),
+                };
+                println!("\tpopulation\t{}", population.trim_end());
             }
             let path = root.join(MANIFEST_PATH);
             std::fs::create_dir_all(path.parent().expect("MANIFEST_PATH has a parent"))
@@ -222,6 +237,18 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 report.gates_unchanged,
                 report.transitions
             );
+            // ⚠ This store numbers handles on its own: they can differ from
+            // the authoring machine's, so the person needs to see them here.
+            for g in &m.body.gates {
+                println!(
+                    "gate\t{}\t{}",
+                    refs::show(store, Kind::Gate, g.id.iri())?,
+                    g.name
+                );
+            }
+            for name in &report.transitions_removed {
+                println!("removed\ttransition\t{name}");
+            }
         }
         Cmd::Check { project } => {
             let p = ProjectId(refs::resolve(

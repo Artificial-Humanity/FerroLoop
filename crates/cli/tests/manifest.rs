@@ -184,13 +184,83 @@ fn another_machine_imports_and_runs_the_gate() {
         .args(["manifest", "import"])
         .assert()
         .success()
-        .stdout(contains("1 added"));
+        .stdout(contains("1 added"))
+        // This store numbers handles on its own, so the person needs to be
+        // told which handle each imported gate landed on, by name.
+        .stdout(contains("gate\t1\trs"));
     other
         .fl(c.path())
         .args(["gate", "run", "1"])
         .assert()
         .success()
         .stdout(contains("PASS"));
+}
+
+#[test]
+fn export_prints_a_population_commands_program() {
+    let m = Machine::new();
+    let r = repo();
+    m.fl(r.path())
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    m.fl(r.path())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "files",
+            "--population-from",
+            "list-files-for-export-test",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    m.fl(r.path())
+        .args(["manifest", "export", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("list-files-for-export-test"));
+}
+
+#[test]
+fn a_gitignored_manifest_is_refused_by_check_naming_gitignore() {
+    let m = Machine::new();
+    let r = repo();
+    m.fl(r.path())
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    m.fl(r.path())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "rs",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    m.fl(r.path())
+        .args(["manifest", "export", "--project", "1"])
+        .assert()
+        .success();
+    std::fs::write(r.path().join(".gitignore"), ".fl/manifest.json\n").unwrap();
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-qm", "ignore the manifest"]);
+    m.fl(r.path())
+        .args(["manifest", "check", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains(".gitignore"));
 }
 
 #[test]

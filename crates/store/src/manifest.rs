@@ -75,14 +75,18 @@ pub enum ManifestError {
     )]
     NotAuthoring(ProjectId),
     #[error(
-        "the manifest no longer lists gate {0}, which this store holds. A re-import would \
-         remove a neighbour from every later verify, so it is refused. Restore the gate in \
-         the store that authors the project and export again"
+        "the manifest no longer lists gate `{name}` ({id}), which this store holds. A \
+         re-import would remove a neighbour from every later verify, so it is refused. The \
+         checked-out manifest may be older than the one this store imported — check out a \
+         commit whose manifest lists the gate. If the gate really was removed where the \
+         project is authored, restore it there and export again"
     )]
-    WouldRemoveGate(GateId),
+    WouldRemoveGate { id: GateId, name: String },
     #[error(
-        "project {other} in this store already uses the root {root}. Import into a store \
-         bound to another checkout, or use that project"
+        "project {other} in this store already uses the root {root}. Import into a separate \
+         store with `fl --db <path> manifest import` — but doing that on the machine that \
+         authors this project makes its IRIs ambiguous between the two stores — or use the \
+         existing project instead of importing"
     )]
     RootTaken { root: String, other: ProjectId },
     #[error(transparent)]

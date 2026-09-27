@@ -223,7 +223,8 @@ fn choose_among(candidates: &[PathBuf], iris: &[Iri]) -> Result<PathBuf> {
                 _ => chosen = Some(one.clone()),
             },
             many => bail!(
-                "{id} is held by more than one store: {}. Refusing to pick one.",
+                "{id} is held by more than one store: {}. Refusing to pick one. Name the store \
+                 to use with `--db <path>` (or `$FL_DB`).",
                 many.iter()
                     .map(|p| p.display().to_string())
                     .collect::<Vec<_>>()

@@ -46,20 +46,28 @@ commit, and import here.
 
 Importing for the first time also changes what kind of store this is, on disk: a store that
 has never imported anything opens in any earlier build of `fl`, but the moment it imports a
-manifest it is marked as a store that holds imports, and an older `fl` — one that has never
-heard of an import and would happily let someone edit an imported gate — refuses to open it
-at all, rather than opening it and quietly ignoring the mark.
+manifest it is marked as a store that holds imports — format 3 — and an older `fl` — one that
+has never heard of an import and would happily let someone edit an imported gate — refuses to
+open it at all, rather than opening it and quietly ignoring the mark.
 
 ## Check
 
-`fl manifest check --project <project>` runs the same test the CLI applies for you before it
-runs any gate belonging to that project, and reports the same verdict without running
-anything. Use it to find out ahead of time whether the manifest at hand is trustworthy.
+`fl manifest check --project <project>` is a *superset* of the check a gate-running command
+(`gate run`, `check`, a gated `record move`, `finding reproduce`/`verify`) applies for you
+before it runs a gate: that check is only the currency check below, it runs only on an
+importing machine, and on the machine that authors the project those same commands apply no
+manifest check at all. `fl manifest check` additionally verifies, on the authoring machine,
+that every gate and the transitions still match what the store holds, and, on either machine,
+that the manifest is committed.
 
 What it refuses, and the remedy for each:
 
-- **The file was edited by hand.** Its content no longer hashes to what it records. Gates
-  are authored in the store that owns the project; export it again from there.
+- **The file was edited by hand.** Its content no longer hashes to what it records. On the
+  machine that authors the project, export it again from there. On an importing machine
+  export is refused (`NotAuthoring`) — the remedy there is to restore the committed file
+  instead, with `git checkout -- .fl/manifest.json` or by pulling. (A field added by hand
+  inside a gate that `fl` does not know about is dropped when the manifest is read back, so it
+  never changes the hash — and it has no effect either.)
 - **A gate changed since the manifest was exported.** Something in the authoring store's
   copy of that gate no longer matches the manifest's copy. Export again, then commit.
 - **A gate or a transition is missing from the manifest**, because it was added after the
@@ -68,14 +76,35 @@ What it refuses, and the remedy for each:
 - **The manifest is not committed.** Another machine can only resolve a gate through a
   committed manifest, so an uncommitted one is refused even if its content is otherwise
   fine. Commit it.
-- **An imported gate was edited locally, or the manifest changed since this store imported
-  it.** Either way, the working tree's `.fl/manifest.json` is no longer the one this store's
-  copy came from. Run `fl manifest import` again before running its gates.
+- **The manifest changed since this store imported it.** The working tree's
+  `.fl/manifest.json` is no longer the one this store's copy came from. Run `fl manifest
+  import` again before running its gates.
+
+An imported gate edited locally is not a `manifest check` verdict at all: that edit — to its
+command, its population, or anything else that would make this copy disagree with the
+manifest — is refused by the store at the moment it is attempted, with its own remedy, and the
+manifest on disk is left untouched.
 
 Every command that runs a gate belonging to an imported project applies the same currency
 check first, so a stale import is refused there too, not just under `manifest check` — see
 [section 8](getting-started.md#8-staleness-and-gate-affirm) of the getting-started guide for
 the analogous staleness check on a gate's population.
+
+## Pitfalls
+
+- Don't run `fl project add .` on an importing machine before `fl manifest import`. If you do,
+  the import is refused because the root is already taken by the project `project add` just
+  registered — and there is no command that removes a project, so recovery means starting over
+  with a fresh store.
+- Importing into a second store on the machine that authors the project makes every one of
+  that project's gates held by two stores at once. From then on, any command naming one of
+  those gates or that project by IRI must pass `--db <path>` (or set `$FL_DB`) to say which
+  store it means, or it is refused as held by more than one store.
+- An older checkout can lag behind the manifest a store already imported. If `git checkout`
+  moves the working tree to a commit whose manifest doesn't list a gate this store holds, `fl
+  manifest import` there is refused (`WouldRemoveGate`, naming the gate) rather than silently
+  dropping it. The usual fix is to check out a commit whose manifest lists the gate again, not
+  to change anything where the project is authored.
 
 `crates/cli/tests/manifest.rs` is the executed version of this page: every scenario above —
 export, import, a stale import, a hand-edited manifest, an uncommitted one, a gate or

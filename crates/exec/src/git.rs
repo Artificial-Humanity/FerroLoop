@@ -35,6 +35,27 @@ impl Git {
         Ok(tracked && clean)
     }
 
+    /// Whether `rel` (relative to `root`) is excluded by a `.gitignore`
+    /// pattern. `git check-ignore` exits 0 when the path is ignored and 1
+    /// when it is not; anything else is a git failure and is never read as
+    /// "not ignored".
+    pub fn is_ignored(root: &Path, rel: &str) -> Result<bool, ExecError> {
+        let out = Command::new("git")
+            .args(["check-ignore", "-q", "--", rel])
+            .current_dir(root)
+            .output()
+            .map_err(|e| ExecError::Git(format!("could not run git: {e}")))?;
+        match out.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(ExecError::Git(format!(
+                "git check-ignore -- {rel} failed in {}: {}",
+                root.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))),
+        }
+    }
+
     /// Absolute paths that differ between two commits.
     pub fn changed_between(root: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>, ExecError> {
         let text = git(root, &["diff", "--name-only", from, to])?;
@@ -158,6 +179,24 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         assert!(matches!(
             Git::is_committed(d.path(), ".fl/manifest.json"),
+            Err(ExecError::Git(_))
+        ));
+    }
+
+    #[test]
+    fn is_ignored_tells_a_tracked_path_from_an_ignored_one() {
+        let d = repo();
+        assert!(!Git::is_ignored(d.path(), "README.md").unwrap());
+        fs::write(d.path().join(".gitignore"), "*.log\n").unwrap();
+        fs::write(d.path().join("out.log"), "x").unwrap();
+        assert!(Git::is_ignored(d.path(), "out.log").unwrap());
+    }
+
+    #[test]
+    fn is_ignored_outside_a_repository_is_an_error_not_false() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            Git::is_ignored(d.path(), "x"),
             Err(ExecError::Git(_))
         ));
     }

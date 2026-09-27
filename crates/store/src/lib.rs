@@ -66,6 +66,9 @@ pub struct ImportReport {
     pub gates_changed: usize,
     pub gates_unchanged: usize,
     pub transitions: usize,
+    /// Names of transitions this store held that the manifest no longer
+    /// lists, and that the import therefore removed.
+    pub transitions_removed: Vec<String>,
     /// `(old, new)` when a re-import came from another checkout. The
     /// project's gates now run over the new root, and the CLI says so.
     pub root_moved: Option<(String, String)>,
@@ -501,7 +504,10 @@ impl RedbStore {
         };
         for g in &held_gates {
             if !body.gates.iter().any(|m| m.id == g.id) {
-                return Err(ManifestError::WouldRemoveGate(g.id.clone()));
+                return Err(ManifestError::WouldRemoveGate {
+                    id: g.id.clone(),
+                    name: g.name.clone(),
+                });
             }
         }
         // Transitions mirror the manifest: one it no longer lists is
@@ -522,6 +528,7 @@ impl RedbStore {
             gates_changed: 0,
             gates_unchanged: 0,
             transitions: body.transitions.len(),
+            transitions_removed: stale_transitions.clone(),
             root_moved,
         };
         // (definition to write, whether it is new to this store)
@@ -1663,8 +1670,9 @@ mod tests {
             content_sha256: content_sha256(&body).unwrap(),
             body,
         };
-        b.import_manifest(&without, "/x").unwrap();
+        let report = b.import_manifest(&without, "/x").unwrap();
         assert!(b.list_transitions(&p).unwrap().is_empty());
+        assert_eq!(report.transitions_removed, vec!["ship".to_string()]);
     }
 
     #[test]
@@ -1717,10 +1725,45 @@ mod tests {
         };
         let err = b.import_manifest(&shrunk, "/x").unwrap_err();
         assert!(
-            matches!(err, ManifestError::WouldRemoveGate(ref g) if *g == g2),
+            matches!(err, ManifestError::WouldRemoveGate { ref id, ref name } if *id == g2 && name == "lint"),
             "{err}"
         );
         assert_eq!(b.imported_hash(&p).unwrap(), Some(first.content_sha256));
         assert!(b.get_gate(&g1).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_gate_held_locally_under_another_project_is_refused_and_writes_nothing() {
+        let (a, _ga, p, _g1, _g2) = authoring();
+        let m = a.export_manifest(&p, "c1", 7).unwrap();
+
+        // `b` authors its own project locally and holds a gate under it —
+        // the manifest below is rewritten to claim that same gate id for a
+        // project `b` has never held.
+        let (b, _gb) = fresh();
+        let q = b.add_project("/local").unwrap();
+        let local_gate = b
+            .add_gate(&q, "local", kind(), selector(), 1, "c0", "o")
+            .unwrap();
+
+        let old_id = m.body.gates[0].id.clone();
+        let mut body = m.body.clone();
+        body.gates[0].id = local_gate.clone();
+        for t in &mut body.transitions {
+            for gid in &mut t.gates {
+                if *gid == old_id {
+                    *gid = local_gate.clone();
+                }
+            }
+        }
+        let swapped = Manifest {
+            content_sha256: content_sha256(&body).unwrap(),
+            body,
+        };
+
+        let err = b.import_manifest(&swapped, "/x").unwrap_err();
+        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
+        assert!(!b.owns(p.iri()).unwrap(), "nothing may be written");
+        assert_eq!(b.get_gate(&local_gate).unwrap().unwrap().project, q);
     }
 }
