@@ -90,7 +90,10 @@ pub enum StoreError {
     Dangling { from: String, to: Iri },
     /// ⚠ The owner deleted the item (a GitHub issue answered 410). "It was
     /// here and is gone" is not "no such item".
-    #[error("{0} was deleted where it was held, so nothing can be read or written through it.")]
+    #[error(
+        "{0} was deleted where it was held, so nothing can be read or written through it. If \
+         it should still exist, raise it again: fl keeps no copy of it."
+    )]
     Deleted(Iri),
     /// ⚠ fl's own record of an item disagrees with the item's visible state
     /// (GitHub tracker spec §3.4). fl adopts neither side silently.
