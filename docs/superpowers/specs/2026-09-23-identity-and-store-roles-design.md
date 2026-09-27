@@ -106,8 +106,10 @@ string.
   GitHub's `node_id` as the match key. A repository rename changes the URL and does not
   change the `node_id`. When they disagree, `node_id` wins: record the new URL and keep
   the old one as an alias.
-* **Projects.** A local project gets a `urn:uuid:`. A GitHub project's id is its
-  repository URL.
+* **Projects.** A local project gets a `urn:uuid:`. ⚠ *Corrected 2026-09-26 by the GitHub
+  tracker spec (`2026-09-26-github-tracker-design.md` §1.5):* this line used to say that a
+  GitHub project's id is its repository URL. In mode A the catalog stays local, so a project
+  keeps its `urn:uuid:`; the repository is a tracker binding, not a project.
 
 **Dependency.** The `uuid` crate with the `v7` feature (MIT OR Apache-2.0). Minting
 needs randomness, and the standard library has no source of it. Our own v7 code over
@@ -151,7 +153,9 @@ A local store is multi-tenant: one store holds many projects. It already works t
 * **An id that no store holds** is `NotOwned`, and the message lists every store it
   searched. The output states exactly where it looked. *(Invariant)*
 
-GitHub stores need none of this, because a URL names its home.
+GitHub stores need none of this, because a URL names its home. ⚠ *Qualified 2026-09-26:*
+a URL names its home only until the repository is renamed and its old name reused. The GitHub
+tracker spec §2.4 binds the repository by `node_id` for that reason.
 
 ---
 

@@ -23,3 +23,4 @@ assert_cmd = "2.2.2"
 predicates = "3.1.4"
 uuid = { version = "1.26", features = ["v7"] }
 toml = "1.1"
+sha2 = "0.10"

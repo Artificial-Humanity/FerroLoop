@@ -74,11 +74,17 @@ fn staleness_for(
     if def.authored_at_commit == head {
         return false;
     }
-    let Ok(changed) = Git::changed_between(root, &def.authored_at_commit, head) else {
+    let Ok(mut changed) = Git::changed_between(root, &def.authored_at_commit, head) else {
         // A stamp we cannot resolve is treated as stale. An unreadable
         // provenance is not evidence of freshness.
         return true;
     };
+    // ⚠ The committed manifest changes on every export, and its content is
+    // governed by the currency checks, not by staleness (GitHub tracker spec
+    // §4.3, §4.5). Counting it here staled every gate whose selector covers
+    // it, and the remedy — affirm, export, commit — staled it again.
+    let manifest = root.join(fl_core::MANIFEST_PATH);
+    changed.retain(|p| *p != manifest);
     if changed.is_empty() {
         return false;
     }
@@ -193,10 +199,19 @@ fn run_gate(
         })
         .map_err(|e| ExecError::Store(e.to_string()))?;
 
+    // ⚠ The pass mark is what makes this gate a neighbour in every later
+    // `verify` (spec §4.2). Discarding a failed write here dropped the gate
+    // from that set with nothing said. The ledger row above is already
+    // written, so the evidence survives the refusal.
     if verdict.is_pass() {
         let mut updated = def.clone();
         updated.last_pass_commit = Some(head.to_string());
-        let _ = catalog.update_gate(&updated);
+        catalog.update_gate(&updated).map_err(|e| {
+            ExecError::Store(format!(
+                "gate `{}` passed, but its pass mark could not be written: {e}",
+                def.name
+            ))
+        })?;
     }
 
     Ok(GateReport {
@@ -402,6 +417,76 @@ mod tests {
         assert!(r.passed());
         assert_eq!(r.exit_code(), 0);
         assert_eq!(r.gates[0].verdict.population(), Some(1));
+    }
+
+    /// Delegates to a `MemStore` in every method except `update_gate`, which
+    /// refuses — the one write a passing gate makes to the catalog.
+    struct StampRefused<'a>(&'a MemStore);
+
+    impl Catalog for StampRefused<'_> {
+        fn add_project(&self, root: &str) -> Result<ProjectId, StoreError> {
+            self.0.add_project(root)
+        }
+        fn get_project(&self, id: &ProjectId) -> Result<Option<Project>, StoreError> {
+            self.0.get_project(id)
+        }
+        fn list_projects(&self) -> Result<Vec<Project>, StoreError> {
+            self.0.list_projects()
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn add_gate(
+            &self,
+            p: &ProjectId,
+            n: &str,
+            k: GateKind,
+            s: Selector,
+            m: u64,
+            c: &str,
+            b: &str,
+        ) -> Result<GateId, StoreError> {
+            self.0.add_gate(p, n, k, s, m, c, b)
+        }
+        fn get_gate(&self, id: &GateId) -> Result<Option<GateDef>, StoreError> {
+            self.0.get_gate(id)
+        }
+        fn list_gates(&self, p: &ProjectId) -> Result<Vec<GateDef>, StoreError> {
+            self.0.list_gates(p)
+        }
+        fn update_gate(&self, _: &GateDef) -> Result<(), StoreError> {
+            Err(StoreError::Backend("the catalog refused the write".into()))
+        }
+        fn add_transition(&self, t: Transition) -> Result<(), StoreError> {
+            self.0.add_transition(t)
+        }
+        fn get_transition(&self, p: &ProjectId, n: &str) -> Result<Option<Transition>, StoreError> {
+            self.0.get_transition(p, n)
+        }
+        fn list_transitions(&self, p: &ProjectId) -> Result<Vec<Transition>, StoreError> {
+            self.0.list_transitions(p)
+        }
+    }
+
+    // ⚠ Spec §4.2 (Invariant): the pass mark is what makes a gate a
+    // neighbour in every later `verify`. A discarded write dropped it from
+    // that set with nothing said — a verify examining less than it claims.
+    #[test]
+    fn a_pass_mark_that_cannot_be_written_is_an_error_and_the_run_is_still_recorded() {
+        let d = repo_with(&[("src/a.rs", "fn a() {}")]);
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "src/**/*.rs", Regret::Low);
+        let g = s.list_gates(&p).unwrap()[0].id.clone();
+
+        let err = run_single_gate(&StampRefused(&s), &s, &p, &g)
+            .expect_err("a pass whose mark was lost must not read as a clean pass");
+
+        assert!(matches!(err, ExecError::Store(_)), "{err:?}");
+        assert!(err.to_string().contains("pass mark"), "{err}");
+        assert_eq!(
+            s.gate_runs(&g).unwrap().len(),
+            1,
+            "the evidence is written before the mark, and it is kept"
+        );
+        assert_eq!(s.get_gate(&g).unwrap().unwrap().last_pass_commit, None);
     }
 
     #[test]
@@ -691,5 +776,28 @@ mod tests {
             "a store failure surfaced as {err:?}"
         );
         assert!(!err.to_string().contains("git"), "blames git: {err}");
+    }
+
+    #[test]
+    fn committing_the_manifest_never_makes_a_gate_stale() {
+        let d = repo_with(&[("cfg/a.json", "{}")]);
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "**/*.json", Regret::High);
+        let manifest = d.path().join(fl_core::MANIFEST_PATH);
+        fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        fs::write(&manifest, "{}").unwrap();
+        for args in [&["add", "-A"][..], &["commit", "-qm", "manifest"][..]] {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(d.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let r = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
+        assert!(r.passed(), "{:?}", r.gates[0].verdict);
+        assert_eq!(r.gates[0].staleness, Staleness::Fresh);
     }
 }
