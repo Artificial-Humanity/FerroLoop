@@ -10,4 +10,4 @@ pub mod tracker;
 
 pub use client::{Client, DEFAULT_API, Method, Reply};
 pub use creds::{AppCredentials, Credentials, EnvToken};
-pub use tracker::{GithubTracker, Notice, Repo};
+pub use tracker::{GithubTracker, Notice, Repaired, Repo};

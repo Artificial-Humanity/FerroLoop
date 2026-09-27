@@ -58,6 +58,25 @@ pub struct GithubTracker {
     settle: std::time::Duration,
 }
 
+/// Timeline events that change what fl reads (spec §3.3). A comment or a
+/// mention does not, and is not a conflict.
+const STATE_EVENTS: [&str; 5] = ["labeled", "unlabeled", "closed", "reopened", "renamed"];
+
+/// What GitHub has recorded about an issue's changes at one moment.
+struct Window {
+    events: BTreeMap<u64, String>,
+    edits: BTreeSet<String>,
+}
+
+/// What `repair` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Repaired {
+    pub number: u64,
+    pub state: String,
+    /// `false` when the issue already agreed with its block.
+    pub changed: bool,
+}
+
 /// What an issue number reached.
 #[allow(clippy::large_enum_variant)] // one value per read; boxing buys nothing
 enum Fetched {
@@ -729,16 +748,29 @@ impl GithubTracker {
     }
 
     /// Read, change, write, and check the answer. `missing` is the error for
-    /// an issue that does not exist.
+    /// an issue that does not exist — `Fn`, not `FnOnce`: the issue is read
+    /// twice, and one that vanishes between the reads is missing too.
     fn update(
         &self,
         n: u64,
         kind: ItemKind,
-        missing: impl FnOnce() -> StoreError,
+        missing: impl Fn() -> StoreError,
         change: impl FnOnce(&mut Meta, &mut String, &mut String) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
         self.ensure_labels()?;
         let id = self.issue_url(n);
+        // Classify first, so a missing, deleted or moved issue keeps its
+        // outcome — its timeline would answer 404, 410 or 301 instead.
+        match self.fetch(n)? {
+            Fetched::Found(_) => {}
+            Fetched::Absent => return Err(missing()),
+            Fetched::Gone => return Err(StoreError::Deleted(id)),
+            Fetched::Moved(to) => return Err(StoreError::Moved { id, to }),
+        }
+        let before = self.window(n)?;
+        // Read again inside the window: the state fl changes is the state
+        // the window starts from, so a write landing between the first read
+        // and the window is inside it.
         let issue = match self.fetch(n)? {
             Fetched::Found(i) => i,
             Fetched::Absent => return Err(missing()),
@@ -811,8 +843,234 @@ impl GithubTracker {
         }
         let back = IssueView::from_json(&r.body)?;
         check_written(&back, &title, &labels, &body, state, reason)?;
+        let after = self.window(n)?;
+        // ⚠ Before `remember`: a write that crossed someone else's must not
+        // become the baseline the next write is compared with.
+        self.check_window(&id, &before, &after, &issue, &back)?;
         self.remember(n, &meta, &prose, &title);
         Ok(())
+    }
+
+    /// The issue's state-changing timeline events and its body edit history,
+    /// now. ⚠ Never `remember`s: it reads no item.
+    fn window(&self, n: u64) -> Result<Window, StoreError> {
+        let mut events = BTreeMap::new();
+        for e in self
+            .client
+            .get_all(&self.path(&format!("/issues/{n}/timeline?per_page=100")))?
+        {
+            let kind = e.get("event").and_then(Value::as_str).unwrap_or("");
+            if !STATE_EVENTS.contains(&kind) {
+                continue;
+            }
+            let id = e.get("id").and_then(Value::as_u64).ok_or_else(|| {
+                backend(format!(
+                    "a `{kind}` event on issue {n} has no id, so fl cannot tell it from its own \
+                     write"
+                ))
+            })?;
+            events.insert(id, kind.to_string());
+        }
+        let (owner, name) = self
+            .repo
+            .full_name
+            .split_once('/')
+            .expect("a full name is owner/name");
+        let data = self.client.graphql(
+            "query($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, \
+             name: $name) { issue(number: $number) { userContentEdits(last: 100) { nodes { id } \
+             } } } }",
+            json!({"owner": owner, "name": name, "number": n}),
+        )?;
+        let nodes = data
+            .pointer("/repository/issue/userContentEdits/nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                backend(format!(
+                    "GitHub's edit history for issue {n} came back without `nodes`"
+                ))
+            })?;
+        let edits = nodes
+            .iter()
+            .filter_map(|x| x.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        Ok(Window { events, edits })
+    }
+
+    /// ⚠ Detection, not prevention (spec §3.3): GitHub has no conditional
+    /// update. Every state-changing event or body edit between `before` and
+    /// `after` that fl's own write does not explain is someone else's.
+    fn check_window(
+        &self,
+        id: &Iri,
+        before: &Window,
+        after: &Window,
+        old: &IssueView,
+        new: &IssueView,
+    ) -> Result<(), StoreError> {
+        let mut expected: BTreeMap<&str, usize> = BTreeMap::new();
+        *expected.entry("labeled").or_default() += new
+            .labels
+            .iter()
+            .filter(|l| !old.labels.contains(l))
+            .count();
+        *expected.entry("unlabeled").or_default() += old
+            .labels
+            .iter()
+            .filter(|l| !new.labels.contains(l))
+            .count();
+        if old.state != new.state {
+            let k = if new.state == "closed" {
+                "closed"
+            } else {
+                "reopened"
+            };
+            *expected.entry(k).or_default() += 1;
+        }
+        if old.title != new.title {
+            *expected.entry("renamed").or_default() += 1;
+        }
+        let mut foreign = Vec::new();
+        for (eid, kind) in &after.events {
+            if before.events.contains_key(eid) {
+                continue;
+            }
+            match expected.get_mut(kind.as_str()) {
+                Some(left) if *left > 0 => *left -= 1,
+                _ => foreign.push(format!("a `{kind}` event")),
+            }
+        }
+        let new_edits = after.edits.difference(&before.edits).count();
+        // ⚠ Modelled, not measured: a FIRST body edit is taken to add two
+        // entries (the original, then the edit), and any later edit one.
+        // Under that model every foreign edit is seen. If GitHub adds ONE
+        // entry on a first edit, a foreign edit landing with fl's first edit
+        // would be hidden — the live test (Task 10) measures exactly this.
+        let own_edits = match (old.body != new.body, before.edits.is_empty()) {
+            (false, _) => 0,
+            (true, true) => 2,
+            (true, false) => 1,
+        };
+        if new_edits > own_edits {
+            foreign.push(format!("{} body edit(s)", new_edits - own_edits));
+        }
+        if foreign.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::Conflict {
+                id: id.clone(),
+                detail: format!(
+                    "GitHub shows changes fl did not make: {}",
+                    foreign.join(", ")
+                ),
+            })
+        }
+    }
+
+    /// `fl github repair` (spec §3.4): rewrite the fl labels and the
+    /// open/closed status FROM the block, and leave a comment naming who ran
+    /// it. The block is fl's record of the protocol, so a repair never moves
+    /// an item to a state the protocol did not reach. ⚠ Never `remember`s:
+    /// the caller receives no item from it.
+    pub fn repair(&self, id: &Iri, by: &str) -> Result<Repaired, StoreError> {
+        // ⚠ Explicitly, as every write does: a deleted fl label is a common
+        // reason to repair, and the PATCH must not recreate it as a side
+        // effect (spec §3.3).
+        self.ensure_labels()?;
+        let n = self.locate(id)?;
+        let classify = |fetched: Fetched| match fetched {
+            Fetched::Found(i) => Ok(i),
+            Fetched::Absent => Err(StoreError::NotAnFlItem {
+                id: id.clone(),
+                what: "an issue that does not exist".into(),
+            }),
+            Fetched::Gone => Err(StoreError::Deleted(id.clone())),
+            Fetched::Moved(to) => Err(StoreError::Moved { id: id.clone(), to }),
+        };
+        // Classify first, so a missing, deleted or moved issue keeps its
+        // outcome; then open the window and read again inside it.
+        classify(self.fetch(n)?)?;
+        let before = self.window(n)?;
+        let issue = classify(self.fetch(n)?)?;
+        if issue.is_pull_request {
+            return Err(StoreError::NotAnFlItem {
+                id: id.clone(),
+                what: "a pull request".into(),
+            });
+        }
+        let restore = |detail: String| StoreError::Diverged {
+            id: id.clone(),
+            detail: format!(
+                "{detail}. A repair rewrites from the block, so restore the block from the \
+                 issue's edit history first — or, if the issue was never fl's, remove its fl \
+                 labels instead of repairing it"
+            ),
+        };
+        let (_, meta) =
+            meta::parse_body(&issue.body).map_err(|e| restore(format!("its body {e}")))?;
+        if !meta.kind.valid_state(&meta.state) {
+            return Err(restore(format!(
+                "the block's state `{}` is not valid",
+                meta.state
+            )));
+        }
+        if matches!(meta::read_item(&issue), Ok(Read::Item { .. })) {
+            return Ok(Repaired {
+                number: n,
+                state: meta.state,
+                changed: false,
+            });
+        }
+        let labels = meta::labels_after(&issue.labels, meta.kind, &meta.state);
+        let (state, reason) = meta::projection(meta.kind, &meta.state);
+        let mut sent = json!({"labels": labels, "state": state});
+        if let Some(r) = reason {
+            sent["state_reason"] = json!(r);
+        }
+        let r = self.client.send(
+            Method::Patch,
+            &self.path(&format!("/issues/{n}")),
+            Some(&sent),
+        )?;
+        if r.status != 200 {
+            return Err(backend(format!(
+                "GitHub answered {} to the repair of {id}; read it again before retrying",
+                r.status
+            )));
+        }
+        let back = IssueView::from_json(&r.body)?;
+        check_written(
+            &back,
+            &issue.title,
+            &labels,
+            &issue.body.replace("\r\n", "\n"),
+            state,
+            reason,
+        )?;
+        let after = self.window(n)?;
+        self.check_window(id, &before, &after, &issue, &back)?;
+        let note = json!({"body": format!(
+            "`fl github repair`: the fl labels and the open/closed status were rewritten from \
+             fl's record (state `{}`) by {by}.",
+            meta.state
+        )});
+        let c = self.client.send(
+            Method::Post,
+            &self.path(&format!("/issues/{n}/comments")),
+            Some(&note),
+        )?;
+        if c.status != 201 {
+            return Err(backend(format!(
+                "the repair of {id} was written, but GitHub answered {} to the comment that \
+                 records who ran it; add that comment by hand",
+                c.status
+            )));
+        }
+        Ok(Repaired {
+            number: n,
+            state: meta.state,
+            changed: true,
+        })
     }
 
     fn record_from(&self, issue: &IssueView, meta: &Meta) -> Result<Record, StoreError> {
@@ -1918,6 +2176,207 @@ mod tests {
             }
             other => panic!("expected Moved, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_foreign_label_inside_fls_write_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().foreign_label_on_next_patch = true;
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// A write that crossed someone else's is not a baseline: the next
+    /// write refuses until the caller reads the item again.
+    #[test]
+    fn a_conflicted_write_does_not_move_the_baseline() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().foreign_label_on_next_patch = true;
+        t.set_record_state(&r, State::Doing).unwrap_err();
+        let err = t.set_record_state(&r, State::Review).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+        assert_eq!(t.get_record(&r).unwrap().unwrap().state, State::Doing);
+        t.set_record_state(&r, State::Review).unwrap();
+    }
+
+    #[test]
+    fn a_foreign_body_edit_inside_fls_write_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        // The first edit is fl's; the blind spot is the first edit only.
+        t.set_record_state(&r, State::Doing).unwrap();
+        fake.state().foreign_edit_on_next_patch = true;
+        let err = t.set_record_state(&r, State::Review).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// Under the model, a foreign FIRST edit adds two entries and fl's edit
+    /// one more: three is more than fl's two, so it is seen.
+    #[test]
+    fn a_foreign_first_edit_inside_fls_first_edit_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().foreign_edit_on_next_patch = true;
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_deleted_or_moved_issue_keeps_its_outcome_through_a_write() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let gone = t.add_record(&p(), "gone").unwrap();
+        let moved = t.add_record(&p(), "moved").unwrap();
+        fake.state().issues.get_mut(&1).unwrap().gone = true;
+        fake.state().issues.get_mut(&2).unwrap().moved_to =
+            Some(format!("{}/repositories/9/issues/1", fake.url()));
+        assert!(matches!(
+            t.set_record_state(&gone, State::Doing),
+            Err(StoreError::Deleted(_))
+        ));
+        assert!(matches!(
+            t.set_record_state(&moved, State::Doing),
+            Err(StoreError::Moved { .. })
+        ));
+        let absent = RecordId(t.issue_url(99));
+        assert!(matches!(
+            t.set_record_state(&absent, State::Doing),
+            Err(StoreError::NoSuchRecord(_))
+        ));
+    }
+
+    #[test]
+    fn fls_own_writes_are_never_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        for s in [
+            State::Doing,
+            State::Review,
+            State::Done,
+            State::Doing,
+            State::Done,
+        ] {
+            t.set_record_state(&r, s).unwrap();
+        }
+        let f = t.add_finding(Finding::raise(p(), r, "a", "c")).unwrap();
+        let mut fin = t.get_finding(&f).unwrap().unwrap();
+        fin.withdraw("w").unwrap();
+        t.update_finding(&fin).unwrap();
+    }
+
+    #[test]
+    fn repair_rewrites_the_labels_and_status_from_the_block_and_says_who() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| {
+            i.labels = vec!["bug".into()];
+            i.state = "closed".into();
+        });
+        assert!(t.get_record(&r).is_err());
+        let done = t.repair(r.iri(), "owner").unwrap();
+        assert_eq!(
+            (done.number, done.state.as_str(), done.changed),
+            (1, "todo", true)
+        );
+        let issue = fake.issue(1);
+        assert_eq!(issue.labels, vec!["bug", "fl:record", "fl:record/todo"]);
+        assert_eq!(
+            issue.state, "open",
+            "the block wins: a repair never closes what fl left open"
+        );
+        assert!(
+            issue.comments.iter().any(|c| c.contains("by owner")),
+            "{:?}",
+            issue.comments
+        );
+        assert_eq!(t.get_record(&r).unwrap().unwrap().state, State::Todo);
+    }
+
+    #[test]
+    fn repair_trusts_the_block_over_a_state_label() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| {
+            i.labels = vec!["fl:record".into(), "fl:record/done".into()];
+            i.state = "closed".into();
+        });
+        let done = t.repair(r.iri(), "owner").unwrap();
+        assert_eq!(done.state, "todo");
+        assert_eq!(fake.issue(1).labels, vec!["fl:record", "fl:record/todo"]);
+        assert_eq!(fake.issue(1).state, "open");
+    }
+
+    #[test]
+    fn repair_of_a_consistent_issue_changes_nothing() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let done = t.repair(r.iri(), "owner").unwrap();
+        assert!(!done.changed);
+        assert!(fake.issue(1).comments.is_empty());
+    }
+
+    /// A label deleted from the repository leaves every fl issue without
+    /// it. Repair creates it explicitly, before its write — never as a side
+    /// effect of the write.
+    #[test]
+    fn repair_creates_a_deleted_label_before_it_writes() {
+        let fake = FakeGithub::start("acme/widgets");
+        let r = open(&fake).add_record(&p(), "t").unwrap();
+        fake.state().labels.remove("fl:record/todo");
+        fake.web_edit(1, |i| i.labels = vec!["fl:record".into()]);
+        let t = open(&fake);
+        fake.state().requests.clear();
+        assert!(t.repair(r.iri(), "owner").unwrap().changed);
+        let requests = fake.state().requests.clone();
+        let created = requests
+            .iter()
+            .position(|q| q == "POST /repos/acme/widgets/labels");
+        let written = requests
+            .iter()
+            .position(|q| q == "PATCH /repos/acme/widgets/issues/1");
+        assert!(
+            matches!((created, written), (Some(c), Some(w)) if c < w),
+            "{requests:?}"
+        );
+    }
+
+    #[test]
+    fn repair_of_a_deleted_or_moved_issue_keeps_its_outcome() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let gone = t.add_record(&p(), "gone").unwrap();
+        let moved = t.add_record(&p(), "moved").unwrap();
+        fake.state().issues.get_mut(&1).unwrap().gone = true;
+        fake.state().issues.get_mut(&2).unwrap().moved_to =
+            Some(format!("{}/repositories/9/issues/1", fake.url()));
+        assert!(matches!(
+            t.repair(gone.iri(), "owner"),
+            Err(StoreError::Deleted(_))
+        ));
+        assert!(matches!(
+            t.repair(moved.iri(), "owner"),
+            Err(StoreError::Moved { .. })
+        ));
+    }
+
+    #[test]
+    fn repair_refuses_a_damaged_block_and_says_to_restore_it() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.body = "someone rewrote it".into());
+        let err = t.repair(r.iri(), "owner").unwrap_err();
+        assert!(err.to_string().contains("restore the block"), "{err}");
     }
 
     /// The same suites the local stores pass (spec §8.1): the GitHub

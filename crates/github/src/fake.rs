@@ -663,6 +663,37 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 Some(i) => answer(200, s.issue_json(i)),
             }
         }
+        ("GET", ["repos", o, r, "issues", n, "timeline"]) if s.is_bound(o, r) => {
+            match n.parse::<u64>().ok().and_then(|n| s.issues.get(&n)) {
+                None => answer(404, json!({"message": "Not Found"})),
+                Some(i) if i.gone => answer(410, json!({"message": "This issue was deleted"})),
+                Some(i) if i.moved_to.is_some() => {
+                    let mut a = answer(301, json!({"message": "Moved Permanently"}));
+                    a.headers
+                        .push(("Location".into(), i.moved_to.clone().unwrap_or_default()));
+                    a
+                }
+                Some(i) => {
+                    let items = i
+                        .events
+                        .iter()
+                        .map(|(id, kind)| json!({"id": id, "event": kind}))
+                        .collect();
+                    s.page(&path, &q, items)
+                }
+            }
+        }
+        ("POST", ["repos", o, r, "issues", n, "comments"]) if s.is_bound(o, r) => {
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            match n.parse::<u64>().ok().and_then(|n| s.issues.get_mut(&n)) {
+                None => answer(404, json!({"message": "Not Found"})),
+                Some(i) => {
+                    i.comments
+                        .push(v["body"].as_str().unwrap_or("").to_string());
+                    answer(201, json!({"id": i.comments.len()}))
+                }
+            }
+        }
         ("PATCH", ["repos", o, r, "issues", n]) if s.is_bound(o, r) => {
             let Some(n) = n.parse::<u64>().ok().filter(|n| s.issues.contains_key(n)) else {
                 return answer(404, json!({"message": "Not Found"}));
@@ -759,6 +790,24 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         // shape).
         ("POST", ["graphql"]) => {
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            // An issue's body edit history (Task 6), checked FIRST: it is
+            // not a node lookup. Answered in the order the fake recorded.
+            let query = v["query"].as_str().unwrap_or("");
+            if query.contains("userContentEdits") {
+                let n = v
+                    .pointer("/variables/number")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let nodes: Vec<Value> = s
+                    .issues
+                    .get(&n)
+                    .map(|i| i.edits.iter().map(|e| json!({"id": e})).collect())
+                    .unwrap_or_default();
+                return answer(
+                    200,
+                    json!({"data": {"repository": {"issue": {"userContentEdits": {"nodes": nodes}}}}}),
+                );
+            }
             let id = v
                 .pointer("/variables/id")
                 .and_then(Value::as_str)
