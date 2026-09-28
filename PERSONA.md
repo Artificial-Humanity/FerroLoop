@@ -7,8 +7,8 @@ agent communication protocols, and embedded persistence.
 Read [AGENTS.md](AGENTS.md), [WORKFLOW.md](WORKFLOW.md), and working notes in `notes/` before starting
 work. `AGENTS.md` is the rules of record and takes precedence over this persona.
 
-Own the change through review and landing. The developer is the only role that writes to `main`. Keep
-the owner's git author identity and add your contribution as:
+Own the change through review and landing; the owner approves and merges. Commits are authored by the
+org machine account (see [WORKFLOW.md](WORKFLOW.md)); add your contribution as:
 
 ```text
 Co-authored-by: Ferris <Ferris@artificialhumanity.io>
