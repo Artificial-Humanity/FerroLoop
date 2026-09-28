@@ -73,6 +73,13 @@ GitHub mode is a permanently supported configuration. The local tracker stays th
 12. Plan A's two agent rulings are **kept**: the first import raises the store to format 3, and
     transitions mirror the manifest on re-import.
 
+### 0.1b Owner decisions, 2026-09-28
+
+13. **`webpki-roots` is accepted.** Its CA data is licensed CDLA-Permissive-2.0; that is compatible
+    enough for this project (§1.1).
+14. **`repair` restores an issue whose block is intact but whose fl labels are gone.** The block is
+    fl's record, so it is enough to make the issue fl's again; §3.5 does not apply to `repair`.
+
 ### 0.2 Out of scope
 
 * The GitHub ledger (sub-project 3) and its rate-limit design.
@@ -98,7 +105,8 @@ Depends on `fl-core` only.
 
 **Dependencies.** A blocking HTTP client with TLS (`ureq` with `rustls`), a JWT signer for
 RS256 (§5.2), and a SHA-256 implementation for the manifest (§4). The plan pins each and
-records its licence. Each must be compatible with Apache-2.0. No dependency may need a
+records its licence. Each must be compatible with Apache-2.0; `webpki-roots` (CDLA-Permissive-2.0)
+is accepted (§0.1b, 13). No dependency may need a
 runtime service or a program outside the binary. *(Invariant — the single-binary rule.)* A
 subprocess to the `gh` CLI was rejected on that rule.
 
@@ -297,7 +305,8 @@ damaged, `repair` refuses; the person restores the block from the issue's edit h
 ### 3.5 What is not an fl item
 
 An issue with no `fl:` label, or a pull request (the issues API returns both), is refused as
-**not an fl item**. It is not "not found", and fl does not adopt it.
+**not an fl item**. It is not "not found", and fl does not adopt it. The one exception is `fl github repair`:
+an issue that still carries an intact fl block is restored from it, labels included (§0.1b, 14).
 
 ### 3.6 Deleted and moved issues
 
