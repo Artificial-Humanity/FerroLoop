@@ -1174,18 +1174,21 @@ impl GithubTracker {
         if let Some(r) = reason {
             sent["state_reason"] = json!(r);
         }
-        let r = self.client.send(
+        // ⚠ `send_unchecked_json`, not `send`: a 2xx whose body cannot be
+        // read still proves the repair landed, so it must reach the comment
+        // below rather than end the call first.
+        let r = self.client.send_unchecked_json(
             Method::Patch,
             &self.path(&format!("/issues/{n}")),
             Some(&sent),
         )?;
-        if r.status != 200 {
+        if !(200..300).contains(&r.status) {
             return Err(backend(format!(
                 "GitHub answered {} to the repair of {id}; read it again before retrying",
                 r.status
             )));
         }
-        // ⚠ The PATCH answered 200, so the repair has landed, at least in
+        // ⚠ The PATCH answered 2xx, so the repair has landed, at least in
         // part: the comment naming who ran it is posted NOW, before anything
         // that could fail — reading the answer, checking it, the window. A
         // rerun after such a failure would find the issue consistent and
@@ -1238,7 +1241,8 @@ impl GithubTracker {
             }
             (Err(e), _) => {
                 return Err(backend(format!(
-                    "GitHub answered 200 to the repair of {id}, but then: {e}; {comment}"
+                    "GitHub answered {} to the repair of {id}, but then: {e}; {comment}",
+                    r.status
                 )));
             }
         }
@@ -2630,6 +2634,28 @@ mod tests {
             issue.comments
         );
         assert_eq!(t.get_record(&r).unwrap().unwrap().state, State::Todo);
+    }
+
+    /// A 200 proves the repair landed, so an unreadable body must not skip
+    /// the comment naming who ran it: a rerun would find the issue
+    /// consistent and post nothing.
+    #[test]
+    fn repair_answered_with_an_unreadable_200_still_says_who() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels = vec!["bug".into()]);
+        fake.state().unreadable_patch_body_next = true;
+        let e = t.repair(r.iri(), "owner").unwrap_err().to_string();
+        assert!(e.contains("GitHub answered 200 to the repair"), "{e}");
+        assert!(e.contains("was posted"), "{e}");
+        let issue = fake.issue(1);
+        assert_eq!(issue.labels, vec!["bug", "fl:record", "fl:record/todo"]);
+        assert!(
+            issue.comments.iter().any(|c| c.contains("by owner")),
+            "{:?}",
+            issue.comments
+        );
     }
 
     #[test]

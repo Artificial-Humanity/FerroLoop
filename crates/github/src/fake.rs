@@ -90,6 +90,9 @@ pub struct State {
     /// a garbled proxy answer, not GitHub's own. The issue is still created.
     /// One-shot.
     pub unreadable_create_body_next: bool,
+    /// The next issue PATCH answers 200 with a body that cannot be read as
+    /// an issue. The PATCH is still applied. One-shot.
+    pub unreadable_patch_body_next: bool,
     /// How many requests the issues-LIST endpoint (not a single-issue GET)
     /// has answered so far, this fake's lifetime.
     pub list_issue_requests: u32,
@@ -829,6 +832,11 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 s.labels.insert(l.clone());
             }
             s.issues.insert(n, new);
+            if std::mem::take(&mut s.unreadable_patch_body_next) {
+                // The PATCH landed, but the answer a caller reads back is
+                // garbage — a garbled proxy body, not GitHub's own.
+                return raw_answer(200, "not json at all");
+            }
             answer(200, s.issue_json(&s.issues[&n]))
         }
         // A node lookup by id (Task 5): the fake's issues all belong to its
