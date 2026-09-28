@@ -122,9 +122,11 @@ impl Client {
                 reply.status
             )));
         }
-        // GitHub answers a lookup of a missing node with `null` data AND a
-        // NOT_FOUND error: that is an answer, not a failure. A rate limit
-        // arrives the same way, as a 200 with an error of type RATE_LIMITED.
+        // GitHub is taken to answer a lookup of a missing node with `null`
+        // data AND a NOT_FOUND error — an answer, not a failure — and a
+        // spent GraphQL rate limit the same way, as a 200 with an error of
+        // type RATE_LIMITED. Both are readings of GitHub's docs: unmeasured;
+        // no live test checks either yet.
         if let Some(errors) = reply
             .body
             .get("errors")

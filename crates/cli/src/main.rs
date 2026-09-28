@@ -342,6 +342,111 @@ fn choose_among(candidates: &[PathBuf], iris: &[Iri]) -> Result<PathBuf> {
     Ok(chosen.expect("iris is non-empty"))
 }
 
+/// Whether two store paths name the same store: the same path, or, when
+/// both exist, the same file once symlinks are resolved.
+fn same_store(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (a.canonicalize(), b.canonicalize()),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// How a config entry's tracker reads in a refusal.
+fn tracker_name(t: Option<&config::TrackerBinding>) -> String {
+    match t {
+        Some(t) => format!("GitHub `{}`", t.github),
+        None => "the store's own tracker".to_string(),
+    }
+}
+
+/// The tracker for a command that reads or writes records or findings, and
+/// works on the store at `chosen` (Final review, item 1).
+///
+/// ⚠ The binding is taken from the config entries whose `store` IS `chosen`
+/// — the store holds the node binding and the catalog GitHub is paired with
+/// — and entries naming the same store with different trackers are refused.
+/// And when `chosen` is not the store of `here` (the current directory's
+/// entry, if any) and EITHER side is bound to GitHub, the command is
+/// refused: the store's own project could then be written through the
+/// wrong tracker, or this directory's GitHub tracker paired with another
+/// project's store. Unbound projects on both sides pass exactly as before.
+fn tracker_for(
+    chosen: &Path,
+    here: Option<&config::Entry>,
+    entries: &[config::Entry],
+    explicit: bool,
+) -> Result<Option<config::TrackerBinding>> {
+    let owners: Vec<&config::Entry> = entries
+        .iter()
+        .filter(|e| same_store(&e.store, chosen))
+        .collect();
+    let mut trackers: Vec<Option<&config::TrackerBinding>> = Vec::new();
+    for e in &owners {
+        if !trackers.contains(&e.tracker.as_ref()) {
+            trackers.push(e.tracker.as_ref());
+        }
+    }
+    if trackers.len() > 1 {
+        let names = owners
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} -> {}",
+                    e.root.display(),
+                    tracker_name(e.tracker.as_ref())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "the store at {} is bound to more than one tracker in the config: {names}. A store \
+             has one tracker: give these entries the same `tracker`, or give each its own store",
+            chosen.display()
+        );
+    }
+    let store_side = trackers.first().copied().flatten();
+    let here_is_chosen = here.is_some_and(|e| same_store(&e.store, chosen));
+    let here_side = here.and_then(|e| e.tracker.as_ref());
+    if !here_is_chosen && (store_side.is_some() || here_side.is_some()) {
+        let theirs = if owners.is_empty() {
+            "no project in the config".to_string()
+        } else {
+            let roots = owners
+                .iter()
+                .map(|e| e.root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "the project at {roots}, whose tracker is {}",
+                tracker_name(store_side)
+            )
+        };
+        let ours = match here {
+            Some(e) => format!(
+                "the project at {} (store {}, tracker {})",
+                e.root.display(),
+                e.store.display(),
+                tracker_name(here_side)
+            ),
+            None => "no project in the config".to_string(),
+        };
+        let without_db = if explicit {
+            ", without --db (and with $FL_DB unset)"
+        } else {
+            ""
+        };
+        bail!(
+            "this command works on the store at {}, which belongs to {theirs}; the current \
+             directory belongs to {ours}. A project bound to GitHub keeps its records and \
+             findings in its own tracker, paired with its own store, so fl will not mix the two. \
+             Run the command from the root of the project that holds the item{without_db}",
+            chosen.display()
+        );
+    }
+    Ok(store_side.cloned())
+}
+
 fn main() {
     let cli = Cli::parse();
     let code = match run(cli) {
@@ -376,11 +481,14 @@ fn run(cli: Cli) -> Result<i32> {
         None
     };
     let configured = entry.as_ref().map(|e| e.store.clone());
-    let binding = entry.and_then(|e| e.tracker);
+    // The tracker the CURRENT DIRECTORY's entry names. Only the early
+    // refusals below and the issue-URL filter read it; the tracker a command
+    // opens is `binding`, taken from the store the command ends up in.
+    let here_binding = entry.as_ref().and_then(|e| e.tracker.clone());
     // Before any store's directory is created, searched or opened: `fl
     // github` with `--db` still reads the entry (it needs the tracker), so
     // this fires there too.
-    if matches!(cli.command, Command::Github(_)) && binding.is_none() {
+    if matches!(cli.command, Command::Github(_)) && here_binding.is_none() {
         bail!(
             "`fl github` needs a tracker binding: add `tracker = {{ github = \"owner/repo\", \
              credential = \"env\" }}` to this project's entry in {}",
@@ -394,20 +502,32 @@ fn run(cli: Cli) -> Result<i32> {
     // ⚠ Before `db_path`, `choose_store` and any open: a refused command
     // must create no directory or store, and an IRI it names must not be
     // refused as not owned by the `--db` store first.
-    if binding.is_some() && explicit.is_some() && needs_tracker {
+    if here_binding.is_some() && explicit.is_some() && needs_tracker {
         bail!(
             "this project's tracker is bound to GitHub in the config, so it uses the store its \
              config entry names. Drop --db (and unset $FL_DB) for this command"
         );
     }
+    let explicit_given = explicit.is_some();
     let (bound, confined) = db_path(explicit, configured)?;
     let mut iris = cli.command.iris();
     // A GitHub issue URL is the tracker's to resolve: no local store holds
     // one, and searching them would refuse it as NotOwned (spec §2.2).
-    if binding.is_some() {
+    if here_binding.is_some() {
         iris.retain(|i| !fl_github::meta::is_issue_url(i));
     }
     let path = choose_store(&bound, entries, &iris, confined)?;
+    // ⚠ Final review, item 1: the tracker comes from the store the command
+    // ends up in, never from the current directory alone — an IRI can send
+    // `choose_store` to another project's store, and pairing that store with
+    // this directory's tracker would write one project's records into the
+    // other's tracker. Before the store is opened: a refused command writes
+    // nothing to it.
+    let binding = if needs_tracker {
+        tracker_for(&path, entry.as_ref(), entries, explicit_given)?
+    } else {
+        None
+    };
     // ⚠ Fix round 1, item 1: a handle resolves only in the store it was
     // read from. If an IRI elsewhere in this same command sent the search
     // to a DIFFERENT store than the bound one, a handle alongside it would
@@ -488,6 +608,63 @@ mod tests {
             let err = api_override_host(url).expect_err(url);
             assert!(format!("{err:#}").contains("https://"), "{url}: {err:#}");
         }
+    }
+
+    fn entry(root: &str, store: &str, github: Option<&str>) -> config::Entry {
+        config::Entry {
+            root: PathBuf::from(root),
+            store: PathBuf::from(store),
+            tracker: github.map(|g| config::TrackerBinding {
+                github: g.into(),
+                credential: config::Credential::Env,
+            }),
+        }
+    }
+
+    /// Final review, item 1: two entries naming one store with different
+    /// trackers leave the store's tracker unknown, from either root.
+    #[test]
+    fn entries_sharing_a_store_but_not_a_tracker_are_refused() {
+        let a = entry("/a", "/s/shared.redb", Some("acme/widgets"));
+        let b = entry("/b", "/s/shared.redb", None);
+        let entries = [a.clone(), b.clone()];
+        for here in [&a, &b] {
+            let err = tracker_for(Path::new("/s/shared.redb"), Some(here), &entries, false)
+                .expect_err("the store's tracker is ambiguous");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("more than one tracker")
+                    && msg.contains("/a -> GitHub `acme/widgets`")
+                    && msg.contains("/b -> the store's own tracker"),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tracker_is_the_chosen_stores_and_unbound_stores_mix_as_before() {
+        let p = entry("/p", "/s/p.redb", Some("acme/widgets"));
+        let q = entry("/q", "/s/q.redb", None);
+        let r = entry("/r", "/s/r.redb", None);
+        let entries = [p.clone(), q.clone(), r.clone()];
+        let got = tracker_for(Path::new("/s/p.redb"), Some(&p), &entries, false).unwrap();
+        assert_eq!(got.map(|t| t.github).as_deref(), Some("acme/widgets"));
+        // Two local projects: an IRI may send one's command to the other's
+        // store, as it always could.
+        assert_eq!(
+            tracker_for(Path::new("/s/r.redb"), Some(&q), &entries, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            tracker_for(Path::new("/s/r.redb"), None, &entries, false).unwrap(),
+            None
+        );
+        // `--db` naming a GitHub-bound store from elsewhere says to drop it.
+        let msg = format!(
+            "{:#}",
+            tracker_for(Path::new("/s/p.redb"), Some(&q), &entries, true).unwrap_err()
+        );
+        assert!(msg.contains("without --db"), "{msg}");
     }
 
     #[test]

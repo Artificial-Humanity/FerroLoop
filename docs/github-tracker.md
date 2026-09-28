@@ -53,6 +53,15 @@ command is refused before any store is searched, created or opened, and the refu
 drop `--db` and unset `$FL_DB`. The catalog commands keep
 `--db` as before. `fl github` needs a binding, and refuses without one, `--db` or not.
 
+A store has one tracker, and a command that uses the tracker takes it from the config entry
+whose `store` is the store the command works on — not only from the directory it runs in. A
+full IRI can send a command to another project's store; if either that store's project or the
+current directory's project is bound to GitHub, the command is refused, naming both, and the
+refusal says to run it from the root of the project that holds the item. The same holds when a
+GitHub-bound project's store is the default store and the command runs in a directory no entry
+covers. Two entries that name the same store with different trackers are refused. Commands
+between projects that are all unbound work as before.
+
 ## Credentials
 
 The binding names one source for the credential, and fl never falls back from one to the
@@ -87,7 +96,8 @@ A record is an issue with two labels, `fl:record` and one state label such as
 `fl:record/doing`; its title is the record's title. A finding is an issue labelled
 `fl:finding` and one state label such as `fl:finding/reproduced`; its body starts with the
 claim, and its title is the claim's first line, cut to GitHub's 256-character limit. A
-record's title longer than that is refused before anything is sent. fl changes only its own
+record's title longer than that is refused before anything is sent, and so is one that starts
+or ends with whitespace, which GitHub may trim. fl changes only its own
 `fl:` labels and keeps every other label on the issue.
 
 fl creates the labels it needs — one kind label and one label per state, for records and for
@@ -119,7 +129,7 @@ is an error, never a success.
 An issue with no `fl:` label is not an fl item, and neither is a pull request, even one that
 carries fl labels: named directly, either is refused as not an fl item, never read as "not
 found". A list that meets a pull request carrying fl labels stops with an error naming it;
-remove its fl labels.
+remove its fl labels (`fl github repair` refuses a pull request).
 
 ## Divergence and repair
 
@@ -141,9 +151,11 @@ on the issue recording that the repair ran and that `<name>` ran it. Anyone may 
 prints `repaired`, the issue number and the state. An issue that already agrees with its
 block is left as it is, with no comment, and the command prints `consistent`.
 
-If the repair itself crosses someone else's change (see [Conflicts](#conflicts)), it has
-still landed, so the comment is still posted before the conflict is reported. If the comment
-cannot be posted, the error says so and asks for the comment to be added by hand.
+Once GitHub has answered the repair's write with success, the repair has landed, at least in
+part, so the comment is posted at once — before fl checks the answer or reads the timeline and
+edit history again. If that check fails, or the repair crossed someone else's change (see
+[Conflicts](#conflicts)), the error says so and also says whether the comment was posted; if the
+comment could not be posted, the error asks for it to be added by hand.
 
 A repair refuses an issue whose block is missing, damaged, of an unknown format, or names a
 state that does not exist: it has nothing to rewrite from. Restore the block from the issue's
@@ -151,6 +163,12 @@ edit history on GitHub first — or, if the issue was never fl's, remove its fl 
 It also refuses a pull request, a deleted issue and a transferred one.
 
 ## Conflicts
+
+**Status: unmeasured.** The live tests (below) have not yet been run against GitHub, so
+conflict detection, and the basics it rests on — GitHub returning a body and a title exactly as
+fl sent them, the `labels=a,b` list filter meaning "both labels", and the edit-history model
+below — are unmeasured until they are. The owner runs them against a private throwaway
+repository.
 
 GitHub has no conditional update, so fl cannot prevent two writers from crossing. It detects
 it, and a write that crossed another is a `Conflict` error, never a success. Two checks make
@@ -172,8 +190,8 @@ Either way, the other change has already landed: read the item again, check it, 
 After the second kind of conflict fl's own write has landed as well, and the next read reports
 any disagreement as diverged.
 
-The detection rests on a model of what GitHub records, and parts of that model are not yet
-measured against GitHub itself:
+The detection rests on a model of what GitHub records, none of it yet measured against
+GitHub itself:
 
 - **The total count.** fl counts edits by the edit history's total count, and takes that
   count to include every entry.
@@ -193,7 +211,7 @@ measured against GitHub itself:
 - **Line endings.** fl takes a body rewrite that only changes line endings to count as an
   edit. If GitHub records none for it, someone else's edit in the same window can be missed.
 
-The live tests (below) check the total count on every read, the first-edit model, one
+Once run, the live tests (below) check the total count on every read, the first-edit model, one
 timeline event for each label added or removed, each close, each reopen and each retitle,
 and the lag, by reading at once after each of fl's writes and again two seconds later. They
 also count lost updates under concurrent writers over repeated rounds. For line endings they
@@ -231,8 +249,10 @@ old name still resolve, at the cost of one lookup each.
 
 **A reused old name.** A different node id means the configured name now reaches another
 repository — someone created a new one at the old name. fl refuses every command that uses the
-tracker until the binding is corrected. A URL under an old name that now reaches another
-repository is refused as not owned, and the message says why.
+tracker until the binding is corrected. A URL under another repository's name is refused as
+not owned, and the message says what fl found: that GitHub leads the name to a repository
+under another name, or that the name is simply another repository. fl does not know a
+repository's past names, so it cannot say whether that name was once this repository's.
 
 **Deleted and transferred issues.** A deleted issue is reported as deleted, and a transferred
 one as moved, naming where it went; neither is "not found".
@@ -248,10 +268,11 @@ is not used, because its index lags and promises no complete result.
 Each create carries a key fl mints, stored in the block. If GitHub's answer to a create is
 lost — a server error, or the connection dropping before an answer — the issue may exist
 anyway, so fl searches the repository's fl issues for that key, up to three times a couple of
-seconds apart, before it sends the create once more. If that second attempt is answered with
-a server error, or its connection drops, the error says to list the repository's fl issues
-before retrying. An error GitHub states outright — a rate limit, a refused credential, a
-rejected request — is reported as itself, without that advice.
+seconds apart, before it sends the create once more. From the first lost answer on, fl cannot
+know whether the issue exists, so every later error carries the advice to list the
+repository's fl issues before retrying: a failed search, and any failure of the second
+attempt — a server error, a dropped connection, a rate limit, a refused credential or a
+rejected request. A plain retry could otherwise make a duplicate.
 
 Once GitHub has answered a create with success, fl never sends it again, even if the answer's
 body could not be read: the issue exists. If fl then cannot find it by its key either, it
@@ -295,6 +316,10 @@ duplicate. `fl record list` and `fl finding list`, or GitHub's issue list filter
   `github.com` URLs, so it is not a way to reach GitHub Enterprise Server.
 
 ## The live tests
+
+**Status: not yet run.** None of the tests below has been run against GitHub yet, so
+everything they check is unmeasured until they are. The owner runs them against a private
+throwaway repository.
 
 The tests that run in CI use an in-process fake GitHub. It proves the structure, not how
 GitHub behaves, so three more tests in `crates/github/tests/live.rs` run against GitHub

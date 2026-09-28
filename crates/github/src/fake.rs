@@ -73,6 +73,11 @@ pub struct State {
     pub hang_up_after_create: bool,
     /// The create answers 502 and nothing lands.
     pub fail_before_create: bool,
+    /// The next comment answers 500 and is not posted. One-shot.
+    pub fail_comment_next: bool,
+    /// The next create that `fail_before_create` does not fail answers 403
+    /// with GitHub's rate-limit headers, and nothing lands. One-shot.
+    pub rate_limited_next_create: bool,
     pub foreign_label_on_next_patch: bool,
     pub foreign_edit_on_next_patch: bool,
     /// The next request answers 502 with an HTML body — what a load
@@ -596,6 +601,13 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             if std::mem::take(&mut s.fail_before_create) {
                 return answer(502, json!({"message": "fake failure before the create"}));
             }
+            if std::mem::take(&mut s.rate_limited_next_create) {
+                let mut a = answer(403, json!({"message": "API rate limit exceeded"}));
+                a.headers.push(("x-ratelimit-remaining".into(), "0".into()));
+                a.headers
+                    .push(("x-ratelimit-reset".into(), "1700000000".into()));
+                return a;
+            }
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let n = s.next_number;
             s.next_number += 1;
@@ -714,6 +726,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             }
         }
         ("POST", ["repos", o, r, "issues", n, "comments"]) if s.is_bound(o, r) => {
+            if std::mem::take(&mut s.fail_comment_next) {
+                return answer(500, json!({"message": "fake comment failure"}));
+            }
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             match n.parse::<u64>().ok().and_then(|n| s.issues.get_mut(&n)) {
                 None => answer(404, json!({"message": "Not Found"})),

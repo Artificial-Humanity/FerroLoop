@@ -108,21 +108,22 @@ fn backend(msg: String) -> StoreError {
     StoreError::Backend(msg)
 }
 
-/// The resend inside `after_ambiguous_create` gets the "list before
-/// retrying" advice ONLY for a transport failure — the one case where fl
-/// genuinely cannot tell whether this second attempt is about to duplicate
-/// the first (fix round 1, item 5b). Any other error — a credential
-/// problem, say — is not about that ambiguity, and naming it "GitHub could
-/// not be reached" would misreport it; it passes through with its own
-/// variant untouched (fix round 2, item 3).
-fn wrap_resend_error(e: StoreError) -> StoreError {
-    match e {
-        e @ StoreError::Unreachable { .. } => backend(format!(
-            "GitHub could not be reached to retry an issue create a second time ({e}). List \
-             the repository's fl issues before retrying, so the retry makes no duplicate"
-        )),
-        other => other,
-    }
+/// ⚠ Every error inside `after_ambiguous_create` — a failed search for the
+/// create key, and ANY failure of the resend (a transport failure, a rate
+/// limit, a refused credential, a rejected request) — gets the "list before
+/// retrying" advice (final review, item 2). The FIRST attempt failed
+/// ambiguously (a 5xx, or the connection dropping), so by then fl cannot
+/// know whether the issue exists, whatever the later error is about: a plain
+/// "retry" would make a duplicate whenever the first attempt had landed.
+/// (Earlier rounds wrapped only a transport failure here, reading the other
+/// errors as unrelated to that ambiguity; they are not, because the
+/// ambiguity comes from the first attempt, not from the error.)
+fn after_ambiguous_failure(step: &str, e: StoreError) -> StoreError {
+    backend(format!(
+        "an issue create failed in a way that may still have created the issue, and then \
+         {step} ({e}). List the repository's fl issues before retrying, so the retry makes no \
+         duplicate"
+    ))
 }
 
 fn text(v: &Value, k: &str) -> Result<String, StoreError> {
@@ -334,7 +335,21 @@ impl GithubTracker {
         }
         Ok(match read_repo(&self.client, &name)? {
             Some((r, _)) if r.node_id == self.repo.node_id => Owner::Ours(n),
-            Some(_) => Owner::Elsewhere(Some(format!("`{name}` now names a different repository"))),
+            // ⚠ "Now" only when GitHub led the name somewhere under another
+            // name — a redirect after a rename or a transfer (final review,
+            // item 6). A repository answering under the name itself is
+            // just another repository: fl cannot tell a reused old name of
+            // this one from a name it never had, so it claims neither.
+            Some((r, _)) if !r.full_name.eq_ignore_ascii_case(&name) => {
+                Owner::Elsewhere(Some(format!(
+                    "`{name}` now leads to `{}`, a different repository from the bound one",
+                    r.full_name
+                )))
+            }
+            Some(_) => Owner::Elsewhere(Some(format!(
+                "`{name}` is another repository, not the bound `{}`",
+                self.repo.full_name
+            ))),
             None => Owner::Elsewhere(None),
         })
     }
@@ -521,6 +536,19 @@ impl GithubTracker {
                         detail: "its kind label and its block disagree".into(),
                     });
                 }
+                // ⚠ Not `Diverged`: its remedy is `fl github repair`, which
+                // refuses a pull request (final review, item 7). The remedy
+                // that works is named instead.
+                Read::NotFl(_) if issue.is_pull_request => {
+                    return Err(backend(format!(
+                        "{} is a pull request carrying fl labels, so fl cannot list the {}s \
+                         of {}: fl keeps items only in issues, and `fl github repair` does not \
+                         rewrite a pull request. Remove its fl labels",
+                        issue.url,
+                        kind.as_wire(),
+                        self.repo.full_name
+                    )));
+                }
                 Read::NotFl(what) => {
                     return Err(StoreError::Diverged {
                         id: issue.url.clone(),
@@ -575,6 +603,17 @@ impl GithubTracker {
                 "a title of {} characters is longer than GitHub's limit of {TITLE_MAX}; \
                  shorten it",
                 title.chars().count()
+            )));
+        }
+        // ⚠ Before anything is sent (final review, item 8): GitHub may trim
+        // a title, and the check that the create came back as sent would
+        // then fail AFTER the issue exists — a landed create reported as an
+        // error. (GitHub's trimming is unmeasured; refusing costs nothing.)
+        if title.trim() != title {
+            return Err(backend(format!(
+                "the title {title:?} starts or ends with whitespace, which GitHub may trim, so \
+                 fl could not confirm the issue it creates. Remove the leading and trailing \
+                 whitespace"
             )));
         }
         let (state, _) = meta::projection(kind, &meta.state);
@@ -659,7 +698,10 @@ impl GithubTracker {
         path: &str,
         sent: &Value,
     ) -> Result<IssueView, StoreError> {
-        if let Some(found) = self.search_by_create_key(kind, &meta.create_key)? {
+        let searched = self
+            .search_by_create_key(kind, &meta.create_key)
+            .map_err(|e| after_ambiguous_failure("searching for it by its create key failed", e))?;
+        if let Some(found) = searched {
             return Ok(found);
         }
         // ⚠ `send_unchecked_json`, not `send` (fix round 3, item 1): the
@@ -681,17 +723,15 @@ impl GithubTracker {
                  repository's fl issues before retrying, so the retry makes no duplicate",
                 r.status
             ))),
-            // ⚠ A transport failure here gets the SAME advice as a bad
-            // status (fix round 1, item 5b): the search already came up
-            // empty, so fl cannot tell whether THIS attempt is about to
-            // duplicate an issue the first attempt actually made — only a
-            // fresh list can settle that, same as a plain failed retry.
-            // Any OTHER kind of error (a credential problem, say) is not
-            // about that ambiguity at all — GitHub never answered anything
-            // here, 2xx or otherwise — and passes through unchanged (fix
-            // round 2, item 3) — `wrap_resend_error` draws exactly that
-            // line, and only for a failure BEFORE any 2xx.
-            Err(e) => Err(wrap_resend_error(e)),
+            // ⚠ Every failure of the resend gets the SAME advice as a bad
+            // status (final review, item 2): the first attempt's fate is
+            // unknown, so whatever stopped this one — a dropped connection,
+            // a rate limit, a refused credential — fl cannot say whether the
+            // issue exists. Only a fresh list can settle that.
+            Err(e) => Err(after_ambiguous_failure(
+                "sending it a second time failed",
+                e,
+            )),
         }
     }
 
@@ -1145,20 +1185,11 @@ impl GithubTracker {
                 r.status
             )));
         }
-        let back = IssueView::from_json(&r.body)?;
-        check_written(
-            &back,
-            &issue.title,
-            &labels,
-            &issue.body.replace("\r\n", "\n"),
-            state,
-            reason,
-        )?;
-        let after = self.window(n)?;
-        // ⚠ The repair has landed either way, so the comment naming who ran
-        // it is posted BEFORE a conflict is returned: a rerun would find the
-        // issue consistent and post nothing, losing the record.
-        let crossed = self.check_window(id, &before, &after, &issue, &back);
+        // ⚠ The PATCH answered 200, so the repair has landed, at least in
+        // part: the comment naming who ran it is posted NOW, before anything
+        // that could fail — reading the answer, checking it, the window. A
+        // rerun after such a failure would find the issue consistent and
+        // post nothing, losing the record (final review, item 3).
         let note = json!({"body": format!(
             "`fl github repair`: the fl labels and the open/closed status were rewritten from \
              fl's record (state `{}`) by {by}.",
@@ -1173,24 +1204,43 @@ impl GithubTracker {
             Ok(c) => Some(format!("GitHub answered {}", c.status)),
             Err(e) => Some(e.to_string()),
         };
-        match (crossed, comment_failed) {
-            (Err(StoreError::Conflict { id, detail }), Some(why)) => {
-                return Err(StoreError::Conflict {
-                    id,
-                    detail: format!(
-                        "{detail}; and the comment recording that {by} ran the repair was not \
-                         posted ({why}) — add that comment by hand"
-                    ),
-                });
-            }
-            (Err(e), _) => return Err(e),
-            (Ok(()), Some(why)) => {
+        let checked = IssueView::from_json(&r.body).and_then(|back| {
+            check_written(
+                &back,
+                &issue.title,
+                &labels,
+                &issue.body.replace("\r\n", "\n"),
+                state,
+                reason,
+            )?;
+            let after = self.window(n)?;
+            self.check_window(id, &before, &after, &issue, &back)
+        });
+        let comment = match &comment_failed {
+            None => format!("the comment recording that {by} ran the repair was posted"),
+            Some(why) => format!(
+                "the comment recording that {by} ran the repair was not posted ({why}) — add \
+                 that comment by hand"
+            ),
+        };
+        match (checked, comment_failed) {
+            (Ok(()), None) => {}
+            (Ok(()), Some(_)) => {
                 return Err(backend(format!(
-                    "the repair of {id} was written, but the comment that records who ran it \
-                     was not posted ({why}); add that comment by hand"
+                    "the repair of {id} was written, but {comment}"
                 )));
             }
-            (Ok(()), None) => {}
+            (Err(StoreError::Conflict { id, detail }), _) => {
+                return Err(StoreError::Conflict {
+                    id,
+                    detail: format!("{detail}; {comment}"),
+                });
+            }
+            (Err(e), _) => {
+                return Err(backend(format!(
+                    "GitHub answered 200 to the repair of {id}, but then: {e}; {comment}"
+                )));
+            }
         }
         Ok(Repaired {
             number: n,
@@ -1684,32 +1734,69 @@ mod tests {
         );
     }
 
-    /// Fix round 2, item 3: unit-level, no fake — `wrap_resend_error`'s own
-    /// contract. A `Credential` error is not about whether the resend's
-    /// write is ambiguous; it must keep its own variant, unlike a transport
-    /// failure (fix round 1, item 5b), which gets the retry advice. This
-    /// case is not provoked through the fake because the fake's create
-    /// route has no path that answers 401 specifically on a resend without
-    /// also changing what the first attempt saw — a knob built only to
-    /// force one match arm would test the knob, not the guard.
+    /// Final review, item 2: unit-level — once the first attempt was
+    /// ambiguous, EVERY later error carries the advice, whatever its kind.
+    /// (Fix round 2, item 3 had a credential error pass through unchanged;
+    /// the first attempt's fate is unknown regardless of what failed next.)
     #[test]
-    fn the_resends_own_error_is_wrapped_only_when_it_is_a_transport_failure() {
-        let credential = StoreError::Credential("bad token".into());
-        match wrap_resend_error(credential) {
-            StoreError::Credential(msg) => assert_eq!(msg, "bad token"),
-            other => panic!("a non-transport error must pass through unchanged: {other:?}"),
-        }
-        let unreachable = StoreError::Unreachable {
-            store: "http://127.0.0.1:1".into(),
-            cause: "boom".into(),
-        };
-        match wrap_resend_error(unreachable) {
-            StoreError::Backend(msg) => assert!(
-                msg.contains("List the repository's fl issues before retrying"),
+    fn every_error_after_an_ambiguous_create_carries_the_advice() {
+        for e in [
+            StoreError::Credential("bad token".into()),
+            StoreError::RateLimited {
+                reset: "1700000000 (unix seconds)".into(),
+            },
+            StoreError::Unreachable {
+                store: "http://127.0.0.1:1".into(),
+                cause: "boom".into(),
+            },
+            StoreError::Backend("GitHub answered 422".into()),
+        ] {
+            let shown = e.to_string();
+            let msg = after_ambiguous_failure("sending it a second time failed", e).to_string();
+            assert!(
+                msg.contains("List the repository's fl issues before retrying")
+                    && msg.contains(&shown),
                 "{msg}"
-            ),
-            other => panic!("a transport failure must get the retry advice: {other:?}"),
+            );
         }
+    }
+
+    /// Final review, item 2 (the reviewer's probe): the first create lands
+    /// but its answer is lost, and the search for its key then fails. The
+    /// error must not say a bare "retry": a retry would make issue #2.
+    #[test]
+    fn a_failed_key_search_after_an_ambiguous_create_carries_the_advice() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().hang_up_after_create = true;
+        fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 1));
+        let err = t.add_record(&p(), "t").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("List the repository's fl issues before retrying")
+                && msg.contains("searching for it by its create key failed"),
+            "{msg}"
+        );
+        assert_eq!(fake.issue_count(), 1, "the first create landed; no resend");
+    }
+
+    /// Final review, item 2: a resend refused by the rate limit after an
+    /// ambiguous first attempt carries the advice too — the first attempt
+    /// may have landed.
+    #[test]
+    fn a_rate_limited_resend_after_an_ambiguous_create_carries_the_advice() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().fail_before_create = true;
+        fake.state().rate_limited_next_create = true;
+        let err = t.add_record(&p(), "t").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("List the repository's fl issues before retrying")
+                && msg.contains("rate limit"),
+            "{msg}"
+        );
+        assert_eq!(fake.issue_count(), 0);
     }
 
     /// ⚠ The engine reads, runs gates, then writes. A finding withdrawn by
@@ -1941,6 +2028,50 @@ mod tests {
         }
     }
 
+    /// Final review, item 7: a pull request carrying fl labels stops a list
+    /// with the remedy that works — removing its fl labels — never
+    /// `fl github repair`, which refuses pull requests.
+    #[test]
+    fn a_pull_request_with_fl_labels_in_a_list_names_removing_the_labels() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record(&p(), "t").unwrap();
+        fake.plain_issue(&["fl:record", "fl:record/todo"], true);
+        let msg = t.list_records(&p()).unwrap_err().to_string();
+        assert!(
+            msg.contains("is a pull request") && msg.contains("Remove its fl labels"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Run `fl github repair"),
+            "the remedy must not be the command that refuses a pull request: {msg}"
+        );
+    }
+
+    /// Final review, item 8.
+    #[test]
+    fn a_title_with_leading_or_trailing_whitespace_is_refused_before_anything_is_sent() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        for title in [" t", "t ", "\tt", "t\n", " "] {
+            let err = t.add_record(&p(), title).unwrap_err();
+            assert!(
+                err.to_string().contains("starts or ends with whitespace"),
+                "{title:?}: {err}"
+            );
+        }
+        assert!(
+            !fake
+                .state()
+                .requests
+                .iter()
+                .any(|r| r.starts_with("POST /repos/acme/widgets/issues")),
+            "nothing may be sent"
+        );
+        assert_eq!(fake.issue_count(), 0);
+        t.add_record(&p(), "a title with inner  spaces").unwrap();
+    }
+
     #[test]
     fn a_title_over_the_limit_is_refused_before_anything_is_sent() {
         let fake = FakeGithub::start("acme/widgets");
@@ -2101,8 +2232,8 @@ mod tests {
     /// refused with the advice and never leads to another send. Before the
     /// fix, the resend used the strict `send`, so a 201 with an unreadable
     /// body made `client.send` itself fail with a plain "…not JSON…"
-    /// `Backend` error that `wrap_resend_error`'s `other => other` arm let
-    /// straight through — no advice, even though the create had already
+    /// `Backend` error that the resend's error wrapper's `other => other` arm
+    /// let straight through — no advice, even though the create had already
     /// landed (the reviewer's probe: `fail_before_create` +
     /// `unreadable_create_body_next` → that error, `issue_count == 1`).
     /// Combined with `omit_from_list` here so the follow-up search also
@@ -2279,8 +2410,46 @@ mod tests {
         let err = t.get_record(&r).unwrap_err();
         assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
         assert!(
-            err.to_string().contains("now names a different repository"),
+            err.to_string()
+                .contains("`acme/widgets` is another repository, not the bound `acme/gadgets`"),
             "{err}"
+        );
+    }
+
+    /// Final review, item 6: an unrelated repository is "not the bound
+    /// one" — never "now names a different repository", which claims a
+    /// history fl does not know. "Now" is kept for a name GitHub redirects
+    /// to a repository under another name.
+    #[test]
+    fn a_url_of_another_repository_says_what_it_is_without_claiming_a_rename() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.reuse_name("other/repo");
+        let err = t
+            .get_record(&RecordId(
+                Iri::parse("https://github.com/other/repo/issues/1").unwrap(),
+            ))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+        assert!(
+            msg.contains("`other/repo` is another repository, not the bound `acme/widgets`")
+                && !msg.contains("now"),
+            "{msg}"
+        );
+
+        fake.reuse_name("other/new");
+        let id = fake.state().repos.last().unwrap().id;
+        fake.state().redirects.insert("other/old".into(), id);
+        let msg = t
+            .get_record(&RecordId(
+                Iri::parse("https://github.com/other/old/issues/1").unwrap(),
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("`other/old` now leads to `other/new`, a different repository"),
+            "{msg}"
         );
     }
 
@@ -2665,6 +2834,51 @@ mod tests {
             comments.iter().any(|c| c.contains("by owner")),
             "{comments:?}"
         );
+    }
+
+    /// Final review, item 3: the repair PATCH answered 200, then its check
+    /// failed (GitHub kept the old labels). The repair landed at least in
+    /// part, so the comment is posted anyway, and the error says it was — a
+    /// rerun could otherwise find nothing to do and never post it.
+    #[test]
+    fn a_repair_whose_check_fails_after_the_patch_still_records_who_ran_it() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| {
+            i.labels = vec!["fl:record".into(), "fl:record/done".into()]
+        });
+        fake.state().drop_labels = true;
+        let msg = t.repair(r.iri(), "owner").unwrap_err().to_string();
+        assert!(
+            msg.contains("did not apply") && msg.contains("ran the repair was posted"),
+            "{msg}"
+        );
+        let comments = fake.issue(1).comments;
+        assert_eq!(comments.len(), 1, "{comments:?}");
+        assert!(comments[0].contains("by owner"), "{comments:?}");
+    }
+
+    /// Final review, item 3: when the comment fails as well as the check,
+    /// the error says to add the comment by hand.
+    #[test]
+    fn a_repair_whose_check_and_comment_both_fail_says_to_add_the_comment_by_hand() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| {
+            i.labels = vec!["fl:record".into(), "fl:record/done".into()]
+        });
+        fake.state().drop_labels = true;
+        fake.state().fail_comment_next = true;
+        let msg = t.repair(r.iri(), "owner").unwrap_err().to_string();
+        assert!(
+            msg.contains("did not apply")
+                && msg.contains("was not posted (GitHub answered 500)")
+                && msg.contains("add that comment by hand"),
+            "{msg}"
+        );
+        assert!(fake.issue(1).comments.is_empty());
     }
 
     /// Fix round 1, items 6 and 7: a timeline item fl cannot classify is an

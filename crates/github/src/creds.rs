@@ -155,8 +155,10 @@ impl AppCredentials {
         let jwt = self.jwt(now)?;
         let url = format!("{}/repos/{}/installation", self.api, self.repo);
         let mut found = send(&self.agent, Method::Get, &url, &jwt, None, &self.api, true)?;
-        // After a rename GitHub redirects the old name. Follow ONE redirect,
-        // and only on this API's own origin: the JWT goes where it points.
+        // After a rename GitHub is taken to redirect the installation lookup
+        // of the old name — unmeasured; no live test checks it yet. Follow
+        // ONE redirect, and only on this API's own origin: the JWT goes
+        // where it points.
         if matches!(found.status, 301 | 302 | 307 | 308) {
             let to = found
                 .location
