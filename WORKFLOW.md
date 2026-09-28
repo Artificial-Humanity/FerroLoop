@@ -11,7 +11,9 @@ Follow [AGENTS.md](AGENTS.md) for repository rules and git configuration.
    then commit the fixes.
 4. Push the branch and open a pull request against `main`. CI runs the verification
    trio on the pull request; the `test, clippy, fmt` check must pass before the merge
-   button is available.
+   button is available. A pull request opened ready for review (not a draft) is put in
+   the owner's review queue and assigned to them by
+   [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml).
 5. The owner reviews, approves, and merges. Merging happens through the pull request. A
    direct push to `main` is not the route, and the ruleset refuses one.
 
