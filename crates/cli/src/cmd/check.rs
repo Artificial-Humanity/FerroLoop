@@ -1,10 +1,10 @@
+use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::Result;
 use clap::Args;
 use fl_core::ids::{ProjectId, RecordId};
 use fl_core::{Iri, Kind};
 use fl_exec::evaluate::evaluate_transition;
-use fl_store::RedbStore;
 
 #[derive(Args)]
 pub struct Cmd {
@@ -39,17 +39,18 @@ impl Cmd {
     }
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
+    let store = ctx.store;
     let project = ProjectId(refs::resolve(
-        store,
+        ctx.handles,
         store.label(),
         Kind::Project,
         &cmd.project,
     )?);
     let record = match &cmd.record {
         Some(r) => Some(RecordId(refs::resolve(
-            store,
-            store.label(),
+            ctx.handles,
+            &ctx.tracker_label,
             Kind::Record,
             r,
         )?)),

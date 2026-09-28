@@ -14,8 +14,31 @@ pub enum Ref {
 impl std::str::FromStr for Ref {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
-        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-            return s
+        // `owner/repo#41` names that repository's issue (GitHub tracker spec
+        // §2.1). The tracker answers `NotOwned` for another repository.
+        if let Some((repo, n)) = s.split_once('#')
+            && repo.contains('/')
+            && !repo.contains(':')
+            && !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+        {
+            // Shaped like `owner/repo#41` and not an IRI (no scheme): the
+            // repository must pass the same check as the config's
+            // `github = "owner/repo"`.
+            if !crate::config::is_owner_repo(repo) {
+                return Err(format!(
+                    "`{s}` names an issue, but `{repo}` is not a repository: write it as \
+                     `owner/repo#{n}`, with both parts named"
+                ));
+            }
+            return Iri::parse(&format!("https://github.com/{repo}/issues/{n}"))
+                .map(Ref::Iri)
+                .map_err(|e| format!("`{s}` names an issue fl cannot address: {e}"));
+        }
+        // A handle may be written `#41`, as GitHub writes an issue number.
+        let digits = s.strip_prefix('#').unwrap_or(s);
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return digits
                 .parse::<u64>()
                 .map(Ref::Handle)
                 .map_err(|_| format!("`{s}` is too large to be a handle"));
@@ -41,7 +64,7 @@ impl std::fmt::Display for Ref {
 
 /// The id `r` names. A handle resolves only in `store`; an IRI is returned
 /// as given, and the store checks ownership when it is asked for the item.
-pub fn resolve(store: &impl Handles, label: &str, kind: Kind, r: &Ref) -> Result<Iri> {
+pub fn resolve(store: &dyn Handles, label: &str, kind: Kind, r: &Ref) -> Result<Iri> {
     match r {
         Ref::Iri(i) => Ok(i.clone()),
         Ref::Handle(n) => match store.resolve_handle(kind, *n)? {
@@ -55,7 +78,7 @@ pub fn resolve(store: &impl Handles, label: &str, kind: Kind, r: &Ref) -> Result
 }
 
 /// How a person reads an id: its handle, or the full IRI if it has none here.
-pub fn show(store: &impl Handles, kind: Kind, id: &Iri) -> Result<String> {
+pub fn show(store: &dyn Handles, kind: Kind, id: &Iri) -> Result<String> {
     Ok(match store.handle_of(kind, id)? {
         Some(n) => n.to_string(),
         None => id.to_string(),
@@ -81,4 +104,44 @@ pub fn iris(refs: &[&Ref]) -> Vec<Iri> {
 /// item 1).
 pub fn has_handle(refs: &[&Ref]) -> bool {
     refs.iter().any(|r| matches!(r, Ref::Handle(_)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(s: &str) -> Result<Ref, String> {
+        s.parse()
+    }
+
+    #[test]
+    fn owner_repo_hash_n_is_that_issue_url() {
+        match parse("acme/widgets#41") {
+            Ok(Ref::Iri(i)) => assert_eq!(i.as_str(), "https://github.com/acme/widgets/issues/41"),
+            other => panic!("expected the issue URL, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_hash_handle_is_a_handle() {
+        assert!(matches!(parse("#41"), Ok(Ref::Handle(41))));
+        assert!(matches!(parse("41"), Ok(Ref::Handle(41))));
+    }
+
+    #[test]
+    fn an_issue_ref_with_an_empty_owner_or_repo_is_refused() {
+        for s in ["/#1", "a/#1", "/b#1", "a/b/c#1", "a b/c#1"] {
+            let err = parse(s).expect_err(s);
+            assert!(err.contains("owner/repo#1"), "{s}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_iri_with_a_fragment_is_still_an_iri() {
+        // A scheme makes it an IRI, even when its tail looks like `a/b#1`.
+        match parse("tag:acme/widgets#1") {
+            Ok(Ref::Iri(i)) => assert_eq!(i.as_str(), "tag:acme/widgets#1"),
+            other => panic!("expected the IRI as typed, got {other:?}"),
+        }
+    }
 }

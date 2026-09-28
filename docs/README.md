@@ -11,6 +11,10 @@ File naming in this directory follows
 
 * [getting-started.md](getting-started.md) — build the CLI, gate a real action, and take a
   claim through the finding protocol, with real commands and their output.
+* [sharing-gates.md](sharing-gates.md) — share a project's gates with other machines through
+  a committed manifest: export, import and check.
+* [github-tracker.md](github-tracker.md) — keep a project's records and findings in a GitHub
+  repository's Issues: binding, credentials, repair, conflicts and limits.
 
 No anchor document exists yet.
 

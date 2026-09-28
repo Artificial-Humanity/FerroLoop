@@ -1,13 +1,13 @@
+use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Args;
 use fl_core::ids::RecordId;
 use fl_core::log::{Attempt, AttemptStatus};
-use fl_core::store::{Catalog, Ledger, Tracker};
+use fl_core::store::{Catalog, Ledger};
 use fl_core::{Iri, Kind};
 use fl_exec::adapters::ClaudeAdapter;
 use fl_exec::runner::{AttemptSpec, Runner};
-use fl_store::RedbStore;
 
 const KNOWN_ADAPTERS: &str = "claude";
 
@@ -44,7 +44,8 @@ impl Cmd {
     }
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
+    let store = ctx.store;
     if cmd.adapter != "claude" {
         bail!(
             "`{}` is not a known adapter. Milestone 1 ships: {KNOWN_ADAPTERS}.",
@@ -52,24 +53,24 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
         );
     }
     let id = RecordId(refs::resolve(
-        store,
-        store.label(),
+        ctx.handles,
+        &ctx.tracker_label,
         Kind::Record,
         &cmd.record,
     )?);
-    let Some(record) = store.get_record(&id)? else {
+    let Some(record) = ctx.tracker.get_record(&id)? else {
         bail!(
             "`{}` is not a record in the store at {}. Run `fl record list --project <project>` \
              to see the ones that exist.",
             cmd.record,
-            store.label()
+            ctx.tracker_label
         );
     };
     let Some(project) = store.get_project(&record.project)? else {
         bail!(
             "record {} belongs to project {}, which no longer exists.",
             cmd.record,
-            refs::show(store, Kind::Project, record.project.iri())?
+            refs::show(ctx.handles, Kind::Project, record.project.iri())?
         );
     };
 

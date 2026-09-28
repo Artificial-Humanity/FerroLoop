@@ -338,6 +338,7 @@ mod tests {
     use fl_core::model::{GateDef, Project, Record, Transition};
     use fl_core::store::{Catalog, Ledger, StoreError, Tracker};
     use fl_core::verdict::FailReason;
+    use fl_core::{Iri, Kind};
     use std::fs;
     use std::process::Command;
 
@@ -463,6 +464,9 @@ mod tests {
         }
         fn list_transitions(&self, p: &ProjectId) -> Result<Vec<Transition>, StoreError> {
             self.0.list_transitions(p)
+        }
+        fn kind_of(&self, id: &Iri) -> Result<Kind, StoreError> {
+            self.0.kind_of(id)
         }
     }
 
@@ -692,6 +696,9 @@ mod tests {
             Err(broken())
         }
         fn list_transitions(&self, _: &ProjectId) -> Result<Vec<Transition>, StoreError> {
+            Err(broken())
+        }
+        fn kind_of(&self, _: &Iri) -> Result<Kind, StoreError> {
             Err(broken())
         }
     }

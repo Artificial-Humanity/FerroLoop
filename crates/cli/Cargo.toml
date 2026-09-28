@@ -13,14 +13,17 @@ path = "src/main.rs"
 fl-core = { path = "../core" }
 fl-store = { path = "../store" }
 fl-exec = { path = "../exec" }
+fl-github = { path = "../github" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+ureq.workspace = true
 
 [dev-dependencies]
+fl-github = { path = "../github", features = ["fake"] }
 tempfile.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true
