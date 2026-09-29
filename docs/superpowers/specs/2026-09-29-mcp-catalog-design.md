@@ -1,7 +1,7 @@
 # MCP catalog — design
 
 **Date:** 2026-09-29
-**Status:** Design, awaiting the owner's review. Sequenced after sub-projects 3 (GitHub ledger)
+**Status:** Approved by the owner 2026-09-29. Sequenced after sub-projects 3 (GitHub ledger)
 and 4 (routing and escalation). Not started.
 **Scope:** One committed catalog of the MCP servers a project uses, a read-only client for an
 MCP registry, and a writer that turns the catalog into each coding-agent CLI's own MCP
