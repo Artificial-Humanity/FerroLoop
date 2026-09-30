@@ -437,6 +437,25 @@ mod tests {
         assert!(matches!(err, StoreError::Tampered { .. }), "{err:?}");
     }
 
+    // Spec §1.3: every published entry carries an id (an entry with none is
+    // never published); one that arrives with none anyway is damage, not a
+    // legacy entry, and `merge` refuses it rather than silently keeping it.
+    #[test]
+    fn a_published_entry_with_no_id_is_a_backend_error() {
+        let (s, _p, g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        let mut headless = sample_record_run(1, &g, Some(&r));
+        headless.id = None;
+        remote.insert_run(headless);
+
+        let err = l.gate_runs(&g).unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
+    }
+
     #[test]
     fn an_attempts_path_count_merges_only_when_it_counts_the_same_paths() {
         for (count, merges) in [(1, true), (2, false)] {
@@ -463,6 +482,11 @@ mod tests {
 
     // Spec §2.5: ordered by `at`, then `id`. An entry from before ids has
     // neither, and is older than every entry that has them.
+    //
+    // ⚠ `skewed`'s id is the smallest of any ided entry here, but its `at`
+    // is the latest: sorting by id alone would place it right after `None`,
+    // so its position at the very end is what tells "by `at`, then id" apart
+    // from "by id".
     #[test]
     fn merged_entries_are_ordered_by_time_then_id_and_entries_without_ids_come_first() {
         let (s, _p, g, r) = world();
@@ -482,9 +506,15 @@ mod tests {
         same_time.at = late.at.clone();
         remote.insert_run(same_time.clone());
         remote.insert_run(elsewhere.clone());
+        let mut skewed = sample_record_run(1, &g, Some(&r));
+        skewed.at = Some(At::from_unix_millis(100));
+        l.append_gate_run(skewed.clone()).unwrap();
 
         let ids: Vec<Option<Iri>> = l.gate_runs(&g).unwrap().into_iter().map(|r| r.id).collect();
-        assert_eq!(ids, vec![None, elsewhere.id, same_time.id, late.id]);
+        assert_eq!(
+            ids,
+            vec![None, elsewhere.id, same_time.id, late.id, skewed.id]
+        );
     }
 
     // ⚠ Spec §2.5 (Invariant): unreachable is not empty.
@@ -582,6 +612,39 @@ mod tests {
                 entry: elsewhere.id.clone().unwrap(),
                 record: theirs,
             }]
+        );
+        assert!(
+            !s.is_published("R_1", elsewhere.id.as_ref().unwrap())
+                .unwrap()
+        );
+    }
+
+    // ⚠ Spec §2.1: the same skip-and-report applies to a pending ATTEMPT
+    // tied to a record another repository owns — not just to a run.
+    #[test]
+    fn a_pending_attempt_of_another_repository_is_skipped_and_reported_not_an_error() {
+        let (s, p, _g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        let theirs = remote.foreign_record();
+        let elsewhere = sample_attempt(1, &p, &theirs);
+        l.append_attempt(elsewhere.clone()).unwrap();
+
+        let flushed = l.flush(sample_decision(1, &r, vec![])).unwrap();
+
+        assert_eq!(
+            flushed.left_local,
+            vec![LeftLocal::OtherRepository {
+                entry: elsewhere.id.clone().unwrap(),
+                record: theirs,
+            }]
+        );
+        assert!(
+            remote.attempts(&p).unwrap().is_empty(),
+            "the foreign attempt was never published"
         );
         assert!(
             !s.is_published("R_1", elsewhere.id.as_ref().unwrap())
