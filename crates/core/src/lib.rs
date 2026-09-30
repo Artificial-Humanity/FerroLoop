@@ -6,6 +6,7 @@ pub mod at;
 #[cfg(any(test, feature = "conformance"))]
 #[doc(hidden)]
 pub mod conformance;
+pub mod decision;
 pub mod finding;
 pub mod ids;
 pub mod iri;
@@ -17,6 +18,7 @@ pub mod store;
 pub mod verdict;
 
 pub use at::{At, AtError};
+pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 pub use iri::{Iri, IriError};

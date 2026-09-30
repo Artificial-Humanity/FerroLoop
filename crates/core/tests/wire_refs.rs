@@ -153,6 +153,19 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
         paths_touched: PathsTouched::Listed(vec!["a.rs".into()]),
         output_excerpt: Some(String::new()),
     };
+    let decision = Decision {
+        id: iri(9),
+        at: At::from_unix_millis(3),
+        record: r.clone(),
+        finding: Some(f.clone()),
+        outcome: Outcome::Verify {
+            reproduction: g.clone(),
+            reproduction_passed: true,
+            regressions: vec![g.clone()],
+            closed: false,
+        },
+        rests_on: vec![iri(10)],
+    };
     assert_every_reference_refuses_a_handle("Project", &project, 1);
     assert_every_reference_refuses_a_handle("GateDef", &gate_def, 2);
     assert_every_reference_refuses_a_handle("Transition", &transition, 2);
@@ -160,4 +173,5 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
     assert_every_reference_refuses_a_handle("Finding", &finding, 5);
     assert_every_reference_refuses_a_handle("GateRun", &gate_run, 3);
     assert_every_reference_refuses_a_handle("Attempt", &attempt, 3);
+    assert_every_reference_refuses_a_handle("Decision", &decision, 6);
 }

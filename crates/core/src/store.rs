@@ -1,3 +1,4 @@
+use crate::decision::{Decision, Flushed};
 use crate::finding::Finding;
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use crate::iri::Iri;
@@ -259,6 +260,19 @@ pub trait Ledger {
     fn append_attempt(&self, attempt: Attempt) -> Result<(), StoreError>;
     fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError>;
     fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError>;
+
+    /// Publish a decision and the evidence it rests on (GitHub ledger spec
+    /// §1.4, §2.2).
+    ///
+    /// ⚠⚠ Call it BEFORE the state change the decision supports, and treat
+    /// an error as a refusal of the decision: no state change. A refused
+    /// decision is flushed too (decision 11).
+    ///
+    /// A ledger with nowhere to publish — every local store — does nothing,
+    /// which is this default.
+    fn flush(&self, _decision: Decision) -> Result<Flushed, StoreError> {
+        Ok(Flushed::NOTHING)
+    }
 }
 
 /// Short names a person types and reads (spec §4). Display only: a handle
@@ -551,5 +565,28 @@ mod tests {
             s.bound_node_id("ACME/widgets").unwrap().as_deref(),
             Some("R_1")
         );
+    }
+
+    // Spec §1.4: a ledger with nowhere to publish — every local store —
+    // answers a flush with `Nothing`, and changes nothing.
+    #[test]
+    fn a_local_store_has_nowhere_to_publish_so_its_flush_does_nothing() {
+        use crate::at::At;
+        use crate::decision::{Decision, Flushed, Outcome};
+        use crate::log::AttemptStatus;
+        let s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let d = Decision {
+            id: seq_iri(90),
+            at: At::from_unix_millis(1),
+            record: r,
+            finding: None,
+            outcome: Outcome::Attempt {
+                status: AttemptStatus::Completed,
+            },
+            rests_on: vec![],
+        };
+        assert_eq!(s.flush(d).unwrap(), Flushed::NOTHING);
     }
 }
