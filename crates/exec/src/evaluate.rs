@@ -252,13 +252,16 @@ fn project_of(catalog: &dyn Catalog, project: &ProjectId) -> Result<Project, Exe
 ///
 /// Applies staleness at [`Regret::Low`] — a bare gate run is not a
 /// transition, so it warns and never fails for staleness alone — and tags
-/// the appended [`GateRun`] with no record. This is what `attach_reproduction`
-/// and `verify_finding` use to run a gate ad hoc, outside any transition.
+/// the appended [`GateRun`] with `record`: `None` for `gate run`, which
+/// stays local; the finding's record for `attach_reproduction` and
+/// `verify_finding`, so the run is published with their decision (GitHub
+/// ledger spec §2.2, decision 7).
 pub fn run_single_gate(
     catalog: &dyn Catalog,
     ledger: &dyn Ledger,
     project: &ProjectId,
     gate: &GateId,
+    record: Option<&RecordId>,
 ) -> Result<GateReport, ExecError> {
     let proj = project_of(catalog, project)?;
     let root = Path::new(&proj.root);
@@ -271,7 +274,7 @@ pub fn run_single_gate(
     };
 
     let head = Git::head(root)?;
-    run_gate(catalog, ledger, root, &head, &def, Regret::Low, None)
+    run_gate(catalog, ledger, root, &head, &def, Regret::Low, record)
 }
 
 pub fn evaluate_transition(
@@ -489,7 +492,7 @@ mod tests {
         let p = setup(&s, d.path(), "true", "src/**/*.rs", Regret::Low);
         let g = s.list_gates(&p).unwrap()[0].id.clone();
 
-        let err = run_single_gate(&StampRefused(&s), &s, &p, &g)
+        let err = run_single_gate(&StampRefused(&s), &s, &p, &g, None)
             .expect_err("a pass whose mark was lost must not read as a clean pass");
 
         assert!(matches!(err, ExecError::Store(_)), "{err:?}");
@@ -797,8 +800,14 @@ mod tests {
     #[test]
     fn a_store_failure_is_reported_as_a_store_failure_and_never_as_git() {
         let store = BrokenStore;
-        let err = run_single_gate(&store, &store, &ProjectId(seq_iri(1)), &GateId(seq_iri(1)))
-            .expect_err("a broken store cannot produce a gate report");
+        let err = run_single_gate(
+            &store,
+            &store,
+            &ProjectId(seq_iri(1)),
+            &GateId(seq_iri(1)),
+            None,
+        )
+        .expect_err("a broken store cannot produce a gate report");
         assert!(
             matches!(err, ExecError::Store(_)),
             "a store failure surfaced as {err:?}"
