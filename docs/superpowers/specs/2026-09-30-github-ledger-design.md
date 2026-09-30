@@ -153,9 +153,18 @@ Every entry is appended to the local store exactly where it is appended today: `
 appends each run before its pass mark, and runs survive an evaluation that errors partway.
 *(Invariant — the local store keeps every run.)*
 
-A flush publishes every local entry that is tied to a record this binding owns (checked by
-repository `node_id`), carries an `id`, and is not yet published — and so also carries an
-attempt left behind by an earlier failed flush (decision 8).
+A flush publishes every local entry that is tied to a record this binding owns, carries an
+`id`, was recorded after the binding's **cut-over**, and is not yet published — and so also
+carries an attempt left behind by an earlier failed flush (decision 8).
+
+* **Ownership** is a local check, with no network: the record's IRI names this binding's
+  repository. An entry whose record another binding owns is skipped and reported, never an
+  error that blocks the decision.
+* **The cut-over** is recorded, per repository `node_id`, when the GitHub ledger is switched on
+  (`init`, §6.1). Entries recorded before it stay local: moving them is out of scope (§0.2).
+  Ids are UUID version 7, so "after the cut-over" is an id comparison.
+* Runs with no record are never candidates, so the set a flush scans stays bounded by what is
+  actually waiting.
 
 ### 2.2 Evidence before state
 
@@ -368,12 +377,13 @@ Run once per repository, by a person. It can be run again.
 2. Refuses if a branch named `fl` exists: git cannot hold both `fl` and `fl/ledger`.
 3. Creates the first commit — `format` and `README.md`, no parent, no `.github/` — through the
    REST Git Data API (trees, commits, refs; `createCommitOnBranch` needs an existing branch).
-4. Records that commit's id as `ledger_root`: in the local store, keyed by repository
+4. Records the cut-over (§2.1), and that commit's id as `ledger_root`: in the local store, keyed by repository
    `node_id`, and in the manifest, which becomes **format 2** exactly when it carries a root
    (the root names its repository's `node_id`; importing records it and refuses a different
    one). Every later export writes `ledger_root` from the store, resolving the project's
    repository through the config binding; an export that cannot tell the repository — under
-   `--db`, or for a store another IRI selected — refuses rather than drop the root. A store
+   `--db`, for a store another IRI selected, or when the store holds a root but no binding for
+   the configured name — refuses rather than drop the root. A store
    holding a root is store **format 4**, so an older fl, which could export without it, cannot
    open it. A new fl refuses a manifest format it does not know and says to upgrade; an older
    fl gives its own refusal. Format 1 manifests still import. The person commits the
@@ -467,8 +477,8 @@ kept by checking ownership against the local catalog.
 * Comment recovery, and marker de-duplication across pages.
 * Escaping: gate names containing `|`, backticks, `@`, `#`, `<!--` and newlines.
 * The 60,000-byte cap.
-* Disclosure by field — `output_excerpt` is `null`, an error's detail equals its class,
-  `paths_touched` is a number — and a scan of every published line and comment for absolute
+* Disclosure by field — `output_excerpt` is `null`, an error's detail is the fixed withheld
+  text, `paths_touched` is a number — and a scan of every published line and comment for absolute
   paths, `$HOME` and the hostname.
 * Both modes of §6.2, including a ruleset that is inactive or missing a rule.
 
