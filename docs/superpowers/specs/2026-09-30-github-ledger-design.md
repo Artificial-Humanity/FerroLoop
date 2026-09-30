@@ -47,8 +47,9 @@ invocation). Both are append-only evidence.
 1. **Purpose:** evidence visible on issues, evidence shared across machines, and a durable
    audit trail.
 2. **Disclosure:** on a repository that is not private, nothing machine-specific is
-   published: `output_excerpt` becomes `null`, an error's detail becomes its class, and
-   `paths_touched` becomes a count. Visibility is read live, and a failed read is an ERROR
+   published: `output_excerpt` becomes `null` (a run's and an attempt's), an error's detail is
+   withheld — a verdict carries no error class to publish instead, so the published copy says
+   only that the gate errored — and `paths_touched` becomes a count. Visibility is read live, and a failed read is an ERROR
    (§5). `internal` counts as not private, as in the tracker.
 3. **Reuse:** runs from other machines are stored and shown only. A transition still runs its
    own gates; fl does not accept another machine's pass in place of its own run.
@@ -105,8 +106,11 @@ Implements `Ledger` for mode B by routing between the local store and `GithubLed
 Entries written before this change have neither and are never published. A new `Decision`
 entry (§2.3) carries the same two fields.
 
-`GateRun.output_excerpt` becomes nullable on the wire, so a published entry can carry `null`
-(decision 2).
+So that a published copy reads back under decision 2: `GateRun.output_excerpt` and
+`Attempt.output_excerpt` become nullable on the wire, and `Attempt.paths_touched` holds either
+the list or a count. `id` and `at` are optional with a serde default, so entries stored before
+this change still load, and an older fl still reads new ones; `at` has one fixed-width RFC 3339
+spelling, so its string order is time order.
 
 ### 1.4 The `Ledger` trait
 
@@ -165,14 +169,14 @@ Flush sites:
 |---|---|
 | record move | inside `move_record`, after every covering transition is evaluated and before `set_record_state` — one flush per move, however many transitions |
 | `check --record` | at the end (no state change follows) |
-| `finding reproduce`, `finding verify` | before `update_finding`; the runs carry the finding's record |
+| `finding reproduce`, `finding verify` | before `update_finding`, or at the end when the verdict refuses and nothing is updated; the runs carry the finding's record |
 | attempt | after the local append; a failure does not refuse (§7) |
 
 A refused decision is flushed too (decision 11).
 
 ### 2.3 The `Decision` entry
 
-The flush commit also appends a `Decision` line: `id`, `at`, `by`, its kind (`move`,
+The flush commit also appends a `Decision` line: `id`, `at`, its kind (`move`,
 `check`, `reproduce`, `verify`, `attempt`), the record or finding, the outcome composed by
 the caller from the reports it already holds (the transitions evaluated and which refused; the
 states for a move; a verify's reproduction and regressions; an attempt's status), and the ids
@@ -191,8 +195,9 @@ decision before anything runs or is spent.
 ### 2.5 Reads
 
 Reads merge the local store and GitHub, de-duplicated by `id` and ordered by `at`, then `id`.
-The same `id` with different content is an ERROR — except the fields blanked on a
-non-private repository, which the local copy supplies.
+The same `id` with different content is an ERROR — except the fields decision 2 blanks, which
+the local copy supplies whatever the repository's visibility is now (it may have changed since
+the entry was published).
 
 * `gate_runs(gate)`: if GitHub cannot be read, an ERROR. Unreachable is not empty.
   *(Invariant.)*
@@ -245,8 +250,9 @@ quarantine.jsonl                    one line per quarantined entry
 5. The head moved: back to step 1, up to five tries. A timeout: back to step 1 — step 3 skips
    whatever landed, and when nothing is left fl makes no commit but still marks the entries
    published. Any other failure: an ERROR.
-6. Record the new head as the last seen, and mark the ids published, both keyed by repository
-   `node_id` in additive local tables.
+6. Record the new head as the last seen. `SplitLedger`, which knows what was pending, marks the
+   ids published once the remote publish returns. Both are kept keyed by repository `node_id`
+   in additive local tables.
 
 Two machines appending at once cannot both land a commit on the same head; the one refused
 reads again and adds only what is missing. No entry is lost or duplicated. *(Invariant.)*
@@ -363,9 +369,14 @@ Run once per repository, by a person. It can be run again.
 3. Creates the first commit — `format` and `README.md`, no parent, no `.github/` — through the
    REST Git Data API (trees, commits, refs; `createCommitOnBranch` needs an existing branch).
 4. Records that commit's id as `ledger_root`: in the local store, keyed by repository
-   `node_id`, and in the manifest, which becomes **format 2**. Every later export writes
-   `ledger_root` from the store, so it cannot be dropped. An older fl refuses a format 2
-   manifest and says to upgrade; format 1 manifests still import. The person commits the
+   `node_id`, and in the manifest, which becomes **format 2** exactly when it carries a root
+   (the root names its repository's `node_id`; importing records it and refuses a different
+   one). Every later export writes `ledger_root` from the store, resolving the project's
+   repository through the config binding; an export that cannot tell the repository — under
+   `--db`, or for a store another IRI selected — refuses rather than drop the root. A store
+   holding a root is store **format 4**, so an older fl, which could export without it, cannot
+   open it. A new fl refuses a manifest format it does not know and says to upgrade; an older
+   fl gives its own refusal. Format 1 manifests still import. The person commits the
    manifest, which is how every machine gets its anchor.
 5. If the branch already exists and the manifest lacks `ledger_root` — `init` stopped after
    step 3 — it walks to the branch's first commit and asks the person to confirm it is the one
