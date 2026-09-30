@@ -101,6 +101,22 @@ pub struct State {
     /// set changing while a multi-page read is under way (spec §3.7). Counts
     /// every list request across every `list()` call, both passes. One-shot.
     pub vanish_after_list_request: Option<(u32, u64)>,
+    /// GitHub's timeline lags a write: an event made by a request stays
+    /// out of that issue's timeline for this many timeline reads after it.
+    /// Measured live: a create's `labeled` events appeared 1.5-3.5 s after
+    /// the create was answered. Events made during a timeline read, and by
+    /// `web_edit`, are not lagged. A setting, not one-shot.
+    pub timeline_lag_reads: u32,
+    /// Event id → timeline reads left before it shows.
+    pub(crate) lag_left: BTreeMap<u64, u32>,
+    /// The next timeline read answers 502. One-shot.
+    pub fail_next_timeline: bool,
+    /// The same for the body's edit history: an entry made by a request
+    /// stays out of it for this many edit-history reads. Measured live: an
+    /// update's entries showed about 0.5 s after its timeline events did.
+    pub edit_lag_reads: u32,
+    /// Edit id → edit-history reads left before it shows.
+    pub(crate) edit_lag_left: BTreeMap<String, u32>,
     /// This issue exists (and a direct `GET` of it succeeds), but every
     /// issues-LIST answer omits it — simulating GitHub's list index lagging
     /// a create indefinitely, so a create-key search can never find it. Not
@@ -181,7 +197,24 @@ impl FakeGithub {
                     .unwrap_or_default();
                 let mut body = String::new();
                 let _ = std::io::Read::read_to_string(req.as_reader(), &mut body);
-                let answer = route(&mut st.lock().unwrap(), &method, &url, &auth, &body);
+                let answer = {
+                    let mut s = st.lock().unwrap();
+                    let first_new = s.next_event;
+                    let answer = route(&mut s, &method, &url, &auth, &body);
+                    let lag = s.timeline_lag_reads;
+                    if lag > 0 && !url.contains("/timeline") {
+                        for e in first_new..s.next_event {
+                            s.lag_left.insert(e, lag);
+                        }
+                    }
+                    let lag = s.edit_lag_reads;
+                    if lag > 0 && url != "/graphql" {
+                        for e in first_new..s.next_event {
+                            s.edit_lag_left.insert(format!("E_{e}"), lag);
+                        }
+                    }
+                    answer
+                };
                 if answer.hang_up {
                     // A broken answer after the server acted: the client
                     // fails at once with a transport error. (Dropping the
@@ -708,6 +741,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     a
                 }
                 Some(_) => {
+                    if std::mem::take(&mut s.fail_next_timeline) {
+                        return answer(502, json!({"message": "fake timeline failure"}));
+                    }
                     let n: u64 = n.parse().unwrap_or(0);
                     if std::mem::take(&mut s.foreign_label_on_next_timeline) {
                         let e = s.tick();
@@ -716,11 +752,14 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                         i.labels.push("bug".into());
                         i.events.push((e, "labeled".into()));
                     }
-                    let mut items: Vec<Value> = s.issues[&n]
-                        .events
-                        .iter()
-                        .map(|(id, kind)| json!({"id": id, "event": kind}))
-                        .collect();
+                    let (issues, lag_left) = (&s.issues, &mut s.lag_left);
+                    let mut items: Vec<Value> = Vec::new();
+                    for (id, kind) in &issues[&n].events {
+                        match lag_left.get_mut(id) {
+                            Some(left) if *left > 0 => *left -= 1,
+                            _ => items.push(json!({"id": id, "event": kind})),
+                        }
+                    }
                     if let Some(odd) = s.odd_timeline_item_next.take() {
                         items.push(odd);
                     }
@@ -869,14 +908,18 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                         json!({"data": {"repository": {"issue": null}}, "errors": [{"type": "NOT_FOUND"}]}),
                     );
                 };
+                let all = i.edits.clone();
+                let mut edits = Vec::new();
+                for e in all {
+                    match s.edit_lag_left.get_mut(&e) {
+                        Some(left) if *left > 0 => *left -= 1,
+                        _ => edits.push(e),
+                    }
+                }
                 let shown = s.edit_nodes_cap.unwrap_or(usize::MAX);
-                let mut nodes: Vec<Value> = i
-                    .edits
-                    .iter()
-                    .take(shown)
-                    .map(|e| json!({"id": e}))
-                    .collect();
-                let total = i.edits.len();
+                let mut nodes: Vec<Value> =
+                    edits.iter().take(shown).map(|e| json!({"id": e})).collect();
+                let total = edits.len();
                 if std::mem::take(&mut s.null_edit_node_next) {
                     nodes.push(Value::Null);
                 }

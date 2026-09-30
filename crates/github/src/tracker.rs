@@ -56,6 +56,10 @@ pub struct GithubTracker {
     seen: RefCell<BTreeMap<u64, Seen>>,
     /// How long to wait between searches for an ambiguous create's key.
     settle: std::time::Duration,
+    /// How long fl waits for GitHub's timeline and edit history to show its
+    /// own write, and how long it pauses between reads while it waits.
+    visible_within: std::time::Duration,
+    poll: std::time::Duration,
 }
 
 /// Timeline events that change what fl reads (spec §3.3). A comment or a
@@ -261,6 +265,8 @@ impl GithubTracker {
             kinds: RefCell::new(BTreeMap::new()),
             seen: RefCell::new(BTreeMap::new()),
             settle: std::time::Duration::from_secs(2),
+            visible_within: std::time::Duration::from_secs(10),
+            poll: std::time::Duration::from_millis(250),
         };
         Ok((tracker, notice))
     }
@@ -282,6 +288,19 @@ impl GithubTracker {
     #[doc(hidden)]
     pub fn without_settle(mut self) -> Self {
         self.settle = std::time::Duration::ZERO;
+        self
+    }
+
+    /// Tests only: how long to wait for GitHub to show fl's own write, and
+    /// the pause between reads.
+    #[doc(hidden)]
+    pub fn with_visibility(
+        mut self,
+        within: std::time::Duration,
+        poll: std::time::Duration,
+    ) -> Self {
+        self.visible_within = within;
+        self.poll = poll;
         self
     }
 
@@ -662,6 +681,7 @@ impl GithubTracker {
             Err(e) => return Err(e),
         };
         check_written(&issue, title, &labels, &body, "open", None)?;
+        self.await_create_events(issue.number, labels.len());
         self.kinds.borrow_mut().insert(issue.number, kind);
         self.remember(issue.number, meta, prose, title);
         Ok(issue)
@@ -894,14 +914,9 @@ impl GithubTracker {
         }
         let back = IssueView::from_json(&r.body)?;
         check_written(&back, &title, &labels, &body, state, reason)?;
-        // ⚠ Modelled: the timeline and the edit history are taken to show
-        // fl's own write as soon as GitHub answers the PATCH. If they lag,
-        // fl's own events can fall after `after` — a foreign write landing
-        // late is then missed here, and fl's late events land inside the
-        // NEXT write's window as foreign. Checked by the live test
-        // `the_edit_history_and_timeline_counts_match_fls_model` (tests/live.rs), which reads
-        // at once after each fl write and again two seconds later.
-        let after = self.window(n)?;
+        // ⚠ Measured live: the timeline and the edit history lag a write, so
+        // `after` is read until it shows fl's own write (`window_after`).
+        let after = self.window_after(&id, n, &before, &issue, &back)?;
         // ⚠ Before `remember`: a write that crossed someone else's must not
         // become the baseline the next write is compared with.
         self.check_window(&id, &before, &after, &issue, &back)?;
@@ -912,6 +927,18 @@ impl GithubTracker {
     /// The issue's state-changing timeline events and its body edit history,
     /// now. ⚠ Never `remember`s: it reads no item.
     fn window(&self, n: u64) -> Result<Window, StoreError> {
+        let events = self.state_events(n)?;
+        let (edits, edits_total) = self.edit_history(n)?;
+        Ok(Window {
+            events,
+            edits,
+            edits_total,
+        })
+    }
+
+    /// The issue's state-changing timeline events, by id. ⚠ Never
+    /// `remember`s: it reads no item.
+    fn state_events(&self, n: u64) -> Result<BTreeMap<u64, String>, StoreError> {
         let mut events = BTreeMap::new();
         for e in self
             .client
@@ -936,6 +963,12 @@ impl GithubTracker {
             })?;
             events.insert(id, kind.to_string());
         }
+        Ok(events)
+    }
+
+    /// The body's edit history: its entries' ids and its `totalCount`.
+    /// ⚠ Never `remember`s: it reads no item.
+    fn edit_history(&self, n: u64) -> Result<(BTreeSet<String>, u64), StoreError> {
         let (owner, name) = self
             .repo
             .full_name
@@ -986,11 +1019,7 @@ impl GithubTracker {
                 })
                 })
                 .collect::<Result<_, _>>()?;
-        Ok(Window {
-            events,
-            edits,
-            edits_total,
-        })
+        Ok((edits, edits_total))
     }
 
     /// Why GitHub's GraphQL finds no issue `n`, which its REST API served a
@@ -1026,28 +1055,10 @@ impl GithubTracker {
         old: &IssueView,
         new: &IssueView,
     ) -> Result<(), StoreError> {
-        let mut expected: BTreeMap<&str, usize> = BTreeMap::new();
-        *expected.entry("labeled").or_default() += new
-            .labels
-            .iter()
-            .filter(|l| !old.labels.contains(l))
-            .count();
-        *expected.entry("unlabeled").or_default() += old
-            .labels
-            .iter()
-            .filter(|l| !new.labels.contains(l))
-            .count();
-        if old.state != new.state {
-            let k = if new.state == "closed" {
-                "closed"
-            } else {
-                "reopened"
-            };
-            *expected.entry(k).or_default() += 1;
-        }
-        if old.title != new.title {
-            *expected.entry("renamed").or_default() += 1;
-        }
+        let Own {
+            events: mut expected,
+            edits: own_edits,
+        } = own_write(before, old, new);
         let mut foreign = Vec::new();
         for (eid, kind) in &after.events {
             if before.events.contains_key(eid) {
@@ -1058,44 +1069,13 @@ impl GithubTracker {
                 _ => foreign.push(format!("a `{kind}` event")),
             }
         }
-        // ⚠ Modelled: `totalCount` is taken to count every entry — checked
-        // on every read by the live test
-        // `the_edit_history_and_timeline_counts_match_fls_model`.
-        // `last: 100` is taken to list the NEWEST hundred (oldest first) —
-        // unmeasured; no live test checks it yet (it needs more than a
-        // hundred entries). Counting by `totalCount` does not depend on that
-        // order; the ids are a second count that cannot over-count under
-        // either order, so the larger of the two is taken. A history that
-        // SHRANK (someone deleted an entry) is someone else's change; a
-        // deletion offset by an edit in the same window is not seen —
-        // unmeasured; no live test checks it yet.
-        let by_ids = after.edits.difference(&before.edits).count();
-        let Some(by_total) = after.edits_total.checked_sub(before.edits_total) else {
+        let Some(new_edits) = new_edits(before, after) else {
             return Err(StoreError::Conflict {
                 id: id.clone(),
                 detail: "GitHub shows changes fl did not make: an entry was deleted from the \
                          body's edit history"
                     .into(),
             });
-        };
-        let new_edits = usize::try_from(by_total).unwrap_or(usize::MAX).max(by_ids);
-        // ⚠ Modelled: a FIRST body edit is taken to add two entries (the
-        // original, then the edit), and any later edit one. Under that model
-        // every foreign edit is seen. If GitHub adds ONE entry on a first
-        // edit, a foreign edit landing with fl's first edit would be hidden.
-        // Checked by exact count in the live test
-        // `the_edit_history_and_timeline_counts_match_fls_model`.
-        // ⚠ Modelled: the raw bodies are compared, so a rewrite that only
-        // turns CRLF into LF is taken to record an edit. If GitHub records
-        // none for it, `own_edits` is one too high and one foreign edit in
-        // the same window would be hidden. Partly measured: the live test
-        // `the_edit_history_and_timeline_counts_match_fls_model` prints whether GitHub
-        // records an entry for a CRLF-only rewrite (it does not assert it),
-        // and checks that an fl write after one is not a conflict.
-        let own_edits = match (old.body != new.body, before.edits_total == 0) {
-            (false, _) => 0,
-            (true, true) => 2,
-            (true, false) => 1,
         };
         if new_edits > own_edits {
             foreign.push(format!("{} body edit(s)", new_edits - own_edits));
@@ -1110,6 +1090,64 @@ impl GithubTracker {
                     foreign.join(", ")
                 ),
             })
+        }
+    }
+
+    /// The window after fl's own write, read again until it SHOWS that
+    /// write. ⚠ Measured live: GitHub's timeline and edit history lag a
+    /// write. Taken too early, `after` lacks fl's own events, and they land
+    /// in the NEXT write's window, where they read as someone else's.
+    /// ⚠ Modelled: once fl's own events show, anything written before them
+    /// shows too — unmeasured; no live test checks it yet.
+    fn window_after(
+        &self,
+        id: &Iri,
+        n: u64,
+        before: &Window,
+        old: &IssueView,
+        new: &IssueView,
+    ) -> Result<Window, StoreError> {
+        let own = own_write(before, old, new);
+        let start = std::time::Instant::now();
+        loop {
+            let after = self.window(n)?;
+            if shows(before, &after, &own) {
+                return Ok(after);
+            }
+            if start.elapsed() >= self.visible_within {
+                return Err(backend(format!(
+                    "GitHub accepted fl's write to {id} but has not shown it in the issue's \
+                     timeline and edit history after {} s, so fl cannot tell whether someone \
+                     else wrote at the same time; read it again before writing",
+                    self.visible_within.as_secs_f32()
+                )));
+            }
+            std::thread::sleep(self.poll);
+        }
+    }
+
+    /// After a create: wait until the timeline shows its `labeled` events,
+    /// so they do not land in the next write's window. ⚠ Measured live:
+    /// they appeared 1.5-3.5 s after GitHub answered the create. A create
+    /// whose events never show still succeeds — the create landed, and the
+    /// next write refuses as a conflict, which is the safe side.
+    /// ⚠ Never an error: the issue exists by now, and `add_record` mints a
+    /// new create key on every call, so an error here would invite a retry
+    /// that makes a DUPLICATE. A failed read ends the wait like a timeout.
+    /// ⚠ Counts every `labeled` event, not the create's own labels: one added
+    /// by someone else can stand in for a lagging one of fl's, which then
+    /// lands in the next write's window — a conflict, the safe side.
+    fn await_create_events(&self, n: u64, labels: usize) {
+        let start = std::time::Instant::now();
+        loop {
+            let Ok(events) = self.state_events(n) else {
+                return;
+            };
+            let shown = events.values().filter(|k| *k == "labeled").count();
+            if shown >= labels || start.elapsed() >= self.visible_within {
+                return;
+            }
+            std::thread::sleep(self.poll);
         }
     }
 
@@ -1216,7 +1254,7 @@ impl GithubTracker {
                 state,
                 reason,
             )?;
-            let after = self.window(n)?;
+            let after = self.window_after(id, n, &before, &issue, &back)?;
             self.check_window(id, &before, &after, &issue, &back)
         });
         let comment = match &comment_failed {
@@ -1566,6 +1604,94 @@ impl Handles for GithubTracker {
     }
 }
 
+/// The events and body edits fl's own write accounts for.
+struct Own {
+    events: BTreeMap<&'static str, usize>,
+    edits: usize,
+}
+
+fn own_write(before: &Window, old: &IssueView, new: &IssueView) -> Own {
+    let mut expected: BTreeMap<&'static str, usize> = BTreeMap::new();
+    *expected.entry("labeled").or_default() += new
+        .labels
+        .iter()
+        .filter(|l| !old.labels.contains(l))
+        .count();
+    *expected.entry("unlabeled").or_default() += old
+        .labels
+        .iter()
+        .filter(|l| !new.labels.contains(l))
+        .count();
+    if old.state != new.state {
+        let k = if new.state == "closed" {
+            "closed"
+        } else {
+            "reopened"
+        };
+        *expected.entry(k).or_default() += 1;
+    }
+    if old.title != new.title {
+        *expected.entry("renamed").or_default() += 1;
+    }
+    // ⚠ Modelled: a FIRST body edit is taken to add two entries (the
+    // original, then the edit), and any later edit one. Under that model
+    // every foreign edit is seen. If GitHub adds ONE entry on a first
+    // edit, a foreign edit landing with fl's first edit would be hidden.
+    // Checked by exact count in the live test
+    // `the_edit_history_and_timeline_counts_match_fls_model`.
+    // ⚠ The raw bodies are compared, so a rewrite that only turns CRLF into
+    // LF is taken to record an edit. Measured live (2026-09-29): GitHub
+    // recorded one entry for a CRLF-only rewrite, as modelled; the live
+    // test prints it but does not assert it. If that ever changes, `edits`
+    // is one too high: `window_after` then waits its full time for an entry
+    // that never comes, and fails the write with "has not shown".
+    // (`update` cannot currently send a line-endings-only change: its
+    // no-op check normalises CRLF, and every change rewrites the block.)
+    let edits = match (old.body != new.body, before.edits_total == 0) {
+        (false, _) => 0,
+        (true, true) => 2,
+        (true, false) => 1,
+    };
+    Own {
+        events: expected,
+        edits,
+    }
+}
+
+/// Body edits between two windows; `None` when the history SHRANK, which is
+/// someone else deleting an entry.
+fn new_edits(before: &Window, after: &Window) -> Option<usize> {
+    // ⚠ Modelled: `totalCount` is taken to count every entry — checked
+    // on every read by the live test
+    // `the_edit_history_and_timeline_counts_match_fls_model`.
+    // `last: 100` is taken to list the NEWEST hundred (oldest first) —
+    // unmeasured; no live test checks it yet (it needs more than a
+    // hundred entries). Counting by `totalCount` does not depend on that
+    // order; the ids are a second count that cannot over-count under
+    // either order, so the larger of the two is taken. A history that
+    // SHRANK (someone deleted an entry) is someone else's change; a
+    // deletion offset by an edit in the same window is not seen —
+    // unmeasured; no live test checks it yet.
+    let by_ids = after.edits.difference(&before.edits).count();
+    let by_total = after.edits_total.checked_sub(before.edits_total)?;
+    Some(usize::try_from(by_total).unwrap_or(usize::MAX).max(by_ids))
+}
+
+/// Whether `after` shows every event and edit fl's own write made. A
+/// shrunken history counts as shown, so `check_window` reports it.
+fn shows(before: &Window, after: &Window, own: &Own) -> bool {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (eid, kind) in &after.events {
+        if !before.events.contains_key(eid) {
+            *seen.entry(kind.as_str()).or_default() += 1;
+        }
+    }
+    own.events
+        .iter()
+        .all(|(k, want)| seen.get(k).copied().unwrap_or(0) >= *want)
+        && new_edits(before, after).is_none_or(|n| n >= own.edits)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1573,6 +1699,7 @@ mod tests {
     use crate::fake::FakeGithub;
     use fl_core::MemStore;
     use fl_core::ids::seq_iri;
+    use std::time::Duration;
 
     fn client(fake: &FakeGithub) -> Client {
         Client::new(
@@ -1585,6 +1712,7 @@ mod tests {
         GithubTracker::open(client(fake), "acme/widgets", &MemStore::default())
             .unwrap()
             .0
+            .with_visibility(Duration::from_secs(10), Duration::ZERO)
     }
 
     fn p() -> ProjectId {
@@ -2124,6 +2252,109 @@ mod tests {
         );
         assert_eq!(t.resolve_handle(Kind::Record, 2).unwrap(), None);
         assert_eq!(t.resolve_handle(Kind::Record, 99).unwrap(), None);
+    }
+
+    /// Measured live: a create's `labeled` events reach the timeline 1.5-3.5 s
+    /// after GitHub answers. Unless the create waits for them, they land in
+    /// the NEXT write's window and read as someone else's.
+    #[test]
+    fn a_create_waits_until_its_labels_show_in_the_timeline() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().timeline_lag_reads = 1;
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().timeline_lag_reads = 0;
+        t.set_record_state(&r, State::Doing).unwrap();
+    }
+
+    /// An update's own events can lag too: unless it waits for them, they
+    /// land in the next write's window and read as someone else's.
+    #[test]
+    fn an_update_waits_until_its_own_events_show_in_the_timeline() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().timeline_lag_reads = 2;
+        t.set_record_state(&r, State::Doing).unwrap();
+        // A body-only write: fl expects no events, so a late one is foreign.
+        let alias = Iri::parse("https://github.com/elsewhere/old/issues/7").unwrap();
+        t.add_alias(r.iri(), alias).unwrap();
+    }
+
+    /// The body's edit history lags too, on its own clock: waiting for the
+    /// timeline alone is not enough.
+    #[test]
+    fn an_update_waits_until_its_own_body_edits_show_in_the_edit_history() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        t.set_record_state(&r, State::Doing).unwrap();
+        fake.state().edit_lag_reads = 2;
+        t.set_record_state(&r, State::Review).unwrap();
+        // A repair edits no body, so a late entry from the write before it
+        // would read as someone else's.
+        fake.web_edit(1, |i| i.labels = vec!["bug".into()]);
+        assert!(t.repair(r.iri(), "owner").unwrap().changed);
+    }
+
+    /// The issue exists once GitHub answers the create. An error after that
+    /// would invite a retry, and a retry mints a new create key: a duplicate.
+    #[test]
+    fn a_create_whose_timeline_read_fails_still_succeeds() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().fail_next_timeline = true;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1);
+    }
+
+    /// Waiting for fl's own events must not hide someone else's that land
+    /// with them.
+    #[test]
+    fn a_foreign_write_is_still_caught_while_fl_waits_for_its_own() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().timeline_lag_reads = 2;
+        fake.state().foreign_label_on_next_patch = true;
+        assert!(matches!(
+            t.set_record_state(&r, State::Doing),
+            Err(StoreError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn an_update_github_never_shows_is_an_error_that_says_to_read_again() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).with_visibility(Duration::from_millis(50), Duration::from_millis(5));
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().timeline_lag_reads = u32::MAX;
+        let e = t
+            .set_record_state(&r, State::Doing)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("has not shown"), "{e}");
+        assert!(e.contains("read it again"), "{e}");
+        assert_eq!(
+            fake.issue(1).labels,
+            vec!["fl:record", "fl:record/doing"],
+            "the write itself landed"
+        );
+        // Not remembered: the next write, without a fresh read, is refused.
+        fake.state().timeline_lag_reads = 0;
+        assert!(matches!(
+            t.set_record_state(&r, State::Review),
+            Err(StoreError::Conflict { .. })
+        ));
+    }
+
+    #[test]
+    fn a_create_github_never_shows_still_succeeds() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).with_visibility(Duration::from_millis(50), Duration::from_millis(5));
+        fake.state().timeline_lag_reads = u32::MAX;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1);
     }
 
     #[test]
