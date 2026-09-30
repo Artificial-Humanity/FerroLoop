@@ -154,6 +154,14 @@ pub struct State {
     /// issue's body edit history (GitHub lets a person delete a revision).
     /// One-shot.
     pub delete_edits_on_next_patch: usize,
+    /// The next request answers with GitHub's secondary rate limit: this
+    /// status (403 or 429), a `retry-after` of this many seconds when set,
+    /// and the primary budget untouched (`x-ratelimit-remaining: 4999`).
+    /// Modelled from GitHub's documentation; not measured. One-shot.
+    pub secondary_rate_limit_next: Option<(u16, Option<u64>)>,
+    /// The next request answers 403 for want of a permission — not a rate
+    /// limit. One-shot.
+    pub forbidden_next: bool,
 }
 
 pub struct FakeGithub {
@@ -526,6 +534,31 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             200,
             json!({"data": null, "errors": [{"type": "RATE_LIMITED"}]}),
         );
+    }
+    if let Some((status, retry_after)) = s.secondary_rate_limit_next.take() {
+        let mut a = answer(
+            status,
+            json!({"message": "You have exceeded a secondary rate limit. Please wait a few \
+                   minutes before you try again. If you reach out to GitHub Support for help, \
+                   please include the request ID 0000:0000:0000000:0000000:00000000."}),
+        );
+        a.headers
+            .push(("x-ratelimit-remaining".into(), "4999".into()));
+        a.headers
+            .push(("x-ratelimit-reset".into(), "1700000000".into()));
+        if let Some(secs) = retry_after {
+            a.headers.push(("retry-after".into(), secs.to_string()));
+        }
+        return a;
+    }
+    if std::mem::take(&mut s.forbidden_next) {
+        let mut a = answer(
+            403,
+            json!({"message": "Resource not accessible by personal access token"}),
+        );
+        a.headers
+            .push(("x-ratelimit-remaining".into(), "4999".into()));
+        return a;
     }
     if s.rate_limited {
         s.rate_limited = false;
