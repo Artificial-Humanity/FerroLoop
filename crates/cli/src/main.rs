@@ -2,6 +2,8 @@ mod cmd;
 mod config;
 mod ctx;
 mod refs;
+#[cfg(test)]
+mod testing;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -562,6 +564,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ctx {
                 store: &store,
                 tracker: &checked,
+                ledger: &store,
                 handles: &routed,
                 github: Some(gh),
                 tracker_label: format!("github:{}", gh.repo().full_name),
@@ -570,6 +573,7 @@ fn run(cli: Cli) -> Result<i32> {
         None => Ctx {
             store: &store,
             tracker: &store,
+            ledger: &store,
             handles: &store,
             github: None,
             tracker_label: store.label().to_string(),

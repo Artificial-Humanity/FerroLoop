@@ -810,3 +810,89 @@ fn a_github_bound_default_store_is_refused_from_a_directory_no_entry_covers() {
         .success();
     assert_eq!(g.fake.issue_count(), 1);
 }
+
+/// A gate over `src/**/*.rs`, a transition `launch` (review → done) over
+/// it, the manifest committed, and one record.
+fn gated_record(g: &G) {
+    g.project();
+    g.fl()
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "no-bug",
+            "--glob",
+            "src/**/*.rs",
+            "--program",
+            "./check.sh",
+        ])
+        .assert()
+        .success();
+    g.fl()
+        .args([
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "low",
+            "--gate",
+            "1",
+        ])
+        .assert()
+        .success();
+    g.fl()
+        .args(["record", "add", "--project", "1", "--title", "work"])
+        .assert()
+        .success();
+}
+
+/// The runs the local store holds for the project's only gate.
+fn runs_of_the_only_gate(g: &G) -> Vec<fl_core::GateRun> {
+    use fl_core::store::{Catalog, Ledger};
+    let store = fl_store::RedbStore::open(&g.home.path().join("fl.redb")).unwrap();
+    let p = store.list_projects().unwrap()[0].id.clone();
+    let gate = store.list_gates(&p).unwrap()[0].id.clone();
+    store.gate_runs(&gate).unwrap()
+}
+
+// GitHub ledger spec §3.2 step 3: an entry is filed by its own record
+// field, so every run of one record names it by the issue's primary URL.
+#[test]
+fn check_with_a_record_in_github_mode_ties_its_runs_to_the_issue() {
+    let g = fixture();
+    gated_record(&g);
+    g.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let runs = runs_of_the_only_gate(&g);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0]
+            .record
+            .as_ref()
+            .map(|r| r.iri().as_str().to_string()),
+        Some("https://github.com/acme/widgets/issues/1".to_string())
+    );
+}
+
+#[test]
+fn check_with_a_record_github_deleted_is_refused_before_any_gate_runs() {
+    let g = fixture();
+    gated_record(&g);
+    g.fake.state().issues.get_mut(&1).unwrap().gone = true;
+    g.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(2);
+    assert!(runs_of_the_only_gate(&g).is_empty(), "no gate ran");
+}
