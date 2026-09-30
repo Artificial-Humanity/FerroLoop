@@ -6,13 +6,13 @@ use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
 use fl_core::split::{Outbox, Pending};
-use fl_core::store::{Catalog, Handles, Ledger, StoreError, Tracker};
+use fl_core::store::{Bindings, Catalog, Handles, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 
 pub mod manifest;
 
-use crate::manifest::{Manifest, ManifestError};
+use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 
 /// Format 2: ids are IRIs, with an ownership index and per-kind handles.
 /// Format 1 keyed every table by a `u64` id from one shared counter.
@@ -71,6 +71,17 @@ const CANDIDATE_ATTEMPTS: TableDefinition<&str, u64> =
 /// This build opens both. A store that never imports stays 2 and still
 /// opens in older builds.
 pub const FORMAT_WITH_IMPORTS: u64 = 3;
+
+/// ⚠ The format of a store that records a ledger root. An older fl opens a
+/// store at 2 or 3 and would export its manifest WITHOUT the root — the
+/// anchor every other machine checks the ledger against — so recording one
+/// raises the store to 4, which an older fl refuses. This build opens 2, 3
+/// and 4. A format is only ever raised (`raise_format`).
+pub const FORMAT_WITH_LEDGER_ROOT: u64 = 4;
+
+/// repository `node_id` → the first commit of its `fl/ledger` branch
+/// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
+const LEDGER_ROOTS: TableDefinition<&str, &str> = TableDefinition::new("ledger_roots");
 
 const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
@@ -169,6 +180,54 @@ fn index_new(tx: &redb::WriteTransaction, id: &Iri, kind: Kind) -> Result<(), St
     Ok(())
 }
 
+/// Raise the store's format to at least `to`, inside `tx`. Never lowers it:
+/// an import into a store that records a ledger root must leave it at 4.
+fn raise_format(tx: &redb::WriteTransaction, to: u64) -> Result<(), StoreError> {
+    let mut meta = tx.open_table(META).map_err(backend)?;
+    let now = meta
+        .get(FORMAT_KEY)
+        .map_err(backend)?
+        .map(|v| v.value())
+        .unwrap_or(FORMAT_VERSION);
+    if now < to {
+        meta.insert(FORMAT_KEY, to).map_err(backend)?;
+    }
+    Ok(())
+}
+
+/// ⚠ An anchor never changes (spec §3.5): a different root for a
+/// `node_id` that has one is refused. Asked BEFORE any write, by both
+/// callers of [`record_ledger_root`].
+fn refuse_a_changed_root(
+    node_id: &str,
+    held: Option<String>,
+    commit: &str,
+) -> Result<(), StoreError> {
+    match held {
+        Some(h) if h != commit => Err(StoreError::LedgerRootChanged {
+            node_id: node_id.to_string(),
+            held: h,
+            found: commit.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Record `commit` as `node_id`'s ledger root inside `tx`, and raise the
+/// store to [`FORMAT_WITH_LEDGER_ROOT`]. The caller has already refused a
+/// changed root.
+fn record_ledger_root(
+    tx: &redb::WriteTransaction,
+    node_id: &str,
+    commit: &str,
+) -> Result<(), StoreError> {
+    tx.open_table(LEDGER_ROOTS)
+        .map_err(backend)?
+        .insert(node_id, commit)
+        .map_err(backend)?;
+    raise_format(tx, FORMAT_WITH_LEDGER_ROOT)
+}
+
 /// The entries `index` lists with an id after `after` that `repo` has not
 /// marked, read from `log` by their row key, in id order.
 fn waiting<T: serde::de::DeserializeOwned>(
@@ -232,11 +291,15 @@ impl RedbStore {
         match found {
             // No META table at all: a brand-new file.
             None => Self::create_tables(&db)?,
-            Some(Some(v)) if v == FORMAT_VERSION || v == FORMAT_WITH_IMPORTS => {}
+            Some(Some(v))
+                if v == FORMAT_VERSION
+                    || v == FORMAT_WITH_IMPORTS
+                    || v == FORMAT_WITH_LEDGER_ROOT => {}
             Some(v) => {
                 return Err(StoreError::FormatVersion {
                     found: v,
-                    expected: FORMAT_VERSION,
+                    oldest: FORMAT_VERSION,
+                    newest: FORMAT_WITH_LEDGER_ROOT,
                 });
             }
         }
@@ -510,18 +573,43 @@ impl RedbStore {
         Ok(())
     }
 
-    /// Export `project`, which this store must author.
+    /// Export `project`, which this store must author. `repository_node_id`
+    /// is the repository the project's ledger is in, when its binding names
+    /// one: the export carries that repository's ledger root, if this store
+    /// records one (GitHub ledger spec §6.1 step 4).
     pub fn export_manifest(
         &self,
         project: &ProjectId,
         commit: &str,
         exported_at_unix: u64,
+        repository_node_id: Option<&str>,
     ) -> Result<Manifest, ManifestError> {
         self.check_kind(project.iri(), Kind::Project)?;
         if self.imported_hash(project)?.is_some() {
             return Err(ManifestError::NotAuthoring(project.clone()));
         }
-        manifest::export(self, project, commit, exported_at_unix)
+        let ledger_root = match repository_node_id {
+            None => None,
+            Some(node) => self.ledger_root(node)?.map(|commit| LedgerRoot {
+                repository_node_id: node.to_string(),
+                commit,
+            }),
+        };
+        manifest::export(self, project, commit, exported_at_unix, ledger_root)
+    }
+
+    /// Whether this store records any ledger root. An export that cannot
+    /// tell which repository its project's ledger is in asks this before it
+    /// writes a manifest without one.
+    pub fn holds_a_ledger_root(&self) -> Result<bool, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_ROOTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(backend(e)),
+        };
+        let any = table.iter().map_err(backend)?.next().is_some();
+        Ok(any)
     }
 
     /// Write the manifest's project, gates and transitions under their own
@@ -532,6 +620,14 @@ impl RedbStore {
         m.verify()?;
         let body = &m.body;
         let project = &body.project;
+
+        if let Some(root) = &body.ledger_root {
+            refuse_a_changed_root(
+                &root.repository_node_id,
+                self.ledger_root(&root.repository_node_id)?,
+                &root.commit,
+            )?;
+        }
 
         let held_project = match self.locate(project.iri()) {
             Ok((_, Kind::Project)) => true,
@@ -682,10 +778,10 @@ impl RedbStore {
             .map_err(backend)?
             .insert(project.iri().as_str(), m.content_sha256.as_str())
             .map_err(backend)?;
-        tx.open_table(META)
-            .map_err(backend)?
-            .insert(FORMAT_KEY, FORMAT_WITH_IMPORTS)
-            .map_err(backend)?;
+        if let Some(root) = &body.ledger_root {
+            record_ledger_root(&tx, &root.repository_node_id, &root.commit)?;
+        }
+        raise_format(&tx, FORMAT_WITH_IMPORTS)?;
         tx.commit().map_err(backend)?;
         Ok(report)
     }
@@ -1135,7 +1231,7 @@ impl Handles for RedbStore {
     }
 }
 
-impl fl_core::store::Bindings for RedbStore {
+impl Bindings for RedbStore {
     fn bound_node_id(&self, repo: &str) -> Result<Option<String>, StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let table = match tx.open_table(GITHUB_BINDINGS) {
@@ -1155,6 +1251,25 @@ impl fl_core::store::Bindings for RedbStore {
             .map_err(backend)?
             .insert(repo.to_ascii_lowercase().as_str(), node_id)
             .map_err(backend)?;
+        tx.commit().map_err(backend)
+    }
+    fn ledger_root(&self, node_id: &str) -> Result<Option<String>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_ROOTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let found = table
+            .get(node_id)
+            .map_err(backend)?
+            .map(|v| v.value().to_string());
+        Ok(found)
+    }
+    fn set_ledger_root(&self, node_id: &str, commit: &str) -> Result<(), StoreError> {
+        refuse_a_changed_root(node_id, self.ledger_root(node_id)?, commit)?;
+        let tx = self.db.begin_write().map_err(backend)?;
+        record_ledger_root(&tx, node_id, commit)?;
         tx.commit().map_err(backend)
     }
 }
@@ -1280,7 +1395,8 @@ mod tests {
                 err,
                 StoreError::FormatVersion {
                     found: Some(1),
-                    expected: 2
+                    oldest: 2,
+                    newest: 4
                 }
             ),
             "{err:?}"
@@ -1659,7 +1775,8 @@ mod tests {
                 err,
                 StoreError::FormatVersion {
                     found: None,
-                    expected: FORMAT_VERSION
+                    oldest: FORMAT_VERSION,
+                    ..
                 }
             ),
             "{err:?}"
@@ -1815,7 +1932,7 @@ mod tests {
         assert_eq!(s.cutover("R_2").unwrap(), None);
     }
 
-    use crate::manifest::{Manifest, ManifestError, content_sha256};
+    use crate::manifest::{LedgerRoot, Manifest, ManifestError, content_sha256};
     use fl_core::model::{Regret, Transition};
 
     /// An authoring store with one project: gates `fmt` and `lint`, and a
@@ -1850,7 +1967,7 @@ mod tests {
     #[test]
     fn an_import_writes_every_item_under_its_own_iri_and_marks_the_project() {
         let (a, _ga, p, g1, g2) = authoring();
-        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
         let (b, _gb) = fresh();
         let report = b.import_manifest(&m, "/elsewhere").unwrap();
         assert_eq!((report.gates_added, report.transitions), (2, 1));
@@ -1872,7 +1989,7 @@ mod tests {
     #[test]
     fn the_authoring_store_refuses_to_import_its_own_project() {
         let (a, _g, p, _, _) = authoring();
-        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
         let err = a.import_manifest(&m, "/author").unwrap_err();
         assert!(matches!(err, ManifestError::AuthoringStore(_)), "{err}");
     }
@@ -1881,9 +1998,9 @@ mod tests {
     fn an_importing_store_refuses_to_export() {
         let (a, _ga, p, _, _) = authoring();
         let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
             .unwrap();
-        let err = b.export_manifest(&p, "c1", 8).unwrap_err();
+        let err = b.export_manifest(&p, "c1", 8, None).unwrap_err();
         assert!(matches!(err, ManifestError::NotAuthoring(_)), "{err}");
     }
 
@@ -1891,7 +2008,7 @@ mod tests {
     fn an_imported_gate_can_earn_a_pass_mark_but_cannot_be_edited() {
         let (a, _ga, p, g1, _) = authoring();
         let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
             .unwrap();
         stamp(&b, &g1, "c1");
         assert_eq!(
@@ -1930,7 +2047,7 @@ mod tests {
     fn a_reimport_keeps_the_mark_of_an_unchanged_gate_and_drops_a_changed_ones() {
         let (a, _ga, p, g1, g2) = authoring();
         let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
             .unwrap();
         stamp(&b, &g1, "c1");
         stamp(&b, &g2, "c1");
@@ -1943,7 +2060,7 @@ mod tests {
             .unwrap();
 
         let report = b
-            .import_manifest(&a.export_manifest(&p, "c2", 8).unwrap(), "/x")
+            .import_manifest(&a.export_manifest(&p, "c2", 8, None).unwrap(), "/x")
             .unwrap();
         assert_eq!(
             (
@@ -1969,7 +2086,7 @@ mod tests {
     #[test]
     fn an_import_refuses_a_manifest_it_did_not_verify() {
         let (a, _ga, p, _, _) = authoring();
-        let mut m = a.export_manifest(&p, "c1", 7).unwrap();
+        let mut m = a.export_manifest(&p, "c1", 7, None).unwrap();
         m.body.gates[0].name = "edited".into();
         let (b, _gb) = fresh();
         let err = b.import_manifest(&m, "/x").unwrap_err();
@@ -1983,7 +2100,7 @@ mod tests {
         let (b, _gb) = fresh();
         let local = b.add_project("/x").unwrap();
         let err = b
-            .import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            .import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
             .unwrap_err();
         assert!(
             matches!(err, ManifestError::RootTaken { ref other, .. } if *other == local),
@@ -1995,7 +2112,7 @@ mod tests {
     fn a_reimport_from_another_checkout_moves_the_root_and_says_so() {
         let (a, _ga, p, _, _) = authoring();
         let (b, _gb) = fresh();
-        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
         assert_eq!(b.import_manifest(&m, "/one").unwrap().root_moved, None);
         let report = b.import_manifest(&m, "/two").unwrap();
         assert_eq!(report.root_moved, Some(("/one".into(), "/two".into())));
@@ -2006,7 +2123,7 @@ mod tests {
     fn a_reimport_mirrors_the_manifests_transitions() {
         let (a, _ga, p, _, _) = authoring();
         let (b, _gb) = fresh();
-        let first = a.export_manifest(&p, "c1", 7).unwrap();
+        let first = a.export_manifest(&p, "c1", 7, None).unwrap();
         b.import_manifest(&first, "/x").unwrap();
         let mut body = first.body.clone();
         body.transitions.clear();
@@ -2033,7 +2150,7 @@ mod tests {
         let (a, _ga, p, _, _) = authoring();
         {
             let b = RedbStore::open(&path).unwrap();
-            b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
                 .unwrap();
         }
         let db = redb::Database::open(&path).unwrap();
@@ -2055,7 +2172,7 @@ mod tests {
     fn a_reimport_that_removes_a_gate_is_refused_and_changes_nothing() {
         let (a, _ga, p, g1, g2) = authoring();
         let (b, _gb) = fresh();
-        let first = a.export_manifest(&p, "c1", 7).unwrap();
+        let first = a.export_manifest(&p, "c1", 7, None).unwrap();
         b.import_manifest(&first, "/x").unwrap();
 
         let mut body = first.body.clone();
@@ -2079,7 +2196,7 @@ mod tests {
     #[test]
     fn a_gate_held_locally_under_another_project_is_refused_and_writes_nothing() {
         let (a, _ga, p, _g1, _g2) = authoring();
-        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
 
         // `b` authors its own project locally and holds a gate under it —
         // the manifest below is rewritten to claim that same gate id for a
@@ -2126,5 +2243,137 @@ mod tests {
             s.bound_node_id("ACME/widgets").unwrap().as_deref(),
             Some("R_1")
         );
+    }
+
+    // Ruling 12: a store a newer fl wrote says to upgrade, not to start over.
+    #[test]
+    fn a_store_from_a_newer_fl_says_to_upgrade_not_to_start_a_new_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            tx.open_table(META)
+                .unwrap()
+                .insert(FORMAT_KEY, FORMAT_WITH_LEDGER_ROOT + 1)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let msg = RedbStore::open(&path).err().unwrap().to_string();
+        assert!(msg.contains("Upgrade fl"), "{msg}");
+        assert!(!msg.contains("start a new store"), "{msg}");
+    }
+
+    // ⚠ An older fl would open a store at format 2 or 3 and export its
+    // manifest WITHOUT the root; format 4 makes it refuse the store instead.
+    #[test]
+    fn a_ledger_root_is_recorded_once_and_raises_the_store_to_format_4() {
+        use fl_core::store::Bindings;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            assert!(!s.holds_a_ledger_root().unwrap());
+            assert_eq!(s.ledger_root("R_1").unwrap(), None);
+            s.set_ledger_root("R_1", "abc").unwrap();
+            s.set_ledger_root("R_1", "abc").unwrap();
+            let err = s.set_ledger_root("R_1", "def").unwrap_err();
+            assert!(
+                matches!(err, StoreError::LedgerRootChanged { ref held, ref found, .. } if held == "abc" && found == "def"),
+                "{err:?}"
+            );
+            assert!(s.holds_a_ledger_root().unwrap());
+        }
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
+            Some(FORMAT_WITH_LEDGER_ROOT),
+            "an older fl must refuse this store rather than export its manifest without the root"
+        );
+        drop(meta);
+        drop(tx);
+        drop(db);
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(s.ledger_root("R_1").unwrap().as_deref(), Some("abc"));
+        assert_eq!(s.ledger_root("R_2").unwrap(), None);
+    }
+
+    #[test]
+    fn an_import_never_lowers_the_format_of_a_store_that_records_a_ledger_root() {
+        use fl_core::store::Bindings;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.redb");
+        let (a, _ga, p, _, _) = authoring();
+        {
+            let b = RedbStore::open(&path).unwrap();
+            b.set_ledger_root("R_9", "abc").unwrap();
+            b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
+                .unwrap();
+        }
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
+            Some(FORMAT_WITH_LEDGER_ROOT)
+        );
+    }
+
+    #[test]
+    fn an_export_carries_the_root_of_the_repository_it_is_told_and_no_other() {
+        use fl_core::store::Bindings;
+        let (a, _ga, p, _, _) = authoring();
+        a.set_ledger_root("R_1", "abc").unwrap();
+        let m = a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap();
+        assert_eq!(m.body.format_version, 2);
+        assert_eq!(
+            m.body.ledger_root,
+            Some(LedgerRoot {
+                repository_node_id: "R_1".into(),
+                commit: "abc".into(),
+            })
+        );
+        for other in [None, Some("R_2")] {
+            let m = a.export_manifest(&p, "c1", 7, other).unwrap();
+            assert_eq!(
+                (m.body.format_version, m.body.ledger_root),
+                (1, None),
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_import_records_the_manifests_ledger_root() {
+        use fl_core::store::Bindings;
+        let (a, _ga, p, _, _) = authoring();
+        a.set_ledger_root("R_1", "abc").unwrap();
+        let (b, _gb) = fresh();
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
+            .unwrap();
+        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn an_import_naming_another_root_for_a_known_repository_is_refused_and_writes_nothing() {
+        use fl_core::store::Bindings;
+        let (a, _ga, p, _, _) = authoring();
+        a.set_ledger_root("R_1", "abc").unwrap();
+        let (b, _gb) = fresh();
+        b.set_ledger_root("R_1", "other").unwrap();
+        let err = b
+            .import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ManifestError::Store(StoreError::LedgerRootChanged { .. })
+            ),
+            "{err}"
+        );
+        assert!(!b.owns(p.iri()).unwrap(), "nothing was written");
+        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("other"));
     }
 }

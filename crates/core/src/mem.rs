@@ -45,6 +45,8 @@ struct Inner {
     published: BTreeSet<(String, Iri)>,
     /// repository `node_id` → the id after which entries are publishable.
     cutovers: BTreeMap<String, Iri>,
+    /// repository `node_id` → its GitHub ledger's first commit.
+    ledger_roots: BTreeMap<String, String>,
 }
 
 impl Inner {
@@ -497,6 +499,25 @@ impl crate::store::Bindings for MemStore {
             .bindings
             .insert(repo.to_ascii_lowercase(), node_id.to_string());
         Ok(())
+    }
+    fn ledger_root(&self, node_id: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.inner.borrow().ledger_roots.get(node_id).cloned())
+    }
+    fn set_ledger_root(&self, node_id: &str, commit: &str) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        match s.ledger_roots.get(node_id) {
+            Some(held) if held == commit => Ok(()),
+            Some(held) => Err(StoreError::LedgerRootChanged {
+                node_id: node_id.to_string(),
+                held: held.clone(),
+                found: commit.to_string(),
+            }),
+            None => {
+                s.ledger_roots
+                    .insert(node_id.to_string(), commit.to_string());
+                Ok(())
+            }
+        }
     }
 }
 

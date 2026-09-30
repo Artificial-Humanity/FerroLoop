@@ -152,7 +152,7 @@ pub fn ensure_publishable(
         // The whole project, not only its gates: a transition added or
         // changed since export would otherwise never reach another machine.
         if gate.is_none() {
-            let now = store.export_manifest(project, "", 0)?;
+            let now = store.export_manifest(project, "", 0, None)?;
             if now.body.gates.len() != m.body.gates.len() {
                 bail!(
                     "the manifest lists a gate this store no longer holds. Run \
@@ -200,7 +200,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .context("the system clock is before 1970")?
                 .as_secs();
-            let m = store.export_manifest(&p, &head, now)?;
+            let m = store.export_manifest(&p, &head, now, None)?;
             // ⚠ Every gate is printed with what it runs, and what it
             // examines: either can name a local path, and this file is
             // about to be committed.
