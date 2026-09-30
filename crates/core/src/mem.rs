@@ -509,9 +509,16 @@ mod tests {
         use crate::conformance::Single;
         crate::conformance::catalog(|| (MemStore::default(), ()));
         crate::conformance::tracker(|| Single(MemStore::default(), ()));
-        crate::conformance::ledger(|| (MemStore::default(), ()));
+        crate::conformance::ledger(|| Single(MemStore::default(), ()));
         crate::conformance::all_roles(|| Single(MemStore::default(), ()));
         crate::conformance::local_handles(|| (MemStore::default(), ()));
+    }
+
+    #[test]
+    fn a_split_ledger_over_a_mem_store_meets_the_ledger_contracts() {
+        use crate::conformance::SplitOver;
+        crate::conformance::ledger(|| SplitOver(MemStore::default(), ()));
+        crate::conformance::split_ledger(|| SplitOver(MemStore::default(), ()));
     }
 
     /// A project with one gate and one record.
