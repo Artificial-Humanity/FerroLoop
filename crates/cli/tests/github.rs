@@ -893,6 +893,7 @@ fn check_with_a_record_github_deleted_is_refused_before_any_gate_runs() {
     g.fl()
         .args(["check", "launch", "--project", "1", "--record", "1"])
         .assert()
-        .code(2);
+        .code(2)
+        .stderr(contains("was deleted"));
     assert!(runs_of_the_only_gate(&g).is_empty(), "no gate ran");
 }

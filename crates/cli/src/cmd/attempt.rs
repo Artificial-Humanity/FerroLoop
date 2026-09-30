@@ -172,6 +172,8 @@ mod tests {
         let ledger = Flushes::default();
         publish(&ledger, &seq_iri(50), &attempt()).unwrap();
         let decisions = ledger.decisions.borrow();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].record, RecordId(seq_iri(2)));
         assert_eq!(decisions[0].rests_on, vec![seq_iri(50)]);
         assert_eq!(
             decisions[0].outcome,

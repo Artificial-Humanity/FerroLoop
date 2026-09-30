@@ -783,3 +783,76 @@ fn an_attempt_through_a_record_alias_stores_the_primary() {
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].record, record, "the attempt stored the alias");
 }
+
+// GitHub ledger spec §7 fix round 1: `check --record` names its record by
+// the record's PRIMARY id, even when the person typed an alias — the same
+// rule `an_attempt_through_a_record_alias_stores_the_primary` pins for `fl
+// attempt`. Skipping the lookup (reverting to `Some(RecordId(resolve(..)))`)
+// would still pass every other `check` test, since a plain handle already
+// resolves to the primary; only an alias catches the regression.
+#[test]
+fn check_through_a_record_alias_stores_the_primary() {
+    use fl_core::store::{Catalog, Ledger, Tracker};
+    let env = Env::new();
+    let repo = registered(&env);
+    env.fl(repo.path())
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--glob",
+            "*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    env.fl(repo.path())
+        .args([
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "launch",
+            "--from",
+            "review",
+            "--to",
+            "done",
+            "--regret",
+            "low",
+            "--gate",
+            "1",
+        ])
+        .assert()
+        .success();
+    env.fl(repo.path())
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .success();
+    let alias = "https://github.com/o/r/issues/42";
+    let (gate, record) = {
+        let s = fl_store::RedbStore::open(&env.default_store()).unwrap();
+        let project = s.list_projects().unwrap().remove(0).id;
+        let gate = s.list_gates(&project).unwrap().remove(0).id;
+        let record = s.list_records(&project).unwrap().remove(0).id;
+        s.add_alias(record.iri(), fl_core::Iri::parse(alias).unwrap())
+            .unwrap();
+        (gate, record)
+    };
+    env.fl(repo.path())
+        .args(["check", "launch", "--project", "1", "--record", alias])
+        .assert()
+        .success();
+    let s = fl_store::RedbStore::open(&env.default_store()).unwrap();
+    let runs = s.gate_runs(&gate).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].record.as_ref(),
+        Some(&record),
+        "the check stored the alias, not the record's primary id"
+    );
+}
