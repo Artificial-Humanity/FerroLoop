@@ -3,6 +3,7 @@
 //! importing clone of the same repository.
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use std::path::Path;
 use std::process::Command as Sys;
@@ -517,4 +518,173 @@ fn a_missing_manifest_on_an_importing_machine_is_refused_by_path() {
         .assert()
         .failure()
         .stderr(contains(".fl/manifest.json"));
+}
+
+/// Put a ledger root for `node` into the store at `db`, bound to `repo`, as
+/// `fl github ledger init` will (plan B).
+fn with_ledger_root(db: &Path, repo: &str, node: &str, commit: &str) {
+    use fl_core::store::Bindings;
+    let s = fl_store::RedbStore::open(db).unwrap();
+    s.bind_node_id(repo, node).unwrap();
+    s.set_ledger_root(node, commit).unwrap();
+}
+
+// Spec §6.1 step 4: every export writes `ledger_root` from the store, and an
+// import records it — how every machine gets its anchor.
+#[test]
+fn a_bound_projects_export_carries_its_ledger_root_and_an_import_records_it() {
+    let m = Machine::new();
+    let r = repo();
+    let db = m.data.path().join("bound.redb");
+    let root = r.path().canonicalize().unwrap();
+    std::fs::create_dir_all(m.config.path().join("fl")).unwrap();
+    std::fs::write(
+        m.config.path().join("fl/config.toml"),
+        format!(
+            "[[project]]\nroot = \"{}\"\nstore = \"{}\"\ntracker = {{ github = \"acme/widgets\", credential = \"env\" }}\n",
+            root.display(),
+            db.display()
+        ),
+    )
+    .unwrap();
+    m.fl(r.path())
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    with_ledger_root(&db, "acme/widgets", "R_1", "abc123");
+
+    m.fl(r.path())
+        .args(["manifest", "export", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("ledger_root\tabc123"));
+    let text = std::fs::read_to_string(r.path().join(".fl/manifest.json")).unwrap();
+    assert!(
+        text.contains("\"format_version\": 2") && text.contains("\"repository_node_id\": \"R_1\""),
+        "{text}"
+    );
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-qm", "manifest"]);
+
+    let other = Machine::new();
+    let c = clone_of(r.path());
+    other
+        .fl(c.path())
+        .args(["manifest", "import"])
+        .assert()
+        .success();
+    use fl_core::store::Bindings;
+    let imported = fl_store::RedbStore::open(&other.data.path().join("fl/fl.redb")).unwrap();
+    assert_eq!(
+        imported.ledger_root("R_1").unwrap().as_deref(),
+        Some("abc123")
+    );
+}
+
+// Spec §6.1 step 4: with --db the config entry is not read, so the export cannot
+// know which repository's root belongs in it — and writing none would drop
+// every machine's anchor.
+#[test]
+fn an_export_under_db_from_a_store_with_a_ledger_root_is_refused_and_writes_nothing() {
+    let m = Machine::new();
+    let r = repo();
+    let db = m.data.path().join("s.redb");
+    let dbs = db.display().to_string();
+    m.fl(r.path())
+        .args(["--db", &dbs, "project", "add", "."])
+        .assert()
+        .success();
+    with_ledger_root(&db, "acme/widgets", "R_1", "abc123");
+
+    m.fl(r.path())
+        .args(["--db", &dbs, "manifest", "export", "--project", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("records a GitHub ledger root").and(contains("without --db")));
+    assert!(
+        !r.path().join(".fl/manifest.json").exists(),
+        "nothing was written"
+    );
+}
+
+// Spec §6.1 step 4: a store that holds a root but no node for the name the
+// config binds cannot tell which root is this project's either.
+#[test]
+fn an_export_whose_configured_repository_has_no_node_in_a_store_with_a_root_is_refused() {
+    let m = Machine::new();
+    let r = repo();
+    let db = m.data.path().join("bound.redb");
+    let root = r.path().canonicalize().unwrap();
+    std::fs::create_dir_all(m.config.path().join("fl")).unwrap();
+    std::fs::write(
+        m.config.path().join("fl/config.toml"),
+        format!(
+            "[[project]]\nroot = \"{}\"\nstore = \"{}\"\ntracker = {{ github = \"acme/widgets\", credential = \"env\" }}\n",
+            root.display(),
+            db.display()
+        ),
+    )
+    .unwrap();
+    m.fl(r.path())
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    // A root for a repository the store knows under another name only.
+    with_ledger_root(&db, "acme/gadgets", "R_1", "abc123");
+
+    m.fl(r.path())
+        .args(["manifest", "export", "--project", "1"])
+        .assert()
+        .code(2)
+        .stderr(
+            contains("no repository node for `acme/widgets`").and(contains("fl github whoami")),
+        );
+    assert!(
+        !r.path().join(".fl/manifest.json").exists(),
+        "nothing was written"
+    );
+}
+
+// Spec §6.1 step 4: "for a store another IRI selected" the export cannot
+// know the repository either — even when that store happens to hold a node
+// under the current directory's configured name.
+#[test]
+fn an_export_of_a_project_in_another_projects_store_is_refused_when_that_store_holds_a_root() {
+    use fl_core::store::Catalog;
+    let m = Machine::new();
+    let bound_repo = repo();
+    let other_repo = repo();
+    let a = m.data.path().join("a.redb");
+    let b = m.data.path().join("b.redb");
+    std::fs::create_dir_all(m.config.path().join("fl")).unwrap();
+    std::fs::write(
+        m.config.path().join("fl/config.toml"),
+        format!(
+            "[[project]]\nroot = \"{}\"\nstore = \"{}\"\ntracker = {{ github = \"acme/widgets\", credential = \"env\" }}\n\n[[project]]\nroot = \"{}\"\nstore = \"{}\"\n",
+            bound_repo.path().canonicalize().unwrap().display(),
+            a.display(),
+            other_repo.path().canonicalize().unwrap().display(),
+            b.display()
+        ),
+    )
+    .unwrap();
+    m.fl(other_repo.path())
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    let other_project = {
+        let s = fl_store::RedbStore::open(&b).unwrap();
+        s.list_projects().unwrap()[0].id.iri().to_string()
+    };
+    with_ledger_root(&b, "acme/widgets", "R_9", "abc123");
+
+    m.fl(bound_repo.path())
+        .args(["manifest", "export", "--project", &other_project])
+        .assert()
+        .code(2)
+        .stderr(contains("records a GitHub ledger root"));
+    assert!(
+        !other_repo.path().join(".fl/manifest.json").exists(),
+        "nothing was written"
+    );
 }

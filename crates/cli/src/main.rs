@@ -477,7 +477,8 @@ fn run(cli: Cli) -> Result<i32> {
     // command never reads it, so an ambiguous config cannot block that
     // escape hatch — but a tracker command with an ambiguous config is
     // refused, because it cannot know its tracker.
-    let entry = if explicit.is_none() || needs_tracker {
+    let entry_read = explicit.is_none() || needs_tracker;
+    let entry = if entry_read {
         config::bound_entry(entries, &locus)?
     } else {
         None
@@ -579,6 +580,18 @@ fn run(cli: Cli) -> Result<i32> {
             tracker_label: store.label().to_string(),
         },
     };
+    // `manifest export` writes the ledger root of the repository the
+    // project's ledger is in (GitHub ledger spec §6.1 step 4). Only the
+    // config entry says which, so it is known only when the entry was read
+    // and the command runs on that entry's store.
+    let manifest_binding = if !entry_read || path != bound {
+        cmd::manifest::Binding::Unread
+    } else {
+        match &here_binding {
+            Some(t) => cmd::manifest::Binding::Github(t.github.clone()),
+            None => cmd::manifest::Binding::Local,
+        }
+    };
     match cli.command {
         Command::Project(c) => cmd::project::run(&store, c),
         Command::Gate(c) => cmd::gate::run(&store, c),
@@ -588,7 +601,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Finding(c) => cmd::finding::run(&ctx, c),
         Command::Attempt(c) => cmd::attempt::run(&ctx, c),
         Command::Stats(c) => cmd::stats::run(&store, c),
-        Command::Manifest(c) => cmd::manifest::run(&store, c),
+        Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c),
     }
 }
