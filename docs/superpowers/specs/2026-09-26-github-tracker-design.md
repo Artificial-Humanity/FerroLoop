@@ -281,6 +281,15 @@ fl writes it; fl never reads state from it.
   in that window is a **conflict ERROR**, never success. This is detection, not prevention: the
   other write has already landed, and the next read reports any inconsistency as diverged.
   *(Release scope — measured in the live test, §8.3, before any claim about it is made.)*
+* **The timeline and the edit history lag a write.** Measured live on 2026-09-29: a create's
+  `labeled` events appeared 1.5–3.5 s after GitHub answered it; an update's events showed on
+  the first read after it (about 0.5 s) and its edit-history entries about 0.5 s later. So after a create fl reads the timeline until the
+  create's `labeled` events show, and after an update or a repair it reads the window until
+  its own events and edits show — each for at most 10 s. A create whose events never show
+  still succeeds, and the next write refuses as a conflict. An update whose write never shows
+  is an ERROR that says to read the item again. Without the wait, fl's own late events land
+  in the next write's window and read as someone else's. *(Release scope. Modelled, not
+  measured: once fl's own events show, every event written before them shows too.)*
 * **A create cannot duplicate.** A create carries a `create_key` that fl mints. After a timeout
   or a connection failure, fl lists the fl issues created since the attempt — the list
   endpoint, not search — and looks for that key before it sends the create again.

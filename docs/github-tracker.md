@@ -164,11 +164,8 @@ It also refuses a pull request, a deleted issue and a transferred one.
 
 ## Conflicts
 
-**Status: unmeasured.** The live tests (below) have not yet been run against GitHub, so
-conflict detection, and the basics it rests on — GitHub returning a body and a title exactly as
-fl sent them, the `labels=a,b` list filter meaning "both labels", and the edit-history model
-below — are unmeasured until they are. The owner runs them against a private throwaway
-repository.
+**Status: measured with a token.** The live tests (below) passed against GitHub on
+2026-09-29, writing with a fine-grained token; they have not yet been run writing as the App.
 
 GitHub has no conditional update, so fl cannot prevent two writers from crossing. It detects
 it, and a write that crossed another is a `Conflict` error, never a success. Two checks make
@@ -190,28 +187,34 @@ Either way, the other change has already landed: read the item again, check it, 
 After the second kind of conflict fl's own write has landed as well, and the next read reports
 any disagreement as diverged.
 
-The detection rests on a model of what GitHub records, none of it yet measured against
-GitHub itself:
+The detection rests on a model of what GitHub records. The live tests measured most of it:
 
 - **The total count.** fl counts edits by the edit history's total count, and takes that
-  count to include every entry.
+  count to include every entry. Measured: it did, on every read.
 
 - **The first-edit blind spot.** fl takes the first edit of an issue's body to add two
   entries to its edit history (the original, then the edit) and every later edit to add one.
   If GitHub records a first edit as one entry, then someone else's body edit that lands in the
   same moment as fl's first edit of that issue is hidden: the count looks like fl's alone.
+  Measured: a first edit added two entries and a later one one, as modelled.
 - **The edit history's order.** fl reads the last hundred entries and the total count; it
   counts by the total, which does not depend on the order GitHub lists them in, and uses the
   entries only as a second count. An entry deleted and another added in the same window
-  cancel out and are not seen.
-- **Lag.** fl takes the timeline and the edit history to show its own write as soon as
-  GitHub answers it. If they lag, someone else's change landing just after fl's write can be
-  missed, and fl's own late events can land in its next write's window, where they are
-  reported as a spurious conflict.
+  cancel out and are not seen. Not measured.
+- **Lag.** Measured: the timeline and the edit history lag a write. A create's label events
+  appeared 1.5–3.5 s after GitHub answered it; an update's events showed on the first read
+  after it (about 0.5 s), and its edit-history entries about 0.5 s later. So fl
+  waits for its own write to show — after a create, until the create's label events are in
+  the timeline; after an update or a repair, until its own events and edits are in the window
+  — for at most 10 s each. Without that, fl's own late events would land in its next write's
+  window and be reported as a spurious conflict. A create whose events never show still
+  succeeds; an update whose write never shows is an error that says to read the item again.
+  Not measured: that once fl's own events show, every event written before them shows too.
 - **Line endings.** fl takes a body rewrite that only changes line endings to count as an
   edit. If GitHub records none for it, someone else's edit in the same window can be missed.
+  Measured: GitHub recorded one entry for such a rewrite, as modelled.
 
-Once run, the live tests (below) check the total count on every read, the first-edit model, one
+The live tests (below) check the total count on every read, the first-edit model, one
 timeline event for each label added or removed, each close, each reopen and each retitle,
 and the lag, by reading at once after each of fl's writes and again two seconds later. They
 also count lost updates under concurrent writers over repeated rounds. For line endings they
@@ -317,9 +320,9 @@ duplicate. `fl record list` and `fl finding list`, or GitHub's issue list filter
 
 ## The live tests
 
-**Status: not yet run.** None of the tests below has been run against GitHub yet, so
-everything they check is unmeasured until they are. The owner runs them against a private
-throwaway repository.
+**Status: passed on 2026-09-29, writing with a fine-grained token.** All three passed. The
+concurrency test counted 1 clean round, 9 conflicts caught and 0 updates lost. They have not
+yet been run writing as the App.
 
 The tests that run in CI use an in-process fake GitHub. It proves the structure, not how
 GitHub behaves, so three more tests in `crates/github/tests/live.rs` run against GitHub
