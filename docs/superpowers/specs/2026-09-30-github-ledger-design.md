@@ -1,7 +1,7 @@
 # GitHub ledger store — design
 
 **Date:** 2026-09-30
-**Status:** Design, awaiting the owner's review. Sub-project 3 of 4. Not started.
+**Status:** Approved by the owner 2026-09-30. Sub-project 3 of 4. Plan A written; plan B follows A's merge.
 **Scope:** A `Ledger` backed by an append-only branch in the GitHub repository that already
 backs the tracker (mode B), the routing that keeps every run locally and sends decisions to
 GitHub, one comment per decision on the issue it concerns, and the setup, disclosure and
@@ -75,6 +75,8 @@ invocation). Both are append-only evidence.
 12. **The Free plan is the baseline.** Every core feature must work on GitHub Free. A
     paid-plan feature may be an option, but it must be non-critical or replaceable by a local
     option. Decision 9 applies this rule.
+13. **`fl finding reproduce` checks the finding's state before its gate runs** (confirmed while
+    planning), so every refusal after the run is a verdict, recorded and flushed.
 
 ### 0.2 Out of scope
 
