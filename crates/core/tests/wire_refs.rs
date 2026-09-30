@@ -128,16 +128,20 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
     finding.reproduction = Some(g.clone());
     finding.also_known_as = vec![iri(6)];
     let gate_run = GateRun {
+        id: Some(iri(7)),
+        at: Some(At::from_unix_millis(1)),
         gate: g.clone(),
         record: Some(r.clone()),
         commit: "abc".into(),
         verdict: Verdict::from_predicate(true, 1),
         population: 1,
-        output_excerpt: String::new(),
+        output_excerpt: Some(String::new()),
         duration_ms: 1,
         cost_usd_micros: 0,
     };
     let attempt = Attempt {
+        id: Some(iri(8)),
+        at: Some(At::from_unix_millis(2)),
         project: p.clone(),
         record: r.clone(),
         adapter: "claude".into(),
@@ -146,14 +150,14 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
         tokens_in: 0,
         tokens_out: 0,
         cost_usd_micros: 0,
-        paths_touched: vec!["a.rs".into()],
-        output_excerpt: String::new(),
+        paths_touched: PathsTouched::Listed(vec!["a.rs".into()]),
+        output_excerpt: Some(String::new()),
     };
     assert_every_reference_refuses_a_handle("Project", &project, 1);
     assert_every_reference_refuses_a_handle("GateDef", &gate_def, 2);
     assert_every_reference_refuses_a_handle("Transition", &transition, 2);
     assert_every_reference_refuses_a_handle("Record", &record, 3);
     assert_every_reference_refuses_a_handle("Finding", &finding, 5);
-    assert_every_reference_refuses_a_handle("GateRun", &gate_run, 2);
-    assert_every_reference_refuses_a_handle("Attempt", &attempt, 2);
+    assert_every_reference_refuses_a_handle("GateRun", &gate_run, 3);
+    assert_every_reference_refuses_a_handle("Attempt", &attempt, 3);
 }

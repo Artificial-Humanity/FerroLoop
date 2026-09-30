@@ -3,7 +3,7 @@ use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Args;
 use fl_core::ids::RecordId;
-use fl_core::log::{Attempt, AttemptStatus};
+use fl_core::log::{Attempt, AttemptStatus, PathsTouched};
 use fl_core::store::{Catalog, Ledger};
 use fl_core::{Iri, Kind};
 use fl_exec::adapters::ClaudeAdapter;
@@ -93,6 +93,8 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     // ⚠ Recorded whatever the outcome. A crash, a timeout and a refusal all
     // cost something, even when that something is only the wall clock.
     store.append_attempt(Attempt {
+        id: Some(fl_exec::stamp::entry_id()),
+        at: Some(fl_exec::stamp::now()),
         project: record.project,
         record: record.id,
         adapter: "claude".into(),
@@ -101,8 +103,8 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         tokens_in: outcome.tokens_in,
         tokens_out: outcome.tokens_out,
         cost_usd_micros: outcome.cost_usd_micros,
-        paths_touched: outcome.paths_touched.clone(),
-        output_excerpt: outcome.output_excerpt.clone(),
+        paths_touched: PathsTouched::Listed(outcome.paths_touched.clone()),
+        output_excerpt: Some(outcome.output_excerpt.clone()),
     })?;
 
     println!("{}\t{}ms", outcome.status.as_wire(), outcome.duration_ms);

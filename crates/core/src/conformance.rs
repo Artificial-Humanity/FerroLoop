@@ -924,14 +924,17 @@ fn sample_selector() -> Selector {
     }
 }
 
+/// A run as recorded before entry ids (spec §1.3): no `id`, no `at`.
 fn sample_run(gate: GateId, commit: &str, population: u64) -> GateRun {
     GateRun {
+        id: None,
+        at: None,
         gate,
         record: None,
         commit: commit.into(),
         verdict: Verdict::from_predicate(true, population),
         population,
-        output_excerpt: String::new(),
+        output_excerpt: Some(String::new()),
         duration_ms: 1,
         cost_usd_micros: 0,
     }

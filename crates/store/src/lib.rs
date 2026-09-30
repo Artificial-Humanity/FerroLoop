@@ -1192,12 +1192,14 @@ mod tests {
                 )
                 .unwrap();
             s.append_gate_run(GateRun {
+                id: None,
+                at: None,
                 gate: g.clone(),
                 record: None,
                 commit: "abc".into(),
                 verdict: verdict.clone(),
                 population: 3,
-                output_excerpt: String::new(),
+                output_excerpt: Some(String::new()),
                 duration_ms: 1,
                 cost_usd_micros: 0,
             })
@@ -1424,6 +1426,62 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = RedbStore::open(&dir.path().join("t.redb")).unwrap();
         (s, dir)
+    }
+
+    /// A store holding one run and one attempt in the shape every store held
+    /// before entry ids: raw rows, as the current fl writes them. The row
+    /// counters move with them, so a later append cannot overwrite them.
+    fn with_legacy_entries() -> (RedbStore, tempfile::TempDir, ProjectId, GateId) {
+        let (s, d) = fresh();
+        let p = s.add_project("/p").unwrap();
+        let g = s
+            .add_gate(&p, "fmt", kind(), selector(), 1, "abc", "o")
+            .unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let run = format!(
+            r#"{{"gate":"{}","record":"{}","commit":"abc","verdict":{{"pass":{{"population":1}}}},"population":1,"output_excerpt":"ok","duration_ms":1,"cost_usd_micros":0}}"#,
+            g.iri(),
+            r.iri()
+        );
+        let attempt = format!(
+            r#"{{"project":"{}","record":"{}","adapter":"claude","status":"completed","duration_ms":1,"tokens_in":0,"tokens_out":0,"cost_usd_micros":0,"paths_touched":["a.rs"],"output_excerpt":""}}"#,
+            p.iri(),
+            r.iri()
+        );
+        {
+            let tx = s.db.begin_write().unwrap();
+            tx.open_table(GATE_RUNS)
+                .unwrap()
+                .insert(1u64, run.as_str())
+                .unwrap();
+            tx.open_table(ATTEMPTS)
+                .unwrap()
+                .insert(1u64, attempt.as_str())
+                .unwrap();
+            {
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert(NEXT_RUN, 1u64).unwrap();
+                meta.insert(NEXT_ATTEMPT, 1u64).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        (s, d, p, g)
+    }
+
+    #[test]
+    fn a_run_and_an_attempt_stored_before_entry_ids_still_read() {
+        let (s, _d, p, g) = with_legacy_entries();
+        let runs = s.gate_runs(&g).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].id.as_ref(), runs[0].at.as_ref()), (None, None));
+        assert_eq!(runs[0].output_excerpt.as_deref(), Some("ok"));
+        let attempts = s.attempts(&p).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].id, None);
+        assert_eq!(
+            attempts[0].paths_touched,
+            fl_core::log::PathsTouched::Listed(vec!["a.rs".into()])
+        );
     }
 
     fn kind() -> GateKind {

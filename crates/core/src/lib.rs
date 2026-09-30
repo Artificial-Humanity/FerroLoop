@@ -2,6 +2,7 @@
 
 mod wire;
 
+pub mod at;
 #[cfg(any(test, feature = "conformance"))]
 #[doc(hidden)]
 pub mod conformance;
@@ -15,10 +16,11 @@ pub mod stale;
 pub mod store;
 pub mod verdict;
 
+pub use at::{At, AtError};
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 pub use iri::{Iri, IriError};
-pub use log::{Attempt, AttemptStatus, GateRun};
+pub use log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 pub use mem::MemStore;
 pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
