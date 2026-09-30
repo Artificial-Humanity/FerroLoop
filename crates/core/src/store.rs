@@ -111,6 +111,28 @@ pub enum StoreError {
          it, and retry."
     )]
     Conflict { id: Iri, detail: String },
+    /// ⚠ One entry id, two contents: this machine's copy and the shared
+    /// ledger's (GitHub ledger spec §2.5). An entry never changes once it is
+    /// written, so one of the two was altered afterwards.
+    #[error(
+        "{id} is recorded differently on this machine and in the shared ledger: {detail}. An \
+         entry never changes once it is written, so one copy was altered afterwards, and fl \
+         uses neither. Find out who changed it before trusting either copy."
+    )]
+    Tampered { id: Iri, detail: String },
+    /// ⚠ The cut-over is recorded once, when a repository's GitHub ledger
+    /// is switched on (spec §2.1): moving it would strand every entry
+    /// recorded between the two.
+    #[error(
+        "the GitHub ledger of repository node {node_id} was switched on at {held}, and this \
+         names {found}. The cut-over never moves: entries between the two would never be \
+         published. Keep the recorded one."
+    )]
+    CutoverChanged {
+        node_id: String,
+        held: Iri,
+        found: Iri,
+    },
     /// The id names something that exists but that fl did not create.
     #[error(
         "{id} is {what}, not an item fl created, so fl neither reads nor changes it. Name an \

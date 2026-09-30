@@ -11,15 +11,20 @@
 //! `make` returns the store plus a guard to keep alive (a temp directory for
 //! a file store, `()` for memory).
 
+use crate::at::At;
+use crate::decision::{Decision, Outcome, TransitionOutcome};
 use crate::finding::{Finding, FindingState};
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
-use crate::log::GateRun;
+use crate::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 use crate::model::{
     CommandSpec, GateDef, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
+use crate::split::{Batch, RemoteLedger};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use crate::verdict::Verdict;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 
 /// Run every case in `cases` against a fresh store from `make`.
 ///
@@ -937,5 +942,240 @@ fn sample_run(gate: GateId, commit: &str, population: u64) -> GateRun {
         output_excerpt: Some(String::new()),
         duration_ms: 1,
         cost_usd_micros: 0,
+    }
+}
+
+/// An entry id no store mints: the `9` variant nibble keeps it apart from
+/// [`seq_iri`]'s ids. Ordered by `n`, as UUIDv7 ids are ordered by time.
+pub fn entry_iri(n: u64) -> Iri {
+    Iri::parse(&format!("urn:uuid:00000000-0000-7000-9000-{n:012x}"))
+        .expect("a formatted urn:uuid is a valid IRI")
+}
+
+/// A run with an id, stamped `n` milliseconds after the epoch.
+pub fn sample_record_run(n: u64, gate: &GateId, record: Option<&RecordId>) -> GateRun {
+    GateRun {
+        id: Some(entry_iri(n)),
+        at: Some(At::from_unix_millis(n)),
+        gate: gate.clone(),
+        record: record.cloned(),
+        commit: "abc".into(),
+        verdict: Verdict::from_predicate(true, 1),
+        population: 1,
+        output_excerpt: Some(format!("run {n}")),
+        duration_ms: 1,
+        cost_usd_micros: 0,
+    }
+}
+
+/// An attempt with an id, stamped `n` milliseconds after the epoch.
+pub fn sample_attempt(n: u64, project: &ProjectId, record: &RecordId) -> Attempt {
+    Attempt {
+        id: Some(entry_iri(n)),
+        at: Some(At::from_unix_millis(n)),
+        project: project.clone(),
+        record: record.clone(),
+        adapter: "claude".into(),
+        status: AttemptStatus::Completed,
+        duration_ms: 1,
+        tokens_in: 0,
+        tokens_out: 0,
+        cost_usd_micros: 0,
+        paths_touched: PathsTouched::Listed(vec!["src/a.rs".into()]),
+        output_excerpt: Some(format!("attempt {n}")),
+    }
+}
+
+/// A `check` decision about `record`, resting on `rests_on`.
+pub fn sample_decision(n: u64, record: &RecordId, rests_on: Vec<Iri>) -> Decision {
+    Decision {
+        id: entry_iri(1_000_000 + n),
+        at: At::from_unix_millis(1_000_000 + n),
+        record: record.clone(),
+        finding: None,
+        outcome: Outcome::Check {
+            transition: TransitionOutcome {
+                transition: "launch".into(),
+                passed: true,
+            },
+        },
+        rests_on,
+    }
+}
+
+/// Drives a split ledger's GitHub side. `MemRemote` implements it here;
+/// plan B's fixture implements it over `GithubLedger` and the fake GitHub.
+pub trait RemoteControl {
+    /// While down, every remote read and write fails as unreachable.
+    /// Ownership is a local check (spec §2.1) and keeps answering.
+    fn set_down(&self, down: bool);
+    /// The next publish lands, and then its answer is lost — a timeout
+    /// after the commit (spec §3.2 step 5, §8.3).
+    fn lose_next_answer(&self);
+    /// A record another repository owns.
+    fn foreign_record(&self) -> RecordId;
+    /// The remote side itself, read without the local store.
+    fn remote(&self) -> &dyn RemoteLedger;
+}
+
+/// The one record [`MemRemote`] does not own.
+fn foreign() -> RecordId {
+    RecordId(
+        Iri::parse("urn:uuid:00000000-0000-7000-f000-000000000001")
+            .expect("a formatted urn:uuid is a valid IRI"),
+    )
+}
+
+/// An in-memory GitHub side for [`crate::split::SplitLedger`] (GitHub
+/// ledger spec §8.2). Ownership is a pure, local answer, as the spec
+/// requires: it owns every record except [`RemoteControl::foreign_record`],
+/// and never reads a tracker. `publish` adds only ids it does not hold, and
+/// makes no commit when nothing is left.
+pub struct MemRemote {
+    node_id: String,
+    inner: RefCell<RemoteInner>,
+}
+
+#[derive(Default)]
+struct RemoteInner {
+    down: bool,
+    fail_publish: bool,
+    lose_next_answer: bool,
+    foreign: BTreeSet<RecordId>,
+    runs: Vec<GateRun>,
+    attempts: Vec<Attempt>,
+    decisions: Vec<Decision>,
+    commits: u64,
+}
+
+impl MemRemote {
+    pub fn new(node_id: &str) -> Self {
+        let inner = RemoteInner {
+            foreign: BTreeSet::from([foreign()]),
+            ..RemoteInner::default()
+        };
+        Self {
+            node_id: node_id.to_string(),
+            inner: RefCell::new(inner),
+        }
+    }
+
+    /// Every `publish` fails and nothing lands, while everything else
+    /// answers.
+    pub fn fail_publish(&self, on: bool) {
+        self.inner.borrow_mut().fail_publish = on;
+    }
+
+    /// A run as GitHub holds it — another machine's, or an altered copy —
+    /// added without de-duplication.
+    pub fn insert_run(&self, run: GateRun) {
+        self.inner.borrow_mut().runs.push(run);
+    }
+
+    /// An attempt as GitHub holds it, added without de-duplication.
+    pub fn insert_attempt(&self, attempt: Attempt) {
+        self.inner.borrow_mut().attempts.push(attempt);
+    }
+
+    pub fn decisions(&self) -> Vec<Decision> {
+        self.inner.borrow().decisions.clone()
+    }
+
+    fn unreachable(&self, cause: &str) -> StoreError {
+        StoreError::Unreachable {
+            store: format!("github ledger {}", self.node_id),
+            cause: cause.to_string(),
+        }
+    }
+
+    fn refuse_if_down(&self) -> Result<(), StoreError> {
+        if self.inner.borrow().down {
+            return Err(self.unreachable("taken down by the test"));
+        }
+        Ok(())
+    }
+}
+
+impl RemoteLedger for MemRemote {
+    fn repo_node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    fn owns_record(&self, record: &RecordId) -> Result<bool, StoreError> {
+        Ok(!self.inner.borrow().foreign.contains(record))
+    }
+
+    fn publish(&self, batch: &Batch) -> Result<Option<String>, StoreError> {
+        self.refuse_if_down()?;
+        let mut s = self.inner.borrow_mut();
+        if s.fail_publish {
+            return Err(self.unreachable("the commit did not land"));
+        }
+        let mut added = 0;
+        for run in &batch.runs {
+            if !s.runs.iter().any(|held| held.id == run.id) {
+                s.runs.push(run.clone());
+                added += 1;
+            }
+        }
+        for attempt in &batch.attempts {
+            if !s.attempts.iter().any(|held| held.id == attempt.id) {
+                s.attempts.push(attempt.clone());
+                added += 1;
+            }
+        }
+        if !s.decisions.iter().any(|d| d.id == batch.decision.id) {
+            s.decisions.push(batch.decision.clone());
+            added += 1;
+        }
+        let commit = if added == 0 {
+            None
+        } else {
+            s.commits += 1;
+            Some(format!("commit-{}", s.commits))
+        };
+        if std::mem::take(&mut s.lose_next_answer) {
+            return Err(self.unreachable("the commit landed, but its answer was lost"));
+        }
+        Ok(commit)
+    }
+
+    fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
+        self.refuse_if_down()?;
+        Ok(self
+            .inner
+            .borrow()
+            .runs
+            .iter()
+            .filter(|r| r.gate == *gate)
+            .cloned()
+            .collect())
+    }
+
+    fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
+        self.refuse_if_down()?;
+        Ok(self
+            .inner
+            .borrow()
+            .attempts
+            .iter()
+            .filter(|a| a.project == *project)
+            .cloned()
+            .collect())
+    }
+}
+
+impl RemoteControl for MemRemote {
+    fn set_down(&self, down: bool) {
+        self.inner.borrow_mut().down = down;
+    }
+    fn lose_next_answer(&self) {
+        self.inner.borrow_mut().lose_next_answer = true;
+    }
+    fn foreign_record(&self) -> RecordId {
+        foreign()
+    }
+    fn remote(&self) -> &dyn RemoteLedger {
+        self
     }
 }

@@ -13,6 +13,7 @@ pub mod iri;
 pub mod log;
 pub mod mem;
 pub mod model;
+pub mod split;
 pub mod stale;
 pub mod store;
 pub mod verdict;
@@ -28,6 +29,7 @@ pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
+pub use split::{Batch, Coverage, LocalLedger, Outbox, Pending, RemoteLedger, SplitLedger};
 pub use stale::{Staleness, apply_staleness, is_stale};
 pub use store::{
     Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,

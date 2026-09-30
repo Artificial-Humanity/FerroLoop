@@ -3,9 +3,10 @@ use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
+use crate::split::{Outbox, Pending};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// An in-memory store for tests. Deliberately lives in `fl-core` so the
 /// engine's own tests need no backend at all. Backs all three roles.
@@ -40,6 +41,10 @@ struct Inner {
     aliases: BTreeMap<Iri, Iri>,
     /// configured `owner/repo` (lowercase) → the repository's `node_id`.
     bindings: BTreeMap<String, String>,
+    /// (repository `node_id`, entry id) for every entry marked published.
+    published: BTreeSet<(String, Iri)>,
+    /// repository `node_id` → the id after which entries are publishable.
+    cutovers: BTreeMap<String, Iri>,
 }
 
 impl Inner {
@@ -401,6 +406,68 @@ impl Ledger for MemStore {
     }
 }
 
+impl Outbox for MemStore {
+    fn unpublished(&self, repo: &str, after: &Iri) -> Result<Pending, StoreError> {
+        let s = self.inner.borrow();
+        let waiting = |id: &Option<Iri>| {
+            id.as_ref().is_some_and(|id| {
+                id > after && !s.published.contains(&(repo.to_string(), id.clone()))
+            })
+        };
+        let mut runs: Vec<GateRun> = s
+            .runs
+            .iter()
+            .filter(|r| r.record.is_some() && waiting(&r.id))
+            .cloned()
+            .collect();
+        let mut attempts: Vec<Attempt> = s
+            .attempts
+            .iter()
+            .filter(|a| waiting(&a.id))
+            .cloned()
+            .collect();
+        runs.sort_by(|a, b| a.id.cmp(&b.id));
+        attempts.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(Pending { runs, attempts })
+    }
+
+    fn is_published(&self, repo: &str, id: &Iri) -> Result<bool, StoreError> {
+        Ok(self
+            .inner
+            .borrow()
+            .published
+            .contains(&(repo.to_string(), id.clone())))
+    }
+
+    fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        for id in ids {
+            s.published.insert((repo.to_string(), id.clone()));
+        }
+        Ok(())
+    }
+
+    fn cutover(&self, repo: &str) -> Result<Option<Iri>, StoreError> {
+        Ok(self.inner.borrow().cutovers.get(repo).cloned())
+    }
+
+    fn set_cutover(&self, repo: &str, id: &Iri) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        match s.cutovers.get(repo) {
+            Some(held) if held == id => Ok(()),
+            Some(held) => Err(StoreError::CutoverChanged {
+                node_id: repo.to_string(),
+                held: held.clone(),
+                found: id.clone(),
+            }),
+            None => {
+                s.cutovers.insert(repo.to_string(), id.clone());
+                Ok(())
+            }
+        }
+    }
+}
+
 impl Handles for MemStore {
     fn handle_of(&self, kind: Kind, id: &Iri) -> Result<Option<u64>, StoreError> {
         let s = self.inner.borrow();
@@ -445,5 +512,85 @@ mod tests {
         crate::conformance::ledger(|| (MemStore::default(), ()));
         crate::conformance::all_roles(|| Single(MemStore::default(), ()));
         crate::conformance::local_handles(|| (MemStore::default(), ()));
+    }
+
+    /// A project with one gate and one record.
+    fn outbox_world() -> (
+        MemStore,
+        crate::ids::GateId,
+        crate::ids::RecordId,
+        ProjectId,
+    ) {
+        let s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let kind = crate::model::GateKind::Command(crate::model::CommandSpec {
+            program: "true".into(),
+            args: vec![],
+            delivery: crate::model::PopulationDelivery::Args,
+            timeout_secs: 5,
+            pass_codes: vec![0],
+        });
+        let sel = crate::model::Selector::Glob {
+            pattern: "**/*".into(),
+        };
+        let g = s.add_gate(&p, "g", kind, sel, 1, "c", "o").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        (s, g, r, p)
+    }
+
+    // Spec §1.3, §2.1, §3.2 step 6: only an entry with an id, tied to a
+    // record, after the cut-over and not yet marked can be waiting; a mark
+    // is per repository; the list is in id order.
+    #[test]
+    fn unpublished_lists_only_record_tied_entries_after_the_cut_over_with_no_mark() {
+        use crate::conformance::{entry_iri, sample_attempt, sample_record_run};
+        use crate::split::Outbox;
+        let (s, g, r, p) = outbox_world();
+        let before = sample_record_run(2, &g, Some(&r));
+        let marked = sample_record_run(4, &g, Some(&r));
+        let no_record = sample_record_run(5, &g, None);
+        let mut no_id = sample_record_run(6, &g, Some(&r));
+        no_id.id = None;
+        let late = sample_record_run(8, &g, Some(&r));
+        let waiting = sample_record_run(7, &g, Some(&r));
+        for run in [&before, &marked, &no_record, &no_id, &late, &waiting] {
+            s.append_gate_run(run.clone()).unwrap();
+        }
+        let attempt = sample_attempt(9, &p, &r);
+        s.append_attempt(attempt.clone()).unwrap();
+        s.mark_published("R_1", &[marked.id.clone().unwrap()])
+            .unwrap();
+
+        let pending = s.unpublished("R_1", &entry_iri(3)).unwrap();
+        assert_eq!(
+            pending.runs,
+            vec![waiting.clone(), late.clone()],
+            "id order"
+        );
+        assert_eq!(pending.attempts, vec![attempt]);
+        assert_eq!(
+            s.unpublished("R_2", &entry_iri(3)).unwrap().runs,
+            vec![marked, waiting, late],
+            "a mark is per repository"
+        );
+    }
+
+    // Spec §2.1: the cut-over is recorded once, when the GitHub ledger is
+    // switched on; moving it would strand every entry in between.
+    #[test]
+    fn a_cut_over_is_recorded_once_per_repository() {
+        use crate::conformance::entry_iri;
+        use crate::split::Outbox;
+        let s = MemStore::default();
+        assert_eq!(s.cutover("R_1").unwrap(), None);
+        s.set_cutover("R_1", &entry_iri(3)).unwrap();
+        s.set_cutover("R_1", &entry_iri(3)).unwrap();
+        let err = s.set_cutover("R_1", &entry_iri(4)).unwrap_err();
+        assert!(
+            matches!(err, StoreError::CutoverChanged { ref held, .. } if *held == entry_iri(3)),
+            "{err:?}"
+        );
+        assert_eq!(s.cutover("R_1").unwrap(), Some(entry_iri(3)));
+        assert_eq!(s.cutover("R_2").unwrap(), None);
     }
 }
