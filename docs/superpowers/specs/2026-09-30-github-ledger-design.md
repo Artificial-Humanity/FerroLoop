@@ -115,8 +115,9 @@ spelling, so its string order is time order.
 ### 1.4 The `Ledger` trait
 
 `Ledger` gains `flush(&self, decision: Decision) -> Result<Flushed, StoreError>`, whose
-default does nothing and returns `Flushed::Nothing`. `Flushed` names the ledger commit, when
-there was one.
+default does nothing. `Flushed` names the ledger commit, when there was one, and what stayed
+local — entries of records another repository owns, or everything when no cut-over is
+recorded — so the command can say so.
 
 ### 1.5 Binding
 
