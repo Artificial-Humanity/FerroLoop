@@ -17,6 +17,16 @@ pub enum ExecError {
     /// command — a refusal naming the wrong cause.
     #[error("{0}")]
     Store(String),
+    /// ⚠ The decision's evidence could not be published (GitHub ledger spec
+    /// §2.2), so the decision is refused and nothing changed. The runs are
+    /// in the local store, and the next decision that reaches the ledger
+    /// publishes them.
+    #[error(
+        "refused: the evidence for this decision could not be published to the shared ledger, \
+         so nothing changed ({0}). The runs are kept in the local store, and the next decision \
+         that reaches the ledger publishes them"
+    )]
+    Unpublished(String),
     #[error("command `{0}` could not be run: {1}")]
     Spawn(String, String),
     /// ⚠ A population command that exits non-zero has told you nothing about

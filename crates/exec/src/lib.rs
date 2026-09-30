@@ -2,9 +2,12 @@
 
 pub mod adapters;
 pub mod command;
+pub mod decision;
 pub mod evaluate;
 pub mod finding;
 pub mod git;
+#[cfg(test)]
+mod journal;
 pub mod population;
 pub mod record;
 pub mod runner;
