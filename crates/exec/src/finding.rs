@@ -884,11 +884,14 @@ mod tests {
                 closed: true,
             }
         );
+        let runs = s.gate_runs(&rep).unwrap();
+        assert_eq!(
+            runs.len(),
+            2,
+            "the reproduce's run and the verify's run, so the check below cannot pass vacuously"
+        );
         assert!(
-            s.gate_runs(&rep)
-                .unwrap()
-                .iter()
-                .all(|run| run.record.as_ref() == Some(&r)),
+            runs.iter().all(|run| run.record.as_ref() == Some(&r)),
             "the reproduce and the verify both tag their runs with the finding's record"
         );
     }
@@ -917,7 +920,7 @@ mod tests {
             Outcome::Verify {
                 reproduction: rep,
                 reproduction_passed: true,
-                regressions: vec![neighbour],
+                regressions: vec![neighbour.clone()],
                 closed: false,
             }
         );
@@ -925,6 +928,19 @@ mod tests {
         assert_eq!(
             s.get_finding(&f).unwrap().unwrap().state,
             FindingState::Assigned
+        );
+        let neighbour_runs = s.gate_runs(&neighbour).unwrap();
+        assert_eq!(
+            neighbour_runs.len(),
+            2,
+            "the baseline run (untagged) and the verify's run, so the check below cannot pass vacuously"
+        );
+        assert_eq!(
+            neighbour_runs.last().unwrap().record,
+            Some(r),
+            "the neighbour's verify run carries the finding's record too, so it is \
+             publishable with the decision that rests on it (GitHub mode refuses a decision \
+             whose rests_on cites a run that is not publishable)"
         );
     }
 
