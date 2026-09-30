@@ -202,7 +202,8 @@ The detection rests on a model of what GitHub records. The live tests measured m
   entries only as a second count. An entry deleted and another added in the same window
   cancel out and are not seen. Not measured.
 - **Lag.** Measured: the timeline and the edit history lag a write. A create's label events
-  appeared 1.5–3.5 s after GitHub answered it; an update's showed within one round trip. So fl
+  appeared 1.5–3.5 s after GitHub answered it; an update's events showed on the first read
+  after it (about 0.5 s), and its edit-history entries about 0.5 s later. So fl
   waits for its own write to show — after a create, until the create's label events are in
   the timeline; after an update or a repair, until its own events and edits are in the window
   — for at most 10 s each. Without that, fl's own late events would land in its next write's

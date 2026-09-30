@@ -229,9 +229,9 @@ fn delta(before: &Seen, after: &Seen) -> (u64, BTreeMap<&'static str, u64>) {
 }
 
 /// After an fl write: read what GitHub shows at once (no pause), and again
-/// after two seconds. `update` takes its `after` window IMMEDIATELY after
-/// GitHub answers the PATCH, so the immediate read must already show fl's
-/// own write.
+/// after two seconds. fl returns only once its own write shows (its
+/// `window_after`), and takes everything written before its own events to
+/// show with them — so nothing more may appear after it returns.
 fn after_fl_write(raw: &Client, repo: &str, n: u64, what: &str) -> Seen {
     let immediate = seen(raw, repo, n);
     std::thread::sleep(Duration::from_secs(2));
@@ -239,10 +239,9 @@ fn after_fl_write(raw: &Client, repo: &str, n: u64, what: &str) -> Seen {
     println!("{what}: immediately {immediate:?}; after 2 s {settled:?}");
     assert_eq!(
         immediate, settled,
-        "{what}: GitHub did not yet show fl's own write when read immediately after the PATCH \
-         was answered. This CONFIRMS the lag hazard in `update`'s comment: fl's `after` window \
-         can miss a late foreign write, and fl's own late events can land in its next write's \
-         window as a spurious conflict"
+        "{what}: GitHub showed more two seconds after fl's write returned than at once. fl \
+         waits only until its OWN write shows, so something that lands later — its own or \
+         someone else's — falls in the next write's window, or is missed"
     );
     settled
 }
@@ -268,8 +267,9 @@ fn number(id: &Iri) -> u64 {
 /// - `totalCount` counts every entry `last: 100` lists (checked on every read);
 /// - a FIRST body edit adds two edit-history entries and a later one adds one
 ///   (on a record, and again on a finding);
-/// - fl's own write shows in the timeline and the edit history as soon as
-///   GitHub answers it (read at once, and again two seconds later);
+/// - once fl's write returns — fl waits for its own write to show — nothing
+///   more appears in the next two seconds: what GitHub shows first is
+///   complete (read at once, and again two seconds later);
 /// - each label added or removed is one `labeled`/`unlabeled` event, a close
 ///   one `closed`, a reopen one `reopened` and a retitle one `renamed`;
 /// - a rewrite that changes only line endings (CRLF): whether GitHub records
@@ -353,7 +353,7 @@ fn the_edit_history_and_timeline_counts_match_fls_model() {
     raw_patch(&raw, &repo, fnum, json!({"state": "open"}));
     std::thread::sleep(Duration::from_secs(2));
     let f3 = seen(&raw, &repo, fnum);
-    // ⚠ Before any assertion: a withdrawn finding left open is diverged, and
+    // ⚠ Before the measurements are asserted: a withdrawn finding left open is diverged, and
     // every later full scan of this repository — the next run's lists and
     // alias lookups — would refuse on it.
     let repaired = t.repair(f.iri(), "the live test").unwrap();

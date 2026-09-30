@@ -109,9 +109,11 @@ pub struct State {
     pub timeline_lag_reads: u32,
     /// Event id → timeline reads left before it shows.
     pub(crate) lag_left: BTreeMap<u64, u32>,
+    /// The next timeline read answers 502. One-shot.
+    pub fail_next_timeline: bool,
     /// The same for the body's edit history: an entry made by a request
-    /// stays out of it for this many edit-history reads. Measured live: the
-    /// history showed an update about 0.5 s after the timeline did.
+    /// stays out of it for this many edit-history reads. Measured live: an
+    /// update's entries showed about 0.5 s after its timeline events did.
     pub edit_lag_reads: u32,
     /// Edit id → edit-history reads left before it shows.
     pub(crate) edit_lag_left: BTreeMap<String, u32>,
@@ -739,6 +741,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     a
                 }
                 Some(_) => {
+                    if std::mem::take(&mut s.fail_next_timeline) {
+                        return answer(502, json!({"message": "fake timeline failure"}));
+                    }
                     let n: u64 = n.parse().unwrap_or(0);
                     if std::mem::take(&mut s.foreign_label_on_next_timeline) {
                         let e = s.tick();

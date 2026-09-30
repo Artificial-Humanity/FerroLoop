@@ -282,8 +282,8 @@ fl writes it; fl never reads state from it.
   other write has already landed, and the next read reports any inconsistency as diverged.
   *(Release scope — measured in the live test, §8.3, before any claim about it is made.)*
 * **The timeline and the edit history lag a write.** Measured live on 2026-09-29: a create's
-  `labeled` events appeared 1.5–3.5 s after GitHub answered it; an update's events and edits
-  were visible within one round trip. So after a create fl reads the timeline until the
+  `labeled` events appeared 1.5–3.5 s after GitHub answered it; an update's events showed on
+  the first read after it (about 0.5 s) and its edit-history entries about 0.5 s later. So after a create fl reads the timeline until the
   create's `labeled` events show, and after an update or a repair it reads the window until
   its own events and edits show — each for at most 10 s. A create whose events never show
   still succeeds, and the next write refuses as a conflict. An update whose write never shows

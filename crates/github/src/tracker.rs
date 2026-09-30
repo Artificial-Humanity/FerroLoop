@@ -681,7 +681,7 @@ impl GithubTracker {
             Err(e) => return Err(e),
         };
         check_written(&issue, title, &labels, &body, "open", None)?;
-        self.await_create_events(issue.number, labels.len())?;
+        self.await_create_events(issue.number, labels.len());
         self.kinds.borrow_mut().insert(issue.number, kind);
         self.remember(issue.number, meta, prose, title);
         Ok(issue)
@@ -927,6 +927,18 @@ impl GithubTracker {
     /// The issue's state-changing timeline events and its body edit history,
     /// now. ⚠ Never `remember`s: it reads no item.
     fn window(&self, n: u64) -> Result<Window, StoreError> {
+        let events = self.state_events(n)?;
+        let (edits, edits_total) = self.edit_history(n)?;
+        Ok(Window {
+            events,
+            edits,
+            edits_total,
+        })
+    }
+
+    /// The issue's state-changing timeline events, by id. ⚠ Never
+    /// `remember`s: it reads no item.
+    fn state_events(&self, n: u64) -> Result<BTreeMap<u64, String>, StoreError> {
         let mut events = BTreeMap::new();
         for e in self
             .client
@@ -951,6 +963,12 @@ impl GithubTracker {
             })?;
             events.insert(id, kind.to_string());
         }
+        Ok(events)
+    }
+
+    /// The body's edit history: its entries' ids and its `totalCount`.
+    /// ⚠ Never `remember`s: it reads no item.
+    fn edit_history(&self, n: u64) -> Result<(BTreeSet<String>, u64), StoreError> {
         let (owner, name) = self
             .repo
             .full_name
@@ -1001,11 +1019,7 @@ impl GithubTracker {
                 })
                 })
                 .collect::<Result<_, _>>()?;
-        Ok(Window {
-            events,
-            edits,
-            edits_total,
-        })
+        Ok((edits, edits_total))
     }
 
     /// Why GitHub's GraphQL finds no issue `n`, which its REST API served a
@@ -1117,17 +1131,21 @@ impl GithubTracker {
     /// they appeared 1.5-3.5 s after GitHub answered the create. A create
     /// whose events never show still succeeds — the create landed, and the
     /// next write refuses as a conflict, which is the safe side.
-    fn await_create_events(&self, n: u64, labels: usize) -> Result<(), StoreError> {
+    /// ⚠ Never an error: the issue exists by now, and `add_record` mints a
+    /// new create key on every call, so an error here would invite a retry
+    /// that makes a DUPLICATE. A failed read ends the wait like a timeout.
+    /// ⚠ Counts every `labeled` event, not the create's own labels: one added
+    /// by someone else can stand in for a lagging one of fl's, which then
+    /// lands in the next write's window — a conflict, the safe side.
+    fn await_create_events(&self, n: u64, labels: usize) {
         let start = std::time::Instant::now();
         loop {
-            let shown = self
-                .window(n)?
-                .events
-                .values()
-                .filter(|k| *k == "labeled")
-                .count();
+            let Ok(events) = self.state_events(n) else {
+                return;
+            };
+            let shown = events.values().filter(|k| *k == "labeled").count();
             if shown >= labels || start.elapsed() >= self.visible_within {
-                return Ok(());
+                return;
             }
             std::thread::sleep(self.poll);
         }
@@ -1621,13 +1639,14 @@ fn own_write(before: &Window, old: &IssueView, new: &IssueView) -> Own {
     // edit, a foreign edit landing with fl's first edit would be hidden.
     // Checked by exact count in the live test
     // `the_edit_history_and_timeline_counts_match_fls_model`.
-    // ⚠ Modelled: the raw bodies are compared, so a rewrite that only
-    // turns CRLF into LF is taken to record an edit. If GitHub records
-    // none for it, `edits` is one too high and one foreign edit in
-    // the same window would be hidden. Partly measured: the live test
-    // `the_edit_history_and_timeline_counts_match_fls_model` prints whether GitHub
-    // records an entry for a CRLF-only rewrite (it does not assert it),
-    // and checks that an fl write after one is not a conflict.
+    // ⚠ The raw bodies are compared, so a rewrite that only turns CRLF into
+    // LF is taken to record an edit. Measured live (2026-09-29): GitHub
+    // recorded one entry for a CRLF-only rewrite, as modelled; the live
+    // test prints it but does not assert it. If that ever changes, `edits`
+    // is one too high: `window_after` then waits its full time for an entry
+    // that never comes, and fails the write with "has not shown".
+    // (`update` cannot currently send a line-endings-only change: its
+    // no-op check normalises CRLF, and every change rewrites the block.)
     let edits = match (old.body != new.body, before.edits_total == 0) {
         (false, _) => 0,
         (true, true) => 2,
@@ -2278,6 +2297,32 @@ mod tests {
         assert!(t.repair(r.iri(), "owner").unwrap().changed);
     }
 
+    /// The issue exists once GitHub answers the create. An error after that
+    /// would invite a retry, and a retry mints a new create key: a duplicate.
+    #[test]
+    fn a_create_whose_timeline_read_fails_still_succeeds() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().fail_next_timeline = true;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1);
+    }
+
+    /// Waiting for fl's own events must not hide someone else's that land
+    /// with them.
+    #[test]
+    fn a_foreign_write_is_still_caught_while_fl_waits_for_its_own() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().timeline_lag_reads = 2;
+        fake.state().foreign_label_on_next_patch = true;
+        assert!(matches!(
+            t.set_record_state(&r, State::Doing),
+            Err(StoreError::Conflict { .. })
+        ));
+    }
+
     #[test]
     fn an_update_github_never_shows_is_an_error_that_says_to_read_again() {
         let fake = FakeGithub::start("acme/widgets");
@@ -2295,6 +2340,12 @@ mod tests {
             vec!["fl:record", "fl:record/doing"],
             "the write itself landed"
         );
+        // Not remembered: the next write, without a fresh read, is refused.
+        fake.state().timeline_lag_reads = 0;
+        assert!(matches!(
+            t.set_record_state(&r, State::Review),
+            Err(StoreError::Conflict { .. })
+        ));
     }
 
     #[test]
