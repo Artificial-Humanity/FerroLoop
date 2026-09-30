@@ -353,6 +353,11 @@ fn the_edit_history_and_timeline_counts_match_fls_model() {
     raw_patch(&raw, &repo, fnum, json!({"state": "open"}));
     std::thread::sleep(Duration::from_secs(2));
     let f3 = seen(&raw, &repo, fnum);
+    // ⚠ Before any assertion: a withdrawn finding left open is diverged, and
+    // every later full scan of this repository — the next run's lists and
+    // alias lookups — would refuse on it.
+    let repaired = t.repair(f.iri(), "the live test").unwrap();
+    assert!(repaired.changed, "the reopen was undone from the block");
     let (e1, v1) = delta(&f0, &f1);
     let (e2, v2) = delta(&f1, &f2);
     let (e3, v3) = delta(&f2, &f3);
