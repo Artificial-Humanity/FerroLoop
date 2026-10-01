@@ -1017,7 +1017,9 @@ fn a_gate_the_local_catalog_never_held_is_not_owned_whatever_github_holds(
 }
 
 // ⚠ Spec §3.2 step 5 and §8.3: a commit that landed before its answer was
-// lost reads, to fl, as a failure; the retry must not add a second copy.
+// lost may read, to fl, as an outright failure — or, if the remote rereads
+// the ledger and finds its own commit, as a success. Either way, the run is
+// never published twice.
 fn a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush(
     roles: &Bound<'_>,
     ctl: &dyn RemoteControl,
@@ -1027,11 +1029,17 @@ fn a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush(
     let id = run.id.clone().unwrap();
     roles.ledger.append_gate_run(run).unwrap();
     ctl.lose_next_answer();
-    // A remote that cannot tell refuses the flush, and the next one carries
-    // the run; one that reads the ledger again finds the commit landed and
-    // answers (GitHub ledger spec §3.2 step 5; ruling 13). Either way, the
-    // run is never published twice.
-    let _ = roles.ledger.flush(sample_decision(1, &r, vec![id.clone()]));
+    let first = roles.ledger.flush(sample_decision(1, &r, vec![id.clone()]));
+    if first.is_ok() {
+        // A remote that reread the ledger already landed the run on this
+        // first flush: the second flush below must find it already there,
+        // not add a second copy of its own.
+        assert_eq!(
+            run_ids(ctl.remote().gate_runs(&g).unwrap()),
+            vec![Some(id.clone())],
+            "the run already landed before the second flush"
+        );
+    }
     let flushed = roles
         .ledger
         .flush(sample_decision(2, &r, vec![id.clone()]))

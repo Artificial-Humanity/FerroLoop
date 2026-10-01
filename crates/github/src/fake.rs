@@ -506,6 +506,18 @@ impl FakeGithub {
             .first_parents(crate::ledger::layout::BRANCH)
             .len()
     }
+
+    /// Every commit message `fl/ledger` holds along first parents — the
+    /// headline each append or hand edit used, so a test can scan commit
+    /// messages for anything machine-specific as well as file contents.
+    pub fn ledger_commit_messages(&self) -> Vec<String> {
+        let s = self.state();
+        s.git
+            .first_parents(crate::ledger::layout::BRANCH)
+            .iter()
+            .filter_map(|id| s.git.commits.get(id).map(|c| c.message.clone()))
+            .collect()
+    }
 }
 
 impl Drop for FakeGithub {

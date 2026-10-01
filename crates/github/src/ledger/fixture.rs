@@ -7,7 +7,9 @@ use crate::client::Client;
 use crate::creds::EnvToken;
 use crate::fake::FakeGithub;
 use crate::tracker::GithubTracker;
-use fl_core::conformance::{Bound, Fixture, RemoteControl, SplitFixture, entry_iri};
+use fl_core::conformance::{
+    Bound, Fixture, RemoteControl, SplitFixture, entry_iri, sample_decision, sample_record_run,
+};
 use fl_core::ids::{GateId, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
@@ -141,4 +143,57 @@ impl Fixture for OverFake {
 fn a_split_ledger_over_github_meets_the_ledger_contracts() {
     fl_core::conformance::ledger(|| OverFake);
     fl_core::conformance::split_ledger(|| OverFake);
+}
+
+// ⚠ The shared lost-answer case cannot, by itself, tell a no-op
+// `lose_next_answer` from a real one: a `GithubLedger` whose single try
+// simply lands cleanly ends in the same state (the run published once) as
+// one that lost the answer and found its own commit on a reread. This
+// checks the mechanism directly: the control sets the fake's one-shot
+// flag, and a commit that follows consumes it.
+#[test]
+fn lose_next_answer_sets_the_fakes_flag_and_a_commit_consumes_it() {
+    let fake = FakeGithub::start("acme/widgets");
+    let root = fake.seed_ledger();
+    let local = MemStore::default();
+    local
+        .set_ledger_root("R_1", &root)
+        .expect("a fresh store records a root");
+    let tracker = GithubTracker::open(client(&fake), "acme/widgets", &local)
+        .expect("the fake's repository opens")
+        .0
+        .with_visibility(Duration::from_secs(10), Duration::ZERO);
+    let ledger = GithubLedger::new(tracker.client(), tracker.repo().clone(), &local)
+        .with_lag(0, Duration::ZERO);
+    let recorded = Recorded {
+        inner: &ledger,
+        batches: RefCell::new(Vec::new()),
+    };
+    let ctl = Controls {
+        fake: &fake,
+        remote: &recorded,
+    };
+    assert!(!fake.state().hang_up_after_next_commit, "nothing lost yet");
+    ctl.lose_next_answer();
+    assert!(
+        fake.state().hang_up_after_next_commit,
+        "the control set the fake's one-shot flag"
+    );
+    let gate = GateId(entry_iri(100));
+    let record = RecordId(
+        Iri::parse("https://github.com/acme/widgets/issues/1").expect("an issue URL is an IRI"),
+    );
+    let run = sample_record_run(1, &gate, Some(&record));
+    let decision = sample_decision(1, &record, vec![run.id.clone().unwrap()]);
+    recorded
+        .publish(&Batch {
+            decision,
+            runs: vec![run],
+            attempts: vec![],
+        })
+        .expect("the retry after the lost answer still lands");
+    assert!(
+        !fake.state().hang_up_after_next_commit,
+        "a commit consumed the one-shot flag"
+    );
 }

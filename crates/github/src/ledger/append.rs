@@ -334,7 +334,7 @@ mod tests {
     use fl_core::conformance::{sample_attempt, sample_decision, sample_record_run};
     use fl_core::decision::Outcome;
     use fl_core::ids::{GateId, ProjectId, RecordId, seq_iri};
-    use fl_core::log::{Attempt, GateRun, PathsTouched, WITHHELD_ERROR_DETAIL};
+    use fl_core::log::{Attempt, GateRun, PathsTouched};
     use fl_core::model::State;
     use fl_core::split::{LedgerCache, RemoteLedger};
     use fl_core::store::Bindings;
@@ -856,24 +856,27 @@ mod tests {
         assert_eq!(l.attempts_of(&project()).unwrap(), vec![attempt(2)]);
     }
 
-    // ⚠ Decision 2 and spec §8.3: on a repository that is not private, no
-    // published line holds anything machine-specific. Supersedes the
-    // former `a_repository_that_is_not_private_is_published_without_excerpts_error_detail_or_paths`:
-    // this covers both shapes the brief calls out — `public` and `internal`
-    // — scans every file the branch holds rather than only the segments
-    // this publish wrote, and checks a withheld error detail as well as an
-    // excerpt and a path count.
+    // ⚠ Decision 2 and spec §8.3: on a repository that is not private — or
+    // whose answer names no visibility at all (ruling 21: the safe side,
+    // since a published excerpt cannot be taken back) — nothing published,
+    // in a file or a commit headline, holds an excerpt, an error's detail,
+    // or a path.
     #[test]
     fn a_repository_that_is_not_private_publishes_nothing_machine_specific() {
         let secret_path = "/home/someone/work/app/src/a.rs";
         let secret_host = "build-host-7";
         let home = std::env::var("HOME").ok().filter(|h| h.len() > 1);
-        for visibility in ["public", "internal"] {
+        for case in ["public", "internal", "omits visibility"] {
             let (fake, local, _root) = world();
-            fake.state().repos[0].visibility = visibility.into();
+            if case == "omits visibility" {
+                fake.state().omit_visibility = true;
+            } else {
+                fake.state().repos[0].visibility = case.into();
+            }
             let mut r = run(1);
             r.output_excerpt = Some(format!("{secret_path} on {secret_host}"));
             let mut errored = run(2);
+            errored.output_excerpt = Some(format!("{secret_path} on {secret_host}"));
             errored.verdict =
                 Verdict::error(format!("could not spawn {secret_path} on {secret_host}"));
             let mut a = attempt(3);
@@ -881,7 +884,9 @@ mod tests {
             a.paths_touched = PathsTouched::Listed(vec![secret_path.into()]);
             let c = client(&fake);
             let l = open(&c, &local);
-            l.publish(&batch(1, vec![r, errored], vec![a])).unwrap();
+            l.publish(&batch(1, vec![r.clone(), errored.clone()], vec![a.clone()]))
+                .unwrap();
+            assert_eq!(l.visibility().unwrap(), Visibility::NotPrivate, "{case}");
             let secrets: Vec<String> = [
                 Some(secret_path.to_string()),
                 Some(secret_host.to_string()),
@@ -894,19 +899,37 @@ mod tests {
                 for secret in &secrets {
                     assert!(
                         !text.contains(secret.as_str()),
-                        "{visibility}: `{path}` holds `{secret}`"
+                        "{case}: `{path}` holds `{secret}`"
                     );
                 }
             }
-            let runs = l.runs(&gate()).unwrap();
-            assert_eq!(runs[0].output_excerpt, None);
-            assert_eq!(runs[1].verdict, Verdict::error(WITHHELD_ERROR_DETAIL));
-            let attempts = l.attempts_of(&project()).unwrap();
-            assert_eq!(attempts[0].output_excerpt, None);
-            assert_eq!(attempts[0].paths_touched, PathsTouched::Counted(1));
+            for message in fake.ledger_commit_messages() {
+                for secret in &secrets {
+                    assert!(
+                        !message.contains(secret.as_str()),
+                        "{case}: commit `{message}` holds `{secret}`"
+                    );
+                }
+            }
+            assert_eq!(
+                l.runs(&gate()).unwrap(),
+                vec![
+                    disclose::run(&r, Visibility::NotPrivate),
+                    disclose::run(&errored, Visibility::NotPrivate),
+                ],
+                "{case}"
+            );
+            assert_eq!(
+                l.attempts_of(&project()).unwrap(),
+                vec![disclose::attempt(&a, Visibility::NotPrivate)],
+                "{case}"
+            );
         }
     }
 
+    // ⚠ Entries already on the branch from before the repository went
+    // public are never rewritten; only what a later publish newly adds is
+    // projected for the visibility read at that time.
     #[test]
     fn a_batch_published_while_private_is_not_added_again_once_public() {
         let (fake, local, _root) = world();
@@ -915,24 +938,24 @@ mod tests {
         open(&c, &local).publish(&b).unwrap();
         let commits = fake.ledger_commits();
         fake.state().repos[0].visibility = "public".into();
-        assert_eq!(open(&c, &local).publish(&b).unwrap(), None);
-        assert_eq!(fake.ledger_commits(), commits);
-    }
-
-    // ⚠ Ruling 21: an answer that names no visibility is taken as not
-    // private — the safe side, since a published excerpt cannot be taken
-    // back.
-    #[test]
-    fn a_repository_answer_that_names_no_visibility_withholds_the_excerpts() {
-        let (fake, local, _root) = world();
-        fake.state().omit_visibility = true;
-        let c = client(&fake);
         let l = open(&c, &local);
-        l.publish(&batch(1, vec![run(1)], vec![attempt(2)]))
-            .unwrap();
         assert_eq!(l.visibility().unwrap(), Visibility::NotPrivate);
-        assert_eq!(l.runs(&gate()).unwrap()[0].output_excerpt, None);
-        assert_eq!(l.attempts_of(&project()).unwrap()[0].output_excerpt, None);
+        assert_eq!(l.publish(&b).unwrap(), None, "nothing new: no commit");
+        assert_eq!(fake.ledger_commits(), commits);
+        let mut extra = run(9);
+        extra.output_excerpt = Some("brand new".into());
+        l.publish(&batch(2, vec![run(1), extra.clone()], vec![attempt(2)]))
+            .unwrap();
+        assert_eq!(
+            fake.ledger_commits(),
+            commits + 1,
+            "one commit, for the new run only"
+        );
+        assert_eq!(
+            l.runs(&gate()).unwrap(),
+            vec![run(1), disclose::run(&extra, Visibility::NotPrivate)],
+            "the old run is as it was written; only the new one is projected"
+        );
     }
 
     // Decision 2: a visibility that cannot be read is an error, never
