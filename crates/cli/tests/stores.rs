@@ -784,9 +784,9 @@ fn an_attempt_through_a_record_alias_stores_the_primary() {
     assert_eq!(attempts[0].record, record, "the attempt stored the alias");
 }
 
-// GitHub ledger spec §7 fix round 1: `check --record` names its record by
-// the record's PRIMARY id, even when the person typed an alias — the same
-// rule `an_attempt_through_a_record_alias_stores_the_primary` pins for `fl
+// Regression guard: `check --record` names its record by the record's
+// PRIMARY id, even when the person typed an alias — the same rule
+// `an_attempt_through_a_record_alias_stores_the_primary` pins for `fl
 // attempt`. Skipping the lookup (reverting to `Some(RecordId(resolve(..)))`)
 // would still pass every other `check` test, since a plain handle already
 // resolves to the primary; only an alias catches the regression.

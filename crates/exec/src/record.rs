@@ -286,8 +286,8 @@ mod tests {
     }
 
     // ⚠⚠ Spec §2.2 (Invariant): evidence before state. Confirmed by
-    // mutation in Step 5 — moving the flush below the state change turns
-    // this test red.
+    // mutation: moving the flush below the state change turns this test
+    // red.
     #[test]
     fn the_decision_is_flushed_before_the_record_moves() {
         let d = repo();

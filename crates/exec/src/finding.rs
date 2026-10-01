@@ -740,7 +740,8 @@ mod tests {
         s.update_gate(&def).unwrap();
     }
 
-    // ⚠⚠ Spec §2.2 (Invariant), confirmed by mutation in Step 5.
+    // ⚠⚠ Spec §2.2 (Invariant). Confirmed by mutation: moving the flush
+    // below `update_finding` turns this test red.
     #[test]
     fn a_reproduction_is_flushed_before_the_finding_changes() {
         let d = repo();
@@ -858,7 +859,8 @@ mod tests {
         assert!(j.events().is_empty(), "nothing was decided or flushed");
     }
 
-    // ⚠⚠ Spec §2.2 (Invariant), confirmed by mutation in Step 5.
+    // ⚠⚠ Spec §2.2 (Invariant). Confirmed by mutation: moving the flush
+    // after the finding closes turns this test red.
     #[test]
     fn a_verify_is_flushed_before_the_finding_closes_and_its_runs_carry_the_record() {
         let d = repo();
