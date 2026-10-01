@@ -513,6 +513,283 @@ fn rules(s: &mut State, full: &str, branch: &str) -> Answer {
     answer(200, Value::Array(items))
 }
 
+/// The ledger's GraphQL operations, told apart by operation name; `None`
+/// for every other query.
+pub(crate) fn graphql(s: &mut State, v: &Value) -> Option<Answer> {
+    let query = v["query"].as_str().unwrap_or("");
+    let vars = &v["variables"];
+    if query.starts_with("query ledgerObjects(") {
+        return Some(objects(s, vars));
+    }
+    if query.starts_with("query ledgerBlame(") {
+        return Some(blame(s, vars));
+    }
+    if query.starts_with("mutation ledgerAppend(") {
+        return Some(append(s, vars));
+    }
+    None
+}
+
+fn repository_known(s: &State, vars: &Value) -> bool {
+    match (vars["owner"].as_str(), vars["name"].as_str()) {
+        (Some(o), Some(n)) => s.is_bound(o, n),
+        _ => false,
+    }
+}
+
+/// ⚠ Modelled: `object(expression: "<commit>:<path>")` answers a tree's
+/// entries, a blob's id, or `null` — no error — for a path the commit does
+/// not hold. Confirmed by live test `init_sets_up_a_ledger_on_a_private_repository`.
+fn objects(s: &State, vars: &Value) -> Answer {
+    if !repository_known(s, vars) {
+        return answer(
+            200,
+            json!({"data": {"repository": null}, "errors": [{"type": "NOT_FOUND"}]}),
+        );
+    }
+    let mut repo = serde_json::Map::new();
+    if let Some(all) = vars.as_object() {
+        for (k, e) in all {
+            if k.starts_with('e') && k[1..].parse::<u32>().is_ok() {
+                repo.insert(k.clone(), object_at(&s.git, e.as_str().unwrap_or("")));
+            }
+        }
+    }
+    answer(200, json!({"data": {"repository": repo}}))
+}
+
+fn object_at(git: &Git, expression: &str) -> Value {
+    let Some((commit, path)) = expression.split_once(':') else {
+        return Value::Null;
+    };
+    let Some(files) = git.commits.get(commit).and_then(|c| git.trees.get(&c.tree)) else {
+        return Value::Null;
+    };
+    if let Some(blob) = files.get(path) {
+        return json!({"__typename": "Blob", "oid": blob, "byteSize": git.blobs[blob].len()});
+    }
+    let prefix = if path.is_empty() {
+        String::new()
+    } else {
+        format!("{path}/")
+    };
+    let mut entries: BTreeMap<String, Value> = BTreeMap::new();
+    for (p, blob) in files {
+        let Some(rest) = p.strip_prefix(prefix.as_str()) else {
+            continue;
+        };
+        match rest.split_once('/') {
+            Some((dir, _)) => {
+                entries.entry(dir.to_string()).or_insert_with(|| {
+                    json!({
+                        "name": dir, "type": "tree",
+                        "oid": object_id(&["subtree", commit, &format!("{prefix}{dir}")]),
+                    })
+                });
+            }
+            None => {
+                entries.insert(
+                    rest.to_string(),
+                    json!({"name": rest, "oid": blob, "type": "blob"}),
+                );
+            }
+        }
+    }
+    if entries.is_empty() {
+        return Value::Null;
+    }
+    json!({"__typename": "Tree", "entries": entries.into_values().collect::<Vec<_>>()})
+}
+
+/// ⚠ Modelled: `Commit.blame(path:)` answers ranges of lines, each with the
+/// commit that last changed them. The fake follows first parents and
+/// compares line by line. Confirmed by live test
+/// `a_hand_edit_is_detected_and_named`.
+fn blame(s: &State, vars: &Value) -> Answer {
+    let nothing = || answer(200, json!({"data": {"repository": {"object": null}}}));
+    let (Some(commit), Some(path)) = (vars["commit"].as_str(), vars["path"].as_str()) else {
+        return nothing();
+    };
+    if !repository_known(s, vars) || !s.git.commits.contains_key(commit) {
+        return nothing();
+    }
+    let mut chain = Vec::new();
+    let mut at = Some(commit.to_string());
+    while let Some(c) = at {
+        at = s.git.commits[&c].parents.first().cloned();
+        chain.push(c);
+    }
+    chain.reverse();
+    let mut owners: Vec<String> = Vec::new();
+    let mut before: Vec<String> = Vec::new();
+    for c in &chain {
+        let text = s
+            .git
+            .files_at(c)
+            .and_then(|f| f.get(path).cloned())
+            .unwrap_or_default();
+        let now: Vec<String> = text.lines().map(str::to_string).collect();
+        owners.truncate(now.len());
+        for (i, line) in now.iter().enumerate() {
+            if before.get(i) != Some(line) {
+                if i < owners.len() {
+                    owners[i] = c.clone();
+                } else {
+                    owners.push(c.clone());
+                }
+            }
+        }
+        before = now;
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    for i in 1..=owners.len() {
+        if i == owners.len() || owners[i] != owners[start] {
+            ranges.push(json!({
+                "startingLine": start + 1, "endingLine": i,
+                "commit": {"oid": owners[start]},
+            }));
+            start = i;
+        }
+    }
+    answer(
+        200,
+        json!({"data": {"repository": {"object": {"blame": {"ranges": ranges}}}}}),
+    )
+}
+
+/// ⚠ Modelled from GitHub's documentation: `createCommitOnBranch` refuses a
+/// stale `expectedHeadOid` with an error of type `STALE_DATA` whose message
+/// says where the branch was expected to point, and lands nothing.
+/// Confirmed by live test `create_commit_on_branch_is_refused_when_the_head_moved`.
+fn append(s: &mut State, vars: &Value) -> Answer {
+    let input = &vars["input"];
+    let branch = input
+        .pointer("/branch/branchName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let named = input
+        .pointer("/branch/repositoryNameWithOwner")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let bound = named.split_once('/').is_some_and(|(o, r)| s.is_bound(o, r));
+    if !bound || s.git.head(&branch).is_none() {
+        return answer(
+            200,
+            json!({
+                "data": {"createCommitOnBranch": null},
+                "errors": [{
+                    "type": "NOT_FOUND",
+                    "message": format!("Could not resolve to a ref named `{branch}`"),
+                }],
+            }),
+        );
+    }
+    if std::mem::take(&mut s.rate_limit_next_commit) {
+        return answer(
+            200,
+            json!({"data": null, "errors": [{"type": "RATE_LIMITED"}]}),
+        );
+    }
+    if let Some(needs) = s.refuse_next_commit_for.take() {
+        let mut a = answer(
+            403,
+            json!({"message": "Resource not accessible by integration"}),
+        );
+        a.headers
+            .push(("x-accepted-github-permissions".into(), needs));
+        return a;
+    }
+    // ⚠ Modelled — confirmed by a B2 live test: live GraphQL can refuse a
+    // missing permission as a 200 carrying a FORBIDDEN error instead of the
+    // 403 above. Both shapes are a refusal: nothing lands, and the branch
+    // head does not move.
+    if std::mem::take(&mut s.refuse_next_commit_as_forbidden) {
+        return answer(
+            200,
+            json!({
+                "data": null,
+                "errors": [{
+                    "type": "FORBIDDEN",
+                    "message": "Resource not accessible by integration",
+                }],
+            }),
+        );
+    }
+    if !s.foreign_appends.is_empty() {
+        let (path, line) = s.foreign_appends.remove(0);
+        let head = s.git.head(&branch).expect("checked above");
+        let mut text = s
+            .git
+            .files_at(&head)
+            .and_then(|f| f.get(&path).cloned())
+            .unwrap_or_default();
+        text.push_str(&line);
+        text.push('\n');
+        s.git
+            .commit_on(&branch, &[(path, Some(text))], "another machine's append");
+    }
+    let head = s.git.head(&branch).expect("checked above");
+    let expected = input["expectedHeadOid"].as_str().unwrap_or("");
+    if expected != head {
+        return answer(
+            200,
+            json!({
+                "data": {"createCommitOnBranch": null},
+                "errors": [{
+                    "type": "STALE_DATA", "path": ["createCommitOnBranch"],
+                    "message": format!(
+                        "Expected branch to point to \"{expected}\" but it did not. Pull and \
+                         try again."
+                    ),
+                }],
+            }),
+        );
+    }
+    if s.fail_commits > 0 {
+        s.fail_commits -= 1;
+        return answer(502, json!({"message": "fake: the commit did not land"}));
+    }
+    let mut changes = Vec::new();
+    let additions = input
+        .pointer("/fileChanges/additions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for add in additions {
+        let text = add["contents"]
+            .as_str()
+            .and_then(|c| STANDARD.decode(c).ok())
+            .and_then(|b| String::from_utf8(b).ok());
+        let (Some(path), Some(text)) = (add["path"].as_str(), text) else {
+            return answer(
+                200,
+                json!({"errors": [{
+                    "type": "UNPROCESSABLE",
+                    "message": "an addition needs a path and base64 contents",
+                }]}),
+            );
+        };
+        changes.push((path.to_string(), Some(text)));
+    }
+    let headline = input
+        .pointer("/message/headline")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let oid = s.git.commit_on(&branch, &changes, &headline);
+    if std::mem::take(&mut s.hang_up_after_next_commit) {
+        let mut a = answer(200, Value::Null);
+        a.hang_up = true;
+        return a;
+    }
+    answer(
+        200,
+        json!({"data": {"createCommitOnBranch": {"commit": {"oid": oid}}}}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::Ruleset;
@@ -951,6 +1228,235 @@ mod tests {
                 .unwrap()
                 .status,
             200
+        );
+    }
+
+    // The fake tells the operations apart by name and reads the variables;
+    // the fields asked for do not change its answer.
+    const OBJECTS: &str = "query ledgerObjects($owner: String!, $name: String!, \
+        $e0: String!, $e1: String!, $e2: String!, $e3: String!) { \
+        repository(owner: $owner, name: $name) { e0: object(expression: $e0) { __typename } } }";
+    const APPEND: &str = "mutation ledgerAppend($input: CreateCommitOnBranchInput!) { \
+        createCommitOnBranch(input: $input) { commit { oid } } }";
+    const BLAME: &str = "query ledgerBlame($owner: String!, $name: String!, \
+        $commit: GitObjectID!, $path: String!) { \
+        repository(owner: $owner, name: $name) { object(oid: $commit) { __typename } } }";
+
+    fn append_input(head: &str, path: &str, text: &str) -> serde_json::Value {
+        use base64::Engine;
+        json!({"input": {
+            "branch": {"repositoryNameWithOwner": "acme/widgets", "branchName": "fl/ledger"},
+            "message": {"headline": "fl: a test append"},
+            "expectedHeadOid": head,
+            "fileChanges": {"additions": [{
+                "path": path,
+                "contents": base64::engine::general_purpose::STANDARD.encode(text),
+            }]},
+        }})
+    }
+
+    // ⚠ Modelled: `object(expression: "<commit>:<path>")` answers a tree's
+    // entries, a blob's id, or `null` for a path the commit does not hold.
+    #[test]
+    fn the_objects_at_a_commit_are_listed_by_expression() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.seed_ledger();
+        let head = fake.hand_commit(&[
+            ("runs/k/1.jsonl", Some("a\n")),
+            ("runs/k/2.jsonl", Some("b\n")),
+        ]);
+        let a = client(&fake)
+            .graphql_answer(
+                OBJECTS,
+                json!({
+                    "owner": "acme", "name": "widgets",
+                    "e0": format!("{head}:format"), "e1": format!("{head}:runs/k"),
+                    "e2": format!("{head}:runs"), "e3": format!("{head}:nothing"),
+                }),
+            )
+            .unwrap();
+        let repo = &a.data.unwrap()["repository"];
+        assert_eq!(repo["e0"]["__typename"], "Blob");
+        assert_eq!(repo["e0"]["oid"].as_str().map(str::len), Some(40));
+        let names: Vec<&str> = repo["e1"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["1.jsonl", "2.jsonl"]);
+        assert_eq!(repo["e2"]["entries"][0]["type"], "tree");
+        assert!(repo["e3"].is_null());
+    }
+
+    #[test]
+    fn an_append_lands_on_the_head_it_expects_and_is_refused_on_any_other() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let c = client(&fake);
+        let a = c
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap();
+        let oid = a.data.unwrap()["createCommitOnBranch"]["commit"]["oid"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(fake.ledger_head(), Some(oid.clone()));
+        assert_eq!(fake.ledger_files()["runs/k/1.jsonl"], "a\n");
+        // ⚠ Modelled: a stale expectedHeadOid is refused with STALE_DATA.
+        // Confirmed by live test `create_commit_on_branch_is_refused_when_the_head_moved`.
+        let stale = c
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\nb\n"))
+            .unwrap();
+        assert_eq!(stale.errors[0]["type"], "STALE_DATA");
+        assert_eq!(
+            fake.ledger_files()["runs/k/1.jsonl"],
+            "a\n",
+            "nothing landed"
+        );
+        assert_eq!(
+            fake.ledger_head(),
+            Some(oid),
+            "a refused commit leaves the branch head unchanged"
+        );
+    }
+
+    #[test]
+    fn another_machines_append_can_land_first() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        fake.state()
+            .foreign_appends
+            .push(("runs/k/1.jsonl".into(), "theirs".into()));
+        let a = client(&fake)
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "mine\n"))
+            .unwrap();
+        assert_eq!(a.errors[0]["type"], "STALE_DATA");
+        assert_eq!(fake.ledger_files()["runs/k/1.jsonl"], "theirs\n");
+        assert_eq!(
+            fake.ledger_commits(),
+            2,
+            "the foreign commit landed; the refused one did not move the head further"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_did_not_land_answers_502_and_one_whose_answer_was_lost_landed() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let c = client(&fake);
+        fake.state().fail_commits = 1;
+        let a = c
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap();
+        assert_eq!(a.status, 502);
+        assert_eq!(fake.ledger_commits(), 1, "nothing landed");
+        assert_eq!(
+            fake.ledger_head(),
+            Some(root.clone()),
+            "a refused commit leaves the branch head unchanged"
+        );
+        fake.state().hang_up_after_next_commit = true;
+        let err = c
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+        assert_eq!(
+            fake.ledger_commits(),
+            2,
+            "it landed; only the answer was lost"
+        );
+    }
+
+    #[test]
+    fn a_commit_answered_with_a_spent_rate_limit_lands_nothing() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        fake.state().rate_limit_next_commit = true;
+        let err = client(&fake)
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
+        assert_eq!(fake.ledger_commits(), 1);
+        assert_eq!(
+            fake.ledger_head(),
+            Some(root),
+            "a refused commit leaves the branch head unchanged"
+        );
+    }
+
+    #[test]
+    fn a_commit_refused_for_want_of_a_permission_names_it() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        fake.state().refuse_next_commit_for = Some("contents=write".into());
+        let err = client(&fake)
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap_err();
+        assert!(err.to_string().contains("contents=write"), "{err}");
+        assert_eq!(
+            fake.ledger_head(),
+            Some(root),
+            "a refused commit leaves the branch head unchanged"
+        );
+    }
+
+    // ⚠ Modelled — confirmed by a B2 live test: live GraphQL can refuse a
+    // missing permission as an HTTP 200 carrying an error of type FORBIDDEN,
+    // rather than an HTTP 403 with `x-accepted-github-permissions` (as
+    // `a_commit_refused_for_want_of_a_permission_names_it` models above).
+    // Task 11 judges both shapes.
+    #[test]
+    fn a_commit_can_also_be_refused_as_an_http_200_with_a_forbidden_error() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        fake.state().refuse_next_commit_as_forbidden = true;
+        let a = client(&fake)
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap();
+        assert_eq!(a.status, 200);
+        assert_eq!(a.errors[0]["type"], "FORBIDDEN");
+        assert_eq!(
+            a.errors[0]["message"],
+            "Resource not accessible by integration"
+        );
+        assert_eq!(
+            fake.ledger_head(),
+            Some(root),
+            "a refused commit leaves the branch head unchanged"
+        );
+    }
+
+    #[test]
+    fn an_append_to_a_branch_that_is_not_there_is_not_found() {
+        let fake = FakeGithub::start("acme/widgets");
+        let a = client(&fake)
+            .graphql_answer(APPEND, append_input("0000", "runs/k/1.jsonl", "a\n"))
+            .unwrap();
+        assert_eq!(a.errors[0]["type"], "NOT_FOUND");
+    }
+
+    // ⚠ Modelled: blame names, for each line, the commit that last changed
+    // it. Confirmed by live test `a_hand_edit_is_detected_and_named`.
+    #[test]
+    fn blame_names_the_commit_that_last_changed_each_line() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.seed_ledger();
+        let first = fake.hand_commit(&[("f.jsonl", Some("a\nb\n"))]);
+        let second = fake.hand_commit(&[("f.jsonl", Some("a\nB\nc\n"))]);
+        let a = client(&fake)
+            .graphql_answer(
+                BLAME,
+                json!({"owner": "acme", "name": "widgets", "commit": second, "path": "f.jsonl"}),
+            )
+            .unwrap();
+        let ranges = a.data.unwrap()["repository"]["object"]["blame"]["ranges"].clone();
+        assert_eq!(
+            ranges,
+            json!([
+                {"startingLine": 1, "endingLine": 1, "commit": {"oid": first}},
+                {"startingLine": 2, "endingLine": 3, "commit": {"oid": second}},
+            ])
         );
     }
 

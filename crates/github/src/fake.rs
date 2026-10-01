@@ -202,6 +202,23 @@ pub struct State {
     pub fail_next_git_create: bool,
     /// The next read of a branch's rules answers 500. One-shot.
     pub fail_rules_next: bool,
+    /// Before each ledger commit is judged, someone else appends this line
+    /// to this path — another machine landing first. Consumed one per
+    /// commit, oldest first.
+    pub foreign_appends: Vec<(String, String)>,
+    /// The next this-many ledger commits answer 502 and nothing lands.
+    pub fail_commits: u32,
+    /// The next ledger commit lands, then its answer breaks off. One-shot.
+    pub hang_up_after_next_commit: bool,
+    /// The next ledger commit answers 403 naming this permission. One-shot.
+    pub refuse_next_commit_for: Option<String>,
+    /// The next ledger commit answers GraphQL's RATE_LIMITED. One-shot.
+    pub rate_limit_next_commit: bool,
+    /// The next ledger commit answers 200 with a GraphQL error of type
+    /// FORBIDDEN, rather than an HTTP 403 naming a permission — a second
+    /// shape live GraphQL can use to refuse a missing permission. One-shot.
+    /// ⚠ Modelled — confirmed by a B2 live test.
+    pub refuse_next_commit_as_forbidden: bool,
 }
 
 pub struct FakeGithub {
@@ -1064,6 +1081,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         // shape; unmeasured; no live test checks it yet).
         ("POST", ["graphql"]) => {
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            if let Some(a) = crate::fake_git::graphql(s, &v) {
+                return a;
+            }
             // An issue's body edit history (Task 6), checked FIRST: it is
             // not a node lookup. Answered in the order the fake recorded.
             let query = v["query"].as_str().unwrap_or("");
