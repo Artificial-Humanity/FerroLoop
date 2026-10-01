@@ -5,7 +5,7 @@ use fl_core::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
-use fl_core::split::{Outbox, Pending};
+use fl_core::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use fl_core::store::{Bindings, Catalog, Handles, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
@@ -82,6 +82,13 @@ pub const FORMAT_WITH_LEDGER_ROOT: u64 = 4;
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
 const LEDGER_ROOTS: TableDefinition<&str, &str> = TableDefinition::new("ledger_roots");
+/// repository `node_id` → the last head of its GitHub ledger this machine
+/// checked (GitHub ledger spec §3.2 step 6). Additive.
+const LEDGER_HEADS: TableDefinition<&str, &str> = TableDefinition::new("ledger_heads");
+/// (repository `node_id`, path on the branch) → that file as last read, as
+/// JSON (`CachedSegment`). Additive.
+const LEDGER_SEGMENTS: TableDefinition<(&str, &str), &str> =
+    TableDefinition::new("ledger_segments");
 
 const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
@@ -1293,6 +1300,82 @@ impl Bindings for RedbStore {
     }
 }
 
+impl LedgerCache for RedbStore {
+    fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_HEADS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let found = table
+            .get(repo)
+            .map_err(backend)?
+            .map(|v| v.value().to_string());
+        Ok(found)
+    }
+
+    fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        tx.open_table(LEDGER_HEADS)
+            .map_err(backend)?
+            .insert(repo, head)
+            .map_err(backend)?;
+        tx.commit().map_err(backend)
+    }
+
+    fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_SEGMENTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let found = match table.get((repo, path)).map_err(backend)? {
+            Some(v) => Some(serde_json::from_str(v.value()).map_err(decode)?),
+            None => None,
+        };
+        Ok(found)
+    }
+
+    fn cached_under(
+        &self,
+        repo: &str,
+        dir: &str,
+    ) -> Result<Vec<(String, CachedSegment)>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_SEGMENTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+            Err(e) => return Err(backend(e)),
+        };
+        let prefix = format!("{dir}/");
+        let mut out = Vec::new();
+        for entry in table.range((repo, prefix.as_str())..).map_err(backend)? {
+            let (k, v) = entry.map_err(backend)?;
+            let (r, p) = k.value();
+            if r != repo || !p.starts_with(&prefix) {
+                break;
+            }
+            out.push((
+                p.to_string(),
+                serde_json::from_str(v.value()).map_err(decode)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError> {
+        let json = serde_json::to_string(segment).map_err(backend)?;
+        let tx = self.db.begin_write().map_err(backend)?;
+        tx.open_table(LEDGER_SEGMENTS)
+            .map_err(backend)?
+            .insert((repo, path), json.as_str())
+            .map_err(backend)?;
+        tx.commit().map_err(backend)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1847,6 +1930,7 @@ mod tests {
         fl_core::conformance::split_ledger(split);
         fl_core::conformance::all_roles(single);
         fl_core::conformance::local_handles(fresh);
+        fl_core::conformance::ledger_cache(fresh);
     }
 
     /// A project with one gate and one record, in `s`.
@@ -1998,6 +2082,26 @@ mod tests {
         let s = RedbStore::open(&path).unwrap();
         assert_eq!(s.cutover("R_1").unwrap(), Some(entry_iri(3)));
         assert_eq!(s.cutover("R_2").unwrap(), None);
+    }
+
+    #[test]
+    fn the_ledger_cache_survives_a_reopen() {
+        use fl_core::split::{CachedSegment, LedgerCache};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let seg = CachedSegment {
+            oid: "o1".into(),
+            text: "{}\n".into(),
+            closed: false,
+        };
+        {
+            let s = RedbStore::open(&path).unwrap();
+            s.set_last_head("R_1", "c1").unwrap();
+            s.cache("R_1", "runs/aa/1.jsonl", &seg).unwrap();
+        }
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c1"));
+        assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), Some(seg));
     }
 
     use crate::manifest::{LedgerRoot, Manifest, ManifestError, content_sha256};

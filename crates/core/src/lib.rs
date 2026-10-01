@@ -31,7 +31,10 @@ pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
-pub use split::{Batch, Coverage, LocalLedger, Outbox, Pending, RemoteLedger, SplitLedger};
+pub use split::{
+    Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,
+    RemoteLedger, SplitLedger,
+};
 pub use stale::{Staleness, apply_staleness, is_stale};
 pub use store::{
     Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,

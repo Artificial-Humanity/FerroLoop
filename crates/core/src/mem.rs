@@ -3,7 +3,7 @@ use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
-use crate::split::{Outbox, Pending};
+use crate::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,6 +50,10 @@ struct Inner {
     cutovers: BTreeMap<String, Iri>,
     /// repository `node_id` → its GitHub ledger's first commit.
     ledger_roots: BTreeMap<String, String>,
+    /// repository `node_id` → the last head of its ledger this machine checked.
+    heads: BTreeMap<String, String>,
+    /// (repository `node_id`, path on the branch) → that file as last read.
+    segments: BTreeMap<(String, String), CachedSegment>,
 }
 
 impl Inner {
@@ -477,6 +481,53 @@ impl Outbox for MemStore {
     }
 }
 
+impl LedgerCache for MemStore {
+    fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError> {
+        Ok(self.inner.borrow().heads.get(repo).cloned())
+    }
+
+    fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError> {
+        self.inner
+            .borrow_mut()
+            .heads
+            .insert(repo.to_string(), head.to_string());
+        Ok(())
+    }
+
+    fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError> {
+        Ok(self
+            .inner
+            .borrow()
+            .segments
+            .get(&(repo.to_string(), path.to_string()))
+            .cloned())
+    }
+
+    fn cached_under(
+        &self,
+        repo: &str,
+        dir: &str,
+    ) -> Result<Vec<(String, CachedSegment)>, StoreError> {
+        let prefix = format!("{dir}/");
+        Ok(self
+            .inner
+            .borrow()
+            .segments
+            .iter()
+            .filter(|((r, p), _)| r == repo && p.starts_with(&prefix))
+            .map(|((_, p), c)| (p.clone(), c.clone()))
+            .collect())
+    }
+
+    fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError> {
+        self.inner
+            .borrow_mut()
+            .segments
+            .insert((repo.to_string(), path.to_string()), segment.clone());
+        Ok(())
+    }
+}
+
 impl Handles for MemStore {
     fn handle_of(&self, kind: Kind, id: &Iri) -> Result<Option<u64>, StoreError> {
         let s = self.inner.borrow();
@@ -540,6 +591,7 @@ mod tests {
         crate::conformance::ledger(|| Single(MemStore::default(), ()));
         crate::conformance::all_roles(|| Single(MemStore::default(), ()));
         crate::conformance::local_handles(|| (MemStore::default(), ()));
+        crate::conformance::ledger_cache(|| (MemStore::default(), ()));
     }
 
     #[test]

@@ -13,8 +13,9 @@ use crate::fault::LedgerFault;
 use crate::ids::{GateId, ProjectId, RecordId};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun, PathsTouched, WITHHELD_ERROR_DETAIL};
-use crate::store::{Ledger, StoreError};
+use crate::store::{Bindings, Ledger, StoreError};
 use crate::verdict::Verdict;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Local entries waiting to be published to one repository.
@@ -62,6 +63,44 @@ pub trait Outbox {
 /// What a split ledger's local side must be.
 pub trait LocalLedger: Ledger + Outbox {}
 impl<T: Ledger + Outbox> LocalLedger for T {}
+
+/// One file of a GitHub ledger as this machine last read it (GitHub ledger
+/// spec §3.3, §3.5 checks 3 and 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedSegment {
+    /// The blob's object id when it was read.
+    pub oid: String,
+    pub text: String,
+    /// Whether a later segment of its directory existed when it was read.
+    /// ⚠ A closed segment never changes.
+    pub closed: bool,
+}
+
+/// What this machine remembers of each repository's GitHub ledger, keyed
+/// by the repository's `node_id` (spec §3.2 step 6, §3.3): the last head it
+/// checked, and every file it read — so a closed segment is downloaded
+/// once, and an altered one is caught.
+pub trait LedgerCache {
+    fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError>;
+    fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError>;
+    fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError>;
+    /// Every file cached under the directory `dir` (such as `runs/<key>`),
+    /// with its path, in path order. Not a directory whose name merely
+    /// starts with `dir`.
+    fn cached_under(
+        &self,
+        repo: &str,
+        dir: &str,
+    ) -> Result<Vec<(String, CachedSegment)>, StoreError>;
+    /// Replaces what was cached at `path`.
+    fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError>;
+}
+
+/// Everything the GitHub ledger keeps on this machine: the repository
+/// bindings and ledger roots, the cut-over and published marks, and the
+/// branch cache.
+pub trait LedgerMemory: Bindings + LedgerCache + Outbox {}
+impl<T: Bindings + LedgerCache + Outbox> LedgerMemory for T {}
 
 /// One flush: the decision and every entry it publishes.
 #[derive(Debug, Clone, PartialEq, Eq)]

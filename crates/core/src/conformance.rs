@@ -21,7 +21,7 @@ use crate::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 use crate::model::{
     CommandSpec, GateDef, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
-use crate::split::{Batch, Outbox, RemoteLedger, SplitLedger};
+use crate::split::{Batch, CachedSegment, LedgerCache, Outbox, RemoteLedger, SplitLedger};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use crate::verdict::Verdict;
 use std::cell::RefCell;
@@ -154,6 +154,8 @@ const SPLIT_LEDGER_CASES: usize = 10;
 const ALL_ROLES_CASES: usize = 7;
 /// How many cases [`local_handles`] runs. Update deliberately — see [`run_suite`].
 const LOCAL_HANDLES_CASES: usize = 1;
+/// How many cases [`ledger_cache`] runs. Update deliberately — see [`run_suite`].
+const LEDGER_CACHE_CASES: usize = 2;
 
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -247,6 +249,65 @@ pub fn all_roles<F: Fixture>(make: impl Fn() -> F) {
 pub fn local_handles<S: Catalog + Tracker + Ledger + Handles, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[handles_are_per_kind_and_start_at_one::<S>];
     run_suite("local-handles", LOCAL_HANDLES_CASES, cases, make);
+}
+
+/// What a local store remembers of a GitHub ledger, per repository `node_id`
+/// (GitHub ledger spec §3.2 step 6, §3.3, §3.5 checks 2–4).
+pub fn ledger_cache<S: LedgerCache, G>(make: impl Fn() -> (S, G)) {
+    let cases: &[fn(&S)] = &[
+        the_last_head_is_kept_per_repository_and_replaced::<S>,
+        a_cached_file_reads_back_by_path_and_by_its_own_directory_only::<S>,
+    ];
+    run_suite("ledger-cache", LEDGER_CACHE_CASES, cases, make);
+}
+
+fn the_last_head_is_kept_per_repository_and_replaced<S: LedgerCache>(s: &S) {
+    assert_eq!(s.last_head("R_1").unwrap(), None);
+    s.set_last_head("R_1", "c1").unwrap();
+    s.set_last_head("R_1", "c2").unwrap();
+    assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c2"));
+    assert_eq!(s.last_head("R_2").unwrap(), None);
+}
+
+fn a_cached_file_reads_back_by_path_and_by_its_own_directory_only<S: LedgerCache>(s: &S) {
+    let seg = |oid: &str, closed: bool| CachedSegment {
+        oid: oid.into(),
+        text: format!("{oid}\n"),
+        closed,
+    };
+    assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), None);
+    assert!(s.cached_under("R_1", "runs/aa").unwrap().is_empty());
+    s.cache("R_1", "runs/aa/1.jsonl", &seg("o1", true)).unwrap();
+    s.cache("R_1", "runs/aa/2.jsonl", &seg("o2", false))
+        .unwrap();
+    s.cache("R_1", "runs/aab/1.jsonl", &seg("o3", false))
+        .unwrap();
+    s.cache("R_2", "runs/aa/1.jsonl", &seg("o4", false))
+        .unwrap();
+    s.cache("R_1", "runs/aa/2.jsonl", &seg("o5", true)).unwrap();
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(seg("o1", true))
+    );
+    assert_eq!(
+        s.cached("R_1", "runs/aa/2.jsonl").unwrap(),
+        Some(seg("o5", true)),
+        "a second write replaces the first"
+    );
+    let under: Vec<(String, String)> = s
+        .cached_under("R_1", "runs/aa")
+        .unwrap()
+        .into_iter()
+        .map(|(p, c)| (p, c.oid))
+        .collect();
+    assert_eq!(
+        under,
+        vec![
+            ("runs/aa/1.jsonl".to_string(), "o1".to_string()),
+            ("runs/aa/2.jsonl".to_string(), "o5".to_string()),
+        ],
+        "not `runs/aab`, and not another repository's"
+    );
 }
 
 fn a_project_round_trips<S: Catalog>(s: &S) {
