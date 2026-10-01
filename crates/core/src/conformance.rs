@@ -13,6 +13,7 @@
 
 use crate::at::At;
 use crate::decision::{Decision, LeftLocal, Outcome, TransitionOutcome};
+use crate::fault::LedgerFault;
 use crate::finding::{Finding, FindingState};
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
@@ -1369,6 +1370,8 @@ pub struct MemRemote {
 struct RemoteInner {
     down: bool,
     fail_publish: bool,
+    damaged: bool,
+    rate_limited: bool,
     lose_next_answer: bool,
     foreign: BTreeSet<RecordId>,
     runs: Vec<GateRun>,
@@ -1393,6 +1396,36 @@ impl MemRemote {
     /// answers.
     pub fn fail_publish(&self, on: bool) {
         self.inner.borrow_mut().fail_publish = on;
+    }
+
+    /// Every read answers that the ledger was altered — a damaged ledger,
+    /// not an unreachable one — while publishing still works.
+    pub fn damage(&self, on: bool) {
+        self.inner.borrow_mut().damaged = on;
+    }
+
+    /// Every read answers that GitHub's rate limit is spent.
+    pub fn rate_limit_reads(&self, on: bool) {
+        self.inner.borrow_mut().rate_limited = on;
+    }
+
+    /// A read refused for a spent rate limit or a damaged ledger.
+    fn refuse_read(&self) -> Result<(), StoreError> {
+        if self.inner.borrow().rate_limited {
+            return Err(StoreError::RateLimited {
+                reset: "1700000000 (unix seconds)".into(),
+            });
+        }
+        if self.inner.borrow().damaged {
+            return Err(LedgerFault::Altered {
+                repo: self.node_id.clone(),
+                file: "runs/0/1.jsonl".into(),
+                what: "was changed by the test".into(),
+                commit: "commit-0".into(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// A run as GitHub holds it — another machine's, or an altered copy —
@@ -1471,6 +1504,7 @@ impl RemoteLedger for MemRemote {
 
     fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
         self.refuse_if_down()?;
+        self.refuse_read()?;
         Ok(self
             .inner
             .borrow()
@@ -1483,6 +1517,7 @@ impl RemoteLedger for MemRemote {
 
     fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
         self.refuse_if_down()?;
+        self.refuse_read()?;
         Ok(self
             .inner
             .borrow()

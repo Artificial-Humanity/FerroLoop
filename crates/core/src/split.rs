@@ -9,6 +9,7 @@
 
 use crate::at::At;
 use crate::decision::{Decision, Flushed, LeftLocal};
+use crate::fault::LedgerFault;
 use crate::ids::{GateId, ProjectId, RecordId};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun, PathsTouched, WITHHELD_ERROR_DETAIL};
@@ -161,11 +162,10 @@ fn merge<T: Entry>(local: Vec<T>, remote: Vec<T>) -> Result<Vec<T>, StoreError> 
     }
     for e in remote {
         let Some(id) = e.entry_id().cloned() else {
-            return Err(StoreError::Backend(
-                "the shared ledger holds an entry with no id, and every published entry carries \
-                 one"
-                .into(),
-            ));
+            return Err(LedgerFault::Unidentified {
+                detail: "an entry read back from the shared ledger".into(),
+            }
+            .into());
         };
         match seen.get(&id) {
             Some(&i) => {
@@ -199,12 +199,16 @@ impl SplitLedger<'_> {
         let local = self.local.attempts(project)?;
         match self.github.attempts(project) {
             Ok(remote) => Ok((merge(local, remote)?, Coverage::Complete)),
-            Err(e) => Ok((
+            // ⚠ Only a GitHub that could not be READ falls back. A ledger
+            // that was read and is damaged is an error: a count over the
+            // local half would hide the damage.
+            Err(e) if e.is_transient() => Ok((
                 local,
                 Coverage::LocalOnly {
                     reason: format!("GitHub could not be read: {e}"),
                 },
             )),
+            Err(e) => Err(e),
         }
     }
 }
@@ -292,13 +296,10 @@ impl Ledger for SplitLedger<'_> {
             .collect();
         for cited in &decision.rests_on {
             if !ids.contains(cited) && !self.local.is_published(&repo, cited)? {
-                return Err(StoreError::Backend(format!(
-                    "decision {} rests on {cited}, which is neither being published nor \
-                     published. A run tied to no record, one recorded before the GitHub ledger \
-                     was switched on, or one tied to another repository's record stays local, \
-                     so a decision cannot rest on it. Nothing was published.",
-                    decision.id
-                )));
+                return Err(StoreError::RestsOnLocalEntry {
+                    decision: decision.id.clone(),
+                    entry: cited.clone(),
+                });
             }
         }
         let commit = self.github.publish(&Batch {
@@ -441,7 +442,7 @@ mod tests {
     // never published); one that arrives with none anyway is damage, not a
     // legacy entry, and `merge` refuses it rather than silently keeping it.
     #[test]
-    fn a_published_entry_with_no_id_is_a_backend_error() {
+    fn a_published_entry_with_no_id_is_a_ledger_fault() {
         let (s, _p, g, r) = world();
         let remote = MemRemote::new("R_1");
         let l = SplitLedger {
@@ -453,7 +454,10 @@ mod tests {
         remote.insert_run(headless);
 
         let err = l.gate_runs(&g).unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
+        assert!(
+            matches!(err, StoreError::Ledger(LedgerFault::Unidentified { .. })),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -558,6 +562,46 @@ mod tests {
         assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
         remote.set_down(false);
         assert_eq!(l.attempts_for_stats(&p).unwrap().1, Coverage::Complete);
+    }
+
+    // ⚠ Spec §2.5: local-only is for a GitHub that cannot be READ. A ledger
+    // that was read and found damaged is an error: a report over the local
+    // half would hide the damage.
+    #[test]
+    fn stats_refuse_a_damaged_ledger_rather_than_fall_back() {
+        let (s, p, _g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        l.append_attempt(sample_attempt(1, &p, &r)).unwrap();
+        remote.damage(true);
+        let err = l.attempts_for_stats(&p).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Ledger(LedgerFault::Altered { .. })),
+            "{err:?}"
+        );
+    }
+
+    // Spec §2.5: a spent rate limit is "cannot be read" too — stats fall
+    // back, saying why — not only an unreachable GitHub.
+    #[test]
+    fn stats_fall_back_when_the_rate_limit_is_spent() {
+        let (s, p, _g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        l.append_attempt(sample_attempt(1, &p, &r)).unwrap();
+        remote.rate_limit_reads(true);
+        let (attempts, coverage) = l.attempts_for_stats(&p).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            matches!(coverage, Coverage::LocalOnly { ref reason } if reason.contains("rate limit")),
+            "{coverage:?}"
+        );
     }
 
     // Spec §2.1: a flush publishes the pending entries tied to a record this
@@ -766,6 +810,14 @@ mod tests {
         let err = l
             .flush(sample_decision(1, &r, vec![untied.id.clone().unwrap()]))
             .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::RestsOnLocalEntry { ref entry, .. }
+                    if Some(entry) == untied.id.as_ref()
+            ),
+            "{err:?}"
+        );
         assert!(
             err.to_string()
                 .contains(untied.id.as_ref().unwrap().as_str()),

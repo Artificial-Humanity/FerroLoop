@@ -7,6 +7,7 @@ pub mod at;
 #[doc(hidden)]
 pub mod conformance;
 pub mod decision;
+pub mod fault;
 pub mod finding;
 pub mod ids;
 pub mod iri;
@@ -20,6 +21,7 @@ pub mod verdict;
 
 pub use at::{At, AtError};
 pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
+pub use fault::LedgerFault;
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 pub use iri::{Iri, IriError};
