@@ -250,7 +250,7 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
         Cmd::Run { id } => {
             let g = gate(store, &id)?;
             crate::cmd::manifest::ensure_import_current(store, &g.project)?;
-            let report = run_single_gate(store, store, &g.project, &g.id)
+            let report = run_single_gate(store, store, &g.project, &g.id, None)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let (label, detail) = report.verdict.describe();
             println!("{label}\t{}\t{detail}", g.name);

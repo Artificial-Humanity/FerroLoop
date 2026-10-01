@@ -6,6 +6,7 @@ pub mod creds;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
 pub mod meta;
+pub mod owner;
 pub mod tracker;
 
 pub use client::{Client, DEFAULT_API, Method, Reply};

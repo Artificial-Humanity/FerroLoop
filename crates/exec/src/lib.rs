@@ -2,12 +2,16 @@
 
 pub mod adapters;
 pub mod command;
+pub mod decision;
 pub mod evaluate;
 pub mod finding;
 pub mod git;
+#[cfg(test)]
+mod journal;
 pub mod population;
 pub mod record;
 pub mod runner;
+pub mod stamp;
 pub use adapters::ClaudeAdapter;
 pub use command::{GateOutcome, run_command_gate};
 pub use evaluate::{GateReport, TransitionReport, evaluate_transition};

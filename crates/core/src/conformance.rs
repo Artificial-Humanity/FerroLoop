@@ -11,15 +11,20 @@
 //! `make` returns the store plus a guard to keep alive (a temp directory for
 //! a file store, `()` for memory).
 
+use crate::at::At;
+use crate::decision::{Decision, LeftLocal, Outcome, TransitionOutcome};
 use crate::finding::{Finding, FindingState};
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
-use crate::log::GateRun;
+use crate::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 use crate::model::{
     CommandSpec, GateDef, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
+use crate::split::{Batch, Outbox, RemoteLedger, SplitLedger};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use crate::verdict::Verdict;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 
 /// Run every case in `cases` against a fresh store from `make`.
 ///
@@ -76,6 +81,45 @@ impl<S: Catalog + Tracker + Ledger + Handles, G> Fixture for Single<S, G> {
     }
 }
 
+/// A split ledger to test, with the means to drive its GitHub side.
+pub trait SplitFixture {
+    fn with_split(&self, f: &mut dyn FnMut(&Bound<'_>, &dyn RemoteControl));
+}
+
+/// `SplitLedger` over a local store `S` and a [`MemRemote`] for `R_1`,
+/// whose ledger was switched on (a cut-over before every sample entry). A
+/// [`Fixture`] too, so the shared ledger suite runs over it. Plan B's
+/// fixture swaps `MemRemote` for `GithubLedger` over the fake GitHub.
+pub struct SplitOver<S, G>(pub S, pub G);
+
+impl<S: Catalog + Tracker + Ledger + Handles + Outbox, G> SplitFixture for SplitOver<S, G> {
+    fn with_split(&self, f: &mut dyn FnMut(&Bound<'_>, &dyn RemoteControl)) {
+        self.0
+            .set_cutover("R_1", &entry_iri(0))
+            .expect("a fresh store records a cut-over");
+        let remote = MemRemote::new("R_1");
+        let split = SplitLedger {
+            local: &self.0,
+            github: &remote,
+        };
+        f(
+            &Bound {
+                catalog: &self.0,
+                tracker: &self.0,
+                ledger: &split,
+                handles: &self.0,
+            },
+            &remote,
+        );
+    }
+}
+
+impl<S: Catalog + Tracker + Ledger + Handles + Outbox, G> Fixture for SplitOver<S, G> {
+    fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
+        self.with_split(&mut |b, _| f(b));
+    }
+}
+
 /// [`run_suite`] for cases written against a [`Bound`].
 fn run_bound<F: Fixture>(
     suite: &str,
@@ -102,7 +146,9 @@ const CATALOG_CASES: usize = 3;
 /// How many cases [`tracker`] runs. Update deliberately — see [`run_suite`].
 const TRACKER_CASES: usize = 12;
 /// How many cases [`ledger`] runs. Update deliberately — see [`run_suite`].
-const LEDGER_CASES: usize = 1;
+const LEDGER_CASES: usize = 4;
+/// How many cases [`split_ledger`] runs. Update deliberately — see [`run_suite`].
+const SPLIT_LEDGER_CASES: usize = 8;
 /// How many cases [`all_roles`] runs. Update deliberately — see [`run_suite`].
 const ALL_ROLES_CASES: usize = 7;
 /// How many cases [`local_handles`] runs. Update deliberately — see [`run_suite`].
@@ -135,9 +181,46 @@ pub fn tracker<F: Fixture>(make: impl Fn() -> F) {
     run_bound("tracker", TRACKER_CASES, cases, make);
 }
 
-pub fn ledger<S: Catalog + Ledger, G>(make: impl Fn() -> (S, G)) {
-    let cases: &[fn(&S)] = &[the_logs_are_append_only_and_read_back_in_order::<S>];
-    run_suite("ledger", LEDGER_CASES, cases, make);
+/// The contract every `Ledger` meets: the local stores, and a split ledger
+/// over them. Bound-based, so a split binding runs it too.
+pub fn ledger<F: Fixture>(make: impl Fn() -> F) {
+    let cases: &[fn(&Bound<'_>)] = &[
+        the_logs_are_append_only_and_read_back_in_order,
+        attempts_are_read_back_per_project,
+        a_flush_with_nothing_waiting_still_answers,
+        a_run_tied_to_a_record_reads_back_once_after_its_flush,
+    ];
+    run_bound("ledger", LEDGER_CASES, cases, make);
+}
+
+/// What only a split ledger has (GitHub ledger spec §8.2, §8.3): runs tied
+/// to a record, the flush, merge by id, the local store succeeding while
+/// GitHub fails, a lost answer retried without a duplicate, another
+/// repository's entry skipped without blocking, and `NotOwned` from the
+/// local catalog.
+pub fn split_ledger<F: SplitFixture>(make: impl Fn() -> F) {
+    let cases: &[fn(&Bound<'_>, &dyn RemoteControl)] = &[
+        runs_tied_to_a_record_reach_github_at_the_flush_and_not_before,
+        a_run_tied_to_no_record_is_never_published,
+        a_second_flush_publishes_nothing_twice_and_reads_see_each_run_once,
+        while_github_is_down_appends_succeed_and_flushes_and_reads_are_refused_until_it_returns,
+        another_machines_run_is_read_back_beside_this_ones,
+        a_gate_the_local_catalog_never_held_is_not_owned_whatever_github_holds,
+        a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush,
+        a_pending_entry_of_another_repository_does_not_block_the_decision,
+    ];
+    assert_eq!(
+        cases.len(),
+        SPLIT_LEDGER_CASES,
+        "the split-ledger suite lists {} cases but declares {SPLIT_LEDGER_CASES}. A case was \
+         added or removed: if that was deliberate, update the count beside the list; if not, \
+         restore the case",
+        cases.len()
+    );
+    for case in cases {
+        let fixture = make();
+        fixture.with_split(&mut |b, c| case(b, c));
+    }
 }
 
 /// Cases over every role at once, including ownership and handles.
@@ -515,9 +598,10 @@ pub fn update_finding_keeps_the_stored_aliases_whatever_the_caller_holds(roles: 
     );
 }
 
-fn the_logs_are_append_only_and_read_back_in_order<S: Catalog + Ledger>(s: &S) {
-    let p = s.add_project("/tmp/p").unwrap();
-    let g = s
+fn the_logs_are_append_only_and_read_back_in_order(roles: &Bound<'_>) {
+    let p = roles.catalog.add_project("/tmp/p").unwrap();
+    let g = roles
+        .catalog
         .add_gate(
             &p,
             "fmt",
@@ -528,12 +612,262 @@ fn the_logs_are_append_only_and_read_back_in_order<S: Catalog + Ledger>(s: &S) {
             "owner",
         )
         .unwrap();
-    s.append_gate_run(sample_run(g.clone(), "abc", 3)).unwrap();
-    s.append_gate_run(sample_run(g.clone(), "def", 5)).unwrap();
-    let runs = s.gate_runs(&g).unwrap();
+    roles
+        .ledger
+        .append_gate_run(sample_run(g.clone(), "abc", 3))
+        .unwrap();
+    roles
+        .ledger
+        .append_gate_run(sample_run(g.clone(), "def", 5))
+        .unwrap();
+    let runs = roles.ledger.gate_runs(&g).unwrap();
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].commit, "abc");
     assert_eq!(runs[1].population, 5);
+}
+
+fn attempts_are_read_back_per_project(roles: &Bound<'_>) {
+    let p1 = roles.catalog.add_project("/p1").unwrap();
+    let p2 = roles.catalog.add_project("/p2").unwrap();
+    let r1 = roles.tracker.add_record(&p1, "a").unwrap();
+    let r2 = roles.tracker.add_record(&p2, "b").unwrap();
+    for a in [
+        sample_attempt(1, &p1, &r1),
+        sample_attempt(2, &p2, &r2),
+        sample_attempt(3, &p1, &r1),
+    ] {
+        roles.ledger.append_attempt(a).unwrap();
+    }
+    let ids = |p: &ProjectId| -> Vec<Option<Iri>> {
+        roles
+            .ledger
+            .attempts(p)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect()
+    };
+    assert_eq!(ids(&p1), vec![Some(entry_iri(1)), Some(entry_iri(3))]);
+    assert_eq!(ids(&p2), vec![Some(entry_iri(2))]);
+}
+
+fn a_flush_with_nothing_waiting_still_answers(roles: &Bound<'_>) {
+    let p = roles.catalog.add_project("/p").unwrap();
+    let r = roles.tracker.add_record(&p, "t").unwrap();
+    roles
+        .ledger
+        .flush(sample_decision(1, &r, vec![]))
+        .expect("a flush with nothing waiting is not an error");
+}
+
+/// A project with one gate and one record.
+fn record_world(roles: &Bound<'_>) -> (ProjectId, GateId, RecordId) {
+    let p = roles.catalog.add_project("/p").unwrap();
+    let g = roles
+        .catalog
+        .add_gate(&p, "g", sample_kind(), sample_selector(), 1, "abc", "o")
+        .unwrap();
+    let r = roles.tracker.add_record(&p, "t").unwrap();
+    (p, g, r)
+}
+
+fn run_ids(runs: Vec<GateRun>) -> Vec<Option<Iri>> {
+    runs.into_iter().map(|r| r.id).collect()
+}
+
+fn a_run_tied_to_a_record_reads_back_once_after_its_flush(roles: &Bound<'_>) {
+    let (_p, g, r) = record_world(roles);
+    let run = sample_record_run(1, &g, Some(&r));
+    let id = run.id.clone().unwrap();
+    roles.ledger.append_gate_run(run).unwrap();
+    roles
+        .ledger
+        .flush(sample_decision(1, &r, vec![id.clone()]))
+        .unwrap();
+    assert_eq!(run_ids(roles.ledger.gate_runs(&g).unwrap()), vec![Some(id)]);
+}
+
+fn runs_tied_to_a_record_reach_github_at_the_flush_and_not_before(
+    roles: &Bound<'_>,
+    ctl: &dyn RemoteControl,
+) {
+    let (_p, g, r) = record_world(roles);
+    let run = sample_record_run(1, &g, Some(&r));
+    roles.ledger.append_gate_run(run.clone()).unwrap();
+    assert!(
+        ctl.remote().gate_runs(&g).unwrap().is_empty(),
+        "an append publishes nothing"
+    );
+    roles
+        .ledger
+        .flush(sample_decision(1, &r, vec![run.id.clone().unwrap()]))
+        .unwrap();
+    assert_eq!(run_ids(ctl.remote().gate_runs(&g).unwrap()), vec![run.id]);
+}
+
+fn a_run_tied_to_no_record_is_never_published(roles: &Bound<'_>, ctl: &dyn RemoteControl) {
+    let (_p, g, r) = record_world(roles);
+    let untied = sample_record_run(1, &g, None);
+    let tied = sample_record_run(2, &g, Some(&r));
+    roles.ledger.append_gate_run(untied).unwrap();
+    roles.ledger.append_gate_run(tied.clone()).unwrap();
+    roles
+        .ledger
+        .flush(sample_decision(1, &r, vec![tied.id.clone().unwrap()]))
+        .unwrap();
+    assert_eq!(run_ids(ctl.remote().gate_runs(&g).unwrap()), vec![tied.id]);
+}
+
+fn a_second_flush_publishes_nothing_twice_and_reads_see_each_run_once(
+    roles: &Bound<'_>,
+    ctl: &dyn RemoteControl,
+) {
+    let (_p, g, r) = record_world(roles);
+    let run = sample_record_run(1, &g, Some(&r));
+    let id = run.id.clone().unwrap();
+    roles.ledger.append_gate_run(run).unwrap();
+    roles
+        .ledger
+        .flush(sample_decision(1, &r, vec![id.clone()]))
+        .unwrap();
+    // The second decision rests on a run that is already published.
+    roles
+        .ledger
+        .flush(sample_decision(2, &r, vec![id.clone()]))
+        .unwrap();
+    assert_eq!(
+        run_ids(ctl.remote().gate_runs(&g).unwrap()),
+        vec![Some(id.clone())]
+    );
+    assert_eq!(run_ids(roles.ledger.gate_runs(&g).unwrap()), vec![Some(id)]);
+}
+
+// ⚠ Spec §2.2 and decision 8: the local store keeps every entry while
+// GitHub is down; the decision is refused; reads are errors, not the local
+// half; and the next flush publishes what was left behind.
+fn while_github_is_down_appends_succeed_and_flushes_and_reads_are_refused_until_it_returns(
+    roles: &Bound<'_>,
+    ctl: &dyn RemoteControl,
+) {
+    let (p, g, r) = record_world(roles);
+    let run = sample_record_run(1, &g, Some(&r));
+    let attempt = sample_attempt(2, &p, &r);
+    ctl.set_down(true);
+    roles.ledger.append_gate_run(run.clone()).unwrap();
+    roles.ledger.append_attempt(attempt.clone()).unwrap();
+    assert!(
+        roles
+            .ledger
+            .flush(sample_decision(1, &r, vec![attempt.id.clone().unwrap()]))
+            .is_err(),
+        "a flush GitHub cannot take refuses the decision"
+    );
+    assert!(
+        roles.ledger.gate_runs(&g).is_err(),
+        "unreachable is not empty"
+    );
+    ctl.set_down(false);
+    assert!(ctl.remote().gate_runs(&g).unwrap().is_empty());
+    roles
+        .ledger
+        .flush(sample_decision(2, &r, vec![run.id.clone().unwrap()]))
+        .unwrap();
+    assert_eq!(run_ids(ctl.remote().gate_runs(&g).unwrap()), vec![run.id]);
+    assert_eq!(
+        ctl.remote()
+            .attempts(&p)
+            .unwrap()
+            .into_iter()
+            .map(|a| a.id)
+            .collect::<Vec<_>>(),
+        vec![attempt.id],
+        "the attempt left behind goes out with the next flush"
+    );
+}
+
+fn another_machines_run_is_read_back_beside_this_ones(roles: &Bound<'_>, ctl: &dyn RemoteControl) {
+    let (_p, g, r) = record_world(roles);
+    let mine = sample_record_run(1, &g, Some(&r));
+    roles.ledger.append_gate_run(mine.clone()).unwrap();
+    let theirs = sample_record_run(2, &g, Some(&r));
+    ctl.remote()
+        .publish(&Batch {
+            decision: sample_decision(9, &r, vec![theirs.id.clone().unwrap()]),
+            runs: vec![theirs.clone()],
+            attempts: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        run_ids(roles.ledger.gate_runs(&g).unwrap()),
+        vec![mine.id, theirs.id]
+    );
+}
+
+fn a_gate_the_local_catalog_never_held_is_not_owned_whatever_github_holds(
+    roles: &Bound<'_>,
+    _ctl: &dyn RemoteControl,
+) {
+    let err = roles.ledger.gate_runs(&GateId(stranger())).unwrap_err();
+    assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+}
+
+// ⚠ Spec §3.2 step 5 and §8.3: a commit that landed before its answer was
+// lost reads, to fl, as a failure; the retry must not add a second copy.
+fn a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush(
+    roles: &Bound<'_>,
+    ctl: &dyn RemoteControl,
+) {
+    let (_p, g, r) = record_world(roles);
+    let run = sample_record_run(1, &g, Some(&r));
+    let id = run.id.clone().unwrap();
+    roles.ledger.append_gate_run(run).unwrap();
+    ctl.lose_next_answer();
+    assert!(
+        roles
+            .ledger
+            .flush(sample_decision(1, &r, vec![id.clone()]))
+            .is_err(),
+        "an answer that never came is not a landed commit, as far as fl can tell"
+    );
+    let flushed = roles
+        .ledger
+        .flush(sample_decision(2, &r, vec![id.clone()]))
+        .unwrap();
+    assert!(
+        flushed.commit.is_some(),
+        "the new decision is new: a commit"
+    );
+    assert_eq!(
+        run_ids(ctl.remote().gate_runs(&g).unwrap()),
+        vec![Some(id.clone())],
+        "the retry added no second copy"
+    );
+    assert_eq!(run_ids(roles.ledger.gate_runs(&g).unwrap()), vec![Some(id)]);
+}
+
+// ⚠ Spec §2.1: skipped and reported, never an error that blocks.
+fn a_pending_entry_of_another_repository_does_not_block_the_decision(
+    roles: &Bound<'_>,
+    ctl: &dyn RemoteControl,
+) {
+    let (_p, g, r) = record_world(roles);
+    let theirs = ctl.foreign_record();
+    let mine = sample_record_run(1, &g, Some(&r));
+    let other = sample_record_run(2, &g, Some(&theirs));
+    roles.ledger.append_gate_run(mine.clone()).unwrap();
+    roles.ledger.append_gate_run(other.clone()).unwrap();
+    let flushed = roles
+        .ledger
+        .flush(sample_decision(1, &r, vec![mine.id.clone().unwrap()]))
+        .unwrap();
+    assert_eq!(
+        flushed.left_local,
+        vec![LeftLocal::OtherRepository {
+            entry: other.id.clone().unwrap(),
+            record: theirs,
+        }]
+    );
+    assert_eq!(run_ids(ctl.remote().gate_runs(&g).unwrap()), vec![mine.id]);
 }
 
 /// Asserts that every result is `NotOwned` and names `id`. Each result is
@@ -924,15 +1258,253 @@ fn sample_selector() -> Selector {
     }
 }
 
+/// A run as recorded before entry ids (spec §1.3): no `id`, no `at`.
 fn sample_run(gate: GateId, commit: &str, population: u64) -> GateRun {
     GateRun {
+        id: None,
+        at: None,
         gate,
         record: None,
         commit: commit.into(),
         verdict: Verdict::from_predicate(true, population),
         population,
-        output_excerpt: String::new(),
+        output_excerpt: Some(String::new()),
         duration_ms: 1,
         cost_usd_micros: 0,
+    }
+}
+
+/// An entry id no store mints: the `9` variant nibble keeps it apart from
+/// [`seq_iri`]'s ids. Ordered by `n`, as UUIDv7 ids are ordered by time.
+pub fn entry_iri(n: u64) -> Iri {
+    Iri::parse(&format!("urn:uuid:00000000-0000-7000-9000-{n:012x}"))
+        .expect("a formatted urn:uuid is a valid IRI")
+}
+
+/// A run with an id, stamped `n` milliseconds after the epoch.
+pub fn sample_record_run(n: u64, gate: &GateId, record: Option<&RecordId>) -> GateRun {
+    GateRun {
+        id: Some(entry_iri(n)),
+        at: Some(At::from_unix_millis(n)),
+        gate: gate.clone(),
+        record: record.cloned(),
+        commit: "abc".into(),
+        verdict: Verdict::from_predicate(true, 1),
+        population: 1,
+        output_excerpt: Some(format!("run {n}")),
+        duration_ms: 1,
+        cost_usd_micros: 0,
+    }
+}
+
+/// An attempt with an id, stamped `n` milliseconds after the epoch.
+pub fn sample_attempt(n: u64, project: &ProjectId, record: &RecordId) -> Attempt {
+    Attempt {
+        id: Some(entry_iri(n)),
+        at: Some(At::from_unix_millis(n)),
+        project: project.clone(),
+        record: record.clone(),
+        adapter: "claude".into(),
+        status: AttemptStatus::Completed,
+        duration_ms: 1,
+        tokens_in: 0,
+        tokens_out: 0,
+        cost_usd_micros: 0,
+        paths_touched: PathsTouched::Listed(vec!["src/a.rs".into()]),
+        output_excerpt: Some(format!("attempt {n}")),
+    }
+}
+
+/// A `check` decision about `record`, resting on `rests_on`.
+pub fn sample_decision(n: u64, record: &RecordId, rests_on: Vec<Iri>) -> Decision {
+    Decision {
+        id: entry_iri(1_000_000 + n),
+        at: At::from_unix_millis(1_000_000 + n),
+        record: record.clone(),
+        finding: None,
+        outcome: Outcome::Check {
+            transition: TransitionOutcome {
+                transition: "launch".into(),
+                passed: true,
+            },
+        },
+        rests_on,
+    }
+}
+
+/// Drives a split ledger's GitHub side. `MemRemote` implements it here;
+/// plan B's fixture implements it over `GithubLedger` and the fake GitHub.
+pub trait RemoteControl {
+    /// While down, every remote read and write fails as unreachable.
+    /// Ownership is a local check (spec §2.1) and keeps answering.
+    fn set_down(&self, down: bool);
+    /// The next publish lands, and then its answer is lost — a timeout
+    /// after the commit (spec §3.2 step 5, §8.3).
+    fn lose_next_answer(&self);
+    /// A record another repository owns.
+    fn foreign_record(&self) -> RecordId;
+    /// The remote side itself, read without the local store.
+    fn remote(&self) -> &dyn RemoteLedger;
+}
+
+/// The one record [`MemRemote`] does not own.
+fn foreign() -> RecordId {
+    RecordId(
+        Iri::parse("urn:uuid:00000000-0000-7000-f000-000000000001")
+            .expect("a formatted urn:uuid is a valid IRI"),
+    )
+}
+
+/// An in-memory GitHub side for [`crate::split::SplitLedger`] (GitHub
+/// ledger spec §8.2). Ownership is a pure, local answer, as the spec
+/// requires: it owns every record except [`RemoteControl::foreign_record`],
+/// and never reads a tracker. `publish` adds only ids it does not hold, and
+/// makes no commit when nothing is left.
+pub struct MemRemote {
+    node_id: String,
+    inner: RefCell<RemoteInner>,
+}
+
+#[derive(Default)]
+struct RemoteInner {
+    down: bool,
+    fail_publish: bool,
+    lose_next_answer: bool,
+    foreign: BTreeSet<RecordId>,
+    runs: Vec<GateRun>,
+    attempts: Vec<Attempt>,
+    decisions: Vec<Decision>,
+    commits: u64,
+}
+
+impl MemRemote {
+    pub fn new(node_id: &str) -> Self {
+        let inner = RemoteInner {
+            foreign: BTreeSet::from([foreign()]),
+            ..RemoteInner::default()
+        };
+        Self {
+            node_id: node_id.to_string(),
+            inner: RefCell::new(inner),
+        }
+    }
+
+    /// Every `publish` fails and nothing lands, while everything else
+    /// answers.
+    pub fn fail_publish(&self, on: bool) {
+        self.inner.borrow_mut().fail_publish = on;
+    }
+
+    /// A run as GitHub holds it — another machine's, or an altered copy —
+    /// added without de-duplication.
+    pub fn insert_run(&self, run: GateRun) {
+        self.inner.borrow_mut().runs.push(run);
+    }
+
+    /// An attempt as GitHub holds it, added without de-duplication.
+    pub fn insert_attempt(&self, attempt: Attempt) {
+        self.inner.borrow_mut().attempts.push(attempt);
+    }
+
+    pub fn decisions(&self) -> Vec<Decision> {
+        self.inner.borrow().decisions.clone()
+    }
+
+    fn unreachable(&self, cause: &str) -> StoreError {
+        StoreError::Unreachable {
+            store: format!("github ledger {}", self.node_id),
+            cause: cause.to_string(),
+        }
+    }
+
+    fn refuse_if_down(&self) -> Result<(), StoreError> {
+        if self.inner.borrow().down {
+            return Err(self.unreachable("taken down by the test"));
+        }
+        Ok(())
+    }
+}
+
+impl RemoteLedger for MemRemote {
+    fn repo_node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    fn owns_record(&self, record: &RecordId) -> Result<bool, StoreError> {
+        Ok(!self.inner.borrow().foreign.contains(record))
+    }
+
+    fn publish(&self, batch: &Batch) -> Result<Option<String>, StoreError> {
+        self.refuse_if_down()?;
+        let mut s = self.inner.borrow_mut();
+        if s.fail_publish {
+            return Err(self.unreachable("the commit did not land"));
+        }
+        let mut added = 0;
+        for run in &batch.runs {
+            if !s.runs.iter().any(|held| held.id == run.id) {
+                s.runs.push(run.clone());
+                added += 1;
+            }
+        }
+        for attempt in &batch.attempts {
+            if !s.attempts.iter().any(|held| held.id == attempt.id) {
+                s.attempts.push(attempt.clone());
+                added += 1;
+            }
+        }
+        if !s.decisions.iter().any(|d| d.id == batch.decision.id) {
+            s.decisions.push(batch.decision.clone());
+            added += 1;
+        }
+        let commit = if added == 0 {
+            None
+        } else {
+            s.commits += 1;
+            Some(format!("commit-{}", s.commits))
+        };
+        if std::mem::take(&mut s.lose_next_answer) {
+            return Err(self.unreachable("the commit landed, but its answer was lost"));
+        }
+        Ok(commit)
+    }
+
+    fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
+        self.refuse_if_down()?;
+        Ok(self
+            .inner
+            .borrow()
+            .runs
+            .iter()
+            .filter(|r| r.gate == *gate)
+            .cloned()
+            .collect())
+    }
+
+    fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
+        self.refuse_if_down()?;
+        Ok(self
+            .inner
+            .borrow()
+            .attempts
+            .iter()
+            .filter(|a| a.project == *project)
+            .cloned()
+            .collect())
+    }
+}
+
+impl RemoteControl for MemRemote {
+    fn set_down(&self, down: bool) {
+        self.inner.borrow_mut().down = down;
+    }
+    fn lose_next_answer(&self) {
+        self.inner.borrow_mut().lose_next_answer = true;
+    }
+    fn foreign_record(&self) -> RecordId {
+        foreign()
+    }
+    fn remote(&self) -> &dyn RemoteLedger {
+        self
     }
 }

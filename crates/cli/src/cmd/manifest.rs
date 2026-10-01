@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{GateKind, Selector};
-use fl_core::store::Catalog;
+use fl_core::store::{Bindings, Catalog};
 use fl_core::{Iri, Kind};
 use fl_exec::git::Git;
 use fl_store::RedbStore;
@@ -152,7 +152,7 @@ pub fn ensure_publishable(
         // The whole project, not only its gates: a transition added or
         // changed since export would otherwise never reach another machine.
         if gate.is_none() {
-            let now = store.export_manifest(project, "", 0)?;
+            let now = store.export_manifest(project, "", 0, None)?;
             if now.body.gates.len() != m.body.gates.len() {
                 bail!(
                     "the manifest lists a gate this store no longer holds. Run \
@@ -185,7 +185,56 @@ pub fn ensure_publishable(
     Ok(())
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+/// What `manifest export` knows of the repository its project's ledger is
+/// in (GitHub ledger spec §6.1 step 4) — or that it cannot know.
+pub enum Binding {
+    /// The config entry was not read (`--db`/`$FL_DB`), or the command runs
+    /// on another project's store.
+    Unread,
+    /// The project's tracker is the local store: no GitHub ledger.
+    Local,
+    /// The project is bound to this `owner/repo`.
+    Github(String),
+}
+
+/// The `node_id` whose ledger root an export writes.
+///
+/// ⚠ Every export writes the root from the store, so it cannot be dropped
+/// (spec §6.1 step 4). When the store records a root and the export cannot
+/// tell which repository is this project's — the entry was not read, or it
+/// names a repository this store has no node for — it is refused rather
+/// than written without one.
+fn ledger_node(store: &RedbStore, binding: &Binding) -> Result<Option<String>> {
+    match binding {
+        Binding::Github(repo) => match store.bound_node_id(repo)? {
+            Some(node) => Ok(Some(node)),
+            None if store.holds_a_ledger_root()? => bail!(
+                "this store records a GitHub ledger root, but no repository node for `{repo}`, \
+                 the repository this project's config entry names, so fl cannot tell which \
+                 root belongs in the manifest. Run a command that opens the GitHub tracker from \
+                 the project's root — `fl github whoami` — which records the binding, then \
+                 export again"
+            ),
+            None => Ok(None),
+        },
+        Binding::Local => Ok(None),
+        Binding::Unread => {
+            if store.holds_a_ledger_root()? {
+                bail!(
+                    "this store records a GitHub ledger root, and fl cannot tell which \
+                     repository this project's ledger is in: with --db (or $FL_DB), or an IRI \
+                     held by another project's store, it does not read the project's config \
+                     entry. Run `fl manifest export` from the project's root, without --db and \
+                     with $FL_DB unset, so the manifest keeps the root every other machine \
+                     checks the ledger against"
+                );
+            }
+            Ok(None)
+        }
+    }
+}
+
+pub fn run(store: &RedbStore, cmd: Cmd, binding: &Binding) -> Result<i32> {
     match cmd {
         Cmd::Export { project } => {
             let p = ProjectId(refs::resolve(
@@ -200,7 +249,8 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .context("the system clock is before 1970")?
                 .as_secs();
-            let m = store.export_manifest(&p, &head, now)?;
+            let node = ledger_node(store, binding)?;
+            let m = store.export_manifest(&p, &head, now, node.as_deref())?;
             // ⚠ Every gate is printed with what it runs, and what it
             // examines: either can name a local path, and this file is
             // about to be committed.
@@ -228,6 +278,9 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
             std::fs::write(&path, m.to_json())
                 .with_context(|| format!("could not write {}", path.display()))?;
             println!("wrote\t{}\tsha256:{}", path.display(), m.content_sha256);
+            if let Some(ledger_root) = &m.body.ledger_root {
+                println!("ledger_root\t{}", ledger_root.commit);
+            }
             println!(
                 "commit it: another machine resolves these gates only through a committed manifest"
             );

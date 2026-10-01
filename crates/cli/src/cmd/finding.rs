@@ -169,8 +169,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             if ctx.github.is_some() {
                 crate::cmd::manifest::ensure_publishable(store, &f.project, Some(&gid))?;
             }
-            let report = attach_reproduction(ctx.roles(), &fid, &gid)
+            let (report, flushed) = attach_reproduction(ctx.roles(), &fid, &gid)
                 .map_err(|e| explain(e, &finding, Some(&gate)))?;
+            crate::ctx::report_flush(&flushed);
             println!(
                 "{}\treproduced\tgate {} failed over {} items",
                 refs::show(ctx.handles, Kind::Finding, fid.iri())?,
@@ -193,6 +194,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             let id = f.id;
             let report =
                 verify_finding(ctx.roles(), &id).map_err(|e| explain(e, &finding, None))?;
+            crate::ctx::report_flush(&report.flushed);
 
             if report.reproduction.verdict.is_pass() {
                 println!(

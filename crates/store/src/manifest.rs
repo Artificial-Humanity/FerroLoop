@@ -13,7 +13,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
-pub const MANIFEST_FORMAT: u64 = 1;
+/// Format 1: gates and transitions. Format 2 adds `ledger_root` (GitHub
+/// ledger spec §6.1 step 4). An export writes 2 exactly when it carries a
+/// root, so a project with no GitHub ledger still exports a manifest every
+/// older fl reads.
+pub const MANIFEST_FORMAT: u64 = 2;
+pub const MANIFEST_FORMAT_WITHOUT_LEDGER: u64 = 1;
 pub use fl_core::MANIFEST_PATH;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +26,17 @@ pub use fl_core::MANIFEST_PATH;
 pub struct Provenance {
     pub commit: String,
     pub exported_at_unix: u64,
+}
+
+/// The first commit of the `fl/ledger` branch in the repository whose
+/// `node_id` this names: every machine's anchor for the ledger's tamper
+/// checks (GitHub ledger spec §3.5). The `node_id` lets an importing machine
+/// key it without knowing the exporter's config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LedgerRoot {
+    pub repository_node_id: String,
+    pub commit: String,
 }
 
 /// Everything the hash covers. ⚠ No store path and no project root: both
@@ -36,6 +52,10 @@ pub struct Body {
     pub gates: Vec<GateDef>,
     /// Sorted by name.
     pub transitions: Vec<Transition>,
+    /// Format 2 only. ⚠ Skipped when absent, so a format-1 body serializes —
+    /// and hashes — byte for byte as it did before format 2 existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_root: Option<LedgerRoot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,8 +72,9 @@ pub enum ManifestError {
     )]
     Parse(String),
     #[error(
-        "the manifest is format {found}, and this version of fl reads format \
-         {MANIFEST_FORMAT}. Use a version of fl that reads format {found}"
+        "the manifest is format {found}, and this version of fl reads formats \
+         {MANIFEST_FORMAT_WITHOUT_LEDGER} to {MANIFEST_FORMAT}. A newer fl wrote it: upgrade fl \
+         to read it"
     )]
     Format { found: u64 },
     #[error(
@@ -112,12 +133,14 @@ pub fn content_sha256(body: &Body) -> Result<String, ManifestError> {
         .collect())
 }
 
-/// Every gate and transition of `project`, with pass marks cleared.
+/// Every gate and transition of `project`, with pass marks cleared, and the
+/// ledger root when the project's repository has one.
 pub fn export(
     catalog: &dyn Catalog,
     project: &ProjectId,
     commit: &str,
     exported_at_unix: u64,
+    ledger_root: Option<LedgerRoot>,
 ) -> Result<Manifest, ManifestError> {
     if catalog.get_project(project)?.is_none() {
         return Err(ManifestError::Inconsistent(format!(
@@ -132,7 +155,11 @@ pub fn export(
     let mut transitions = catalog.list_transitions(project)?;
     transitions.sort_by(|a, b| a.name.cmp(&b.name));
     let body = Body {
-        format_version: MANIFEST_FORMAT,
+        format_version: if ledger_root.is_some() {
+            MANIFEST_FORMAT
+        } else {
+            MANIFEST_FORMAT_WITHOUT_LEDGER
+        },
         provenance: Provenance {
             commit: commit.to_string(),
             exported_at_unix,
@@ -140,6 +167,7 @@ pub fn export(
         project: project.clone(),
         gates,
         transitions,
+        ledger_root,
     };
     let content_sha256 = content_sha256(&body)?;
     let m = Manifest {
@@ -171,7 +199,7 @@ impl Manifest {
             .pointer("/body/format_version")
             .and_then(|v| v.as_u64())
         {
-            Some(MANIFEST_FORMAT) => {}
+            Some(v) if (MANIFEST_FORMAT_WITHOUT_LEDGER..=MANIFEST_FORMAT).contains(&v) => {}
             Some(found) => return Err(ManifestError::Format { found }),
             None => {
                 return Err(ManifestError::Parse(
@@ -200,6 +228,23 @@ impl Manifest {
     }
 
     fn check_consistent(&self) -> Result<(), ManifestError> {
+        let f = self.body.format_version;
+        match (&self.body.ledger_root, f) {
+            (None, MANIFEST_FORMAT_WITHOUT_LEDGER) | (Some(_), MANIFEST_FORMAT) => {}
+            (None, _) => {
+                return Err(ManifestError::Inconsistent(format!(
+                    "it is format {f} and carries no ledger root; only format \
+                     {MANIFEST_FORMAT} carries one, and every format {MANIFEST_FORMAT} manifest \
+                     does"
+                )));
+            }
+            (Some(_), _) => {
+                return Err(ManifestError::Inconsistent(format!(
+                    "it carries a ledger root but is format {f}; a manifest with a ledger root \
+                     is format {MANIFEST_FORMAT}"
+                )));
+            }
+        }
         let p = &self.body.project;
         let mut ids = BTreeSet::new();
         for g in &self.body.gates {
@@ -317,14 +362,14 @@ mod tests {
     #[test]
     fn an_export_round_trips_through_its_file_form() {
         let (s, p, _, _) = store();
-        let m = export(&s, &p, "abc", 7).unwrap();
+        let m = export(&s, &p, "abc", 7, None).unwrap();
         assert_eq!(Manifest::parse(&m.to_json()).unwrap(), m);
     }
 
     #[test]
     fn an_export_carries_only_the_named_project() {
         let (s, p, g1, g2) = store();
-        let m = export(&s, &p, "abc", 7).unwrap();
+        let m = export(&s, &p, "abc", 7, None).unwrap();
         let ids: Vec<_> = m.body.gates.iter().map(|g| g.id.clone()).collect();
         assert_eq!(ids, vec![g1, g2]);
         assert_eq!(m.body.transitions.len(), 1);
@@ -336,14 +381,14 @@ mod tests {
         let mut def = s.get_gate(&g1).unwrap().unwrap();
         def.last_pass_commit = Some("abc".into());
         s.update_gate(&def).unwrap();
-        let m = export(&s, &p, "abc", 7).unwrap();
+        let m = export(&s, &p, "abc", 7, None).unwrap();
         assert!(m.body.gates.iter().all(|g| g.last_pass_commit.is_none()));
     }
 
     #[test]
     fn a_hand_edit_is_refused() {
         let (s, p, _, _) = store();
-        let text = export(&s, &p, "abc", 7)
+        let text = export(&s, &p, "abc", 7, None)
             .unwrap()
             .to_json()
             .replace("\"name\": \"fmt\"", "\"name\": \"fmt2\"");
@@ -355,18 +400,90 @@ mod tests {
     #[test]
     fn a_future_format_is_named_as_one() {
         let (s, p, _, _) = store();
-        let text = export(&s, &p, "abc", 7)
+        let text = export(&s, &p, "abc", 7, None)
             .unwrap()
             .to_json()
             .replace("\"format_version\": 1", "\"format_version\": 9");
         let err = Manifest::parse(&text).unwrap_err();
         assert!(matches!(err, ManifestError::Format { found: 9 }), "{err}");
+        assert!(err.to_string().contains("upgrade fl"), "{err}");
+    }
+
+    /// `Body` and `Manifest` as format 1 was declared before format 2
+    /// existed, frozen here: an older fl parses and hashes with exactly this.
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct OlderBody {
+        format_version: u64,
+        provenance: Provenance,
+        project: ProjectId,
+        gates: Vec<GateDef>,
+        transitions: Vec<Transition>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct OlderManifest {
+        body: OlderBody,
+        content_sha256: String,
+    }
+
+    // ⚠ A project with no GitHub ledger must keep exporting exactly what an
+    // older fl reads: same fields, same bytes, same hash.
+    #[test]
+    fn a_manifest_with_no_ledger_root_is_format_1_and_an_older_fl_reads_it() {
+        let (s, p, _, _) = store();
+        let m = export(&s, &p, "abc", 7, None).unwrap();
+        assert_eq!(m.body.format_version, 1);
+        let text = m.to_json();
+        assert!(!text.contains("ledger_root"), "{text}");
+        let old: OlderManifest =
+            serde_json::from_str(&text).expect("an older fl parses a format-1 export");
+        let bytes = serde_json::to_vec(&old.body).unwrap();
+        let hash: String = Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hash, old.content_sha256, "an older fl's hash check passes");
+    }
+
+    fn root() -> LedgerRoot {
+        LedgerRoot {
+            repository_node_id: "R_1".into(),
+            commit: "abc123".into(),
+        }
+    }
+
+    #[test]
+    fn a_manifest_with_a_ledger_root_is_format_2_and_round_trips() {
+        let (s, p, _, _) = store();
+        let m = export(&s, &p, "abc", 7, Some(root())).unwrap();
+        assert_eq!(m.body.format_version, 2);
+        let back = Manifest::parse(&m.to_json()).unwrap();
+        assert_eq!(back.body.ledger_root, Some(root()));
+        assert_eq!(back, m);
+    }
+
+    #[test]
+    fn a_root_on_format_1_or_no_root_on_format_2_is_refused() {
+        let (s, p, _, _) = store();
+        let mut m = export(&s, &p, "abc", 7, None).unwrap();
+        m.body.ledger_root = Some(root());
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
+
+        let mut m = export(&s, &p, "abc", 7, Some(root())).unwrap();
+        m.body.ledger_root = None;
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
     }
 
     #[test]
     fn a_transition_naming_an_unlisted_gate_is_refused_even_with_a_correct_hash() {
         let (s, p, _, g2) = store();
-        let mut m = export(&s, &p, "abc", 7).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None).unwrap();
         m.body.gates.retain(|g| g.id != g2);
         m.content_sha256 = content_sha256(&m.body).unwrap();
         let err = Manifest::parse(&m.to_json()).unwrap_err();
@@ -382,7 +499,7 @@ mod tests {
     #[test]
     fn a_gate_of_another_project_is_refused() {
         let (s, p, g1, _) = store();
-        let mut m = export(&s, &p, "abc", 7).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None).unwrap();
         let g = m.body.gates.iter_mut().find(|g| g.id == g1).unwrap();
         g.project = ProjectId(fl_core::ids::seq_iri(999));
         let err = rehashed(m).verify().unwrap_err();
@@ -392,7 +509,7 @@ mod tests {
     #[test]
     fn a_pass_mark_in_the_file_is_refused() {
         let (s, p, _, _) = store();
-        let mut m = export(&s, &p, "abc", 7).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None).unwrap();
         m.body.gates[0].last_pass_commit = Some("abc".into());
         let err = rehashed(m).verify().unwrap_err();
         assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
@@ -401,13 +518,13 @@ mod tests {
     #[test]
     fn a_gate_or_transition_listed_twice_is_refused() {
         let (s, p, _, _) = store();
-        let mut m = export(&s, &p, "abc", 7).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None).unwrap();
         let dup = m.body.gates[0].clone();
         m.body.gates.push(dup);
         let err = rehashed(m).verify().unwrap_err();
         assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
 
-        let mut m = export(&s, &p, "abc", 7).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None).unwrap();
         let dup = m.body.transitions[0].clone();
         m.body.transitions.push(dup);
         let err = rehashed(m).verify().unwrap_err();
@@ -417,7 +534,7 @@ mod tests {
     #[test]
     fn currency_ignores_the_pass_mark_and_sees_every_other_change() {
         let (s, p, g1, _) = store();
-        let m = export(&s, &p, "abc", 7).unwrap();
+        let m = export(&s, &p, "abc", 7, None).unwrap();
         let mut def = s.get_gate(&g1).unwrap().unwrap();
         def.last_pass_commit = Some("zzz".into());
         assert_eq!(m.currency_of(&def), Currency::Current);

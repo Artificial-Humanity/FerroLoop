@@ -385,6 +385,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "uuid",
  "walkdir",
 ]
 

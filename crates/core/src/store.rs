@@ -1,3 +1,4 @@
+use crate::decision::{Decision, Flushed};
 use crate::finding::Finding;
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use crate::iri::Iri;
@@ -60,13 +61,12 @@ pub enum StoreError {
     /// must never read as an empty store.
     #[error("the store at {store} could not be opened: {cause}")]
     Unreachable { store: String, cause: String },
-    #[error(
-        "the store holds format {}, and this version of fl reads format {expected}. \
-         There is no migration: start a new store, or keep using the version of fl \
-         that wrote this one.",
-        match found { Some(v) => v.to_string(), None => "none (written before format versioning)".to_string() }
-    )]
-    FormatVersion { found: Option<u64>, expected: u64 },
+    #[error("{}", format_version_message(*found, *oldest, *newest))]
+    FormatVersion {
+        found: Option<u64>,
+        oldest: u64,
+        newest: u64,
+    },
     /// ⚠ A stored record could not be read back into its type. This is what a
     /// wire-format change looks like from the other side, so the message names
     /// that cause and the remedy — a refusal that only reports serde's
@@ -110,6 +110,41 @@ pub enum StoreError {
          it, and retry."
     )]
     Conflict { id: Iri, detail: String },
+    /// ⚠ One entry id, two contents: this machine's copy and the shared
+    /// ledger's (GitHub ledger spec §2.5). An entry never changes once it is
+    /// written, so one of the two was altered afterwards.
+    #[error(
+        "{id} is recorded differently on this machine and in the shared ledger: {detail}. An \
+         entry never changes once it is written, so one copy was altered afterwards, and fl \
+         uses neither. Find out who changed it before trusting either copy."
+    )]
+    Tampered { id: Iri, detail: String },
+    /// ⚠ A ledger's anchor — its branch's first commit — never changes
+    /// (GitHub ledger spec §3.5).
+    #[error(
+        "the GitHub ledger of repository node {node_id} is anchored at commit {held}, and this \
+         names {found}. A ledger's first commit never changes: a different one means the ledger \
+         was deleted and created again, or the manifest was edited. Find out which before \
+         trusting either."
+    )]
+    LedgerRootChanged {
+        node_id: String,
+        held: String,
+        found: String,
+    },
+    /// ⚠ The cut-over is recorded once, when a repository's GitHub ledger
+    /// is switched on (spec §2.1): moving it would strand every entry
+    /// recorded between the two.
+    #[error(
+        "the GitHub ledger of repository node {node_id} was switched on at {held}, and this \
+         names {found}. The cut-over never moves: entries between the two would never be \
+         published. Keep the recorded one."
+    )]
+    CutoverChanged {
+        node_id: String,
+        held: Iri,
+        found: Iri,
+    },
     /// The id names something that exists but that fl did not create.
     #[error(
         "{id} is {what}, not an item fl created, so fl neither reads nor changes it. Name an \
@@ -163,6 +198,28 @@ pub fn follow<T>(
             to: to.clone(),
         }),
         Err(e) => Err(e),
+    }
+}
+
+/// `FormatVersion`'s message. A store from a NEWER fl is not damaged and
+/// needs no new store: importing a manifest that carries a ledger root, for
+/// one, raises a store to format 4, and the remedy on an older build is to
+/// upgrade.
+fn format_version_message(found: Option<u64>, oldest: u64, newest: u64) -> String {
+    match found {
+        Some(v) if v > newest => format!(
+            "the store holds format {v}, which a newer fl wrote, and this version of fl reads \
+             formats {oldest} to {newest}. Upgrade fl to open it: nothing is wrong with the store."
+        ),
+        _ => format!(
+            "the store holds format {}, and this version of fl reads formats {oldest} to \
+             {newest}. There is no migration: start a new store, or keep using the version of fl \
+             that wrote this one.",
+            match found {
+                Some(v) => v.to_string(),
+                None => "none (written before format versioning)".to_string(),
+            }
+        ),
     }
 }
 
@@ -259,6 +316,19 @@ pub trait Ledger {
     fn append_attempt(&self, attempt: Attempt) -> Result<(), StoreError>;
     fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError>;
     fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError>;
+
+    /// Publish a decision and the evidence it rests on (GitHub ledger spec
+    /// §1.4, §2.2).
+    ///
+    /// ⚠⚠ Call it BEFORE the state change the decision supports, and treat
+    /// an error as a refusal of the decision: no state change. A refused
+    /// decision is flushed too (decision 11).
+    ///
+    /// A ledger with nowhere to publish — every local store — does nothing,
+    /// which is this default.
+    fn flush(&self, _decision: Decision) -> Result<Flushed, StoreError> {
+        Ok(Flushed::NOTHING)
+    }
 }
 
 /// Short names a person types and reads (spec §4). Display only: a handle
@@ -391,10 +461,16 @@ impl Handles for KindRouted<'_> {
 
 /// What a local store remembers about the GitHub repositories a tracker is
 /// bound to (GitHub tracker spec §2.4): the repository's `node_id`, keyed by
-/// the configured `owner/repo`, compared without regard to case.
+/// the configured `owner/repo`, compared without regard to case; and the
+/// ledger root of each repository whose GitHub ledger it knows (GitHub
+/// ledger spec §6.1 step 4), keyed by `node_id`.
 pub trait Bindings {
     fn bound_node_id(&self, repo: &str) -> Result<Option<String>, StoreError>;
     fn bind_node_id(&self, repo: &str, node_id: &str) -> Result<(), StoreError>;
+    fn ledger_root(&self, node_id: &str) -> Result<Option<String>, StoreError>;
+    /// ⚠ An anchor never changes: a different root for a `node_id` that has
+    /// one is `LedgerRootChanged`; the same root again is a no-op.
+    fn set_ledger_root(&self, node_id: &str, commit: &str) -> Result<(), StoreError>;
 }
 
 #[cfg(test)]
@@ -551,5 +627,45 @@ mod tests {
             s.bound_node_id("ACME/widgets").unwrap().as_deref(),
             Some("R_1")
         );
+    }
+
+    // Spec §1.4: a ledger with nowhere to publish — every local store —
+    // answers a flush with `Nothing`, and changes nothing.
+    #[test]
+    fn a_local_store_has_nowhere_to_publish_so_its_flush_does_nothing() {
+        use crate::at::At;
+        use crate::decision::{Decision, Flushed, Outcome};
+        use crate::log::AttemptStatus;
+        let s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let d = Decision {
+            id: seq_iri(90),
+            at: At::from_unix_millis(1),
+            record: r,
+            finding: None,
+            outcome: Outcome::Attempt {
+                status: AttemptStatus::Completed,
+            },
+            rests_on: vec![],
+        };
+        assert_eq!(s.flush(d).unwrap(), Flushed::NOTHING);
+    }
+
+    // Spec §3.5: the anchor never changes. A different root for a
+    // repository that has one is refused, the same one again is not.
+    #[test]
+    fn a_memory_store_records_a_ledger_root_once() {
+        let s = MemStore::default();
+        assert_eq!(s.ledger_root("R_1").unwrap(), None);
+        s.set_ledger_root("R_1", "abc").unwrap();
+        s.set_ledger_root("R_1", "abc").unwrap();
+        let err = s.set_ledger_root("R_1", "def").unwrap_err();
+        assert!(
+            matches!(err, StoreError::LedgerRootChanged { ref held, ref found, .. } if held == "abc" && found == "def"),
+            "{err:?}"
+        );
+        assert_eq!(s.ledger_root("R_1").unwrap().as_deref(), Some("abc"));
+        assert_eq!(s.ledger_root("R_2").unwrap(), None);
     }
 }
