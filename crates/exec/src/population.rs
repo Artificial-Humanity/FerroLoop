@@ -27,6 +27,15 @@ pub enum ExecError {
          that reaches the ledger publishes them"
     )]
     Unpublished(String),
+    /// ⚠ The decision's evidence was refused for a reason waiting will not
+    /// cure (GitHub ledger spec §7): the cause names what to fix. The runs
+    /// are kept in the local store.
+    #[error(
+        "refused: the evidence for this decision could not be published to the shared ledger, \
+         so nothing changed: {0}. The runs are kept in the local store; fix what is named above \
+         before deciding again"
+    )]
+    PublishRefused(String),
     #[error("command `{0}` could not be run: {1}")]
     Spawn(String, String),
     /// ⚠ A population command that exits non-zero has told you nothing about
@@ -146,6 +155,18 @@ pub fn resolve(
             out.sort();
             Ok(out)
         }
+    }
+}
+
+/// How a failed flush refuses its decision (GitHub ledger spec §2.2, §7).
+/// ⚠ Only a transient refusal — GitHub unreachable, rate limited, or
+/// contended — promises that the next decision publishes the runs; any
+/// other cause names what to fix first.
+pub fn refused_publish(e: fl_core::StoreError) -> ExecError {
+    if e.is_transient() {
+        ExecError::Unpublished(e.to_string())
+    } else {
+        ExecError::PublishRefused(e.to_string())
     }
 }
 

@@ -121,10 +121,17 @@ fn publish(
     ledger
         .flush(fl_exec::decision::for_check(record, report))
         .map_err(|e| {
+            // ⚠ Only a transient refusal promises a later publish (spec §7).
+            let after = if e.is_transient() {
+                "Its runs are kept in the local store, and the next decision that reaches the \
+                 ledger publishes them."
+            } else {
+                "Its runs are kept in the local store. Fix what is named above before deciding \
+                 again."
+            };
             anyhow::anyhow!(
                 "refused: the check ran, but its decision could not be published to the shared \
-                 ledger ({e}). Its runs are kept in the local store, and the next decision that \
-                 reaches the ledger publishes them."
+                 ledger ({e}). {after}"
             )
         })
 }
@@ -204,5 +211,31 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("refused"), "{msg}");
         assert!(msg.contains("kept in the local store"), "{msg}");
+    }
+
+    // Spec §7: only a transient refusal promises that the next decision
+    // publishes the runs.
+    #[test]
+    fn a_check_refused_for_a_cause_a_retry_cannot_cure_promises_no_retry() {
+        let ledger = Flushes::refusing_with(|| fl_core::store::StoreError::Tampered {
+            id: seq_iri(99),
+            detail: "edited".into(),
+        });
+        let err = publish(&ledger, Some(&RecordId(seq_iri(3))), &report(true)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refused"), "{msg}");
+        assert!(msg.contains("kept in the local store"), "{msg}");
+        assert!(!msg.contains("next decision"), "{msg}");
+    }
+
+    #[test]
+    fn a_check_that_could_not_reach_github_promises_the_next_decision_publishes_it() {
+        let err = publish(
+            &Flushes::refusing(),
+            Some(&RecordId(seq_iri(3))),
+            &report(true),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("next decision"), "{err:#}");
     }
 }

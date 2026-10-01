@@ -1,6 +1,6 @@
 use crate::decision;
 use crate::evaluate::{TransitionReport, evaluate_transition};
-use crate::population::ExecError;
+use crate::population::{ExecError, refused_publish};
 use fl_core::decision::Flushed;
 use fl_core::model::{Record, State, Transition};
 use fl_core::store::Roles;
@@ -89,7 +89,7 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
     let flushed = roles
         .ledger
         .flush(decision::for_move(record, to, &transitions, allowed))
-        .map_err(|e| ExecError::Unpublished(e.to_string()))?;
+        .map_err(refused_publish)?;
 
     if allowed {
         roles
@@ -414,6 +414,35 @@ mod tests {
                 transitions: vec![],
                 allowed: true,
             }
+        );
+    }
+
+    // Spec §7: only an unreachable or rate-limited GitHub may be promised a
+    // later publish. A ledger that refused for any other cause names what
+    // to fix, and the refusal must not tell the person to wait it out.
+    #[test]
+    fn a_move_refused_for_a_cause_a_retry_cannot_cure_promises_no_retry() {
+        let d = repo();
+        let store = MemStore::default();
+        let record = gated_record(&store, d.path());
+        let j = Journal::refusing_with(&store, || StoreError::Tampered {
+            id: fl_core::ids::seq_iri(99),
+            detail: "edited".into(),
+        });
+
+        let err = match move_record(j.roles(), &record, State::Done) {
+            Err(e) => e,
+            Ok(_) => panic!("a move whose flush failed must be refused"),
+        };
+
+        assert!(matches!(err, ExecError::PublishRefused(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("nothing changed"), "{msg}");
+        assert!(msg.contains("edited"), "the cause is named: {msg}");
+        assert!(!msg.contains("next decision"), "{msg}");
+        assert_eq!(
+            store.get_record(&record.id).unwrap().unwrap().state,
+            State::Todo
         );
     }
 }

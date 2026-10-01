@@ -7,17 +7,30 @@ use fl_core::store::{Ledger, StoreError};
 use std::cell::RefCell;
 
 /// A ledger that keeps every decision it is asked to flush — or, built with
-/// [`Flushes::refusing`], refuses every one as unreachable.
+/// [`Flushes::refusing`] or [`Flushes::refusing_with`], refuses every one.
 #[derive(Default)]
 pub struct Flushes {
-    refuse: bool,
+    refuse: Option<fn() -> StoreError>,
     pub decisions: RefCell<Vec<Decision>>,
 }
 
+fn unreachable() -> StoreError {
+    StoreError::Unreachable {
+        store: "github:acme/widgets".into(),
+        cause: "connection refused".into(),
+    }
+}
+
 impl Flushes {
+    /// Every flush fails as GitHub unreachable.
     pub fn refusing() -> Self {
+        Self::refusing_with(unreachable)
+    }
+
+    /// Every flush fails with `cause()`.
+    pub fn refusing_with(cause: fn() -> StoreError) -> Self {
         Self {
-            refuse: true,
+            refuse: Some(cause),
             ..Self::default()
         }
     }
@@ -37,11 +50,8 @@ impl Ledger for Flushes {
         Ok(vec![])
     }
     fn flush(&self, decision: Decision) -> Result<Flushed, StoreError> {
-        if self.refuse {
-            return Err(StoreError::Unreachable {
-                store: "github:acme/widgets".into(),
-                cause: "connection refused".into(),
-            });
+        if let Some(cause) = self.refuse {
+            return Err(cause());
         }
         self.decisions.borrow_mut().push(decision);
         Ok(Flushed {
