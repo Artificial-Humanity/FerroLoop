@@ -834,6 +834,9 @@ mod tests {
             let why = ledger_root_shape(node, commit).expect_err(node);
             assert!(why.contains(names), "{why}");
         }
+        let longest = format!("R{}", "a".repeat(127));
+        assert_eq!(longest.len(), 128);
+        assert_eq!(ledger_root_shape(&longest, sha1), Ok(()), "128 characters");
         let long = format!("R{}", "a".repeat(128));
         assert!(ledger_root_shape(&long, sha1).is_err(), "129 characters");
     }
