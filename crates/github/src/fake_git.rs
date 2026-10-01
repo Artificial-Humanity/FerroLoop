@@ -223,8 +223,15 @@ fn wrapped(text: &str) -> String {
     out
 }
 
-/// The ledger's REST endpoints; `None` for every other route.
-pub(crate) fn rest(s: &mut State, method: &str, parts: &[&str], body: &str) -> Option<Answer> {
+/// The ledger's REST endpoints; `None` for every other route. `q` is the
+/// request's query parameters (e.g. `recursive` on a tree read).
+pub(crate) fn rest(
+    s: &mut State,
+    method: &str,
+    parts: &[&str],
+    q: &BTreeMap<String, String>,
+    body: &str,
+) -> Option<Answer> {
     let ["repos", o, r, rest @ ..] = parts else {
         return None;
     };
@@ -269,7 +276,9 @@ pub(crate) fn rest(s: &mut State, method: &str, parts: &[&str], body: &str) -> O
             Some(c) => answer(200, commit_json(sha, c)),
             None => not_found(),
         },
-        ("GET", ["git", "trees", sha]) => get_tree(s, sha),
+        ("GET", ["git", "trees", sha]) => {
+            get_tree(s, sha, q.get("recursive").map(String::as_str) == Some("1"))
+        }
         ("GET", ["git", "blobs", sha]) => match s.git.blobs.get(*sha) {
             Some(t) => answer(
                 200,
@@ -363,14 +372,18 @@ fn create_commit(s: &mut State, v: &Value) -> Answer {
     if !s.git.trees.contains_key(tree) {
         return unprocessable("Tree SHA does not exist");
     }
-    let parents: Vec<String> = v["parents"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|p| p.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    // ⚠ A parent that is not a string is refused outright — never silently
+    // dropped, which would otherwise turn a malformed request into an
+    // accidental root commit.
+    let mut parents: Vec<String> = Vec::new();
+    if let Some(arr) = v["parents"].as_array() {
+        for p in arr {
+            match p.as_str() {
+                Some(sha) => parents.push(sha.to_string()),
+                None => return unprocessable("each parent SHA must be a string"),
+            }
+        }
+    }
     if parents.iter().any(|p| !s.git.commits.contains_key(p)) {
         return unprocessable("Parent SHA does not exist");
     }
@@ -378,28 +391,53 @@ fn create_commit(s: &mut State, v: &Value) -> Answer {
     answer(201, commit_json(&sha, &s.git.commits[&sha]))
 }
 
-fn get_tree(s: &State, sha: &str) -> Answer {
+/// ⚠ Modelled: without `recursive=1`, GitHub lists only the tree's own
+/// level (direct blobs, and one `tree` entry per immediate subdirectory);
+/// `recursive=1` lists every blob at its full path plus every intermediate
+/// directory. Unmeasured; no live test provokes either shape.
+fn get_tree(s: &State, sha: &str, recursive: bool) -> Answer {
     let Some(files) = s.git.trees.get(sha) else {
         return not_found();
     };
-    let mut dirs = BTreeSet::new();
     let mut items = Vec::new();
-    for (path, blob) in files {
-        let mut at = path.as_str();
-        while let Some((parent, _)) = at.rsplit_once('/') {
-            dirs.insert(parent.to_string());
-            at = parent;
+    if recursive {
+        let mut dirs = BTreeSet::new();
+        for (path, blob) in files {
+            let mut at = path.as_str();
+            while let Some((parent, _)) = at.rsplit_once('/') {
+                dirs.insert(parent.to_string());
+                at = parent;
+            }
+            items.push(json!({
+                "path": path, "mode": "100644", "type": "blob", "sha": blob,
+                "size": s.git.blobs[blob].len(),
+            }));
         }
-        items.push(json!({
-            "path": path, "mode": "100644", "type": "blob", "sha": blob,
-            "size": s.git.blobs[blob].len(),
-        }));
-    }
-    for d in dirs {
-        items.push(json!({
-            "path": d, "mode": "040000", "type": "tree",
-            "sha": object_id(&["subtree", sha, &d]),
-        }));
+        for d in dirs {
+            items.push(json!({
+                "path": d, "mode": "040000", "type": "tree",
+                "sha": object_id(&["subtree", sha, &d]),
+            }));
+        }
+    } else {
+        let mut top_dirs = BTreeSet::new();
+        for (path, blob) in files {
+            match path.split_once('/') {
+                None => items.push(json!({
+                    "path": path, "mode": "100644", "type": "blob", "sha": blob,
+                    "size": s.git.blobs[blob].len(),
+                })),
+                Some((top, _)) => {
+                    top_dirs.insert(top.to_string());
+                }
+            }
+        }
+        for d in top_dirs {
+            items.push(json!({
+                "path": d, "mode": "040000", "type": "tree",
+                "sha": object_id(&["subtree", sha, &d]),
+            }));
+        }
     }
     answer(200, json!({"sha": sha, "tree": items, "truncated": false}))
 }
@@ -444,11 +482,19 @@ fn rules(s: &mut State, full: &str, branch: &str) -> Answer {
         return answer(500, json!({"message": "fake rules failure"}));
     }
     if s.rules_need_upgrade {
-        return answer(
+        let mut a = answer(
             403,
             json!({"message": "Upgrade to GitHub Pro or make this repository public to enable \
                                this feature."}),
         );
+        // ⚠ Modelled: `x-accepted-github-permissions` can ride along on this
+        // 403 too, even though rulesets are unavailable for the plan, not
+        // for want of a permission. Unmeasured; no live test provokes it.
+        a.headers.push((
+            "x-accepted-github-permissions".into(),
+            "administration=write".into(),
+        ));
+        return a;
     }
     let items: Vec<Value> = s
         .rulesets
@@ -564,6 +610,46 @@ mod tests {
         assert!(parent.to_string().contains("conflicts"), "{parent}");
     }
 
+    // The create_ref body checks the brief's other tests never provoke: a
+    // missing field, a non-`refs/` name, a `sha` naming no commit, and the
+    // collision direction `a_ref_that_exists_or_collides_with_another_is_refused`
+    // never exercises — a NEW name lying under an EXISTING ref.
+    #[test]
+    fn create_ref_is_refused_for_a_malformed_body_a_missing_object_or_a_name_under_an_existing_ref()
+    {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        // An existing ref that is a PARENT path of a name about to be made —
+        // the direction `name.starts_with("{r}/")`, never hit above (there,
+        // the new name was the parent, not the child).
+        fake.state()
+            .git
+            .refs
+            .insert("heads/fl".into(), root.clone());
+        let c = client(&fake);
+        let post = |body: serde_json::Value| {
+            c.send(Method::Post, &format!("{REPO}/git/refs"), Some(&body))
+        };
+        for (body, says) in [
+            (json!({}), "ref and sha are required"),
+            (
+                json!({"ref": "heads/x", "sha": root.clone()}),
+                "must start with 'refs/'",
+            ),
+            (
+                json!({"ref": "refs/heads/x", "sha": "0".repeat(40)}),
+                "Object does not exist",
+            ),
+            (
+                json!({"ref": "refs/heads/fl/other", "sha": root.clone()}),
+                "conflicts",
+            ),
+        ] {
+            let err = post(body).unwrap_err();
+            assert!(err.to_string().contains(says), "{says}: {err}");
+        }
+    }
+
     #[test]
     fn a_blob_comes_back_as_wrapped_base64() {
         use base64::Engine;
@@ -607,7 +693,13 @@ mod tests {
         assert_eq!(status(&next, &other), (200, "diverged".into()));
         assert_eq!(
             status(&root, "0000000000000000000000000000000000000000").0,
-            404
+            404,
+            "an unknown head"
+        );
+        assert_eq!(
+            status("0000000000000000000000000000000000000000", &root).0,
+            404,
+            "an unknown base"
         );
         fake.state().compare_behind_next = 1;
         assert_eq!(
@@ -645,6 +737,13 @@ mod tests {
             Ruleset::on_ledger("active", &["non_fast_forward"]),
             Ruleset::on_ledger("disabled", &["deletion"]),
             Ruleset::on_ledger("evaluate", &["deletion"]),
+            // Active, but on another branch entirely — must not be reported
+            // under `fl/ledger`.
+            Ruleset {
+                enforcement: "active".into(),
+                branch: "main".into(),
+                rules: vec!["deletion".into()],
+            },
         ];
         assert_eq!(types(), vec!["non_fast_forward".to_string()]);
         fake.state().rules_need_upgrade = true;
@@ -655,7 +754,11 @@ mod tests {
                 None,
             )
             .unwrap_err();
+        // GitHub's own message is still readable even though the fake now
+        // also attaches `x-accepted-github-permissions` to this 403 (the
+        // header is not a promise that a permission was actually missing).
         assert!(err.to_string().contains("Upgrade to GitHub"), "{err}");
+        assert!(err.to_string().contains("GitHub says this needs"), "{err}");
     }
 
     #[test]
@@ -700,6 +803,85 @@ mod tests {
         fake.state().fail_next_git_create = true;
         let made = post("git/commits", json!({"tree": tree, "message": "m"})).unwrap();
         assert_eq!(made.status, 500);
+    }
+
+    // A parent that is not a string must be refused, not silently dropped
+    // into an accidental root commit (GitHub refuses a malformed array
+    // element; it does not quietly ignore it).
+    #[test]
+    fn a_parent_that_is_not_a_string_is_refused_not_dropped() {
+        let fake = FakeGithub::start("acme/widgets");
+        let c = client(&fake);
+        let tree = c
+            .send(
+                Method::Post,
+                &format!("{REPO}/git/trees"),
+                Some(&json!({"tree": []})),
+            )
+            .unwrap()
+            .body["sha"]
+            .clone();
+        let err = c
+            .send(
+                Method::Post,
+                &format!("{REPO}/git/commits"),
+                Some(&json!({"tree": tree, "message": "m", "parents": [123]})),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("must be a string"), "{err}");
+    }
+
+    // The ledger's git endpoints only answer for the BOUND repository
+    // (spec §8.1): another repository the fake also knows about (GitHub
+    // ledger spec: repositories `acme/widgets`/`acme/other`) must not reach
+    // the same git state through its own name.
+    #[test]
+    fn a_git_endpoint_is_served_only_for_the_bound_repository() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.seed_ledger();
+        fake.reuse_name("acme/other");
+        let c = client(&fake);
+        let r = c
+            .send(
+                Method::Get,
+                "/repos/acme/other/git/ref/heads/fl/ledger",
+                None,
+            )
+            .unwrap();
+        assert_eq!(r.status, 404, "acme/other is not the bound repository");
+    }
+
+    // GitHub's tree read defaults to one level; `recursive=1` asks for the
+    // whole tree.
+    #[test]
+    fn a_tree_read_is_one_level_deep_unless_recursive_is_asked() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger_with(&[("format", "1\n"), ("runs/a/1.jsonl", "x\n")]);
+        let tree_sha = fake.state().git.commits[&root].tree.clone();
+        let c = client(&fake);
+        let paths = |recursive: bool| -> Vec<String> {
+            let url = if recursive {
+                format!("{REPO}/git/trees/{tree_sha}?recursive=1")
+            } else {
+                format!("{REPO}/git/trees/{tree_sha}")
+            };
+            c.send(Method::Get, &url, None).unwrap().body["tree"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x["path"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let one_level = paths(false);
+        assert!(one_level.contains(&"format".to_string()), "{one_level:?}");
+        assert!(one_level.contains(&"runs".to_string()), "{one_level:?}");
+        assert!(
+            !one_level.iter().any(|p| p.contains('/')),
+            "one level only: {one_level:?}"
+        );
+        let full = paths(true);
+        assert!(full.contains(&"runs/a/1.jsonl".to_string()), "{full:?}");
+        assert!(full.contains(&"runs/a".to_string()), "{full:?}");
     }
 
     // Spec §3.5 check 2: a replica that has not seen the last write.

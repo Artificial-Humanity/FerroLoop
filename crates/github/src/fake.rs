@@ -66,6 +66,10 @@ pub struct State {
     pub fail_page: Option<(String, u32)>,
     pub rate_limited: bool,
     pub graphql_rate_limited: bool,
+    /// The next GraphQL request answers 200 with `data: null` and one error
+    /// of this `type` — neither RATE_LIMITED nor NOT_FOUND, so `graphql`
+    /// must still refuse it. One-shot.
+    pub graphql_error_next: Option<String>,
     pub fail_repo_read: bool,
     pub drop_labels: bool,
     pub fail_after_create: bool,
@@ -660,6 +664,12 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             json!({"data": null, "errors": [{"type": "RATE_LIMITED"}]}),
         );
     }
+    if method == "POST"
+        && url == "/graphql"
+        && let Some(t) = s.graphql_error_next.take()
+    {
+        return answer(200, json!({"data": null, "errors": [{"type": t}]}));
+    }
     if let Some((status, retry_after)) = s.secondary_rate_limit_next.take() {
         let mut a = answer(
             status,
@@ -674,6 +684,13 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         if let Some(secs) = retry_after {
             a.headers.push(("retry-after".into(), secs.to_string()));
         }
+        // ⚠ Modelled: `x-accepted-github-permissions` can ride along on ANY
+        // 403, not only a true missing-permission refusal. GitHub ledger
+        // spec §1.6 / §6.3; unmeasured — no live test provokes either.
+        a.headers.push((
+            "x-accepted-github-permissions".into(),
+            "contents=write".into(),
+        ));
         return a;
     }
     if std::mem::take(&mut s.forbidden_next) {
@@ -700,7 +717,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
     }
     let (path, q) = split(url);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    if let Some(a) = crate::fake_git::rest(s, method, &parts, body) {
+    if let Some(a) = crate::fake_git::rest(s, method, &parts, &q, body) {
         return a;
     }
     match (method, parts.as_slice()) {

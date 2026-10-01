@@ -263,7 +263,11 @@ pub(crate) fn send(
     let reset = header("x-ratelimit-reset");
     let retry_after = header("retry-after");
     // ⚠ Spec §6.3: GitHub names the permission a refused request needed.
-    // Modelled from GitHub's documentation; no live test provokes it.
+    // Modelled from GitHub's documentation; no live test provokes it. The
+    // header can ride along on ANY 403 — including a secondary rate limit,
+    // or the rulesets-unavailable upgrade refusal — so it is read here but
+    // only ever consulted by the LAST arm below, after every other 403
+    // reading (rate-limited first) has had its chance to claim the status.
     let accepted = header("x-accepted-github-permissions");
     let is_2xx = (200..300).contains(&status);
     let text = match resp.body_mut().read_to_string() {
@@ -337,10 +341,14 @@ pub(crate) fn send(
         401 => Err(StoreError::Credential(format!(
             "GitHub refused the credential ({message}). Check the credential the binding names"
         ))),
+        // ⚠ Worded neutrally: the header can be present on a 403 that is
+        // not a missing-permission refusal at all (a secondary rate limit,
+        // or the rulesets upgrade refusal both carry it in this fake's
+        // model), and GitHub's own `message` is kept verbatim so a reader
+        // of the error still sees what actually happened, not just a
+        // permission name.
         403 if accepted.is_some() => Err(StoreError::Backend(format!(
-            "GitHub answered 403 to {method:?} {url}: {message}. The credential lacks a \
-             permission this needs; GitHub names `{}`. Grant it to the token or the App \
-             (Contents: read and write, Issues: read and write, Metadata: read)",
+            "GitHub answered 403 to {method:?} {url}: {message}. GitHub says this needs: {}",
             accepted.unwrap_or_default()
         ))),
         _ => Err(StoreError::Backend(format!(
@@ -583,6 +591,12 @@ mod tests {
             .unwrap();
         assert_eq!(a.status, 200);
         assert_eq!(a.errors.len(), 1);
+        assert_eq!(
+            a.errors[0]["type"].as_str(),
+            Some("NOT_FOUND"),
+            "{:?}",
+            a.errors
+        );
         assert_eq!(a.data, Some(serde_json::json!({"node": null})));
         fake.state().graphql_rate_limited = true;
         let err = c
@@ -618,5 +632,34 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
         assert!(err.to_string().contains("contents=write"), "{err}");
+    }
+
+    // `graphql`'s production path (not `graphql_answer`'s): an error whose
+    // type is neither RATE_LIMITED nor NOT_FOUND is still a refusal, never
+    // read as partial data.
+    #[test]
+    fn a_graphql_error_that_is_not_all_not_found_is_refused() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().graphql_error_next = Some("FORBIDDEN".into());
+        let err = client(&fake)
+            .graphql("query { viewer { login } }", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref m) if m.contains("FORBIDDEN")),
+            "{err:?}"
+        );
+    }
+
+    // GitHub's `x-accepted-github-permissions` header can ride along on any
+    // 403, including a secondary rate limit's — the rate-limit reading must
+    // still win over the permission-named reading.
+    #[test]
+    fn a_secondary_rate_limit_still_rate_limits_even_carrying_a_permission_header() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().secondary_rate_limit_next = Some((403, None));
+        let err = client(&fake)
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
     }
 }
