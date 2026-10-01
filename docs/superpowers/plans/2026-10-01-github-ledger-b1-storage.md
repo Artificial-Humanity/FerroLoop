@@ -14,6 +14,25 @@
 
 **Plan B2 (written after B1 merges) — intended scope:** the `ledger = "github"` config key (§1.5) and the binding of `SplitLedger { local: store, github: GithubLedger }` in `Ctx` (plan A ruling 11), built over the tracker's `Client` (`GithubTracker::client`, added here); the pre-flight (§2.4) before any gate or adapter — visibility, mode, `GithubLedger::check_format` (head, anchor, last seen, format), `ensure_publishable(project, None)`, and the refusal naming `init` on a machine with no cut-over (§6.1 step 5) — cached per command; the commands `fl github ledger init | verify | quarantine | comment` over this plan's library calls (with init's confirmation prompt and `guidance`); decision comments (§4: rendered from the ledger — finding a move's or check's runs through the local catalog's gates, §4.2 — escaping, the 60,000-byte cap, the marker, recovery, posted after the state change; the fake's paginated comment listing); the `fl stats` binding rule; the mode in `fl github whoami`; printing `GithubLedger::take_notes`; the live tests of §8.4, which also confirm every shape this plan marks *Modelled* — by the names this plan's comments give them: `init_sets_up_a_ledger_on_a_private_repository`, `create_commit_on_branch_is_refused_when_the_head_moved`, `a_hand_edit_is_detected_and_named`, `rules_on_the_ledger_branch_are_readable`, `a_private_repository_without_a_ruleset_is_detection_only` (with §8.4's refused force update and deletion on a public throwaway); `docs/github-ledger.md` and its links (§9).
 
+## B2 requirements from the final review
+
+These must be carried into plan B2 (the product side). Items 1–3 must land BEFORE `SplitLedger` is bound in the CLI.
+
+1. Golden-bytes tests for each ledger line kind (literal expected strings), and a guard that `serde_json`'s `preserve_order` feature stays off (feature unification would reorder every `Value` encode and make every published line unreadable under the byte-equality decode).
+2. Remove `LedgerCache::cache` / `set_last_head` from the production trait (or make them test-only) so the non-atomic cache-then-head pattern cannot come back; every write goes through `remember`.
+3. The CLI imports the project's manifest before `init` (otherwise a machine without the ledger root creates a second ledger, caught only later as `LedgerRootChanged`); `init` refuses when refs exist under `fl/ledger/…`.
+4. `fl attempt`: a black-box test that a failed publish prints a `warning:` and keeps the attempt's own exit code (decision 14); a ruling on a LOCAL append failure after a paid attempt (print the outcome first, never exit 2).
+5. The quarantine command states that `--by` and `--reason` are published permanently, and warns before appending on a repository that is not private (decision 2's projection does not cover them).
+6. Either an id-uniqueness pass in `verify` at the head (check 5's "locally" half and the same id in two directories), or document the limit.
+7. Live tests: every *Modelled* name in the code, plus `create_commit_on_branch_without_contents_write_is_refused`; the shape of a GraphQL timeout (if a 200 with an error, `judge` maps it to "unknown"); `TreeEntry.mode` as an Int; an unrelated-history compare (404 "No common ancestor"?); an empty repository answering 409 to `git/ref`; `rules/branches` on Free (403 vs 200 `[]` vs 404); a near-full segment through `createCommitOnBranch`.
+8. `verify`: a cap or progress output on a long/foreign history; compare with `?per_page=1`; paginate rules in `mode()`.
+9. REST `tree_files` fails closed on an entry with no path or no sha (as `parse_object` does).
+10. A test that `graphql_write`'s 401 becomes `StoreError::Credential`.
+11. Message wording sweep: "above" where the cause is on the same line; the double period after `RestsOnLocalEntry`.
+12. Everything already in B2's scope: the `ledger = "github"` config key and the `SplitLedger` binding in `Ctx`; pre-flight; `fl github ledger init | verify | quarantine | comment`; decision comments and recovery; the `fl stats` rule; the mode in `fl github whoami`; surfacing `take_notes`; the live tests; `docs/github-ledger.md`.
+
+Intended behaviour confirmed (not defects): a quarantined entry is re-published by the next flush (readers see one copy); two fl processes cannot race on one store (redb's exclusive lock — revisit if B2 opens the store per operation).
+
 ## Global Constraints
 
 - Verification trio, all green before every commit: `cargo fmt --all --check`, `cargo clippy --all-targets --workspace -- -D warnings`, `cargo test --workspace`. CI runs the same as the `test, clippy, fmt` check. Each task runs `cargo fmt --all` first, so the code blocks here need not be in rustfmt's exact layout; lines stay within 100 columns.
