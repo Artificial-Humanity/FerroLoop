@@ -420,6 +420,18 @@ mod tests {
                 .unwrap_or_else(|| panic!("{case}: nothing reported"));
             assert_eq!(first.commit, bad, "{case}: {first:?}");
             assert!(first.what.contains(what), "{case}: {}", first.what);
+            // ⚠ "changes `{path}`" is a strict PREFIX of the generic
+            // "changes `{path}`, which fl never writes" fallback that
+            // every other unknown file gets — `contains` alone cannot
+            // tell the format/README guard from that fallback having
+            // fired instead. Pin it exactly, so disabling the guard (and
+            // falling through to the fallback) turns this red.
+            if case == "the format" || case == "the README" {
+                assert_eq!(
+                    first.what, what,
+                    "{case}: the guard-specific message, not the generic fallback"
+                );
+            }
         }
     }
 
@@ -632,19 +644,50 @@ mod tests {
         let c = client(&fake);
         let l = open(&c, &local);
         let at = At::from_unix_millis(60);
-        for (file, line, by, reason, says) in [
-            (QUARANTINE_FILE.to_string(), 1, "Ada", "r", "its own lines"),
-            (FORMAT_FILE.to_string(), 1, "Ada", "r", "not a segment"),
-            (seg(2), 1, "Ada", "r", "no such file"),
-            (seg(1), 0, "Ada", "r", "1 lines"),
-            (seg(1), 2, "Ada", "r", "1 lines"),
-            (seg(1), 1, " ", "r", "--by"),
-            (seg(1), 1, "Ada", "", "--reason"),
+        // ⚠ The quarantine-file, not-a-segment, --by and --reason checks
+        // all refuse BEFORE any request (none needs a snapshot to judge).
+        // `read.rs`'s own `directory()` can refuse an unrelated "not a
+        // segment" shape too (if a bogus directory were ever read), so the
+        // message alone is not always enough to tell this guard fired
+        // rather than that one — pin the exact, guard-specific wording
+        // ("of the ledger", which `directory()`'s "fl writes" never says)
+        // AND that no request was made, so disabling the guard and
+        // falling through to a snapshot read turns this red either way.
+        for (file, line, by, reason, says, no_request) in [
+            (
+                QUARANTINE_FILE.to_string(),
+                1,
+                "Ada",
+                "r",
+                "its own lines",
+                true,
+            ),
+            (
+                FORMAT_FILE.to_string(),
+                1,
+                "Ada",
+                "r",
+                "not a segment of the ledger",
+                true,
+            ),
+            (seg(2), 1, "Ada", "r", "no such file", false),
+            (seg(1), 0, "Ada", "r", "1 lines", false),
+            (seg(1), 2, "Ada", "r", "1 lines", false),
+            (seg(1), 1, " ", "r", "--by", true),
+            (seg(1), 1, "Ada", "", "--reason", true),
         ] {
+            let before = fake.state().requests.len();
             let err = l
                 .quarantine(&seq_iri(60), &at, &file, line, by, reason)
                 .unwrap_err();
             assert!(err.to_string().contains(says), "{file} {line}: {err}");
+            if no_request {
+                assert_eq!(
+                    fake.state().requests.len(),
+                    before,
+                    "{file} {line}: refused before any request"
+                );
+            }
         }
         assert!(
             !fake.ledger_files().contains_key(QUARANTINE_FILE),

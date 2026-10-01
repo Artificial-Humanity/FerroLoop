@@ -525,6 +525,48 @@ mod tests {
         assert!(err.to_string().contains("no parents"), "{err}");
     }
 
+    // ⚠ A malformed commit answer must never read as "no tree" by way of
+    // an empty default: an unbuildable `CommitObject` is an error, like
+    // every sibling reader (`branch_head`'s missing commit,
+    // `parents_of`'s missing parents field above).
+    #[test]
+    fn commit_object_refuses_a_200_with_no_tree_field() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(
+            &fake,
+            "/git/commits/",
+            200,
+            json!({"sha": root, "parents": []}),
+        );
+        let err = open(&c, &local).commit_object(&root).unwrap_err();
+        assert!(err.to_string().contains("no tree"), "{err}");
+    }
+
+    // ⚠ Like `objects_refuses_a_tree_with_no_entries`: a malformed tree
+    // answer (no `tree` array at all) must never read as an EMPTY tree —
+    // "unreachable is not empty" applies here too, and `verify` relies on
+    // `tree_files` never silently passing a tree it could not actually
+    // list.
+    #[test]
+    fn tree_files_refuses_a_200_with_no_entries_field() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let tree_sha = fake.state().git.commits[&root].tree.clone();
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(
+            &fake,
+            &format!("/git/trees/{tree_sha}"),
+            200,
+            json!({"sha": tree_sha, "truncated": false}),
+        );
+        let err = open(&c, &local).tree_files(&tree_sha).unwrap_err();
+        assert!(err.to_string().contains("no entries"), "{err}");
+    }
+
     #[test]
     fn objects_refuses_a_blob_with_no_oid() {
         let fake = FakeGithub::start("acme/widgets");
