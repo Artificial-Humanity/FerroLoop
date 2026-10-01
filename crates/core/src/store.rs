@@ -509,6 +509,46 @@ pub trait Bindings {
     fn set_ledger_root(&self, node_id: &str, commit: &str) -> Result<(), StoreError>;
 }
 
+/// Whether `node_id` and `commit` can be a ledger root (GitHub ledger spec
+/// §6.1 step 4). `commit` is a full commit id: 40 lowercase hexadecimal
+/// digits (SHA-1), or 64 (SHA-256). `node_id` is a GitHub node id: 1 to 128
+/// of `A-Za-z0-9_=+/-`, starting with a letter.
+///
+/// ⚠ A root is the anchor every tamper check rests on (§3.5), so a value
+/// that cannot be one is refused where it enters: the manifest's
+/// consistency check and `init`. The `Err` says which part is wrong.
+pub fn ledger_root_shape(node_id: &str, commit: &str) -> Result<(), String> {
+    let hex = commit
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !(commit.len() == 40 || commit.len() == 64) || !hex {
+        return Err(format!(
+            "`{commit}` is not a full commit id: 40 or 64 lowercase hexadecimal digits"
+        ));
+    }
+    node_id_shape(node_id)
+}
+
+/// Whether `node_id` can be a GitHub node id: 1 to 128 of `A-Za-z0-9_=+/-`,
+/// starting with a letter. `init` asks this before it creates anything, so
+/// a malformed binding leaves no branch behind.
+pub fn node_id_shape(node_id: &str) -> Result<(), String> {
+    let first = node_id
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic());
+    let chars = node_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '=' | '+' | '/'));
+    if !first || !chars || node_id.len() > 128 {
+        return Err(format!(
+            "`{node_id}` is not a GitHub node id: 1 to 128 letters, digits and `_-=+/`, \
+             starting with a letter"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,5 +797,44 @@ mod tests {
         };
         let e: StoreError = fault.clone().into();
         assert_eq!(e.to_string(), fault.to_string());
+    }
+
+    // Ruling 20: a root is the anchor every tamper check rests on, so a
+    // value that cannot be one is refused where it enters.
+    #[test]
+    fn a_ledger_root_is_a_full_commit_id_and_a_github_node_id() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for (node, commit) in [
+            ("R_1", sha1),
+            ("R_kgDOAbCdEf", sha256),
+            ("MDEwOlJlcG9zaXRvcnkxMjk2MjY5", sha1),
+            ("MDEwOlJlcG9zaXRvcnkx+/==", sha1),
+        ] {
+            assert_eq!(ledger_root_shape(node, commit), Ok(()), "{node} {commit}");
+        }
+        for (node, commit, names) in [
+            ("R_1", "abc", "abc"),
+            (
+                "R_1",
+                "0123456789ABCDEF0123456789ABCDEF01234567",
+                "0123456789ABCDEF",
+            ),
+            (
+                "R_1",
+                "0123456789abcdef0123456789abcdef0123456",
+                "0123456789abcdef0123456",
+            ),
+            ("R_1", "g123456789abcdef0123456789abcdef01234567", "g123"),
+            ("", sha1, "``"),
+            ("1R", sha1, "1R"),
+            ("R 1", sha1, "R 1"),
+            ("R_1;", sha1, "R_1;"),
+        ] {
+            let why = ledger_root_shape(node, commit).expect_err(node);
+            assert!(why.contains(names), "{why}");
+        }
+        let long = format!("R{}", "a".repeat(128));
+        assert!(ledger_root_shape(&long, sha1).is_err(), "129 characters");
     }
 }

@@ -2003,6 +2003,9 @@ mod tests {
     use crate::manifest::{LedgerRoot, Manifest, ManifestError, content_sha256};
     use fl_core::model::{Regret, Transition};
 
+    /// A well-formed ledger root (ruling 20).
+    const ROOT_A: &str = "0123456789abcdef0123456789abcdef01234567";
+
     /// An authoring store with one project: gates `fmt` and `lint`, and a
     /// transition over both. Returns the store's guard too.
     fn authoring() -> (RedbStore, tempfile::TempDir, ProjectId, GateId, GateId) {
@@ -2393,14 +2396,14 @@ mod tests {
     fn an_export_carries_the_root_of_the_repository_it_is_told_and_no_other() {
         use fl_core::store::Bindings;
         let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", "abc").unwrap();
+        a.set_ledger_root("R_1", ROOT_A).unwrap();
         let m = a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap();
         assert_eq!(m.body.format_version, 2);
         assert_eq!(
             m.body.ledger_root,
             Some(LedgerRoot {
                 repository_node_id: "R_1".into(),
-                commit: "abc".into(),
+                commit: ROOT_A.into(),
             })
         );
         for other in [None, Some("R_2")] {
@@ -2417,18 +2420,27 @@ mod tests {
     fn an_import_records_the_manifests_ledger_root() {
         use fl_core::store::Bindings;
         let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", "abc").unwrap();
+        a.set_ledger_root("R_1", ROOT_A).unwrap();
         let (b, _gb) = fresh();
         b.import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
             .unwrap();
-        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("abc"));
+        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some(ROOT_A));
+        // ⚠ Plan A's checklist: an import that records a root makes the
+        // store one an older fl refuses, not one it opens and exports
+        // without the root.
+        let tx = b.db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
+            Some(FORMAT_WITH_LEDGER_ROOT)
+        );
     }
 
     #[test]
     fn an_import_naming_another_root_for_a_known_repository_is_refused_and_writes_nothing() {
         use fl_core::store::Bindings;
         let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", "abc").unwrap();
+        a.set_ledger_root("R_1", ROOT_A).unwrap();
         let (b, _gb) = fresh();
         b.set_ledger_root("R_1", "other").unwrap();
         let err = b

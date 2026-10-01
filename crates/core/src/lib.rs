@@ -35,7 +35,7 @@ pub use split::{Batch, Coverage, LocalLedger, Outbox, Pending, RemoteLedger, Spl
 pub use stale::{Staleness, apply_staleness, is_stale};
 pub use store::{
     Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,
-    follow,
+    follow, ledger_root_shape, node_id_shape,
 };
 pub use verdict::{FailReason, Population, Verdict};
 

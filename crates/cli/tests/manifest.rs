@@ -520,6 +520,9 @@ fn a_missing_manifest_on_an_importing_machine_is_refused_by_path() {
         .stderr(contains(".fl/manifest.json"));
 }
 
+/// A well-formed ledger root (plan B1 ruling 20).
+const ROOT: &str = "0123456789abcdef0123456789abcdef01234567";
+
 /// Put a ledger root for `node` into the store at `db`, bound to `repo`, as
 /// `fl github ledger init` will (plan B).
 fn with_ledger_root(db: &Path, repo: &str, node: &str, commit: &str) {
@@ -551,13 +554,13 @@ fn a_bound_projects_export_carries_its_ledger_root_and_an_import_records_it() {
         .args(["project", "add", "."])
         .assert()
         .success();
-    with_ledger_root(&db, "acme/widgets", "R_1", "abc123");
+    with_ledger_root(&db, "acme/widgets", "R_1", ROOT);
 
     m.fl(r.path())
         .args(["manifest", "export", "--project", "1"])
         .assert()
         .success()
-        .stdout(contains("ledger_root\tabc123"));
+        .stdout(contains(format!("ledger_root\t{ROOT}")));
     let text = std::fs::read_to_string(r.path().join(".fl/manifest.json")).unwrap();
     assert!(
         text.contains("\"format_version\": 2") && text.contains("\"repository_node_id\": \"R_1\""),
@@ -575,10 +578,7 @@ fn a_bound_projects_export_carries_its_ledger_root_and_an_import_records_it() {
         .success();
     use fl_core::store::Bindings;
     let imported = fl_store::RedbStore::open(&other.data.path().join("fl/fl.redb")).unwrap();
-    assert_eq!(
-        imported.ledger_root("R_1").unwrap().as_deref(),
-        Some("abc123")
-    );
+    assert_eq!(imported.ledger_root("R_1").unwrap().as_deref(), Some(ROOT));
 }
 
 // Spec §6.1 step 4: with --db the config entry is not read, so the export cannot
@@ -594,7 +594,7 @@ fn an_export_under_db_from_a_store_with_a_ledger_root_is_refused_and_writes_noth
         .args(["--db", &dbs, "project", "add", "."])
         .assert()
         .success();
-    with_ledger_root(&db, "acme/widgets", "R_1", "abc123");
+    with_ledger_root(&db, "acme/widgets", "R_1", ROOT);
 
     m.fl(r.path())
         .args(["--db", &dbs, "manifest", "export", "--project", "1"])
@@ -630,7 +630,7 @@ fn an_export_whose_configured_repository_has_no_node_in_a_store_with_a_root_is_r
         .assert()
         .success();
     // A root for a repository the store knows under another name only.
-    with_ledger_root(&db, "acme/gadgets", "R_1", "abc123");
+    with_ledger_root(&db, "acme/gadgets", "R_1", ROOT);
 
     m.fl(r.path())
         .args(["manifest", "export", "--project", "1"])
@@ -676,7 +676,7 @@ fn an_export_of_a_project_in_another_projects_store_is_refused_when_that_store_h
         let s = fl_store::RedbStore::open(&b).unwrap();
         s.list_projects().unwrap()[0].id.iri().to_string()
     };
-    with_ledger_root(&b, "acme/widgets", "R_9", "abc123");
+    with_ledger_root(&b, "acme/widgets", "R_9", ROOT);
 
     m.fl(bound_repo.path())
         .args(["manifest", "export", "--project", &other_project])
@@ -719,7 +719,7 @@ fn an_export_from_a_store_bound_to_two_trackers_in_the_config_is_refused() {
         .args(["project", "add", "."])
         .assert()
         .success();
-    with_ledger_root(&db, "acme/widgets", "R_1", "abc123");
+    with_ledger_root(&db, "acme/widgets", "R_1", ROOT);
 
     m.fl(r.path())
         .args(["manifest", "export", "--project", "1"])

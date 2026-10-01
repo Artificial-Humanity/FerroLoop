@@ -230,7 +230,14 @@ impl Manifest {
     fn check_consistent(&self) -> Result<(), ManifestError> {
         let f = self.body.format_version;
         match (&self.body.ledger_root, f) {
-            (None, MANIFEST_FORMAT_WITHOUT_LEDGER) | (Some(_), MANIFEST_FORMAT) => {}
+            (None, MANIFEST_FORMAT_WITHOUT_LEDGER) => {}
+            (Some(root), MANIFEST_FORMAT) => {
+                fl_core::ledger_root_shape(&root.repository_node_id, &root.commit).map_err(
+                    |why| {
+                        ManifestError::Inconsistent(format!("its ledger root cannot be one: {why}"))
+                    },
+                )?;
+            }
             (None, _) => {
                 return Err(ManifestError::Inconsistent(format!(
                     "it is format {f} and carries no ledger root; only format \
@@ -449,10 +456,43 @@ mod tests {
         assert_eq!(hash, old.content_sha256, "an older fl's hash check passes");
     }
 
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
     fn root() -> LedgerRoot {
         LedgerRoot {
             repository_node_id: "R_1".into(),
-            commit: "abc123".into(),
+            commit: COMMIT.into(),
+        }
+    }
+
+    // Ruling 20: a root that cannot be one is refused by the consistency
+    // check, so by parse, by import, and by export alike.
+    #[test]
+    fn a_ledger_root_that_cannot_be_one_is_refused_even_with_a_correct_hash() {
+        let (s, p, _, _) = store();
+        for (node, commit) in [("R_1", "abc123"), ("", COMMIT), ("1R", COMMIT)] {
+            let mut m = export(&s, &p, "abc", 7, Some(root())).unwrap();
+            m.body.ledger_root = Some(LedgerRoot {
+                repository_node_id: node.into(),
+                commit: commit.into(),
+            });
+            let err = Manifest::parse(&rehashed(m).to_json()).unwrap_err();
+            assert!(
+                matches!(err, ManifestError::Inconsistent(ref m) if m.contains("ledger root")),
+                "{node} {commit}: {err}"
+            );
+            let err = export(
+                &s,
+                &p,
+                "abc",
+                7,
+                Some(LedgerRoot {
+                    repository_node_id: node.into(),
+                    commit: commit.into(),
+                }),
+            )
+            .unwrap_err();
+            assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
         }
     }
 
