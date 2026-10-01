@@ -3,6 +3,7 @@
 //! `init` tells the person.
 
 use super::GithubLedger;
+use super::git::Object;
 use super::layout::{BRANCH, FORMAT_FILE, README, README_FILE};
 use crate::client::Method;
 use fl_core::iri::Iri;
@@ -51,6 +52,13 @@ impl Mode {
 }
 
 const RULES: [&str; 2] = ["non_fast_forward", "deletion"];
+
+/// How many commits `first_commit` walks back before refusing — far more
+/// than any real ledger grows, so hitting it means `head` is not really
+/// descended from a ledger's first commit at all (an unrelated history the
+/// branch name `fl/ledger` was reused for), and walking it one commit at a
+/// time would be the wrong way to find out.
+const MAX_WALK: u32 = 1_000;
 
 impl GithubLedger<'_> {
     /// `fl github ledger init` (spec §6.1 steps 2–6). Run once per
@@ -200,15 +208,44 @@ impl GithubLedger<'_> {
     }
 
     /// The branch's first commit: first parents from `head` back to the
-    /// commit with none.
+    /// commit with none, bounded by [`MAX_WALK`], and checked to look like
+    /// a ledger root before it is offered for confirmation.
     fn first_commit(&self, head: &str) -> Result<String, StoreError> {
         let mut at = head.to_string();
-        loop {
+        for _ in 0..MAX_WALK {
             match self.parents_of(&at)?.into_iter().next() {
                 Some(p) => at = p,
-                None => return Ok(at),
+                None => {
+                    self.check_looks_like_a_root(&at)?;
+                    return Ok(at);
+                }
             }
         }
+        Err(StoreError::Backend(format!(
+            "fl walked {MAX_WALK} commits back from {}'s `fl/ledger` branch without finding one \
+             with no parent, so this does not look like a ledger fl started; import the \
+             project's manifest, which carries the ledger's first commit, instead of confirming \
+             one found this way",
+            self.repo.full_name
+        )))
+    }
+
+    /// ⚠ A commit with no parent is not, on its own, proof it is a ledger's
+    /// first commit — any orphan would pass that test. Before `init` offers
+    /// it for confirmation (spec §6.1 step 6), it must also hold the
+    /// `format` file every ledger's first commit carries, so a branch named
+    /// `fl/ledger` for an unrelated reason is refused rather than adopted.
+    fn check_looks_like_a_root(&self, commit: &str) -> Result<(), StoreError> {
+        let found = self.objects(commit, &[FORMAT_FILE.to_string()])?;
+        if !matches!(found[0], Some(Object::Blob { .. })) {
+            return Err(StoreError::Backend(format!(
+                "the first commit of {}'s `fl/ledger` branch ({commit}) has no `format` file, so \
+                 it does not look like a ledger fl started. Find out who created this branch \
+                 before confirming it",
+                self.repo.full_name
+            )));
+        }
+        Ok(())
     }
 
     /// The mode in force (spec §6.2), from the rules GitHub applies to
@@ -241,15 +278,22 @@ impl GithubLedger<'_> {
                 r.status
             )));
         }
-        let in_force: BTreeSet<&str> = r
-            .body
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|x| x.get("type").and_then(Value::as_str))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // ⚠ Like the sibling readers (`objects`'s trees, `get_all_paged`'s
+        // pages): something that is not a list is an error, never read as
+        // an empty one — an empty list and an unreadable answer are
+        // different facts, and conflating them would turn "fl cannot tell
+        // what rules apply" into "no rules apply".
+        let Some(rules) = r.body.as_array() else {
+            return Err(StoreError::Backend(
+                "GitHub answered the rules on `fl/ledger` with something that is not a list; \
+                 retry"
+                    .into(),
+            ));
+        };
+        let in_force: BTreeSet<&str> = rules
+            .iter()
+            .filter_map(|x| x.get("type").and_then(Value::as_str))
+            .collect();
         let missing: Vec<String> = RULES
             .iter()
             .filter(|t| !in_force.contains(**t))
@@ -280,10 +324,11 @@ pub fn guidance(repo: &str, mode: &Mode) -> Vec<String> {
     }];
     if *mode != Mode::Protected {
         out.push(format!(
-            "Optional, for an administrator, where the plan offers rulesets (on GitHub Free a \
-             private repository has none, and the ledger stays detection-only): protect \
-             `fl/ledger` with a ruleset. fl's credential must not hold Administration \
-             permission, so fl cannot add it itself:\n\n{}",
+            "Optional, for an administrator: protect `fl/ledger` with a ruleset. It is \
+             recommended where the plan offers rulesets; on GitHub Free, for a private \
+             repository, it is not available, and the ledger runs detection-only. fl's \
+             credential must not hold Administration permission, so fl cannot add it \
+             itself:\n\n{}",
             ruleset_command(repo)
         ));
     }
@@ -295,7 +340,7 @@ pub fn guidance(repo: &str, mode: &Mode) -> Vec<String> {
         "fl's credential needs Contents: read and write, Issues: read and write, and Metadata: \
          read. A missing write permission shows at the first flush or comment, whose error \
          names it; until it is granted, every move, check and finding decision is refused, and \
-         each attempt is kept locally with a warning."
+         each attempt is kept locally with a repeated error."
             .to_string(),
     );
     out.push(format!(
@@ -332,6 +377,7 @@ mod tests {
     use fl_core::ids::{GateId, seq_iri};
     use fl_core::split::{CachedSegment, LedgerCache, Outbox, Pending};
     use fl_core::store::Bindings;
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     fn client(fake: &FakeGithub) -> Client {
@@ -350,6 +396,12 @@ mod tests {
 
     fn open<'a>(c: &'a Client, local: &'a dyn fl_core::split::LedgerMemory) -> GithubLedger<'a> {
         GithubLedger::new(c, repo(), local).with_lag(0, Duration::ZERO)
+    }
+
+    /// The next request whose URL contains `frag` answers `status`/`body`
+    /// instead, once.
+    fn body_next(fake: &FakeGithub, frag: &str, status: u16, body: Value) {
+        fake.state().body_next = Some((frag.into(), status, body));
     }
 
     // Spec §6.1 steps 3 and 4.
@@ -492,6 +544,51 @@ mod tests {
         assert_eq!(local.cutover("R_1").unwrap(), Some(entry_iri(3)));
     }
 
+    // Ruling: a commit with no parent is not, on its own, proof it is a
+    // ledger's first commit. A branch named `fl/ledger` for an unrelated
+    // reason — no `format` file in its root — must be refused rather than
+    // offered for confirmation.
+    #[test]
+    fn init_refuses_to_confirm_a_first_commit_that_does_not_look_like_a_ledger_root() {
+        let fake = FakeGithub::start("acme/widgets");
+        let bogus = fake.seed_ledger_with(&[("README.md", "not a ledger")]);
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local).init(&entry_iri(0), None).unwrap_err();
+        assert!(err.to_string().contains(&bogus), "{err}");
+        assert!(
+            err.to_string().contains("does not look like a ledger"),
+            "{err}"
+        );
+        assert_eq!(local.ledger_root("R_1").unwrap(), None);
+    }
+
+    // `first_commit` must not walk forever looking for a commit with no
+    // parent: a history this long is not really a ledger whose root fl
+    // should ever confirm by walking to it one commit at a time.
+    #[test]
+    fn first_commit_refuses_a_history_longer_than_the_walk_limit() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        {
+            let mut s = fake.state();
+            let mut at = root.clone();
+            for _ in 0..=MAX_WALK {
+                let tree = s.git.put_tree(&BTreeMap::new());
+                at = s.git.put_commit(&tree, vec![at], "filler");
+            }
+            s.git.refs.insert(format!("heads/{BRANCH}"), at);
+        }
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local).init(&entry_iri(0), None).unwrap_err();
+        assert!(
+            err.to_string().contains("import the project's manifest"),
+            "{err}"
+        );
+        assert_eq!(local.ledger_root("R_1").unwrap(), None);
+    }
+
     #[test]
     fn init_whose_branch_could_not_be_created_records_nothing_and_a_rerun_creates_it() {
         let fake = FakeGithub::start("acme/widgets");
@@ -589,6 +686,22 @@ mod tests {
         assert_eq!(local.cutover("R_1").unwrap(), None);
     }
 
+    // ⚠ A 201 that creates something but names no id must be refused, never
+    // read as if the id were simply absent (empty) — a garbled answer is a
+    // different fact from "GitHub created nothing".
+    #[test]
+    fn init_whose_first_tree_was_created_with_no_id_records_nothing() {
+        let fake = FakeGithub::start("acme/widgets");
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(&fake, "/git/trees", 201, json!({}));
+        let err = open(&c, &local).init(&entry_iri(0), None).unwrap_err();
+        assert!(err.to_string().contains("named no id"), "{err}");
+        assert_eq!(fake.ledger_head(), None, "no branch left behind");
+        assert_eq!(local.ledger_root("R_1").unwrap(), None);
+        assert_eq!(local.cutover("R_1").unwrap(), None);
+    }
+
     #[test]
     fn a_mode_that_cannot_be_read_is_an_error_not_detection_only() {
         let fake = FakeGithub::start("acme/widgets");
@@ -598,6 +711,21 @@ mod tests {
         let c = client(&fake);
         let err = open(&c, &local).mode().unwrap_err();
         assert!(err.to_string().contains("answered 500"), "{err}");
+    }
+
+    // ⚠ A 200 that is not a list must be an error, like the sibling readers
+    // (`objects`'s trees, `get_all_paged`'s pages) — never read as "no
+    // active ruleset", which would hide that fl could not read the rules at
+    // all behind the detection-only answer a real absence of rules gives.
+    #[test]
+    fn a_mode_whose_rules_are_not_a_list_is_an_error_not_detection_only() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(&fake, "/rules/branches/fl/ledger", 200, json!({}));
+        let err = open(&c, &local).mode().unwrap_err();
+        assert!(err.to_string().contains("not a list"), "{err}");
     }
 
     /// A local store whose cut-over cannot be written.
@@ -674,8 +802,13 @@ mod tests {
         let store = MemStore::default();
         let local = NoCutover(&store);
         let c = client(&fake);
-        assert!(open(&c, &local).init(&entry_iri(0), None).is_err());
+        let err = open(&c, &local).init(&entry_iri(0), None).unwrap_err();
+        assert!(err.to_string().contains("the disk is full"), "{err}");
         assert_eq!(store.ledger_root("R_1").unwrap(), None);
+        assert!(
+            fake.ledger_head().is_some(),
+            "the branch was created on GitHub before the local write failed"
+        );
     }
 
     // Spec §6.2: protected only with both rules in force.
@@ -773,9 +906,14 @@ mod tests {
             .map(|(json, _)| json)
             .expect("a heredoc body");
         let v: Value = serde_json::from_str(body).expect("the ruleset is JSON");
+        // ⚠ Pinned exactly: a broadened `include`, or a `target` other than
+        // `branch`, would hand an administrator a command that blocks a
+        // force-push or a deletion on more than `fl/ledger` — or on no
+        // branch at all.
+        assert_eq!(v["target"], "branch");
         assert_eq!(
-            v["conditions"]["ref_name"]["include"][0],
-            "refs/heads/fl/ledger"
+            v["conditions"],
+            json!({"ref_name": {"include": ["refs/heads/fl/ledger"], "exclude": []}})
         );
         assert_eq!(v["enforcement"], "active");
         let rules: Vec<&str> = v["rules"]

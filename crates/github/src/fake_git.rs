@@ -7,7 +7,7 @@
 //! documentation. A shape no live test confirms yet says so.
 
 use crate::fake::{Answer, State, answer};
-use crate::ledger::layout::BRANCH;
+use crate::ledger::layout::{BRANCH, FORMAT_FILE, README, README_FILE};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
@@ -313,9 +313,15 @@ fn create_ref(s: &mut State, v: &Value) -> Answer {
         return unprocessable("Reference name must start with 'refs/'");
     };
     if std::mem::take(&mut s.race_next_ref_create) {
-        // Someone else creates the same branch a moment earlier.
-        let tree = s.git.put_tree(&BTreeMap::new());
-        let theirs = s.git.put_commit(&tree, vec![], "someone else's start");
+        // Someone else's `init` lands first: the same first commit any
+        // `init` makes — `format` and `README.md`, no parent — not an
+        // arbitrary orphan.
+        let files = BTreeMap::from([
+            (FORMAT_FILE.to_string(), "1\n".to_string()),
+            (README_FILE.to_string(), README.to_string()),
+        ]);
+        let tree = s.git.put_tree(&files);
+        let theirs = s.git.put_commit(&tree, vec![], "fl: start the ledger");
         s.git.refs.insert(name.to_string(), theirs);
     }
     if s.git.refs.contains_key(name) {
