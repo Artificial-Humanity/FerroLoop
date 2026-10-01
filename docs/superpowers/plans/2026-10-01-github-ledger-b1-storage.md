@@ -4,19 +4,19 @@
 
 **Goal:** Land everything plan A's final review said must precede binding `SplitLedger` (a bounded flush scan, typed refusals with an honest retry promise, decision 14, the batch a flush sends made visible, `LedgerRoot` validation), and build `fl_github::ledger::GithubLedger` — the `fl/ledger` branch in format 1, its reads with the seven tamper checks, its append protocol, decision 2's projection, quarantine, `verify`, `init` and the mode — as a library proven against the in-process fake GitHub, with no CLI binding yet.
 
-**Architecture:** `fl-core` gains `LedgerFault` (one variant per remedy) inside `StoreError::Ledger`, `StoreError::{RestsOnLocalEntry, Contended}`, `StoreError::is_transient`, `Outbox::set_aside`, and `LedgerCache`/`LedgerMemory` — what a machine remembers of a branch (last head, segment cache). `fl-store` drops candidate rows when an entry is published or set aside, and keeps the cache in two additive tables. `fl-github` gains `ledger/` — `layout` (format 1, pure), `disclose` (decision 2, pure), `git` (the requests), `read` (head, snapshot, lines, checks 1–7), `append` (publish), `init` (setup, mode, guidance) and `verify` (history walk, quarantine) — and the fake gains git objects, the ledger's REST endpoints and its three GraphQL operations. `GithubLedger` implements plan A's `RemoteLedger`; the conformance suites run `SplitLedger` over it and the fake.
+**Architecture:** `fl-core` gains `LedgerFault` (one variant per remedy) inside `StoreError::Ledger`, `StoreError::{RestsOnLocalEntry, Contended}`, `StoreError::is_transient`, `Outbox::settle`, and `LedgerCache`/`LedgerMemory` — what a machine remembers of a branch (last head, segment cache). `fl-store` drops candidate rows when an entry is published or set aside, and keeps the cache in two additive tables. `fl-github` gains `ledger/` — `layout` (format 1, pure), `disclose` (decision 2, pure), `git` (the requests), `read` (head, snapshot, lines, checks 1–7), `append` (publish), `init` (setup, mode, guidance) and `verify` (history walk, quarantine) — and the fake gains git objects, the ledger's REST endpoints and its three GraphQL operations. `GithubLedger` implements plan A's `RemoteLedger`; the conformance suites run `SplitLedger` over it and the fake.
 
 **Tech Stack:** Rust 2024 (`rust-version = "1.98"`), redb 4.3, serde/serde_json, ureq 3, base64 0.22, sha2 0.10 (a workspace dependency already; this plan adds it to `fl-github`). No new crates.
 
-**Spec:** `docs/superpowers/specs/2026-09-30-github-ledger-design.md` at `ee2663e` — especially decisions 2, 8, 9, 10, 12 and 14, §1.1, §2.1, §2.5, §3 (all of it), §5, §6.1 steps 2–5, §6.2, §6.3, §7, §8.1, §8.3. Plan A (`2026-09-30-github-ledger-a-core.md`, merged) defines `SplitLedger`, `RemoteLedger`, `Outbox`, `Batch`, `Decision` and the rulings this plan builds on.
+**Spec:** `docs/superpowers/specs/2026-09-30-github-ledger-design.md` at `3caee14` — especially decisions 2, 8, 9, 10, 12 and 14, §1.1, §2.1, §2.5, §3 (all of it), §5, §6.1 steps 2–9, §6.2, §6.3, §7, §8.1, §8.3. Plan A (`2026-09-30-github-ledger-a-core.md`, merged) defines `SplitLedger`, `RemoteLedger`, `Outbox`, `Batch`, `Decision` and the rulings this plan builds on.
 
-**Branch:** `ferris/github-ledger-b1`, off `ferris/github-ledger-plan-b` (main + spec decision 14), or off `main` once decision 14 is merged.
+**Branch:** `ferris/github-ledger-b1`, off `ferris/github-ledger-plan-b` (main + spec decision 14 + this plan), or off `main` once that is merged.
 
-**Plan B2 (written after B1 merges) — intended scope:** the `ledger = "github"` config key (§1.5) and the binding of `SplitLedger { local: store, github: GithubLedger }` in `Ctx` (plan A ruling 11), sharing the tracker's `Client` (`GithubTracker::client`, added here); the pre-flight (§2.4) before any gate or adapter — visibility, mode, `GithubLedger::check_head`, `ensure_publishable(project, None)`, and a refusal naming `init` on a machine with no cut-over — cached per command; the commands `fl github ledger init | verify | quarantine | comment` over this plan's library calls (with init's confirmation prompt and `init::guidance`); decision comments (§4: rendered from the ledger, escaping, the 60,000-byte cap, the marker, recovery, posted after the state change; the fake's paginated comment listing); the `fl stats` binding rule; the mode in `fl github whoami`; printing `GithubLedger::take_notes`; the live tests of §8.4, which also confirm every shape this plan marks *Modelled* — by the names this plan's comments give them: `init_sets_up_a_ledger_on_a_private_repository`, `create_commit_on_branch_is_refused_when_the_head_moved`, `a_hand_edit_is_detected_and_named`, `rules_on_the_ledger_branch_are_readable`, `a_private_repository_without_a_ruleset_is_detection_only` (with §8.4's refused force update and deletion on a public throwaway); `docs/github-ledger.md` and its links (§9).
+**Plan B2 (written after B1 merges) — intended scope:** the `ledger = "github"` config key (§1.5) and the binding of `SplitLedger { local: store, github: GithubLedger }` in `Ctx` (plan A ruling 11), built over the tracker's `Client` (`GithubTracker::client`, added here); the pre-flight (§2.4) before any gate or adapter — visibility, mode, `GithubLedger::check_format` (head, anchor, last seen, format), `ensure_publishable(project, None)`, and the refusal naming `init` on a machine with no cut-over (§6.1 step 5) — cached per command; the commands `fl github ledger init | verify | quarantine | comment` over this plan's library calls (with init's confirmation prompt and `guidance`); decision comments (§4: rendered from the ledger — finding a move's or check's runs through the local catalog's gates, §4.2 — escaping, the 60,000-byte cap, the marker, recovery, posted after the state change; the fake's paginated comment listing); the `fl stats` binding rule; the mode in `fl github whoami`; printing `GithubLedger::take_notes`; the live tests of §8.4, which also confirm every shape this plan marks *Modelled* — by the names this plan's comments give them: `init_sets_up_a_ledger_on_a_private_repository`, `create_commit_on_branch_is_refused_when_the_head_moved`, `a_hand_edit_is_detected_and_named`, `rules_on_the_ledger_branch_are_readable`, `a_private_repository_without_a_ruleset_is_detection_only` (with §8.4's refused force update and deletion on a public throwaway); `docs/github-ledger.md` and its links (§9).
 
 ## Global Constraints
 
-- Verification trio, all green before every commit: `cargo fmt --all --check`, `cargo clippy --all-targets --workspace -- -D warnings`, `cargo test --workspace`. CI runs the same as the `test, clippy, fmt` check.
+- Verification trio, all green before every commit: `cargo fmt --all --check`, `cargo clippy --all-targets --workspace -- -D warnings`, `cargo test --workspace`. CI runs the same as the `test, clippy, fmt` check. Each task runs `cargo fmt --all` first, so the code blocks here need not be in rustfmt's exact layout; lines stay within 100 columns.
 - Unit tests live in `#[cfg(test)] mod tests` inside the module they test; black-box CLI tests live in `crates/cli/tests/`.
 - **No test contacts the network.** GitHub is the in-process fake (`fl_github::fake::FakeGithub`, on `127.0.0.1`) or `conformance::MemRemote`.
 - `fl-core` stays pure: "No IO, no async, no clock, no network" (`crates/core/src/lib.rs:1`).
@@ -25,55 +25,54 @@
 - Every existing configuration keeps working: B1 binds nothing in the CLI, so a local project and a mode-A project behave exactly as before. Every existing test passes, except the assertions this plan changes on purpose (named in each task).
 - `snake_case` on every wire (`crates/core/src/wire.rs`).
 - Every guard gets a mutation check: revert it, watch its test go red, restore. Each task lists its guards explicitly; say so in the commit message.
-- Line numbers cite `ee2663e`. An earlier task's edits shift the lines a later task names: find the named item, not the number.
+- Line numbers cite `ee2663e` (the code is unchanged at `3caee14`). An earlier task's edits shift the lines a later task names: find the named item, not the number.
 - An answer shape fl relies on that no live test has confirmed is marked in a comment: *Modelled — confirmed by live test `<name>`*. Every test so named is plan B2's to write; code comments carry no plan names.
 - Commits are authored by the machine account (WORKFLOW.md) and end with `Co-authored-by: Ferris <Ferris@artificialhumanity.io>`. Stage explicit paths — never `git add -A`.
 - The repository is public: no machine paths, host names or lab names in code, tests or messages. Test repositories are `acme/widgets` (and `acme/other` for a record another repository owns).
 
 ## Review Focus
 
-1. **Another machine appends to the same directory between this machine's read and its commit.** GitHub refuses the stale commit; fl reads again and adds only what is missing — nothing lost, nothing twice. Task 10 (`two_flushes_racing_both_land_and_none_is_lost`, `two_machines_appending_at_once_all_land_once`).
-2. **A commit whose answer was lost after it rolled a segment over.** The retry must find the lines in the closed segment as well as the open one, add nothing twice, and make no empty commit. Task 10 (`a_lost_answer_after_a_rollover_adds_nothing_twice`).
-3. **GitHub's replica answering `behind` right after this machine's own append.** fl reads again and raises no alarm; a `behind` that persists is a rewrite. Task 9 (`a_head_behind_the_last_one_seen_is_read_again_before_it_counts`, `a_head_that_stays_behind_is_a_rewrite`).
-4. **A batch published while the repository was private, sent again after it became public.** The ids are already there, so nothing is added and no commit is made. Task 10 (`a_batch_published_while_private_is_not_added_again_once_public`).
+1. **Another machine appends to the same directory between this machine's read and its commit.** GitHub refuses the stale commit; fl reads again and adds only what is missing — nothing lost, nothing twice. Task 11 (`two_flushes_racing_both_land_and_none_is_lost`, `two_machines_appending_at_once_all_land_once`).
+2. **A commit whose answer was lost after it rolled a segment over.** The retry must find the lines in the closed segment as well as the open one, add nothing twice, and make no empty commit. Task 11 (`a_lost_answer_after_a_rollover_adds_nothing_twice`).
+3. **A replica that has not seen this machine's own append yet.** Right after it, a branch read may answer the head before it, or a compare may not know this machine's commit; fl reads again and raises no alarm, and only an answer that persists is a rewrite. Task 9 (`a_replica_that_has_not_seen_the_last_write_raises_no_alarm`, `a_head_that_stays_behind_is_a_rewrite`), Task 11 (`a_lagging_replica_after_this_machines_own_append_raises_no_alarm`).
+4. **A batch published while the repository was private, sent again after it became public.** The ids are already there, so nothing is added and no commit is made. Task 12 (`a_batch_published_while_private_is_not_added_again_once_public`).
 5. **An entry another repository owns, and a store that has published thousands of entries.** The first is reported by one flush only; the second scans only what is still waiting. Task 3 (`a_skipped_entry_is_reported_by_one_flush_only`, `a_published_or_set_aside_entry_leaves_the_candidate_index`).
+6. **Disclosure cannot be undone.** An excerpt, an error's detail or a path published on a repository that is not private stays in the branch's history for good, so every doubt withholds: `internal` is not private, an answer that names no visibility is not private, and a visibility that cannot be read publishes nothing. Task 12 (`a_repository_that_is_not_private_publishes_nothing_machine_specific`, `a_repository_answer_that_names_no_visibility_withholds_the_excerpts`), Task 11 (`a_visibility_that_cannot_be_read_refuses_and_publishes_nothing`).
+7. **False alarms from the segment cache.** Checks 3 and 4 compare against what this machine cached; an open segment that another machine — or this one — grows and then closes by rolling over is not tampering. Task 10 (`appends_and_a_rollover_by_another_machine_raise_no_alarm`), Task 11 (`segments_roll_over_and_a_directory_of_many_reads_back_whole`, whose every append reads through checks 3–4).
+8. **The strict codec rests on "a new field means a new format".** A line a newer fl wrote with a field this fl does not know is unreadable here, and the message must say a newer fl may have written it, not only that someone damaged it. Task 6 (`a_line_is_read_strictly`), Task 10 (`a_line_with_a_field_this_fl_does_not_write_is_unreadable_and_says_to_upgrade`).
 
 ## Rulings this plan makes
 
-The spec is silent or ambiguous on these. Each says why, and what it costs if wrong.
+The spec is silent or ambiguous on these, or states them since `3caee14`. Each says why, and what it costs if wrong.
 
 1. **B1 is the library; every new CLI surface is B2's.** The `ledger = "github"` key with no binding behind it would let a person believe decisions publish when they stay local. *If wrong:* B2 holds one more small CLI task.
 2. **Plan A's final-review checklist lands here, whole** (Tasks 1–4), so B2 binds `SplitLedger` onto finished foundations. Decision 14 rides with the retry wording (Task 2) because both are about what a failed publish says. *If wrong:* none; it is ordering.
-3. **The waiting set is the store's, not a repository's.** `mark_published` and the new `set_aside` drop the entry's candidate row in the same write, so a flush scans only what waits (spec §2.1). `is_published` stays per repository. A store binds one tracker — the CLI already refuses a store two trackers share — so no second repository can be waiting for the same entry. *If wrong:* a store rebound to another repository would not re-offer entries the first already took; they predate the new repository's cut-over anyway.
-4. **An entry skipped for another repository is set aside after the publish lands,** so the flush that reports it is the one whose report reaches the command. *If wrong:* a crash between publish and set-aside reports it once more.
+3. **The waiting set is the store's, not a repository's.** `mark_published`, and the new `settle`, drop the entry's candidate row in the same write, so a flush scans only what waits (spec §2.1). `is_published` stays per repository. A store binds one tracker — the CLI already refuses a store two trackers share — so no second repository can be waiting for the same entry. *If wrong:* a store rebound to another repository would not re-offer entries the first already took; they predate the new repository's cut-over anyway.
+4. **What a landed flush leaves behind is one store write.** `Outbox::settle` marks the published ids and sets aside the entries another repository owns together, after the publish lands, so the flush that reports a skip is the one whose report reaches the command, and a landed publish is never refused by a second write failing. *If wrong:* none; one transaction instead of two.
 5. **`LedgerFault` is one enum inside `StoreError::Ledger`, one variant per remedy,** and `StoreError::is_transient` is exactly `Unreachable | RateLimited | Contended`. Only a transient refusal promises that "the next decision … publishes them". *If wrong:* message text.
 6. **Decision 14 supersedes plan A ruling 16:** `fl attempt` exits with the attempt's own code and prints the publish failure as `warning: …`.
-7. **A decision is filed under its finding when it has one, else its record** (§3.1 "one directory per record or finding"; §4.1 comments a finding decision on the finding's issue). Check 6 compares against the same subject. *If wrong:* one function, `layout::decision_subject`.
-8. **De-duplication reads the whole directory, not only "the file"** (§3.2 step 3). A lost answer whose commit rolled a segment over would otherwise duplicate the lines that landed in the closed segment. Closed segments are cached, so this costs no request. See spec defect 1.
+7. **A finding decision is filed under its finding, any other under its record** — spec §3.1 and §3.5 check 6 now say so. One function, `layout::decision_subject`, places it and checks it.
+8. **De-duplication reads the whole directory** — spec §3.2 step 3 now says so. Closed segments are cached, so this costs no request.
 9. **One compare per read.** The head is compared with the last head this machine saw when there is one, else with the anchor. Every recorded head was itself checked to descend from the anchor, so descent from it implies descent from the anchor (checks 1 and 2 together). *If wrong:* one more request per read.
 10. **A read records its checked head as the last seen,** not only an append (§3.2 step 6 names the append). *If wrong:* a later read compares against an older head, which still descends.
-11. **A line is encoded through `serde_json::Value` and read by round trip.** The parsed entry, serialized again, must equal the line without `by`; anything else — a field fl does not write, a value spelled differently — is unreadable (§3.1 "A new field in any entry means a new format"). *If wrong:* a looser reader accepts lines a newer format wrote.
+11. **A line is encoded through `serde_json::Value` and read by round trip.** The parsed entry, serialized again, must equal the line without `by`; anything else — a field fl does not write, a value spelled differently — is unreadable (§3.1 "A new field in any entry means a new format"), and the message offers upgrading fl. *If wrong:* a looser reader accepts lines a newer format wrote.
 12. **The segment cache lives in the local store** (`ledger_heads`, `ledger_segments`, additive tables keyed by `node_id`), and text is cached only after it passes checks 3–4. *If wrong:* a machine downloads its segments again each command.
 13. **A lost answer is not an error to the caller.** `publish` reads again; if every line is there it returns the head that holds them. The conformance case `a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush` accepts either behaviour, since `MemRemote` reports the failure. *If wrong:* one more refused decision per lost answer.
-14. **Five tries that each found the head moved is `StoreError::Contended`,** which is transient; five tries whose answers were lost or 5xx is `Unreachable`. §7 has no row for either. *If wrong:* message text.
-15. **The mode is read from `rules/branches/fl/ledger` alone.** That endpoint lists only rules in force, so a disabled or evaluate-only ruleset shows as the rules missing, and the message says so; a 403 whose message says to upgrade means rulesets are unavailable on the plan. *Modelled — confirmed by live tests `rules_on_the_ledger_branch_are_readable` and `a_private_repository_without_a_ruleset_is_detection_only` (plan B2).* See spec defect 4.
-16. **`init` records this machine's cut-over whenever it has none**, including where the ledger is already set up and the root came from an imported manifest. Recorded before the root, and never replaced. See spec defect 2.
-17. **A line in the wrong directory may be quarantined,** as an unreadable one may; both messages name the quarantine command. **`quarantine.jsonl` cannot quarantine itself:** an unreadable quarantine line is `Altered` and names `verify`.
+14. **Five tries that each found the head moved is `StoreError::Contended`** (spec §7's contention row: transient); five tries whose answers were lost or 5xx is `Unreachable`, transient too. A spent rate limit is neither: it refuses at once. *If wrong:* message text.
+15. **The mode is read from `rules/branches/fl/ledger` alone,** as spec §6.2 now says: it lists only rules in force, so a disabled or evaluate-only ruleset shows as the rules missing, and the message says so; a 403 whose message says to upgrade means rulesets are unavailable on the plan. *Modelled — confirmed by live tests `rules_on_the_ledger_branch_are_readable` and `a_private_repository_without_a_ruleset_is_detection_only`.*
+16. **`init` records this machine's cut-over whenever it has none** (spec §6.1 step 5), including where the ledger is already set up and the root came from an imported manifest. Recorded before the root, and never replaced.
+17. **A line in the wrong directory is tampering** (spec §7), reported as `LedgerFault::Misplaced`: the GitHub ledger "was altered", naming the file, the line and the commit, and `verify`. The message also offers the quarantine command, and a misplaced line may be quarantined. **`quarantine.jsonl` cannot quarantine itself:** an unreadable quarantine line is `Altered` and names `verify`.
 18. **`by` is the credential's identity** (`/user`'s login, or `<slug>[bot]` for the App), read once per `GithubLedger`. A quarantine line also carries `quarantined_by`, the name the person gave with `--by`.
 19. **The `format` file holds `1\n`;** a reader accepts exactly `1` or `1\n`.
-20. **A ledger root's shape** — the commit 40 or 64 lowercase hex digits, the node id 1 to 128 characters of `A-Za-z0-9_=+/-` starting with a letter — is checked by the manifest's consistency check (so at import, parse and export) and by `init`, through one function, `fl_core::store::ledger_root_shape`. `set_ledger_root` does not check it. *If wrong:* one more call site.
-21. **Visibility is read once per `GithubLedger`,** which lives for one command and so one decision; B2's pre-flight reads it first.
-22. **The unreadable-line error names the commit through GraphQL `blame`;** when blame cannot answer, the message says the commit is unknown rather than failing to report. *Modelled — confirmed by live test `a_hand_edit_is_detected_and_named` (plan B2).*
-23. **`verify` walks first parents with `git/commits` and lists each tree with `git/trees?recursive=1`,** reporting the oldest bad commit; a merge or a second root is itself a bad commit.
+20. **A ledger root's shape** — the commit 40 or 64 lowercase hex digits, the node id 1 to 128 characters of `A-Za-z0-9_=+/-` starting with a letter — is checked by the manifest's consistency check (so at import, parse and export) through `ledger_root_shape`. `init` checks the node id (`node_id_shape`) before it creates anything, so a malformed binding leaves no branch behind; the commit is GitHub's own, and the manifest check refuses a malformed one at export. `set_ledger_root` does not check either. *If wrong:* one more call site.
+21. **Visibility is read once per `GithubLedger`,** which lives for one command and so one decision; B2's pre-flight reads it first. An answer that names no visibility is not private: a published excerpt cannot be taken back. *If wrong:* a repository whose answer omits the field publishes no excerpts.
+22. **The unreadable-line error names the commit through GraphQL `blame`;** when blame cannot answer, the message says the commit is unknown rather than failing to report. *Modelled — confirmed by live test `a_hand_edit_is_detected_and_named`.*
+23. **`verify` walks first parents with `git/commits` and lists each tree once with `git/trees?recursive=1`,** reporting the oldest bad commit; a merge or a second root is itself a bad commit.
+24. **A compare that does not know a commit is read again, like `behind`,** within `lag_reads` (3 reads, 500 ms apart). Right after this machine's own append, which it records as the last head seen, a replica can answer a branch read with the head before it (`behind`) or not know the new commit at all (404). Only an answer that persists past the re-reads is a rewrite. *If wrong:* a genuinely unknown commit is reported about 1.5 s later.
 
-## Spec defects found
+## Spec gaps this plan found
 
-1. §3.2 step 3 de-duplicates against "the file" only; see ruling 8.
-2. §6.1 records the cut-over only on the machine that runs `init`. A second machine that imports the manifest has a root and no cut-over, so under plan A ruling 5 its flushes publish nothing, silently. Ruling 16 has `init` record it there; B2's pre-flight should refuse a machine with no cut-over and name `init`.
-3. §3.1 says decisions go in "one directory per record or finding", while §3.5 check 6 compares a line's "record" with its directory. Ruling 7.
-4. §6.2 asks fl to report "a ruleset that exists but is inactive", but the only endpoint the credential is expected to read lists active rules only. Ruling 15.
-5. §2.3 says "a comment can be rendered from the ledger alone", but a `move` or `check` decision names transitions, not gates, so finding its runs under `runs/<gate-key>/` needs the local catalog's gate list. B2's comment recovery must read that list.
-6. §7 has no row for a head that keeps moving (contention). Ruling 14.
+The six gaps this plan found are folded into the spec at `3caee14`: §3.1 and §3.5 check 6 (where a finding decision is filed), §3.2 step 3 (de-duplicate against the whole directory), §4.2 (a move's runs are found through the local catalog's gates), §6.1 step 5 (every machine records its own cut-over), §6.2 (the mode comes from the rules in force) and §7 (contention).
 
 ---
 
@@ -82,15 +81,15 @@ The spec is silent or ambiguous on these. Each says why, and what it costs if wr
 | File | Change | Responsibility |
 |---|---|---|
 | `crates/core/src/fault.rs` | create | `LedgerFault`: what is wrong with a shared ledger, one variant per remedy |
-| `crates/core/src/store.rs` | modify | `StoreError::{Ledger, RestsOnLocalEntry, Contended}`, `is_transient`; `ledger_root_shape` |
-| `crates/core/src/split.rs` | modify | typed refusals in `merge`/`flush`; stats fall back only when transient; `Outbox::set_aside`; `LedgerCache`, `CachedSegment`, `LedgerMemory` |
-| `crates/core/src/mem.rs` | modify | `set_aside`, the store-wide waiting set, `LedgerCache` for `MemStore` |
-| `crates/core/src/conformance.rs` | modify | `MemRemote::damage`, `RemoteControl::batches`, two split cases, the `ledger_cache` suite, the lost-answer case |
+| `crates/core/src/store.rs` | modify | `StoreError::{Ledger, RestsOnLocalEntry, Contended}`, `is_transient`; `ledger_root_shape`, `node_id_shape` |
+| `crates/core/src/split.rs` | modify | typed refusals in `merge`/`flush`; stats fall back only when transient; `Outbox::settle`; `LedgerCache`, `CachedSegment`, `LedgerMemory` |
+| `crates/core/src/mem.rs` | modify | `settle`, the store-wide waiting set, `LedgerCache` for `MemStore` |
+| `crates/core/src/conformance.rs` | modify | `MemRemote::{damage, rate_limit_reads}`, `RemoteControl::batches`, two split cases, the `ledger_cache` suite, the lost-answer case |
 | `crates/core/src/lib.rs` | modify | modules and exports |
 | `crates/exec/src/population.rs` | modify | `ExecError::PublishRefused`, `refused_publish` |
 | `crates/exec/src/record.rs`, `finding.rs`, `journal.rs` | modify | the three flush sites; `Journal::refusing_with` |
 | `crates/cli/src/cmd/check.rs`, `attempt.rs`, `testing.rs` | modify | the retry promise only when transient; decision 14; `Flushes::refusing_with` |
-| `crates/store/src/lib.rs` | modify | candidate rows dropped; `set_aside`; `LedgerCache` tables; tests |
+| `crates/store/src/lib.rs` | modify | candidate rows dropped; `settle` in one transaction; `LedgerCache` tables; tests |
 | `crates/store/src/manifest.rs` | modify | the root's shape in `check_consistent` |
 | `crates/cli/tests/manifest.rs` | modify | well-formed roots |
 | `crates/github/Cargo.toml` | modify | `sha2` |
@@ -103,8 +102,8 @@ The spec is silent or ambiguous on these. Each says why, and what it costs if wr
 | `crates/github/src/ledger/layout.rs` | create | format 1: keys, paths, lines, segments (pure) |
 | `crates/github/src/ledger/disclose.rs` | create | decision 2's projection (pure) |
 | `crates/github/src/ledger/git.rs` | create | the requests, each answer judged once |
-| `crates/github/src/ledger/read.rs` | create | the checked head, snapshots, lines; checks 1–7 |
-| `crates/github/src/ledger/append.rs` | create | the append protocol and `publish` |
+| `crates/github/src/ledger/read.rs` | create | the checked head and format (Task 9); snapshots, lines, reads (Task 10); checks 1–7 |
+| `crates/github/src/ledger/append.rs` | create | the append protocol and `publish` (Task 11); disclosure tests (Task 12) |
 | `crates/github/src/ledger/fixture.rs` | create (test-only) | `SplitLedger` over `GithubLedger` and the fake, for the conformance suites |
 | `crates/github/src/ledger/init.rs` | create | `init`, the mode, the guidance text |
 | `crates/github/src/ledger/verify.rs` | create | `verify` and `quarantine` |
@@ -246,7 +245,8 @@ mod tests {
     #[test]
     fn every_fault_names_its_remedy() {
         let faults = every_fault();
-        let named: std::collections::BTreeSet<&str> = faults.iter().map(|(f, _)| variant(f)).collect();
+        let named: std::collections::BTreeSet<&str> =
+            faults.iter().map(|(f, _)| variant(f)).collect();
         assert_eq!(named.len(), 9, "one sample per variant: {named:?}");
         for (fault, remedy) in faults {
             let msg = fault.to_string();
@@ -264,7 +264,38 @@ mod tests {
             cause: "not JSON".into(),
         }
         .to_string();
-        for part in ["runs/k/2.jsonl", "line 7", "c42", "not JSON", "acme/widgets"] {
+        for part in [
+            "runs/k/2.jsonl",
+            "line 7",
+            "c42",
+            "not JSON",
+            "acme/widgets",
+            "upgrade fl",
+        ] {
+            assert!(msg.contains(part), "{part}: {msg}");
+        }
+    }
+
+    // Spec §7: a line in the wrong directory is tampering, naming the file
+    // and the commit; the message may also offer the quarantine command.
+    #[test]
+    fn a_misplaced_line_is_reported_as_tampering() {
+        let msg = LedgerFault::Misplaced {
+            repo: "acme/widgets".into(),
+            file: "runs/k/2.jsonl".into(),
+            line: 4,
+            belongs: "urn:uuid:x".into(),
+            commit: "c42".into(),
+        }
+        .to_string();
+        for part in [
+            "was altered",
+            "runs/k/2.jsonl",
+            "line 4",
+            "c42",
+            "fl github ledger verify",
+            "fl github ledger quarantine runs/k/2.jsonl 4",
+        ] {
             assert!(msg.contains(part), "{part}: {msg}");
         }
     }
@@ -378,15 +409,23 @@ After `stats_fall_back_to_the_local_store_and_say_why` (line 561), add:
         );
     }
 
+    // Spec §2.5: a spent rate limit is "cannot be read" too — stats fall
+    // back, saying why — not only an unreachable GitHub.
     #[test]
     fn stats_fall_back_when_the_rate_limit_is_spent() {
-        // `is_transient` is the rule; this pins that stats use it, not a
-        // match on `Unreachable` alone.
+        let (s, p, _g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        l.append_attempt(sample_attempt(1, &p, &r)).unwrap();
+        remote.rate_limit_reads(true);
+        let (attempts, coverage) = l.attempts_for_stats(&p).unwrap();
+        assert_eq!(attempts.len(), 1);
         assert!(
-            StoreError::RateLimited {
-                reset: "soon".into()
-            }
-            .is_transient()
+            matches!(coverage, Coverage::LocalOnly { ref reason } if reason.contains("rate limit")),
+            "{coverage:?}"
         );
     }
 ```
@@ -395,7 +434,11 @@ In `a_decision_resting_on_an_entry_that_is_not_being_published_is_refused_before
 
 ```rust
         assert!(
-            matches!(err, StoreError::RestsOnLocalEntry { ref entry, .. } if Some(entry) == untied.id.as_ref()),
+            matches!(
+                err,
+                StoreError::RestsOnLocalEntry { ref entry, .. }
+                    if Some(entry) == untied.id.as_ref()
+            ),
             "{err:?}"
         );
 ```
@@ -461,10 +504,11 @@ pub enum LedgerFault {
         commit: String,
     },
     #[error(
-        "the GitHub ledger of {repo} holds a line in the wrong place: `{file}` line {line} is \
-         about {belongs}, which that directory does not hold (added by commit {commit}). Find out \
-         who wrote it, then run `fl github ledger quarantine {file} {line} --by <name> --reason \
-         <text>` so readers skip it; nothing is ever removed"
+        "the GitHub ledger of {repo} was altered: `{file}` line {line} is about {belongs}, which \
+         that directory does not hold (added by commit {commit}). fl writes every line into its \
+         own directory, so someone else wrote this one. Run `fl github ledger verify`, and find \
+         out who wrote it before trusting the ledger; then `fl github ledger quarantine {file} \
+         {line} --by <name> --reason <text>` lets readers skip it. Nothing is ever removed"
     )]
     Misplaced {
         repo: String,
@@ -475,8 +519,9 @@ pub enum LedgerFault {
     },
     #[error(
         "the GitHub ledger of {repo} holds an unreadable line: `{file}` line {line}, added by \
-         commit {commit}: {cause}. Find out who wrote it, then run `fl github ledger quarantine \
-         {file} {line} --by <name> --reason <text>` so readers skip it; nothing is ever removed"
+         commit {commit}: {cause}. A newer fl may have written it — then upgrade fl. Otherwise \
+         find out who wrote it, and run `fl github ledger quarantine {file} {line} --by <name> \
+         --reason <text>` so readers skip it; nothing is ever removed"
     )]
     Unreadable {
         repo: String,
@@ -608,6 +653,7 @@ Add a field to `RemoteInner` (after `fail_publish: bool,`, line 1373):
 
 ```rust
     damaged: bool,
+    rate_limited: bool,
 ```
 
 Add to `impl MemRemote` (after `fail_publish`, line 1397):
@@ -619,7 +665,18 @@ Add to `impl MemRemote` (after `fail_publish`, line 1397):
         self.inner.borrow_mut().damaged = on;
     }
 
-    fn refuse_if_damaged(&self) -> Result<(), StoreError> {
+    /// Every read answers that GitHub's rate limit is spent.
+    pub fn rate_limit_reads(&self, on: bool) {
+        self.inner.borrow_mut().rate_limited = on;
+    }
+
+    /// A read refused for a spent rate limit or a damaged ledger.
+    fn refuse_read(&self) -> Result<(), StoreError> {
+        if self.inner.borrow().rate_limited {
+            return Err(StoreError::RateLimited {
+                reset: "1700000000 (unix seconds)".into(),
+            });
+        }
         if self.inner.borrow().damaged {
             return Err(LedgerFault::Altered {
                 repo: self.node_id.clone(),
@@ -633,7 +690,7 @@ Add to `impl MemRemote` (after `fail_publish`, line 1397):
     }
 ```
 
-In `impl RemoteLedger for MemRemote`, add `self.refuse_if_damaged()?;` right after `self.refuse_if_down()?;` in both `gate_runs` (line 1473) and `attempts` (line 1485).
+In `impl RemoteLedger for MemRemote`, add `self.refuse_read()?;` right after `self.refuse_if_down()?;` in both `gate_runs` (line 1473) and `attempts` (line 1485).
 
 In `crates/core/src/lib.rs`, add `pub mod fault;` after `pub mod decision;` (line 9), and after line 22 add:
 
@@ -652,17 +709,18 @@ Revert each guard, run `cargo test -p fl-core`, confirm the named test goes red,
 
 1. `is_transient`: drop the `Unreachable` arm → `only_an_unreachable_a_rate_limited_or_a_contended_ledger_is_transient` red (and `stats_fall_back_to_the_local_store_and_say_why`).
 2. `is_transient`: drop the `RateLimited` arm → `only_an_unreachable…` and `stats_fall_back_when_the_rate_limit_is_spent` red.
+2b. `attempts_for_stats`: narrow the fallback guard to `matches!(e, StoreError::Unreachable { .. })` → `stats_fall_back_when_the_rate_limit_is_spent` red.
 3. `is_transient`: drop the `Contended` arm → `only_an_unreachable…` red.
 4. `attempts_for_stats`: remove the `if e.is_transient()` guard so every error falls back → `stats_refuse_a_damaged_ledger_rather_than_fall_back` red.
 5. `merge`: return `StoreError::Backend(..)` instead of `LedgerFault::Unidentified` → `a_published_entry_with_no_id_is_a_ledger_fault` red.
 6. `flush`: return `StoreError::Backend(..)` instead of `RestsOnLocalEntry` → `a_decision_resting_on_an_entry_that_is_not_being_published…` red.
-7. `LedgerFault`: delete "Upgrade fl" from `UnknownFormat`'s message → `every_fault_names_its_remedy` red.
-8. `MemRemote::refuse_if_damaged`: return `Ok(())` always → `stats_refuse_a_damaged_ledger…` red.
+7. `LedgerFault`: delete "Upgrade fl" from `UnknownFormat`'s message → `every_fault_names_its_remedy` red; delete "upgrade fl" from `Unreadable`'s → `a_fault_names_the_file_line_and_commit_it_is_about` red; delete "was altered" or the verify command from `Misplaced`'s → `a_misplaced_line_is_reported_as_tampering` red.
+8. `MemRemote::refuse_read`: drop the damage branch → `stats_refuse_a_damaged_ledger…` red; drop the rate-limit branch → `stats_fall_back_when_the_rate_limit_is_spent` red.
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/core/src/fault.rs crates/core/src/store.rs crates/core/src/split.rs crates/core/src/conformance.rs crates/core/src/lib.rs
 git commit -m "feat(core): typed ledger refusals, and which of them clear up by waiting
 
@@ -698,7 +756,9 @@ ExecError::PublishRefused(String)            // new variant: no retry promise
 pub fn refused_publish(e: fl_core::StoreError) -> ExecError; // Unpublished iff transient
 
 // fl_exec::journal (test-only)
-impl Journal<'_> { pub fn refusing_with(store: &MemStore, cause: fn() -> StoreError) -> Journal<'_>; }
+impl Journal<'_> {
+    pub fn refusing_with(store: &MemStore, cause: fn() -> StoreError) -> Journal<'_>;
+}
 
 // fl_cli::testing (test-only)
 impl Flushes { pub fn refusing_with(cause: fn() -> StoreError) -> Flushes; }
@@ -1175,7 +1235,7 @@ Expected: PASS. (`a_move_whose_flush_fails_is_refused_and_the_record_stays`, `a_
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/exec/src/population.rs crates/exec/src/lib.rs crates/exec/src/record.rs crates/exec/src/finding.rs crates/exec/src/journal.rs crates/cli/src/cmd/check.rs crates/cli/src/cmd/attempt.rs crates/cli/src/testing.rs
 git commit -m "fix: promise a later publish only when waiting can work; decision 14
 
@@ -1195,7 +1255,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 - Modify: `crates/core/src/split.rs:26-43` (`Outbox`), `:244-313` (`SplitLedger::flush`), tests after `:653`
 - Modify: `crates/core/src/mem.rs:23-50` (`Inner`), `:411-450` (`Outbox for MemStore`), tests `:571-606`
 - Modify: `crates/core/src/conformance.rs:141-150` (case count), `:201-224` (`split_ledger`), after `:874` (two cases), `:1337-1348` (`RemoteControl`), `:1371-1380`, `:1437-1470`, `:1497-1510` (`MemRemote`)
-- Modify: `crates/store/src/lib.rs:231-271` (after `waiting`), `:1159-1168` (`mark_published`), after it (`set_aside`), tests `:1280`, `:1844-1870`, new test
+- Modify: `crates/store/src/lib.rs:231-271` (after `waiting`), `:1159-1168` (`mark_published`), after it (`settle`), tests `:1280`, `:1844-1870`, new test
 
 **Interfaces:**
 - Consumes: Task 1's `SplitLedger::flush`.
@@ -1203,8 +1263,11 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 
 ```rust
 // fl_core::split::Outbox — one new method; mark_published's contract tightened
-fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError>; // also leaves the waiting set
-fn set_aside(&self, ids: &[Iri]) -> Result<(), StoreError>;                  // leaves it, unmarked
+// also leaves the waiting set
+fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError>;
+/// One write: marks `published` and leaves the waiting set with them, and
+/// sets `set_aside` aside (leaves it, unmarked).
+fn settle(&self, repo: &str, published: &[Iri], set_aside: &[Iri]) -> Result<(), StoreError>;
 
 // fl_core::conformance::RemoteControl — one new method
 fn batches(&self) -> Vec<Batch>;            // every batch publish was handed, in order
@@ -1334,8 +1397,8 @@ In `crates/core/src/mem.rs`, replace the last assertion of `unpublished_lists_on
         let (s, g, r, _p) = outbox_world();
         let aside = sample_record_run(4, &g, Some(&r));
         s.append_gate_run(aside.clone()).unwrap();
-        s.set_aside(&[aside.id.clone().unwrap()]).unwrap();
-        s.set_aside(&[aside.id.clone().unwrap()]).unwrap();
+        s.settle("R_1", &[], &[aside.id.clone().unwrap()]).unwrap();
+        s.settle("R_1", &[], &[aside.id.clone().unwrap()]).unwrap();
         assert!(s.unpublished("R_1", &entry_iri(0)).unwrap().runs.is_empty());
         assert!(!s.is_published("R_1", aside.id.as_ref().unwrap()).unwrap());
 ```
@@ -1375,12 +1438,12 @@ and add after `a_run_with_no_record_never_enters_the_candidate_index` (ends line
         }
         let attempt = sample_attempt(4, &p, &r);
         s.append_attempt(attempt.clone()).unwrap();
-        s.mark_published(
+        s.settle(
             "R_1",
             &[published.id.clone().unwrap(), attempt.id.clone().unwrap()],
+            &[aside.id.clone().unwrap()],
         )
         .unwrap();
-        s.set_aside(&[aside.id.clone().unwrap()]).unwrap();
 
         let tx = s.db.begin_read().unwrap();
         let runs: Vec<String> = tx
@@ -1410,7 +1473,7 @@ and add after `a_run_with_no_record_never_enters_the_candidate_index` (ends line
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p fl-core -p fl-store`
-Expected: FAIL to compile — `RemoteControl::batches` has no implementation for `MemRemote`, and `Outbox::set_aside` does not exist.
+Expected: FAIL to compile — `RemoteControl::batches` has no implementation for `MemRemote`, and `Outbox::settle` does not exist.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1435,10 +1498,20 @@ pub trait Outbox {
     /// the set a flush scans stays bounded by what is actually waiting
     /// (spec §2.1).
     fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError>;
-    /// Entries a flush skipped because another repository owns their record
-    /// (spec §2.1): they leave the waiting set unmarked — reported once, by
-    /// the flush that skipped them, and never offered again. Idempotent.
-    fn set_aside(&self, ids: &[Iri]) -> Result<(), StoreError>;
+    /// What a flush that landed leaves behind, in ONE write: `published` is
+    /// marked and leaves the waiting set; `set_aside` — entries a flush
+    /// skipped because another repository owns their record (spec §2.1) —
+    /// leaves it unmarked: reported once, by the flush that skipped them,
+    /// and never offered again. Idempotent.
+    ///
+    /// ⚠ One write, so a publish that landed is never refused by a second
+    /// write failing after the first.
+    fn settle(
+        &self,
+        repo: &str,
+        published: &[Iri],
+        set_aside: &[Iri],
+    ) -> Result<(), StoreError>;
     /// The id after which entries are publishable to `repo`, if its GitHub
     /// ledger was switched on.
     fn cutover(&self, repo: &str) -> Result<Option<Iri>, StoreError>;
@@ -1524,11 +1597,10 @@ Replace `SplitLedger::flush` (lines 237-313, the doc comment included) with:
             attempts,
         })?;
         // Only after the commit landed: a mark written first would hide an
-        // entry GitHub never received.
-        self.local.mark_published(&repo, &ids)?;
-        // ⚠ Set aside only now, by the flush whose report reaches the
-        // command: reported once, never offered again (spec §2.1).
-        self.local.set_aside(&set_aside)?;
+        // entry GitHub never received. ⚠ And set aside only now, by the
+        // flush whose report reaches the command: reported once, never
+        // offered again (spec §2.1). One write for both (ruling 4).
+        self.local.settle(&repo, &ids, &set_aside)?;
         Ok(Flushed { commit, left_local })
     }
 ```
@@ -1564,8 +1636,18 @@ Replace `mark_published` (lines 444-450) with:
         Ok(())
     }
 
-    fn set_aside(&self, ids: &[Iri]) -> Result<(), StoreError> {
-        self.inner.borrow_mut().settled.extend(ids.iter().cloned());
+    fn settle(
+        &self,
+        repo: &str,
+        published: &[Iri],
+        set_aside: &[Iri],
+    ) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        for id in published {
+            s.published.insert((repo.to_string(), id.clone()));
+        }
+        s.settled
+            .extend(published.iter().chain(set_aside).cloned());
         Ok(())
     }
 ```
@@ -1612,21 +1694,25 @@ Replace `mark_published` (lines 1159-1168) with:
 
 ```rust
     fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError> {
+        self.settle(repo, ids, &[])
+    }
+
+    fn settle(
+        &self,
+        repo: &str,
+        published: &[Iri],
+        set_aside: &[Iri],
+    ) -> Result<(), StoreError> {
         let tx = self.db.begin_write().map_err(backend)?;
         {
             let mut table = tx.open_table(LEDGER_PUBLISHED).map_err(backend)?;
-            for id in ids {
+            for id in published {
                 table.insert((repo, id.as_str()), true).map_err(backend)?;
             }
         }
-        // ⚠ The same write: a published entry waits no more.
-        drop_candidates(&tx, ids)?;
-        tx.commit().map_err(backend)
-    }
-
-    fn set_aside(&self, ids: &[Iri]) -> Result<(), StoreError> {
-        let tx = self.db.begin_write().map_err(backend)?;
-        drop_candidates(&tx, ids)?;
+        // ⚠ The same write: a published or set-aside entry waits no more.
+        drop_candidates(&tx, published)?;
+        drop_candidates(&tx, set_aside)?;
         tx.commit().map_err(backend)
     }
 ```
@@ -1638,25 +1724,26 @@ Expected: PASS — both stores run the ten split cases (`a_split_ledger_over_a_m
 
 - [ ] **Step 5: Mutation checks**
 
-1. `SplitLedger::flush`: delete the `mark_published` call → `a_published_entry_is_never_offered_to_github_again` red (both stores).
-2. `SplitLedger::flush`: delete the `set_aside` call → `a_skipped_entry_is_reported_by_one_flush_only` red (both stores).
-3. `SplitLedger::flush`: move the `set_aside` call above `publish` → `a_skipped_entry_whose_flush_failed_is_reported_by_the_next_one` red.
-4. `RedbStore::mark_published`: delete `drop_candidates` → `a_published_or_set_aside_entry_leaves_the_candidate_index` red.
-5. `RedbStore::set_aside`: make it a no-op → the same test red, and `a_skipped_entry…` red for the redb split suite.
-6. `MemStore::mark_published`: stop inserting into `settled` → `unpublished_lists_only…` red ("waits for no repository") and `a_published_entry_is_never_offered…` red for the memory suite.
-7. `MemStore::set_aside`: make it a no-op → `an_entry_set_aside_waits_no_more…` red.
+1. `SplitLedger::flush`: pass `&[]` as `settle`'s `published` → `a_published_entry_is_never_offered_to_github_again` red (both stores).
+2. `SplitLedger::flush`: pass `&[]` as `settle`'s `set_aside` → `a_skipped_entry_is_reported_by_one_flush_only` red (both stores).
+3. `SplitLedger::flush`: move the `settle` call above `publish` → `a_skipped_entry_whose_flush_failed_is_reported_by_the_next_one` red (and plan A's `a_flush_that_fails_publishes_and_marks_nothing…`).
+4. `RedbStore::settle`: delete `drop_candidates(&tx, published)` → `a_published_or_set_aside_entry_leaves_the_candidate_index` red.
+5. `RedbStore::settle`: delete `drop_candidates(&tx, set_aside)` → the same test red, and `a_skipped_entry…` red for the redb split suite.
+6. `MemStore::mark_published`: stop inserting into `settled` → `unpublished_lists_only…` red ("waits for no repository"); `MemStore::settle`: leave `published` out of `settled` → `a_published_entry_is_never_offered…` red for the memory suite.
+7. `MemStore::settle`: leave `set_aside` out of `settled` → `an_entry_set_aside_waits_no_more…` red.
 8. `MemRemote::publish`: drop `s.batches.push` → `a_published_entry_is_never_offered…` red ("one batch per flush").
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/core/src/split.rs crates/core/src/mem.rs crates/core/src/conformance.rs crates/store/src/lib.rs
 git commit -m "fix(ledger): a flush scans only what waits, and reports a skip once
 
 mark_published drops the entry's candidate row in the same write, and the
-new Outbox::set_aside drops an entry another repository owns after the
-flush that reported it lands. RemoteControl::batches lets the split suite
+new Outbox::settle marks what a landed flush published and sets aside
+what another repository owns, in one write, so the skip is reported once
+and a landed publish is never refused by a second write. RemoteControl::batches lets the split suite
 see what each flush offered, so a missing mark can no longer hide behind
 GitHub's de-duplication. Guards mutation-tested.
 
@@ -1668,7 +1755,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 ### Task 4: A ledger root must look like one; format 4 after an import
 
 **Files:**
-- Modify: `crates/core/src/store.rs` (after `Bindings`, line 474: `ledger_root_shape`), tests
+- Modify: `crates/core/src/store.rs` (after `Bindings`, line 474: `ledger_root_shape`, `node_id_shape`), tests
 - Modify: `crates/core/src/lib.rs:34-37` (export)
 - Modify: `crates/store/src/manifest.rs:224-246` (`check_consistent`), tests `:445-480`
 - Modify: `crates/store/src/lib.rs` tests `:2325-2378`
@@ -1679,8 +1766,10 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 - Produces:
 
 ```rust
-// fl_core::store (re-exported as fl_core::ledger_root_shape)
+// fl_core::store (both re-exported at the crate root)
+// commit, then node_id_shape
 pub fn ledger_root_shape(node_id: &str, commit: &str) -> Result<(), String>;
+pub fn node_id_shape(node_id: &str) -> Result<(), String>;
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -1840,7 +1929,17 @@ pub fn ledger_root_shape(node_id: &str, commit: &str) -> Result<(), String> {
             "`{commit}` is not a full commit id: 40 or 64 lowercase hexadecimal digits"
         ));
     }
-    let first = node_id.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
+    node_id_shape(node_id)
+}
+
+/// Whether `node_id` can be a GitHub node id: 1 to 128 of `A-Za-z0-9_=+/-`,
+/// starting with a letter. `init` asks this before it creates anything, so
+/// a malformed binding leaves no branch behind.
+pub fn node_id_shape(node_id: &str) -> Result<(), String> {
+    let first = node_id
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic());
     let chars = node_id
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '=' | '+' | '/'));
@@ -1854,12 +1953,12 @@ pub fn ledger_root_shape(node_id: &str, commit: &str) -> Result<(), String> {
 }
 ```
 
-In `crates/core/src/lib.rs`, add `ledger_root_shape` to the `pub use store::{…}` list (lines 34-37):
+In `crates/core/src/lib.rs`, add `ledger_root_shape` and `node_id_shape` to the `pub use store::{…}` list (lines 34-37):
 
 ```rust
 pub use store::{
     Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,
-    follow, ledger_root_shape,
+    follow, ledger_root_shape, node_id_shape,
 };
 ```
 
@@ -1899,14 +1998,14 @@ Expected: PASS.
 1. `check_consistent`: delete the `ledger_root_shape` call → `a_ledger_root_that_cannot_be_one_is_refused…` red.
 2. `ledger_root_shape`: accept any length → the `"abc"` and 39-digit cases red.
 3. `ledger_root_shape`: accept uppercase (`is_ascii_hexdigit`) → the uppercase case red.
-4. `ledger_root_shape`: drop the first-letter rule → the `""` and `"1R"` cases red.
-5. `ledger_root_shape`: drop the character rule → the `"R 1"` and `"R_1;"` cases red.
-6. `ledger_root_shape`: drop the 128 limit → the 129-character case red.
+4. `node_id_shape`: drop the first-letter rule → the `""` and `"1R"` cases red.
+5. `node_id_shape`: drop the character rule → the `"R 1"` and `"R_1;"` cases red.
+6. `node_id_shape`: drop the 128 limit → the 129-character case red.
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/core/src/store.rs crates/core/src/lib.rs crates/store/src/manifest.rs crates/store/src/lib.rs crates/cli/tests/manifest.rs
 git commit -m "fix(manifest): a ledger root must look like one; pin format 4 after import
 
@@ -1940,7 +2039,8 @@ pub trait LedgerCache {
     fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError>;
     fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError>;
     fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError>;
-    fn cached_under(&self, repo: &str, dir: &str) -> Result<Vec<(String, CachedSegment)>, StoreError>;
+    fn cached_under(&self, repo: &str, dir: &str)
+        -> Result<Vec<(String, CachedSegment)>, StoreError>;
     fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError>;
 }
 pub trait LedgerMemory: Bindings + LedgerCache + Outbox {}   // blanket impl
@@ -2119,7 +2219,7 @@ pub use split::{
 };
 ```
 
-In `crates/core/src/conformance.rs`, replace line 22 with:
+In `crates/core/src/conformance.rs`, replace the import `use crate::split::{Batch, Outbox, RemoteLedger, SplitLedger};` (line 23 at `ee2663e`, lower after Task 1's import — find it by its content) with:
 
 ```rust
 use crate::split::{Batch, CachedSegment, LedgerCache, Outbox, RemoteLedger, SplitLedger};
@@ -2300,7 +2400,7 @@ Expected: PASS.
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/core/src/split.rs crates/core/src/mem.rs crates/core/src/conformance.rs crates/core/src/lib.rs crates/store/src/lib.rs
 git commit -m "feat(store): remember the last ledger head and every file read
 
@@ -2357,7 +2457,10 @@ pub fn lines(text: &str) -> Vec<(u64, Result<&str, &'static str>)>;
 pub fn plan_append(segments: &[(u64, String)], new: &[String]) -> Vec<(u64, String)>;
 pub struct QuarantineLine { pub id: Iri, pub at: At, pub file: String, pub line: u64,
                             pub quarantined_by: String, pub reason: String, pub by: String }
-impl QuarantineLine { pub fn encode(&self) -> String; pub fn decode(text: &str) -> Result<QuarantineLine, String>; }
+impl QuarantineLine {
+    pub fn encode(&self) -> String;
+    pub fn decode(text: &str) -> Result<QuarantineLine, String>;
+}
 
 // fl_github::ledger::disclose (Visibility re-exported at fl_github::ledger::Visibility)
 pub enum Visibility { Private, NotPrivate }         // Copy, Eq, Debug
@@ -3075,7 +3178,7 @@ Expected: PASS.
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/github/Cargo.toml crates/github/src/lib.rs crates/github/src/ledger/mod.rs crates/github/src/ledger/layout.rs crates/github/src/ledger/disclose.rs Cargo.lock
 git commit -m "feat(github): the ledger branch's format 1, and decision 2's projection
 
@@ -3097,7 +3200,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 - Modify: `crates/github/src/client.rs:116-155` (`graphql`, new `graphql_answer`), `:226-312` (`send`: the permission header), tests
 - Modify: `crates/github/src/lib.rs:4-14`
 - Create: `crates/github/src/fake_git.rs`
-- Modify: `crates/github/src/fake.rs:47-165` (`State`), `:370-391` (`Answer`, `answer`), `:434` (`is_bound`), `:530-578` (`route`), after `:354` (branch helpers)
+- Modify: `crates/github/src/fake.rs:47-165` (`State`), `:370-391` (`Answer`, `answer`), `:434` (`is_bound`), `:469-475` (`repo_json`), `:530-578` (`route`), after `:354` (branch helpers)
 
 **Interfaces:**
 - Consumes: `layout::{BRANCH, FORMAT_FILE, README, README_FILE}` (Task 6).
@@ -3106,7 +3209,10 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 ```rust
 // fl_github::client (GraphqlAnswer re-exported at fl_github::GraphqlAnswer)
 pub struct GraphqlAnswer { pub status: u16, pub data: Option<Value>, pub errors: Vec<Value> }
-impl Client { pub fn graphql_answer(&self, query: &str, variables: Value) -> Result<GraphqlAnswer, StoreError>; }
+impl Client {
+    pub fn graphql_answer(&self, query: &str, variables: Value)
+        -> Result<GraphqlAnswer, StoreError>;
+}
 
 // fl_github::fake_git (cfg test or feature "fake")
 pub struct FakeCommit { pub tree: String, pub parents: Vec<String>, pub message: String }
@@ -3120,7 +3226,8 @@ impl Git {
     pub fn head(&self, branch: &str) -> Option<String>;
     pub fn files_at(&self, commit: &str) -> Option<BTreeMap<String, String>>;
     pub fn is_ancestor(&self, a: &str, b: &str) -> bool;
-    pub fn commit_on(&mut self, branch: &str, changes: &[(String, Option<String>)], message: &str) -> String;
+    pub fn commit_on(&mut self, branch: &str, changes: &[(String, Option<String>)],
+                     message: &str) -> String;
     pub fn first_parents(&self, branch: &str) -> Vec<String>;
 }
 pub fn seed(git: &mut Git, files: &[(&str, &str)]) -> String; // a root commit on fl/ledger
@@ -3129,6 +3236,8 @@ pub fn seed(git: &mut Git, files: &[(&str, &str)]) -> String; // a root commit o
 pub git: Git, pub rulesets: Vec<Ruleset>, pub rules_need_upgrade: bool, pub down: bool,
 pub compare_behind_next: u32, pub fail_next_ref_create: bool, pub race_next_ref_create: bool,
 pub permission_refused_next: Option<String>,
+pub ref_behind_next: u32, pub compare_unknown_next: u32,      // replica lag (spec §3.5 check 2)
+pub omit_visibility: bool, pub fail_next_git_create: bool, pub fail_rules_next: bool,
 
 // fl_github::fake::FakeGithub — branch helpers
 pub fn seed_ledger(&self) -> String;
@@ -3229,7 +3338,9 @@ mod tests {
             .send(
                 Method::Post,
                 &format!("{REPO}/git/trees"),
-                Some(&json!({"tree": [{"path": "format", "mode": "100644", "type": "blob", "content": "1\n"}]})),
+                Some(&json!({"tree": [
+                    {"path": "format", "mode": "100644", "type": "blob", "content": "1\n"},
+                ]})),
             )
             .unwrap();
         assert_eq!(tree.status, 201);
@@ -3361,6 +3472,78 @@ mod tests {
             .send(Method::Get, &format!("{REPO}/rules/branches/fl/ledger"), None)
             .unwrap_err();
         assert!(err.to_string().contains("Upgrade to GitHub"), "{err}");
+    }
+
+    #[test]
+    fn a_tree_or_commit_the_fake_cannot_build_is_refused() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let c = client(&fake);
+        let post = |rest: &str, body: serde_json::Value| {
+            c.send(Method::Post, &format!("{REPO}/{rest}"), Some(&body))
+        };
+        for (rest, body, says) in [
+            ("git/trees", json!({"base_tree": root, "tree": []}), "from scratch"),
+            ("git/trees", json!({}), "tree is required"),
+            ("git/trees", json!({"tree": [{"path": "f", "type": "blob"}]}), "only blobs"),
+            ("git/commits", json!({"tree": "nope"}), "required"),
+            ("git/commits", json!({"tree": "nope", "message": "m"}), "Tree SHA"),
+        ] {
+            let err = post(rest, body).unwrap_err();
+            assert!(err.to_string().contains(says), "{rest} {says}: {err}");
+        }
+        let tree = post("git/trees", json!({"tree": []})).unwrap().body["sha"].clone();
+        let err = post(
+            "git/commits",
+            json!({"tree": tree, "message": "m", "parents": ["nope"]}),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Parent SHA"), "{err}");
+        fake.state().fail_next_git_create = true;
+        assert_eq!(post("git/trees", json!({"tree": []})).unwrap().status, 500);
+        fake.state().fail_next_git_create = true;
+        let made = post("git/commits", json!({"tree": tree, "message": "m"})).unwrap();
+        assert_eq!(made.status, 500);
+    }
+
+    // Spec §3.5 check 2: a replica that has not seen the last write.
+    #[test]
+    fn a_lagging_replica_answers_an_older_head_or_knows_no_commit() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let head = fake.hand_commit(&[("runs/a/1.jsonl", Some("x\n"))]);
+        let c = client(&fake);
+        let read = || {
+            c.send(Method::Get, &format!("{REPO}/git/ref/heads/fl/ledger"), None)
+                .unwrap()
+                .body["object"]["sha"]
+                .clone()
+        };
+        fake.state().ref_behind_next = 1;
+        assert_eq!(read(), json!(root), "the commit before the head");
+        assert_eq!(read(), json!(head), "and then the head");
+        fake.state().compare_unknown_next = 1;
+        let compare = || {
+            c.send(Method::Get, &format!("{REPO}/compare/{root}...{head}"), None)
+                .unwrap()
+                .status
+        };
+        assert_eq!(compare(), 404);
+        assert_eq!(compare(), 200);
+    }
+
+    #[test]
+    fn a_repository_answer_can_name_no_visibility_and_a_rules_read_can_fail() {
+        let fake = FakeGithub::start("acme/widgets");
+        let c = client(&fake);
+        fake.state().omit_visibility = true;
+        let r = c.send(Method::Get, REPO, None).unwrap();
+        assert!(r.body.get("visibility").is_none(), "{}", r.body);
+        fake.state().fail_rules_next = true;
+        let r = c
+            .send(Method::Get, &format!("{REPO}/rules/branches/fl/ledger"), None)
+            .unwrap();
+        assert_eq!(r.status, 500);
     }
 
     #[test]
@@ -3544,6 +3727,36 @@ In `crates/github/src/fake.rs`:
     /// The next request answers 403 naming this permission in
     /// `x-accepted-github-permissions`. One-shot.
     pub permission_refused_next: Option<String>,
+    /// The next this-many branch reads answer the commit before the head
+    /// (its first parent) — a replica that has not seen the last write yet
+    /// (spec §3.5 check 2).
+    pub ref_behind_next: u32,
+    /// The next this-many compares answer 404 — a replica that does not
+    /// know a commit yet, such as the one this machine just wrote.
+    pub compare_unknown_next: u32,
+    /// The repository answer names no `visibility`. A setting.
+    pub omit_visibility: bool,
+    /// The next tree or commit creation answers 500 and creates nothing.
+    /// One-shot.
+    pub fail_next_git_create: bool,
+    /// The next read of a branch's rules answers 500. One-shot.
+    pub fail_rules_next: bool,
+```
+
+5. In `State::repo_json` (lines 469-475), replace the body with:
+
+```rust
+        let mut v = json!({
+            "id": r.id, "node_id": r.node_id, "full_name": r.full_name,
+            "visibility": r.visibility, "private": r.visibility == "private",
+            "has_issues": r.has_issues,
+        });
+        if self.omit_visibility
+            && let Some(map) = v.as_object_mut()
+        {
+            map.remove("visibility");
+        }
+        v
 ```
 
 2. Make `Answer`'s fields and two functions crate-visible: change lines 371-379 to
@@ -3904,10 +4117,28 @@ pub(crate) fn rest(s: &mut State, method: &str, parts: &[&str], body: &str) -> O
     Some(match (method, rest) {
         ("GET", ["git", "ref", name @ ..]) => {
             let name = name.join("/");
-            match s.git.refs.get(&name) {
+            let head = s.git.refs.get(&name).cloned();
+            let lagging = s.ref_behind_next > 0;
+            let sha = match head {
+                // A replica that has not seen the last write: the commit
+                // before the head.
+                Some(h) if lagging => {
+                    s.ref_behind_next -= 1;
+                    s.git
+                        .commits
+                        .get(&h)
+                        .and_then(|c| c.parents.first().cloned())
+                        .or(Some(h))
+                }
+                other => other,
+            };
+            match sha {
                 Some(sha) => answer(
                     200,
-                    json!({"ref": format!("refs/{name}"), "object": {"sha": sha, "type": "commit"}}),
+                    json!({
+                        "ref": format!("refs/{name}"),
+                        "object": {"sha": sha, "type": "commit"},
+                    }),
                 ),
                 None => not_found(),
             }
@@ -3971,6 +4202,9 @@ fn create_ref(s: &mut State, v: &Value) -> Answer {
 }
 
 fn create_tree(s: &mut State, v: &Value) -> Answer {
+    if std::mem::take(&mut s.fail_next_git_create) {
+        return answer(500, json!({"message": "fake failure: nothing was created"}));
+    }
     if !v["base_tree"].is_null() {
         return unprocessable("the fake builds trees from scratch only");
     }
@@ -3991,6 +4225,9 @@ fn create_tree(s: &mut State, v: &Value) -> Answer {
 }
 
 fn create_commit(s: &mut State, v: &Value) -> Answer {
+    if std::mem::take(&mut s.fail_next_git_create) {
+        return answer(500, json!({"message": "fake failure: nothing was created"}));
+    }
     let (Some(tree), Some(message)) = (v["tree"].as_str(), v["message"].as_str()) else {
         return unprocessable("tree and message are required");
     };
@@ -4042,6 +4279,10 @@ fn compare(s: &mut State, spec: &str) -> Answer {
     let Some((base, head)) = spec.split_once("...") else {
         return not_found();
     };
+    if s.compare_unknown_next > 0 {
+        s.compare_unknown_next -= 1;
+        return not_found();
+    }
     if !s.git.commits.contains_key(base) || !s.git.commits.contains_key(head) {
         return not_found();
     }
@@ -4065,11 +4306,15 @@ fn compare(s: &mut State, spec: &str) -> Answer {
 /// a plan without rulesets answers 403 with an upgrade message. Confirmed
 /// by live tests `rules_on_the_ledger_branch_are_readable` and
 /// `a_private_repository_without_a_ruleset_is_detection_only`.
-fn rules(s: &State, full: &str, branch: &str) -> Answer {
+fn rules(s: &mut State, full: &str, branch: &str) -> Answer {
+    if std::mem::take(&mut s.fail_rules_next) {
+        return answer(500, json!({"message": "fake rules failure"}));
+    }
     if s.rules_need_upgrade {
         return answer(
             403,
-            json!({"message": "Upgrade to GitHub Pro or make this repository public to enable this feature."}),
+            json!({"message": "Upgrade to GitHub Pro or make this repository public to enable \
+                               this feature."}),
         );
     }
     let items: Vec<Value> = s
@@ -4105,11 +4350,14 @@ Expected: PASS — the new tests, and every existing client, tracker and creds t
 5. fake `compare`: drop the `compare_behind_next` branch → `a_compare_says_how_two_commits_relate_and_can_lag` red.
 6. fake `rules`: drop the `enforcement == "active"` filter → `the_rules_on_a_branch_are_those_of_active_rulesets` red.
 7. fake `route`: drop the `down` check → `a_fake_that_is_down_is_unreachable` red.
+8. fake `create_tree`: drop the `base_tree` refusal, the missing-`tree` refusal, or the blobs-only refusal; fake `create_commit`: drop the missing-field, unknown-tree or unknown-parent refusal; either: ignore `fail_next_git_create` → `a_tree_or_commit_the_fake_cannot_build_is_refused` red at that row.
+9. fake ref read: ignore `ref_behind_next`; fake `compare`: ignore `compare_unknown_next` → `a_lagging_replica_answers_an_older_head_or_knows_no_commit` red.
+10. fake `repo_json`: ignore `omit_visibility`; fake `rules`: ignore `fail_rules_next` → `a_repository_answer_can_name_no_visibility_and_a_rules_read_can_fail` red.
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/github/src/client.rs crates/github/src/lib.rs crates/github/src/fake.rs crates/github/src/fake_git.rs
 git commit -m "feat(github): GraphQL answers the caller judges; the fake's git objects
 
@@ -4124,11 +4372,12 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 ```
 
 ---
+
 ### Task 8: The fake's ledger GraphQL — listing, `createCommitOnBranch`, blame
 
 **Files:**
 - Modify: `crates/github/src/fake_git.rs` (three operations, tests)
-- Modify: `crates/github/src/fake.rs:47-165` (`State`: four knobs), `:920-921` (the GraphQL arm)
+- Modify: `crates/github/src/fake.rs:47-165` (`State`: five knobs), `:920-921` (the GraphQL arm)
 
 **Interfaces:**
 - Consumes: `Git`, `State`, `answer` (Task 7).
@@ -4140,9 +4389,10 @@ pub foreign_appends: Vec<(String, String)>,  // before each commit: someone appe
 pub fail_commits: u32,                       // the next N commits answer 502, nothing lands
 pub hang_up_after_next_commit: bool,         // lands, then the answer is lost; one-shot
 pub refuse_next_commit_for: Option<String>,  // 403 naming this permission; one-shot
+pub rate_limit_next_commit: bool,            // the commit answers RATE_LIMITED; one-shot
 ```
 
-The three operations, exactly as `GithubLedger` sends them (Tasks 9 and 10):
+The three operations, exactly as `GithubLedger` sends them (Tasks 9–11):
 
 ```graphql
 query ledgerObjects($owner: String!, $name: String!, $e0: String!, …) {
@@ -4166,9 +4416,16 @@ mutation ledgerAppend($input: CreateCommitOnBranchInput!) {
 Append to the `tests` module of `crates/github/src/fake_git.rs`:
 
 ```rust
-    const OBJECTS: &str = "query ledgerObjects($owner: String!, $name: String!, $e0: String!, $e1: String!, $e2: String!, $e3: String!) { repository(owner: $owner, name: $name) { e0: object(expression: $e0) { __typename } } }";
-    const APPEND: &str = "mutation ledgerAppend($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }";
-    const BLAME: &str = "query ledgerBlame($owner: String!, $name: String!, $commit: GitObjectID!, $path: String!) { repository(owner: $owner, name: $name) { object(oid: $commit) { __typename } } }";
+    // The fake tells the operations apart by name and reads the variables;
+    // the fields asked for do not change its answer.
+    const OBJECTS: &str = "query ledgerObjects($owner: String!, $name: String!, \
+        $e0: String!, $e1: String!, $e2: String!, $e3: String!) { \
+        repository(owner: $owner, name: $name) { e0: object(expression: $e0) { __typename } } }";
+    const APPEND: &str = "mutation ledgerAppend($input: CreateCommitOnBranchInput!) { \
+        createCommitOnBranch(input: $input) { commit { oid } } }";
+    const BLAME: &str = "query ledgerBlame($owner: String!, $name: String!, \
+        $commit: GitObjectID!, $path: String!) { \
+        repository(owner: $owner, name: $name) { object(oid: $commit) { __typename } } }";
 
     fn append_input(head: &str, path: &str, text: &str) -> serde_json::Value {
         use base64::Engine;
@@ -4274,6 +4531,18 @@ Append to the `tests` module of `crates/github/src/fake_git.rs`:
     }
 
     #[test]
+    fn a_commit_answered_with_a_spent_rate_limit_lands_nothing() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        fake.state().rate_limit_next_commit = true;
+        let err = client(&fake)
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
+        assert_eq!(fake.ledger_commits(), 1);
+    }
+
+    #[test]
     fn a_commit_refused_for_want_of_a_permission_names_it() {
         let fake = FakeGithub::start("acme/widgets");
         let root = fake.seed_ledger();
@@ -4321,7 +4590,7 @@ Append to the `tests` module of `crates/github/src/fake_git.rs`:
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p fl-github --lib fake_git`
-Expected: FAIL to compile — the four knobs do not exist; once they do, the GraphQL tests fail because the fake answers the operations as node lookups.
+Expected: FAIL to compile — the five knobs do not exist; once they do, the GraphQL tests fail because the fake answers the operations as node lookups.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -4338,6 +4607,8 @@ Add to `State` in `crates/github/src/fake.rs` (after the knobs Task 7 added):
     pub hang_up_after_next_commit: bool,
     /// The next ledger commit answers 403 naming this permission. One-shot.
     pub refuse_next_commit_for: Option<String>,
+    /// The next ledger commit answers GraphQL's RATE_LIMITED. One-shot.
+    pub rate_limit_next_commit: bool,
 ```
 
 In `route`'s GraphQL arm, right after `let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);` (line 921), add:
@@ -4517,8 +4788,17 @@ fn append(s: &mut State, vars: &Value) -> Answer {
             200,
             json!({
                 "data": {"createCommitOnBranch": null},
-                "errors": [{"type": "NOT_FOUND", "message": format!("Could not resolve to a ref named `{branch}`")}],
+                "errors": [{
+                    "type": "NOT_FOUND",
+                    "message": format!("Could not resolve to a ref named `{branch}`"),
+                }],
             }),
+        );
+    }
+    if std::mem::take(&mut s.rate_limit_next_commit) {
+        return answer(
+            200,
+            json!({"data": null, "errors": [{"type": "RATE_LIMITED"}]}),
         );
     }
     if let Some(needs) = s.refuse_next_commit_for.take() {
@@ -4549,7 +4829,10 @@ fn append(s: &mut State, vars: &Value) -> Answer {
                 "data": {"createCommitOnBranch": null},
                 "errors": [{
                     "type": "STALE_DATA", "path": ["createCommitOnBranch"],
-                    "message": format!("Expected branch to point to \"{expected}\" but it did not. Pull and try again."),
+                    "message": format!(
+                        "Expected branch to point to \"{expected}\" but it did not. Pull and \
+                         try again."
+                    ),
                 }],
             }),
         );
@@ -4572,7 +4855,10 @@ fn append(s: &mut State, vars: &Value) -> Answer {
         let (Some(path), Some(text)) = (add["path"].as_str(), text) else {
             return answer(
                 200,
-                json!({"errors": [{"type": "UNPROCESSABLE", "message": "an addition needs a path and base64 contents"}]}),
+                json!({"errors": [{
+                    "type": "UNPROCESSABLE",
+                    "message": "an addition needs a path and base64 contents",
+                }]}),
             );
         };
         changes.push((path.to_string(), Some(text)));
@@ -4609,11 +4895,12 @@ Expected: PASS — the new tests, and every existing tracker test (whose node lo
 5. `object_at`: answer a directory's whole subtree instead of its immediate entries → `the_objects_at_a_commit_are_listed_by_expression` red (`e2` would list files).
 6. `blame`: attribute every line to the newest commit → `blame_names_the_commit_that_last_changed_each_line` red.
 7. `graphql`: answer every query as `ledgerObjects` (return `Some(objects(s, vars))` first) → the tracker's node-lookup tests in `tracker.rs` (every test that reads a record back by its node id) red.
+8. `append`: ignore `rate_limit_next_commit` → `a_commit_answered_with_a_spent_rate_limit_lands_nothing` red.
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/github/src/fake.rs crates/github/src/fake_git.rs
 git commit -m "test(github): the fake answers the ledger's GraphQL
 
@@ -4629,7 +4916,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 
 ---
 
-### Task 9: `GithubLedger` reads the branch — the seven checks
+### Task 9: `GithubLedger` checks the head and the format — checks 1, 2 and 7
 
 **Files:**
 - Modify: `crates/github/src/ledger/mod.rs` (the struct)
@@ -4639,7 +4926,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 - Modify: `crates/github/src/tracker.rs` (after `repo()`, line 276: `client()`)
 
 **Interfaces:**
-- Consumes: `LedgerMemory`, `CachedSegment` (Task 5); `layout` (Task 6); `GraphqlAnswer` (Task 7); the fake (Tasks 7–8); `owner::issue_of_repository` (plan A).
+- Consumes: `LedgerMemory`, `CachedSegment` (Task 5); `layout` (Task 6); the fake, with its lag knobs (Tasks 7–8).
 - Produces:
 
 ```rust
@@ -4647,33 +4934,29 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 pub struct GithubLedger<'a> { /* client, repo, local, lag */ }
 impl<'a> GithubLedger<'a> {
     pub fn new(client: &'a Client, repo: Repo, local: &'a dyn LedgerMemory) -> Self;
-    #[doc(hidden)] pub fn with_lag(self, reads: u32, pause: Duration) -> Self; // default 3 reads, 500 ms
+    // default 3 reads, 500 ms
+    #[doc(hidden)] pub fn with_lag(self, reads: u32, pause: Duration) -> Self;
     pub fn repo(&self) -> &Repo;
-    pub fn check_head(&self) -> Result<String, StoreError>;     // checks 1 and 2
-    pub fn runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError>;
-    pub fn attempts_of(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError>;
-    pub fn decisions(&self, subject: &Iri) -> Result<Vec<Decision>, StoreError>;
-    pub fn owns(&self, record: &RecordId) -> Result<bool, StoreError>;   // local, no request
-    pub fn take_notes(&self) -> Vec<Note>;
+    pub fn check_head(&self) -> Result<String, StoreError>;   // checks 1 and 2; lag read again
+    pub fn check_format(&self) -> Result<String, StoreError>; // and check 7; records the head
 }
-pub enum Note { Quarantined { file: String, line: u64, reason: String } } // Display, Ord
 
-// crate-internal, used by Tasks 10–12
-pub(crate) struct Segment { pub path: String, pub text: String }
-pub(crate) struct Snapshot { pub head: String, pub dirs: BTreeMap<String, Vec<Segment>>, pub quarantine: String }
+// crate-internal, used by Tasks 10–14
+pub(crate) enum Object { Tree, Blob { oid: String } }       // Task 10 gives `Tree` its entries
 impl GithubLedger<'_> {
-    pub(crate) fn snapshot(&self, dirs: &[String]) -> Result<Snapshot, StoreError>; // checks 1–4, 7
-    pub(crate) fn lines(&self, snap: &Snapshot, area: Area, dir: &str) -> Result<Vec<Line>, StoreError>; // 5, 6
-    pub(crate) fn quarantine_lines(&self, snap: &Snapshot) -> Result<Vec<QuarantineLine>, StoreError>;
     pub(crate) fn altered(&self, file: &str, what: impl Into<String>, commit: &str) -> StoreError;
-    pub(crate) fn path(&self, rest: &str) -> String;                       // "/repos/{full_name}{rest}"
+    // "/repos/{full_name}{rest}"
+    pub(crate) fn path(&self, rest: &str) -> String;
     pub(crate) fn branch_head(&self, branch: &str) -> Result<Option<String>, StoreError>;
     pub(crate) fn compare(&self, base: &str, head: &str) -> Result<Option<String>, StoreError>;
+    pub(crate) fn objects(&self, head: &str, paths: &[String])
+        -> Result<Vec<Option<Object>>, StoreError>;
     pub(crate) fn blob_text(&self, oid: &str) -> Result<String, StoreError>;
 }
 
 // fl_github::GithubTracker
-pub fn client(&self) -> &Client;              // for B2, which builds the ledger over the tracker's client
+// B2 and Task 12's fixture build the ledger over the tracker's client
+pub fn client(&self) -> &Client;
 ```
 
 - [ ] **Step 1: Write the failing tests**
@@ -4693,12 +4976,9 @@ mod read;
 use crate::client::Client;
 use crate::tracker::Repo;
 use fl_core::split::LedgerMemory;
-use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub use disclose::Visibility;
-pub use read::Note;
 
 /// The GitHub side of mode B, for one repository and one command.
 ///
@@ -4709,12 +4989,10 @@ pub struct GithubLedger<'a> {
     pub(crate) client: &'a Client,
     pub(crate) repo: Repo,
     pub(crate) local: &'a dyn LedgerMemory,
-    /// How many times a `behind` answer is read again before it counts
+    /// How many times a lagging answer is read again before it counts
     /// (spec §3.5 check 2), and the pause between reads.
     pub(crate) lag_reads: u32,
     pub(crate) lag_pause: Duration,
-    /// What reads noted without refusing, once each.
-    pub(crate) notes: RefCell<BTreeSet<Note>>,
 }
 
 impl<'a> GithubLedger<'a> {
@@ -4725,12 +5003,11 @@ impl<'a> GithubLedger<'a> {
             local,
             lag_reads: 3,
             lag_pause: Duration::from_millis(500),
-            notes: RefCell::new(BTreeSet::new()),
         }
     }
 
-    /// Tests only: how often a lagging `behind` is read again, and the
-    /// pause between reads.
+    /// Tests only: how often a lagging answer is read again, and the pause
+    /// between reads.
     #[doc(hidden)]
     pub fn with_lag(mut self, reads: u32, pause: Duration) -> Self {
         self.lag_reads = reads;
@@ -4740,14 +5017,6 @@ impl<'a> GithubLedger<'a> {
 
     pub fn repo(&self) -> &Repo {
         &self.repo
-    }
-
-    /// What reads noted since the last call (a quarantined line skipped),
-    /// once each, for the command to print.
-    pub fn take_notes(&self) -> Vec<Note> {
-        std::mem::take(&mut *self.notes.borrow_mut())
-            .into_iter()
-            .collect()
     }
 }
 ```
@@ -4763,9 +5032,6 @@ mod tests {
     use crate::fake::FakeGithub;
     use crate::tracker::Repo;
     use fl_core::MemStore;
-    use fl_core::at::At;
-    use fl_core::conformance::{sample_attempt, sample_decision, sample_record_run};
-    use fl_core::ids::seq_iri;
     use fl_core::split::LedgerCache;
     use fl_core::store::Bindings;
     use std::time::Duration;
@@ -4797,35 +5063,6 @@ mod tests {
         GithubLedger::new(c, repo(), local).with_lag(2, Duration::ZERO)
     }
 
-    fn gate() -> GateId {
-        GateId(seq_iri(7))
-    }
-
-    fn record() -> RecordId {
-        RecordId(Iri::parse("https://github.com/acme/widgets/issues/1").unwrap())
-    }
-
-    fn run(n: u64) -> GateRun {
-        sample_record_run(n, &gate(), Some(&record()))
-    }
-
-    fn runs_dir() -> String {
-        layout::dir(Area::Runs, gate().iri())
-    }
-
-    fn seg(n: u64) -> String {
-        layout::segment_path(&runs_dir(), n)
-    }
-
-    /// A segment's text: each line and its newline.
-    fn file(lines: &[String]) -> String {
-        lines.iter().map(|l| format!("{l}\n")).collect()
-    }
-
-    fn line(r: &GateRun) -> String {
-        Line::Run(r.clone()).encode("someone")
-    }
-
     fn blob_reads(fake: &FakeGithub) -> usize {
         fake.state()
             .requests
@@ -4834,11 +5071,17 @@ mod tests {
             .count()
     }
 
+    /// A commit on the fake's ledger that only this test reads: what it holds
+    /// does not matter to the head and format checks.
+    fn commit_on(fake: &FakeGithub, text: &str) -> String {
+        fake.hand_commit(&[("runs/k/1.jsonl", Some(text))])
+    }
+
     #[test]
-    fn a_fresh_ledger_reads_empty_and_remembers_the_head_it_checked() {
+    fn a_fresh_ledger_checks_and_remembers_the_head_it_checked() {
         let (fake, local, root) = world();
         let c = client(&fake);
-        assert!(open(&c, &local).runs(&gate()).unwrap().is_empty());
+        assert_eq!(open(&c, &local).check_format().unwrap(), root);
         assert_eq!(local.last_head("R_1").unwrap(), Some(root));
     }
 
@@ -4871,11 +5114,11 @@ mod tests {
     }
 
     #[test]
-    fn reading_while_github_is_down_is_an_error_not_empty() {
+    fn checking_while_github_is_down_is_an_error_not_a_pass() {
         let (fake, local, _root) = world();
         let c = client(&fake);
         fake.state().down = true;
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        let err = open(&c, &local).check_format().unwrap_err();
         assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
     }
 
@@ -4900,8 +5143,8 @@ mod tests {
     fn a_head_behind_the_last_one_seen_is_read_again_before_it_counts() {
         let (fake, local, _root) = world();
         let c = client(&fake);
-        open(&c, &local).runs(&gate()).unwrap();
-        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        open(&c, &local).check_format().unwrap();
+        commit_on(&fake, "a\n");
         fake.state().compare_behind_next = 2;
         open(&c, &local)
             .check_head()
@@ -4912,13 +5155,10 @@ mod tests {
     fn a_head_that_stays_behind_is_a_rewrite() {
         let (fake, local, _root) = world();
         let c = client(&fake);
-        let first = fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
-        open(&c, &local).runs(&gate()).unwrap();
+        let first = commit_on(&fake, "a\n");
+        open(&c, &local).check_format().unwrap();
         assert_eq!(local.last_head("R_1").unwrap(), Some(first.clone()));
-        fake.hand_commit(&[(
-            seg(1).as_str(),
-            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
-        )]);
+        commit_on(&fake, "a\nb\n");
         fake.state().compare_behind_next = 3;
         match open(&c, &local).check_head().unwrap_err() {
             StoreError::Ledger(LedgerFault::Rewritten {
@@ -4936,8 +5176,8 @@ mod tests {
     fn a_branch_reset_to_an_older_commit_is_a_rewrite() {
         let (fake, local, root) = world();
         let c = client(&fake);
-        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
-        open(&c, &local).runs(&gate()).unwrap();
+        commit_on(&fake, "a\n");
+        open(&c, &local).check_format().unwrap();
         fake.state()
             .git
             .refs
@@ -4949,6 +5189,35 @@ mod tests {
         );
     }
 
+    // ⚠ Ruling 24: right after a write, a replica may answer a branch read
+    // with the head before it, or not know a commit in a compare. Both are
+    // read again before they count; one that persists is a rewrite.
+    #[test]
+    fn a_replica_that_has_not_seen_the_last_write_raises_no_alarm() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let mine = commit_on(&fake, "a\n");
+        // As after this machine's own append: its commit is the last seen.
+        local.set_last_head("R_1", &mine).unwrap();
+        fake.state().ref_behind_next = 1;
+        assert_eq!(open(&c, &local).check_head().unwrap(), mine);
+        commit_on(&fake, "a\nb\n");
+        fake.state().compare_unknown_next = 2;
+        open(&c, &local)
+            .check_head()
+            .expect("a compare that knows the commit after two reads: no alarm");
+        let theirs = commit_on(&fake, "a\nb\nc\n");
+        local.set_last_head("R_1", &theirs).unwrap();
+        commit_on(&fake, "a\nb\nc\nd\n");
+        fake.state().compare_unknown_next = 3;
+        match open(&c, &local).check_head().unwrap_err() {
+            StoreError::Ledger(LedgerFault::Rewritten { how, .. }) => {
+                assert!(how.contains("does not know"), "{how}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     // ⚠ Spec §3.5 check 7.
     #[test]
     fn a_format_other_than_1_is_refused_naming_an_upgrade() {
@@ -4957,9 +5226,13 @@ mod tests {
         let local = MemStore::default();
         local.set_ledger_root("R_1", &root).unwrap();
         let c = client(&fake);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        let err = open(&c, &local).check_format().unwrap_err();
         assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::UnknownFormat { ref found, .. }) if found == "2"),
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::UnknownFormat { ref found, .. })
+                    if found == "2"
+            ),
             "{err:?}"
         );
         assert!(err.to_string().contains("Upgrade fl"), "{err}");
@@ -4972,324 +5245,26 @@ mod tests {
         let local = MemStore::default();
         local.set_ledger_root("R_1", &root).unwrap();
         let c = client(&fake);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        let err = open(&c, &local).check_format().unwrap_err();
         assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref file, .. }) if file == FORMAT_FILE),
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, .. })
+                    if file == FORMAT_FILE
+            ),
             "{err:?}"
         );
     }
 
+    // Spec §3.3: a file read before is not downloaded again.
     #[test]
-    fn runs_read_back_in_the_order_they_were_written_across_segments() {
+    fn the_format_is_downloaded_once() {
         let (fake, local, _root) = world();
-        fake.hand_commit(&[
-            (seg(1).as_str(), Some(file(&[line(&run(1)), line(&run(2))]).as_str())),
-            (seg(2).as_str(), Some(file(&[line(&run(3))]).as_str())),
-        ]);
         let c = client(&fake);
-        assert_eq!(
-            open(&c, &local).runs(&gate()).unwrap(),
-            vec![run(1), run(2), run(3)]
-        );
-    }
-
-    // ⚠ Spec §3.5 check 3: a closed segment never changes — not even by
-    // growing, which an open one may.
-    #[test]
-    fn a_closed_segment_that_changes_is_altered() {
-        let (fake, local, _root) = world();
-        fake.hand_commit(&[
-            (seg(1).as_str(), Some(file(&[line(&run(1))]).as_str())),
-            (seg(2).as_str(), Some(file(&[line(&run(2))]).as_str())),
-        ]);
-        let c = client(&fake);
-        open(&c, &local).runs(&gate()).unwrap();
-        fake.hand_commit(&[(
-            seg(1).as_str(),
-            Some(file(&[line(&run(1)), line(&run(9))]).as_str()),
-        )]);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. }) if *file == seg(1) && what.contains("closed")),
-            "{err:?}"
-        );
-    }
-
-    // ⚠ Spec §3.5 check 4.
-    #[test]
-    fn an_open_segment_that_no_longer_starts_with_the_copy_read_before_is_altered() {
-        let (fake, local, _root) = world();
-        fake.hand_commit(&[(
-            seg(1).as_str(),
-            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
-        )]);
-        let c = client(&fake);
-        open(&c, &local).runs(&gate()).unwrap();
-        let mut edited = run(1);
-        edited.population = 9;
-        fake.hand_commit(&[(
-            seg(1).as_str(),
-            Some(file(&[line(&edited), line(&run(2))]).as_str()),
-        )]);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref what, .. }) if what.contains("no longer starts")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn an_open_segment_that_grew_is_read_again_and_cached() {
-        let (fake, local, _root) = world();
-        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
-        let c = client(&fake);
-        open(&c, &local).runs(&gate()).unwrap();
-        fake.hand_commit(&[(
-            seg(1).as_str(),
-            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
-        )]);
-        assert_eq!(open(&c, &local).runs(&gate()).unwrap(), vec![run(1), run(2)]);
-        let cached = local.cached("R_1", &seg(1)).unwrap().unwrap();
-        assert!(cached.text.contains(&line(&run(2))));
-    }
-
-    #[test]
-    fn a_segment_that_disappears_or_leaves_a_gap_is_altered() {
-        let (fake, local, _root) = world();
-        fake.hand_commit(&[(seg(2).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
-        let c = client(&fake);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref what, .. }) if what.contains("missing a segment")),
-            "{err:?}"
-        );
-
-        let (fake2, local2, _root2) = world();
-        fake2.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
-        let c2 = client(&fake2);
-        open(&c2, &local2).runs(&gate()).unwrap();
-        fake2.hand_commit(&[(seg(1).as_str(), None)]);
-        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. }) if *file == seg(1) && what.contains("deleted")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn a_file_that_is_not_a_segment_or_a_file_where_a_directory_belongs_is_altered() {
-        let (fake, local, _root) = world();
-        let stray = format!("{}/notes.txt", runs_dir());
-        fake.hand_commit(&[(stray.as_str(), Some("x"))]);
-        let c = client(&fake);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref file, .. }) if *file == stray),
-            "{err:?}"
-        );
-
-        let (fake2, local2, _root2) = world();
-        fake2.hand_commit(&[(runs_dir().as_str(), Some("x"))]);
-        let c2 = client(&fake2);
-        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref what, .. }) if what.contains("directory")),
-            "{err:?}"
-        );
-    }
-
-    // Spec §3.3: a segment read before is not downloaded again.
-    #[test]
-    fn a_segment_read_before_is_not_downloaded_again() {
-        let (fake, local, _root) = world();
-        fake.hand_commit(&[
-            (seg(1).as_str(), Some(file(&[line(&run(1))]).as_str())),
-            (seg(2).as_str(), Some(file(&[line(&run(2))]).as_str())),
-        ]);
-        let c = client(&fake);
-        open(&c, &local).runs(&gate()).unwrap();
+        open(&c, &local).check_format().unwrap();
         let before = blob_reads(&fake);
-        assert_eq!(open(&c, &local).runs(&gate()).unwrap(), vec![run(1), run(2)]);
-        assert_eq!(blob_reads(&fake), before, "nothing downloaded twice");
-    }
-
-    // ⚠ Spec §3.3: an unreadable line names the file, the line, the commit
-    // that added it, and the quarantine command.
-    #[test]
-    fn an_unreadable_line_names_its_file_line_commit_and_the_quarantine_command() {
-        let (fake, local, _root) = world();
-        let first = fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
-        let damaged = format!("{}not json\n", file(&[line(&run(1))]));
-        let bad = fake.hand_commit(&[(seg(1).as_str(), Some(damaged.as_str()))]);
-        // A later commit that reads do not look at: the head is not `bad`.
-        fake.hand_commit(&[("notes.txt", Some("x"))]);
-        let c = client(&fake);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
-        match &err {
-            StoreError::Ledger(LedgerFault::Unreadable {
-                file: f,
-                line: n,
-                commit,
-                ..
-            }) => {
-                assert_eq!(f, &seg(1));
-                assert_eq!(*n, 2);
-                assert_eq!(commit, &bad);
-                assert_ne!(commit, &first);
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(
-            err.to_string()
-                .contains(&format!("fl github ledger quarantine {} 2", seg(1))),
-            "{err}"
-        );
-    }
-
-    // Spec §3.6: a quarantined line is skipped and reported; nothing is
-    // removed.
-    #[test]
-    fn a_quarantined_line_is_skipped_and_noted_once() {
-        let (fake, local, _root) = world();
-        let q = QuarantineLine {
-            id: seq_iri(50),
-            at: At::from_unix_millis(50),
-            file: seg(1),
-            line: 2,
-            quarantined_by: "Ada".into(),
-            reason: "a hand edit".into(),
-            by: "fake-user".into(),
-        };
-        let damaged = format!("{}not json\n{}", file(&[line(&run(1))]), file(&[line(&run(3))]));
-        fake.hand_commit(&[
-            (seg(1).as_str(), Some(damaged.as_str())),
-            (QUARANTINE_FILE, Some(file(&[q.encode()]).as_str())),
-        ]);
-        let c = client(&fake);
-        let l = open(&c, &local);
-        assert_eq!(l.runs(&gate()).unwrap(), vec![run(1), run(3)]);
-        l.runs(&gate()).unwrap();
-        assert_eq!(
-            l.take_notes(),
-            vec![Note::Quarantined {
-                file: seg(1),
-                line: 2,
-                reason: "a hand edit".into(),
-            }],
-            "once, however often it is read"
-        );
-        assert!(
-            fake.ledger_files()[&seg(1)].contains("not json"),
-            "nothing was removed"
-        );
-    }
-
-    // ⚠ Spec §3.5 check 6.
-    #[test]
-    fn a_line_in_the_wrong_directory_is_misplaced() {
-        let (fake, local, _root) = world();
-        let elsewhere = sample_record_run(1, &GateId(seq_iri(8)), Some(&record()));
-        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&elsewhere)]).as_str()))]);
-        let c = client(&fake);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Misplaced { line: 1, .. })),
-            "{err:?}"
-        );
-        assert!(err.to_string().contains("fl github ledger quarantine"), "{err}");
-    }
-
-    // ⚠ Spec §3.5 check 5: one id, one content.
-    #[test]
-    fn one_id_with_two_contents_is_tampered_and_an_identical_copy_is_read_once() {
-        let (fake, local, _root) = world();
-        fake.hand_commit(&[(
-            seg(1).as_str(),
-            Some(file(&[line(&run(1)), line(&run(1)), line(&run(2))]).as_str()),
-        )]);
-        let c = client(&fake);
-        assert_eq!(open(&c, &local).runs(&gate()).unwrap(), vec![run(1), run(2)]);
-        let mut other = run(1);
-        other.commit = "def".into();
-        fake.hand_commit(&[(
-            seg(1).as_str(),
-            Some(file(&[line(&run(1)), line(&run(1)), line(&run(2)), line(&other)]).as_str()),
-        )]);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
-        let want = run(1).id.unwrap();
-        assert!(
-            matches!(err, StoreError::Tampered { ref id, .. } if *id == want),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn an_unreadable_or_vanished_quarantine_file_is_altered() {
-        let (fake, local, _root) = world();
-        fake.hand_commit(&[(QUARANTINE_FILE, Some("not json\n"))]);
-        let c = client(&fake);
-        let err = open(&c, &local).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref file, .. }) if file == QUARANTINE_FILE),
-            "{err:?}"
-        );
-
-        let (fake2, local2, _root2) = world();
-        let q = QuarantineLine {
-            id: seq_iri(50),
-            at: At::from_unix_millis(50),
-            file: seg(1),
-            line: 1,
-            quarantined_by: "Ada".into(),
-            reason: "r".into(),
-            by: "fake-user".into(),
-        };
-        fake2.hand_commit(&[(QUARANTINE_FILE, Some(file(&[q.encode()]).as_str()))]);
-        let c2 = client(&fake2);
-        open(&c2, &local2).runs(&gate()).unwrap();
-        fake2.hand_commit(&[(QUARANTINE_FILE, None)]);
-        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
-        assert!(
-            matches!(err, StoreError::Ledger(LedgerFault::Altered { ref what, .. }) if what.contains("deleted")),
-            "{err:?}"
-        );
-    }
-
-    #[test]
-    fn attempts_and_decisions_read_from_their_own_directories() {
-        let (fake, local, _root) = world();
-        let p = ProjectId(seq_iri(8));
-        let a = sample_attempt(2, &p, &record());
-        let d = sample_decision(3, &record(), vec![]);
-        let adir = layout::dir(Area::Attempts, p.iri());
-        let ddir = layout::dir(Area::Decisions, record().iri());
-        fake.hand_commit(&[
-            (
-                layout::segment_path(&adir, 1).as_str(),
-                Some(file(&[Line::Attempt(a.clone()).encode("x")]).as_str()),
-            ),
-            (
-                layout::segment_path(&ddir, 1).as_str(),
-                Some(file(&[Line::Decision(d.clone()).encode("x")]).as_str()),
-            ),
-        ]);
-        let c = client(&fake);
-        let l = open(&c, &local);
-        assert_eq!(l.attempts_of(&p).unwrap(), vec![a]);
-        assert_eq!(l.decisions(record().iri()).unwrap(), vec![d]);
-    }
-
-    // Spec §2.1: ownership is a local answer, with no request.
-    #[test]
-    fn a_record_this_repository_holds_is_owned_and_another_is_not() {
-        let (fake, local, _root) = world();
-        let c = client(&fake);
-        let l = open(&c, &local);
-        let before = fake.state().requests.len();
-        assert!(l.owns(&record()).unwrap());
-        let theirs = RecordId(Iri::parse("https://github.com/acme/other/issues/1").unwrap());
-        assert!(!l.owns(&theirs).unwrap());
-        assert_eq!(fake.state().requests.len(), before, "no request");
+        open(&c, &local).check_format().unwrap();
+        assert_eq!(blob_reads(&fake), before);
     }
 }
 ```
@@ -5297,7 +5272,7 @@ mod tests {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p fl-github --lib ledger::read`
-Expected: FAIL to compile — `git.rs` and the read methods do not exist.
+Expected: FAIL to compile — `git.rs`, `check_head` and `check_format` do not exist.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -5330,27 +5305,16 @@ use base64::engine::general_purpose::STANDARD;
 use fl_core::StoreError;
 use serde_json::{Map, Value, json};
 
-/// What a path on the branch is at one commit.
+/// What a path on the branch is at one commit. A directory's entries are
+/// read where a directory is listed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Object {
-    Tree(Vec<Entry>),
+    Tree,
     Blob { oid: String },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Entry {
-    pub name: String,
-    pub oid: String,
-    pub is_blob: bool,
 }
 
 const OBJECT_FIELDS: &str =
     "__typename ... on Tree { entries { name oid type } } ... on Blob { oid }";
-
-/// ⚠ Modelled: `Commit.blame(path:)` names the commit that last changed
-/// each range of lines. Confirmed by live test
-/// `a_hand_edit_is_detected_and_named`.
-const BLAME: &str = "query ledgerBlame($owner: String!, $name: String!, $commit: GitObjectID!, $path: String!) { repository(owner: $owner, name: $name) { object(oid: $commit) { ... on Commit { blame(path: $path) { ranges { startingLine endingLine commit { oid } } } } } } }";
 
 fn backend(msg: String) -> StoreError {
     StoreError::Backend(msg)
@@ -5437,7 +5401,1009 @@ impl GithubLedger<'_> {
             vars.insert(format!("e{i}"), json!(format!("{head}:{p}")));
         }
         let query = format!(
-            "query ledgerObjects({declared}) {{ repository(owner: $owner, name: $name) {{{fields} }} }}"
+            "query ledgerObjects({declared}) {{ repository(owner: $owner, name: $name) \
+             {{{fields} }} }}"
+        );
+        let data = self.client.graphql(&query, Value::Object(vars))?;
+        let repo = data
+            .get("repository")
+            .filter(|r| !r.is_null())
+            .ok_or_else(|| {
+                backend(format!(
+                    "GitHub did not find the repository {} when fl read its ledger",
+                    self.repo.full_name
+                ))
+            })?;
+        paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| parse_object(&repo[format!("e{i}").as_str()], p))
+            .collect()
+    }
+
+    /// A blob's text, downloaded.
+    ///
+    /// ⚠ Lossy on purpose: bytes that are not UTF-8 become U+FFFD, so a
+    /// damaged file fails the line and growth checks by name instead of
+    /// failing here without one.
+    pub(crate) fn blob_text(&self, oid: &str) -> Result<String, StoreError> {
+        let r = self
+            .client
+            .send(Method::Get, &self.path(&format!("/git/blobs/{oid}")), None)?;
+        if r.status != 200 {
+            return Err(backend(format!(
+                "GitHub answered {} when fl read ledger blob {oid}; retry",
+                r.status
+            )));
+        }
+        // GitHub wraps the base64 in lines.
+        let content: String = r
+            .body
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| backend(format!("GitHub answered ledger blob {oid} with no content")))?
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace())
+            .collect();
+        let bytes = STANDARD.decode(content).map_err(|e| {
+            backend(format!(
+                "GitHub answered ledger blob {oid} with content that is not base64 ({e})"
+            ))
+        })?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
+fn parse_object(v: &Value, path: &str) -> Result<Option<Object>, StoreError> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    match v.get("__typename").and_then(Value::as_str) {
+        Some("Blob") => {
+            let oid = v.get("oid").and_then(Value::as_str).ok_or_else(|| {
+                backend(format!("GitHub answered `{path}` on the ledger branch with no id"))
+            })?;
+            Ok(Some(Object::Blob { oid: oid.to_string() }))
+        }
+        Some("Tree") => Ok(Some(Object::Tree)),
+        other => Err(backend(format!(
+            "GitHub answered `{path}` on the ledger branch as {other:?}, which is neither a \
+             file nor a directory"
+        ))),
+    }
+}
+```
+
+Prepend to `crates/github/src/ledger/read.rs` (above its tests):
+
+```rust
+//! Reading the `fl/ledger` branch (GitHub ledger spec §3.3, §3.5): the
+//! checked head and the format. Each check is named where it is made.
+
+use super::GithubLedger;
+use super::git::Object;
+use super::layout::{BRANCH, FORMAT, FORMAT_FILE};
+use fl_core::split::CachedSegment;
+use fl_core::{LedgerFault, StoreError};
+
+impl GithubLedger<'_> {
+    pub(crate) fn altered(&self, file: &str, what: impl Into<String>, commit: &str) -> StoreError {
+        LedgerFault::Altered {
+            repo: self.repo.full_name.clone(),
+            file: file.to_string(),
+            what: what.into(),
+            commit: commit.to_string(),
+        }
+        .into()
+    }
+
+    /// The head of `fl/ledger`, checked (spec §3.5 checks 1 and 2).
+    ///
+    /// ⚠ One compare (ruling 9): against the last head this machine saw
+    /// when there is one, else against the anchor. Every head recorded as
+    /// seen was itself checked to descend from the anchor, so descending
+    /// from it is descending from the anchor. A `behind` answer, or a
+    /// compare that does not know one of the commits, is read again
+    /// `lag_reads` times before it counts: GitHub's replicas can briefly lag
+    /// a write — above all this machine's own, which it records as the last
+    /// head seen (ruling 24).
+    pub fn check_head(&self) -> Result<String, StoreError> {
+        let repo = self.repo.full_name.clone();
+        let node = self.repo.node_id.as_str();
+        let anchor = self.local.ledger_root(node)?;
+        let mut reads = 0u32;
+        loop {
+            let (head, anchor) = match (self.branch_head(BRANCH)?, anchor.clone()) {
+                (Some(h), Some(a)) => (h, a),
+                (None, None) => return Err(LedgerFault::NotSetUp { repo }.into()),
+                (None, Some(root)) => return Err(LedgerFault::Deleted { repo, root }.into()),
+                (Some(_), None) => return Err(LedgerFault::NoAnchor { repo }.into()),
+            };
+            let (against, base) = match self.local.last_head(node)? {
+                Some(seen) => ("the last head this machine saw", seen),
+                None => ("the ledger's first commit", anchor),
+            };
+            if head == base {
+                return Ok(head);
+            }
+            match self.compare(&base, &head)?.as_deref() {
+                Some("ahead" | "identical") => return Ok(head),
+                Some("behind") | None if reads < self.lag_reads => {
+                    reads += 1;
+                    std::thread::sleep(self.lag_pause);
+                }
+                other => {
+                    let how = match other {
+                        Some("behind") => {
+                            format!("it is behind it, still after {reads} reads again")
+                        }
+                        Some(s) => format!("GitHub compares them as `{s}`"),
+                        None => format!(
+                            "GitHub does not know one of the two commits, still after {reads} \
+                             reads again"
+                        ),
+                    };
+                    return Err(LedgerFault::Rewritten {
+                        repo,
+                        head,
+                        against,
+                        base,
+                        how,
+                    }
+                    .into());
+                }
+            }
+        }
+    }
+
+    /// The checked head (checks 1 and 2) whose `format` this fl reads
+    /// (check 7), recorded as the last head seen (ruling 10). What B2's
+    /// pre-flight asks before any gate or adapter runs (spec §2.4).
+    pub fn check_format(&self) -> Result<String, StoreError> {
+        let head = self.check_head()?;
+        let found = self.objects(&head, &[FORMAT_FILE.to_string()])?;
+        self.format(&head, found[0].as_ref())?;
+        self.local.set_last_head(&self.repo.node_id, &head)?;
+        Ok(head)
+    }
+
+    /// `path`'s text at blob `oid` — from this machine's cache when it
+    /// holds that blob, else downloaded — and what the cache held before.
+    fn text_at(&self, path: &str, oid: &str) -> Result<(String, Option<CachedSegment>), StoreError> {
+        let before = self.local.cached(&self.repo.node_id, path)?;
+        let text = match &before {
+            Some(c) if c.oid == oid => c.text.clone(),
+            _ => self.blob_text(oid)?,
+        };
+        Ok((text, before))
+    }
+
+    /// ⚠ Check 7: the format is one this fl knows.
+    fn format(&self, head: &str, found: Option<&Object>) -> Result<(), StoreError> {
+        let Some(Object::Blob { oid }) = found else {
+            return Err(self.altered(FORMAT_FILE, "is missing, or is not a file", head));
+        };
+        let (text, _) = self.text_at(FORMAT_FILE, oid)?;
+        if text.strip_suffix('\n').unwrap_or(&text) != FORMAT {
+            return Err(LedgerFault::UnknownFormat {
+                repo: self.repo.full_name.clone(),
+                found: text.trim().to_string(),
+            }
+            .into());
+        }
+        self.local.cache(
+            &self.repo.node_id,
+            FORMAT_FILE,
+            &CachedSegment {
+                oid: oid.clone(),
+                text,
+                closed: true,
+            },
+        )
+    }
+}
+
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p fl-github`
+Expected: PASS.
+
+- [ ] **Step 5: Mutation checks**
+
+1. `check_head`: swap the `(None, Some(root))` and `(Some(_), None)` arms' faults → `a_ledger_that_is_not_there_says_why` red.
+2. `check_head`: accept `diverged` with `ahead` → `a_head_that_does_not_descend_from_the_anchor_is_a_rewrite` red.
+3. `check_head`: narrow the read-again arm to `None` only, so a first `behind` is a rewrite → `a_head_behind_the_last_one_seen_is_read_again_before_it_counts` red.
+4. `check_head`: narrow the read-again arm to `Some("behind")` only → `a_replica_that_has_not_seen_the_last_write_raises_no_alarm` red (the unknown commit).
+5. `check_head`: read again without limit (drop `if reads < self.lag_reads`) → `a_head_that_stays_behind_is_a_rewrite` red: once the knob runs out the real compare answers `ahead`, so no error comes back.
+6. `check_head`: always compare against the anchor, ignoring the last head → `a_head_that_stays_behind_is_a_rewrite` red (its `base`) and `a_branch_reset…` red (the reset head is the anchor).
+7. `format`: accept any text → `a_format_other_than_1…` red; accept a missing file → `a_ledger_with_no_format_file_is_altered` red.
+8. `check_format`: drop `set_last_head` → `a_fresh_ledger_checks_and_remembers…` and `a_head_that_stays_behind…` red.
+9. `text_at`: always download → `the_format_is_downloaded_once` red.
+
+- [ ] **Step 6: Run the trio and commit**
+
+```bash
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+git add crates/github/src/lib.rs crates/github/src/tracker.rs crates/github/src/ledger/mod.rs crates/github/src/ledger/git.rs crates/github/src/ledger/read.rs
+git commit -m "feat(github): GithubLedger checks the ledger's head and format
+
+The head must exist, have an anchor, and descend from the last head this
+machine saw, else from the anchor; a behind answer, or a compare that does
+not know a commit yet, is read again a few times first, since a replica
+can lag a write (this machine's own above all). The format must be 1.
+Guards mutation-tested.
+
+Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
+```
+
+---
+
+### Task 10: `GithubLedger` reads segments and lines — checks 3–6, and quarantine skipped
+
+**Files:**
+- Modify: `crates/github/src/ledger/mod.rs` (notes)
+- Modify: `crates/github/src/ledger/git.rs` (directory entries, blame)
+- Modify: `crates/github/src/ledger/read.rs` (snapshots, lines, reads, ownership)
+
+**Interfaces:**
+- Consumes: Task 9's `check_head`, `objects`, `blob_text`, `text_at`, `format`; `owner::issue_of_repository` (plan A).
+- Produces:
+
+```rust
+// fl_github::ledger
+impl GithubLedger<'_> {
+    pub fn runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError>;
+    pub fn attempts_of(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError>;
+    pub fn decisions(&self, subject: &Iri) -> Result<Vec<Decision>, StoreError>;
+    pub fn owns(&self, record: &RecordId) -> Result<bool, StoreError>;   // local, no request
+    pub fn take_notes(&self) -> Vec<Note>;
+}
+pub enum Note { Quarantined { file: String, line: u64, reason: String } } // Display, Ord
+
+// crate-internal, used by Tasks 11–14
+pub(crate) enum Object { Tree(Vec<Entry>), Blob { oid: String } }
+pub(crate) struct Entry { pub name: String, pub oid: String, pub is_blob: bool }
+pub(crate) struct Segment { pub path: String, pub text: String }
+pub(crate) struct Snapshot {
+    pub head: String,
+    pub dirs: BTreeMap<String, Vec<Segment>>,
+    pub quarantine: String,
+}
+impl GithubLedger<'_> {
+    pub(crate) fn snapshot(&self, dirs: &[String]) -> Result<Snapshot, StoreError>; // checks 1–4, 7
+    // 5, 6
+    pub(crate) fn lines(&self, snap: &Snapshot, area: Area, dir: &str)
+        -> Result<Vec<Line>, StoreError>;
+    pub(crate) fn quarantine_lines(&self, snap: &Snapshot)
+        -> Result<Vec<QuarantineLine>, StoreError>;
+    pub(crate) fn blame(&self, commit: &str, path: &str, line: u64) -> String;
+}
+```
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to the top of the `tests` module of `crates/github/src/ledger/read.rs`, after its `use` lines:
+
+```rust
+    use fl_core::at::At;
+    use fl_core::conformance::{sample_attempt, sample_decision, sample_record_run};
+    use fl_core::ids::seq_iri;
+```
+
+after its `blob_reads` helper:
+
+```rust
+    fn gate() -> GateId {
+        GateId(seq_iri(7))
+    }
+
+    fn record() -> RecordId {
+        RecordId(Iri::parse("https://github.com/acme/widgets/issues/1").unwrap())
+    }
+
+    fn run(n: u64) -> GateRun {
+        sample_record_run(n, &gate(), Some(&record()))
+    }
+
+    fn runs_dir() -> String {
+        layout::dir(Area::Runs, gate().iri())
+    }
+
+    fn seg(n: u64) -> String {
+        layout::segment_path(&runs_dir(), n)
+    }
+
+    /// A segment's text: each line and its newline.
+    fn file(lines: &[String]) -> String {
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    fn line(r: &GateRun) -> String {
+        Line::Run(r.clone()).encode("someone")
+    }
+```
+
+and at its end:
+
+```rust
+    #[test]
+    fn reading_while_github_is_down_is_an_error_not_empty() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        fake.state().down = true;
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn runs_read_back_in_the_order_they_were_written_across_segments() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(file(&[line(&run(1)), line(&run(2))]).as_str())),
+            (seg(2).as_str(), Some(file(&[line(&run(3))]).as_str())),
+        ]);
+        let c = client(&fake);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2), run(3)]
+        );
+    }
+
+    // ⚠ Spec §3.5 check 3: a closed segment never changes — not even by
+    // growing, which an open one may.
+    #[test]
+    fn a_closed_segment_that_changes_is_altered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(file(&[line(&run(1))]).as_str())),
+            (seg(2).as_str(), Some(file(&[line(&run(2))]).as_str())),
+        ]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(9))]).as_str()),
+        )]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if *file == seg(1) && what.contains("closed")
+            ),
+            "{err:?}"
+        );
+    }
+
+    // ⚠ Spec §3.5 check 4.
+    #[test]
+    fn an_open_segment_that_no_longer_starts_with_the_copy_read_before_is_altered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+        )]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        let mut edited = run(1);
+        edited.population = 9;
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&edited), line(&run(2))]).as_str()),
+        )]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("no longer starts")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_segment_that_grew_is_read_again_and_cached() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+        )]);
+        assert_eq!(open(&c, &local).runs(&gate()).unwrap(), vec![run(1), run(2)]);
+        let cached = local.cached("R_1", &seg(1)).unwrap().unwrap();
+        assert!(cached.text.contains(&line(&run(2))));
+    }
+
+    // ⚠ The segment cache must not raise false alarms (checks 3 and 4):
+    // another machine growing the open segment and rolling over to a new
+    // one is what the ledger is for.
+    #[test]
+    fn appends_and_a_rollover_by_another_machine_raise_no_alarm() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(file(&[line(&run(1)), line(&run(2))]).as_str())),
+            (seg(2).as_str(), Some(file(&[line(&run(3))]).as_str())),
+        ]);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2), run(3)]
+        );
+        fake.hand_commit(&[(
+            seg(2).as_str(),
+            Some(file(&[line(&run(3)), line(&run(4))]).as_str()),
+        )]);
+        assert_eq!(open(&c, &local).runs(&gate()).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_segment_that_disappears_or_leaves_a_gap_is_altered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(2).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("missing a segment")
+            ),
+            "{err:?}"
+        );
+
+        let (fake2, local2, _root2) = world();
+        fake2.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c2 = client(&fake2);
+        open(&c2, &local2).runs(&gate()).unwrap();
+        fake2.hand_commit(&[(seg(1).as_str(), None)]);
+        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if *file == seg(1) && what.contains("deleted")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn anything_in_a_directory_but_a_segment_or_a_file_where_a_directory_belongs_is_altered() {
+        let (fake, local, _root) = world();
+        let stray = format!("{}/notes.txt", runs_dir());
+        fake.hand_commit(&[(stray.as_str(), Some("x"))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, .. })
+                    if *file == stray
+            ),
+            "{err:?}"
+        );
+
+        // A directory inside a segment directory is not a segment either.
+        let (fake3, local3, _root3) = world();
+        let nested = format!("{}/sub/1.jsonl", runs_dir());
+        fake3.hand_commit(&[(nested.as_str(), Some("x"))]);
+        let c3 = client(&fake3);
+        let err = open(&c3, &local3).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if *file == format!("{}/sub", runs_dir()) && what.contains("not a segment")
+            ),
+            "{err:?}"
+        );
+
+        let (fake2, local2, _root2) = world();
+        fake2.hand_commit(&[(runs_dir().as_str(), Some("x"))]);
+        let c2 = client(&fake2);
+        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("directory")
+            ),
+            "{err:?}"
+        );
+    }
+
+    // Spec §3.3: a segment read before is not downloaded again.
+    #[test]
+    fn a_segment_read_before_is_not_downloaded_again() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(file(&[line(&run(1))]).as_str())),
+            (seg(2).as_str(), Some(file(&[line(&run(2))]).as_str())),
+        ]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        let before = blob_reads(&fake);
+        assert_eq!(open(&c, &local).runs(&gate()).unwrap(), vec![run(1), run(2)]);
+        assert_eq!(blob_reads(&fake), before, "nothing downloaded twice");
+    }
+
+    // ⚠ Spec §3.3: an unreadable line names the file, the line, the commit
+    // that added it, and the quarantine command.
+    #[test]
+    fn an_unreadable_line_names_its_file_line_commit_and_the_quarantine_command() {
+        let (fake, local, _root) = world();
+        let first = fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let damaged = format!("{}not json\n", file(&[line(&run(1))]));
+        let bad = fake.hand_commit(&[(seg(1).as_str(), Some(damaged.as_str()))]);
+        // A later commit that reads do not look at: the head is not `bad`.
+        fake.hand_commit(&[("notes.txt", Some("x"))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        match &err {
+            StoreError::Ledger(LedgerFault::Unreadable {
+                file: f,
+                line: n,
+                commit,
+                ..
+            }) => {
+                assert_eq!(f, &seg(1));
+                assert_eq!(*n, 2);
+                assert_eq!(commit, &bad);
+                assert_ne!(commit, &first);
+            }
+            other => panic!("{other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("fl github ledger quarantine {} 2", seg(1))),
+            "{msg}"
+        );
+        assert!(msg.contains("upgrade fl"), "a newer fl's line reads as this: {msg}");
+    }
+
+    // ⚠ Spec §3.1: a new field means a new format. A line a newer fl wrote
+    // with a field this fl does not know is unreadable here, and the
+    // message says a newer fl may have written it.
+    #[test]
+    fn a_line_with_a_field_this_fl_does_not_write_is_unreadable_and_says_to_upgrade() {
+        let (fake, local, _root) = world();
+        let mut v: serde_json::Value = serde_json::from_str(&line(&run(1))).unwrap();
+        v["retried"] = serde_json::Value::Bool(true);
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[v.to_string()]).as_str()))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Ledger(LedgerFault::Unreadable { line: 1, .. })),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("upgrade fl"), "{err}");
+    }
+
+    // Spec §3.6: a quarantined line is skipped and reported; nothing is
+    // removed.
+    #[test]
+    fn a_quarantined_line_is_skipped_and_noted_once() {
+        let (fake, local, _root) = world();
+        let q = QuarantineLine {
+            id: seq_iri(50),
+            at: At::from_unix_millis(50),
+            file: seg(1),
+            line: 2,
+            quarantined_by: "Ada".into(),
+            reason: "a hand edit".into(),
+            by: "fake-user".into(),
+        };
+        let damaged = format!("{}not json\n{}", file(&[line(&run(1))]), file(&[line(&run(3))]));
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(damaged.as_str())),
+            (QUARANTINE_FILE, Some(file(&[q.encode()]).as_str())),
+        ]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        assert_eq!(l.runs(&gate()).unwrap(), vec![run(1), run(3)]);
+        l.runs(&gate()).unwrap();
+        assert_eq!(
+            l.take_notes(),
+            vec![Note::Quarantined {
+                file: seg(1),
+                line: 2,
+                reason: "a hand edit".into(),
+            }],
+            "once, however often it is read"
+        );
+        assert!(
+            fake.ledger_files()[&seg(1)].contains("not json"),
+            "nothing was removed"
+        );
+    }
+
+    // ⚠ Spec §3.5 check 6 and §7: a line in the wrong directory is
+    // tampering, naming the file and the commit; quarantine is offered too.
+    #[test]
+    fn a_line_in_the_wrong_directory_is_reported_as_tampering() {
+        let (fake, local, _root) = world();
+        let elsewhere = sample_record_run(1, &GateId(seq_iri(8)), Some(&record()));
+        let added =
+            fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&elsewhere)]).as_str()))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Misplaced { line: 1, ref commit, .. })
+                    if *commit == added
+            ),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        for part in ["was altered", "fl github ledger verify", "fl github ledger quarantine"] {
+            assert!(msg.contains(part), "{part}: {msg}");
+        }
+    }
+
+    // ⚠ Spec §3.5 check 5: one id, one content.
+    #[test]
+    fn one_id_with_two_contents_is_tampered_and_an_identical_copy_is_read_once() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(1)), line(&run(2))]).as_str()),
+        )]);
+        let c = client(&fake);
+        assert_eq!(open(&c, &local).runs(&gate()).unwrap(), vec![run(1), run(2)]);
+        let mut other = run(1);
+        other.commit = "def".into();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(1)), line(&run(2)), line(&other)]).as_str()),
+        )]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        let want = run(1).id.unwrap();
+        assert!(
+            matches!(err, StoreError::Tampered { ref id, .. } if *id == want),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_or_vanished_quarantine_file_is_altered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(QUARANTINE_FILE, Some("not json\n"))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, .. })
+                    if file == QUARANTINE_FILE
+            ),
+            "{err:?}"
+        );
+
+        let (fake2, local2, _root2) = world();
+        let q = QuarantineLine {
+            id: seq_iri(50),
+            at: At::from_unix_millis(50),
+            file: seg(1),
+            line: 1,
+            quarantined_by: "Ada".into(),
+            reason: "r".into(),
+            by: "fake-user".into(),
+        };
+        fake2.hand_commit(&[(QUARANTINE_FILE, Some(file(&[q.encode()]).as_str()))]);
+        let c2 = client(&fake2);
+        open(&c2, &local2).runs(&gate()).unwrap();
+        fake2.hand_commit(&[(QUARANTINE_FILE, None)]);
+        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("deleted")
+            ),
+            "{err:?}"
+        );
+    }
+
+    // ⚠ Spec §3.5 check 4 applies to `quarantine.jsonl` as to an open
+    // segment: it only grows. And it is a file.
+    #[test]
+    fn a_quarantine_file_that_lost_a_line_or_is_a_directory_is_altered() {
+        let quarantined = |n: u64| {
+            QuarantineLine {
+                id: seq_iri(50 + n),
+                at: At::from_unix_millis(50 + n),
+                file: seg(1),
+                line: n,
+                quarantined_by: "Ada".into(),
+                reason: "r".into(),
+                by: "fake-user".into(),
+            }
+            .encode()
+        };
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(
+            QUARANTINE_FILE,
+            Some(file(&[quarantined(1), quarantined(2)]).as_str()),
+        )]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        fake.hand_commit(&[(QUARANTINE_FILE, Some(file(&[quarantined(2)]).as_str()))]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if file == QUARANTINE_FILE && what.contains("no longer starts")
+            ),
+            "{err:?}"
+        );
+
+        let (fake2, local2, _root2) = world();
+        fake2.hand_commit(&[("quarantine.jsonl/x", Some("y"))]);
+        let c2 = client(&fake2);
+        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("directory")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn attempts_and_decisions_read_from_their_own_directories() {
+        let (fake, local, _root) = world();
+        let p = ProjectId(seq_iri(8));
+        let a = sample_attempt(2, &p, &record());
+        let d = sample_decision(3, &record(), vec![]);
+        let adir = layout::dir(Area::Attempts, p.iri());
+        let ddir = layout::dir(Area::Decisions, record().iri());
+        fake.hand_commit(&[
+            (
+                layout::segment_path(&adir, 1).as_str(),
+                Some(file(&[Line::Attempt(a.clone()).encode("x")]).as_str()),
+            ),
+            (
+                layout::segment_path(&ddir, 1).as_str(),
+                Some(file(&[Line::Decision(d.clone()).encode("x")]).as_str()),
+            ),
+        ]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        assert_eq!(l.attempts_of(&p).unwrap(), vec![a]);
+        assert_eq!(l.decisions(record().iri()).unwrap(), vec![d]);
+    }
+
+    // Spec §2.1: ownership is a local answer, with no request.
+    #[test]
+    fn a_record_this_repository_holds_is_owned_and_another_is_not() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let before = fake.state().requests.len();
+        assert!(l.owns(&record()).unwrap());
+        let theirs = RecordId(Iri::parse("https://github.com/acme/other/issues/1").unwrap());
+        assert!(!l.owns(&theirs).unwrap());
+        assert_eq!(fake.state().requests.len(), before, "no request");
+    }
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p fl-github --lib ledger::read`
+Expected: FAIL to compile — `runs`, `attempts_of`, `decisions`, `owns`, `take_notes` and `Note` do not exist.
+
+- [ ] **Step 3: Write the implementation**
+
+Replace `crates/github/src/ledger/mod.rs` with:
+
+```rust
+//! The GitHub ledger (GitHub ledger spec §1.1, §3): the `fl/ledger` branch
+//! of the repository that backs the tracker, where mode B publishes each
+//! decision and the evidence it rests on.
+
+pub mod disclose;
+mod git;
+pub mod layout;
+mod read;
+
+use crate::client::Client;
+use crate::tracker::Repo;
+use fl_core::split::LedgerMemory;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
+use std::time::Duration;
+
+pub use disclose::Visibility;
+pub use read::Note;
+
+/// The GitHub side of mode B, for one repository and one command.
+///
+/// ⚠ It borrows the tracker's `Client` — one credential, one origin guard,
+/// one rate-limit handling (spec §1.1) — and the local store, which keeps
+/// the anchor, the last head this machine checked, and every file it read.
+pub struct GithubLedger<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) repo: Repo,
+    pub(crate) local: &'a dyn LedgerMemory,
+    /// How many times a lagging answer is read again before it counts
+    /// (spec §3.5 check 2), and the pause between reads.
+    pub(crate) lag_reads: u32,
+    pub(crate) lag_pause: Duration,
+    /// What reads noted without refusing, once each.
+    pub(crate) notes: RefCell<BTreeSet<Note>>,
+}
+
+impl<'a> GithubLedger<'a> {
+    pub fn new(client: &'a Client, repo: Repo, local: &'a dyn LedgerMemory) -> Self {
+        Self {
+            client,
+            repo,
+            local,
+            lag_reads: 3,
+            lag_pause: Duration::from_millis(500),
+            notes: RefCell::new(BTreeSet::new()),
+        }
+    }
+
+    /// Tests only: how often a lagging answer is read again, and the pause
+    /// between reads.
+    #[doc(hidden)]
+    pub fn with_lag(mut self, reads: u32, pause: Duration) -> Self {
+        self.lag_reads = reads;
+        self.lag_pause = pause;
+        self
+    }
+
+    pub fn repo(&self) -> &Repo {
+        &self.repo
+    }
+
+    /// What reads noted since the last call (a quarantined line skipped),
+    /// once each, for the command to print.
+    pub fn take_notes(&self) -> Vec<Note> {
+        std::mem::take(&mut *self.notes.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+}
+```
+
+Replace `crates/github/src/ledger/git.rs` with (Task 9's file, with a directory's entries and `blame`):
+
+```rust
+//! The requests the GitHub ledger makes. Each answer is judged here, once,
+//! so no caller reads a failure as data.
+
+use super::GithubLedger;
+use crate::client::Method;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use fl_core::StoreError;
+use serde_json::{Map, Value, json};
+
+/// What a path on the branch is at one commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Object {
+    Tree(Vec<Entry>),
+    Blob { oid: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub name: String,
+    pub oid: String,
+    pub is_blob: bool,
+}
+
+const OBJECT_FIELDS: &str =
+    "__typename ... on Tree { entries { name oid type } } ... on Blob { oid }";
+
+/// ⚠ Modelled: `Commit.blame(path:)` names the commit that last changed
+/// each range of lines. Confirmed by live test
+/// `a_hand_edit_is_detected_and_named`.
+const BLAME: &str = "query ledgerBlame($owner: String!, $name: String!, \
+    $commit: GitObjectID!, $path: String!) { repository(owner: $owner, name: $name) { \
+    object(oid: $commit) { ... on Commit { blame(path: $path) { \
+    ranges { startingLine endingLine commit { oid } } } } } } }";
+
+fn backend(msg: String) -> StoreError {
+    StoreError::Backend(msg)
+}
+
+impl GithubLedger<'_> {
+    pub(crate) fn path(&self, rest: &str) -> String {
+        format!("/repos/{}{rest}", self.repo.full_name)
+    }
+
+    fn owner_and_name(&self) -> (&str, &str) {
+        self.repo
+            .full_name
+            .split_once('/')
+            .unwrap_or((self.repo.full_name.as_str(), ""))
+    }
+
+    /// The commit `branch` points at; `None` when there is no such branch.
+    /// ⚠ An exact name: `fl` is not `fl/ledger`.
+    pub(crate) fn branch_head(&self, branch: &str) -> Result<Option<String>, StoreError> {
+        let r = self.client.send(
+            Method::Get,
+            &self.path(&format!("/git/ref/heads/{branch}")),
+            None,
+        )?;
+        match r.status {
+            200 => r
+                .body
+                .pointer("/object/sha")
+                .and_then(Value::as_str)
+                .map(|s| Some(s.to_string()))
+                .ok_or_else(|| {
+                    backend(format!(
+                        "GitHub answered a read of the branch `{branch}` with no commit"
+                    ))
+                }),
+            404 => Ok(None),
+            s => Err(backend(format!(
+                "GitHub answered {s} when fl read the branch `{branch}`; retry"
+            ))),
+        }
+    }
+
+    /// How `head` relates to `base` as GitHub's compare names it
+    /// (`identical`, `ahead`, `behind`, `diverged`); `None` when GitHub
+    /// knows one of the two commits not at all.
+    pub(crate) fn compare(&self, base: &str, head: &str) -> Result<Option<String>, StoreError> {
+        let r = self
+            .client
+            .send(Method::Get, &self.path(&format!("/compare/{base}...{head}")), None)?;
+        match r.status {
+            200 => r
+                .body
+                .get("status")
+                .and_then(Value::as_str)
+                .map(|s| Some(s.to_string()))
+                .ok_or_else(|| {
+                    backend("GitHub compared two ledger commits but named no status".into())
+                }),
+            404 => Ok(None),
+            s => Err(backend(format!(
+                "GitHub answered {s} when fl compared two commits of the ledger; retry"
+            ))),
+        }
+    }
+
+    /// What each of `paths` is at commit `head`, in one request.
+    pub(crate) fn objects(
+        &self,
+        head: &str,
+        paths: &[String],
+    ) -> Result<Vec<Option<Object>>, StoreError> {
+        let (owner, name) = self.owner_and_name();
+        let mut vars = Map::new();
+        vars.insert("owner".into(), json!(owner));
+        vars.insert("name".into(), json!(name));
+        let mut declared = String::from("$owner: String!, $name: String!");
+        let mut fields = String::new();
+        for (i, p) in paths.iter().enumerate() {
+            declared.push_str(&format!(", $e{i}: String!"));
+            fields.push_str(&format!(
+                " e{i}: object(expression: $e{i}) {{ {OBJECT_FIELDS} }}"
+            ));
+            vars.insert(format!("e{i}"), json!(format!("{head}:{p}")));
+        }
+        let query = format!(
+            "query ledgerObjects({declared}) {{ repository(owner: $owner, name: $name) \
+             {{{fields} }} }}"
         );
         let data = self.client.graphql(&query, Value::Object(vars))?;
         let repo = data
@@ -5558,7 +6524,7 @@ fn parse_object(v: &Value, path: &str) -> Result<Option<Object>, StoreError> {
 }
 ```
 
-Prepend to `crates/github/src/ledger/read.rs` (above its tests):
+Replace everything above the `#[cfg(test)]` line of `crates/github/src/ledger/read.rs` with (Task 9's code, with the snapshot, the lines and the reads):
 
 ```rust
 //! Reading the `fl/ledger` branch (GitHub ledger spec §3.3, §3.5): the
@@ -5633,9 +6599,11 @@ impl GithubLedger<'_> {
     /// ⚠ One compare (ruling 9): against the last head this machine saw
     /// when there is one, else against the anchor. Every head recorded as
     /// seen was itself checked to descend from the anchor, so descending
-    /// from it is descending from the anchor. A `behind` answer is read
-    /// again `lag_reads` times before it counts: GitHub's replicas can
-    /// briefly lag a write.
+    /// from it is descending from the anchor. A `behind` answer, or a
+    /// compare that does not know one of the commits, is read again
+    /// `lag_reads` times before it counts: GitHub's replicas can briefly lag
+    /// a write — above all this machine's own, which it records as the last
+    /// head seen (ruling 24).
     pub fn check_head(&self) -> Result<String, StoreError> {
         let repo = self.repo.full_name.clone();
         let node = self.repo.node_id.as_str();
@@ -5657,7 +6625,7 @@ impl GithubLedger<'_> {
             }
             match self.compare(&base, &head)?.as_deref() {
                 Some("ahead" | "identical") => return Ok(head),
-                Some("behind") if reads < self.lag_reads => {
+                Some("behind") | None if reads < self.lag_reads => {
                     reads += 1;
                     std::thread::sleep(self.lag_pause);
                 }
@@ -5667,7 +6635,10 @@ impl GithubLedger<'_> {
                             format!("it is behind it, still after {reads} reads again")
                         }
                         Some(s) => format!("GitHub compares them as `{s}`"),
-                        None => "GitHub does not know one of the two commits".to_string(),
+                        None => format!(
+                            "GitHub does not know one of the two commits, still after {reads} \
+                             reads again"
+                        ),
                     };
                     return Err(LedgerFault::Rewritten {
                         repo,
@@ -5680,6 +6651,17 @@ impl GithubLedger<'_> {
                 }
             }
         }
+    }
+
+    /// The checked head (checks 1 and 2) whose `format` this fl reads
+    /// (check 7), recorded as the last head seen (ruling 10). What B2's
+    /// pre-flight asks before any gate or adapter runs (spec §2.4).
+    pub fn check_format(&self) -> Result<String, StoreError> {
+        let head = self.check_head()?;
+        let found = self.objects(&head, &[FORMAT_FILE.to_string()])?;
+        self.format(&head, found[0].as_ref())?;
+        self.local.set_last_head(&self.repo.node_id, &head)?;
+        Ok(head)
     }
 
     /// `dirs` at the checked head (spec §3.5 checks 1–4 and 7), with
@@ -5736,7 +6718,7 @@ impl GithubLedger<'_> {
     /// ⚠ Check 7: the format is one this fl knows.
     fn format(&self, head: &str, found: Option<&Object>) -> Result<(), StoreError> {
         let Some(Object::Blob { oid }) = found else {
-            return Err(self.altered(FORMAT_FILE, "is missing", head));
+            return Err(self.altered(FORMAT_FILE, "is missing, or is not a file", head));
         };
         let (text, _) = self.text_at(FORMAT_FILE, oid)?;
         if text.strip_suffix('\n').unwrap_or(&text) != FORMAT {
@@ -5992,7 +6974,6 @@ impl GithubLedger<'_> {
         )
     }
 }
-
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
@@ -6002,61 +6983,56 @@ Expected: PASS.
 
 - [ ] **Step 5: Mutation checks**
 
-1. `check_head`: swap the `(None, Some(root))` and `(Some(_), None)` arms' faults → `a_ledger_that_is_not_there_says_why` red.
-2. `check_head`: accept `diverged` with `ahead` → `a_head_that_does_not_descend_from_the_anchor_is_a_rewrite` red.
-3. `check_head`: delete the `Some("behind") if reads < self.lag_reads` arm, so a first `behind` is a rewrite → `a_head_behind_the_last_one_seen_is_read_again_before_it_counts` red.
-4. `check_head`: accept `behind` outright → `a_head_that_stays_behind_is_a_rewrite` and `a_branch_reset_to_an_older_commit_is_a_rewrite` red.
-5. `check_head`: always compare against the anchor, ignoring the last head → `a_head_that_stays_behind_is_a_rewrite` red (its `base`) and `a_branch_reset…` red.
-6. `format`: accept any text → `a_format_other_than_1…` red; accept a missing file → `a_ledger_with_no_format_file_is_altered` red.
-7. `grown`: delete the `closed` check → `a_closed_segment_that_changes_is_altered` red (the change only grows it, so check 4 alone passes it).
-8. `grown`: delete the `starts_with` check → `an_open_segment_that_no_longer_starts…` red.
-9. `directory`: delete the gap check → `a_segment_that_disappears_or_leaves_a_gap…` red (first half); delete the deleted-file check → the same test red (second half); delete the not-a-segment check, or the blob-where-a-directory-belongs check → `a_file_that_is_not_a_segment…` red.
-10. `snapshot`: delete the deleted-quarantine check → `an_unreadable_or_vanished_quarantine_file_is_altered` red; delete `set_last_head` → `a_fresh_ledger_reads_empty_and_remembers…` and `a_head_that_stays_behind…` red.
-11. `quarantine_lines`: skip an unreadable line instead → `an_unreadable_or_vanished_quarantine_file…` red.
-12. `lines`: delete the quarantine skip → `a_quarantined_line_is_skipped_and_noted_once` red; delete the note → the same; delete the misplaced check → `a_line_in_the_wrong_directory_is_misplaced` red; delete the different-content check → `one_id_with_two_contents…` red; push identical copies too → the same test's first assertion red.
-13. `text_at`: always download → `a_segment_read_before_is_not_downloaded_again` red.
-14. `lines`: name the head instead of `self.blame(…)` as the unreadable line's commit → `an_unreadable_line_names_its_file_line_commit_and_the_quarantine_command` red (a later, unrelated commit is the head there).
+1. `grown`: delete the `closed` check → `a_closed_segment_that_changes_is_altered` red (the change only grows it, so check 4 alone passes it).
+2. `grown`: delete the `starts_with` check → `an_open_segment_that_no_longer_starts…` and `a_quarantine_file_that_lost_a_line_or_is_a_directory_is_altered` red.
+3. `directory`: cache every segment as closed (`true` instead of `n < last`) → `appends_and_a_rollover_by_another_machine_raise_no_alarm` red — the false alarm the cache must not raise.
+4. `directory`: delete the gap check → `a_segment_that_disappears_or_leaves_a_gap…` red (first half); delete the deleted-file check → the same test red (second half); delete the not-a-segment check, or the blob-where-a-directory-belongs check, or treat a tree entry as a segment (drop the `e.is_blob` test) → `anything_in_a_directory_but_a_segment…` red.
+5. `snapshot`: delete the deleted-quarantine check → `an_unreadable_or_vanished_quarantine_file_is_altered` red; accept a tree where `quarantine.jsonl` belongs → `a_quarantine_file_that_lost_a_line_or_is_a_directory_is_altered` red.
+6. `quarantine_lines`: skip an unreadable line instead → `an_unreadable_or_vanished_quarantine_file…` red.
+7. `lines`: delete the quarantine skip → `a_quarantined_line_is_skipped_and_noted_once` red; delete the note → the same; delete the misplaced check → `a_line_in_the_wrong_directory_is_reported_as_tampering` red; delete the different-content check → `one_id_with_two_contents…` red; push identical copies too → the same test's first assertion red.
+8. `lines`: name the head instead of `self.blame(…)` as the unreadable line's commit → `an_unreadable_line_names_its_file_line_commit_and_the_quarantine_command` red (a later, unrelated commit is the head there).
+9. `layout::decode`'s round trip (Task 6) seen from here: drop it → `a_line_with_a_field_this_fl_does_not_write_is_unreadable_and_says_to_upgrade` red.
+10. `text_at` for segments: always download → `a_segment_read_before_is_not_downloaded_again` red.
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
-git add crates/github/src/lib.rs crates/github/src/tracker.rs crates/github/src/ledger/mod.rs crates/github/src/ledger/git.rs crates/github/src/ledger/read.rs
-git commit -m "feat(github): GithubLedger reads the branch, with the seven checks
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+git add crates/github/src/ledger/mod.rs crates/github/src/ledger/git.rs crates/github/src/ledger/read.rs
+git commit -m "feat(github): GithubLedger reads segments and lines, with checks 3 to 6
 
-The head must exist, have an anchor, and descend from the last head seen
-or the anchor (a behind answer is read again for replica lag); the format
-must be 1; a closed segment never changes, the open one only grows, no
-segment goes missing; every line is read strictly, sits in its own
-directory, and carries one content per id. A quarantined line is skipped
-and noted; an unreadable one names its file, line, commit and the
-quarantine command. Ownership stays local. Guards mutation-tested.
+A closed segment never changes, the open one and quarantine.jsonl only
+grow, no segment goes missing and nothing but segments sits in a
+directory; every line is read strictly, sits in its own directory, and
+carries one content per id. A quarantined line is skipped and noted; an
+unreadable one names its file, line, commit, an upgrade and the
+quarantine command; a misplaced one is tampering. Ownership stays local.
+Guards mutation-tested.
 
 Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 ```
 
 ---
-### Task 10: `GithubLedger` publishes — the append protocol, decision 2, and the split suites over GitHub
+
+### Task 11: `GithubLedger` publishes — the append protocol
 
 **Files:**
 - Create: `crates/github/src/ledger/append.rs`
-- Create: `crates/github/src/ledger/fixture.rs` (test-only)
-- Modify: `crates/github/src/ledger/mod.rs` (modules, two fields, `visibility`, `identity`, `RemoteLedger`)
-- Modify: `crates/core/src/conformance.rs:814-846` (the lost-answer case)
-- Modify: `crates/core/src/split.rs` tests (the `MemRemote` lost answer, kept)
+- Modify: `crates/github/src/ledger/mod.rs` (module, two fields, `visibility`, `identity`, `RemoteLedger`)
 
 **Interfaces:**
-- Consumes: `snapshot`, `lines`, `quarantine_lines`, `runs`, `attempts_of`, `owns` (Task 9); `layout`, `disclose` (Task 6); `GraphqlAnswer` (Task 7); `StoreError::Contended` (Task 1); `RemoteControl::batches` (Task 3).
+- Consumes: `snapshot`, `lines`, `quarantine_lines`, `runs`, `attempts_of`, `owns` (Task 10); `layout`, `disclose` (Task 6); `GraphqlAnswer` (Task 7); the fake's commit knobs (Task 8); `StoreError::Contended` (Task 1).
 - Produces:
 
 ```rust
-// fl_github::ledger::append
+// fl_github::ledger::append (TRIES re-exported at fl_github::ledger::TRIES)
 pub const TRIES: u32;                                       // 5
 pub(crate) struct NewLine { pub id: Iri, pub text: String }
 impl GithubLedger<'_> {
     /// One commit adding the missing lines of each directory and of quarantine.jsonl.
     pub(crate) fn append(&self, dirs: &[(Area, String, Vec<NewLine>)], quarantine: &[NewLine],
                          headline: &str) -> Result<Option<String>, StoreError>;
+    pub(crate) fn publish_batch(&self, batch: &Batch) -> Result<Option<String>, StoreError>;
 }
 
 // fl_github::ledger (mod.rs)
@@ -6064,196 +7040,11 @@ impl GithubLedger<'_> {
     pub fn visibility(&self) -> Result<Visibility, StoreError>;   // once per GithubLedger
     pub(crate) fn identity(&self) -> Result<String, StoreError>;  // `by`, once
 }
-impl RemoteLedger for GithubLedger<'_> { /* repo_node_id, owns_record, publish, gate_runs, attempts */ }
+// repo_node_id, owns_record, publish, gate_runs, attempts
+impl RemoteLedger for GithubLedger<'_> { … }
 ```
 
 - [ ] **Step 1: Write the failing tests**
-
-In `crates/core/src/conformance.rs`, replace the first `flush` assertion of `a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush` (lines 824-831) with:
-
-```rust
-    ctl.lose_next_answer();
-    // A remote that cannot tell refuses the flush, and the next one carries
-    // the run; one that reads the ledger again finds the commit landed and
-    // answers (GitHub ledger spec §3.2 step 5; ruling 13). Either way, the
-    // run is never published twice.
-    let _ = roles.ledger.flush(sample_decision(1, &r, vec![id.clone()]));
-```
-
-In `crates/core/src/split.rs`'s `tests`, add — so `MemRemote`'s own answer to a lost answer stays pinned now that the shared case accepts either:
-
-```rust
-    // ⚠ Spec §3.2 step 5: `MemRemote` reports a lost answer as a failure;
-    // the next flush carries the run, and adds no second copy.
-    #[test]
-    fn a_lost_answer_refuses_the_flush_and_the_next_one_adds_nothing_twice() {
-        let (s, _p, g, r) = world();
-        let remote = MemRemote::new("R_1");
-        let l = SplitLedger {
-            local: &s,
-            github: &remote,
-        };
-        let run = sample_record_run(1, &g, Some(&r));
-        l.append_gate_run(run.clone()).unwrap();
-        remote.lose_next_answer();
-        assert!(
-            l.flush(sample_decision(1, &r, vec![run.id.clone().unwrap()]))
-                .is_err()
-        );
-        l.flush(sample_decision(2, &r, vec![run.id.clone().unwrap()]))
-            .unwrap();
-        assert_eq!(published_ids(&remote, &g), vec![run.id]);
-    }
-```
-
-Create `crates/github/src/ledger/fixture.rs`:
-
-```rust
-//! `SplitLedger` over `GithubLedger` and the fake GitHub, for the shared
-//! ledger suites (GitHub ledger spec §8.2): the split ledger meets the
-//! same contract over the GitHub side as over `MemRemote`.
-
-use super::GithubLedger;
-use crate::client::Client;
-use crate::creds::EnvToken;
-use crate::fake::FakeGithub;
-use crate::tracker::GithubTracker;
-use fl_core::conformance::{Bound, Fixture, RemoteControl, SplitFixture, entry_iri};
-use fl_core::ids::{GateId, ProjectId, RecordId};
-use fl_core::iri::Iri;
-use fl_core::log::{Attempt, GateRun};
-use fl_core::split::{Batch, Outbox, RemoteLedger, SplitLedger};
-use fl_core::store::{Bindings, StoreError};
-use fl_core::{CatalogChecked, KindRouted, MemStore};
-use std::cell::RefCell;
-use std::time::Duration;
-
-fn client(fake: &FakeGithub) -> Client {
-    Client::new(
-        &fake.url(),
-        Box::new(EnvToken::from_lookup(|_| Some("t".into())).expect("a token")),
-    )
-}
-
-/// The GitHub side, keeping each batch it is handed, so the suite sees
-/// what a flush offered.
-struct Recorded<'a> {
-    inner: &'a dyn RemoteLedger,
-    batches: RefCell<Vec<Batch>>,
-}
-
-impl RemoteLedger for Recorded<'_> {
-    fn repo_node_id(&self) -> &str {
-        self.inner.repo_node_id()
-    }
-    fn owns_record(&self, record: &RecordId) -> Result<bool, StoreError> {
-        self.inner.owns_record(record)
-    }
-    fn publish(&self, batch: &Batch) -> Result<Option<String>, StoreError> {
-        self.batches.borrow_mut().push(batch.clone());
-        self.inner.publish(batch)
-    }
-    fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
-        self.inner.gate_runs(gate)
-    }
-    fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
-        self.inner.attempts(project)
-    }
-}
-
-struct Controls<'a> {
-    fake: &'a FakeGithub,
-    remote: &'a Recorded<'a>,
-}
-
-impl RemoteControl for Controls<'_> {
-    fn set_down(&self, down: bool) {
-        self.fake.state().down = down;
-    }
-    fn lose_next_answer(&self) {
-        self.fake.state().hang_up_after_next_commit = true;
-    }
-    fn foreign_record(&self) -> RecordId {
-        RecordId(
-            Iri::parse("https://github.com/acme/other/issues/1").expect("an issue URL is an IRI"),
-        )
-    }
-    fn remote(&self) -> &dyn RemoteLedger {
-        self.remote
-    }
-    fn batches(&self) -> Vec<Batch> {
-        self.remote.batches.borrow().clone()
-    }
-}
-
-/// A split ledger over a `MemStore`, a `GithubTracker` and a `GithubLedger`
-/// on a fresh fake whose ledger is set up, with this machine's cut-over
-/// before every sample entry.
-struct OverFake;
-
-impl SplitFixture for OverFake {
-    fn with_split(&self, f: &mut dyn FnMut(&Bound<'_>, &dyn RemoteControl)) {
-        let fake = FakeGithub::start("acme/widgets");
-        let root = fake.seed_ledger();
-        let local = MemStore::default();
-        local
-            .set_ledger_root("R_1", &root)
-            .expect("a fresh store records a root");
-        local
-            .set_cutover("R_1", &entry_iri(0))
-            .expect("a fresh store records a cut-over");
-        let tracker = GithubTracker::open(client(&fake), "acme/widgets", &local)
-            .expect("the fake's repository opens")
-            .0
-            .with_visibility(Duration::from_secs(10), Duration::ZERO);
-        let ledger_client = client(&fake);
-        let ledger = GithubLedger::new(&ledger_client, tracker.repo().clone(), &local)
-            .with_lag(0, Duration::ZERO);
-        let recorded = Recorded {
-            inner: &ledger,
-            batches: RefCell::new(Vec::new()),
-        };
-        let split = SplitLedger {
-            local: &local,
-            github: &recorded,
-        };
-        let checked = CatalogChecked {
-            catalog: &local,
-            tracker: &tracker,
-        };
-        let routed = KindRouted {
-            catalog: &local,
-            tracker: &tracker,
-        };
-        f(
-            &Bound {
-                catalog: &local,
-                tracker: &checked,
-                ledger: &split,
-                handles: &routed,
-            },
-            &Controls {
-                fake: &fake,
-                remote: &recorded,
-            },
-        );
-    }
-}
-
-impl Fixture for OverFake {
-    fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
-        self.with_split(&mut |b, _| f(b));
-    }
-}
-
-// ⚠ Spec §8.2: the split ledger meets the shared contracts over the GitHub
-// side itself, not only over `MemRemote`.
-#[test]
-fn a_split_ledger_over_github_meets_the_ledger_contracts() {
-    fl_core::conformance::ledger(|| OverFake);
-    fl_core::conformance::split_ledger(|| OverFake);
-}
-```
 
 Create `crates/github/src/ledger/append.rs` with only its tests for now:
 
@@ -6270,11 +7061,10 @@ mod tests {
     use fl_core::conformance::{sample_attempt, sample_decision, sample_record_run};
     use fl_core::decision::Outcome;
     use fl_core::ids::{GateId, ProjectId, RecordId, seq_iri};
-    use fl_core::log::{Attempt, GateRun, PathsTouched, WITHHELD_ERROR_DETAIL};
+    use fl_core::log::{Attempt, GateRun};
     use fl_core::model::State;
     use fl_core::split::{LedgerCache, RemoteLedger};
     use fl_core::store::Bindings;
-    use fl_core::verdict::Verdict;
     use std::time::Duration;
 
     fn client_at(url: &str) -> Client {
@@ -6573,6 +7363,51 @@ mod tests {
         assert_eq!(fake.ledger_commits(), 1);
     }
 
+    // Spec §7: a spent rate limit refuses the decision; it is not an
+    // ambiguous answer to read again.
+    #[test]
+    fn a_rate_limited_commit_is_refused_and_not_retried() {
+        let (fake, local, _root) = world();
+        fake.state().rate_limit_next_commit = true;
+        let c = client(&fake);
+        let err = open(&c, &local)
+            .publish(&batch(1, vec![run(1)], vec![]))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
+        assert_eq!(fake.ledger_commits(), 1, "not retried");
+    }
+
+    // ⚠ Spec §3.5 check 2 (ruling 24): right after this machine's own
+    // append, a replica may answer the branch with the head before it, or
+    // not know this machine's commit in a compare. Neither is an alarm.
+    #[test]
+    fn a_lagging_replica_after_this_machines_own_append_raises_no_alarm() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        l.publish(&batch(1, vec![run(1)], vec![])).unwrap();
+        fake.state().ref_behind_next = 1;
+        assert_eq!(
+            l.runs(&gate()).unwrap(),
+            vec![run(1)],
+            "the branch read answered the head before this machine's own"
+        );
+        // Another machine appends after this one.
+        let seg1 = layout::segment_path(&runs_dir(), 1);
+        let theirs = format!(
+            "{}{}\n",
+            fake.ledger_files()[&seg1],
+            Line::Run(run(5)).encode("another-machine")
+        );
+        fake.hand_commit(&[(seg1.as_str(), Some(theirs.as_str()))]);
+        fake.state().compare_unknown_next = 1;
+        assert_eq!(
+            l.runs(&gate()).unwrap(),
+            vec![run(1), run(5)],
+            "a compare whose replica did not know this machine's commit yet"
+        );
+    }
+
     // Spec §3.1: segments roll over, and a directory of many reads back
     // whole, even on a machine that never read it.
     #[test]
@@ -6595,44 +7430,6 @@ mod tests {
         assert_eq!(open(&c, &fresh).runs(&gate()).unwrap(), published);
     }
 
-    // ⚠ Decision 2 and spec §8.3: on a repository that is not private, no
-    // published line holds anything machine-specific.
-    #[test]
-    fn a_repository_that_is_not_private_publishes_nothing_machine_specific() {
-        let secret_path = "/home/someone/work/app/src/a.rs";
-        let secret_host = "build-host-7";
-        let home = std::env::var("HOME").ok().filter(|h| h.len() > 1);
-        for visibility in ["public", "internal"] {
-            let (fake, local, _root) = world();
-            fake.state().repos[0].visibility = visibility.into();
-            let mut r = run(1);
-            r.output_excerpt = Some(format!("{secret_path} on {secret_host}"));
-            let mut errored = run(2);
-            errored.verdict = Verdict::error(format!("could not spawn {secret_path} on {secret_host}"));
-            let mut a = attempt(3);
-            a.output_excerpt = Some(format!("{secret_path} on {secret_host}"));
-            a.paths_touched = PathsTouched::Listed(vec![secret_path.into()]);
-            let c = client(&fake);
-            let l = open(&c, &local);
-            l.publish(&batch(1, vec![r, errored], vec![a])).unwrap();
-            let secrets: Vec<String> = [Some(secret_path.to_string()), Some(secret_host.to_string()), home.clone()]
-                .into_iter()
-                .flatten()
-                .collect();
-            for (path, text) in fake.ledger_files() {
-                for secret in &secrets {
-                    assert!(!text.contains(secret.as_str()), "{visibility}: `{path}` holds `{secret}`");
-                }
-            }
-            let runs = l.runs(&gate()).unwrap();
-            assert_eq!(runs[0].output_excerpt, None);
-            assert_eq!(runs[1].verdict, Verdict::error(WITHHELD_ERROR_DETAIL));
-            let attempts = l.attempts_of(&project()).unwrap();
-            assert_eq!(attempts[0].output_excerpt, None);
-            assert_eq!(attempts[0].paths_touched, PathsTouched::Counted(1));
-        }
-    }
-
     #[test]
     fn a_private_repository_publishes_the_excerpts() {
         let (fake, local, _root) = world();
@@ -6641,18 +7438,6 @@ mod tests {
         l.publish(&batch(1, vec![run(1)], vec![attempt(2)])).unwrap();
         assert_eq!(l.runs(&gate()).unwrap(), vec![run(1)]);
         assert_eq!(l.attempts_of(&project()).unwrap(), vec![attempt(2)]);
-    }
-
-    #[test]
-    fn a_batch_published_while_private_is_not_added_again_once_public() {
-        let (fake, local, _root) = world();
-        let c = client(&fake);
-        let b = batch(1, vec![run(1)], vec![attempt(2)]);
-        open(&c, &local).publish(&b).unwrap();
-        let commits = fake.ledger_commits();
-        fake.state().repos[0].visibility = "public".into();
-        assert_eq!(open(&c, &local).publish(&b).unwrap(), None);
-        assert_eq!(fake.ledger_commits(), commits);
     }
 
     // Decision 2: a visibility that cannot be read is an error, never
@@ -6684,6 +7469,23 @@ mod tests {
             .filter(|r| r.as_str() == "GET /repos/acme/widgets")
             .count();
         assert_eq!(reads, 1);
+    }
+
+    // Ruling 18: `by` is asked of GitHub once per ledger.
+    #[test]
+    fn the_writer_is_asked_once_per_ledger() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        l.publish(&batch(1, vec![run(1)], vec![])).unwrap();
+        l.publish(&batch(2, vec![run(2)], vec![])).unwrap();
+        let asked = fake
+            .state()
+            .requests
+            .iter()
+            .filter(|r| r.as_str() == "GET /user")
+            .count();
+        assert_eq!(asked, 1);
     }
 
     // Spec §1.3: an entry with no id is never published.
@@ -6743,7 +7545,7 @@ mod tests {
         assert_eq!(landed.unwrap(), Landed::Commit("c1".into()));
         for e in [
             json!({"type": "STALE_DATA"}),
-            json!({"message": "Expected branch to point to \"c0\" but it did not. Pull and try again."}),
+            json!({"message": "Expected branch to point to \"c0\" but it did not."}),
         ] {
             assert_eq!(judge(answer(200, None, vec![e])).unwrap(), Landed::HeadMoved);
         }
@@ -6763,60 +7565,101 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p fl-github --lib ledger`
+Run: `cargo test -p fl-github --lib ledger::append`
 Expected: FAIL to compile — `append`, `judge`, `Landed`, `visibility` and `RemoteLedger for GithubLedger` do not exist.
 
 - [ ] **Step 3: Write the implementation**
 
-In `crates/github/src/ledger/mod.rs`, replace the module list and imports (from `pub mod disclose;` through `use std::time::Duration;`) with:
+Replace `crates/github/src/ledger/mod.rs` with:
 
 ```rust
+//! The GitHub ledger (GitHub ledger spec §1.1, §3): the `fl/ledger` branch
+//! of the repository that backs the tracker, where mode B publishes each
+//! decision and the evidence it rests on.
+
 mod append;
 pub mod disclose;
-#[cfg(test)]
-mod fixture;
 mod git;
 pub mod layout;
 mod read;
 
 use crate::client::{Client, Method};
 use crate::tracker::Repo;
+use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId, RecordId};
 use fl_core::log::{Attempt, GateRun};
 use fl_core::split::{Batch, LedgerMemory, RemoteLedger};
-use fl_core::StoreError;
 use serde_json::Value;
 use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub use append::TRIES;
-```
+pub use disclose::Visibility;
+pub use read::Note;
 
-Add two fields to `GithubLedger` (after `notes`):
-
-```rust
+/// The GitHub side of mode B, for one repository and one command.
+///
+/// ⚠ It borrows the tracker's `Client` — one credential, one origin guard,
+/// one rate-limit handling (spec §1.1) — and the local store, which keeps
+/// the anchor, the last head this machine checked, and every file it read.
+pub struct GithubLedger<'a> {
+    pub(crate) client: &'a Client,
+    pub(crate) repo: Repo,
+    pub(crate) local: &'a dyn LedgerMemory,
+    /// How many times a lagging answer is read again before it counts
+    /// (spec §3.5 check 2), and the pause between reads.
+    pub(crate) lag_reads: u32,
+    pub(crate) lag_pause: Duration,
+    /// What reads noted without refusing, once each.
+    pub(crate) notes: RefCell<BTreeSet<Note>>,
     /// Read once per `GithubLedger` (spec §5; ruling 21).
     pub(crate) visibility: OnceCell<Visibility>,
     /// `by` on every line it writes (spec §3.1; ruling 18).
     pub(crate) identity: OnceCell<String>,
-```
+}
 
-initialise them in `new` (after `notes: …,`):
-
-```rust
+impl<'a> GithubLedger<'a> {
+    pub fn new(client: &'a Client, repo: Repo, local: &'a dyn LedgerMemory) -> Self {
+        Self {
+            client,
+            repo,
+            local,
+            lag_reads: 3,
+            lag_pause: Duration::from_millis(500),
+            notes: RefCell::new(BTreeSet::new()),
             visibility: OnceCell::new(),
             identity: OnceCell::new(),
-```
+        }
+    }
 
-and add to `impl<'a> GithubLedger<'a>`:
+    /// Tests only: how often a lagging answer is read again, and the pause
+    /// between reads.
+    #[doc(hidden)]
+    pub fn with_lag(mut self, reads: u32, pause: Duration) -> Self {
+        self.lag_reads = reads;
+        self.lag_pause = pause;
+        self
+    }
 
-```rust
+    pub fn repo(&self) -> &Repo {
+        &self.repo
+    }
+
+    /// What reads noted since the last call (a quarantined line skipped),
+    /// once each, for the command to print.
+    pub fn take_notes(&self) -> Vec<Note> {
+        std::mem::take(&mut *self.notes.borrow_mut())
+            .into_iter()
+            .collect()
+    }
+
     /// The repository's visibility, read live, once per `GithubLedger` —
     /// one command, one decision (spec §5).
     ///
     /// ⚠ A failed read is an error: an unknown visibility is not private.
-    /// An answer that names none is taken as not private, which withholds.
+    /// An answer that names none is taken as not private, which withholds
+    /// (ruling 21): a published excerpt cannot be taken back.
     pub fn visibility(&self) -> Result<Visibility, StoreError> {
         if let Some(v) = self.visibility.get() {
             return Ok(*v);
@@ -6848,11 +7691,8 @@ and add to `impl<'a> GithubLedger<'a>`:
         let _ = self.identity.set(by.clone());
         Ok(by)
     }
-```
+}
 
-and at the end of `mod.rs`:
-
-```rust
 impl RemoteLedger for GithubLedger<'_> {
     fn repo_node_id(&self) -> &str {
         &self.repo.node_id
@@ -6902,7 +7742,8 @@ pub const TRIES: u32 = 5;
 /// ⚠ Modelled from GitHub's documentation: `createCommitOnBranch` lands a
 /// signed commit only on `expectedHeadOid`. Confirmed by live test
 /// `create_commit_on_branch_is_refused_when_the_head_moved`.
-const APPEND: &str = "mutation ledgerAppend($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }";
+const APPEND: &str = "mutation ledgerAppend($input: CreateCommitOnBranchInput!) { \
+    createCommitOnBranch(input: $input) { commit { oid } } }";
 
 const HEAD_MOVED: &str = "someone else appended first";
 
@@ -7126,15 +7967,14 @@ impl GithubLedger<'_> {
         self.append(&dirs, &[], &format!("fl: {} {}", d.kind().as_wire(), d.id))
     }
 }
-
 ```
 
 Note for the test module: `use super::*` brings `json!`, `Line`, `layout`, `Area`, `Batch`, `Iri`, `StoreError`, `judge`, `Landed` and `TRIES`.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p fl-github && cargo test -p fl-core -p fl-store`
-Expected: PASS — including `a_split_ledger_over_github_meets_the_ledger_contracts`, which runs the four ledger cases and ten split cases over the fake.
+Run: `cargo test -p fl-github`
+Expected: PASS.
 
 - [ ] **Step 5: Mutation checks**
 
@@ -7145,33 +7985,365 @@ Expected: PASS — including `a_split_ledger_over_github_meets_the_ledger_contra
 5. `append`: one try only (`TRIES` used as 1 in the loop) → `two_flushes_racing…`, `a_commit_that_did_not_land_is_sent_again` red.
 6. `append`: swap `Contended` and `Unreachable` → `a_head_that_keeps_moving_is_contended…` and `answers_that_never_say…` red.
 7. `append`: drop `set_last_head` after a commit → `a_publish_files_each_entry…` red.
-8. `commit`: propagate `Unreachable` instead of `Landed::Unknown` → `a_lost_answer_is_read_again…` red, and the conformance case `a_commit_whose_answer_was_lost…` red over the fake.
-9. `judge`: treat any error as `HeadMoved` → `each_answer_to_a_commit_is_judged_once` red (NOT_FOUND); drop the message test → the same test red; treat a 5xx as an error → the same test red and `a_commit_that_did_not_land_is_sent_again` red.
-10. `publish_batch`: skip the projection → `a_repository_that_is_not_private_publishes_nothing_machine_specific` red.
+8. `commit`: propagate `Unreachable` instead of `Landed::Unknown` → `a_lost_answer_is_read_again…` red.
+9. `commit`: turn every error into `Landed::Unknown` (a spent rate limit read again) → `a_rate_limited_commit_is_refused_and_not_retried` red.
+10. `judge`: treat any error as `HeadMoved` → `each_answer_to_a_commit_is_judged_once` red (NOT_FOUND); drop the message test → the same test red; treat a 5xx as an error → the same test red and `a_commit_that_did_not_land_is_sent_again` red.
 11. `publish_batch`: drop the id check for runs, or for attempts → `an_entry_without_an_id_is_refused…` red (it panics on `expect`).
 12. `visibility`: do not cache → `the_visibility_is_read_once_per_ledger` red; treat a failed read as private → `a_visibility_that_cannot_be_read…` red.
-13. `SplitLedger` over GitHub: in `fixture.rs`, make `Recorded::publish` skip the push → `a_published_entry_is_never_offered_to_github_again` red (proves the suite sees the batches).
+13. `identity`: do not cache → `the_writer_is_asked_once_per_ledger` red.
+14. `check_head` (Task 9) seen from an append: narrow its read-again arm to `behind` only → `a_lagging_replica_after_this_machines_own_append_raises_no_alarm` red.
+
+The projection in `publish_batch` and `visibility`'s default for an answer that names none are mutation-checked in Task 12, whose tests pin them.
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
-git add crates/github/src/ledger/mod.rs crates/github/src/ledger/append.rs crates/github/src/ledger/fixture.rs crates/core/src/conformance.rs crates/core/src/split.rs
-git commit -m "feat(github): GithubLedger publishes, and the split suites run over it
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+git add crates/github/src/ledger/mod.rs crates/github/src/ledger/append.rs
+git commit -m "feat(github): GithubLedger publishes
 
 publish projects each entry for the repository's visibility (decision 2),
 groups the lines by directory, and appends them in one createCommitOnBranch
 on the head it read: it de-duplicates against every segment of a
 directory, makes no empty commit, reads again when the head moved or an
-answer was lost, and gives up after five tries as Contended or
-Unreachable. The shared ledger and split-ledger suites now run over the
-fake GitHub too. Guards mutation-tested.
+answer was lost, refuses a spent rate limit, and gives up after five tries
+as Contended or Unreachable. Guards mutation-tested.
 
 Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 ```
 
 ---
-### Task 11: `init`, the mode, and what `init` tells the person
+
+### Task 12: Decision 2 on the branch, and the split suites over GitHub
+
+**Files:**
+- Create: `crates/github/src/ledger/fixture.rs` (test-only)
+- Modify: `crates/github/src/ledger/mod.rs` (`#[cfg(test)] mod fixture;`)
+- Modify: `crates/github/src/ledger/append.rs` (tests)
+- Modify: `crates/core/src/conformance.rs:824-831` (the lost-answer case)
+- Modify: `crates/core/src/split.rs` tests (the `MemRemote` lost answer, kept)
+
+**Interfaces:**
+- Consumes: `GithubLedger` as a `RemoteLedger` (Task 11); `GithubTracker::client` (Task 9); `RemoteControl::batches` (Task 3); the fake's `omit_visibility` (Task 7).
+- Produces: no new API. `fixture.rs`'s `OverFake` runs the shared `ledger` and `split_ledger` suites over `SplitLedger { local: MemStore, github: GithubLedger }` on the fake, built over the tracker's own client as B2 binds it.
+
+- [ ] **Step 1: Write the failing tests**
+
+Add after `mod read;` in `crates/github/src/ledger/mod.rs`:
+
+```rust
+
+#[cfg(test)]
+mod fixture;
+```
+
+Create `crates/github/src/ledger/fixture.rs`:
+
+```rust
+//! `SplitLedger` over `GithubLedger` and the fake GitHub, for the shared
+//! ledger suites (GitHub ledger spec §8.2): the split ledger meets the
+//! same contract over the GitHub side as over `MemRemote`.
+
+use super::GithubLedger;
+use crate::client::Client;
+use crate::creds::EnvToken;
+use crate::fake::FakeGithub;
+use crate::tracker::GithubTracker;
+use fl_core::conformance::{Bound, Fixture, RemoteControl, SplitFixture, entry_iri};
+use fl_core::ids::{GateId, ProjectId, RecordId};
+use fl_core::iri::Iri;
+use fl_core::log::{Attempt, GateRun};
+use fl_core::split::{Batch, Outbox, RemoteLedger, SplitLedger};
+use fl_core::store::{Bindings, StoreError};
+use fl_core::{CatalogChecked, KindRouted, MemStore};
+use std::cell::RefCell;
+use std::time::Duration;
+
+fn client(fake: &FakeGithub) -> Client {
+    Client::new(
+        &fake.url(),
+        Box::new(EnvToken::from_lookup(|_| Some("t".into())).expect("a token")),
+    )
+}
+
+/// The GitHub side, keeping each batch it is handed, so the suite sees
+/// what a flush offered.
+struct Recorded<'a> {
+    inner: &'a dyn RemoteLedger,
+    batches: RefCell<Vec<Batch>>,
+}
+
+impl RemoteLedger for Recorded<'_> {
+    fn repo_node_id(&self) -> &str {
+        self.inner.repo_node_id()
+    }
+    fn owns_record(&self, record: &RecordId) -> Result<bool, StoreError> {
+        self.inner.owns_record(record)
+    }
+    fn publish(&self, batch: &Batch) -> Result<Option<String>, StoreError> {
+        self.batches.borrow_mut().push(batch.clone());
+        self.inner.publish(batch)
+    }
+    fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
+        self.inner.gate_runs(gate)
+    }
+    fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
+        self.inner.attempts(project)
+    }
+}
+
+struct Controls<'a> {
+    fake: &'a FakeGithub,
+    remote: &'a Recorded<'a>,
+}
+
+impl RemoteControl for Controls<'_> {
+    fn set_down(&self, down: bool) {
+        self.fake.state().down = down;
+    }
+    fn lose_next_answer(&self) {
+        self.fake.state().hang_up_after_next_commit = true;
+    }
+    fn foreign_record(&self) -> RecordId {
+        RecordId(
+            Iri::parse("https://github.com/acme/other/issues/1").expect("an issue URL is an IRI"),
+        )
+    }
+    fn remote(&self) -> &dyn RemoteLedger {
+        self.remote
+    }
+    fn batches(&self) -> Vec<Batch> {
+        self.remote.batches.borrow().clone()
+    }
+}
+
+/// A split ledger over a `MemStore`, a `GithubTracker` and a `GithubLedger`
+/// on a fresh fake whose ledger is set up, with this machine's cut-over
+/// before every sample entry.
+struct OverFake;
+
+impl SplitFixture for OverFake {
+    fn with_split(&self, f: &mut dyn FnMut(&Bound<'_>, &dyn RemoteControl)) {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let local = MemStore::default();
+        local
+            .set_ledger_root("R_1", &root)
+            .expect("a fresh store records a root");
+        local
+            .set_cutover("R_1", &entry_iri(0))
+            .expect("a fresh store records a cut-over");
+        let tracker = GithubTracker::open(client(&fake), "acme/widgets", &local)
+            .expect("the fake's repository opens")
+            .0
+            .with_visibility(Duration::from_secs(10), Duration::ZERO);
+        // The tracker's own client, as the CLI binds it (spec §1.1).
+        let ledger = GithubLedger::new(tracker.client(), tracker.repo().clone(), &local)
+            .with_lag(0, Duration::ZERO);
+        let recorded = Recorded {
+            inner: &ledger,
+            batches: RefCell::new(Vec::new()),
+        };
+        let split = SplitLedger {
+            local: &local,
+            github: &recorded,
+        };
+        let checked = CatalogChecked {
+            catalog: &local,
+            tracker: &tracker,
+        };
+        let routed = KindRouted {
+            catalog: &local,
+            tracker: &tracker,
+        };
+        f(
+            &Bound {
+                catalog: &local,
+                tracker: &checked,
+                ledger: &split,
+                handles: &routed,
+            },
+            &Controls {
+                fake: &fake,
+                remote: &recorded,
+            },
+        );
+    }
+}
+
+impl Fixture for OverFake {
+    fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
+        self.with_split(&mut |b, _| f(b));
+    }
+}
+
+// ⚠ Spec §8.2: the split ledger meets the shared contracts over the GitHub
+// side itself, not only over `MemRemote`.
+#[test]
+fn a_split_ledger_over_github_meets_the_ledger_contracts() {
+    fl_core::conformance::ledger(|| OverFake);
+    fl_core::conformance::split_ledger(|| OverFake);
+}
+```
+
+In `crates/core/src/split.rs`'s `tests`, add — so `MemRemote`'s own answer to a lost answer stays pinned once Step 3 lets the shared case accept either:
+
+```rust
+    // ⚠ Spec §3.2 step 5: `MemRemote` reports a lost answer as a failure;
+    // the next flush carries the run, and adds no second copy.
+    #[test]
+    fn a_lost_answer_refuses_the_flush_and_the_next_one_adds_nothing_twice() {
+        let (s, _p, g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        let run = sample_record_run(1, &g, Some(&r));
+        l.append_gate_run(run.clone()).unwrap();
+        remote.lose_next_answer();
+        assert!(
+            l.flush(sample_decision(1, &r, vec![run.id.clone().unwrap()]))
+                .is_err()
+        );
+        l.flush(sample_decision(2, &r, vec![run.id.clone().unwrap()]))
+            .unwrap();
+        assert_eq!(published_ids(&remote, &g), vec![run.id]);
+    }
+```
+
+Add at the end of the `tests` module of `crates/github/src/ledger/append.rs`:
+
+```rust
+    // ⚠ Decision 2 and spec §8.3: on a repository that is not private, no
+    // published line holds anything machine-specific.
+    #[test]
+    fn a_repository_that_is_not_private_publishes_nothing_machine_specific() {
+        let secret_path = "/home/someone/work/app/src/a.rs";
+        let secret_host = "build-host-7";
+        let home = std::env::var("HOME").ok().filter(|h| h.len() > 1);
+        for visibility in ["public", "internal"] {
+            let (fake, local, _root) = world();
+            fake.state().repos[0].visibility = visibility.into();
+            let mut r = run(1);
+            r.output_excerpt = Some(format!("{secret_path} on {secret_host}"));
+            let mut errored = run(2);
+            errored.verdict = Verdict::error(format!("could not spawn {secret_path} on {secret_host}"));
+            let mut a = attempt(3);
+            a.output_excerpt = Some(format!("{secret_path} on {secret_host}"));
+            a.paths_touched = PathsTouched::Listed(vec![secret_path.into()]);
+            let c = client(&fake);
+            let l = open(&c, &local);
+            l.publish(&batch(1, vec![r, errored], vec![a])).unwrap();
+            let secrets: Vec<String> = [
+                Some(secret_path.to_string()),
+                Some(secret_host.to_string()),
+                home.clone(),
+            ]
+                .into_iter()
+                .flatten()
+                .collect();
+            for (path, text) in fake.ledger_files() {
+                for secret in &secrets {
+                    assert!(!text.contains(secret.as_str()), "{visibility}: `{path}` holds `{secret}`");
+                }
+            }
+            let runs = l.runs(&gate()).unwrap();
+            assert_eq!(runs[0].output_excerpt, None);
+            assert_eq!(runs[1].verdict, Verdict::error(WITHHELD_ERROR_DETAIL));
+            let attempts = l.attempts_of(&project()).unwrap();
+            assert_eq!(attempts[0].output_excerpt, None);
+            assert_eq!(attempts[0].paths_touched, PathsTouched::Counted(1));
+        }
+    }
+
+    #[test]
+    fn a_batch_published_while_private_is_not_added_again_once_public() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let b = batch(1, vec![run(1)], vec![attempt(2)]);
+        open(&c, &local).publish(&b).unwrap();
+        let commits = fake.ledger_commits();
+        fake.state().repos[0].visibility = "public".into();
+        assert_eq!(open(&c, &local).publish(&b).unwrap(), None);
+        assert_eq!(fake.ledger_commits(), commits);
+    }
+
+    // ⚠ Ruling 21: an answer that names no visibility is taken as not
+    // private — the safe side, since a published excerpt cannot be taken
+    // back.
+    #[test]
+    fn a_repository_answer_that_names_no_visibility_withholds_the_excerpts() {
+        let (fake, local, _root) = world();
+        fake.state().omit_visibility = true;
+        let c = client(&fake);
+        let l = open(&c, &local);
+        l.publish(&batch(1, vec![run(1)], vec![attempt(2)])).unwrap();
+        assert_eq!(l.visibility().unwrap(), crate::ledger::Visibility::NotPrivate);
+        assert_eq!(l.runs(&gate()).unwrap()[0].output_excerpt, None);
+        assert_eq!(l.attempts_of(&project()).unwrap()[0].output_excerpt, None);
+    }
+```
+
+and to its `use` lines:
+
+```rust
+    use fl_core::log::{PathsTouched, WITHHELD_ERROR_DETAIL};
+    use fl_core::verdict::Verdict;
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p fl-github --lib ledger`
+Expected: `a_split_ledger_over_github_meets_the_ledger_contracts` FAILS at the split case `a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush`: `GithubLedger` reads the ledger again after a lost answer and answers (ruling 13), where the case insists on an error. The three disclosure tests pass at once — they pin Task 11's projection and visibility rules, and Step 5 proves they can fail.
+
+- [ ] **Step 3: Write the implementation**
+
+In `crates/core/src/conformance.rs`, replace the first `flush` assertion of `a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush` (lines 824-831) with:
+
+```rust
+    ctl.lose_next_answer();
+    // A remote that cannot tell refuses the flush, and the next one carries
+    // the run; one that reads the ledger again finds the commit landed and
+    // answers (GitHub ledger spec §3.2 step 5; ruling 13). Either way, the
+    // run is never published twice.
+    let _ = roles.ledger.flush(sample_decision(1, &r, vec![id.clone()]));
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p fl-github && cargo test -p fl-core -p fl-store`
+Expected: PASS — `a_split_ledger_over_github_meets_the_ledger_contracts` runs the four ledger cases and ten split cases over the fake.
+
+- [ ] **Step 5: Mutation checks**
+
+1. `publish_batch`: skip the projection (publish `r.clone()` and `a.clone()`) → `a_repository_that_is_not_private_publishes_nothing_machine_specific` and `a_repository_answer_that_names_no_visibility_withholds_the_excerpts` red.
+2. `disclose::run`: keep the error's detail → `a_repository_that_is_not_private_publishes_nothing_machine_specific` red (the scan finds the path and the host).
+3. `visibility`: take an answer that names none as private (`unwrap_or("private")`) → `a_repository_answer_that_names_no_visibility_withholds_the_excerpts` red.
+4. `append`: de-duplicate by line text instead of by id → `a_batch_published_while_private_is_not_added_again_once_public` red (the public copy differs).
+5. `fixture.rs`: make `Recorded::publish` skip the push → `a_published_entry_is_never_offered_to_github_again` red over the fake (proves the suite sees the batches).
+6. `MemRemote::publish` (`conformance.rs`): stop losing the answer under `lose_next_answer` → `a_lost_answer_refuses_the_flush_and_the_next_one_adds_nothing_twice` red.
+
+- [ ] **Step 6: Run the trio and commit**
+
+```bash
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+git add crates/github/src/ledger/mod.rs crates/github/src/ledger/fixture.rs crates/github/src/ledger/append.rs crates/core/src/conformance.rs crates/core/src/split.rs
+git commit -m "test(github): decision 2 on the branch, and the split suites over GitHub
+
+On a repository that is not private — or whose answer names no
+visibility — no published line holds an excerpt, an error's detail or a
+path; a batch sent again after the repository went public adds nothing.
+The shared ledger and split-ledger suites now run over GithubLedger and
+the fake, built on the tracker's own client; the lost-answer case accepts
+a remote that reads the ledger again. Guards mutation-tested.
+
+Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
+```
+
+---
+
+### Task 13: `init`, the mode, and what `init` tells the person
 
 **Files:**
 - Create: `crates/github/src/ledger/init.rs`
@@ -7179,7 +8351,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 - Modify: `crates/github/src/ledger/mod.rs` (module, exports)
 
 **Interfaces:**
-- Consumes: `branch_head`, `check_head`, `path` (Task 9); `LedgerMemory` (`ledger_root`, `set_ledger_root`, `cutover`, `set_cutover`); `ledger_root_shape` (Task 4); the fake's refs, trees, commits and rules (Task 7).
+- Consumes: `branch_head`, `check_head`, `path` (Task 9); `LedgerMemory` (`ledger_root`, `set_ledger_root`, `cutover`, `set_cutover`); `node_id_shape` (Task 4); the fake's refs, trees, commits and rules (Task 7).
 - Produces:
 
 ```rust
@@ -7196,7 +8368,7 @@ impl GithubLedger<'_> {
     pub fn init(&self, cutover: &Iri, confirmed: Option<&str>) -> Result<InitOutcome, StoreError>;
     pub fn mode(&self) -> Result<Mode, StoreError>;
 }
-pub fn guidance(repo: &str, mode: &Mode) -> Vec<String>;   // spec §6.1 steps 6-8, §6.3
+pub fn guidance(repo: &str, mode: &Mode) -> Vec<String>;   // spec §6.1 steps 7-9, §6.3
 pub fn ruleset_command(repo: &str) -> String;              // a ready `gh api` command
 
 // crate-internal (git.rs)
@@ -7286,7 +8458,7 @@ mod tests {
         assert_eq!(fake.ledger_commits(), 1);
     }
 
-    // ⚠ Ruling 16 (spec defect 2): a machine that imported the root has no
+    // ⚠ Spec §6.1 step 5 (ruling 16): a machine that imported the root has no
     // cut-over; init records one, or its flushes would publish nothing.
     #[test]
     fn a_machine_that_imported_the_root_records_its_own_cut_over() {
@@ -7320,7 +8492,7 @@ mod tests {
         assert_eq!(local.ledger_root("R_1").unwrap(), None);
     }
 
-    // Spec §6.1 step 5: init stopped after creating the branch.
+    // Spec §6.1 step 6: init stopped after creating the branch.
     #[test]
     fn init_that_stopped_after_the_branch_asks_to_confirm_its_first_commit() {
         let fake = FakeGithub::start("acme/widgets");
@@ -7393,7 +8565,7 @@ mod tests {
         );
     }
 
-    // Spec §6.1 step 5 and §7: a deleted ledger is refused, never replaced.
+    // Spec §6.1 step 6 and §7: a deleted ledger is refused, never replaced.
     #[test]
     fn init_refuses_a_ledger_that_was_deleted() {
         let fake = FakeGithub::start("acme/widgets");
@@ -7425,9 +8597,10 @@ mod tests {
         );
     }
 
-    // Ruling 20: init checks the root's shape before recording it.
+    // Ruling 20: init checks the repository's node id before it creates
+    // anything, so a malformed binding leaves no branch behind.
     #[test]
-    fn init_refuses_a_root_it_cannot_record() {
+    fn init_refuses_a_node_id_that_cannot_be_one_before_creating_anything() {
         let fake = FakeGithub::start("acme/widgets");
         let local = MemStore::default();
         let c = client(&fake);
@@ -7440,8 +8613,33 @@ mod tests {
             &local,
         );
         let err = bad.init(&entry_iri(0), None).unwrap_err();
-        assert!(err.to_string().contains("cannot be one"), "{err}");
+        assert!(err.to_string().contains("is not a GitHub node id"), "{err}");
+        assert_eq!(fake.ledger_head(), None, "no branch left behind");
+        assert!(fake.state().requests.is_empty(), "not one request");
         assert_eq!(local.cutover("1 not a node").unwrap(), None);
+    }
+
+    #[test]
+    fn init_whose_first_tree_or_commit_was_not_created_records_nothing() {
+        let fake = FakeGithub::start("acme/widgets");
+        let local = MemStore::default();
+        let c = client(&fake);
+        fake.state().fail_next_git_create = true;
+        let err = open(&c, &local).init(&entry_iri(0), None).unwrap_err();
+        assert!(err.to_string().contains("answered 500"), "{err}");
+        assert_eq!(fake.ledger_head(), None);
+        assert_eq!(local.cutover("R_1").unwrap(), None);
+    }
+
+    #[test]
+    fn a_mode_that_cannot_be_read_is_an_error_not_detection_only() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.seed_ledger();
+        fake.state().fail_rules_next = true;
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local).mode().unwrap_err();
+        assert!(err.to_string().contains("answered 500"), "{err}");
     }
 
     /// A local store whose cut-over cannot be written.
@@ -7491,8 +8689,8 @@ mod tests {
         fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError> {
             self.0.mark_published(repo, ids)
         }
-        fn set_aside(&self, ids: &[Iri]) -> Result<(), StoreError> {
-            self.0.set_aside(ids)
+        fn settle(&self, repo: &str, done: &[Iri], aside: &[Iri]) -> Result<(), StoreError> {
+            self.0.settle(repo, done, aside)
         }
         fn cutover(&self, repo: &str) -> Result<Option<Iri>, StoreError> {
             self.0.cutover(repo)
@@ -7562,7 +8760,7 @@ mod tests {
         assert_eq!(Mode::Protected.name(), "protected");
     }
 
-    // Spec §6.1 steps 6-8 and §6.3.
+    // Spec §6.1 steps 7-9 and §6.3.
     #[test]
     fn the_guidance_names_the_mode_the_ruleset_the_default_branch_the_permissions_and_the_limit() {
         let detection = Mode::DetectionOnly {
@@ -7654,7 +8852,7 @@ use super::GithubLedger;
 use super::layout::{BRANCH, FORMAT_FILE, README, README_FILE};
 use crate::client::Method;
 use fl_core::iri::Iri;
-use fl_core::{LedgerFault, StoreError, ledger_root_shape};
+use fl_core::{LedgerFault, StoreError, node_id_shape};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
@@ -7669,7 +8867,7 @@ pub enum InitOutcome {
     AlreadySetUp { root: String, cutover_recorded: bool },
     /// The branch exists and this machine knows no root: the person confirms
     /// that `root` is the first commit they made, by running `init` again
-    /// with it (spec §6.1 step 5). Nothing was recorded.
+    /// with it (spec §6.1 step 6). Nothing was recorded.
     Confirm { root: String },
     /// The person confirmed `root`; this machine recorded it and its
     /// cut-over.
@@ -7698,7 +8896,7 @@ impl Mode {
 const RULES: [&str; 2] = ["non_fast_forward", "deletion"];
 
 impl GithubLedger<'_> {
-    /// `fl github ledger init` (spec §6.1 steps 2–5). Run once per
+    /// `fl github ledger init` (spec §6.1 steps 2–6). Run once per
     /// repository by a person, and safe to run again: it recovers from a
     /// run that stopped after any step.
     ///
@@ -7707,6 +8905,13 @@ impl GithubLedger<'_> {
     /// commit the person confirmed after an earlier `Confirm`.
     pub fn init(&self, cutover: &Iri, confirmed: Option<&str>) -> Result<InitOutcome, StoreError> {
         let repo = self.repo.full_name.clone();
+        // ⚠ Ruling 20: a node id that cannot be one is refused before
+        // anything is created, so a malformed binding leaves no branch.
+        node_id_shape(&self.repo.node_id).map_err(|why| {
+            StoreError::Backend(format!(
+                "fl will not set up a ledger for {repo}: its node id {why}"
+            ))
+        })?;
         // ⚠ Step 2: git cannot hold both `fl` and `fl/ledger`.
         if self.branch_head("fl")?.is_some() {
             return Err(StoreError::Backend(format!(
@@ -7718,7 +8923,7 @@ impl GithubLedger<'_> {
             self.branch_head(BRANCH)?,
             self.local.ledger_root(&self.repo.node_id)?,
         ) {
-            // ⚠ Step 5: the ledger was deleted. A new one would hide that.
+            // ⚠ Step 6: the ledger was deleted. A new one would hide that.
             (None, Some(root)) => Err(LedgerFault::Deleted { repo, root }.into()),
             (None, None) => {
                 let root = self.create_branch()?;
@@ -7811,24 +9016,19 @@ impl GithubLedger<'_> {
             .ok_or_else(|| StoreError::Backend(format!("GitHub created {what} but named no id")))
     }
 
-    /// Step 4: this machine's cut-over if it has none, then the root.
+    /// Steps 4 and 5: this machine's cut-over if it has none, then the
+    /// root. The root is GitHub's own commit id; the manifest's consistency
+    /// check refuses a malformed one at export.
     ///
     /// ⚠ In that order (ruling 16): a root on record means the cut-over is
     /// too, and a run that stopped between the two keeps its cut-over.
     fn record(&self, cutover: &Iri, root: &str) -> Result<(), StoreError> {
-        ledger_root_shape(&self.repo.node_id, root).map_err(|why| {
-            StoreError::Backend(format!(
-                "fl cannot record {root} as the ledger's root for repository node {}: it cannot \
-                 be one ({why})",
-                self.repo.node_id
-            ))
-        })?;
         self.record_cutover(cutover)?;
         self.local.set_ledger_root(&self.repo.node_id, root)
     }
 
-    /// Whether this machine had no cut-over and now has `cutover`. ⚠ An
-    /// existing cut-over never moves.
+    /// Whether this machine had no cut-over and now has `cutover` (spec §6.1
+    /// step 5). ⚠ An existing cut-over never moves.
     fn record_cutover(&self, cutover: &Iri) -> Result<bool, StoreError> {
         if self.local.cutover(&self.repo.node_id)?.is_some() {
             return Ok(false);
@@ -7908,7 +9108,7 @@ impl GithubLedger<'_> {
 }
 
 /// What `init` tells the person once the ledger is set up (spec §6.1 steps
-/// 6–8, §6.2, §6.3), one paragraph each, for the command to print.
+/// 7–9, §6.2, §6.3), one paragraph each, for the command to print.
 pub fn guidance(repo: &str, mode: &Mode) -> Vec<String> {
     let mut out = vec![match mode {
         Mode::Protected => "mode: protected. A ruleset on `fl/ledger` refuses a rewrite or a \
@@ -7945,7 +9145,7 @@ pub fn guidance(repo: &str, mode: &Mode) -> Vec<String> {
 }
 
 /// The administrator's ruleset for `fl/ledger`, as a ready `gh api`
-/// command (spec §6.1 step 6).
+/// command (spec §6.1 step 7).
 pub fn ruleset_command(repo: &str) -> String {
     let body = json!({
         "name": "fl ledger",
@@ -7973,15 +9173,17 @@ Expected: PASS.
 5. `record_cutover`: always write the new cut-over → `init_run_again_says…` and `init_that_stopped_between…` red (`CutoverChanged`).
 6. `init`'s set-up arm: skip `record_cutover` → `a_machine_that_imported_the_root_records_its_own_cut_over` red.
 7. `record`: record the root before the cut-over → `a_cut_over_that_cannot_be_recorded_leaves_no_root` red.
-8. `record`: drop the shape check → `init_refuses_a_root_it_cannot_record` red.
+8. `init`: drop the node-id check, or move it after `create_branch` → `init_refuses_a_node_id_that_cannot_be_one_before_creating_anything` red.
 9. `create_branch`: treat "already exists" as success → `someone_creating_the_branch_while_init_runs…` red.
 10. `mode`: require only `non_fast_forward` → `the_mode_is_protected_only_when_both_rules_are_in_force` red; drop the upgrade arm → the same test red (an error, not a mode).
 11. `guidance`: print the ruleset command when protected → `the_guidance_names…` red.
+12. `created`: drop the `201` check → `init_whose_first_tree_or_commit_was_not_created_records_nothing` red (the error no longer names the 500).
+13. `mode`: drop the `200` check → `a_mode_that_cannot_be_read_is_an_error_not_detection_only` red (an empty answer reads as detection-only).
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/github/src/ledger/mod.rs crates/github/src/ledger/git.rs crates/github/src/ledger/init.rs
 git commit -m "feat(github): ledger init, the mode in force, and init's guidance
 
@@ -7999,7 +9201,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 
 ---
 
-### Task 12: `verify` and `quarantine`
+### Task 14: `verify` and `quarantine`
 
 **Files:**
 - Create: `crates/github/src/ledger/verify.rs`
@@ -8008,7 +9210,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 - Modify: `crates/github/src/fake.rs` (`State`: `truncate_trees`), `crates/github/src/fake_git.rs` (`get_tree`)
 
 **Interfaces:**
-- Consumes: `snapshot`, `identity`, `append`, `NewLine` (Tasks 9–10); `layout::{parse_segment_path, lines, QuarantineLine}` (Task 6).
+- Consumes: `snapshot`, `identity`, `append`, `NewLine` (Tasks 10–11); `layout::{parse_segment_path, lines, QuarantineLine}` (Task 6).
 - Produces:
 
 ```rust
@@ -8024,7 +9226,8 @@ impl GithubLedger<'_> {
 // crate-internal (git.rs)
 pub(crate) struct CommitObject { pub tree: String, pub parents: Vec<String> }
 pub(crate) fn commit_object(&self, sha: &str) -> Result<CommitObject, StoreError>;
-pub(crate) fn tree_files(&self, tree: &str) -> Result<BTreeMap<String, String>, StoreError>; // path → blob
+// path → blob
+pub(crate) fn tree_files(&self, tree: &str) -> Result<BTreeMap<String, String>, StoreError>;
 
 // fl_github::fake::State
 pub truncate_trees: bool,
@@ -8154,6 +9357,37 @@ mod tests {
             assert_eq!(first.commit, bad, "{case}: {first:?}");
             assert!(first.what.contains(what), "{case}: {}", first.what);
         }
+    }
+
+    // Spec §3.5 check 4 as `verify` sees it: `quarantine.jsonl` only grows.
+    #[test]
+    fn a_quarantine_file_that_lost_a_line_is_reported() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(QUARANTINE_FILE, Some("a\nb\n"))]);
+        let bad = fake.hand_commit(&[(QUARANTINE_FILE, Some("b\n"))]);
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert!(first.what.contains("rewrites lines of `quarantine.jsonl`"), "{}", first.what);
+    }
+
+    // About one request per commit (spec §3.5): each tree is listed once,
+    // though it is compared twice.
+    #[test]
+    fn verify_lists_each_tree_once() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        for n in 1..=3 {
+            publish(&l, n);
+        }
+        let before = fake.state().requests.len();
+        let v = l.verify().unwrap();
+        let listed = fake.state().requests[before..]
+            .iter()
+            .filter(|r| r.contains("/git/trees/"))
+            .count();
+        assert_eq!(listed, v.commits);
     }
 
     #[test]
@@ -8342,7 +9576,7 @@ pub(crate) struct CommitObject {
 }
 ```
 
-and replace `parents_of` (Task 11) with:
+and replace `parents_of` (Task 13) with:
 
 ```rust
     /// A ledger commit: its tree and its parents.
@@ -8453,6 +9687,13 @@ pub struct BadCommit {
     pub what: String,
 }
 
+/// What one verify has already read: blob texts and tree listings, by id.
+#[derive(Default)]
+struct Seen {
+    blobs: BTreeMap<String, String>,
+    trees: BTreeMap<String, BTreeMap<String, String>>,
+}
+
 impl GithubLedger<'_> {
     /// `fl github ledger verify` (spec §3.5): every commit from the anchor
     /// to the head, along first parents, each checked to only add lines or
@@ -8504,13 +9745,13 @@ impl GithubLedger<'_> {
             }
         }
         chain.reverse();
-        let mut blobs: BTreeMap<String, String> = BTreeMap::new();
+        let mut seen = Seen::default();
         if chain.first().is_some_and(|(c, _)| *c == anchor) {
-            if let Some(what) = self.fls_first_commit(&chain[0].1, &mut blobs)? {
+            if let Some(what) = self.fls_first_commit(&chain[0].1, &mut seen)? {
                 bad.push((anchor.clone(), what));
             }
             for pair in chain.windows(2) {
-                if let Some(what) = self.only_adds(&pair[0].1, &pair[1].1, &mut blobs)? {
+                if let Some(what) = self.only_adds(&pair[0].1, &pair[1].1, &mut seen)? {
                     bad.push((pair[1].0.clone(), what));
                 }
             }
@@ -8530,13 +9771,24 @@ impl GithubLedger<'_> {
         })
     }
 
-    fn text_of(&self, oid: &str, blobs: &mut BTreeMap<String, String>) -> Result<String, StoreError> {
-        if let Some(t) = blobs.get(oid) {
+    fn text_of(&self, oid: &str, seen: &mut Seen) -> Result<String, StoreError> {
+        if let Some(t) = seen.blobs.get(oid) {
             return Ok(t.clone());
         }
         let t = self.blob_text(oid)?;
-        blobs.insert(oid.to_string(), t.clone());
+        seen.blobs.insert(oid.to_string(), t.clone());
         Ok(t)
+    }
+
+    /// A tree's files, listed once per verify: each commit's tree is both
+    /// the "after" of one comparison and the "before" of the next.
+    fn files_of(&self, tree: &str, seen: &mut Seen) -> Result<BTreeMap<String, String>, StoreError> {
+        if let Some(files) = seen.trees.get(tree) {
+            return Ok(files.clone());
+        }
+        let files = self.tree_files(tree)?;
+        seen.trees.insert(tree.to_string(), files.clone());
+        Ok(files)
     }
 
     /// What is wrong with the anchor, if anything: it holds exactly
@@ -8544,16 +9796,16 @@ impl GithubLedger<'_> {
     fn fls_first_commit(
         &self,
         anchor: &CommitObject,
-        blobs: &mut BTreeMap<String, String>,
+        seen: &mut Seen,
     ) -> Result<Option<String>, StoreError> {
-        let files = self.tree_files(&anchor.tree)?;
+        let files = self.files_of(&anchor.tree, seen)?;
         let names: BTreeSet<&str> = files.keys().map(String::as_str).collect();
         if names != BTreeSet::from([FORMAT_FILE, README_FILE]) {
             return Ok(Some(format!(
                 "starts the ledger with {names:?}, where fl writes only `format` and `README.md`"
             )));
         }
-        let format = self.text_of(&files[FORMAT_FILE], blobs)?;
+        let format = self.text_of(&files[FORMAT_FILE], seen)?;
         if format.strip_suffix('\n').unwrap_or(&format) != FORMAT {
             return Ok(Some(format!("starts the ledger at format `{}`", format.trim())));
         }
@@ -8565,10 +9817,10 @@ impl GithubLedger<'_> {
         &self,
         before: &CommitObject,
         after: &CommitObject,
-        blobs: &mut BTreeMap<String, String>,
+        seen: &mut Seen,
     ) -> Result<Option<String>, StoreError> {
-        let old = self.tree_files(&before.tree)?;
-        let new = self.tree_files(&after.tree)?;
+        let old = self.files_of(&before.tree, seen)?;
+        let new = self.files_of(&after.tree, seen)?;
         for (path, oid) in &old {
             let Some(now) = new.get(path) else {
                 return Ok(Some(format!("deletes `{path}`")));
@@ -8591,7 +9843,7 @@ impl GithubLedger<'_> {
                 None if path == QUARANTINE_FILE => {}
                 None => return Ok(Some(format!("changes `{path}`, which fl never writes"))),
             }
-            let (was, is) = (self.text_of(oid, blobs)?, self.text_of(now, blobs)?);
+            let (was, is) = (self.text_of(oid, seen)?, self.text_of(now, seen)?);
             if !is.starts_with(&was) {
                 return Ok(Some(format!("rewrites lines of `{path}`")));
             }
@@ -8697,15 +9949,17 @@ Expected: PASS.
 3. `fls_first_commit`: accept any file list → `a_first_commit_holding_more_than_fl_writes_is_reported` red.
 4. `only_adds`: drop the deletion check → "a deletion" case red; drop the `format`/`README.md` check → those cases red; drop the closed-segment check → `a_closed_segment_that_changes_is_reported` red; drop the `starts_with` check → "a rewritten line" case red; drop the stray-file check → "a stray file" case red; drop the gap check → "a gap" case red.
 5. `tree_files`: ignore `truncated` → `a_tree_listing_cut_short_is_an_error_not_a_pass` red.
+5b. `files_of`: list every time (skip the memo) → `verify_lists_each_tree_once` red.
+5c. `only_adds`: exempt `quarantine.jsonl` from the growth check → `a_quarantine_file_that_lost_a_line_is_reported` red.
 6. `verify`: return `Verified` for a missing anchor → `verify_says_why_when_there_is_no_ledger_to_walk` red.
 7. `quarantine`: each refusal — the quarantine file, a non-segment, a missing file, line 0, a line past the end, an empty `--by`, an empty `--reason` — removed one at a time → `a_quarantine_must_name_a_line_of_a_segment_and_who_decided_why` red at that row.
-8. `append`'s quarantine branch (Task 10): add every line without the id check → `a_quarantine_retried_after_a_lost_answer_adds_one_line` red.
-9. `lines` (Task 9) still skips a quarantined misplaced line: move the quarantine skip below the misplaced check → `a_misplaced_line_can_be_quarantined` red.
+8. `append`'s quarantine branch (Task 11): add every line without the id check → `a_quarantine_retried_after_a_lost_answer_adds_one_line` red.
+9. `lines` (Task 10) still skips a quarantined misplaced line: move the quarantine skip below the misplaced check → `a_misplaced_line_can_be_quarantined` red.
 
 - [ ] **Step 6: Run the trio and commit**
 
 ```bash
-cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
+cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace
 git add crates/github/src/fake.rs crates/github/src/fake_git.rs crates/github/src/ledger/mod.rs crates/github/src/ledger/git.rs crates/github/src/ledger/verify.rs
 git commit -m "feat(github): verify the ledger's history, and quarantine a line
 
@@ -8724,34 +9978,35 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 
 ## After the last task
 
-- [ ] Run the trio once more on the whole branch: `cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace`.
+- [ ] Run the trio once more on the whole branch: `cargo fmt --all && cargo fmt --all --check && cargo clippy --all-targets --workspace -- -D warnings && cargo test --workspace`.
 - [ ] Confirm no test reached the network: `grep -rn 'api.github.com' crates --include='*.rs'` lists only `DEFAULT_API` and the ignored live tests.
 - [ ] Confirm every *Modelled* shape names the live test that will confirm it: `grep -rn 'Modelled' crates/github/src` — each hit names a test for plan B2 to write.
-- [ ] Follow WORKFLOW.md: `superpowers:requesting-code-review` on the whole branch, then a pull request against `main`. The pull request names this plan's rulings 1–23 and spec defects 1–6 for the owner, and says plainly that B1 binds nothing in the CLI: `ledger = "github"` is still refused as an unknown key until B2.
+- [ ] Follow WORKFLOW.md: `superpowers:requesting-code-review` on the whole branch, then a pull request against `main`. The pull request names this plan's rulings 1–24 for the owner, and says plainly that B1 binds nothing in the CLI: `ledger = "github"` is still refused as an unknown key until B2.
 
 ## Spec coverage (plan B1's share)
 
 | spec | where |
 |---|---|
-| decision 2 (projection on a repository that is not private; `internal` is not private; a failed visibility read is an error) | Task 6 (`disclose`), Task 10 (`publish_batch`, `visibility`) |
+| decision 2 (projection on a repository that is not private; `internal` is not private; a failed visibility read is an error) | Task 6 (`disclose`), Task 11 (`publish_batch`, `visibility`), Task 12 (the tests that pin them) |
 | decision 8 (an attempt whose flush fails is kept and published next time) | plan A; Task 2 (decision 14's warning) |
-| decision 9 / §6.2 (modes; inactive or partial ruleset is detection-only, naming what is missing) | Task 11 (`mode`, ruling 15) |
-| decision 10 / §3.6 (quarantine by an append, never a removal) | Task 9 (readers skip and note), Task 12 (`quarantine`) |
-| decision 12 (Free is the baseline) | Task 11 (detection-only works; the plan's refusal is a mode, not an error) |
+| decision 9 / §6.2 (modes; read from the rules in force; detection-only names what is missing) | Task 13 (`mode`, ruling 15) |
+| decision 10 / §3.6 (quarantine by an append, never a removal) | Task 10 (readers skip and note), Task 14 (`quarantine`) |
+| decision 12 (Free is the baseline) | Task 13 (detection-only works; the plan's refusal is a mode, not an error) |
 | decision 14 (an unpublished attempt exits with its own code, warning) | Task 2 |
-| §1.1 `GithubLedger`, sharing the tracker's client | Tasks 9–10 (`GithubTracker::client`) |
-| §2.1 bounded scan; a skipped entry reported | Task 3 |
-| §2.5 `attempts` local-only only when GitHub cannot be read | Task 1 |
-| §3.1 layout, keys, segments, lines with `by`, strict format | Task 6 |
-| §3.2 append protocol: read, check, add what is missing, `expectedHeadOid`, five tries, timeout, no empty commit, last seen | Task 10 |
-| §3.3 reads: listing with ids, download only what is not cached, strict lines, quarantine skipped, unreadable line names file, line, commit and command | Task 9 |
-| §3.5 checks 1–7 | Task 9 (each named in the code), Task 10 (on every append) |
-| §3.5 `verify` | Task 12 |
-| §6.1 steps 2–5 (`init`, its recovery) and steps 6–8 (guidance) | Task 11 (the CLI prints it in B2) |
-| §6.3 permissions named from `x-accepted-github-permissions` | Task 7, Task 10 |
-| §7 rows: branch missing; deleted; no root; rewritten; tampering; unknown format; unreadable line; rate limited; unreachable | Task 1 (`LedgerFault`), Task 9, Task 10 |
+| §1.1 `GithubLedger`, sharing the tracker's client | Tasks 9–11 (`GithubTracker::client`; Task 12's fixture uses it) |
+| §2.1 bounded scan; a skipped entry reported once | Task 3 |
+| §2.5 `attempts` local-only only when GitHub cannot be read (unreachable or rate limited) | Task 1 |
+| §3.1 layout, keys, segments, lines with `by`, strict format; a finding decision under its finding | Task 6 |
+| §3.2 append protocol: read, check, add what the directory lacks, `expectedHeadOid`, five tries, timeout, no empty commit, last seen | Task 11 |
+| §3.3 reads: listing with ids, download only what is not cached, strict lines, quarantine skipped, unreadable line names file, line, commit and command | Tasks 9–10 |
+| §3.5 checks 1, 2, 7 (with replica lag) | Task 9 |
+| §3.5 checks 3–6 | Task 10 (each named in the code); Task 11 (on every append) |
+| §3.5 `verify` | Task 14 |
+| §6.1 steps 2–6 (`init`, its recovery, every machine's cut-over) and steps 7–9 (guidance) | Task 13 (the CLI prints it in B2) |
+| §6.3 permissions named from `x-accepted-github-permissions` | Task 7, Task 11 |
+| §7 rows: branch missing; deleted; no root; rewritten; tampering (incl. a line in the wrong directory); unknown format; unreadable line; rate limited; contention; unreachable | Task 1 (`LedgerFault`), Tasks 9–11 |
 | §8.1 fake: Git Data API, `createCommitOnBranch` with `expectedHeadOid` and its knobs, listing with ids, `rules/branches` knobs | Tasks 7–8 (paginated issue comments: B2) |
-| §8.2 conformance over `SplitLedger` and the fake | Task 10 (`fixture.rs`) |
-| §8.3 battery: racing flushes; timeout then retry; each tamper check and a `behind` that catches up; quarantine; unknown ledger format; rollover and many segments; refused decision flushed; `init` stopped after each step; disclosure by field and a scan for paths, `$HOME` and a host name; both modes | Tasks 9–12 (the manifest-format refusal is plan A's; comment battery items: B2) |
+| §8.2 conformance over `SplitLedger` and the fake | Task 12 (`fixture.rs`) |
+| §8.3 battery: racing flushes; timeout then retry; each tamper check and a `behind` that catches up; quarantine; unknown ledger format; rollover and many segments; refused decision flushed; `init` stopped after each step; disclosure by field and a scan for paths, `$HOME` and a host name; both modes | Tasks 9–14 (the manifest-format refusal is plan A's; comment battery items: B2) |
 | plan A checklist: unbounded scan; typed refusals and retry wording; decision 14; batches visible; `LedgerRoot` shape; stats fall back only when transient; format 4 after import | Tasks 1–4 |
 | §1.5 config key, §2.4 pre-flight, §4 comments, §2.6 stats rule, whoami mode, §8.4 live tests, §9 docs | plan B2 |
