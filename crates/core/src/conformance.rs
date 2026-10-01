@@ -89,7 +89,7 @@ pub trait SplitFixture {
 
 /// `SplitLedger` over a local store `S` and a [`MemRemote`] for `R_1`,
 /// whose ledger was switched on (a cut-over before every sample entry). A
-/// [`Fixture`] too, so the shared ledger suite runs over it. Plan B's
+/// [`Fixture`] too, so the shared ledger suite runs over it. `fl_github`'s
 /// fixture swaps `MemRemote` for `GithubLedger` over the fake GitHub.
 pub struct SplitOver<S, G>(pub S, pub G);
 
@@ -707,7 +707,7 @@ pub fn add_alias_resolves_through_an_existing_alias_to_the_true_primary(roles: &
     assert!(via_second.also_known_as.contains(&second));
 }
 
-/// Fix round 1, item 1: `set_record_state` and `update_finding` both take an
+/// `set_record_state` and `update_finding` both take an
 /// id/struct the caller may have addressed by alias. Either must land on —
 /// and stay keyed by — the primary: no phantom second row, no double count.
 pub fn set_record_state_and_update_finding_through_an_alias_touch_the_primary_once(
@@ -768,7 +768,7 @@ pub fn set_record_state_and_update_finding_through_an_alias_touch_the_primary_on
     );
 }
 
-/// Fix round 1, item 6: `add_finding` must store the referenced record's
+/// `add_finding` must store the referenced record's
 /// PRIMARY id, never whatever alias the caller happened to raise against
 /// (e.g. the CLI stores exactly what the user typed) — otherwise two
 /// findings against "the same" record could disagree on which IRI names it.
@@ -786,7 +786,7 @@ pub fn a_finding_raised_against_a_record_alias_stores_the_primary(roles: &Bound<
     assert_eq!(f.record, r, "the finding stores the record's primary id");
 }
 
-/// Final review, item 12: `update_finding` keeps the STORED
+/// `update_finding` keeps the STORED
 /// `also_known_as` and ignores the caller's. A caller holding a copy read
 /// before an `add_alias` must not erase that alias from the item while the
 /// alias index still resolves it; a caller that edits the list must not add
@@ -1319,7 +1319,7 @@ fn assert_all_wrong_kind(
     }
 }
 
-// Final review, item 1: an id this store DOES hold, but as another kind,
+// An id this store DOES hold, but as another kind,
 // passed where a project (or `add_finding`'s record) is needed. An empty
 // list would claim the store looked at a project and found nothing in it;
 // `NotOwned` would claim the store never held the id. Both are false, so
@@ -1447,7 +1447,7 @@ fn handles_are_per_kind_and_start_at_one<S: Catalog + Tracker + Ledger + Handles
     assert_eq!(s.resolve_handle(Kind::Finding, 0).unwrap(), None);
 }
 
-// Final review, item 11: `refs::show` prints a handle only when
+// `refs::show` prints a handle only when
 // `handle_of(kind, id)` answers `Some`, so an id held under another kind must
 // answer `None` — never the handle it has under its OWN kind. A store that
 // ignored `kind` would answer `Some` in every row that must be `None`.
@@ -1625,7 +1625,8 @@ pub fn sample_decision(n: u64, record: &RecordId, rests_on: Vec<Iri>) -> Decisio
 }
 
 /// Drives a split ledger's GitHub side. `MemRemote` implements it here;
-/// plan B's fixture implements it over `GithubLedger` and the fake GitHub.
+/// `fl_github`'s fixture implements it over `GithubLedger` and the fake
+/// GitHub.
 pub trait RemoteControl {
     /// While down, every remote read and write fails as unreachable.
     /// Ownership is a local check (spec §2.1) and keeps answering.

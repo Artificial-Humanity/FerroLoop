@@ -70,8 +70,8 @@ pub enum FindingExecError {
 /// `neighbours` whose verdict did not pass. It is not additional data, and
 /// it is not re-run to produce — `verify_finding` filters it out of the same
 /// single pass over `neighbours`. It stays a first-class field (rather than
-/// a method) because `closed`/`exit_code()`'s contract is pinned by a
-/// reviewer's mutation testing and existing callers already read it as a
+/// a method) because `closed`/`exit_code()`'s contract is pinned by
+/// mutation-checked tests and existing callers already read it as a
 /// field.
 pub struct FixReport {
     pub reproduction: GateReport,
@@ -677,7 +677,7 @@ mod tests {
         f
     }
 
-    // Fix round 1, item 3: `verify_finding`'s two `follow_ref` calls (for
+    // `verify_finding`'s two `follow_ref` calls (for
     // `f.project` and `f.reproduction`) had no test — deleting either left
     // the whole suite green. Each is pinned here by corrupting the
     // finding's own stored reference, after it is legitimately `Assigned`,

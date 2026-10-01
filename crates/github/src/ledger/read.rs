@@ -1885,7 +1885,7 @@ mod tests {
         }
     }
 
-    // I3 (fix round 3): a symlink or an executable named like a segment
+    // A symlink or an executable named like a segment
     // (`1.jsonl`) must never be read as ordinary text — `directory` checks
     // `Entry::irregular` before it ever asks whether the name looks like a
     // segment.

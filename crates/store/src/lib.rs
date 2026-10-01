@@ -1604,7 +1604,7 @@ mod tests {
         assert_eq!(runs[0].verdict.population(), Some(3));
     }
 
-    /// Fix round 1, rewritten for handles: pins that minting, indexing,
+    /// Pins that minting, indexing,
     /// the handle bump and the row write inside `insert_new_with_id` commit
     /// as one unit. If they didn't, a failed insert would still leave the
     /// handle counter advanced and the id in `IDS` — a burned handle, and an
@@ -1786,7 +1786,7 @@ mod tests {
         );
     }
 
-    // Final review, item 7: `IDS` naming an id as a record whose row is
+    // `IDS` naming an id as a record whose row is
     // missing is on-disk damage, and `add_alias` must report it as `Decode`
     // — as `alias_primary` reports its own damaged cases — never panic.
     #[test]
@@ -2586,7 +2586,7 @@ mod tests {
         b.import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
             .unwrap();
         assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some(ROOT_A));
-        // ⚠ Plan A's checklist: an import that records a root makes the
+        // ⚠ An import that records a root makes the
         // store one an older fl refuses, not one it opens and exports
         // without the root.
         let tx = b.db.begin_read().unwrap();

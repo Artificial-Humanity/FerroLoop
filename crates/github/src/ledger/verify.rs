@@ -625,7 +625,7 @@ mod tests {
         );
     }
 
-    // I4 (fix round 3): an empty new segment is a different defect from
+    // An empty new segment is a different defect from
     // one merely missing its final newline — fl never creates an empty
     // one at all (there is always at least one line to write), and the
     // message says so rather than the misleading "without a final
@@ -648,7 +648,7 @@ mod tests {
         );
     }
 
-    // I4 (fix round 3): the same completeness rule applies to a BRAND-NEW
+    // The same completeness rule applies to a BRAND-NEW
     // `quarantine.jsonl`, not only to a segment — the adds-loop's check
     // previously covered segment paths only.
     #[test]
@@ -725,7 +725,7 @@ mod tests {
         );
     }
 
-    // I2 (fix round 3): a non-regular tree entry must be a `verify`
+    // A non-regular tree entry must be a `verify`
     // DEPARTURE, reported like any other — never a hard error that leaves
     // `verify` unable to finish past it at all.
     #[test]
@@ -742,7 +742,7 @@ mod tests {
         );
     }
 
-    // The reviewer's shape: an OLDER rewrite is still the oldest
+    // An OLDER rewrite is still the oldest
     // departure, even behind a LATER commit that adds a symlink.
     #[test]
     fn a_symlink_entry_is_reported_behind_an_older_rewrite() {
@@ -881,7 +881,7 @@ mod tests {
         );
     }
 
-    // I1 (fix round 3): an invalid UTF-8 byte in one line must not make
+    // An invalid UTF-8 byte in one line must not make
     // `snapshot` (and so `quarantine`, which only needs a snapshot) fail
     // hard — only `lines()`-based reads (`runs`), which actually decode
     // each line, see it, and only as the usual `Unreadable` for that one
@@ -941,7 +941,7 @@ mod tests {
         assert_eq!(l.runs(&gate()).unwrap(), vec![run(1)]);
     }
 
-    // I1 (fix round 3): `verify` must still tell two DIFFERENT invalid
+    // `verify` must still tell two DIFFERENT invalid
     // byte sequences apart — the whole point of comparing raw bytes
     // instead of a lossy-decoded string, which would collapse both to the
     // same replacement characters and see no rewrite at all.

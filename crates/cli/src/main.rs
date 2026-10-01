@@ -83,7 +83,7 @@ impl Command {
     }
 
     /// Whether the chosen subcommand names any item by handle rather than
-    /// IRI, dispatched to its own `has_handle()` (Fix round 1, item 1).
+    /// IRI, dispatched to its own `has_handle()`.
     fn has_handle(&self) -> bool {
         match self {
             Command::Project(c) => c.has_handle(),
@@ -217,7 +217,7 @@ fn explicit_db(flag: Option<PathBuf>) -> Option<PathBuf> {
 /// as-is — used as-is, it would put the store relative to whatever
 /// directory the command happened to run in.
 ///
-/// ⚠ Ruling (Fix round 1, item 0): `--db` and `$FL_DB` CONFINE the command
+/// ⚠ Ruling: `--db` and `$FL_DB` CONFINE the command
 /// to exactly the store they name. An IRI that store does not hold is
 /// `NotOwned` naming only that one store — never a search across every
 /// store any project happens to be bound to in the config. Only the
@@ -283,7 +283,7 @@ fn choose_store(
         return choose_among(&candidates, iris);
     }
 
-    // ⚠ Fix round 2, item 2: confined mode has exactly one candidate —
+    // ⚠ Confined mode has exactly one candidate —
     // `bound` itself — but looking up an IRI must never create a store
     // (`RedbStore::open` calls `Database::create`, which does). If `bound`
     // does not exist yet, every id in `iris` is `NotOwned` by construction;
@@ -408,7 +408,7 @@ fn store_tracker(
 }
 
 /// The tracker for a command that reads or writes records or findings, and
-/// works on the store at `chosen` (Final review, item 1).
+/// works on the store at `chosen`.
 ///
 /// ⚠ The binding is taken from the config entries whose `store` IS `chosen`
 /// — the store holds the node binding and the catalog GitHub is paired with
@@ -542,7 +542,7 @@ fn run(cli: Cli) -> Result<i32> {
         iris.retain(|i| !fl_github::meta::is_issue_url(i));
     }
     let path = choose_store(&bound, entries, &iris, confined)?;
-    // ⚠ Final review, item 1: the tracker comes from the store the command
+    // ⚠ The tracker comes from the store the command
     // ends up in, never from the current directory alone — an IRI can send
     // `choose_store` to another project's store, and pairing that store with
     // this directory's tracker would write one project's records into the
@@ -553,7 +553,7 @@ fn run(cli: Cli) -> Result<i32> {
     } else {
         None
     };
-    // ⚠ Fix round 1, item 1: a handle resolves only in the store it was
+    // ⚠ A handle resolves only in the store it was
     // read from. If an IRI elsewhere in this same command sent the search
     // to a DIFFERENT store than the bound one, a handle alongside it would
     // silently resolve against that other store's numbering instead —
@@ -672,7 +672,7 @@ mod tests {
         }
     }
 
-    /// Final review, item 1: two entries naming one store with different
+    /// Two entries naming one store with different
     /// trackers leave the store's tracker unknown, from either root.
     #[test]
     fn entries_sharing_a_store_but_not_a_tracker_are_refused() {

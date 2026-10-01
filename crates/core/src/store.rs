@@ -187,7 +187,7 @@ pub enum StoreError {
     #[error("{0}")]
     Ledger(#[from] LedgerFault),
     /// ⚠ A decision may rest only on entries it publishes or that are
-    /// already published (plan A ruling 8).
+    /// already published (ruling 8).
     #[error(
         "decision {decision} rests on {entry}, which is neither being published nor published. \
          A run tied to no record, one recorded before the GitHub ledger was switched on, or one \

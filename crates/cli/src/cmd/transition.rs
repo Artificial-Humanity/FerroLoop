@@ -35,7 +35,7 @@ pub enum Cmd {
 impl Cmd {
     /// Every item this command names, by `Ref` — the single source `iris()`
     /// and `has_handle()` both derive from, so a `Ref` field added to a
-    /// variant here is picked up by both at once (Fix round 2, item 5): the
+    /// variant here is picked up by both at once: the
     /// project, and (for `Add`) every `--gate` — a transition name is not
     /// an id and never appears here.
     fn refs(&self) -> Vec<&Ref> {

@@ -30,7 +30,7 @@ pub struct Cmd {
 
 impl Cmd {
     /// The one item this command names, by `Ref` — the single source
-    /// `iris()` and `has_handle()` both derive from (Fix round 2, item 5).
+    /// `iris()` and `has_handle()` both derive from.
     fn refs(&self) -> Vec<&Ref> {
         vec![&self.record]
     }

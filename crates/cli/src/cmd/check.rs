@@ -21,7 +21,7 @@ pub struct Cmd {
 impl Cmd {
     /// Every item this command names, by `Ref` — the single source `iris()`
     /// and `has_handle()` both derive from, so a `Ref` field added here is
-    /// picked up by both at once (Fix round 2, item 5). The transition name
+    /// picked up by both at once. The transition name
     /// is not an id.
     fn refs(&self) -> Vec<&Ref> {
         let mut out: Vec<&Ref> = vec![&self.project];

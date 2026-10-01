@@ -4,7 +4,7 @@
 //! the decision.
 //!
 //! The GitHub side is a [`RemoteLedger`]: `fl_github::GithubLedger`
-//! implements it (plan B), and `conformance::MemRemote` is the in-memory
+//! implements it, and `conformance::MemRemote` is the in-memory
 //! double every test here uses.
 
 use crate::at::At;

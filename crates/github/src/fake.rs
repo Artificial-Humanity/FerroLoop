@@ -1146,9 +1146,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 // A pull request, or a missing, deleted or transferred issue,
-                // answers `issue: null` with a NOT_FOUND error (the
-                // reviewer's reading of GitHub; unmeasured; no live test
-                // checks it yet).
+                // answers `issue: null` with a NOT_FOUND error (a reading
+                // of GitHub's docs; unmeasured; no live test checks it
+                // yet).
                 let Some(i) = s
                     .issues
                     .get(&n)

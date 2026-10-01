@@ -520,11 +520,11 @@ fn a_missing_manifest_on_an_importing_machine_is_refused_by_path() {
         .stderr(contains(".fl/manifest.json"));
 }
 
-/// A well-formed ledger root (plan B1 ruling 20).
+/// A well-formed ledger root (ruling 20).
 const ROOT: &str = "0123456789abcdef0123456789abcdef01234567";
 
 /// Put a ledger root for `node` into the store at `db`, bound to `repo`, as
-/// `fl github ledger init` will (plan B).
+/// `fl github ledger init` will.
 fn with_ledger_root(db: &Path, repo: &str, node: &str, commit: &str) {
     use fl_core::store::Bindings;
     let s = fl_store::RedbStore::open(db).unwrap();

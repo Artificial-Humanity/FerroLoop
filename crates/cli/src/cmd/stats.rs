@@ -17,7 +17,7 @@ pub struct Cmd {
 
 impl Cmd {
     /// The one item this command names, by `Ref` — the single source
-    /// `iris()` and `has_handle()` both derive from (Fix round 2, item 5).
+    /// `iris()` and `has_handle()` both derive from.
     fn refs(&self) -> Vec<&Ref> {
         vec![&self.project]
     }
@@ -39,8 +39,9 @@ pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
         Kind::Project,
         &cmd.project,
     )?);
-    // Plan A: the local store is the whole ledger. Plan B reads through a
-    // `SplitLedger` and passes the coverage it answers.
+    // The local store is the whole ledger here. Once a project binds the
+    // GitHub ledger, this reads through a `SplitLedger` and passes the
+    // coverage it answers.
     let attempts = store.attempts(&project)?;
     for line in report(&attempts, &Coverage::Complete) {
         println!("{line}");

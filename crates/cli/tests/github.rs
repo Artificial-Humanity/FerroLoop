@@ -696,7 +696,7 @@ fn local_records(store: &Path, project: &str) -> usize {
     s.list_records(&p).unwrap().len()
 }
 
-/// Final review, item 1 (a): outside a GitHub-bound project's root, an IRI
+/// Outside a GitHub-bound project's root, an IRI
 /// of that project sends the command to its store. Its records live in
 /// GitHub, so the store's local tracker must never take the write — and
 /// GitHub is not opened from a directory that is not the project's.
@@ -728,7 +728,7 @@ fn an_iri_of_a_github_bound_project_named_from_outside_its_root_is_refused() {
     );
 }
 
-/// Final review, item 1 (b): inside a GitHub-bound project's root, an IRI of
+/// Inside a GitHub-bound project's root, an IRI of
 /// a LOCALLY bound project sends the command to that project's store. GitHub
 /// must not be opened with it: the repository's node binding would be
 /// written into the other store, and its records would become issues.
@@ -781,7 +781,7 @@ fn an_iri_of_a_local_project_named_from_a_github_bound_root_is_refused() {
     assert!(g.fake.state().requests.is_empty());
 }
 
-/// Final review, item 1: a GitHub-bound project whose store is the default
+/// A GitHub-bound project whose store is the default
 /// store. From a directory no entry covers, a command with no IRI uses the
 /// default store — that project's — and must not write it locally.
 #[test]

@@ -873,7 +873,7 @@ mod tests {
         assert!(msg.contains("no mode"), "{msg}");
     }
 
-    // I3 (fix round 3): GraphQL's tree entries carry a mode too — a
+    // GraphQL's tree entries carry a mode too — a
     // symlink or an executable must be marked irregular here, the same
     // way the REST tree listing (`tree_files`) already is, so a reader's
     // `directory` can refuse one named like a segment instead of reading

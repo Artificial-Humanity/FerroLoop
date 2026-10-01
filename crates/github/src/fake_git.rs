@@ -1370,7 +1370,7 @@ mod tests {
         assert!(repo["e3"].is_null());
     }
 
-    // Controller fix round 1(a): the git endpoints are served only for the
+    // The git endpoints are served only for the
     // bound repository (as REST's `a_git_endpoint_is_served_only_for_the_bound_repository`
     // already checks); `ledgerObjects` must do the same.
     #[test]
@@ -1573,7 +1573,7 @@ mod tests {
         assert_eq!(a.errors[0]["type"], "NOT_FOUND");
     }
 
-    // Controller fix round 1(c): `an_append_to_a_branch_that_is_not_there_is_not_found`
+    // `an_append_to_a_branch_that_is_not_there_is_not_found`
     // above exercises the branch-missing half of the NOT_FOUND check; this
     // covers the unbound-repository half, with the ledger actually seeded
     // (so a bug that checked only the branch's existence would miss it).
@@ -1593,7 +1593,7 @@ mod tests {
         );
     }
 
-    // Controller fix round 1(d): an addition the fake cannot read is
+    // An addition the fake cannot read is
     // refused, not silently coerced into an empty path or empty content.
     #[test]
     fn an_addition_with_no_path_or_unreadable_base64_is_unprocessable() {
@@ -1616,7 +1616,7 @@ mod tests {
         );
     }
 
-    // Controller fix round 1 item 4: the fake must refuse a deletion
+    // The fake must refuse a deletion
     // outright (fl never asks for one — the ledger only ever appends) and
     // not silently ignore it.
     #[test]
@@ -1647,7 +1647,7 @@ mod tests {
             .to_string()
     }
 
-    // Controller fix round 1(e): every refusal knob above is one-shot —
+    // Every refusal knob above is one-shot —
     // after it fires once, the NEXT append on the current head must still
     // land, not go on being refused forever.
     #[test]
@@ -1707,7 +1707,7 @@ mod tests {
         );
     }
 
-    // Controller fix round 1(b): both halves of blame's guard are needed —
+    // Both halves of blame's guard are needed —
     // not just the bound-repository check: without the commit-existence
     // check, `s.git.commits[&c]` would panic in the server thread the
     // moment it tried to walk an unknown commit's first-parent chain.
