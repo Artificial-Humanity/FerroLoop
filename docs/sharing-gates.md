@@ -50,12 +50,13 @@ manifest it is marked as a store that holds imports — format 3 — and an olde
 has never heard of an import and would happily let someone edit an imported gate — refuses to
 open it at all, rather than opening it and quietly ignoring the mark.
 
-A store that records a GitHub ledger root is format 4. `fl github ledger init` records one, and
-so does importing a manifest that carries one (manifest format 2, written for a project whose
-GitHub ledger is switched on). An older `fl` refuses a format 4 store — it would otherwise export
-the manifest without the root every other machine checks the ledger against. The remedy is to
-upgrade `fl`: nothing is wrong with the store, and starting a new one would lose its history.
-From this release on, `fl` itself says so when it meets a store newer than it reads.
+A store that records a GitHub ledger root is format 4. Importing a manifest that carries one
+(manifest format 2, written for a project whose GitHub ledger is switched on) raises the store to
+format 4 — the same thing happens when the GitHub ledger is set up directly. An older `fl` refuses
+a format 4 store — it would otherwise export the manifest without the root every other machine
+checks the ledger against. The remedy is to upgrade `fl`: nothing is wrong with the store, and
+starting a new one would lose its history. From this release on, `fl` itself says so when it meets
+a store newer than it reads.
 
 ## Check
 
