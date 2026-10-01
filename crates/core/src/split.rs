@@ -942,4 +942,26 @@ mod tests {
         assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
         assert!(remote.decisions().is_empty());
     }
+
+    // ⚠ Spec §3.2 step 5: `MemRemote` reports a lost answer as a failure;
+    // the next flush carries the run, and adds no second copy.
+    #[test]
+    fn a_lost_answer_refuses_the_flush_and_the_next_one_adds_nothing_twice() {
+        let (s, _p, g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        let run = sample_record_run(1, &g, Some(&r));
+        l.append_gate_run(run.clone()).unwrap();
+        remote.lose_next_answer();
+        assert!(
+            l.flush(sample_decision(1, &r, vec![run.id.clone().unwrap()]))
+                .is_err()
+        );
+        l.flush(sample_decision(2, &r, vec![run.id.clone().unwrap()]))
+            .unwrap();
+        assert_eq!(published_ids(&remote, &g), vec![run.id]);
+    }
 }

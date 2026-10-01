@@ -856,40 +856,83 @@ mod tests {
         assert_eq!(l.attempts_of(&project()).unwrap(), vec![attempt(2)]);
     }
 
-    // ⚠ Decision 2 on the publish path: `Line::encode` withholds nothing
-    // itself, so the publish must project each run and attempt BEFORE it
-    // encodes them. The bytes on the branch carry no excerpt, the one
-    // withheld error text, and only a count of paths.
+    // ⚠ Decision 2 and spec §8.3: on a repository that is not private, no
+    // published line holds anything machine-specific. Supersedes the
+    // former `a_repository_that_is_not_private_is_published_without_excerpts_error_detail_or_paths`:
+    // this covers both shapes the brief calls out — `public` and `internal`
+    // — scans every file the branch holds rather than only the segments
+    // this publish wrote, and checks a withheld error detail as well as an
+    // excerpt and a path count.
     #[test]
-    fn a_repository_that_is_not_private_is_published_without_excerpts_error_detail_or_paths() {
+    fn a_repository_that_is_not_private_publishes_nothing_machine_specific() {
+        let secret_path = "/home/someone/work/app/src/a.rs";
+        let secret_host = "build-host-7";
+        let home = std::env::var("HOME").ok().filter(|h| h.len() > 1);
+        for visibility in ["public", "internal"] {
+            let (fake, local, _root) = world();
+            fake.state().repos[0].visibility = visibility.into();
+            let mut r = run(1);
+            r.output_excerpt = Some(format!("{secret_path} on {secret_host}"));
+            let mut errored = run(2);
+            errored.verdict =
+                Verdict::error(format!("could not spawn {secret_path} on {secret_host}"));
+            let mut a = attempt(3);
+            a.output_excerpt = Some(format!("{secret_path} on {secret_host}"));
+            a.paths_touched = PathsTouched::Listed(vec![secret_path.into()]);
+            let c = client(&fake);
+            let l = open(&c, &local);
+            l.publish(&batch(1, vec![r, errored], vec![a])).unwrap();
+            let secrets: Vec<String> = [
+                Some(secret_path.to_string()),
+                Some(secret_host.to_string()),
+                home.clone(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            for (path, text) in fake.ledger_files() {
+                for secret in &secrets {
+                    assert!(
+                        !text.contains(secret.as_str()),
+                        "{visibility}: `{path}` holds `{secret}`"
+                    );
+                }
+            }
+            let runs = l.runs(&gate()).unwrap();
+            assert_eq!(runs[0].output_excerpt, None);
+            assert_eq!(runs[1].verdict, Verdict::error(WITHHELD_ERROR_DETAIL));
+            let attempts = l.attempts_of(&project()).unwrap();
+            assert_eq!(attempts[0].output_excerpt, None);
+            assert_eq!(attempts[0].paths_touched, PathsTouched::Counted(1));
+        }
+    }
+
+    #[test]
+    fn a_batch_published_while_private_is_not_added_again_once_public() {
         let (fake, local, _root) = world();
+        let c = client(&fake);
+        let b = batch(1, vec![run(1)], vec![attempt(2)]);
+        open(&c, &local).publish(&b).unwrap();
+        let commits = fake.ledger_commits();
         fake.state().repos[0].visibility = "public".into();
-        let mut r = run(1);
-        r.verdict = Verdict::error("spawn failed at the lint binary");
-        let a = attempt(2);
+        assert_eq!(open(&c, &local).publish(&b).unwrap(), None);
+        assert_eq!(fake.ledger_commits(), commits);
+    }
+
+    // ⚠ Ruling 21: an answer that names no visibility is taken as not
+    // private — the safe side, since a published excerpt cannot be taken
+    // back.
+    #[test]
+    fn a_repository_answer_that_names_no_visibility_withholds_the_excerpts() {
+        let (fake, local, _root) = world();
+        fake.state().omit_visibility = true;
         let c = client(&fake);
         let l = open(&c, &local);
-        l.publish(&batch(1, vec![r.clone()], vec![a.clone()]))
+        l.publish(&batch(1, vec![run(1)], vec![attempt(2)]))
             .unwrap();
-        let files = fake.ledger_files();
-        let run_text = &files[&layout::segment_path(&runs_dir(), 1)];
-        let (Line::Run(got), _) = decode(Area::Runs, run_text.trim_end()).unwrap() else {
-            panic!("not a run: {run_text}");
-        };
-        assert_eq!(got.output_excerpt, None);
-        assert_eq!(got.verdict, Verdict::error(WITHHELD_ERROR_DETAIL));
-        assert_eq!(got, disclose::run(&r, Visibility::NotPrivate));
-        assert!(!run_text.contains("spawn failed"), "{run_text}");
-        let attempts_dir = layout::dir(Area::Attempts, project().iri());
-        let att_text = &files[&layout::segment_path(&attempts_dir, 1)];
-        let (Line::Attempt(got), _) = decode(Area::Attempts, att_text.trim_end()).unwrap() else {
-            panic!("not an attempt: {att_text}");
-        };
-        assert_eq!(got.output_excerpt, None);
-        assert_eq!(got.paths_touched, PathsTouched::Counted(1));
-        assert_eq!(got, disclose::attempt(&a, Visibility::NotPrivate));
-        assert!(!att_text.contains("src/a.rs"), "{att_text}");
-        assert!(!att_text.contains("attempt 2"), "{att_text}");
+        assert_eq!(l.visibility().unwrap(), Visibility::NotPrivate);
+        assert_eq!(l.runs(&gate()).unwrap()[0].output_excerpt, None);
+        assert_eq!(l.attempts_of(&project()).unwrap()[0].output_excerpt, None);
     }
 
     // Decision 2: a visibility that cannot be read is an error, never

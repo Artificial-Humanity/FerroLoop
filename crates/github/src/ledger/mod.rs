@@ -8,6 +8,9 @@ mod git;
 pub mod layout;
 mod read;
 
+#[cfg(test)]
+mod fixture;
+
 use crate::client::{Client, Method};
 use crate::tracker::Repo;
 use fl_core::StoreError;

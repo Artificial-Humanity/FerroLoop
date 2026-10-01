@@ -1027,13 +1027,11 @@ fn a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush(
     let id = run.id.clone().unwrap();
     roles.ledger.append_gate_run(run).unwrap();
     ctl.lose_next_answer();
-    assert!(
-        roles
-            .ledger
-            .flush(sample_decision(1, &r, vec![id.clone()]))
-            .is_err(),
-        "an answer that never came is not a landed commit, as far as fl can tell"
-    );
+    // A remote that cannot tell refuses the flush, and the next one carries
+    // the run; one that reads the ledger again finds the commit landed and
+    // answers (GitHub ledger spec §3.2 step 5; ruling 13). Either way, the
+    // run is never published twice.
+    let _ = roles.ledger.flush(sample_decision(1, &r, vec![id.clone()]));
     let flushed = roles
         .ledger
         .flush(sample_decision(2, &r, vec![id.clone()]))
