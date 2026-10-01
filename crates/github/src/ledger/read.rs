@@ -567,8 +567,8 @@ mod tests {
     use fl_core::at::At;
     use fl_core::conformance::{sample_attempt, sample_decision, sample_record_run};
     use fl_core::ids::seq_iri;
-    use fl_core::split::LedgerCache;
-    use fl_core::store::Bindings;
+    use fl_core::split::{Coverage, LedgerCache, SplitLedger};
+    use fl_core::store::{Bindings, Catalog, Ledger as _, Tracker as _};
     use serde_json::{Value, json};
     use std::time::Duration;
 
@@ -1038,7 +1038,53 @@ mod tests {
             !matches!(err, StoreError::Ledger(LedgerFault::Altered { .. })),
             "a replica that never catches up must not be reported as the file missing: {err:?}"
         );
-        assert!(err.to_string().contains("Retry"), "{err}");
+        // ⚠ Transient: nothing lasting was learned, so a report falls back
+        // to the local store and a refused publish is retried later.
+        assert!(
+            matches!(err, StoreError::Unreachable { .. }) && err.is_transient(),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("replica"), "{err}");
+    }
+
+    // Spec §2.5: `fl stats` over the split ledger falls back to the local
+    // store, saying why, when any ledger read is answered with a server
+    // error — and reads both halves once GitHub answers again.
+    #[test]
+    fn stats_fall_back_to_the_local_store_when_a_ledger_read_is_a_server_error() {
+        let (fake, local, _root) = world();
+        let p = local.add_project("/p").unwrap();
+        let r = local.add_record(&p, "t").unwrap();
+        local.append_attempt(sample_attempt(1, &p, &r)).unwrap();
+        let remote = sample_attempt(2, &p, &r);
+        let adir = layout::dir(Area::Attempts, p.iri());
+        fake.hand_commit(&[(
+            layout::segment_path(&adir, 1).as_str(),
+            Some(file(&[Line::Attempt(remote).encode("x")]).as_str()),
+        )]);
+        let c = client(&fake);
+        let ledger = open(&c, &local);
+        let split = SplitLedger {
+            local: &local,
+            github: &ledger,
+        };
+        // Each read an attempts read makes, in order; none caches anything
+        // when it fails, so the next request reaches the next read.
+        for frag in ["/git/ref/heads/", "/compare/", "/graphql", "/git/blobs/"] {
+            body_next(&fake, frag, 502, json!({}));
+            let (attempts, coverage) = split.attempts_for_stats(&p).unwrap();
+            assert_eq!(attempts.len(), 1, "{frag}: the local attempt alone");
+            assert!(
+                matches!(
+                    coverage,
+                    Coverage::LocalOnly { ref reason }
+                        if reason.contains("could not be read") && reason.contains("502")
+                ),
+                "{frag}: {coverage:?}"
+            );
+        }
+        let (attempts, coverage) = split.attempts_for_stats(&p).unwrap();
+        assert_eq!((attempts.len(), coverage), (2, Coverage::Complete));
     }
 
     // ⚠ Ruling 24: a branch-ref 404 right after a write this machine already

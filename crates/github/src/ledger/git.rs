@@ -88,6 +88,28 @@ impl GithubLedger<'_> {
         format!("/repos/{}{rest}", self.repo.full_name)
     }
 
+    /// What a ledger read answered with anything but the answer it needs.
+    ///
+    /// ⚠ A server error (5xx) says nothing lasting: it is transient, as
+    /// [`Self::visibility`] reads it — so `fl stats` falls back to the
+    /// local store, and a refused publish says the next one adds what is
+    /// missing. Any other status is a refusal.
+    pub(crate) fn read_refused(&self, status: u16, what: &str) -> StoreError {
+        if (500..=599).contains(&status) {
+            self.unreachable(format!("GitHub answered {status} when fl {what}"))
+        } else {
+            backend(format!("GitHub answered {status} when fl {what}; retry"))
+        }
+    }
+
+    /// The ledger could not be read, or read nothing lasting: transient.
+    pub(crate) fn unreachable(&self, cause: String) -> StoreError {
+        StoreError::Unreachable {
+            store: format!("the GitHub ledger of {}", self.repo.full_name),
+            cause,
+        }
+    }
+
     fn owner_and_name(&self) -> (&str, &str) {
         self.repo
             .full_name
@@ -115,9 +137,7 @@ impl GithubLedger<'_> {
                     ))
                 }),
             404 => Ok(None),
-            s => Err(backend(format!(
-                "GitHub answered {s} when fl read the branch `{branch}`; retry"
-            ))),
+            s => Err(self.read_refused(s, &format!("read the branch `{branch}`"))),
         }
     }
 
@@ -140,9 +160,7 @@ impl GithubLedger<'_> {
                     backend("GitHub compared two ledger commits but named no status".into())
                 }),
             404 => Ok(None),
-            s => Err(backend(format!(
-                "GitHub answered {s} when fl compared two commits of the ledger; retry"
-            ))),
+            s => Err(self.read_refused(s, "compared two commits of the ledger")),
         }
     }
 
@@ -181,7 +199,11 @@ impl GithubLedger<'_> {
                 "query ledgerObjects({declared}) {{ repository(owner: $owner, name: $name) \
                  {{{fields} }} }}"
             );
-            let data = self.client.graphql(&query, Value::Object(vars))?;
+            let answer = self.client.graphql_answer(&query, Value::Object(vars))?;
+            if answer.status != 200 {
+                return Err(self.read_refused(answer.status, "read the ledger's files"));
+            }
+            let data = answer.into_data()?;
             let repo = data
                 .get("repository")
                 .filter(|r| !r.is_null())
@@ -198,10 +220,11 @@ impl GithubLedger<'_> {
                     std::thread::sleep(self.lag_pause);
                     continue;
                 }
-                return Err(backend(format!(
+                // ⚠ Transient: nothing lasting was learned.
+                return Err(self.unreachable(format!(
                     "GitHub's GraphQL still does not know commit {head} of the ledger, still \
                      after {reads} reads again; this machine's own write may not have reached \
-                     every replica yet. Retry"
+                     every replica yet"
                 )));
             }
             return paths
@@ -224,10 +247,7 @@ impl GithubLedger<'_> {
             .client
             .send(Method::Get, &self.path(&format!("/git/blobs/{oid}")), None)?;
         if r.status != 200 {
-            return Err(backend(format!(
-                "GitHub answered {} when fl read ledger blob {oid}; retry",
-                r.status
-            )));
+            return Err(self.read_refused(r.status, &format!("read ledger blob {oid}")));
         }
         // GitHub wraps the base64 in lines.
         let content: String = r
@@ -253,10 +273,7 @@ impl GithubLedger<'_> {
             None,
         )?;
         if r.status != 200 {
-            return Err(backend(format!(
-                "GitHub answered {} when fl read ledger commit {sha}; retry",
-                r.status
-            )));
+            return Err(self.read_refused(r.status, &format!("read ledger commit {sha}")));
         }
         // ⚠ Checked before `tree`: `parents_of_refuses_a_200_with_no_parents_field`
         // pins a body with neither field as "no parents" — the message this
@@ -298,10 +315,7 @@ impl GithubLedger<'_> {
             None,
         )?;
         if r.status != 200 {
-            return Err(backend(format!(
-                "GitHub answered {} when fl listed ledger tree {sha}; retry",
-                r.status
-            )));
+            return Err(self.read_refused(r.status, &format!("listed ledger tree {sha}")));
         }
         if r.body.get("truncated").and_then(Value::as_bool) == Some(true) {
             return Err(backend(format!(
@@ -603,6 +617,71 @@ mod tests {
         fake.state().html_502_next = true;
         let err = open(&c, &local).parents_of(&root).unwrap_err();
         assert!(err.to_string().contains("502"), "{err}");
+    }
+
+    // A server error on any ledger read says nothing lasting: it is
+    // transient (`Unreachable`), so a report falls back to the local store
+    // and a refused publish says the next one adds what is missing — never
+    // `Backend`, which reads as damage to fix. Any other refusal (a 410)
+    // is not transient.
+    #[test]
+    fn a_server_error_on_any_ledger_read_is_transient() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let tree = fake.state().git.commits[&root].tree.clone();
+        let local = MemStore::default();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        type Read<'a> = Box<dyn Fn() -> Result<(), StoreError> + 'a>;
+        let reads: Vec<(&str, &str, Read<'_>)> = vec![
+            (
+                "branch_head",
+                "/git/ref/heads/",
+                Box::new(|| l.branch_head(BRANCH).map(drop)),
+            ),
+            (
+                "compare",
+                "/compare/",
+                Box::new(|| l.compare(&root, &root).map(drop)),
+            ),
+            (
+                "objects",
+                "/graphql",
+                Box::new(|| l.objects(&root, &[FORMAT_FILE.to_string()]).map(drop)),
+            ),
+            (
+                "blob_bytes",
+                "/git/blobs/",
+                Box::new(|| l.blob_bytes("deadbeef").map(drop)),
+            ),
+            (
+                "commit_object",
+                "/git/commits/",
+                Box::new(|| l.commit_object(&root).map(drop)),
+            ),
+            (
+                "tree_files",
+                "/git/trees/",
+                Box::new(|| l.tree_files(&tree).map(drop)),
+            ),
+        ];
+        for (name, frag, read) in &reads {
+            for status in [500, 502, 503] {
+                body_next(&fake, frag, status, json!({}));
+                let err = read().unwrap_err();
+                assert!(
+                    matches!(err, StoreError::Unreachable { .. }) && err.is_transient(),
+                    "{name} {status}: {err:?}"
+                );
+                assert!(err.to_string().contains(&status.to_string()), "{err}");
+            }
+            body_next(&fake, frag, 410, json!({}));
+            let err = read().unwrap_err();
+            assert!(
+                matches!(err, StoreError::Backend(ref m) if m.contains("410")),
+                "{name} 410: {err:?}"
+            );
+        }
     }
 
     #[test]

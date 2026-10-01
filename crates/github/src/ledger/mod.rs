@@ -102,14 +102,11 @@ impl<'a> GithubLedger<'a> {
             200 => {}
             // ⚠ A server error says nothing lasting: transient, retry.
             500..=599 => {
-                return Err(StoreError::Unreachable {
-                    store: format!("the GitHub ledger of {repo}"),
-                    cause: format!(
-                        "GitHub answered {} when fl read the repository's visibility, so fl \
-                         publishes nothing to its ledger: an unknown visibility is not private",
-                        r.status
-                    ),
-                });
+                return Err(self.unreachable(format!(
+                    "GitHub answered {} when fl read the repository's visibility, so fl \
+                     publishes nothing to its ledger: an unknown visibility is not private",
+                    r.status
+                )));
             }
             s => {
                 return Err(StoreError::Backend(format!(

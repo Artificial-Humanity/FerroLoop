@@ -44,6 +44,38 @@ pub struct GraphqlAnswer {
     pub needs: Option<String>,
 }
 
+impl GraphqlAnswer {
+    /// The `data` of an answer to a query, judged as [`Client::graphql`]
+    /// judges it: any status but 200 is an error, and so is an `errors`
+    /// member — never partial data. For a caller that reads the status
+    /// first (the ledger's reads, which take a 5xx as transient).
+    pub(crate) fn into_data(self) -> Result<Value, StoreError> {
+        if self.status != 200 {
+            return Err(StoreError::Backend(format!(
+                "GitHub answered {} to a GraphQL query; retry",
+                self.status
+            )));
+        }
+        // GitHub is taken to answer a lookup of a missing node with `null`
+        // data AND a NOT_FOUND error — an answer, not a failure. A reading
+        // of GitHub's docs: unmeasured; no live test checks it yet.
+        if !self.errors.is_empty()
+            && !self
+                .errors
+                .iter()
+                .all(|e| e.get("type").and_then(Value::as_str) == Some("NOT_FOUND"))
+        {
+            return Err(StoreError::Backend(format!(
+                "GitHub refused a GraphQL query: {}",
+                Value::Array(self.errors)
+            )));
+        }
+        self.data.ok_or_else(|| {
+            StoreError::Backend("GitHub answered a GraphQL query with no `data`".into())
+        })
+    }
+}
+
 pub struct Client {
     agent: ureq::Agent,
     api: String,
@@ -208,30 +240,7 @@ impl Client {
 
     /// One GraphQL query. An `errors` member is an error, never partial data.
     pub fn graphql(&self, query: &str, variables: Value) -> Result<Value, StoreError> {
-        let answer = self.graphql_answer(query, variables)?;
-        if answer.status != 200 {
-            return Err(StoreError::Backend(format!(
-                "GitHub answered {} to a GraphQL query; retry",
-                answer.status
-            )));
-        }
-        // GitHub is taken to answer a lookup of a missing node with `null`
-        // data AND a NOT_FOUND error — an answer, not a failure. A reading
-        // of GitHub's docs: unmeasured; no live test checks it yet.
-        if !answer.errors.is_empty()
-            && !answer
-                .errors
-                .iter()
-                .all(|e| e.get("type").and_then(Value::as_str) == Some("NOT_FOUND"))
-        {
-            return Err(StoreError::Backend(format!(
-                "GitHub refused a GraphQL query: {}",
-                Value::Array(answer.errors)
-            )));
-        }
-        answer.data.ok_or_else(|| {
-            StoreError::Backend("GitHub answered a GraphQL query with no `data`".into())
-        })
+        self.graphql_answer(query, variables)?.into_data()
     }
 
     /// Who GitHub says fl writes as (spec §5.4).
