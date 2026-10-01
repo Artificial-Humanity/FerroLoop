@@ -162,6 +162,42 @@ pub struct State {
     /// The next request answers 403 for want of a permission — not a rate
     /// limit. One-shot.
     pub forbidden_next: bool,
+    /// The repository's git objects and refs (GitHub ledger spec §8.1).
+    pub git: crate::fake_git::Git,
+    /// Rulesets; only `active` ones apply. A setting, not one-shot.
+    pub rulesets: Vec<crate::fake_git::Ruleset>,
+    /// `rules/branches` answers 403 with GitHub's upgrade message — rulesets
+    /// unavailable on the plan. Modelled — confirmed by live test
+    /// `a_private_repository_without_a_ruleset_is_detection_only`.
+    pub rules_need_upgrade: bool,
+    /// Every request breaks off before an answer: GitHub unreachable. A
+    /// setting, not one-shot.
+    pub down: bool,
+    /// The next this-many compares answer `behind` whatever the commits —
+    /// a replica lagging a write (spec §3.5 check 2).
+    pub compare_behind_next: u32,
+    /// The next ref creation answers 500 and creates nothing. One-shot.
+    pub fail_next_ref_create: bool,
+    /// Right before the next ref creation, someone else creates the same
+    /// branch. One-shot.
+    pub race_next_ref_create: bool,
+    /// The next request answers 403 naming this permission in
+    /// `x-accepted-github-permissions`. One-shot.
+    pub permission_refused_next: Option<String>,
+    /// The next this-many branch reads answer the commit before the head
+    /// (its first parent) — a replica that has not seen the last write yet
+    /// (spec §3.5 check 2).
+    pub ref_behind_next: u32,
+    /// The next this-many compares answer 404 — a replica that does not
+    /// know a commit yet, such as the one this machine just wrote.
+    pub compare_unknown_next: u32,
+    /// The repository answer names no `visibility`. A setting.
+    pub omit_visibility: bool,
+    /// The next tree or commit creation answers 500 and creates nothing.
+    /// One-shot.
+    pub fail_next_git_create: bool,
+    /// The next read of a branch's rules answers 500. One-shot.
+    pub fail_rules_next: bool,
 }
 
 pub struct FakeGithub {
@@ -352,6 +388,75 @@ impl FakeGithub {
         s.issues.insert(n, issue);
         n
     }
+
+    /// `fl/ledger` started as `fl github ledger init` starts it — `format`
+    /// and `README.md` in a commit with no parent. Returns that commit.
+    pub fn seed_ledger(&self) -> String {
+        use crate::ledger::layout::{FORMAT_FILE, README, README_FILE};
+        self.seed_ledger_with(&[(FORMAT_FILE, "1\n"), (README_FILE, README)])
+    }
+
+    /// `fl/ledger` started with `files` in its first commit.
+    pub fn seed_ledger_with(&self, files: &[(&str, &str)]) -> String {
+        crate::fake_git::seed(&mut self.state().git, files)
+    }
+
+    pub fn ledger_head(&self) -> Option<String> {
+        self.state().git.head(crate::ledger::layout::BRANCH)
+    }
+
+    /// Every file on `fl/ledger` at its head; empty when there is no branch.
+    pub fn ledger_files(&self) -> BTreeMap<String, String> {
+        let s = self.state();
+        s.git
+            .head(crate::ledger::layout::BRANCH)
+            .and_then(|h| s.git.files_at(&h))
+            .unwrap_or_default()
+    }
+
+    /// A person with write access committing to `fl/ledger` by hand: each
+    /// path written (`Some`) or removed (`None`).
+    pub fn hand_commit(&self, changes: &[(&str, Option<&str>)]) -> String {
+        let changes: Vec<(String, Option<String>)> = changes
+            .iter()
+            .map(|(p, t)| (p.to_string(), t.map(str::to_string)))
+            .collect();
+        self.state()
+            .git
+            .commit_on(crate::ledger::layout::BRANCH, &changes, "a hand edit")
+    }
+
+    /// A person merging a side commit into `fl/ledger`: two parents.
+    pub fn hand_merge(&self) -> String {
+        let branch = crate::ledger::layout::BRANCH;
+        let mut s = self.state();
+        let git = &mut s.git;
+        let head = git.head(branch).expect("a ledger to merge into");
+        let tree = git.commits[&head].tree.clone();
+        let side = git.put_commit(&tree, vec![head.clone()], "a side commit");
+        let merge = git.put_commit(&tree, vec![head, side], "a merge");
+        git.refs.insert(format!("heads/{branch}"), merge.clone());
+        merge
+    }
+
+    /// A person rewriting `fl/ledger`: a new first commit holding `files`,
+    /// forced onto the branch.
+    pub fn rewrite_ledger(&self, files: &[(&str, &str)]) -> String {
+        crate::fake_git::seed(&mut self.state().git, files)
+    }
+
+    pub fn delete_ledger(&self) {
+        let branch = crate::ledger::layout::BRANCH;
+        self.state().git.refs.remove(&format!("heads/{branch}"));
+    }
+
+    /// How many commits `fl/ledger` holds along first parents.
+    pub fn ledger_commits(&self) -> usize {
+        self.state()
+            .git
+            .first_parents(crate::ledger::layout::BRANCH)
+            .len()
+    }
 }
 
 impl Drop for FakeGithub {
@@ -368,18 +473,18 @@ fn header(k: &str, v: &str) -> tiny_http::Header {
 }
 
 pub(crate) struct Answer {
-    status: u16,
-    body: Value,
+    pub(crate) status: u16,
+    pub(crate) body: Value,
     /// When set, this exact text is sent instead of `body.to_string()` — for
     /// answers that are not JSON at all (an HTML 502 from a load balancer).
-    raw_body: Option<String>,
-    headers: Vec<(String, String)>,
-    hang_up: bool,
+    pub(crate) raw_body: Option<String>,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) hang_up: bool,
     /// Send the status line and headers, then a body that cannot be read.
-    break_body: bool,
+    pub(crate) break_body: bool,
 }
 
-fn answer(status: u16, body: Value) -> Answer {
+pub(crate) fn answer(status: u16, body: Value) -> Answer {
     Answer {
         status,
         body,
@@ -431,7 +536,7 @@ impl State {
     }
 
     /// `{o}/{r}` names the bound repository under its current name.
-    fn is_bound(&self, o: &str, r: &str) -> bool {
+    pub(crate) fn is_bound(&self, o: &str, r: &str) -> bool {
         self.bound()
             .full_name
             .eq_ignore_ascii_case(&format!("{o}/{r}"))
@@ -467,11 +572,17 @@ impl State {
     }
 
     fn repo_json(&self, r: &Repo) -> Value {
-        json!({
+        let mut v = json!({
             "id": r.id, "node_id": r.node_id, "full_name": r.full_name,
             "visibility": r.visibility, "private": r.visibility == "private",
             "has_issues": r.has_issues,
-        })
+        });
+        if self.omit_visibility
+            && let Some(map) = v.as_object_mut()
+        {
+            map.remove("visibility");
+        }
+        v
     }
 
     /// One page of `items`, with a `Link` header when more remain.
@@ -529,6 +640,20 @@ fn installation(s: &State, repo: Option<u64>) -> Answer {
 /// Every route the fake serves. Later tasks add arms above the final `_`.
 pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &str) -> Answer {
     s.requests.push(format!("{method} {url}"));
+    if s.down {
+        let mut a = answer(503, Value::Null);
+        a.hang_up = true;
+        return a;
+    }
+    if let Some(needs) = s.permission_refused_next.take() {
+        let mut a = answer(
+            403,
+            json!({"message": "Resource not accessible by personal access token"}),
+        );
+        a.headers
+            .push(("x-accepted-github-permissions".into(), needs));
+        return a;
+    }
     if method == "POST" && url == "/graphql" && std::mem::take(&mut s.graphql_rate_limited) {
         return answer(
             200,
@@ -575,6 +700,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
     }
     let (path, q) = split(url);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if let Some(a) = crate::fake_git::rest(s, method, &parts, body) {
+        return a;
+    }
     match (method, parts.as_slice()) {
         ("GET", ["repos", o, r]) => {
             if s.fail_repo_read {
