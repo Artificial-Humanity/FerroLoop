@@ -63,11 +63,12 @@ pub(crate) struct TreeFile {
 }
 
 /// ⚠ Modelled: `mode` on a `TreeEntry` is requested so `directory` can
-/// tell a symlink or an executable from an ordinary file — GitHub's REST
-/// tree listing already sends it as a string (`tree_files` above), but
-/// unmeasured here: no live test confirms GraphQL sends it, as an `Int`
-/// whose value is the octal mode (`0o100644`). An entry without one is
-/// refused (`parse_object`), never taken for an ordinary file.
+/// tell a symlink or an executable from an ordinary file. GitHub's REST
+/// tree listing sends it as a string (`tree_files` below); GraphQL is
+/// taken to send it as an `Int` whose value is the octal mode
+/// (`0o100644`). Confirmed by live test `tree_entry_modes_are_integers`.
+/// An entry without one is refused (`parse_object`), never taken for an
+/// ordinary file.
 const OBJECT_FIELDS: &str =
     "__typename ... on Tree { entries { name oid type mode } } ... on Blob { oid }";
 
