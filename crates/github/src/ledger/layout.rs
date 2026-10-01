@@ -177,10 +177,13 @@ impl Line {
 
 /// One line of an `area` segment, and who wrote it.
 ///
-/// ⚠ Strict (ruling 11): the entry, serialized again, must equal the line
-/// without `by`. A field fl does not write, or a value spelled as fl never
-/// spells it, is unreadable — a new field means a new format (spec §3.1).
-/// A published run or attempt always carries `id` and `at`.
+/// ⚠ Strict (ruling 11): the line must be byte-for-byte what the entry's
+/// own [`Line::encode`] would write, not merely structurally equal to it.
+/// A field fl does not write, a value spelled as fl never spells it, a
+/// duplicate key (JSON lets the last one win, silently dropping whatever
+/// came before it) or a reordered one (parses to the same `Value`, but is
+/// not fl's own bytes) is unreadable — a new field means a new format
+/// (spec §3.1). A published run or attempt always carries `id` and `at`.
 pub fn decode(area: Area, text: &str) -> Result<(Line, String), String> {
     let mut v: Value = serde_json::from_str(text).map_err(|e| format!("it is not JSON ({e})"))?;
     let Some(map) = v.as_object_mut() else {
@@ -202,9 +205,11 @@ pub fn decode(area: Area, text: &str) -> Result<(Line, String), String> {
             .map(Line::Decision)
             .map_err(|e| format!("it is not a decision ({e})"))?,
     };
-    if line.value() != v {
+    if line.encode(&by) != text {
         return Err(
-            "it holds a field fl does not write, or a value spelled as fl never spells it".into(),
+            "it is not byte-for-byte what fl itself would write: a field fl does not write, a \
+             value spelled as fl never spells it, or a duplicate or reordered key"
+                .into(),
         );
     }
     let stamped = match &line {
@@ -260,6 +265,10 @@ pub fn plan_append(segments: &[(u64, String)], new: &[String]) -> Vec<(u64, Stri
     let mut changed = false;
     let mut out = Vec::new();
     for line in new {
+        debug_assert!(
+            !line.contains('\n'),
+            "a new line never itself contains a newline"
+        );
         if !text.is_empty() && text.len() + line.len() + 1 > SEGMENT_LIMIT {
             if changed {
                 out.push((n, std::mem::take(&mut text)));
@@ -307,6 +316,12 @@ impl QuarantineLine {
             serde_json::from_str(text).map_err(|e| format!("it is not a quarantine line ({e})"))?;
         if q.by.trim().is_empty() || q.quarantined_by.trim().is_empty() {
             return Err("it names no one".into());
+        }
+        if q.line == 0 {
+            return Err("its `line` is not numbered from 1".into());
+        }
+        if parse_segment_path(&q.file).is_none() {
+            return Err("its `file` is not a segment path".into());
         }
         Ok(q)
     }
@@ -374,6 +389,10 @@ mod tests {
             "a.jsonl",
             ".jsonl",
             "-1.jsonl",
+            // `u64::from_str` accepts a leading `+` (unlike `-`, which it
+            // already refuses on its own): only the all-digits guard
+            // catches this one.
+            "+1.jsonl",
             "1.jsonl.bak",
         ] {
             assert_eq!(segment_number(bad), None, "{bad}");
@@ -403,6 +422,7 @@ mod tests {
             // component after: fails only the trailing-component guard,
             // not any earlier check.
             format!("runs/{k}/1.jsonl/x"),
+            format!("runs/{k}/+1.jsonl"),
             QUARANTINE_FILE.to_string(),
             FORMAT_FILE.to_string(),
         ] {
@@ -447,6 +467,7 @@ mod tests {
     #[test]
     fn a_line_is_read_strictly() {
         let g = GateId(seq_iri(7));
+        let p = ProjectId(seq_iri(8));
         let good = Line::Run(sample_record_run(1, &g, Some(&record()))).encode("fake-user");
         let edit = |f: &dyn Fn(&mut Value)| {
             let mut v: Value = serde_json::from_str(&good).unwrap();
@@ -484,6 +505,66 @@ mod tests {
             "a run is not an attempt"
         );
         assert!(decode(Area::Runs, &good).is_ok());
+
+        // The `stamped` check has one arm per kind; a run's `id`/`at`
+        // cases above never reach the attempt arm.
+        let good_attempt = Line::Attempt(sample_attempt(2, &p, &record())).encode("fake-user");
+        let edit_attempt = |f: &dyn Fn(&mut Value)| {
+            let mut v: Value = serde_json::from_str(&good_attempt).unwrap();
+            f(&mut v);
+            v.to_string()
+        };
+        assert!(
+            decode(Area::Attempts, &edit_attempt(&|v| v["id"] = Value::Null)).is_err(),
+            "an attempt with no id"
+        );
+        assert!(
+            decode(Area::Attempts, &edit_attempt(&|v| v["at"] = Value::Null)).is_err(),
+            "an attempt with no time"
+        );
+        assert!(decode(Area::Attempts, &good_attempt).is_ok());
+
+        // Ruling: the round trip is byte-for-byte against the raw line,
+        // not merely structural equality of the parsed `Value` — JSON
+        // itself lets a duplicate key's last occurrence win, so a hidden
+        // value ahead of the real one would otherwise ride along
+        // undetected. Built by hand: a parsed `Value` can never hold a
+        // duplicate key, so `edit` cannot produce this case.
+        let duplicate_key = good.replacen(
+            "\"output_excerpt\":\"run 1\"",
+            "\"output_excerpt\":\"SECRET\",\"output_excerpt\":\"run 1\"",
+            1,
+        );
+        assert_ne!(duplicate_key, good);
+        assert!(
+            decode(Area::Runs, &duplicate_key).is_err(),
+            "a hidden duplicate key"
+        );
+
+        // Ruling: reordered keys parse to the same `Value` as the
+        // canonical line, but are not the bytes fl itself writes, so they
+        // are refused too.
+        let reordered = {
+            let v: Value = serde_json::from_str(&good).unwrap();
+            let mut entries: Vec<(String, Value)> = v
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            entries.reverse();
+            let body: String = entries
+                .iter()
+                .map(|(k, v)| format!("{}:{v}", serde_json::to_string(k).unwrap()))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        };
+        assert_ne!(reordered, good);
+        assert!(
+            decode(Area::Runs, &reordered).is_err(),
+            "keys in any order but fl's own"
+        );
     }
 
     #[test]
@@ -562,7 +643,7 @@ mod tests {
         let q = QuarantineLine {
             id: seq_iri(5),
             at: At::from_unix_millis(5),
-            file: "runs/k/1.jsonl".into(),
+            file: segment_path(&dir(Area::Runs, &seq_iri(1)), 1),
             line: 3,
             quarantined_by: "Ada".into(),
             reason: "a hand edit".into(),
@@ -575,5 +656,23 @@ mod tests {
         let mut nobody = q.clone();
         nobody.quarantined_by = " ".into();
         assert!(QuarantineLine::decode(&nobody.encode()).is_err());
+        let mut no_writer = q.clone();
+        no_writer.by = " ".into();
+        assert!(
+            QuarantineLine::decode(&no_writer.encode()).is_err(),
+            "a blank `by` names no one either"
+        );
+        let mut zero_line = q.clone();
+        zero_line.line = 0;
+        assert!(
+            QuarantineLine::decode(&zero_line.encode()).is_err(),
+            "a line number is from 1"
+        );
+        let mut bad_file = q.clone();
+        bad_file.file = "not-a-segment-path".into();
+        assert!(
+            QuarantineLine::decode(&bad_file.encode()).is_err(),
+            "its file is not a segment path"
+        );
     }
 }
