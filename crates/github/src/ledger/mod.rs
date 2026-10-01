@@ -10,9 +10,12 @@ mod read;
 use crate::client::Client;
 use crate::tracker::Repo;
 use fl_core::split::LedgerMemory;
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub use disclose::Visibility;
+pub use read::Note;
 
 /// The GitHub side of mode B, for one repository and one command.
 ///
@@ -27,6 +30,8 @@ pub struct GithubLedger<'a> {
     /// (spec §3.5 check 2), and the pause between reads.
     pub(crate) lag_reads: u32,
     pub(crate) lag_pause: Duration,
+    /// What reads noted without refusing, once each.
+    pub(crate) notes: RefCell<BTreeSet<Note>>,
 }
 
 impl<'a> GithubLedger<'a> {
@@ -37,6 +42,7 @@ impl<'a> GithubLedger<'a> {
             local,
             lag_reads: 3,
             lag_pause: Duration::from_millis(500),
+            notes: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -51,5 +57,13 @@ impl<'a> GithubLedger<'a> {
 
     pub fn repo(&self) -> &Repo {
         &self.repo
+    }
+
+    /// What reads noted since the last call (a quarantined line skipped),
+    /// once each, for the command to print.
+    pub fn take_notes(&self) -> Vec<Note> {
+        std::mem::take(&mut *self.notes.borrow_mut())
+            .into_iter()
+            .collect()
     }
 }

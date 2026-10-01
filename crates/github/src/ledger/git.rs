@@ -8,16 +8,32 @@ use base64::engine::general_purpose::STANDARD;
 use fl_core::StoreError;
 use serde_json::{Map, Value, json};
 
-/// What a path on the branch is at one commit. A directory's entries are
-/// read where a directory is listed.
+/// What a path on the branch is at one commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Object {
-    Tree,
+    Tree(Vec<Entry>),
     Blob { oid: String },
+}
+
+/// One entry of a directory: its name, the object id, and whether it is a
+/// file (`blob`) rather than a nested directory (`tree`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub name: String,
+    pub oid: String,
+    pub is_blob: bool,
 }
 
 const OBJECT_FIELDS: &str =
     "__typename ... on Tree { entries { name oid type } } ... on Blob { oid }";
+
+/// ⚠ Modelled: `Commit.blame(path:)` names the commit that last changed
+/// each range of lines. Confirmed by live test
+/// `a_hand_edit_is_detected_and_named`.
+const BLAME: &str = "query ledgerBlame($owner: String!, $name: String!, \
+    $commit: GitObjectID!, $path: String!) { repository(owner: $owner, name: $name) { \
+    object(oid: $commit) { ... on Commit { blame(path: $path) { \
+    ranges { startingLine endingLine commit { oid } } } } } } }";
 
 fn backend(msg: String) -> StoreError {
     StoreError::Backend(msg)
@@ -183,6 +199,34 @@ impl GithubLedger<'_> {
         })?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+
+    /// The commit that last changed `line` of `path` at `commit`, for a
+    /// message. ⚠ Never an error: a message that cannot name the commit
+    /// says so, and still names the file and the line.
+    pub(crate) fn blame(&self, commit: &str, path: &str, line: u64) -> String {
+        let (owner, name) = self.owner_and_name();
+        let found = self
+            .client
+            .graphql(
+                BLAME,
+                json!({"owner": owner, "name": name, "commit": commit, "path": path}),
+            )
+            .ok()
+            .and_then(|d| {
+                d.pointer("/repository/object/blame/ranges")?
+                    .as_array()?
+                    .iter()
+                    .find(|r| {
+                        let from = r["startingLine"].as_u64().unwrap_or(0);
+                        let to = r["endingLine"].as_u64().unwrap_or(0);
+                        from <= line && line <= to
+                    })?
+                    .pointer("/commit/oid")?
+                    .as_str()
+                    .map(str::to_string)
+            });
+        found.unwrap_or_else(|| format!("unknown (GitHub's blame of `{path}` did not name it)"))
+    }
 }
 
 fn parse_object(v: &Value, path: &str) -> Result<Option<Object>, StoreError> {
@@ -200,7 +244,27 @@ fn parse_object(v: &Value, path: &str) -> Result<Option<Object>, StoreError> {
                 oid: oid.to_string(),
             }))
         }
-        Some("Tree") => Ok(Some(Object::Tree)),
+        Some("Tree") => {
+            let entries = v.get("entries").and_then(Value::as_array).ok_or_else(|| {
+                backend(format!(
+                    "GitHub answered the directory `{path}` with no entries"
+                ))
+            })?;
+            let mut out = Vec::new();
+            for e in entries {
+                let (Some(name), Some(oid)) = (e["name"].as_str(), e["oid"].as_str()) else {
+                    return Err(backend(format!(
+                        "GitHub answered an entry of `{path}` with no name or no id"
+                    )));
+                };
+                out.push(Entry {
+                    name: name.to_string(),
+                    oid: oid.to_string(),
+                    is_blob: e["type"].as_str() == Some("blob"),
+                });
+            }
+            Ok(Some(Object::Tree(out)))
+        }
         other => Err(backend(format!(
             "GitHub answered `{path}` on the ledger branch as {other:?}, which is neither a \
              file nor a directory"

@@ -1,11 +1,58 @@
 //! Reading the `fl/ledger` branch (GitHub ledger spec §3.3, §3.5): the
-//! checked head and the format. Each check is named where it is made.
+//! checked head, a snapshot of the directories one read or append needs,
+//! and their lines, parsed strictly. Each of the seven checks is named
+//! where it is made.
 
 use super::GithubLedger;
 use super::git::Object;
-use super::layout::{BRANCH, FORMAT, FORMAT_FILE};
+use super::layout::{
+    self, Area, BRANCH, FORMAT, FORMAT_FILE, Line, QUARANTINE_FILE, QuarantineLine,
+};
+use fl_core::decision::Decision;
+use fl_core::ids::{GateId, ProjectId, RecordId};
+use fl_core::iri::Iri;
+use fl_core::log::{Attempt, GateRun};
 use fl_core::split::CachedSegment;
 use fl_core::{LedgerFault, StoreError};
+use std::collections::BTreeMap;
+
+/// What a read reports without refusing (spec §3.3, §3.6).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Note {
+    /// A quarantined line, skipped.
+    Quarantined {
+        file: String,
+        line: u64,
+        reason: String,
+    },
+}
+
+impl std::fmt::Display for Note {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Note::Quarantined { file, line, reason } => write!(
+                f,
+                "`{file}` line {line} of the GitHub ledger is quarantined ({reason}), so fl \
+                 skipped it"
+            ),
+        }
+    }
+}
+
+/// One segment of a directory, read and checked. Segments are numbered
+/// from 1 with no gap, so a directory's `n`th is at index `n - 1`.
+pub(crate) struct Segment {
+    pub path: String,
+    pub text: String,
+}
+
+/// The directories one read or append needs, at one checked head.
+pub(crate) struct Snapshot {
+    pub head: String,
+    pub dirs: BTreeMap<String, Vec<Segment>>,
+    /// `quarantine.jsonl`'s text; empty when there is none.
+    pub quarantine: String,
+}
 
 impl GithubLedger<'_> {
     pub(crate) fn altered(&self, file: &str, what: impl Into<String>, commit: &str) -> StoreError {
@@ -97,6 +144,46 @@ impl GithubLedger<'_> {
         Ok(head)
     }
 
+    /// `dirs` at the checked head (spec §3.5 checks 1–4 and 7), with
+    /// `quarantine.jsonl`. Records the head as the last seen (ruling 10).
+    pub(crate) fn snapshot(&self, dirs: &[String]) -> Result<Snapshot, StoreError> {
+        let head = self.check_head()?;
+        let mut paths = vec![FORMAT_FILE.to_string(), QUARANTINE_FILE.to_string()];
+        paths.extend(dirs.iter().cloned());
+        let found = self.objects(&head, &paths)?;
+        self.format(&head, found[0].as_ref())?;
+        let quarantine = match &found[1] {
+            None => {
+                if self
+                    .local
+                    .cached(&self.repo.node_id, QUARANTINE_FILE)?
+                    .is_some()
+                {
+                    return Err(self.altered(QUARANTINE_FILE, "was deleted", &head));
+                }
+                String::new()
+            }
+            Some(Object::Blob { oid }) => self.grown(&head, QUARANTINE_FILE, oid, false)?,
+            Some(Object::Tree(_)) => {
+                return Err(self.altered(
+                    QUARANTINE_FILE,
+                    "is a directory where a file belongs",
+                    &head,
+                ));
+            }
+        };
+        let mut out = BTreeMap::new();
+        for (dir, f) in dirs.iter().zip(&found[2..]) {
+            out.insert(dir.clone(), self.directory(&head, dir, f.as_ref())?);
+        }
+        self.local.set_last_head(&self.repo.node_id, &head)?;
+        Ok(Snapshot {
+            head,
+            dirs: out,
+            quarantine,
+        })
+    }
+
     /// `path`'s text at blob `oid` — from this machine's cache when it
     /// holds that blob, else downloaded — and what the cache held before.
     fn text_at(
@@ -141,6 +228,250 @@ impl GithubLedger<'_> {
             },
         )
     }
+
+    /// A file that may only grow, checked against the copy read before, and
+    /// cached only once it passed.
+    fn grown(&self, head: &str, path: &str, oid: &str, closed: bool) -> Result<String, StoreError> {
+        let (text, before) = self.text_at(path, oid)?;
+        if let Some(c) = &before
+            && c.oid != oid
+        {
+            // ⚠ Check 3: a closed segment never changes.
+            if c.closed {
+                return Err(self.altered(path, "changed after it was closed", head));
+            }
+            // ⚠ Check 4: the open segment starts with the copy read before.
+            if !text.starts_with(&c.text) {
+                return Err(self.altered(
+                    path,
+                    "no longer starts with the copy this machine read before",
+                    head,
+                ));
+            }
+        }
+        self.local.cache(
+            &self.repo.node_id,
+            path,
+            &CachedSegment {
+                oid: oid.to_string(),
+                text: text.clone(),
+                closed,
+            },
+        )?;
+        Ok(text)
+    }
+
+    /// One directory's segments: named `1.jsonl` up with no gap, none of
+    /// those read before gone, each checked by [`Self::grown`].
+    fn directory(
+        &self,
+        head: &str,
+        dir: &str,
+        found: Option<&Object>,
+    ) -> Result<Vec<Segment>, StoreError> {
+        let entries = match found {
+            None => Vec::new(),
+            Some(Object::Tree(entries)) => entries.clone(),
+            Some(Object::Blob { .. }) => {
+                return Err(self.altered(dir, "is a file where a directory belongs", head));
+            }
+        };
+        let mut numbered: BTreeMap<u64, (String, String)> = BTreeMap::new();
+        for e in &entries {
+            let n = if e.is_blob {
+                layout::segment_number(&e.name)
+            } else {
+                None
+            };
+            let Some(n) = n else {
+                return Err(self.altered(
+                    &format!("{dir}/{}", e.name),
+                    "is not a segment fl writes",
+                    head,
+                ));
+            };
+            numbered.insert(n, (layout::segment_path(dir, n), e.oid.clone()));
+        }
+        let last = numbered.len() as u64;
+        if numbered.keys().copied().ne(1..=last) {
+            return Err(self.altered(dir, "is missing a segment", head));
+        }
+        for (path, _) in self.local.cached_under(&self.repo.node_id, dir)? {
+            if !numbered.values().any(|(p, _)| *p == path) {
+                return Err(self.altered(&path, "was deleted", head));
+            }
+        }
+        let mut out = Vec::new();
+        for (n, (path, oid)) in numbered {
+            let text = self.grown(head, &path, &oid, n < last)?;
+            out.push(Segment { path, text });
+        }
+        Ok(out)
+    }
+
+    /// `quarantine.jsonl`'s lines. ⚠ One fl cannot read is `Altered`: the
+    /// quarantine file cannot quarantine itself (ruling 17).
+    pub(crate) fn quarantine_lines(
+        &self,
+        snap: &Snapshot,
+    ) -> Result<Vec<QuarantineLine>, StoreError> {
+        let mut out = Vec::new();
+        for (n, text) in layout::lines(&snap.quarantine) {
+            match text
+                .map_err(str::to_string)
+                .and_then(QuarantineLine::decode)
+            {
+                Ok(q) => out.push(q),
+                Err(cause) => {
+                    return Err(self.altered(
+                        QUARANTINE_FILE,
+                        format!(
+                            "has an unreadable line {n} ({cause}), and the quarantine file \
+                             cannot quarantine its own lines"
+                        ),
+                        &snap.head,
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every line of `dir` in `snap`, parsed strictly (spec §3.3), checked
+    /// (§3.5 checks 5 and 6), each id once. A quarantined line is skipped
+    /// and noted (§3.6).
+    pub(crate) fn lines(
+        &self,
+        snap: &Snapshot,
+        area: Area,
+        dir: &str,
+    ) -> Result<Vec<Line>, StoreError> {
+        let skipped: BTreeMap<(String, u64), String> = self
+            .quarantine_lines(snap)?
+            .into_iter()
+            .map(|q| ((q.file, q.line), q.reason))
+            .collect();
+        let mut out: Vec<Line> = Vec::new();
+        let mut seen: BTreeMap<Iri, (String, u64, usize)> = BTreeMap::new();
+        for seg in snap.dirs.get(dir).map(Vec::as_slice).unwrap_or_default() {
+            for (n, text) in layout::lines(&seg.text) {
+                if let Some(reason) = skipped.get(&(seg.path.clone(), n)) {
+                    self.notes.borrow_mut().insert(Note::Quarantined {
+                        file: seg.path.clone(),
+                        line: n,
+                        reason: reason.clone(),
+                    });
+                    continue;
+                }
+                let line = match text
+                    .map_err(str::to_string)
+                    .and_then(|t| layout::decode(area, t))
+                {
+                    Ok((line, _by)) => line,
+                    Err(cause) => {
+                        return Err(LedgerFault::Unreadable {
+                            repo: self.repo.full_name.clone(),
+                            file: seg.path.clone(),
+                            line: n,
+                            commit: self.blame(&snap.head, &seg.path, n),
+                            cause,
+                        }
+                        .into());
+                    }
+                };
+                // ⚠ Check 6: a line's gate, project or record matches its
+                // directory.
+                if line.dir() != dir {
+                    return Err(LedgerFault::Misplaced {
+                        repo: self.repo.full_name.clone(),
+                        file: seg.path.clone(),
+                        line: n,
+                        belongs: line.subject().to_string(),
+                        commit: self.blame(&snap.head, &seg.path, n),
+                    }
+                    .into());
+                }
+                let id = line
+                    .id()
+                    .cloned()
+                    .expect("decode refuses a line with no id");
+                match seen.get(&id) {
+                    // ⚠ Check 5: the same id never appears with different
+                    // content. An identical copy is read once.
+                    Some((file, at, i)) => {
+                        if out[*i] != line {
+                            return Err(StoreError::Tampered {
+                                id,
+                                detail: format!(
+                                    "the GitHub ledger holds it twice with different content: \
+                                     `{file}` line {at} and `{}` line {n}",
+                                    seg.path
+                                ),
+                            });
+                        }
+                    }
+                    None => {
+                        seen.insert(id, (seg.path.clone(), n, out.len()));
+                        out.push(line);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn read(&self, area: Area, subject: &Iri) -> Result<Vec<Line>, StoreError> {
+        let dir = layout::dir(area, subject);
+        let snap = self.snapshot(std::slice::from_ref(&dir))?;
+        self.lines(&snap, area, &dir)
+    }
+
+    /// Every run of `gate` the ledger holds. ⚠ Unreachable is an error,
+    /// never an empty list (spec §2.5).
+    pub fn runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
+        Ok(self
+            .read(Area::Runs, gate.iri())?
+            .into_iter()
+            .filter_map(|l| match l {
+                Line::Run(r) => Some(r),
+                _ => None,
+            })
+            .collect())
+    }
+
+    pub fn attempts_of(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
+        Ok(self
+            .read(Area::Attempts, project.iri())?
+            .into_iter()
+            .filter_map(|l| match l {
+                Line::Attempt(a) => Some(a),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The decisions filed under `subject`: a finding, or a record.
+    pub fn decisions(&self, subject: &Iri) -> Result<Vec<Decision>, StoreError> {
+        Ok(self
+            .read(Area::Decisions, subject)?
+            .into_iter()
+            .filter_map(|l| match l {
+                Line::Decision(d) => Some(d),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// Whether `record` is an issue of this repository. ⚠ A local answer,
+    /// never a request (spec §2.1).
+    pub fn owns(&self, record: &RecordId) -> Result<bool, StoreError> {
+        crate::owner::issue_of_repository(
+            record.iri(),
+            &self.repo.full_name,
+            &self.repo.node_id,
+            self.local,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +482,9 @@ mod tests {
     use crate::fake::FakeGithub;
     use crate::tracker::Repo;
     use fl_core::MemStore;
+    use fl_core::at::At;
+    use fl_core::conformance::{sample_attempt, sample_decision, sample_record_run};
+    use fl_core::ids::seq_iri;
     use fl_core::split::LedgerCache;
     use fl_core::store::Bindings;
     use std::time::Duration;
@@ -202,6 +536,35 @@ mod tests {
     /// does not matter to the head and format checks.
     fn commit_on(fake: &FakeGithub, text: &str) -> String {
         fake.hand_commit(&[("runs/k/1.jsonl", Some(text))])
+    }
+
+    fn gate() -> GateId {
+        GateId(seq_iri(7))
+    }
+
+    fn record() -> RecordId {
+        RecordId(Iri::parse("https://github.com/acme/widgets/issues/1").unwrap())
+    }
+
+    fn run(n: u64) -> GateRun {
+        sample_record_run(n, &gate(), Some(&record()))
+    }
+
+    fn runs_dir() -> String {
+        layout::dir(Area::Runs, gate().iri())
+    }
+
+    fn seg(n: u64) -> String {
+        layout::segment_path(&runs_dir(), n)
+    }
+
+    /// A segment's text: each line and its newline.
+    fn file(lines: &[String]) -> String {
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    fn line(r: &GateRun) -> String {
+        Line::Run(r.clone()).encode("someone")
     }
 
     #[test]
@@ -546,6 +909,556 @@ mod tests {
             open(&c, &local).check_head().unwrap(),
             mine,
             "one 404 read again, then the real branch: no alarm"
+        );
+    }
+
+    #[test]
+    fn reading_while_github_is_down_is_an_error_not_empty() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        fake.state().down = true;
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn runs_read_back_in_the_order_they_were_written_across_segments() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[
+            (
+                seg(1).as_str(),
+                Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+            ),
+            (seg(2).as_str(), Some(file(&[line(&run(3))]).as_str())),
+        ]);
+        let c = client(&fake);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2), run(3)]
+        );
+    }
+
+    // ⚠ Spec §3.5 check 3: a closed segment never changes — not even by
+    // growing, which an open one may.
+    #[test]
+    fn a_closed_segment_that_changes_is_altered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(file(&[line(&run(1))]).as_str())),
+            (seg(2).as_str(), Some(file(&[line(&run(2))]).as_str())),
+        ]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(9))]).as_str()),
+        )]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if *file == seg(1) && what.contains("closed")
+            ),
+            "{err:?}"
+        );
+    }
+
+    // ⚠ Spec §3.5 check 4.
+    #[test]
+    fn an_open_segment_that_no_longer_starts_with_the_copy_read_before_is_altered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+        )]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        let mut edited = run(1);
+        edited.population = 9;
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&edited), line(&run(2))]).as_str()),
+        )]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("no longer starts")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_segment_that_grew_is_read_again_and_cached() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+        )]);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2)]
+        );
+        let cached = local.cached("R_1", &seg(1)).unwrap().unwrap();
+        assert!(cached.text.contains(&line(&run(2))));
+    }
+
+    // ⚠ The segment cache must not raise false alarms (checks 3 and 4):
+    // another machine growing the open segment and rolling over to a new
+    // one is what the ledger is for.
+    #[test]
+    fn appends_and_a_rollover_by_another_machine_raise_no_alarm() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        fake.hand_commit(&[
+            (
+                seg(1).as_str(),
+                Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+            ),
+            (seg(2).as_str(), Some(file(&[line(&run(3))]).as_str())),
+        ]);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2), run(3)]
+        );
+        fake.hand_commit(&[(
+            seg(2).as_str(),
+            Some(file(&[line(&run(3)), line(&run(4))]).as_str()),
+        )]);
+        assert_eq!(open(&c, &local).runs(&gate()).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_segment_that_disappears_or_leaves_a_gap_is_altered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(2).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("missing a segment")
+            ),
+            "{err:?}"
+        );
+
+        let (fake2, local2, _root2) = world();
+        fake2.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c2 = client(&fake2);
+        open(&c2, &local2).runs(&gate()).unwrap();
+        fake2.hand_commit(&[(seg(1).as_str(), None)]);
+        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if *file == seg(1) && what.contains("deleted")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn anything_in_a_directory_but_a_segment_or_a_file_where_a_directory_belongs_is_altered() {
+        let (fake, local, _root) = world();
+        let stray = format!("{}/notes.txt", runs_dir());
+        fake.hand_commit(&[(stray.as_str(), Some("x"))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, .. })
+                    if *file == stray
+            ),
+            "{err:?}"
+        );
+
+        // A directory inside a segment directory is not a segment either.
+        let (fake3, local3, _root3) = world();
+        let nested = format!("{}/sub/1.jsonl", runs_dir());
+        fake3.hand_commit(&[(nested.as_str(), Some("x"))]);
+        let c3 = client(&fake3);
+        let err = open(&c3, &local3).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if *file == format!("{}/sub", runs_dir()) && what.contains("not a segment")
+            ),
+            "{err:?}"
+        );
+
+        let (fake2, local2, _root2) = world();
+        fake2.hand_commit(&[(runs_dir().as_str(), Some("x"))]);
+        let c2 = client(&fake2);
+        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("directory")
+            ),
+            "{err:?}"
+        );
+    }
+
+    // Spec §3.3: a segment read before is not downloaded again.
+    #[test]
+    fn a_segment_read_before_is_not_downloaded_again() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(file(&[line(&run(1))]).as_str())),
+            (seg(2).as_str(), Some(file(&[line(&run(2))]).as_str())),
+        ]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        let before = blob_reads(&fake);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2)]
+        );
+        assert_eq!(blob_reads(&fake), before, "nothing downloaded twice");
+    }
+
+    // ⚠ Spec §3.3: an unreadable line names the file, the line, the commit
+    // that added it, and the quarantine command.
+    #[test]
+    fn an_unreadable_line_names_its_file_line_commit_and_the_quarantine_command() {
+        let (fake, local, _root) = world();
+        let first = fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let damaged = format!("{}not json\n", file(&[line(&run(1))]));
+        let bad = fake.hand_commit(&[(seg(1).as_str(), Some(damaged.as_str()))]);
+        // A later commit that reads do not look at: the head is not `bad`.
+        fake.hand_commit(&[("notes.txt", Some("x"))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        match &err {
+            StoreError::Ledger(LedgerFault::Unreadable {
+                file: f,
+                line: n,
+                commit,
+                ..
+            }) => {
+                assert_eq!(f, &seg(1));
+                assert_eq!(*n, 2);
+                assert_eq!(commit, &bad);
+                assert_ne!(commit, &first);
+            }
+            other => panic!("{other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("fl github ledger quarantine {} 2", seg(1))),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("upgrade fl"),
+            "a newer fl's line reads as this: {msg}"
+        );
+    }
+
+    // ⚠ Controller ruling: `layout::lines` refuses a cut-short last segment
+    // (no final newline); a reader must surface that as tampering BEFORE
+    // any append could ever be planned on top of it.
+    #[test]
+    fn a_cut_short_open_segment_is_reported_as_unreadable() {
+        let (fake, local, _root) = world();
+        let cut = format!("{}\nnot terminated", line(&run(1)));
+        let bad = fake.hand_commit(&[(seg(1).as_str(), Some(cut.as_str()))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        match &err {
+            StoreError::Ledger(LedgerFault::Unreadable {
+                file: f,
+                line: n,
+                commit,
+                cause,
+                ..
+            }) => {
+                assert_eq!(f, &seg(1));
+                assert_eq!(*n, 2);
+                assert_eq!(commit, &bad);
+                assert!(cause.contains("cut short"), "{cause}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ⚠ Spec §3.1: a new field means a new format. A line a newer fl wrote
+    // with a field this fl does not know is unreadable here, and the
+    // message says a newer fl may have written it.
+    #[test]
+    fn a_line_with_a_field_this_fl_does_not_write_is_unreadable_and_says_to_upgrade() {
+        let (fake, local, _root) = world();
+        let mut v: serde_json::Value = serde_json::from_str(&line(&run(1))).unwrap();
+        v["retried"] = serde_json::Value::Bool(true);
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[v.to_string()]).as_str()))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Unreadable { line: 1, .. })
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("upgrade fl"), "{err}");
+    }
+
+    // Spec §3.6: a quarantined line is skipped and reported; nothing is
+    // removed.
+    #[test]
+    fn a_quarantined_line_is_skipped_and_noted_once() {
+        let (fake, local, _root) = world();
+        let q = QuarantineLine {
+            id: seq_iri(50),
+            at: At::from_unix_millis(50),
+            file: seg(1),
+            line: 2,
+            quarantined_by: "Ada".into(),
+            reason: "a hand edit".into(),
+            by: "fake-user".into(),
+        };
+        let damaged = format!(
+            "{}not json\n{}",
+            file(&[line(&run(1))]),
+            file(&[line(&run(3))])
+        );
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(damaged.as_str())),
+            (QUARANTINE_FILE, Some(file(&[q.encode()]).as_str())),
+        ]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        assert_eq!(l.runs(&gate()).unwrap(), vec![run(1), run(3)]);
+        l.runs(&gate()).unwrap();
+        assert_eq!(
+            l.take_notes(),
+            vec![Note::Quarantined {
+                file: seg(1),
+                line: 2,
+                reason: "a hand edit".into(),
+            }],
+            "once, however often it is read"
+        );
+        assert!(
+            fake.ledger_files()[&seg(1)].contains("not json"),
+            "nothing was removed"
+        );
+    }
+
+    // ⚠ Spec §3.5 check 6 and §7: a line in the wrong directory is
+    // tampering, naming the file and the commit; quarantine is offered too.
+    #[test]
+    fn a_line_in_the_wrong_directory_is_reported_as_tampering() {
+        let (fake, local, _root) = world();
+        let elsewhere = sample_record_run(1, &GateId(seq_iri(8)), Some(&record()));
+        let added =
+            fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&elsewhere)]).as_str()))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Misplaced { line: 1, ref commit, .. })
+                    if *commit == added
+            ),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        for part in [
+            "was altered",
+            "fl github ledger verify",
+            "fl github ledger quarantine",
+        ] {
+            assert!(msg.contains(part), "{part}: {msg}");
+        }
+    }
+
+    // ⚠ Spec §3.5 check 5: one id, one content.
+    #[test]
+    fn one_id_with_two_contents_is_tampered_and_an_identical_copy_is_read_once() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(1)), line(&run(2))]).as_str()),
+        )]);
+        let c = client(&fake);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2)]
+        );
+        let mut other = run(1);
+        other.commit = "def".into();
+        fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(1)), line(&run(2)), line(&other)]).as_str()),
+        )]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        let want = run(1).id.unwrap();
+        assert!(
+            matches!(err, StoreError::Tampered { ref id, .. } if *id == want),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_or_vanished_quarantine_file_is_altered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(QUARANTINE_FILE, Some("not json\n"))]);
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, .. })
+                    if file == QUARANTINE_FILE
+            ),
+            "{err:?}"
+        );
+
+        let (fake2, local2, _root2) = world();
+        let q = QuarantineLine {
+            id: seq_iri(50),
+            at: At::from_unix_millis(50),
+            file: seg(1),
+            line: 1,
+            quarantined_by: "Ada".into(),
+            reason: "r".into(),
+            by: "fake-user".into(),
+        };
+        fake2.hand_commit(&[(QUARANTINE_FILE, Some(file(&[q.encode()]).as_str()))]);
+        let c2 = client(&fake2);
+        open(&c2, &local2).runs(&gate()).unwrap();
+        fake2.hand_commit(&[(QUARANTINE_FILE, None)]);
+        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("deleted")
+            ),
+            "{err:?}"
+        );
+    }
+
+    // ⚠ Spec §3.5 check 4 applies to `quarantine.jsonl` as to an open
+    // segment: it only grows. And it is a file.
+    #[test]
+    fn a_quarantine_file_that_lost_a_line_or_is_a_directory_is_altered() {
+        let quarantined = |n: u64| {
+            QuarantineLine {
+                id: seq_iri(50 + n),
+                at: At::from_unix_millis(50 + n),
+                file: seg(1),
+                line: n,
+                quarantined_by: "Ada".into(),
+                reason: "r".into(),
+                by: "fake-user".into(),
+            }
+            .encode()
+        };
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(
+            QUARANTINE_FILE,
+            Some(file(&[quarantined(1), quarantined(2)]).as_str()),
+        )]);
+        let c = client(&fake);
+        open(&c, &local).runs(&gate()).unwrap();
+        fake.hand_commit(&[(QUARANTINE_FILE, Some(file(&[quarantined(2)]).as_str()))]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if file == QUARANTINE_FILE && what.contains("no longer starts")
+            ),
+            "{err:?}"
+        );
+
+        let (fake2, local2, _root2) = world();
+        fake2.hand_commit(&[("quarantine.jsonl/x", Some("y"))]);
+        let c2 = client(&fake2);
+        let err = open(&c2, &local2).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("directory")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn attempts_and_decisions_read_from_their_own_directories() {
+        let (fake, local, _root) = world();
+        let p = ProjectId(seq_iri(8));
+        let a = sample_attempt(2, &p, &record());
+        let d = sample_decision(3, &record(), vec![]);
+        let adir = layout::dir(Area::Attempts, p.iri());
+        let ddir = layout::dir(Area::Decisions, record().iri());
+        fake.hand_commit(&[
+            (
+                layout::segment_path(&adir, 1).as_str(),
+                Some(file(&[Line::Attempt(a.clone()).encode("x")]).as_str()),
+            ),
+            (
+                layout::segment_path(&ddir, 1).as_str(),
+                Some(file(&[Line::Decision(d.clone()).encode("x")]).as_str()),
+            ),
+        ]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        assert_eq!(l.attempts_of(&p).unwrap(), vec![a]);
+        assert_eq!(l.decisions(record().iri()).unwrap(), vec![d]);
+    }
+
+    // Spec §2.1: ownership is a local answer, with no request.
+    #[test]
+    fn a_record_this_repository_holds_is_owned_and_another_is_not() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let before = fake.state().requests.len();
+        assert!(l.owns(&record()).unwrap());
+        let theirs = RecordId(Iri::parse("https://github.com/acme/other/issues/1").unwrap());
+        assert!(!l.owns(&theirs).unwrap());
+        assert_eq!(fake.state().requests.len(), before, "no request");
+    }
+
+    // ⚠ Controller ruling: the GraphQL lag rule (ruling 24) applies to
+    // segment listing and segment reads too, not just the format file.
+    // Right after this machine's own append, a replica that does not yet
+    // know the head commit must never raise a false alarm reading segments.
+    #[test]
+    fn a_graphql_replica_that_has_not_seen_this_machines_own_append_raises_no_alarm_reading_segments()
+     {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        open(&c, &local).runs(&gate()).unwrap();
+        let mine = fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+        )]);
+        local.set_last_head("R_1", &mine).unwrap();
+        fake.state().graphql_commit_unknown_next = 2;
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2)],
+            "two lagging GraphQL reads after this machine's own append, then it \
+             catches up: no alarm"
         );
     }
 }
