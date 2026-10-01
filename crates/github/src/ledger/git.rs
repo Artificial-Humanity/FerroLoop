@@ -437,6 +437,32 @@ mod tests {
         assert!(err.to_string().contains("not base64"), "{err}");
     }
 
+    // ⚠ A 502 must not read as "no parents" (an orphan's meaning) — the two
+    // are different facts fl must tell apart, the same distinction
+    // `branch_head_treats_a_server_error_as_an_error_not_as_no_such_branch`
+    // makes for a missing branch.
+    #[test]
+    fn parents_of_treats_a_server_error_as_an_error_not_as_an_empty_list() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        fake.state().html_502_next = true;
+        let err = open(&c, &local).parents_of(&root).unwrap_err();
+        assert!(err.to_string().contains("502"), "{err}");
+    }
+
+    #[test]
+    fn parents_of_refuses_a_200_with_no_parents_field() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(&fake, "/git/commits/", 200, json!({"sha": root}));
+        let err = open(&c, &local).parents_of(&root).unwrap_err();
+        assert!(err.to_string().contains("no parents"), "{err}");
+    }
+
     #[test]
     fn objects_refuses_a_blob_with_no_oid() {
         let fake = FakeGithub::start("acme/widgets");
