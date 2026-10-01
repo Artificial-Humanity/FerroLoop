@@ -8938,6 +8938,9 @@ impl GithubLedger<'_> {
                     cutover_recorded,
                 })
             }
+            // ⚠ Step 6: the branch exists but no root was recorded — `init`
+            // stopped after creating it. Ask the person to confirm its first
+            // commit is the one they created.
             (Some(head), None) => {
                 let first = self.first_commit(&head)?;
                 match confirmed {
