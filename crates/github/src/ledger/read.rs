@@ -44,15 +44,17 @@ impl std::fmt::Display for Note {
 #[derive(Debug)]
 pub(crate) struct Segment {
     pub path: String,
-    pub text: String,
+    /// Exactly the bytes GitHub holds: each line is decoded on its own,
+    /// strictly, when it is read (`layout::lines`).
+    pub bytes: Vec<u8>,
 }
 
 /// The directories one read or append needs, at one checked head.
 pub(crate) struct Snapshot {
     pub head: String,
     pub dirs: BTreeMap<String, Vec<Segment>>,
-    /// `quarantine.jsonl`'s text; empty when there is none.
-    pub quarantine: String,
+    /// `quarantine.jsonl`'s bytes; empty when there is none.
+    pub quarantine: Vec<u8>,
 }
 
 impl GithubLedger<'_> {
@@ -176,7 +178,7 @@ impl GithubLedger<'_> {
                 {
                     return Err(self.altered(QUARANTINE_FILE, "was deleted", &head));
                 }
-                String::new()
+                Vec::new()
             }
             Some(Object::Blob { oid }) => {
                 self.grown(&head, QUARANTINE_FILE, oid, false, &mut pending)?
@@ -204,19 +206,25 @@ impl GithubLedger<'_> {
         })
     }
 
-    /// `path`'s text at blob `oid` — from this machine's cache when it
+    /// `path`'s bytes at blob `oid` — from this machine's cache when it
     /// holds that blob, else downloaded — and what the cache held before.
-    fn text_at(
+    ///
+    /// ⚠ Bytes, never decoded here: a reader decodes each LINE strictly
+    /// (`layout::lines`), so a damaged line is `Unreadable` on its own; a
+    /// lossy decode of the whole file would hand back U+FFFD as if the
+    /// ledger held it, and let check 4 see two different damaged lines as
+    /// the same.
+    fn bytes_at(
         &self,
         path: &str,
         oid: &str,
-    ) -> Result<(String, Option<CachedSegment>), StoreError> {
+    ) -> Result<(Vec<u8>, Option<CachedSegment>), StoreError> {
         let before = self.local.cached(&self.repo.node_id, path)?;
-        let text = match &before {
-            Some(c) if c.oid == oid => c.text.clone(),
-            _ => self.blob_text(oid)?,
+        let bytes = match &before {
+            Some(c) if c.oid == oid => c.bytes.clone(),
+            _ => self.blob_bytes(oid)?,
         };
-        Ok((text, before))
+        Ok((bytes, before))
     }
 
     /// ⚠ Check 7: the format is one this fl knows. Queues its cache entry
@@ -232,17 +240,21 @@ impl GithubLedger<'_> {
         let Some(Object::Blob { oid }) = found else {
             return Err(self.altered(FORMAT_FILE, "is missing, or is not a file", head));
         };
-        let (text, _) = self.text_at(FORMAT_FILE, oid)?;
+        let (bytes, _) = self.bytes_at(FORMAT_FILE, oid)?;
         // ⚠ Ruling 19: only the exact text `1` (one trailing newline
         // allowed) is format 1 — not merely text that TRIMS to `1`, which
         // `1\r\n` or ` 1\n` also would. `found` carries the raw text,
-        // escaped (`{:?}`), never trimmed: a damaged `1\r\n` must not be
-        // reported as `1`, which would read as "this is already the format
-        // fl reads" and hide the damage instead of naming it.
-        if text.strip_suffix('\n').unwrap_or(&text) != FORMAT {
+        // escaped, never trimmed: a damaged `1\r\n` must not be reported
+        // as `1`, which would read as "this is already the format fl reads"
+        // and hide the damage instead of naming it.
+        if bytes.strip_suffix(b"\n").unwrap_or(&bytes) != FORMAT.as_bytes() {
+            let found = match std::str::from_utf8(&bytes) {
+                Ok(text) => format!("{text:?}"),
+                Err(_) => format!("\"{}\"", bytes.escape_ascii()),
+            };
             return Err(LedgerFault::UnknownFormat {
                 repo: self.repo.full_name.clone(),
-                found: format!("{text:?}"),
+                found,
             }
             .into());
         }
@@ -250,7 +262,7 @@ impl GithubLedger<'_> {
             FORMAT_FILE.to_string(),
             CachedSegment {
                 oid: oid.clone(),
-                text,
+                bytes,
                 closed: true,
             },
         ));
@@ -266,8 +278,8 @@ impl GithubLedger<'_> {
         oid: &str,
         closed: bool,
         pending: &mut Vec<(String, CachedSegment)>,
-    ) -> Result<String, StoreError> {
-        let (text, before) = self.text_at(path, oid)?;
+    ) -> Result<Vec<u8>, StoreError> {
+        let (bytes, before) = self.bytes_at(path, oid)?;
         if let Some(c) = &before
             && c.oid != oid
         {
@@ -279,9 +291,11 @@ impl GithubLedger<'_> {
             // before. `grows_only` is shared with `verify`'s `only_adds`
             // so the rule can never drift between the two; here it is
             // always equivalent to the plain prefix check it replaces,
-            // since `c.text` is only ever cached below when it is itself
-            // empty or newline-terminated.
-            if !layout::grows_only(c.text.as_bytes(), text.as_bytes()) {
+            // since `c.bytes` is only ever cached below when it is itself
+            // empty or newline-terminated. ⚠ It compares BYTES: one
+            // invalid byte rewritten into another is a rewrite, though a
+            // lossy decode of both reads the same.
+            if !layout::grows_only(&c.bytes, &bytes) {
                 return Err(self.altered(
                     path,
                     "no longer starts with the copy this machine read before",
@@ -297,17 +311,22 @@ impl GithubLedger<'_> {
         // check 4 vacuous for whatever follows it. Leave the cache as it
         // was; `lines()` still catches the cut line itself, as
         // `Unreadable`, before any append could ever be planned on it.
-        if text.is_empty() || text.ends_with('\n') {
+        //
+        // ⚠ Cached as the bytes read, exactly — a line that is not UTF-8
+        // included (`CachedSegment` stores those losslessly), so check 4
+        // compares the next copy with what GitHub really held, and a
+        // quarantine works from it.
+        if bytes.is_empty() || bytes.ends_with(b"\n") {
             pending.push((
                 path.to_string(),
                 CachedSegment {
                     oid: oid.to_string(),
-                    text: text.clone(),
+                    bytes: bytes.clone(),
                     closed,
                 },
             ));
         }
-        Ok(text)
+        Ok(bytes)
     }
 
     /// One directory's segments: named `1.jsonl` up with no gap, none of
@@ -363,8 +382,8 @@ impl GithubLedger<'_> {
         }
         let mut out = Vec::new();
         for (n, (path, oid)) in numbered {
-            let text = self.grown(head, &path, &oid, n < last, pending)?;
-            out.push(Segment { path, text });
+            let bytes = self.grown(head, &path, &oid, n < last, pending)?;
+            out.push(Segment { path, bytes });
         }
         Ok(out)
     }
@@ -414,7 +433,7 @@ impl GithubLedger<'_> {
         let mut out: Vec<Line> = Vec::new();
         let mut seen: BTreeMap<Iri, (String, u64, usize)> = BTreeMap::new();
         for seg in snap.dirs.get(dir).map(Vec::as_slice).unwrap_or_default() {
-            for (n, text) in layout::lines(&seg.text) {
+            for (n, text) in layout::lines(&seg.bytes) {
                 if let Some(reason) = skipped.get(&(seg.path.clone(), n)) {
                     self.notes.borrow_mut().insert(Note::Quarantined {
                         file: seg.path.clone(),
@@ -542,6 +561,8 @@ mod tests {
     use crate::creds::EnvToken;
     use crate::fake::FakeGithub;
     use crate::tracker::Repo;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use fl_core::MemStore;
     use fl_core::at::At;
     use fl_core::conformance::{sample_attempt, sample_decision, sample_record_run};
@@ -633,6 +654,46 @@ mod tests {
 
     fn line(r: &GateRun) -> String {
         Line::Run(r.clone()).encode("someone")
+    }
+
+    /// The blob id the fake holds `text` under.
+    fn oid_of(fake: &FakeGithub, text: &str) -> String {
+        fake.state()
+            .git
+            .blobs
+            .iter()
+            .find(|(_, t)| t.as_str() == text)
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| panic!("no blob holds {text:?}"))
+    }
+
+    /// The next download of `text`'s blob answers `bytes` instead. The fake
+    /// commits only text, so bytes that are not UTF-8 reach a reader this
+    /// way.
+    fn serve_instead(fake: &FakeGithub, text: &str, bytes: &[u8]) {
+        let oid = oid_of(fake, text);
+        body_next(
+            fake,
+            &format!("/git/blobs/{oid}"),
+            200,
+            json!({"content": STANDARD.encode(bytes)}),
+        );
+    }
+
+    /// `bytes` with the first `from` replaced by `to`.
+    fn swap(bytes: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+        let at = bytes
+            .windows(from.len())
+            .position(|w| w == from)
+            .expect("the marker is there");
+        [&bytes[..at], to, &bytes[at + from.len()..]].concat()
+    }
+
+    /// `run(n)`'s line, whose output excerpt is `excerpt`.
+    fn excerpted(n: u64, excerpt: &str) -> String {
+        let mut r = run(n);
+        r.output_excerpt = Some(excerpt.into());
+        line(&r)
     }
 
     #[test]
@@ -860,6 +921,24 @@ mod tests {
         }
     }
 
+    // A `format` that is not UTF-8 is refused like any other, and `found`
+    // shows its bytes escaped — never U+FFFD in their place.
+    #[test]
+    fn a_format_that_is_not_utf8_is_refused_and_reported_escaped() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger_with(&[("format", "1Z\n"), ("README.md", "x")]);
+        let local = MemStore::default();
+        local.set_ledger_root("R_1", &root).unwrap();
+        serve_instead(&fake, "1Z\n", b"1\xff\n");
+        let c = client(&fake);
+        match open(&c, &local).check_format().unwrap_err() {
+            StoreError::Ledger(LedgerFault::UnknownFormat { found, .. }) => {
+                assert_eq!(found, r#""1\xff\n""#);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     // Ruling 19, the other half: `1` with NO trailing newline is also
     // accepted — the newline is optional, not required. A comparison
     // tightened to require it (`text != "1\n"`) would refuse this silently.
@@ -1074,7 +1153,8 @@ mod tests {
             vec![run(1), run(2)]
         );
         let cached = local.cached("R_1", &seg(1)).unwrap().unwrap();
-        assert!(cached.text.contains(&line(&run(2))));
+        let cached = String::from_utf8(cached.bytes).unwrap();
+        assert!(cached.contains(&line(&run(2))));
     }
 
     // ⚠ The segment cache must not raise false alarms (checks 3 and 4):
@@ -1232,6 +1312,104 @@ mod tests {
         assert!(
             msg.contains("upgrade fl"),
             "a newer fl's line reads as this: {msg}"
+        );
+    }
+
+    // ⚠ Readers carry BYTES. A byte that is not UTF-8 inside a JSON string
+    // is an unreadable line, named — never read with U+FFFD in its place,
+    // which would hand back data the ledger does not hold (and the strict
+    // byte-for-byte check would compare the line with its own re-encoding,
+    // which carries the same replacement character).
+    #[test]
+    fn a_line_that_is_not_utf8_is_unreadable_never_read_with_a_replacement() {
+        let (fake, local, _root) = world();
+        let text = file(&[excerpted(1, "run X")]);
+        let bad = fake.hand_commit(&[(seg(1).as_str(), Some(text.as_str()))]);
+        serve_instead(&fake, &text, &swap(text.as_bytes(), b"run X", b"run \xff"));
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        match &err {
+            StoreError::Ledger(LedgerFault::Unreadable {
+                file: f,
+                line: n,
+                commit,
+                cause,
+                ..
+            }) => {
+                assert_eq!((f.as_str(), *n), (seg(1).as_str(), 1));
+                assert_eq!(commit, &bad);
+                assert!(cause.contains("not valid UTF-8"), "{cause}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            err.to_string()
+                .contains(&format!("fl github ledger quarantine {} 1", seg(1))),
+            "{err}"
+        );
+    }
+
+    // ⚠ Check 4 compares BYTES: a commit that rewrites one invalid byte
+    // into another is a rewrite, even though both decode lossily to the
+    // same text.
+    #[test]
+    fn a_rewrite_from_one_invalid_byte_to_another_is_caught_by_a_reader() {
+        let (fake, local, _root) = world();
+        let one = file(&[excerpted(1, "run X")]);
+        fake.hand_commit(&[(seg(1).as_str(), Some(one.as_str()))]);
+        serve_instead(&fake, &one, &swap(one.as_bytes(), b"run X", b"run \xff"));
+        let c = client(&fake);
+        assert!(
+            open(&c, &local).runs(&gate()).is_err(),
+            "line 1 is unreadable"
+        );
+        let two = file(&[excerpted(1, "run Y")]);
+        fake.hand_commit(&[(seg(1).as_str(), Some(two.as_str()))]);
+        serve_instead(&fake, &two, &swap(two.as_bytes(), b"run Y", b"run \xfe"));
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if *file == seg(1) && what.contains("no longer starts")
+            ),
+            "{err:?}"
+        );
+    }
+
+    // ⚠ `quarantine.jsonl` is decoded strictly too: a byte that is not
+    // UTF-8 there is `Altered` (the quarantine file cannot quarantine its
+    // own lines), never a reason read with U+FFFD in it.
+    #[test]
+    fn a_quarantine_file_line_that_is_not_utf8_is_altered() {
+        let (fake, local, _root) = world();
+        let q = QuarantineLine {
+            id: seq_iri(50),
+            at: At::from_unix_millis(50),
+            file: seg(1),
+            line: 1,
+            quarantined_by: "Ada".into(),
+            reason: "a hand edit X".into(),
+            by: "fake-user".into(),
+        };
+        let text = file(&[q.encode()]);
+        fake.hand_commit(&[(QUARANTINE_FILE, Some(text.as_str()))]);
+        serve_instead(
+            &fake,
+            &text,
+            &swap(text.as_bytes(), b"edit X", b"edit \xff"),
+        );
+        let c = client(&fake);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref file, ref what, .. })
+                    if file == QUARANTINE_FILE
+                        && what.contains("unreadable line 1")
+                        && what.contains("not valid UTF-8")
+            ),
+            "{err:?}"
         );
     }
 

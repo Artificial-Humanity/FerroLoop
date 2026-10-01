@@ -223,23 +223,27 @@ pub fn decode(area: Area, text: &str) -> Result<(Line, String), String> {
     Ok((line, by))
 }
 
-/// The lines of a segment, numbered from 1.
+/// The lines of a segment, numbered from 1, from its bytes.
 ///
 /// ⚠ Every line fl writes ends with a newline: an empty line, or text after
 /// the last newline (a line cut short), comes back as `Err` in its place,
 /// with its number, for the reader to report.
-pub fn lines(text: &str) -> Vec<(u64, Result<&str, &'static str>)> {
+///
+/// ⚠ Each line is decoded on its own, strictly: one that is not valid
+/// UTF-8 is `Err` in its place too — never read with U+FFFD standing in for
+/// the bytes the ledger holds — and the lines around it read as usual.
+pub fn lines(bytes: &[u8]) -> Vec<(u64, Result<&str, &'static str>)> {
     let mut out = Vec::new();
-    if text.is_empty() {
+    if bytes.is_empty() {
         return out;
     }
-    let mut pieces: Vec<&str> = text.split('\n').collect();
-    let tail = pieces.pop().unwrap_or("");
+    let mut pieces: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
+    let tail = pieces.pop().unwrap_or_default();
     for (i, p) in pieces.iter().enumerate() {
         let line = if p.is_empty() {
             Err("it is empty")
         } else {
-            Ok(*p)
+            std::str::from_utf8(p).map_err(|_| "it is not valid UTF-8")
         };
         out.push(((i + 1) as u64, line));
     }
@@ -272,14 +276,19 @@ pub fn grows_only(was: &[u8], is: &[u8]) -> bool {
 }
 
 /// The files to write so `new` lines join a directory whose segments are
-/// `segments` — (number, text), oldest first. Only the last segment grows;
+/// `segments` — (number, bytes), oldest first. Only the last segment grows;
 /// it closes when the next line would take it past [`SEGMENT_LIMIT`].
-/// Returns (number, its whole new text) for each segment written; nothing
+/// Returns (number, its whole new bytes) for each segment written; nothing
 /// to add writes nothing.
-pub fn plan_append(segments: &[(u64, String)], new: &[String]) -> Vec<(u64, String)> {
-    let (mut n, mut text) = match segments.last() {
-        Some((n, t)) => (*n, t.clone()),
-        None => (1, String::new()),
+///
+/// ⚠ Bytes, not text: the last segment is written back byte-for-byte
+/// before the new lines, even a line in it that is not UTF-8 (quarantined,
+/// so readers skip it). Text would have to re-encode that line lossily —
+/// a rewrite, which `verify` rightly reports.
+pub fn plan_append(segments: &[(u64, Vec<u8>)], new: &[String]) -> Vec<(u64, Vec<u8>)> {
+    let (mut n, mut bytes) = match segments.last() {
+        Some((n, b)) => (*n, b.clone()),
+        None => (1, Vec::new()),
     };
     let mut changed = false;
     let mut out = Vec::new();
@@ -288,20 +297,20 @@ pub fn plan_append(segments: &[(u64, String)], new: &[String]) -> Vec<(u64, Stri
             !line.contains('\n'),
             "a new line never itself contains a newline"
         );
-        if !text.is_empty() && text.len() + line.len() + 1 > SEGMENT_LIMIT {
+        if !bytes.is_empty() && bytes.len() + line.len() + 1 > SEGMENT_LIMIT {
             if changed {
-                out.push((n, std::mem::take(&mut text)));
+                out.push((n, std::mem::take(&mut bytes)));
             } else {
-                text.clear();
+                bytes.clear();
             }
             n += 1;
         }
-        text.push_str(line);
-        text.push('\n');
+        bytes.extend_from_slice(line.as_bytes());
+        bytes.push(b'\n');
         changed = true;
     }
     if changed {
-        out.push((n, text));
+        out.push((n, bytes));
     }
     out
 }
@@ -359,8 +368,11 @@ mod tests {
         RecordId(Iri::parse("https://github.com/acme/widgets/issues/1").unwrap())
     }
 
-    fn seg(lines: &[&str]) -> String {
-        lines.iter().map(|l| format!("{l}\n")).collect()
+    fn seg(lines: &[&str]) -> Vec<u8> {
+        lines
+            .iter()
+            .flat_map(|l| format!("{l}\n").into_bytes())
+            .collect()
     }
 
     #[test]
@@ -588,16 +600,30 @@ mod tests {
 
     #[test]
     fn lines_are_numbered_from_one_and_a_cut_or_empty_line_is_flagged_in_place() {
-        assert!(lines("").is_empty());
-        assert_eq!(lines("a\nb\n"), vec![(1, Ok("a")), (2, Ok("b"))]);
+        assert!(lines(b"").is_empty());
+        assert_eq!(lines(b"a\nb\n"), vec![(1, Ok("a")), (2, Ok("b"))]);
         assert_eq!(
-            lines("a\n\nb\n"),
+            lines(b"a\n\nb\n"),
             vec![(1, Ok("a")), (2, Err("it is empty")), (3, Ok("b"))]
         );
-        let cut = lines("a\nb");
+        let cut = lines(b"a\nb");
         assert_eq!(cut[0], (1, Ok("a")));
         assert_eq!(cut[1].0, 2);
         assert!(cut[1].1.is_err(), "{cut:?}");
+    }
+
+    // ⚠ A line that is not UTF-8 is flagged in its own place; the lines
+    // around it read as usual, and keep their numbers.
+    #[test]
+    fn a_line_that_is_not_utf8_is_flagged_in_place() {
+        assert_eq!(
+            lines(b"a\n\xffb\nc\n"),
+            vec![
+                (1, Ok("a")),
+                (2, Err("it is not valid UTF-8")),
+                (3, Ok("c"))
+            ]
+        );
     }
 
     // Spec §3.5 checks 3 and 4, the shared rule: ordinary growth, a plain
@@ -630,6 +656,17 @@ mod tests {
         );
     }
 
+    // ⚠ The last segment is written back byte-for-byte, even a line in it
+    // that is not UTF-8 (one a quarantine lets readers skip).
+    #[test]
+    fn a_line_that_is_not_utf8_is_written_back_byte_for_byte() {
+        let segments = vec![(1, b"a\n\xff\n".to_vec())];
+        assert_eq!(
+            plan_append(&segments, &["b".into()]),
+            vec![(1, b"a\n\xff\nb\n".to_vec())]
+        );
+    }
+
     #[test]
     fn new_lines_grow_the_last_segment_and_a_closed_one_is_never_rewritten() {
         let segments = vec![(1, seg(&["a"])), (2, seg(&["b"]))];
@@ -654,21 +691,24 @@ mod tests {
         // The segment holds SEGMENT_LIMIT - 9 bytes: a line of 8 and its
         // newline fill it exactly; a line of 9 does not fit.
         let fill = "x".repeat(SEGMENT_LIMIT - 10);
-        let segments = vec![(1, format!("{fill}\n"))];
+        let segments = vec![(1, format!("{fill}\n").into_bytes())];
         let eight = "y".repeat(8);
         assert_eq!(
             plan_append(&segments, std::slice::from_ref(&eight)),
-            vec![(1, format!("{fill}\n{eight}\n"))]
+            vec![(1, format!("{fill}\n{eight}\n").into_bytes())]
         );
         let nine = "z".repeat(9);
         assert_eq!(
             plan_append(&segments, std::slice::from_ref(&nine)),
-            vec![(2, format!("{nine}\n"))]
+            vec![(2, format!("{nine}\n").into_bytes())]
         );
         let out = plan_append(&segments, &[eight.clone(), nine.clone()]);
         assert_eq!(
             out,
-            vec![(1, format!("{fill}\n{eight}\n")), (2, format!("{nine}\n"))]
+            vec![
+                (1, format!("{fill}\n{eight}\n").into_bytes()),
+                (2, format!("{nine}\n").into_bytes())
+            ]
         );
         assert!(out.iter().all(|(_, t)| t.len() <= SEGMENT_LIMIT));
     }
@@ -678,11 +718,11 @@ mod tests {
         let huge = "h".repeat(SEGMENT_LIMIT + 1);
         assert_eq!(
             plan_append(&[(1, seg(&["a"]))], &[huge.clone(), "b".into()]),
-            vec![(2, format!("{huge}\n")), (3, seg(&["b"]))]
+            vec![(2, format!("{huge}\n").into_bytes()), (3, seg(&["b"]))]
         );
         assert_eq!(
             plan_append(&[], std::slice::from_ref(&huge)),
-            vec![(1, format!("{huge}\n"))],
+            vec![(1, format!("{huge}\n").into_bytes())],
             "an empty segment takes it"
         );
     }

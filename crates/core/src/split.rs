@@ -66,15 +66,72 @@ impl<T: Ledger + Outbox> LocalLedger for T {}
 
 /// One file of a GitHub ledger as this machine last read it (GitHub ledger
 /// spec §3.3, §3.5 checks 3 and 4).
+///
+/// ⚠ Stored as JSON. Bytes that are valid UTF-8 — every file fl writes —
+/// are stored as the string `text`, exactly the shape a cache written
+/// before `bytes` existed holds, so such a cache reads back unchanged.
+/// Bytes that are not (a damaged line) are stored as `bytes`, an array of
+/// numbers, so they round-trip exactly: a lossy string would make two
+/// different damaged lines compare equal (check 4) and hand back data the
+/// ledger does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "CachedSegmentJson", try_from = "CachedSegmentJson")]
 pub struct CachedSegment {
     /// The blob's object id when it was read.
     pub oid: String,
-    /// The blob's text as read.
-    pub text: String,
+    /// The blob's bytes as read, exactly — never decoded.
+    pub bytes: Vec<u8>,
     /// Whether a later segment of its directory existed when it was read.
     /// ⚠ A closed segment never changes.
     pub closed: bool,
+}
+
+/// [`CachedSegment`] as stored: exactly one of `text` and `bytes`.
+#[derive(Serialize, Deserialize)]
+struct CachedSegmentJson {
+    oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes: Option<Vec<u8>>,
+    closed: bool,
+}
+
+impl From<CachedSegment> for CachedSegmentJson {
+    fn from(s: CachedSegment) -> Self {
+        let (text, bytes) = match String::from_utf8(s.bytes) {
+            Ok(text) => (Some(text), None),
+            Err(e) => (None, Some(e.into_bytes())),
+        };
+        CachedSegmentJson {
+            oid: s.oid,
+            text,
+            bytes,
+            closed: s.closed,
+        }
+    }
+}
+
+impl TryFrom<CachedSegmentJson> for CachedSegment {
+    type Error = String;
+
+    fn try_from(j: CachedSegmentJson) -> Result<Self, String> {
+        let bytes = match (j.text, j.bytes) {
+            (Some(text), None) => text.into_bytes(),
+            (None, Some(bytes)) => bytes,
+            _ => {
+                return Err(format!(
+                    "the cached copy of blob {} holds neither or both of `text` and `bytes`",
+                    j.oid
+                ));
+            }
+        };
+        Ok(CachedSegment {
+            oid: j.oid,
+            bytes,
+            closed: j.closed,
+        })
+    }
 }
 
 /// What this machine remembers of each repository's GitHub ledger, keyed
@@ -398,6 +455,49 @@ mod tests {
     use crate::ids::seq_iri;
     use crate::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
     use crate::store::{Catalog, Tracker};
+
+    // ⚠ The stored shape is additive: a cache written before `bytes`
+    // existed reads back, and a file fl wrote (always UTF-8) is still
+    // stored in exactly that shape.
+    #[test]
+    fn a_cached_segment_stores_utf8_as_text_exactly_as_before() {
+        let old = r#"{"oid":"o1","text":"{}\n","closed":false}"#;
+        let seg: CachedSegment = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            seg,
+            CachedSegment {
+                oid: "o1".into(),
+                bytes: b"{}\n".to_vec(),
+                closed: false,
+            }
+        );
+        assert_eq!(serde_json::to_string(&seg).unwrap(), old);
+    }
+
+    // ⚠ Bytes that are not UTF-8 round-trip exactly — never as a lossy
+    // string, under which two different damaged lines would compare equal.
+    #[test]
+    fn a_cached_segment_keeps_bytes_that_are_not_utf8_exactly() {
+        let seg = CachedSegment {
+            oid: "o1".into(),
+            bytes: vec![b'a', b'\n', 0xff, b'\n'],
+            closed: true,
+        };
+        let json = serde_json::to_string(&seg).unwrap();
+        assert_eq!(json, r#"{"oid":"o1","bytes":[97,10,255,10],"closed":true}"#);
+        assert_eq!(serde_json::from_str::<CachedSegment>(&json).unwrap(), seg);
+    }
+
+    #[test]
+    fn a_cached_segment_with_neither_or_both_contents_is_refused() {
+        for json in [
+            r#"{"oid":"o1","closed":false}"#,
+            r#"{"oid":"o1","text":"a\n","bytes":[97,10],"closed":false}"#,
+        ] {
+            let err = serde_json::from_str::<CachedSegment>(json).unwrap_err();
+            assert!(err.to_string().contains("neither or both"), "{json}: {err}");
+        }
+    }
 
     /// A project with one gate and one record, with no cut-over recorded.
     fn bare_world() -> (MemStore, ProjectId, GateId, RecordId) {

@@ -155,7 +155,7 @@ const ALL_ROLES_CASES: usize = 7;
 /// How many cases [`local_handles`] runs. Update deliberately — see [`run_suite`].
 const LOCAL_HANDLES_CASES: usize = 1;
 /// How many cases [`ledger_cache`] runs. Update deliberately — see [`run_suite`].
-const LEDGER_CACHE_CASES: usize = 5;
+const LEDGER_CACHE_CASES: usize = 6;
 
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -260,6 +260,7 @@ pub fn ledger_cache<S: LedgerCache, G>(make: impl Fn() -> (S, G)) {
         a_segment_at_the_same_path_in_another_repository_is_never_returned::<S>,
         cached_under_scans_from_the_directory_not_from_the_start_of_the_repository::<S>,
         remember_commits_the_head_and_every_segment_together::<S>,
+        a_cached_file_keeps_bytes_that_are_not_utf8_exactly::<S>,
     ];
     run_suite("ledger-cache", LEDGER_CACHE_CASES, cases, make);
 }
@@ -275,7 +276,7 @@ fn the_last_head_is_kept_per_repository_and_replaced<S: LedgerCache>(s: &S) {
 fn a_cached_file_reads_back_by_path_and_by_its_own_directory_only<S: LedgerCache>(s: &S) {
     let seg = |oid: &str, closed: bool| CachedSegment {
         oid: oid.into(),
-        text: format!("{oid}\n"),
+        bytes: format!("{oid}\n").into_bytes(),
         closed,
     };
     assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), None);
@@ -323,7 +324,7 @@ fn a_cached_file_reads_back_by_path_and_by_its_own_directory_only<S: LedgerCache
 fn a_segment_at_the_same_path_in_another_repository_is_never_returned<S: LedgerCache>(s: &S) {
     let seg = |oid: &str| CachedSegment {
         oid: oid.into(),
-        text: format!("{oid}\n"),
+        bytes: format!("{oid}\n").into_bytes(),
         closed: false,
     };
     s.cache("R_1", "runs/aa/1.jsonl", &seg("o1")).unwrap();
@@ -358,7 +359,7 @@ fn cached_under_scans_from_the_directory_not_from_the_start_of_the_repository<S:
 ) {
     let seg = |oid: &str| CachedSegment {
         oid: oid.into(),
-        text: format!("{oid}\n"),
+        bytes: format!("{oid}\n").into_bytes(),
         closed: false,
     };
     s.cache("R_1", "format", &seg("meta")).unwrap();
@@ -401,7 +402,7 @@ fn cached_under_scans_from_the_directory_not_from_the_start_of_the_repository<S:
 fn remember_commits_the_head_and_every_segment_together<S: LedgerCache>(s: &S) {
     let seg = |oid: &str, closed: bool| CachedSegment {
         oid: oid.into(),
-        text: format!("{oid}\n"),
+        bytes: format!("{oid}\n").into_bytes(),
         closed,
     };
     assert_eq!(s.last_head("R_1").unwrap(), None);
@@ -448,6 +449,34 @@ fn remember_commits_the_head_and_every_segment_together<S: LedgerCache>(s: &S) {
     assert_eq!(
         s.cached("R_1", "runs/aa/2.jsonl").unwrap(),
         Some(seg("r2", true))
+    );
+}
+
+/// ⚠ A file is cached as the bytes GitHub sent, exactly — through `cache`
+/// and through `remember` alike. A store that keeps text would have to
+/// decode a damaged line lossily, and two different damaged lines would
+/// then compare equal (check 4).
+fn a_cached_file_keeps_bytes_that_are_not_utf8_exactly<S: LedgerCache>(s: &S) {
+    let seg = |oid: &str, bytes: &[u8]| CachedSegment {
+        oid: oid.into(),
+        bytes: bytes.to_vec(),
+        closed: false,
+    };
+    let one = seg("o1", &[b'a', b'\n', 0xff, b'\n']);
+    let two = seg("o2", &[0xfe, b'\n']);
+    s.cache("R_1", "runs/aa/1.jsonl", &one).unwrap();
+    s.remember("R_1", "c1", &[("runs/aa/2.jsonl".to_string(), two.clone())])
+        .unwrap();
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(one.clone())
+    );
+    assert_eq!(
+        s.cached_under("R_1", "runs/aa").unwrap(),
+        vec![
+            ("runs/aa/1.jsonl".to_string(), one),
+            ("runs/aa/2.jsonl".to_string(), two),
+        ]
     );
 }
 

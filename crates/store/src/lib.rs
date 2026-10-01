@@ -2117,7 +2117,7 @@ mod tests {
         let path = dir.path().join("t.redb");
         let seg = CachedSegment {
             oid: "o1".into(),
-            text: "{}\n".into(),
+            bytes: b"{}\n".to_vec(),
             closed: false,
         };
         {
@@ -2128,6 +2128,37 @@ mod tests {
         let s = RedbStore::open(&path).unwrap();
         assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c1"));
         assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), Some(seg));
+    }
+
+    // ⚠ A ledger cache written before `CachedSegment` held bytes (its
+    // `text` a JSON string) reads back unchanged: the change is additive,
+    // nothing to migrate or download again.
+    #[test]
+    fn a_ledger_cache_row_written_as_text_still_reads() {
+        use fl_core::split::{CachedSegment, LedgerCache};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            let tx = s.db.begin_write().unwrap();
+            tx.open_table(LEDGER_SEGMENTS)
+                .unwrap()
+                .insert(
+                    ("R_1", "runs/aa/1.jsonl"),
+                    r#"{"oid":"o1","text":"{}\n","closed":true}"#,
+                )
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(
+            s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+            Some(CachedSegment {
+                oid: "o1".into(),
+                bytes: b"{}\n".to_vec(),
+                closed: true,
+            })
+        );
     }
 
     use crate::manifest::{LedgerRoot, Manifest, ManifestError, content_sha256};

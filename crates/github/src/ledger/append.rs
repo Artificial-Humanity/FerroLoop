@@ -155,7 +155,7 @@ impl GithubLedger<'_> {
         let mut why: Vec<String> = Vec::new();
         for _ in 0..TRIES {
             let snap = self.snapshot(&wanted)?;
-            let mut writes: Vec<(String, String)> = Vec::new();
+            let mut writes: Vec<(String, Vec<u8>)> = Vec::new();
             for (area, dir, lines) in dirs {
                 let present: BTreeSet<Iri> = self
                     .lines(&snap, *area, dir)?
@@ -167,13 +167,13 @@ impl GithubLedger<'_> {
                     .filter(|l| !present.contains(&l.id))
                     .map(|l| l.text.clone())
                     .collect();
-                let segments: Vec<(u64, String)> = snap
+                let segments: Vec<(u64, Vec<u8>)> = snap
                     .dirs
                     .get(dir)
                     .map(|segs| {
                         segs.iter()
                             .enumerate()
-                            .map(|(i, s)| ((i + 1) as u64, s.text.clone()))
+                            .map(|(i, s)| ((i + 1) as u64, s.bytes.clone()))
                             .collect()
                     })
                     .unwrap_or_default();
@@ -187,14 +187,14 @@ impl GithubLedger<'_> {
                     .into_iter()
                     .map(|q| q.id)
                     .collect();
-                let mut text = snap.quarantine.clone();
-                let before = text.len();
+                let mut bytes = snap.quarantine.clone();
+                let before = bytes.len();
                 for l in quarantine.iter().filter(|l| !present.contains(&l.id)) {
-                    text.push_str(&l.text);
-                    text.push('\n');
+                    bytes.extend_from_slice(l.text.as_bytes());
+                    bytes.push(b'\n');
                 }
-                if text.len() != before {
-                    writes.push((QUARANTINE_FILE.to_string(), text));
+                if bytes.len() != before {
+                    writes.push((QUARANTINE_FILE.to_string(), bytes));
                 }
             }
             if writes.is_empty() {
@@ -240,12 +240,12 @@ impl GithubLedger<'_> {
     fn commit(
         &self,
         head: &str,
-        writes: &[(String, String)],
+        writes: &[(String, Vec<u8>)],
         headline: &str,
     ) -> Result<Landed, StoreError> {
         let additions: Vec<Value> = writes
             .iter()
-            .map(|(path, text)| json!({"path": path, "contents": STANDARD.encode(text.as_bytes())}))
+            .map(|(path, bytes)| json!({"path": path, "contents": STANDARD.encode(bytes)}))
             .collect();
         let input = json!({
             "branch": {"repositoryNameWithOwner": self.repo.full_name, "branchName": BRANCH},
@@ -627,7 +627,10 @@ mod tests {
             .unwrap();
         let segs = files_under(&fake, &runs_dir());
         assert_eq!(segs.len(), 2, "`b` rolled into a second segment");
-        let lines: usize = segs.iter().map(|(_, t)| layout::lines(t).len()).sum();
+        let lines: usize = segs
+            .iter()
+            .map(|(_, t)| layout::lines(t.as_bytes()).len())
+            .sum();
         assert_eq!(lines, 3, "the filler, `a` and `b`, each once");
         assert_eq!(
             fake.ledger_commits(),

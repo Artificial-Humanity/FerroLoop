@@ -32,18 +32,15 @@ pub(crate) struct Entry {
 /// What `mode` says an entry is, when `is_blob` and it is not an ordinary
 /// file. A `tree` (directory) entry is never irregular here — `directory`
 /// judges those separately, by name, the same way it always has.
-fn irregular_of(is_blob: bool, mode: Option<i64>) -> Option<&'static str> {
+fn irregular_of(is_blob: bool, mode: i64) -> Option<&'static str> {
     if !is_blob {
         return None;
     }
     match mode {
-        // ⚠ Absent: an older fixture (or a GraphQL answer this fake does
-        // not model byte-for-byte) names no mode at all — assumed
-        // regular, never irregular by omission.
-        None | Some(0o100644) => None,
-        Some(0o120000) => Some("a symlink"),
-        Some(0o100755) => Some("an executable"),
-        Some(_) => Some("an entry of a kind fl does not write"),
+        0o100644 => None,
+        0o120000 => Some("a symlink"),
+        0o100755 => Some("an executable"),
+        _ => Some("an entry of a kind fl does not write"),
     }
 }
 
@@ -68,7 +65,9 @@ pub(crate) struct TreeFile {
 /// ⚠ Modelled: `mode` on a `TreeEntry` is requested so `directory` can
 /// tell a symlink or an executable from an ordinary file — GitHub's REST
 /// tree listing already sends it as a string (`tree_files` above), but
-/// unmeasured here: no live test confirms GraphQL sends the same shape.
+/// unmeasured here: no live test confirms GraphQL sends it, as an `Int`
+/// whose value is the octal mode (`0o100644`). An entry without one is
+/// refused (`parse_object`), never taken for an ordinary file.
 const OBJECT_FIELDS: &str =
     "__typename ... on Tree { entries { name oid type mode } } ... on Blob { oid }";
 
@@ -213,12 +212,13 @@ impl GithubLedger<'_> {
         }
     }
 
-    /// A blob's raw bytes, downloaded. Never decoded here: `verify`'s
-    /// growth comparison needs the exact bytes, because
+    /// A blob's raw bytes, downloaded. Never decoded here — by readers or by
+    /// `verify`: the growth comparison needs the exact bytes, because
     /// `String::from_utf8_lossy` would let two DIFFERENT invalid byte
     /// sequences decode to the identical string (every bad byte collapses
     /// to the same U+FFFD) — a false equality a byte-level check must
-    /// never be fooled by.
+    /// never be fooled by. A reader decodes each LINE strictly
+    /// (`layout::lines`), so one damaged line is unreadable on its own.
     pub(crate) fn blob_bytes(&self, oid: &str) -> Result<Vec<u8>, StoreError> {
         let r = self
             .client
@@ -243,16 +243,6 @@ impl GithubLedger<'_> {
                 "GitHub answered ledger blob {oid} with content that is not base64 ({e})"
             ))
         })
-    }
-
-    /// A blob's text, downloaded — LOSSY: bytes that are not UTF-8 become
-    /// U+FFFD. Fine for a reader: it decodes each LINE strictly afterwards
-    /// (`layout::decode`/`QuarantineLine::decode`), so one damaged line
-    /// fails there, named, without blocking its siblings or the file-level
-    /// growth check this feeds. Never used for `verify`'s own byte-level
-    /// comparison, which calls `blob_bytes` directly instead.
-    pub(crate) fn blob_text(&self, oid: &str) -> Result<String, StoreError> {
-        Ok(String::from_utf8_lossy(&self.blob_bytes(oid)?).into_owned())
     }
 
     /// A ledger commit: its tree and its parents.
@@ -416,12 +406,21 @@ fn parse_object(v: &Value, path: &str) -> Result<Option<Object>, StoreError> {
                         "GitHub answered an entry of `{path}` with no name or no id"
                     )));
                 };
+                // ⚠ Fail closed: an entry with no mode is refused, never
+                // assumed an ordinary file — a symlink or an executable
+                // named like a segment would pass as one.
+                let Some(mode) = e["mode"].as_i64() else {
+                    return Err(backend(format!(
+                        "GitHub answered the entry `{path}/{name}` of the ledger branch with no \
+                         mode, so fl cannot tell an ordinary file from a symlink or an executable"
+                    )));
+                };
                 let is_blob = e["type"].as_str() == Some("blob");
                 out.push(Entry {
                     name: name.to_string(),
                     oid: oid.to_string(),
                     is_blob,
-                    irregular: irregular_of(is_blob, e["mode"].as_i64()),
+                    irregular: irregular_of(is_blob, mode),
                 });
             }
             Ok(Some(Object::Tree(out)))
@@ -491,12 +490,12 @@ mod tests {
     }
 
     #[test]
-    fn blob_text_treats_a_server_error_as_an_error() {
+    fn blob_bytes_treats_a_server_error_as_an_error() {
         let fake = FakeGithub::start("acme/widgets");
         let local = MemStore::default();
         let c = client(&fake);
         fake.state().html_502_next = true;
-        let err = open(&c, &local).blob_text("deadbeef").unwrap_err();
+        let err = open(&c, &local).blob_bytes("deadbeef").unwrap_err();
         assert!(err.to_string().contains("502"), "{err}");
     }
 
@@ -544,18 +543,18 @@ mod tests {
     }
 
     #[test]
-    fn blob_text_refuses_a_200_with_no_content() {
+    fn blob_bytes_refuses_a_200_with_no_content() {
         let fake = FakeGithub::start("acme/widgets");
         let oid = fake.state().git.put_blob("x");
         let local = MemStore::default();
         let c = client(&fake);
         body_next(&fake, "/git/blobs/", 200, json!({"sha": oid}));
-        let err = open(&c, &local).blob_text(&oid).unwrap_err();
+        let err = open(&c, &local).blob_bytes(&oid).unwrap_err();
         assert!(err.to_string().contains("no content"), "{err}");
     }
 
     #[test]
-    fn blob_text_refuses_content_that_is_not_base64() {
+    fn blob_bytes_refuses_content_that_is_not_base64() {
         let fake = FakeGithub::start("acme/widgets");
         let oid = fake.state().git.put_blob("x");
         let local = MemStore::default();
@@ -566,7 +565,7 @@ mod tests {
             200,
             json!({"content": "not base64 !!!"}),
         );
-        let err = open(&c, &local).blob_text(&oid).unwrap_err();
+        let err = open(&c, &local).blob_bytes(&oid).unwrap_err();
         assert!(err.to_string().contains("not base64"), "{err}");
     }
 
@@ -589,25 +588,6 @@ mod tests {
         );
         let bytes = open(&c, &local).blob_bytes(&oid).unwrap();
         assert_eq!(bytes, vec![0x80]);
-    }
-
-    // `blob_text`, by contrast, is lossy on purpose: a reader decodes each
-    // LINE strictly afterwards, so a damaged line fails there, named,
-    // without blocking its siblings.
-    #[test]
-    fn blob_text_is_lossy() {
-        let fake = FakeGithub::start("acme/widgets");
-        let oid = fake.state().git.put_blob("x");
-        let local = MemStore::default();
-        let c = client(&fake);
-        body_next(
-            &fake,
-            "/git/blobs/",
-            200,
-            json!({"content": STANDARD.encode([0x80])}),
-        );
-        let text = open(&c, &local).blob_text(&oid).unwrap();
-        assert_eq!(text, "\u{FFFD}");
     }
 
     // ⚠ A 502 must not read as "no parents" (an orphan's meaning) — the two
@@ -782,6 +762,35 @@ mod tests {
             .objects(&head, &["runs/k".to_string()])
             .unwrap_err();
         assert!(err.to_string().contains("no name or no id"), "{err}");
+    }
+
+    // ⚠ Fail closed: an entry GraphQL answers with no mode is refused,
+    // named — never assumed to be an ordinary file, which a symlink or an
+    // executable named like a segment would then pass as.
+    #[test]
+    fn objects_refuses_a_tree_entry_with_no_mode() {
+        let fake = FakeGithub::start("acme/widgets");
+        let head = fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(
+            &fake,
+            "/graphql",
+            200,
+            json!({"data": {"repository": {
+                "head": {"oid": head},
+                "e0": {
+                    "__typename": "Tree",
+                    "entries": [{"name": "1.jsonl", "oid": "a".repeat(40), "type": "blob"}],
+                },
+            }}}),
+        );
+        let err = open(&c, &local)
+            .objects(&head, &["runs/k".to_string()])
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("`runs/k/1.jsonl`"), "{msg}");
+        assert!(msg.contains("no mode"), "{msg}");
     }
 
     // I3 (fix round 3): GraphQL's tree entries carry a mode too — a

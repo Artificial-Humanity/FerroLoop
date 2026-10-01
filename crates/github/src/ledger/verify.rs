@@ -341,7 +341,7 @@ impl GithubLedger<'_> {
             .dirs
             .get(&dir)
             .and_then(|segs| segs.iter().find(|s| s.path == file))
-            .map(|s| layout::lines(&s.text).len() as u64);
+            .map(|s| layout::lines(&s.bytes).len() as u64);
         match held {
             None => {
                 return Err(refuse(format!(
@@ -388,7 +388,7 @@ mod tests {
     use fl_core::conformance::{sample_decision, sample_record_run};
     use fl_core::ids::{GateId, RecordId, seq_iri};
     use fl_core::log::GateRun;
-    use fl_core::split::{Batch, RemoteLedger};
+    use fl_core::split::{Batch, LedgerCache, RemoteLedger};
     use fl_core::store::Bindings;
     use serde_json::{Value, json};
     use std::time::Duration;
@@ -909,8 +909,24 @@ mod tests {
         let c = client(&fake);
         let l = open(&c, &local);
         // The one bad line fails the whole decode, exactly as "not json"
-        // already does (an existing, unrelated behaviour, unchanged here).
-        assert!(l.runs(&gate()).is_err());
+        // already does — as `Unreadable`, for line 2 alone.
+        let err = l.runs(&gate()).unwrap_err();
+        match &err {
+            StoreError::Ledger(LedgerFault::Unreadable {
+                file: f,
+                line: n,
+                cause,
+                ..
+            }) => {
+                assert_eq!((f.as_str(), *n), (seg(1).as_str(), 2));
+                assert!(cause.contains("not valid UTF-8"), "{cause}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // ⚠ Cached as the bytes GitHub sent — never as lossy text, which
+        // `quarantine` (and every later read) would then work from.
+        let cached = local.cached("R_1", &seg(1)).unwrap().expect("cached");
+        assert_eq!(cached.bytes, raw);
         let committed = l
             .quarantine(
                 &seq_iri(60),
@@ -1015,7 +1031,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            layout::lines(&fake.ledger_files()[QUARANTINE_FILE]).len(),
+            layout::lines(fake.ledger_files()[QUARANTINE_FILE].as_bytes()).len(),
             1
         );
     }

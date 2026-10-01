@@ -627,7 +627,7 @@ fn object_at(git: &Git, expression: &str) -> Value {
             Some((dir, _)) => {
                 entries.entry(dir.to_string()).or_insert_with(|| {
                     json!({
-                        "name": dir, "type": "tree",
+                        "name": dir, "type": "tree", "mode": 0o040000,
                         "oid": object_id(&["subtree", commit, &format!("{prefix}{dir}")]),
                     })
                 });
@@ -635,7 +635,7 @@ fn object_at(git: &Git, expression: &str) -> Value {
             None => {
                 entries.insert(
                     rest.to_string(),
-                    json!({"name": rest, "oid": blob, "type": "blob"}),
+                    json!({"name": rest, "oid": blob, "type": "blob", "mode": 0o100644}),
                 );
             }
         }
@@ -1364,6 +1364,9 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["1.jsonl", "2.jsonl"]);
         assert_eq!(repo["e2"]["entries"][0]["type"], "tree");
+        // GraphQL's `TreeEntry.mode` is an `Int`: the octal mode's value.
+        assert_eq!(repo["e1"]["entries"][0]["mode"], 0o100644);
+        assert_eq!(repo["e2"]["entries"][0]["mode"], 0o040000);
         assert!(repo["e3"].is_null());
     }
 
