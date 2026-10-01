@@ -362,22 +362,19 @@ fn tracker_name(t: Option<&config::TrackerBinding>) -> String {
     }
 }
 
-/// The tracker for a command that reads or writes records or findings, and
-/// works on the store at `chosen` (Final review, item 1).
+/// The one tracker every config entry bound to `chosen`'s store agrees on
+/// (`None` if none binds one), refusing when they disagree.
 ///
-/// ⚠ The binding is taken from the config entries whose `store` IS `chosen`
-/// — the store holds the node binding and the catalog GitHub is paired with
-/// — and entries naming the same store with different trackers are refused.
-/// And when `chosen` is not the store of `here` (the current directory's
-/// entry, if any) and EITHER side is bound to GitHub, the command is
-/// refused: the store's own project could then be written through the
-/// wrong tracker, or this directory's GitHub tracker paired with another
-/// project's store. Unbound projects on both sides pass exactly as before.
-fn tracker_for(
+/// ⚠ Shared by every caller that trusts a config entry's tracker for a
+/// store it did not itself pick by root alone: `tracker_for`, for the
+/// tracker commands, and `manifest export`'s ledger-root binding (whole-
+/// branch review finding 4) — a store bound to more than one tracker in
+/// the config is exactly the config state in which trusting any one
+/// entry's tracker for that store can attribute an item, or a ledger
+/// root, to the wrong repository.
+fn store_tracker(
     chosen: &Path,
-    here: Option<&config::Entry>,
     entries: &[config::Entry],
-    explicit: bool,
 ) -> Result<Option<config::TrackerBinding>> {
     let owners: Vec<&config::Entry> = entries
         .iter()
@@ -407,10 +404,35 @@ fn tracker_for(
             chosen.display()
         );
     }
-    let store_side = trackers.first().copied().flatten();
+    Ok(trackers.first().copied().flatten().cloned())
+}
+
+/// The tracker for a command that reads or writes records or findings, and
+/// works on the store at `chosen` (Final review, item 1).
+///
+/// ⚠ The binding is taken from the config entries whose `store` IS `chosen`
+/// — the store holds the node binding and the catalog GitHub is paired with
+/// — and entries naming the same store with different trackers are refused
+/// ([`store_tracker`]). And when `chosen` is not the store of `here` (the
+/// current directory's entry, if any) and EITHER side is bound to GitHub,
+/// the command is refused: the store's own project could then be written
+/// through the wrong tracker, or this directory's GitHub tracker paired
+/// with another project's store. Unbound projects on both sides pass
+/// exactly as before.
+fn tracker_for(
+    chosen: &Path,
+    here: Option<&config::Entry>,
+    entries: &[config::Entry],
+    explicit: bool,
+) -> Result<Option<config::TrackerBinding>> {
+    let store_side = store_tracker(chosen, entries)?;
     let here_is_chosen = here.is_some_and(|e| same_store(&e.store, chosen));
     let here_side = here.and_then(|e| e.tracker.as_ref());
     if !here_is_chosen && (store_side.is_some() || here_side.is_some()) {
+        let owners: Vec<&config::Entry> = entries
+            .iter()
+            .filter(|e| same_store(&e.store, chosen))
+            .collect();
         let theirs = if owners.is_empty() {
             "no project in the config".to_string()
         } else {
@@ -421,7 +443,7 @@ fn tracker_for(
                 .join(", ");
             format!(
                 "the project at {roots}, whose tracker is {}",
-                tracker_name(store_side)
+                tracker_name(store_side.as_ref())
             )
         };
         let ours = match here {
@@ -446,7 +468,7 @@ fn tracker_for(
             chosen.display()
         );
     }
-    Ok(store_side.cloned())
+    Ok(store_side)
 }
 
 fn main() {
@@ -587,6 +609,18 @@ fn run(cli: Cli) -> Result<i32> {
     let manifest_binding = if !entry_read || path != bound {
         cmd::manifest::Binding::Unread
     } else {
+        // ⚠⚠ Whole-branch review finding 4: `manifest` never asks for a
+        // tracker (`needs_tracker` is false), so `tracker_for`'s
+        // one-tracker-per-store check never runs for it — unlike `record`,
+        // `finding`, `attempt`, `check --record` and `fl github`. Once the
+        // store holds a ledger root, trusting `here_binding` without that
+        // check could write one repository's root into another project's
+        // manifest, from a config where two entries share this store but
+        // disagree on its tracker. Run the same check, and refuse the same
+        // way, before trusting it.
+        if store.holds_a_ledger_root()? {
+            store_tracker(&path, entries)?;
+        }
         match &here_binding {
             Some(t) => cmd::manifest::Binding::Github(t.github.clone()),
             None => cmd::manifest::Binding::Local,

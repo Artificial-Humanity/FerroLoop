@@ -688,3 +688,80 @@ fn an_export_of_a_project_in_another_projects_store_is_refused_when_that_store_h
         "nothing was written"
     );
 }
+
+// Whole-branch review, finding 4: `manifest` never asks for a tracker
+// (unlike `record`, `finding`, `attempt`, `check --record` or `fl github`),
+// so the one-store-one-tracker check those commands run never ran for it
+// either — `manifest export` trusted the current directory's config entry
+// outright. With an inconsistent config, two entries sharing one store but
+// naming different trackers, that could write one repository's ledger root
+// into another project's manifest. Once the store holds a root, export must
+// refuse exactly as a tracker command would.
+#[test]
+fn an_export_from_a_store_bound_to_two_trackers_in_the_config_is_refused() {
+    let m = Machine::new();
+    let r = repo();
+    let other_repo = repo();
+    let db = m.data.path().join("shared.redb");
+    std::fs::create_dir_all(m.config.path().join("fl")).unwrap();
+    std::fs::write(
+        m.config.path().join("fl/config.toml"),
+        format!(
+            "[[project]]\nroot = \"{}\"\nstore = \"{}\"\ntracker = {{ github = \"acme/widgets\", credential = \"env\" }}\n\n[[project]]\nroot = \"{}\"\nstore = \"{}\"\ntracker = {{ github = \"acme/gadgets\", credential = \"env\" }}\n",
+            r.path().canonicalize().unwrap().display(),
+            db.display(),
+            other_repo.path().canonicalize().unwrap().display(),
+            db.display(),
+        ),
+    )
+    .unwrap();
+    m.fl(r.path())
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    with_ledger_root(&db, "acme/widgets", "R_1", "abc123");
+
+    m.fl(r.path())
+        .args(["manifest", "export", "--project", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("bound to more than one tracker"));
+    assert!(
+        !r.path().join(".fl/manifest.json").exists(),
+        "nothing was written"
+    );
+}
+
+// The same inconsistency, but the store holds no ledger root yet: nothing
+// an export writes can be attributed to the wrong repository, so the
+// ambiguity check must not fire here — only a tracker command would need
+// to know which tracker is right, and `manifest` does not ask for one.
+#[test]
+fn an_export_from_a_store_bound_to_two_trackers_but_with_no_ledger_root_still_exports() {
+    let m = Machine::new();
+    let r = repo();
+    let other_repo = repo();
+    let db = m.data.path().join("shared.redb");
+    std::fs::create_dir_all(m.config.path().join("fl")).unwrap();
+    std::fs::write(
+        m.config.path().join("fl/config.toml"),
+        format!(
+            "[[project]]\nroot = \"{}\"\nstore = \"{}\"\ntracker = {{ github = \"acme/widgets\", credential = \"env\" }}\n\n[[project]]\nroot = \"{}\"\nstore = \"{}\"\ntracker = {{ github = \"acme/gadgets\", credential = \"env\" }}\n",
+            r.path().canonicalize().unwrap().display(),
+            db.display(),
+            other_repo.path().canonicalize().unwrap().display(),
+            db.display(),
+        ),
+    )
+    .unwrap();
+    m.fl(r.path())
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+
+    m.fl(r.path())
+        .args(["manifest", "export", "--project", "1"])
+        .assert()
+        .success();
+    assert!(r.path().join(".fl/manifest.json").exists());
+}
