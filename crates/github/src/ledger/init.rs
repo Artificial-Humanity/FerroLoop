@@ -884,14 +884,17 @@ mod tests {
         for part in [
             "detection-only",
             "gh api --method POST repos/acme/widgets/rulesets",
+            "recommended where the plan offers rulesets",
             "default branch",
             "Contents: read and write",
             "Issues: read and write",
             "Metadata: read",
+            "kept locally with a repeated error",
             "made public",
         ] {
             assert!(all.contains(part), "{part}: {all}");
         }
+        assert!(!all.contains("a warning"), "{all}");
         let protected = guidance("acme/widgets", &Mode::Protected).join("\n");
         assert!(protected.contains("protected"), "{protected}");
         assert!(
