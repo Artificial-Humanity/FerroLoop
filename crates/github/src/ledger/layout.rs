@@ -399,6 +399,10 @@ mod tests {
             "runs/abc/1.jsonl".to_string(),
             format!("runs/{}/1.jsonl", k.to_uppercase()),
             format!("runs/{k}/x/1.jsonl"),
+            // A valid area, key and segment number, with one extra
+            // component after: fails only the trailing-component guard,
+            // not any earlier check.
+            format!("runs/{k}/1.jsonl/x"),
             QUARANTINE_FILE.to_string(),
             FORMAT_FILE.to_string(),
         ] {
