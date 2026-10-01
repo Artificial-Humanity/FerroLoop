@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(a.status, 403);
         assert_eq!(a.needs.as_deref(), Some("contents=write"));
         assert!(a.message.is_some(), "{a:?}");
-        fake.state().body_next = Some((
+        fake.state().body_next.push((
             "/graphql".into(),
             422,
             serde_json::json!({"message": "Unprocessable"}),

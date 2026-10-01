@@ -41,6 +41,7 @@ impl std::fmt::Display for Note {
 
 /// One segment of a directory, read and checked. Segments are numbered
 /// from 1 with no gap, so a directory's `n`th is at index `n - 1`.
+#[derive(Debug)]
 pub(crate) struct Segment {
     pub path: String,
     pub text: String,
@@ -280,7 +281,7 @@ impl GithubLedger<'_> {
             // always equivalent to the plain prefix check it replaces,
             // since `c.text` is only ever cached below when it is itself
             // empty or newline-terminated.
-            if !layout::grows_only(&c.text, &text) {
+            if !layout::grows_only(c.text.as_bytes(), text.as_bytes()) {
                 return Err(self.altered(
                     path,
                     "no longer starts with the copy this machine read before",
@@ -327,6 +328,16 @@ impl GithubLedger<'_> {
         };
         let mut numbered: BTreeMap<u64, (String, String)> = BTreeMap::new();
         for e in &entries {
+            // ⚠ Checked before the segment-name check: a symlink or an
+            // executable named like a segment (`1.jsonl`) would otherwise
+            // pass that check and be read as ordinary text.
+            if let Some(kind) = e.irregular {
+                return Err(self.altered(
+                    &format!("{dir}/{}", e.name),
+                    format!("is {kind}, which fl never writes"),
+                    head,
+                ));
+            }
             let n = if e.is_blob {
                 layout::segment_number(&e.name)
             } else {
@@ -525,6 +536,7 @@ impl GithubLedger<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::git::Entry;
     use super::*;
     use crate::client::Client;
     use crate::creds::EnvToken;
@@ -585,7 +597,7 @@ mod tests {
     /// The next request whose URL contains `frag` answers `status`/`body`
     /// instead, once.
     fn body_next(fake: &FakeGithub, frag: &str, status: u16, body: Value) {
-        fake.state().body_next = Some((frag.into(), status, body));
+        fake.state().body_next.push((frag.into(), status, body));
     }
 
     /// A commit on the fake's ledger that only this test reads: what it holds
@@ -1647,6 +1659,40 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    // I3 (fix round 3): a symlink or an executable named like a segment
+    // (`1.jsonl`) must never be read as ordinary text — `directory` checks
+    // `Entry::irregular` before it ever asks whether the name looks like a
+    // segment.
+    #[test]
+    fn a_segment_shaped_symlink_is_reported_as_altered() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let entries = vec![Entry {
+            name: "1.jsonl".into(),
+            oid: "a".repeat(40),
+            is_blob: true,
+            irregular: Some("a symlink"),
+        }];
+        let mut pending = Vec::new();
+        let err = l
+            .directory(
+                "deadbeef",
+                &runs_dir(),
+                Some(&Object::Tree(entries)),
+                &mut pending,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::Altered { ref what, .. })
+                    if what.contains("a symlink")
+            ),
+            "{err:?}"
+        );
     }
 
     // ⚠ Spec §3.5 check 4, extended: a cut-short copy must never become the

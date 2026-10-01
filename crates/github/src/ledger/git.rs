@@ -23,6 +23,28 @@ pub(crate) struct Entry {
     pub name: String,
     pub oid: String,
     pub is_blob: bool,
+    /// `None`: an ordinary file (mode `100644`) or a directory. `Some`:
+    /// what GitHub says it is instead — a symlink or an executable — fl
+    /// never writes one.
+    pub irregular: Option<&'static str>,
+}
+
+/// What `mode` says an entry is, when `is_blob` and it is not an ordinary
+/// file. A `tree` (directory) entry is never irregular here — `directory`
+/// judges those separately, by name, the same way it always has.
+fn irregular_of(is_blob: bool, mode: Option<i64>) -> Option<&'static str> {
+    if !is_blob {
+        return None;
+    }
+    match mode {
+        // ⚠ Absent: an older fixture (or a GraphQL answer this fake does
+        // not model byte-for-byte) names no mode at all — assumed
+        // regular, never irregular by omission.
+        None | Some(0o100644) => None,
+        Some(0o120000) => Some("a symlink"),
+        Some(0o100755) => Some("an executable"),
+        Some(_) => Some("an entry of a kind fl does not write"),
+    }
 }
 
 /// A commit as the ledger walks it.
@@ -33,8 +55,22 @@ pub(crate) struct CommitObject {
     pub parents: Vec<String>,
 }
 
+/// One file `tree_files` found, with whatever kind GitHub says it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeFile {
+    pub oid: String,
+    /// `None`: an ordinary file (a blob, mode `100644`). `Some(name)`:
+    /// what it actually is instead — fl never writes one, so `verify`
+    /// reports the commit that introduces it as a departure.
+    pub irregular: Option<&'static str>,
+}
+
+/// ⚠ Modelled: `mode` on a `TreeEntry` is requested so `directory` can
+/// tell a symlink or an executable from an ordinary file — GitHub's REST
+/// tree listing already sends it as a string (`tree_files` above), but
+/// unmeasured here: no live test confirms GraphQL sends the same shape.
 const OBJECT_FIELDS: &str =
-    "__typename ... on Tree { entries { name oid type } } ... on Blob { oid }";
+    "__typename ... on Tree { entries { name oid type mode } } ... on Blob { oid }";
 
 /// ⚠ Modelled: `Commit.blame(path:)` names the commit that last changed
 /// each range of lines. Confirmed by live test
@@ -177,15 +213,13 @@ impl GithubLedger<'_> {
         }
     }
 
-    /// A blob's text, downloaded.
-    ///
-    /// ⚠ Strict, never lossy: `from_utf8_lossy` would let two DIFFERENT
-    /// invalid byte sequences decode to the identical string (every bad
-    /// byte collapses to the same U+FFFD), so a byte-level check —
-    /// `verify`'s own growth comparison among them — could compare two
-    /// blobs that are not actually equal as though they were. A blob that
-    /// is not valid UTF-8 is refused outright, naming it.
-    pub(crate) fn blob_text(&self, oid: &str) -> Result<String, StoreError> {
+    /// A blob's raw bytes, downloaded. Never decoded here: `verify`'s
+    /// growth comparison needs the exact bytes, because
+    /// `String::from_utf8_lossy` would let two DIFFERENT invalid byte
+    /// sequences decode to the identical string (every bad byte collapses
+    /// to the same U+FFFD) — a false equality a byte-level check must
+    /// never be fooled by.
+    pub(crate) fn blob_bytes(&self, oid: &str) -> Result<Vec<u8>, StoreError> {
         let r = self
             .client
             .send(Method::Get, &self.path(&format!("/git/blobs/{oid}")), None)?;
@@ -204,16 +238,21 @@ impl GithubLedger<'_> {
             .chars()
             .filter(|c| !c.is_ascii_whitespace())
             .collect();
-        let bytes = STANDARD.decode(content).map_err(|e| {
+        STANDARD.decode(content).map_err(|e| {
             backend(format!(
                 "GitHub answered ledger blob {oid} with content that is not base64 ({e})"
             ))
-        })?;
-        String::from_utf8(bytes).map_err(|e| {
-            backend(format!(
-                "GitHub answered ledger blob {oid} with content that is not valid UTF-8 ({e})"
-            ))
         })
+    }
+
+    /// A blob's text, downloaded — LOSSY: bytes that are not UTF-8 become
+    /// U+FFFD. Fine for a reader: it decodes each LINE strictly afterwards
+    /// (`layout::decode`/`QuarantineLine::decode`), so one damaged line
+    /// fails there, named, without blocking its siblings or the file-level
+    /// growth check this feeds. Never used for `verify`'s own byte-level
+    /// comparison, which calls `blob_bytes` directly instead.
+    pub(crate) fn blob_text(&self, oid: &str) -> Result<String, StoreError> {
+        Ok(String::from_utf8_lossy(&self.blob_bytes(oid)?).into_owned())
     }
 
     /// A ledger commit: its tree and its parents.
@@ -262,7 +301,7 @@ impl GithubLedger<'_> {
     ///
     /// ⚠ A listing GitHub cut short is an error, never read as the whole
     /// tree: a verify over part of a tree would pass what it never saw.
-    pub(crate) fn tree_files(&self, sha: &str) -> Result<BTreeMap<String, String>, StoreError> {
+    pub(crate) fn tree_files(&self, sha: &str) -> Result<BTreeMap<String, TreeFile>, StoreError> {
         let r = self.client.send(
             Method::Get,
             &self.path(&format!("/git/trees/{sha}?recursive=1")),
@@ -287,31 +326,35 @@ impl GithubLedger<'_> {
             .ok_or_else(|| backend(format!("GitHub listed ledger tree {sha} with no entries")))?;
         let mut out = BTreeMap::new();
         for e in items {
-            match e["type"].as_str() {
-                // An intermediate directory in a recursive listing: not a
-                // file, nothing to collect.
-                Some("tree") => continue,
-                // ⚠ A regular file is the only shape fl ever writes: a
-                // gitlink (`commit`), a symlink (mode `120000`) or an
-                // executable (mode `100755`) is refused, never silently
-                // accepted as ordinary text or silently skipped — "fl
-                // never writes" applies to a file's KIND as much as to its
-                // name.
-                Some("blob") if e["mode"].as_str() == Some("100644") => {
-                    if let (Some(path), Some(oid)) = (e["path"].as_str(), e["sha"].as_str()) {
-                        out.insert(path.to_string(), oid.to_string());
-                    }
-                }
-                _ => {
-                    return Err(backend(format!(
-                        "GitHub's ledger tree {sha} holds `{}` as {} (mode {}), which fl never \
-                         writes",
-                        e["path"].as_str().unwrap_or("?"),
-                        e["type"].as_str().unwrap_or("?"),
-                        e["mode"].as_str().unwrap_or("?"),
-                    )));
-                }
+            // An intermediate directory in a recursive listing: not a
+            // file, nothing to collect.
+            if e["type"].as_str() == Some("tree") {
+                continue;
             }
+            let (Some(path), Some(oid)) = (e["path"].as_str(), e["sha"].as_str()) else {
+                continue;
+            };
+            // ⚠ A regular file (a blob, mode `100644`) is the only shape
+            // fl ever writes. A gitlink (`type` `commit`), a symlink
+            // (mode `120000`) or an executable (mode `100755`) is named
+            // here, not refused: this is a listing, and `verify` decides
+            // what a commit introducing one means — an error here would
+            // make `verify` unable to finish past it at all, hiding
+            // whatever came before.
+            let irregular = match (e["type"].as_str(), e["mode"].as_str()) {
+                (Some("blob"), Some("100644")) => None,
+                (Some("commit"), _) => Some("a gitlink"),
+                (Some("blob"), Some("120000")) => Some("a symlink"),
+                (Some("blob"), Some("100755")) => Some("an executable"),
+                _ => Some("an entry of a kind fl does not write"),
+            };
+            out.insert(
+                path.to_string(),
+                TreeFile {
+                    oid: oid.to_string(),
+                    irregular,
+                },
+            );
         }
         Ok(out)
     }
@@ -373,10 +416,12 @@ fn parse_object(v: &Value, path: &str) -> Result<Option<Object>, StoreError> {
                         "GitHub answered an entry of `{path}` with no name or no id"
                     )));
                 };
+                let is_blob = e["type"].as_str() == Some("blob");
                 out.push(Entry {
                     name: name.to_string(),
                     oid: oid.to_string(),
-                    is_blob: e["type"].as_str() == Some("blob"),
+                    is_blob,
+                    irregular: irregular_of(is_blob, e["mode"].as_i64()),
                 });
             }
             Ok(Some(Object::Tree(out)))
@@ -420,7 +465,7 @@ mod tests {
     }
 
     fn body_next(fake: &FakeGithub, frag: &str, status: u16, body: Value) {
-        fake.state().body_next = Some((frag.into(), status, body));
+        fake.state().body_next.push((frag.into(), status, body));
     }
 
     // A 502 must not read as "the branch does not exist" (404's meaning) —
@@ -525,13 +570,13 @@ mod tests {
         assert!(err.to_string().contains("not base64"), "{err}");
     }
 
-    // ⚠ `from_utf8_lossy` would let two DIFFERENT invalid byte sequences
-    // (here, two different lone continuation bytes) decode to the exact
-    // same U+FFFD-laden string — exactly the false equality `verify`'s
-    // byte-level growth comparison must never be fooled by. Refused, not
-    // substituted.
+    // ⚠ `blob_bytes` never decodes: a byte that is not valid UTF-8 (here, a
+    // lone continuation byte with no leader) comes back exactly as GitHub
+    // sent it, not refused and not substituted — `verify`'s byte-level
+    // growth comparison relies on this; `from_utf8_lossy` would let two
+    // DIFFERENT invalid sequences collapse to the same U+FFFD-laden string.
     #[test]
-    fn blob_text_refuses_content_that_is_not_valid_utf8() {
+    fn blob_bytes_returns_invalid_utf8_untouched() {
         let fake = FakeGithub::start("acme/widgets");
         let oid = fake.state().git.put_blob("x");
         let local = MemStore::default();
@@ -542,8 +587,27 @@ mod tests {
             200,
             json!({"content": STANDARD.encode([0x80])}),
         );
-        let err = open(&c, &local).blob_text(&oid).unwrap_err();
-        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+        let bytes = open(&c, &local).blob_bytes(&oid).unwrap();
+        assert_eq!(bytes, vec![0x80]);
+    }
+
+    // `blob_text`, by contrast, is lossy on purpose: a reader decodes each
+    // LINE strictly afterwards, so a damaged line fails there, named,
+    // without blocking its siblings.
+    #[test]
+    fn blob_text_is_lossy() {
+        let fake = FakeGithub::start("acme/widgets");
+        let oid = fake.state().git.put_blob("x");
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(
+            &fake,
+            "/git/blobs/",
+            200,
+            json!({"content": STANDARD.encode([0x80])}),
+        );
+        let text = open(&c, &local).blob_text(&oid).unwrap();
+        assert_eq!(text, "\u{FFFD}");
     }
 
     // ⚠ A 502 must not read as "no parents" (an orphan's meaning) — the two
@@ -619,15 +683,15 @@ mod tests {
     // an ordinary file (a symlink's "contents" is a path, not text; an
     // executable or a gitlink isn't text fl wrote at all).
     #[test]
-    fn tree_files_refuses_anything_that_is_not_a_regular_file() {
+    fn tree_files_names_anything_that_is_not_a_regular_file() {
         let fake = FakeGithub::start("acme/widgets");
         let root = fake.seed_ledger();
         let tree_sha = fake.state().git.commits[&root].tree.clone();
         let local = MemStore::default();
-        for (kind, mode, kind_type) in [
-            ("an executable", "100755", "blob"),
-            ("a symlink", "120000", "blob"),
-            ("a gitlink", "160000", "commit"),
+        for (kind, mode, kind_type, says) in [
+            ("an executable", "100755", "blob", "an executable"),
+            ("a symlink", "120000", "blob", "a symlink"),
+            ("a gitlink", "160000", "commit", "a gitlink"),
         ] {
             let c = client(&fake);
             body_next(
@@ -643,11 +707,13 @@ mod tests {
                     ],
                 }),
             );
-            let err = open(&c, &local).tree_files(&tree_sha).unwrap_err();
-            assert!(
-                err.to_string().contains("which fl never writes"),
-                "{kind}: {err}"
-            );
+            // ⚠ A listing never errors on an irregular entry — only
+            // `verify` decides what it means; an error here would leave
+            // `verify` unable to finish past it, hiding every older
+            // departure behind it.
+            let files = open(&c, &local).tree_files(&tree_sha).unwrap();
+            assert_eq!(files["format"].irregular, None, "{kind}");
+            assert_eq!(files["evil"].irregular, Some(says), "{kind}");
         }
     }
 
@@ -716,6 +782,44 @@ mod tests {
             .objects(&head, &["runs/k".to_string()])
             .unwrap_err();
         assert!(err.to_string().contains("no name or no id"), "{err}");
+    }
+
+    // I3 (fix round 3): GraphQL's tree entries carry a mode too — a
+    // symlink or an executable must be marked irregular here, the same
+    // way the REST tree listing (`tree_files`) already is, so a reader's
+    // `directory` can refuse one named like a segment instead of reading
+    // it as ordinary text.
+    #[test]
+    fn objects_marks_a_tree_entry_with_an_irregular_mode() {
+        let fake = FakeGithub::start("acme/widgets");
+        let head = fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(
+            &fake,
+            "/graphql",
+            200,
+            json!({"data": {"repository": {
+                "head": {"oid": head},
+                "e0": {
+                    "__typename": "Tree",
+                    "entries": [
+                        {"name": "1.jsonl", "oid": "a".repeat(40), "type": "blob", "mode": 0o120000},
+                        {"name": "2.jsonl", "oid": "b".repeat(40), "type": "blob", "mode": 0o100644},
+                    ],
+                },
+            }}}),
+        );
+        let found = open(&c, &local)
+            .objects(&head, &["runs/k".to_string()])
+            .unwrap();
+        match &found[0] {
+            Some(Object::Tree(entries)) => {
+                assert_eq!(entries[0].irregular, Some("a symlink"));
+                assert_eq!(entries[1].irregular, None, "an ordinary mode stays None");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

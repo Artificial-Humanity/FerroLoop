@@ -975,7 +975,7 @@ mod tests {
         );
         assert!(err.is_transient());
         // Any other status is an error that retrying does not fix.
-        fake.state().body_next = Some((
+        fake.state().body_next.push((
             "/repos/acme/widgets".into(),
             404,
             json!({"message": "Not Found"}),

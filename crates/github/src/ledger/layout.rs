@@ -262,8 +262,13 @@ pub fn lines(text: &str) -> Vec<(u64, Result<&str, &'static str>)> {
 /// starts with it: completing a line `was` broke off mid-way through would
 /// otherwise trivially "start with" the cut copy, whatever the completion
 /// said — a false growth that would let a tampered commit verify clean.
-pub fn grows_only(was: &str, is: &str) -> bool {
-    (was.is_empty() || was.ends_with('\n')) && is.starts_with(was)
+///
+/// ⚠ Bytes, not text: `verify` compares raw blob bytes, never a decoded
+/// string — two different invalid-UTF-8 byte sequences must never compare
+/// equal just because a lossy decode of both collapses to the same
+/// replacement characters.
+pub fn grows_only(was: &[u8], is: &[u8]) -> bool {
+    (was.is_empty() || was.ends_with(b"\n")) && is.starts_with(was)
 }
 
 /// The files to write so `new` lines join a directory whose segments are
@@ -602,22 +607,26 @@ mod tests {
     #[test]
     fn grows_only_refuses_completing_a_cut_line() {
         assert!(
-            grows_only("", "a\n"),
+            grows_only(b"", b"a\n"),
             "an empty baseline may grow into anything"
         );
-        assert!(grows_only("a\n", "a\nb\n"), "ordinary growth");
+        assert!(grows_only(b"a\n", b"a\nb\n"), "ordinary growth");
         assert!(
-            grows_only("a\n", "a\n"),
+            grows_only(b"a\n", b"a\n"),
             "unchanged is its own, trivial growth"
         );
-        assert!(!grows_only("a\n", "b\n"), "a rewrite, not a growth");
+        assert!(!grows_only(b"a\n", b"b\n"), "a rewrite, not a growth");
         assert!(
-            !grows_only("a\nnot terminated", "a\nnot terminated, now finished\n"),
+            !grows_only(b"a\nnot terminated", b"a\nnot terminated, now finished\n"),
             "completing a cut line is not growth, however the completion starts"
         );
         assert!(
-            !grows_only("a\nnot terminated", "a\nnot terminated"),
+            !grows_only(b"a\nnot terminated", b"a\nnot terminated"),
             "an unchanged cut copy is not growth either: `was` must end cleanly"
+        );
+        assert!(
+            !grows_only(&[0xffu8, b'\n'], &[0xfeu8, b'\n']),
+            "two different invalid-UTF-8 byte sequences are never equal, lossy decoding aside"
         );
     }
 

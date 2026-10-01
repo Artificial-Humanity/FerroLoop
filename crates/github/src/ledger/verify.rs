@@ -5,7 +5,7 @@
 
 use super::GithubLedger;
 use super::append::NewLine;
-use super::git::CommitObject;
+use super::git::{CommitObject, TreeFile};
 use super::layout::{
     self, BRANCH, FORMAT, FORMAT_FILE, QUARANTINE_FILE, QuarantineLine, README_FILE,
 };
@@ -29,11 +29,26 @@ pub struct BadCommit {
     pub what: String,
 }
 
-/// What one verify has already read: blob texts and tree listings, by id.
+/// What one verify has already read: blob bytes and tree listings, by id.
 #[derive(Default)]
 struct Seen {
-    blobs: BTreeMap<String, String>,
-    trees: BTreeMap<String, BTreeMap<String, String>>,
+    blobs: BTreeMap<String, Vec<u8>>,
+    trees: BTreeMap<String, BTreeMap<String, TreeFile>>,
+}
+
+/// What is wrong with a brand-new segment or `quarantine.jsonl`'s bytes,
+/// if anything: fl never creates one empty (there is always at least one
+/// line to write), and never leaves one without its final newline.
+fn incomplete_new_file(path: &str, bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        Some(format!("adds `{path}` empty, which fl never writes"))
+    } else if !bytes.ends_with(b"\n") {
+        Some(format!(
+            "adds `{path}` without a final newline, which fl never writes"
+        ))
+    } else {
+        None
+    }
 }
 
 impl GithubLedger<'_> {
@@ -113,11 +128,14 @@ impl GithubLedger<'_> {
         })
     }
 
-    fn text_of(&self, oid: &str, seen: &mut Seen) -> Result<String, StoreError> {
+    /// A blob's raw bytes, memoized. ⚠ Never decoded: two different
+    /// invalid-UTF-8 sequences must never compare equal just because a
+    /// lossy decode of both collapses to the same replacement characters.
+    fn bytes_of(&self, oid: &str, seen: &mut Seen) -> Result<Vec<u8>, StoreError> {
         if let Some(t) = seen.blobs.get(oid) {
             return Ok(t.clone());
         }
-        let t = self.blob_text(oid)?;
+        let t = self.blob_bytes(oid)?;
         seen.blobs.insert(oid.to_string(), t.clone());
         Ok(t)
     }
@@ -128,7 +146,7 @@ impl GithubLedger<'_> {
         &self,
         tree: &str,
         seen: &mut Seen,
-    ) -> Result<BTreeMap<String, String>, StoreError> {
+    ) -> Result<BTreeMap<String, TreeFile>, StoreError> {
         if let Some(files) = seen.trees.get(tree) {
             return Ok(files.clone());
         }
@@ -138,7 +156,7 @@ impl GithubLedger<'_> {
     }
 
     /// What is wrong with the anchor, if anything: it holds exactly
-    /// `format` (reading 1) and `README.md`.
+    /// `format` (reading 1) and `README.md`, both ordinary files.
     fn fls_first_commit(
         &self,
         anchor: &CommitObject,
@@ -151,7 +169,15 @@ impl GithubLedger<'_> {
                 "starts the ledger with {names:?}, where fl writes only `format` and `README.md`"
             )));
         }
-        let format = self.text_of(&files[FORMAT_FILE], seen)?;
+        for path in [FORMAT_FILE, README_FILE] {
+            if let Some(kind) = files[path].irregular {
+                return Ok(Some(format!(
+                    "starts the ledger with `{path}` as {kind}, which fl never writes"
+                )));
+            }
+        }
+        let format = self.bytes_of(&files[FORMAT_FILE].oid, seen)?;
+        let format = String::from_utf8_lossy(&format);
         if format.strip_suffix('\n').unwrap_or(&format) != FORMAT {
             return Ok(Some(format!(
                 "starts the ledger at format `{}`",
@@ -170,11 +196,27 @@ impl GithubLedger<'_> {
     ) -> Result<Option<String>, StoreError> {
         let old = self.files_of(&before.tree, seen)?;
         let new = self.files_of(&after.tree, seen)?;
-        for (path, oid) in &old {
+        for (path, file) in &old {
             let Some(now) = new.get(path) else {
                 return Ok(Some(format!("deletes `{path}`")));
             };
-            if now == oid {
+            // ⚠ Checked before anything path-shaped: a commit that turns a
+            // segment (or any other path) into a symlink or an executable
+            // is a departure regardless of what the path looks like, and
+            // `verify` must report it, never error out and leave every
+            // older departure hidden behind it. An entry that was ALREADY
+            // irregular and is unchanged was reported when it first
+            // appeared; only a fresh change to (or within) it is reported
+            // here.
+            if let Some(kind) = now.irregular {
+                if now != file {
+                    return Ok(Some(format!(
+                        "changes `{path}` to {kind}, which fl never writes"
+                    )));
+                }
+                continue;
+            }
+            if now.oid == file.oid {
                 continue;
             }
             if path == FORMAT_FILE || path == README_FILE {
@@ -192,7 +234,10 @@ impl GithubLedger<'_> {
                 None if path == QUARANTINE_FILE => {}
                 None => return Ok(Some(format!("changes `{path}`, which fl never writes"))),
             }
-            let (was, is) = (self.text_of(oid, seen)?, self.text_of(now, seen)?);
+            let (was, is) = (
+                self.bytes_of(&file.oid, seen)?,
+                self.bytes_of(&now.oid, seen)?,
+            );
             // ⚠ `grows_only` (shared with `read.rs`'s `grown`, so the rule
             // can never drift) refuses completing a line `was` itself left
             // cut short, even though the completion trivially "starts
@@ -201,30 +246,49 @@ impl GithubLedger<'_> {
             // ITS OWN result cut short — with no later commit to complete
             // it, there may be none — must be caught here too, not
             // deferred to a comparison that might never happen.
-            if !layout::grows_only(&was, &is) || !is.ends_with('\n') {
+            if !layout::grows_only(&was, &is) || !is.ends_with(b"\n") {
                 return Ok(Some(format!("rewrites lines of `{path}`")));
             }
         }
         let mut numbers: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-        for path in new.keys() {
+        for (path, file) in &new {
+            // ⚠ A path this commit introduces, already irregular: never
+            // silently accepted — fl writes only ordinary files, whether
+            // it is a segment-shaped name or not.
+            if !old.contains_key(path)
+                && let Some(kind) = file.irregular
+            {
+                return Ok(Some(format!(
+                    "adds `{path}` as {kind}, which fl never writes"
+                )));
+            }
             match layout::parse_segment_path(path) {
                 Some((_, dir, n)) => {
                     numbers.entry(dir).or_default().push(n);
                     // ⚠ A brand-new segment is held to the same rule: fl
-                    // never writes a line without its trailing newline, so
-                    // one introduced without one is reported here, at the
-                    // commit that introduced it — never silently accepted
-                    // because there was nothing yet to compare it against.
+                    // never writes a line without its trailing newline
+                    // (nor an empty segment at all), so one introduced
+                    // without one is reported here, at the commit that
+                    // introduced it — never silently accepted because
+                    // there was nothing yet to compare it against.
                     if !old.contains_key(path) {
-                        let text = self.text_of(&new[path], seen)?;
-                        if !text.ends_with('\n') {
-                            return Ok(Some(format!(
-                                "adds `{path}` without a final newline, which fl never writes"
-                            )));
+                        let text = self.bytes_of(&file.oid, seen)?;
+                        if let Some(what) = incomplete_new_file(path, &text) {
+                            return Ok(Some(what));
                         }
                     }
                 }
-                None if path == QUARANTINE_FILE || old.contains_key(path) => {}
+                None if path == QUARANTINE_FILE => {
+                    // ⚠ The same rule applies to a `quarantine.jsonl`
+                    // this commit creates for the first time.
+                    if !old.contains_key(path) {
+                        let text = self.bytes_of(&file.oid, seen)?;
+                        if let Some(what) = incomplete_new_file(path, &text) {
+                            return Ok(Some(what));
+                        }
+                    }
+                }
+                None if old.contains_key(path) => {}
                 None => return Ok(Some(format!("adds `{path}`, which fl never writes"))),
             }
         }
@@ -318,13 +382,22 @@ mod tests {
     use crate::creds::EnvToken;
     use crate::fake::{FakeGithub, USER_LOGIN};
     use crate::tracker::Repo;
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
     use fl_core::MemStore;
     use fl_core::conformance::{sample_decision, sample_record_run};
     use fl_core::ids::{GateId, RecordId, seq_iri};
     use fl_core::log::GateRun;
     use fl_core::split::{Batch, RemoteLedger};
     use fl_core::store::Bindings;
+    use serde_json::{Value, json};
     use std::time::Duration;
+
+    /// The next request whose URL contains `frag` answers `status`/`body`
+    /// instead, once.
+    fn body_next(fake: &FakeGithub, frag: &str, status: u16, body: Value) {
+        fake.state().body_next.push((frag.into(), status, body));
+    }
 
     fn client(fake: &FakeGithub) -> Client {
         Client::new(
@@ -552,6 +625,46 @@ mod tests {
         );
     }
 
+    // I4 (fix round 3): an empty new segment is a different defect from
+    // one merely missing its final newline — fl never creates an empty
+    // one at all (there is always at least one line to write), and the
+    // message says so rather than the misleading "without a final
+    // newline" (true of an empty file too, but not the real problem).
+    #[test]
+    fn an_empty_new_segment_is_worded_as_empty() {
+        let (fake, local, _root) = world();
+        let bad = fake.hand_commit(&[(seg(1).as_str(), Some(""))]);
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert_eq!(
+            first.what,
+            format!("adds `{}` empty, which fl never writes", seg(1))
+        );
+        assert!(
+            !first.what.contains("without a final newline"),
+            "{}",
+            first.what
+        );
+    }
+
+    // I4 (fix round 3): the same completeness rule applies to a BRAND-NEW
+    // `quarantine.jsonl`, not only to a segment — the adds-loop's check
+    // previously covered segment paths only.
+    #[test]
+    fn a_new_quarantine_file_without_a_final_newline_is_reported() {
+        let (fake, local, _root) = world();
+        let bad = fake.hand_commit(&[(QUARANTINE_FILE, Some("not terminated"))]);
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert!(
+            first.what.contains("without a final newline"),
+            "{}",
+            first.what
+        );
+    }
+
     #[test]
     fn a_second_history_or_a_merge_is_reported() {
         let (fake, local, root) = world();
@@ -587,6 +700,84 @@ mod tests {
         let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
         assert_eq!(first.commit, rewrite, "the rewrite, not the merge");
         assert!(first.what.contains("rewrites"), "{}", first.what);
+    }
+
+    /// Overrides `commit`'s own tree listing so `path` is a symlink (mode
+    /// `120000`) instead of whatever `hand_commit` actually wrote —
+    /// `hand_commit` can only ever write an ordinary file, so a test that
+    /// needs an irregular entry must fake the listing GitHub would answer
+    /// for one.
+    fn make_a_symlink(fake: &FakeGithub, commit: &str, path: &str) {
+        let tree_sha = fake.state().git.commits[commit].tree.clone();
+        let real = fake.state().git.trees[&tree_sha].clone();
+        let items: Vec<Value> = real
+            .iter()
+            .map(|(p, oid)| {
+                let mode = if p == path { "120000" } else { "100644" };
+                json!({"path": p, "mode": mode, "type": "blob", "sha": oid})
+            })
+            .collect();
+        body_next(
+            fake,
+            &format!("/git/trees/{tree_sha}"),
+            200,
+            json!({"sha": tree_sha, "truncated": false, "tree": items}),
+        );
+    }
+
+    // I2 (fix round 3): a non-regular tree entry must be a `verify`
+    // DEPARTURE, reported like any other — never a hard error that leaves
+    // `verify` unable to finish past it at all.
+    #[test]
+    fn a_commit_introducing_a_symlink_is_reported_alone() {
+        let (fake, local, _root) = world();
+        let bad = fake.hand_commit(&[("link", Some("target"))]);
+        make_a_symlink(&fake, &bad, "link");
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert_eq!(
+            first.what,
+            "adds `link` as a symlink, which fl never writes"
+        );
+    }
+
+    // The reviewer's shape: an OLDER rewrite is still the oldest
+    // departure, even behind a LATER commit that adds a symlink.
+    #[test]
+    fn a_symlink_entry_is_reported_behind_an_older_rewrite() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let rewrite = fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(9))]).as_str()))]);
+        let bad = fake.hand_commit(&[("link", Some("target"))]);
+        make_a_symlink(&fake, &bad, "link");
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(
+            first.commit, rewrite,
+            "the older rewrite, not the later symlink"
+        );
+        assert!(first.what.contains("rewrites lines"), "{}", first.what);
+    }
+
+    // The other direction: a path fl ALREADY wrote, turned into a symlink
+    // by a later commit without ever being deleted first.
+    #[test]
+    fn a_path_turned_into_a_symlink_is_reported() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let bad = fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+        )]);
+        make_a_symlink(&fake, &bad, &seg(1));
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert_eq!(
+            first.what,
+            format!("changes `{}` to a symlink, which fl never writes", seg(1))
+        );
     }
 
     #[test]
@@ -688,6 +879,93 @@ mod tests {
             None,
             "a quarantine only adds"
         );
+    }
+
+    // I1 (fix round 3): an invalid UTF-8 byte in one line must not make
+    // `snapshot` (and so `quarantine`, which only needs a snapshot) fail
+    // hard — only `lines()`-based reads (`runs`), which actually decode
+    // each line, see it, and only as the usual `Unreadable` for that one
+    // line.
+    #[test]
+    fn an_invalid_byte_in_a_line_does_not_block_snapshot_or_quarantine() {
+        let (fake, local, _root) = world();
+        let good = file(&[line(&run(1))]);
+        fake.hand_commit(&[(seg(1).as_str(), Some(good.as_str()))]);
+        let seg_oid = fake
+            .state()
+            .git
+            .blobs
+            .iter()
+            .find(|(_, t)| **t == good)
+            .map(|(id, _)| id.clone())
+            .expect("seg(1)'s blob exists on the fake");
+        let raw = [good.as_bytes(), &[0xffu8], b"\n"].concat();
+        body_next(
+            &fake,
+            &format!("/git/blobs/{seg_oid}"),
+            200,
+            json!({"content": STANDARD.encode(&raw)}),
+        );
+        let c = client(&fake);
+        let l = open(&c, &local);
+        // The one bad line fails the whole decode, exactly as "not json"
+        // already does (an existing, unrelated behaviour, unchanged here).
+        assert!(l.runs(&gate()).is_err());
+        let committed = l
+            .quarantine(
+                &seq_iri(60),
+                &At::from_unix_millis(60),
+                &seg(1),
+                2,
+                "Ada",
+                "a hand edit",
+            )
+            .unwrap();
+        assert_eq!(committed, fake.ledger_head());
+        assert_eq!(l.runs(&gate()).unwrap(), vec![run(1)]);
+    }
+
+    // I1 (fix round 3): `verify` must still tell two DIFFERENT invalid
+    // byte sequences apart — the whole point of comparing raw bytes
+    // instead of a lossy-decoded string, which would collapse both to the
+    // same replacement characters and see no rewrite at all.
+    #[test]
+    fn verify_tells_apart_two_different_invalid_byte_sequences() {
+        let (fake, local, _root) = world();
+        // The fake can only commit valid UTF-8 (`&str`), so these are mere
+        // placeholders: each commit's REAL download is overridden below to
+        // answer invalid bytes instead, each ending in a newline (so the
+        // new-segment and growth checks have something to compare).
+        let placeholder_a = "placeholder a";
+        let placeholder_b = "placeholder b";
+        fake.hand_commit(&[(seg(1).as_str(), Some(placeholder_a))]);
+        let bad = fake.hand_commit(&[(seg(1).as_str(), Some(placeholder_b))]);
+        let oid_of = |text: &str| {
+            fake.state()
+                .git
+                .blobs
+                .iter()
+                .find(|(_, t)| t.as_str() == text)
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| panic!("{text} was not committed"))
+        };
+        let (oid_a, oid_b) = (oid_of(placeholder_a), oid_of(placeholder_b));
+        body_next(
+            &fake,
+            &format!("/git/blobs/{oid_a}"),
+            200,
+            json!({"content": STANDARD.encode([0xffu8, b'\n'])}),
+        );
+        body_next(
+            &fake,
+            &format!("/git/blobs/{oid_b}"),
+            200,
+            json!({"content": STANDARD.encode([0xfeu8, b'\n'])}),
+        );
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert!(first.what.contains("rewrites lines"), "{}", first.what);
     }
 
     // Ruling 17: a line in the wrong directory can be quarantined too.

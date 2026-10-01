@@ -401,7 +401,7 @@ mod tests {
     /// The next request whose URL contains `frag` answers `status`/`body`
     /// instead, once.
     fn body_next(fake: &FakeGithub, frag: &str, status: u16, body: Value) {
-        fake.state().body_next = Some((frag.into(), status, body));
+        fake.state().body_next.push((frag.into(), status, body));
     }
 
     // Spec §6.1 steps 3 and 4.

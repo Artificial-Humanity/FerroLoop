@@ -228,14 +228,17 @@ pub struct State {
     /// The next ledger commit lands, then answers 200 with a body that
     /// breaks off. One-shot.
     pub break_next_commit_answer: bool,
-    /// The first request whose path contains this fragment answers with
-    /// this status and body instead of its normal handling — a malformed
-    /// GitHub answer none of the fake's real routes produce on their own
-    /// (a 200 missing a field it always sends, a non-`Blob`/`Tree`
-    /// `__typename`). Left alone (not consumed) by every request that does
-    /// not match the fragment, so it fires on the one request a test means
-    /// it for. One-shot once matched.
-    pub body_next: Option<(String, u16, Value)>,
+    /// A queue of overrides: the first request whose path contains a
+    /// queued fragment answers with that entry's status and body instead
+    /// of its normal handling — a malformed GitHub answer none of the
+    /// fake's real routes produce on their own (a 200 missing a field it
+    /// always sends, a non-`Blob`/`Tree` `__typename`). Each entry is
+    /// one-shot once matched (removed from the queue); a request that
+    /// matches none of them falls through to normal handling. Usually
+    /// holds at most one entry, but a test that needs to override TWO
+    /// distinct requests (two different blob ids, say) within one call can
+    /// queue both up front.
+    pub body_next: Vec<(String, u16, Value)>,
     /// The next this-many `ledgerObjects` reads answer as if GraphQL does
     /// not yet know the newest commit at all: `head` and every `eN` object
     /// come back null, even when the commit and paths are real — a GraphQL
@@ -708,11 +711,12 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         a.hang_up = true;
         return a;
     }
-    if s.body_next
-        .as_ref()
-        .is_some_and(|(frag, _, _)| url.contains(frag.as_str()))
+    if let Some(i) = s
+        .body_next
+        .iter()
+        .position(|(frag, _, _)| url.contains(frag.as_str()))
     {
-        let (_, status, body) = s.body_next.take().expect("just matched");
+        let (_, status, body) = s.body_next.remove(i);
         return answer(status, body);
     }
     if let Some(needs) = s.permission_refused_next.take() {
