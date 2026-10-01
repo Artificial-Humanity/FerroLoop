@@ -54,8 +54,8 @@ pub trait Outbox {
     /// The id after which entries are publishable to `repo`, if its GitHub
     /// ledger was switched on.
     fn cutover(&self, repo: &str) -> Result<Option<Iri>, StoreError>;
-    /// Recorded once, by `fl github ledger init` (plan B). ⚠ The same id
-    /// again is a no-op; a different one is `CutoverChanged`.
+    /// Recorded once, by `fl github ledger init`. ⚠ The same id again is a
+    /// no-op; a different one is `CutoverChanged`.
     fn set_cutover(&self, repo: &str, id: &Iri) -> Result<(), StoreError>;
 }
 

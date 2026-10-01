@@ -444,12 +444,7 @@ impl Outbox for MemStore {
     }
 
     fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError> {
-        let mut s = self.inner.borrow_mut();
-        for id in ids {
-            s.published.insert((repo.to_string(), id.clone()));
-            s.settled.insert(id.clone());
-        }
-        Ok(())
+        self.settle(repo, ids, &[])
     }
 
     fn settle(&self, repo: &str, published: &[Iri], set_aside: &[Iri]) -> Result<(), StoreError> {

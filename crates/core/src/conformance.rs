@@ -901,17 +901,26 @@ fn a_published_entry_is_never_offered_to_github_again(roles: &Bound<'_>, ctl: &d
 }
 
 // ⚠ Spec §2.1: an entry another repository owns is reported by the flush
-// that skips it, and by no later one.
+// that skips it, and by no later one. A foreign ATTEMPT is skipped the same
+// way as a foreign run — covering both guards the attempt branch's own
+// `set_aside` push, which a run-only case cannot catch.
 fn a_skipped_entry_is_reported_by_one_flush_only(roles: &Bound<'_>, ctl: &dyn RemoteControl) {
-    let (_p, g, r) = record_world(roles);
-    let other = sample_record_run(1, &g, Some(&ctl.foreign_record()));
+    let (p, g, r) = record_world(roles);
+    let theirs = ctl.foreign_record();
+    let other = sample_record_run(1, &g, Some(&theirs));
+    let elsewhere = sample_attempt(2, &p, &theirs);
     roles.ledger.append_gate_run(other).unwrap();
+    roles.ledger.append_attempt(elsewhere).unwrap();
     let first = roles.ledger.flush(sample_decision(1, &r, vec![])).unwrap();
-    assert_eq!(first.left_local.len(), 1, "{first:?}");
+    assert_eq!(first.left_local.len(), 2, "{first:?}");
     let second = roles.ledger.flush(sample_decision(2, &r, vec![])).unwrap();
     assert!(second.left_local.is_empty(), "{second:?}");
+    let batches = ctl.batches();
+    assert_eq!(batches.len(), 2, "one batch per flush");
     assert!(
-        ctl.batches().iter().all(|b| b.runs.is_empty()),
+        batches
+            .iter()
+            .all(|b| b.runs.is_empty() && b.attempts.is_empty()),
         "never published"
     );
 }
