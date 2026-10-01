@@ -179,9 +179,12 @@ impl GithubLedger<'_> {
 
     /// A blob's text, downloaded.
     ///
-    /// ⚠ Lossy on purpose: bytes that are not UTF-8 become U+FFFD, so a
-    /// damaged file fails the line and growth checks by name instead of
-    /// failing here without one.
+    /// ⚠ Strict, never lossy: `from_utf8_lossy` would let two DIFFERENT
+    /// invalid byte sequences decode to the identical string (every bad
+    /// byte collapses to the same U+FFFD), so a byte-level check —
+    /// `verify`'s own growth comparison among them — could compare two
+    /// blobs that are not actually equal as though they were. A blob that
+    /// is not valid UTF-8 is refused outright, naming it.
     pub(crate) fn blob_text(&self, oid: &str) -> Result<String, StoreError> {
         let r = self
             .client
@@ -206,7 +209,11 @@ impl GithubLedger<'_> {
                 "GitHub answered ledger blob {oid} with content that is not base64 ({e})"
             ))
         })?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
+        String::from_utf8(bytes).map_err(|e| {
+            backend(format!(
+                "GitHub answered ledger blob {oid} with content that is not valid UTF-8 ({e})"
+            ))
+        })
     }
 
     /// A ledger commit: its tree and its parents.
@@ -278,16 +285,35 @@ impl GithubLedger<'_> {
             .get("tree")
             .and_then(Value::as_array)
             .ok_or_else(|| backend(format!("GitHub listed ledger tree {sha} with no entries")))?;
-        Ok(items
-            .iter()
-            .filter(|e| e["type"].as_str() == Some("blob"))
-            .filter_map(|e| {
-                Some((
-                    e["path"].as_str()?.to_string(),
-                    e["sha"].as_str()?.to_string(),
-                ))
-            })
-            .collect())
+        let mut out = BTreeMap::new();
+        for e in items {
+            match e["type"].as_str() {
+                // An intermediate directory in a recursive listing: not a
+                // file, nothing to collect.
+                Some("tree") => continue,
+                // ⚠ A regular file is the only shape fl ever writes: a
+                // gitlink (`commit`), a symlink (mode `120000`) or an
+                // executable (mode `100755`) is refused, never silently
+                // accepted as ordinary text or silently skipped — "fl
+                // never writes" applies to a file's KIND as much as to its
+                // name.
+                Some("blob") if e["mode"].as_str() == Some("100644") => {
+                    if let (Some(path), Some(oid)) = (e["path"].as_str(), e["sha"].as_str()) {
+                        out.insert(path.to_string(), oid.to_string());
+                    }
+                }
+                _ => {
+                    return Err(backend(format!(
+                        "GitHub's ledger tree {sha} holds `{}` as {} (mode {}), which fl never \
+                         writes",
+                        e["path"].as_str().unwrap_or("?"),
+                        e["type"].as_str().unwrap_or("?"),
+                        e["mode"].as_str().unwrap_or("?"),
+                    )));
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The commit that last changed `line` of `path` at `commit`, for a
@@ -499,6 +525,27 @@ mod tests {
         assert!(err.to_string().contains("not base64"), "{err}");
     }
 
+    // ⚠ `from_utf8_lossy` would let two DIFFERENT invalid byte sequences
+    // (here, two different lone continuation bytes) decode to the exact
+    // same U+FFFD-laden string — exactly the false equality `verify`'s
+    // byte-level growth comparison must never be fooled by. Refused, not
+    // substituted.
+    #[test]
+    fn blob_text_refuses_content_that_is_not_valid_utf8() {
+        let fake = FakeGithub::start("acme/widgets");
+        let oid = fake.state().git.put_blob("x");
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(
+            &fake,
+            "/git/blobs/",
+            200,
+            json!({"content": STANDARD.encode([0x80])}),
+        );
+        let err = open(&c, &local).blob_text(&oid).unwrap_err();
+        assert!(err.to_string().contains("not valid UTF-8"), "{err}");
+    }
+
     // ⚠ A 502 must not read as "no parents" (an orphan's meaning) — the two
     // are different facts fl must tell apart, the same distinction
     // `branch_head_treats_a_server_error_as_an_error_not_as_no_such_branch`
@@ -565,6 +612,43 @@ mod tests {
         );
         let err = open(&c, &local).tree_files(&tree_sha).unwrap_err();
         assert!(err.to_string().contains("no entries"), "{err}");
+    }
+
+    // ⚠ A gitlink, a symlink or an executable is not a shape fl ever
+    // writes to the ledger — each must be refused by name, never read as
+    // an ordinary file (a symlink's "contents" is a path, not text; an
+    // executable or a gitlink isn't text fl wrote at all).
+    #[test]
+    fn tree_files_refuses_anything_that_is_not_a_regular_file() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let tree_sha = fake.state().git.commits[&root].tree.clone();
+        let local = MemStore::default();
+        for (kind, mode, kind_type) in [
+            ("an executable", "100755", "blob"),
+            ("a symlink", "120000", "blob"),
+            ("a gitlink", "160000", "commit"),
+        ] {
+            let c = client(&fake);
+            body_next(
+                &fake,
+                &format!("/git/trees/{tree_sha}"),
+                200,
+                json!({
+                    "sha": tree_sha,
+                    "truncated": false,
+                    "tree": [
+                        {"path": "format", "mode": "100644", "type": "blob", "sha": "a".repeat(40)},
+                        {"path": "evil", "mode": mode, "type": kind_type, "sha": "b".repeat(40)},
+                    ],
+                }),
+            );
+            let err = open(&c, &local).tree_files(&tree_sha).unwrap_err();
+            assert!(
+                err.to_string().contains("which fl never writes"),
+                "{kind}: {err}"
+            );
+        }
     }
 
     #[test]

@@ -252,6 +252,20 @@ pub fn lines(text: &str) -> Vec<(u64, Result<&str, &'static str>)> {
     out
 }
 
+/// Whether `is` could be `was` after only growth (spec §3.5 checks 3 and
+/// 4): `was` is empty or ends with a newline, and `is` starts with `was`
+/// exactly. Shared by every reader (`ledger::read::grown`) and by
+/// `ledger::verify`'s `only_adds`, so the rule can never drift between
+/// them.
+///
+/// ⚠ A `was` that does NOT end in a newline is refused even when `is`
+/// starts with it: completing a line `was` broke off mid-way through would
+/// otherwise trivially "start with" the cut copy, whatever the completion
+/// said — a false growth that would let a tampered commit verify clean.
+pub fn grows_only(was: &str, is: &str) -> bool {
+    (was.is_empty() || was.ends_with('\n')) && is.starts_with(was)
+}
+
 /// The files to write so `new` lines join a directory whose segments are
 /// `segments` — (number, text), oldest first. Only the last segment grows;
 /// it closes when the next line would take it past [`SEGMENT_LIMIT`].
@@ -579,6 +593,32 @@ mod tests {
         assert_eq!(cut[0], (1, Ok("a")));
         assert_eq!(cut[1].0, 2);
         assert!(cut[1].1.is_err(), "{cut:?}");
+    }
+
+    // Spec §3.5 checks 3 and 4, the shared rule: ordinary growth, a plain
+    // rewrite, and the specific hole this closes — completing (or merely
+    // repeating) a line `was` itself left cut short must never read as
+    // growth just because the result trivially "starts with" it.
+    #[test]
+    fn grows_only_refuses_completing_a_cut_line() {
+        assert!(
+            grows_only("", "a\n"),
+            "an empty baseline may grow into anything"
+        );
+        assert!(grows_only("a\n", "a\nb\n"), "ordinary growth");
+        assert!(
+            grows_only("a\n", "a\n"),
+            "unchanged is its own, trivial growth"
+        );
+        assert!(!grows_only("a\n", "b\n"), "a rewrite, not a growth");
+        assert!(
+            !grows_only("a\nnot terminated", "a\nnot terminated, now finished\n"),
+            "completing a cut line is not growth, however the completion starts"
+        );
+        assert!(
+            !grows_only("a\nnot terminated", "a\nnot terminated"),
+            "an unchanged cut copy is not growth either: `was` must end cleanly"
+        );
     }
 
     #[test]

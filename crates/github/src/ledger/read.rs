@@ -274,8 +274,13 @@ impl GithubLedger<'_> {
             if c.closed {
                 return Err(self.altered(path, "changed after it was closed", head));
             }
-            // ⚠ Check 4: the open segment starts with the copy read before.
-            if !text.starts_with(&c.text) {
+            // ⚠ Check 4: the open segment only grew from the copy read
+            // before. `grows_only` is shared with `verify`'s `only_adds`
+            // so the rule can never drift between the two; here it is
+            // always equivalent to the plain prefix check it replaces,
+            // since `c.text` is only ever cached below when it is itself
+            // empty or newline-terminated.
+            if !layout::grows_only(&c.text, &text) {
                 return Err(self.altered(
                     path,
                     "no longer starts with the copy this machine read before",

@@ -193,14 +193,37 @@ impl GithubLedger<'_> {
                 None => return Ok(Some(format!("changes `{path}`, which fl never writes"))),
             }
             let (was, is) = (self.text_of(oid, seen)?, self.text_of(now, seen)?);
-            if !is.starts_with(&was) {
+            // ⚠ `grows_only` (shared with `read.rs`'s `grown`, so the rule
+            // can never drift) refuses completing a line `was` itself left
+            // cut short, even though the completion trivially "starts
+            // with" it. It is not enough on its own, though: it only
+            // examines `was`, so a commit that grows a segment but leaves
+            // ITS OWN result cut short — with no later commit to complete
+            // it, there may be none — must be caught here too, not
+            // deferred to a comparison that might never happen.
+            if !layout::grows_only(&was, &is) || !is.ends_with('\n') {
                 return Ok(Some(format!("rewrites lines of `{path}`")));
             }
         }
         let mut numbers: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         for path in new.keys() {
             match layout::parse_segment_path(path) {
-                Some((_, dir, n)) => numbers.entry(dir).or_default().push(n),
+                Some((_, dir, n)) => {
+                    numbers.entry(dir).or_default().push(n);
+                    // ⚠ A brand-new segment is held to the same rule: fl
+                    // never writes a line without its trailing newline, so
+                    // one introduced without one is reported here, at the
+                    // commit that introduced it — never silently accepted
+                    // because there was nothing yet to compare it against.
+                    if !old.contains_key(path) {
+                        let text = self.text_of(&new[path], seen)?;
+                        if !text.ends_with('\n') {
+                            return Ok(Some(format!(
+                                "adds `{path}` without a final newline, which fl never writes"
+                            )));
+                        }
+                    }
+                }
                 None if path == QUARANTINE_FILE || old.contains_key(path) => {}
                 None => return Ok(Some(format!("adds `{path}`, which fl never writes"))),
             }
@@ -263,7 +286,8 @@ impl GithubLedger<'_> {
                 )));
             }
             Some(n) if line == 0 || line > n => {
-                return Err(refuse(format!("it has {n} lines, numbered from 1")));
+                let noun = if n == 1 { "line" } else { "lines" };
+                return Err(refuse(format!("it has {n} {noun}, numbered from 1")));
             }
             Some(_) => {}
         }
@@ -485,6 +509,49 @@ mod tests {
         assert!(first.what.contains("closed"), "{}", first.what);
     }
 
+    // Spec §3.5 check 4, extended (the hole a bare `starts_with` left
+    // open): a commit that completes a line an earlier one left cut short
+    // must be reported — not read as ordinary growth just because the
+    // completion trivially "starts with" the cut copy. The commit that
+    // FIRST left it cut is reported, since it is the older departure
+    // (fl never writes an incomplete line either); either commit's
+    // message is "rewrites lines", which is why both qualify.
+    #[test]
+    fn a_commit_that_leaves_or_completes_a_cut_line_is_reported() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let cut = format!("{}second line, not terminated", file(&[line(&run(1))]));
+        let left_it_cut = fake.hand_commit(&[(seg(1).as_str(), Some(cut.as_str()))]);
+        let completed = format!("{cut}, now finished\n");
+        fake.hand_commit(&[(seg(1).as_str(), Some(completed.as_str()))]);
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(
+            first.commit, left_it_cut,
+            "the commit that first left it cut: the oldest departure"
+        );
+        assert!(first.what.contains("rewrites lines"), "{}", first.what);
+    }
+
+    // Spec §3.5 check 4, extended: a brand-new segment that is itself cut
+    // short — never completed by a later commit, so `grows_only` alone
+    // would never see it — must still be reported, at the commit that
+    // introduced it.
+    #[test]
+    fn a_new_segment_without_a_final_newline_is_reported() {
+        let (fake, local, _root) = world();
+        let cut = format!("{}second line, not terminated", file(&[line(&run(1))]));
+        let bad = fake.hand_commit(&[(seg(1).as_str(), Some(cut.as_str()))]);
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert!(
+            first.what.contains("without a final newline"),
+            "{}",
+            first.what
+        );
+    }
+
     #[test]
     fn a_second_history_or_a_merge_is_reported() {
         let (fake, local, root) = world();
@@ -506,6 +573,22 @@ mod tests {
         assert!(first.what.contains("merges"), "{}", first.what);
     }
 
+    // The walk must keep following first parents PAST a merge, all the
+    // way to the anchor: an older rewrite, behind a newer merge, is still
+    // the oldest departure and must be the one reported — not the merge,
+    // which would hide it.
+    #[test]
+    fn verify_reports_an_older_rewrite_even_past_a_newer_merge() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let rewrite = fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(9))]).as_str()))]);
+        fake.hand_merge();
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, rewrite, "the rewrite, not the merge");
+        assert!(first.what.contains("rewrites"), "{}", first.what);
+    }
+
     #[test]
     fn a_first_commit_holding_more_than_fl_writes_is_reported() {
         let fake = FakeGithub::start("acme/widgets");
@@ -519,6 +602,20 @@ mod tests {
         let c = client(&fake);
         let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
         assert_eq!(first.commit, root);
+    }
+
+    // The sibling check `fls_first_commit` also makes: the right two
+    // files, but the wrong format VALUE.
+    #[test]
+    fn an_anchor_whose_format_is_not_1_is_reported() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger_with(&[("format", "2\n"), ("README.md", "x")]);
+        let local = MemStore::default();
+        local.set_ledger_root("R_1", &root).unwrap();
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, root);
+        assert!(first.what.contains("format"), "{}", first.what);
     }
 
     #[test]
@@ -544,6 +641,14 @@ mod tests {
         assert!(matches!(
             open(&c, &local).verify().unwrap_err(),
             StoreError::Ledger(LedgerFault::NoAnchor { .. })
+        ));
+        local
+            .set_ledger_root("R_1", &fake.ledger_head().unwrap())
+            .unwrap();
+        fake.delete_ledger();
+        assert!(matches!(
+            open(&c, &local).verify().unwrap_err(),
+            StoreError::Ledger(LedgerFault::Deleted { .. })
         ));
     }
 
@@ -671,8 +776,8 @@ mod tests {
                 true,
             ),
             (seg(2), 1, "Ada", "r", "no such file", false),
-            (seg(1), 0, "Ada", "r", "1 lines", false),
-            (seg(1), 2, "Ada", "r", "1 lines", false),
+            (seg(1), 0, "Ada", "r", "it has 1 line,", false),
+            (seg(1), 2, "Ada", "r", "it has 1 line,", false),
             (seg(1), 1, " ", "r", "--by", true),
             (seg(1), 1, "Ada", "", "--reason", true),
         ] {
