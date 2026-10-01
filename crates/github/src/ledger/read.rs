@@ -190,6 +190,14 @@ mod tests {
             .count()
     }
 
+    fn ref_reads(fake: &FakeGithub) -> usize {
+        fake.state()
+            .requests
+            .iter()
+            .filter(|r| r.contains("/git/ref/heads/"))
+            .count()
+    }
+
     /// A commit on the fake's ledger that only this test reads: what it holds
     /// does not matter to the head and format checks.
     fn commit_on(fake: &FakeGithub, text: &str) -> String {
@@ -225,10 +233,45 @@ mod tests {
             .set_ledger_root("R_1", &fake.ledger_head().unwrap())
             .unwrap();
         fake.delete_ledger();
+        // ⚠ Pinned: with no last head recorded yet, a 404 is `Deleted` on
+        // the FIRST read — never retried. The retry in
+        // `a_branch_404_right_after_this_machines_own_write_is_read_again_before_a_deletion_is_declared`
+        // is earned only by a machine that already saw a head.
+        let before = ref_reads(&fake);
         let err = open(&c, &local).check_head().unwrap_err();
         assert!(
             matches!(err, StoreError::Ledger(LedgerFault::Deleted { .. })),
             "{err:?}"
+        );
+        assert_eq!(
+            ref_reads(&fake) - before,
+            1,
+            "no last head recorded yet: straight to `Deleted`, no retry"
+        );
+    }
+
+    // ⚠⚠ Important: the 404 retry budget must be BOUNDED — otherwise a real
+    // deletion retries forever. `ref_404_next` set well past `lag_reads`
+    // proves it: the correct code gives up with `Deleted` after exactly
+    // `lag_reads` retries, never because GitHub eventually answered.
+    #[test]
+    fn a_branch_that_stays_404_past_the_lag_budget_is_declared_deleted() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let mine = commit_on(&fake, "a\n");
+        local.set_last_head("R_1", &mine).unwrap();
+        fake.state().ref_404_next = 10;
+        let before = ref_reads(&fake);
+        let err = open(&c, &local).check_head().unwrap_err();
+        assert!(
+            matches!(err, StoreError::Ledger(LedgerFault::Deleted { .. })),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("Restore the branch"), "{err}");
+        assert_eq!(
+            ref_reads(&fake) - before,
+            3,
+            "the initial read plus exactly `lag_reads` (2) retries, then it gives up"
         );
     }
 
@@ -386,6 +429,19 @@ mod tests {
         }
     }
 
+    // Ruling 19, the other half: `1` with NO trailing newline is also
+    // accepted — the newline is optional, not required. A comparison
+    // tightened to require it (`text != "1\n"`) would refuse this silently.
+    #[test]
+    fn a_bare_format_with_no_trailing_newline_is_accepted() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger_with(&[("format", "1"), ("README.md", "x")]);
+        let local = MemStore::default();
+        local.set_ledger_root("R_1", &root).unwrap();
+        let c = client(&fake);
+        assert_eq!(open(&c, &local).check_format().unwrap(), root);
+    }
+
     #[test]
     fn a_ledger_with_no_format_file_is_altered() {
         let fake = FakeGithub::start("acme/widgets");
@@ -472,6 +528,7 @@ mod tests {
             !matches!(err, StoreError::Ledger(LedgerFault::Altered { .. })),
             "a replica that never catches up must not be reported as the file missing: {err:?}"
         );
+        assert!(err.to_string().contains("Retry"), "{err}");
     }
 
     // ⚠ Ruling 24: a branch-ref 404 right after a write this machine already

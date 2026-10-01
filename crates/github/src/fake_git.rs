@@ -565,6 +565,10 @@ fn objects(s: &mut State, vars: &Value) -> Answer {
     }
     let mut repo = serde_json::Map::new();
     if let Some(head) = head {
+        // ⚠ Modelled: `object(oid:)` on a commit GitHub does not hold at
+        // all (never existed — not merely "not yet replicated") answers
+        // `null` with no error, the same shape `graphql_commit_unknown_next`
+        // simulates for a lag — unmeasured; no live test confirms it.
         let known = s.git.commits.contains_key(head) && !lagging;
         repo.insert(
             "head".into(),
