@@ -429,6 +429,53 @@ mod tests {
         assert!(err.to_string().contains("no id"), "{err}");
     }
 
+    // ⚠ A malformed directory answer must never read as an EMPTY directory:
+    // "unreachable is not empty" (spec §2.5) applies here too — a directory
+    // GitHub cannot describe properly is an error, not zero segments.
+    #[test]
+    fn objects_refuses_a_tree_with_no_entries() {
+        let fake = FakeGithub::start("acme/widgets");
+        let head = fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(
+            &fake,
+            "/graphql",
+            200,
+            json!({"data": {"repository": {
+                "head": {"oid": head}, "e0": {"__typename": "Tree"},
+            }}}),
+        );
+        let err = open(&c, &local)
+            .objects(&head, &["runs/k".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("no entries"), "{err}");
+    }
+
+    #[test]
+    fn objects_refuses_a_tree_entry_with_no_name_or_no_oid() {
+        let fake = FakeGithub::start("acme/widgets");
+        let head = fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        body_next(
+            &fake,
+            "/graphql",
+            200,
+            json!({"data": {"repository": {
+                "head": {"oid": head},
+                "e0": {
+                    "__typename": "Tree",
+                    "entries": [{"name": "1.jsonl", "type": "blob"}],
+                },
+            }}}),
+        );
+        let err = open(&c, &local)
+            .objects(&head, &["runs/k".to_string()])
+            .unwrap_err();
+        assert!(err.to_string().contains("no name or no id"), "{err}");
+    }
+
     #[test]
     fn objects_refuses_an_unknown_object_type() {
         let fake = FakeGithub::start("acme/widgets");

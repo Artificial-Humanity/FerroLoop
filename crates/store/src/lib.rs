@@ -1374,6 +1374,32 @@ impl LedgerCache for RedbStore {
             .map_err(backend)?;
         tx.commit().map_err(backend)
     }
+
+    /// One write transaction: the head and every segment land together, or
+    /// (on any error before `commit()`) none of them do — `redb`'s
+    /// `WriteTransaction` aborts on drop when it was never completed.
+    fn remember(
+        &self,
+        repo: &str,
+        head: &str,
+        segments: &[(String, CachedSegment)],
+    ) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        tx.open_table(LEDGER_HEADS)
+            .map_err(backend)?
+            .insert(repo, head)
+            .map_err(backend)?;
+        {
+            let mut table = tx.open_table(LEDGER_SEGMENTS).map_err(backend)?;
+            for (path, segment) in segments {
+                let json = serde_json::to_string(segment).map_err(backend)?;
+                table
+                    .insert((repo, path.as_str()), json.as_str())
+                    .map_err(backend)?;
+            }
+        }
+        tx.commit().map_err(backend)
+    }
 }
 
 #[cfg(test)]

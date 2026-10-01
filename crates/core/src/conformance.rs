@@ -155,7 +155,7 @@ const ALL_ROLES_CASES: usize = 7;
 /// How many cases [`local_handles`] runs. Update deliberately — see [`run_suite`].
 const LOCAL_HANDLES_CASES: usize = 1;
 /// How many cases [`ledger_cache`] runs. Update deliberately — see [`run_suite`].
-const LEDGER_CACHE_CASES: usize = 4;
+const LEDGER_CACHE_CASES: usize = 5;
 
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -259,6 +259,7 @@ pub fn ledger_cache<S: LedgerCache, G>(make: impl Fn() -> (S, G)) {
         a_cached_file_reads_back_by_path_and_by_its_own_directory_only::<S>,
         a_segment_at_the_same_path_in_another_repository_is_never_returned::<S>,
         cached_under_scans_from_the_directory_not_from_the_start_of_the_repository::<S>,
+        remember_commits_the_head_and_every_segment_together::<S>,
     ];
     run_suite("ledger-cache", LEDGER_CACHE_CASES, cases, make);
 }
@@ -391,6 +392,62 @@ fn cached_under_scans_from_the_directory_not_from_the_start_of_the_repository<S:
             ("runs/aa/2.jsonl".to_string(), "r2b".to_string()),
         ],
         "in path order"
+    );
+}
+
+/// `remember` is the write a read commits with: the head and every segment
+/// it validated land together, and a later call only touches what it names
+/// — it adds and replaces, it does not wipe what an earlier call cached.
+fn remember_commits_the_head_and_every_segment_together<S: LedgerCache>(s: &S) {
+    let seg = |oid: &str, closed: bool| CachedSegment {
+        oid: oid.into(),
+        text: format!("{oid}\n"),
+        closed,
+    };
+    assert_eq!(s.last_head("R_1").unwrap(), None);
+    s.remember(
+        "R_1",
+        "c1",
+        &[
+            ("format".to_string(), seg("f1", true)),
+            ("runs/aa/1.jsonl".to_string(), seg("r1", false)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c1"));
+    assert_eq!(s.cached("R_1", "format").unwrap(), Some(seg("f1", true)));
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(seg("r1", false))
+    );
+
+    // A head-only `remember` (no directory read, as `check_format` makes)
+    // still advances the head, and leaves earlier segments alone.
+    s.remember("R_1", "c2", &[]).unwrap();
+    assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c2"));
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(seg("r1", false)),
+        "a head-only remember must not touch a segment it does not name"
+    );
+
+    // A segment an earlier call cached, that this call does not mention,
+    // survives this call: `remember` adds and replaces, it never wipes.
+    s.remember(
+        "R_1",
+        "c3",
+        &[("runs/aa/2.jsonl".to_string(), seg("r2", true))],
+    )
+    .unwrap();
+    assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c3"));
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(seg("r1", false)),
+        "a segment this call did not name is untouched"
+    );
+    assert_eq!(
+        s.cached("R_1", "runs/aa/2.jsonl").unwrap(),
+        Some(seg("r2", true))
     );
 }
 

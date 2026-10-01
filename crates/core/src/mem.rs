@@ -526,6 +526,22 @@ impl LedgerCache for MemStore {
             .insert((repo.to_string(), path.to_string()), segment.clone());
         Ok(())
     }
+
+    fn remember(
+        &self,
+        repo: &str,
+        head: &str,
+        segments: &[(String, CachedSegment)],
+    ) -> Result<(), StoreError> {
+        let mut inner = self.inner.borrow_mut();
+        inner.heads.insert(repo.to_string(), head.to_string());
+        for (path, segment) in segments {
+            inner
+                .segments
+                .insert((repo.to_string(), path.clone()), segment.clone());
+        }
+        Ok(())
+    }
 }
 
 impl Handles for MemStore {

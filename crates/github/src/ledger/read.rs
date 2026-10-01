@@ -139,19 +139,33 @@ impl GithubLedger<'_> {
     pub fn check_format(&self) -> Result<String, StoreError> {
         let head = self.check_head()?;
         let found = self.objects(&head, &[FORMAT_FILE.to_string()])?;
-        self.format(&head, found[0].as_ref())?;
-        self.local.set_last_head(&self.repo.node_id, &head)?;
+        let mut pending = Vec::new();
+        self.format(&head, found[0].as_ref(), &mut pending)?;
+        self.local.remember(&self.repo.node_id, &head, &pending)?;
         Ok(head)
     }
 
     /// `dirs` at the checked head (spec §3.5 checks 1–4 and 7), with
     /// `quarantine.jsonl`. Records the head as the last seen (ruling 10).
+    ///
+    /// ⚠ Every file this read validates is cached together with the new
+    /// last head, in ONE call to `remember` at the very end — never one at
+    /// a time as each file passes. A read that fails partway
+    /// (one directory's blob download, say) must leave NEITHER applied:
+    /// otherwise an earlier file in this same read, already cached on its
+    /// own, would hold a position or content the last head — still the OLD
+    /// one, since this read never finished — never itself confirmed, and a
+    /// later read at that same, unmoved head would see a cache entry from a
+    /// commit it was never recorded as having read, and raise a false
+    /// `Altered` alarm (reproduced by `a_blob_download_that_fails_after_an_
+    /// earlier_segment_already_passed_raises_no_later_alarm`).
     pub(crate) fn snapshot(&self, dirs: &[String]) -> Result<Snapshot, StoreError> {
         let head = self.check_head()?;
         let mut paths = vec![FORMAT_FILE.to_string(), QUARANTINE_FILE.to_string()];
         paths.extend(dirs.iter().cloned());
         let found = self.objects(&head, &paths)?;
-        self.format(&head, found[0].as_ref())?;
+        let mut pending: Vec<(String, CachedSegment)> = Vec::new();
+        self.format(&head, found[0].as_ref(), &mut pending)?;
         let quarantine = match &found[1] {
             None => {
                 if self
@@ -163,7 +177,9 @@ impl GithubLedger<'_> {
                 }
                 String::new()
             }
-            Some(Object::Blob { oid }) => self.grown(&head, QUARANTINE_FILE, oid, false)?,
+            Some(Object::Blob { oid }) => {
+                self.grown(&head, QUARANTINE_FILE, oid, false, &mut pending)?
+            }
             Some(Object::Tree(_)) => {
                 return Err(self.altered(
                     QUARANTINE_FILE,
@@ -174,9 +190,12 @@ impl GithubLedger<'_> {
         };
         let mut out = BTreeMap::new();
         for (dir, f) in dirs.iter().zip(&found[2..]) {
-            out.insert(dir.clone(), self.directory(&head, dir, f.as_ref())?);
+            out.insert(
+                dir.clone(),
+                self.directory(&head, dir, f.as_ref(), &mut pending)?,
+            );
         }
-        self.local.set_last_head(&self.repo.node_id, &head)?;
+        self.local.remember(&self.repo.node_id, &head, &pending)?;
         Ok(Snapshot {
             head,
             dirs: out,
@@ -199,8 +218,16 @@ impl GithubLedger<'_> {
         Ok((text, before))
     }
 
-    /// ⚠ Check 7: the format is one this fl knows.
-    fn format(&self, head: &str, found: Option<&Object>) -> Result<(), StoreError> {
+    /// ⚠ Check 7: the format is one this fl knows. Queues its cache entry
+    /// in `pending` rather than writing it — `snapshot`/`check_format`
+    /// commit every queued entry together with the new last head, only once
+    /// the whole read has passed every check.
+    fn format(
+        &self,
+        head: &str,
+        found: Option<&Object>,
+        pending: &mut Vec<(String, CachedSegment)>,
+    ) -> Result<(), StoreError> {
         let Some(Object::Blob { oid }) = found else {
             return Err(self.altered(FORMAT_FILE, "is missing, or is not a file", head));
         };
@@ -218,20 +245,27 @@ impl GithubLedger<'_> {
             }
             .into());
         }
-        self.local.cache(
-            &self.repo.node_id,
-            FORMAT_FILE,
-            &CachedSegment {
+        pending.push((
+            FORMAT_FILE.to_string(),
+            CachedSegment {
                 oid: oid.clone(),
                 text,
                 closed: true,
             },
-        )
+        ));
+        Ok(())
     }
 
     /// A file that may only grow, checked against the copy read before, and
-    /// cached only once it passed.
-    fn grown(&self, head: &str, path: &str, oid: &str, closed: bool) -> Result<String, StoreError> {
+    /// queued in `pending` — never written directly — only once it passed.
+    fn grown(
+        &self,
+        head: &str,
+        path: &str,
+        oid: &str,
+        closed: bool,
+        pending: &mut Vec<(String, CachedSegment)>,
+    ) -> Result<String, StoreError> {
         let (text, before) = self.text_at(path, oid)?;
         if let Some(c) = &before
             && c.oid != oid
@@ -249,15 +283,24 @@ impl GithubLedger<'_> {
                 ));
             }
         }
-        self.local.cache(
-            &self.repo.node_id,
-            path,
-            &CachedSegment {
-                oid: oid.to_string(),
-                text: text.clone(),
-                closed,
-            },
-        )?;
+        // ⚠ Spec §3.5 check 4, extended: a cut-short copy (no final
+        // newline) must never become the trusted baseline for that
+        // comparison. Completing a cut line only appends bytes after an
+        // unchanged prefix, so ANY completion — including a malicious one —
+        // would trivially "start with" a cached cut-short copy, making
+        // check 4 vacuous for whatever follows it. Leave the cache as it
+        // was; `lines()` still catches the cut line itself, as
+        // `Unreadable`, before any append could ever be planned on it.
+        if text.is_empty() || text.ends_with('\n') {
+            pending.push((
+                path.to_string(),
+                CachedSegment {
+                    oid: oid.to_string(),
+                    text: text.clone(),
+                    closed,
+                },
+            ));
+        }
         Ok(text)
     }
 
@@ -268,6 +311,7 @@ impl GithubLedger<'_> {
         head: &str,
         dir: &str,
         found: Option<&Object>,
+        pending: &mut Vec<(String, CachedSegment)>,
     ) -> Result<Vec<Segment>, StoreError> {
         let entries = match found {
             None => Vec::new(),
@@ -303,7 +347,7 @@ impl GithubLedger<'_> {
         }
         let mut out = Vec::new();
         for (n, (path, oid)) in numbered {
-            let text = self.grown(head, &path, &oid, n < last)?;
+            let text = self.grown(head, &path, &oid, n < last, pending)?;
             out.push(Segment { path, text });
         }
         Ok(out)
@@ -487,6 +531,7 @@ mod tests {
     use fl_core::ids::seq_iri;
     use fl_core::split::LedgerCache;
     use fl_core::store::Bindings;
+    use serde_json::{Value, json};
     use std::time::Duration;
 
     fn client(fake: &FakeGithub) -> Client {
@@ -530,6 +575,12 @@ mod tests {
             .iter()
             .filter(|r| r.contains("/git/ref/heads/"))
             .count()
+    }
+
+    /// The next request whose URL contains `frag` answers `status`/`body`
+    /// instead, once.
+    fn body_next(fake: &FakeGithub, frag: &str, status: u16, body: Value) {
+        fake.state().body_next = Some((frag.into(), status, body));
     }
 
     /// A commit on the fake's ledger that only this test reads: what it holds
@@ -1167,9 +1218,10 @@ mod tests {
         );
     }
 
-    // ⚠ Controller ruling: `layout::lines` refuses a cut-short last segment
-    // (no final newline); a reader must surface that as tampering BEFORE
-    // any append could ever be planned on top of it.
+    // ⚠ Spec §3.1/§3.5 check 4: `layout::lines` refuses a cut-short last
+    // segment (no final newline) as "it does not end with a newline: it was
+    // cut short" — a reader must surface that as tampering BEFORE any
+    // append could ever be planned on top of it.
     #[test]
     fn a_cut_short_open_segment_is_reported_as_unreadable() {
         let (fake, local, _root) = world();
@@ -1437,10 +1489,9 @@ mod tests {
         assert_eq!(fake.state().requests.len(), before, "no request");
     }
 
-    // ⚠ Controller ruling: the GraphQL lag rule (ruling 24) applies to
-    // segment listing and segment reads too, not just the format file.
-    // Right after this machine's own append, a replica that does not yet
-    // know the head commit must never raise a false alarm reading segments.
+    // ⚠ Ruling 24, applied beyond the format file: right after this
+    // machine's own append, a replica that does not yet know the head
+    // commit must raise no alarm reading a directory's segments either.
     #[test]
     fn a_graphql_replica_that_has_not_seen_this_machines_own_append_raises_no_alarm_reading_segments()
      {
@@ -1459,6 +1510,164 @@ mod tests {
             vec![run(1), run(2)],
             "two lagging GraphQL reads after this machine's own append, then it \
              catches up: no alarm"
+        );
+    }
+
+    // ⚠ Spec §3.5 checks 3 and 4: a segment's cache entry must land together
+    // with the new last head, never before it. Steps: a normal read; seg1
+    // grows AND a new seg2 appears in the same commit (so both need a fresh
+    // download); seg2's blob download fails once, after seg1's has already
+    // passed its own growth check — the read as a whole must fail, and
+    // nothing from it may be cached, so a later read at the SAME, still
+    // unmoved head raises no alarm.
+    #[test]
+    fn a_blob_download_that_fails_after_an_earlier_segment_already_passed_raises_no_later_alarm() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        open(&c, &local).runs(&gate()).unwrap();
+
+        let seg2_text = file(&[line(&run(3))]);
+        fake.hand_commit(&[
+            (
+                seg(1).as_str(),
+                Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+            ),
+            (seg(2).as_str(), Some(seg2_text.as_str())),
+        ]);
+        let seg2_oid = fake
+            .state()
+            .git
+            .blobs
+            .iter()
+            .find(|(_, t)| **t == seg2_text)
+            .map(|(id, _)| id.clone())
+            .expect("seg2's blob exists on the fake");
+        body_next(&fake, &format!("/git/blobs/{seg2_oid}"), 502, json!({}));
+        open(&c, &local).runs(&gate()).unwrap_err();
+
+        // A replica now serves the OLD head again — one behind the true,
+        // current one, exactly what `check_head` sees right after this
+        // machine's own write, before every replica has caught up. The
+        // failed read above must not have cached anything that contradicts
+        // it.
+        fake.state().ref_behind_next = 1;
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1)],
+            "no alarm reading the old head again"
+        );
+
+        // Once a replica serves the real head again, it reads back in
+        // full — seg2's blob, never cached by the failed attempt, downloads
+        // cleanly.
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2), run(3)]
+        );
+    }
+
+    // ⚠ Spec §3.5 check 5, across segments: `seen` must span every segment
+    // of a directory, not reset per segment — the same id can land in two
+    // different segments as easily as twice in one.
+    #[test]
+    fn the_same_id_in_two_different_segments_with_different_content_is_tampered() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(file(&[line(&run(1))]).as_str())),
+            (seg(2).as_str(), Some(file(&[line(&run(2))]).as_str())),
+        ]);
+        let c = client(&fake);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2)]
+        );
+        let mut other = run(1);
+        other.commit = "def".into();
+        fake.hand_commit(&[(
+            seg(2).as_str(),
+            Some(file(&[line(&run(2)), line(&other)]).as_str()),
+        )]);
+        let err = open(&c, &local).runs(&gate()).unwrap_err();
+        let want = run(1).id.unwrap();
+        assert!(
+            matches!(err, StoreError::Tampered { ref id, .. } if *id == want),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn the_same_id_in_two_different_segments_with_identical_content_is_read_once() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[
+            (seg(1).as_str(), Some(file(&[line(&run(1))]).as_str())),
+            (
+                seg(2).as_str(),
+                Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
+            ),
+        ]);
+        let c = client(&fake);
+        assert_eq!(
+            open(&c, &local).runs(&gate()).unwrap(),
+            vec![run(1), run(2)]
+        );
+    }
+
+    // ⚠ `blame` never errors: when GitHub's GraphQL cannot answer it, the
+    // unreadable-line message still names the file and the line, and says
+    // the commit is unknown rather than silently naming the wrong one.
+    #[test]
+    fn an_unreadable_lines_blame_that_fails_still_names_the_file_and_line_as_unknown() {
+        let (fake, local, _root) = world();
+        let damaged = format!("not json\n{}", file(&[line(&run(2))]));
+        fake.hand_commit(&[(seg(1).as_str(), Some(damaged.as_str()))]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let dir = runs_dir();
+        let snap = l.snapshot(std::slice::from_ref(&dir)).unwrap();
+        // The directory snapshot's own GraphQL call already landed; only
+        // `blame`'s call (made inside `lines`) is left to intercept.
+        body_next(&fake, "/graphql", 502, json!({}));
+        let err = l.lines(&snap, Area::Runs, &dir).unwrap_err();
+        match &err {
+            StoreError::Ledger(LedgerFault::Unreadable {
+                file: f,
+                line: n,
+                commit,
+                ..
+            }) => {
+                assert_eq!(f, &seg(1));
+                assert_eq!(*n, 1);
+                assert!(commit.contains("unknown"), "{commit}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // ⚠ Spec §3.5 check 4, extended: a cut-short copy must never become the
+    // trusted baseline for a later comparison — any later text trivially
+    // "starts with" it. A good read first establishes a real baseline; a
+    // later cut-short growth must leave that baseline exactly as it was.
+    #[test]
+    fn a_cut_short_segment_is_not_cached_so_the_trusted_copy_is_unchanged() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        open(&c, &local).runs(&gate()).unwrap();
+        let good = local.cached("R_1", &seg(1)).unwrap().unwrap();
+
+        let cut = format!(
+            "{}{}\nnot terminated",
+            file(&[line(&run(1))]),
+            line(&run(2))
+        );
+        fake.hand_commit(&[(seg(1).as_str(), Some(cut.as_str()))]);
+        open(&c, &local).runs(&gate()).unwrap_err();
+
+        assert_eq!(
+            local.cached("R_1", &seg(1)).unwrap().unwrap(),
+            good,
+            "a cut-short read must not replace the trusted baseline"
         );
     }
 }

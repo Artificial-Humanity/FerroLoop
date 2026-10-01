@@ -95,6 +95,19 @@ pub trait LedgerCache {
     ) -> Result<Vec<(String, CachedSegment)>, StoreError>;
     /// Replaces what was cached at `path`.
     fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError>;
+    /// Commits `head` as the last seen, and every `(path, segment)` a read
+    /// validated, together in ONE write (GitHub ledger spec §3.5 checks 3
+    /// and 4). A read that fails partway must leave neither applied: a
+    /// segment cached from a read that never finished, while the last head
+    /// stayed behind it, would hold a position (open or closed) or a
+    /// content a later read AT THAT SAME, unmoved head never itself
+    /// confirmed — raising a false alarm the next time that head is read.
+    fn remember(
+        &self,
+        repo: &str,
+        head: &str,
+        segments: &[(String, CachedSegment)],
+    ) -> Result<(), StoreError>;
 }
 
 /// Everything the GitHub ledger keeps on this machine: the repository
