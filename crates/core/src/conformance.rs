@@ -155,7 +155,7 @@ const ALL_ROLES_CASES: usize = 7;
 /// How many cases [`local_handles`] runs. Update deliberately — see [`run_suite`].
 const LOCAL_HANDLES_CASES: usize = 1;
 /// How many cases [`ledger_cache`] runs. Update deliberately — see [`run_suite`].
-const LEDGER_CACHE_CASES: usize = 3;
+const LEDGER_CACHE_CASES: usize = 4;
 
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -258,6 +258,7 @@ pub fn ledger_cache<S: LedgerCache, G>(make: impl Fn() -> (S, G)) {
         the_last_head_is_kept_per_repository_and_replaced::<S>,
         a_cached_file_reads_back_by_path_and_by_its_own_directory_only::<S>,
         a_segment_at_the_same_path_in_another_repository_is_never_returned::<S>,
+        cached_under_scans_from_the_directory_not_from_the_start_of_the_repository::<S>,
     ];
     run_suite("ledger-cache", LEDGER_CACHE_CASES, cases, make);
 }
@@ -340,6 +341,56 @@ fn a_segment_at_the_same_path_in_another_repository_is_never_returned<S: LedgerC
         under_r1,
         vec![("runs/aa/1.jsonl".to_string(), "o1".to_string())],
         "R_2's segment at the identical path must not appear in R_1's read"
+    );
+}
+
+/// ⚠ Pins `cached_under`'s scan START, not just its stopping condition.
+/// `R_1`'s `format` row sorts, as a `(repo, path)` key, before `runs/aa/` —
+/// and `R_1`'s `runs/a9/1.jsonl` sorts between `format` and `runs/aa/` too,
+/// since `'9'` is less than `'a'`. A scan that starts too early (the whole
+/// table, or the repository's own first row) hits one of these before ever
+/// reaching `runs/aa`, and an implementation that stops at the first
+/// mismatch breaks right there — silently returning an empty or short list,
+/// never an error.
+fn cached_under_scans_from_the_directory_not_from_the_start_of_the_repository<S: LedgerCache>(
+    s: &S,
+) {
+    let seg = |oid: &str| CachedSegment {
+        oid: oid.into(),
+        text: format!("{oid}\n"),
+        closed: false,
+    };
+    s.cache("R_1", "format", &seg("meta")).unwrap();
+    s.cache("R_1", "runs/a9/1.jsonl", &seg("a9")).unwrap();
+    s.cache("R_1", "runs/aa/1.jsonl", &seg("r1a")).unwrap();
+    s.cache("R_2", "runs/aa/1.jsonl", &seg("r2a")).unwrap();
+    s.cache("R_2", "runs/aa/2.jsonl", &seg("r2b")).unwrap();
+
+    let r1: Vec<(String, String)> = s
+        .cached_under("R_1", "runs/aa")
+        .unwrap()
+        .into_iter()
+        .map(|(p, c)| (p, c.oid))
+        .collect();
+    assert_eq!(
+        r1,
+        vec![("runs/aa/1.jsonl".to_string(), "r1a".to_string())],
+        "neither `format` nor `runs/a9` belong under `runs/aa`"
+    );
+
+    let r2: Vec<(String, String)> = s
+        .cached_under("R_2", "runs/aa")
+        .unwrap()
+        .into_iter()
+        .map(|(p, c)| (p, c.oid))
+        .collect();
+    assert_eq!(
+        r2,
+        vec![
+            ("runs/aa/1.jsonl".to_string(), "r2a".to_string()),
+            ("runs/aa/2.jsonl".to_string(), "r2b".to_string()),
+        ],
+        "in path order"
     );
 }
 

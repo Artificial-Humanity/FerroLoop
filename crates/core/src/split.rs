@@ -70,6 +70,7 @@ impl<T: Ledger + Outbox> LocalLedger for T {}
 pub struct CachedSegment {
     /// The blob's object id when it was read.
     pub oid: String,
+    /// The blob's text as read.
     pub text: String,
     /// Whether a later segment of its directory existed when it was read.
     /// ⚠ A closed segment never changes.
