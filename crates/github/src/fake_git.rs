@@ -242,6 +242,10 @@ pub(crate) fn rest(
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     Some(match (method, rest) {
         ("GET", ["git", "ref", name @ ..]) => {
+            if s.ref_404_next > 0 {
+                s.ref_404_next -= 1;
+                return Some(not_found());
+            }
             let name = name.join("/");
             let head = s.git.refs.get(&name).cloned();
             let lagging = s.ref_behind_next > 0;
@@ -540,18 +544,46 @@ fn repository_known(s: &State, vars: &Value) -> bool {
 /// ⚠ Modelled: `object(expression: "<commit>:<path>")` answers a tree's
 /// entries, a blob's id, or `null` — no error — for a path the commit does
 /// not hold. Confirmed by live test `init_sets_up_a_ledger_on_a_private_repository`.
-fn objects(s: &State, vars: &Value) -> Answer {
+///
+/// When the caller also asks for `head` (the commit itself, by `oid`):
+/// `graphql_commit_unknown_next` makes this replica answer as though it has
+/// not learned of that commit yet — `head` AND every `eN` come back null,
+/// even for a commit and paths that are real, since a replica that has not
+/// replicated a commit could not resolve expressions against it either
+/// (spec §3.5 / ruling 24).
+fn objects(s: &mut State, vars: &Value) -> Answer {
     if !repository_known(s, vars) {
         return answer(
             200,
             json!({"data": {"repository": null}, "errors": [{"type": "NOT_FOUND"}]}),
         );
     }
+    let head = vars.get("head").and_then(Value::as_str);
+    let lagging = head.is_some() && s.graphql_commit_unknown_next > 0;
+    if lagging {
+        s.graphql_commit_unknown_next -= 1;
+    }
     let mut repo = serde_json::Map::new();
+    if let Some(head) = head {
+        let known = s.git.commits.contains_key(head) && !lagging;
+        repo.insert(
+            "head".into(),
+            if known {
+                json!({"oid": head})
+            } else {
+                Value::Null
+            },
+        );
+    }
     if let Some(all) = vars.as_object() {
         for (k, e) in all {
             if k.starts_with('e') && k[1..].parse::<u32>().is_ok() {
-                repo.insert(k.clone(), object_at(&s.git, e.as_str().unwrap_or("")));
+                let v = if lagging {
+                    Value::Null
+                } else {
+                    object_at(&s.git, e.as_str().unwrap_or(""))
+                };
+                repo.insert(k.clone(), v);
             }
         }
     }

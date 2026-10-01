@@ -222,6 +222,25 @@ pub struct State {
     /// ⚠ Modelled — confirmed by live test
     /// `create_commit_on_branch_without_contents_write_is_refused`.
     pub refuse_next_commit_as_forbidden: bool,
+    /// The first request whose path contains this fragment answers with
+    /// this status and body instead of its normal handling — a malformed
+    /// GitHub answer none of the fake's real routes produce on their own
+    /// (a 200 missing a field it always sends, a non-`Blob`/`Tree`
+    /// `__typename`). Left alone (not consumed) by every request that does
+    /// not match the fragment, so it fires on the one request a test means
+    /// it for. One-shot once matched.
+    pub body_next: Option<(String, u16, Value)>,
+    /// The next this-many `ledgerObjects` reads answer as if GraphQL does
+    /// not yet know the newest commit at all: `head` and every `eN` object
+    /// come back null, even when the commit and paths are real — a GraphQL
+    /// replica that has not caught up with a write this machine (or
+    /// another) just made (spec §3.5 / ruling 24).
+    pub graphql_commit_unknown_next: u32,
+    /// The next this-many branch-ref reads answer 404 outright, as if the
+    /// branch does not exist yet — distinct from `ref_behind_next` (which
+    /// answers an older commit): a replica that has not learned of the
+    /// branch at all yet (ruling 24).
+    pub ref_404_next: u32,
 }
 
 pub struct FakeGithub {
@@ -668,6 +687,13 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         let mut a = answer(503, Value::Null);
         a.hang_up = true;
         return a;
+    }
+    if s.body_next
+        .as_ref()
+        .is_some_and(|(frag, _, _)| url.contains(frag.as_str()))
+    {
+        let (_, status, body) = s.body_next.take().expect("just matched");
+        return answer(status, body);
     }
     if let Some(needs) = s.permission_refused_next.take() {
         let mut a = answer(

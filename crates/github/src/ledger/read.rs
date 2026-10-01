@@ -32,15 +32,24 @@ impl GithubLedger<'_> {
         let repo = self.repo.full_name.clone();
         let node = self.repo.node_id.as_str();
         let anchor = self.local.ledger_root(node)?;
+        let last_seen = self.local.last_head(node)?;
         let mut reads = 0u32;
         loop {
             let (head, anchor) = match (self.branch_head(BRANCH)?, anchor.clone()) {
                 (Some(h), Some(a)) => (h, a),
                 (None, None) => return Err(LedgerFault::NotSetUp { repo }.into()),
-                (None, Some(root)) => return Err(LedgerFault::Deleted { repo, root }.into()),
                 (Some(_), None) => return Err(LedgerFault::NoAnchor { repo }.into()),
+                // ⚠ Ruling 24: when this machine already saw a head, a 404
+                // can be a replica that has not learned of the branch at
+                // all yet — not proof it was deleted. Read again first.
+                (None, Some(_)) if last_seen.is_some() && reads < self.lag_reads => {
+                    reads += 1;
+                    std::thread::sleep(self.lag_pause);
+                    continue;
+                }
+                (None, Some(root)) => return Err(LedgerFault::Deleted { repo, root }.into()),
             };
-            let (against, base) = match self.local.last_head(node)? {
+            let (against, base) = match last_seen.clone() {
                 Some(seen) => ("the last head this machine saw", seen),
                 None => ("the ledger's first commit", anchor),
             };
@@ -109,10 +118,16 @@ impl GithubLedger<'_> {
             return Err(self.altered(FORMAT_FILE, "is missing, or is not a file", head));
         };
         let (text, _) = self.text_at(FORMAT_FILE, oid)?;
+        // ⚠ Ruling 19: only the exact text `1` (one trailing newline
+        // allowed) is format 1 — not merely text that TRIMS to `1`, which
+        // `1\r\n` or ` 1\n` also would. `found` carries the raw text,
+        // escaped (`{:?}`), never trimmed: a damaged `1\r\n` must not be
+        // reported as `1`, which would read as "this is already the format
+        // fl reads" and hide the damage instead of naming it.
         if text.strip_suffix('\n').unwrap_or(&text) != FORMAT {
             return Err(LedgerFault::UnknownFormat {
                 repo: self.repo.full_name.clone(),
-                found: text.trim().to_string(),
+                found: format!("{text:?}"),
             }
             .into());
         }
@@ -322,7 +337,9 @@ mod tests {
         }
     }
 
-    // ⚠ Spec §3.5 check 7.
+    // ⚠ Spec §3.5 check 7. Ruling 19: `found` carries the RAW text, escaped
+    // — never trimmed — so a damaged file is never shown as the clean text
+    // it merely trims to.
     #[test]
     fn a_format_other_than_1_is_refused_naming_an_upgrade() {
         let fake = FakeGithub::start("acme/widgets");
@@ -335,11 +352,38 @@ mod tests {
             matches!(
                 err,
                 StoreError::Ledger(LedgerFault::UnknownFormat { ref found, .. })
-                    if found == "2"
+                    if *found == format!("{:?}", "2\n")
             ),
             "{err:?}"
         );
         assert!(err.to_string().contains("Upgrade fl"), "{err}");
+        assert_eq!(
+            local.last_head("R_1").unwrap(),
+            None,
+            "a refusal must not record the head as checked"
+        );
+    }
+
+    // Ruling 19: only the exact text `1` (one trailing newline allowed) is
+    // format 1 — text that merely TRIMS to `1` (a stray `\r`, a leading
+    // space) is not, and `found` must show the raw, escaped text so the
+    // message never reads as "this is already format 1".
+    #[test]
+    fn a_format_with_hidden_whitespace_is_refused_and_reported_raw_not_trimmed() {
+        for damaged in ["1\r\n", " 1\n", " 1"] {
+            let fake = FakeGithub::start("acme/widgets");
+            let root = fake.seed_ledger_with(&[("format", damaged), ("README.md", "x")]);
+            let local = MemStore::default();
+            local.set_ledger_root("R_1", &root).unwrap();
+            let c = client(&fake);
+            match open(&c, &local).check_format().unwrap_err() {
+                StoreError::Ledger(LedgerFault::UnknownFormat { found, .. }) => {
+                    assert_ne!(found, "1", "{damaged:?}: must not read as the clean format");
+                    assert_eq!(found, format!("{damaged:?}"), "{damaged:?}");
+                }
+                other => panic!("{damaged:?}: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -358,6 +402,11 @@ mod tests {
             ),
             "{err:?}"
         );
+        assert_eq!(
+            local.last_head("R_1").unwrap(),
+            None,
+            "a refusal must not record the head as checked"
+        );
     }
 
     // Spec §3.3: a file read before is not downloaded again.
@@ -367,7 +416,79 @@ mod tests {
         let c = client(&fake);
         open(&c, &local).check_format().unwrap();
         let before = blob_reads(&fake);
+        assert_eq!(before, 1, "the first check must itself have downloaded it");
         open(&c, &local).check_format().unwrap();
         assert_eq!(blob_reads(&fake), before);
+    }
+
+    // The cache is reused only when its recorded oid still matches what the
+    // branch names now — never merely because the path was read before.
+    #[test]
+    fn a_cached_file_is_not_reused_once_its_oid_has_moved_on() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        open(&c, &local).check_format().unwrap();
+        fake.hand_commit(&[("format", Some("2\n"))]);
+        let err = open(&c, &local).check_format().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Ledger(LedgerFault::UnknownFormat { ref found, .. })
+                    if *found == format!("{:?}", "2\n")
+            ),
+            "{err:?}"
+        );
+    }
+
+    // ⚠ Ruling 24: GraphQL can be served by a replica that has not caught up
+    // with a write yet — separately from the REST replica `check_head`
+    // already confirmed the head against. A `ledgerObjects` answer that does
+    // not yet know the checked head is read again before it counts as the
+    // format file being missing.
+    #[test]
+    fn a_graphql_replica_that_has_not_seen_the_last_write_raises_no_alarm_reading_the_format() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        open(&c, &local).check_format().unwrap();
+        commit_on(&fake, "a\n");
+        fake.state().graphql_commit_unknown_next = 2;
+        open(&c, &local)
+            .check_format()
+            .expect("two lagging GraphQL reads, then it catches up: no alarm");
+    }
+
+    // The reverse of the above: a lag that never resolves must not be
+    // reported as the file being missing — that would be a false alarm just
+    // as much as an immediate one.
+    #[test]
+    fn a_graphql_replica_that_never_catches_up_is_an_error_not_a_false_altered() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        open(&c, &local).check_format().unwrap();
+        commit_on(&fake, "a\n");
+        fake.state().graphql_commit_unknown_next = 3;
+        let err = open(&c, &local).check_format().unwrap_err();
+        assert!(
+            !matches!(err, StoreError::Ledger(LedgerFault::Altered { .. })),
+            "a replica that never catches up must not be reported as the file missing: {err:?}"
+        );
+    }
+
+    // ⚠ Ruling 24: a branch-ref 404 right after a write this machine already
+    // recorded can be a replica that has not learned of the branch at all
+    // yet, not proof it was deleted.
+    #[test]
+    fn a_branch_404_right_after_this_machines_own_write_is_read_again_before_a_deletion_is_declared()
+     {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let mine = commit_on(&fake, "a\n");
+        local.set_last_head("R_1", &mine).unwrap();
+        fake.state().ref_404_next = 1;
+        assert_eq!(
+            open(&c, &local).check_head().unwrap(),
+            mine,
+            "one 404 read again, then the real branch: no alarm"
+        );
     }
 }
