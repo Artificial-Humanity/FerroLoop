@@ -206,7 +206,9 @@ pub struct State {
     /// to this path — another machine landing first. Consumed one per
     /// commit, oldest first.
     pub foreign_appends: Vec<(String, String)>,
-    /// The next this-many ledger commits answer 502 and nothing lands.
+    /// The next this-many commits that would land answer 502 instead (a
+    /// stale commit, refused before this is consulted, does not consume
+    /// it).
     pub fail_commits: u32,
     /// The next ledger commit lands, then its answer breaks off. One-shot.
     pub hang_up_after_next_commit: bool,
@@ -217,7 +219,8 @@ pub struct State {
     /// The next ledger commit answers 200 with a GraphQL error of type
     /// FORBIDDEN, rather than an HTTP 403 naming a permission — a second
     /// shape live GraphQL can use to refuse a missing permission. One-shot.
-    /// ⚠ Modelled — confirmed by a B2 live test.
+    /// ⚠ Modelled — confirmed by live test
+    /// `create_commit_on_branch_without_contents_write_is_refused`.
     pub refuse_next_commit_as_forbidden: bool,
 }
 

@@ -674,6 +674,10 @@ fn append(s: &mut State, vars: &Value) -> Answer {
         .and_then(Value::as_str)
         .unwrap_or("");
     let bound = named.split_once('/').is_some_and(|(o, r)| s.is_bound(o, r));
+    // ⚠ Modelled: an unbound repository and a branch GitHub cannot resolve
+    // both answer `createCommitOnBranch: null` with a NOT_FOUND error — the
+    // same shape either way. Unmeasured; no live test provokes either case
+    // yet.
     if !bound || s.git.head(&branch).is_none() {
         return answer(
             200,
@@ -701,10 +705,11 @@ fn append(s: &mut State, vars: &Value) -> Answer {
             .push(("x-accepted-github-permissions".into(), needs));
         return a;
     }
-    // ⚠ Modelled — confirmed by a B2 live test: live GraphQL can refuse a
-    // missing permission as a 200 carrying a FORBIDDEN error instead of the
-    // 403 above. Both shapes are a refusal: nothing lands, and the branch
-    // head does not move.
+    // ⚠ Modelled — confirmed by live test
+    // `create_commit_on_branch_without_contents_write_is_refused`: live
+    // GraphQL can refuse a missing permission as a 200 carrying a FORBIDDEN
+    // error instead of the 403 above. Both shapes are a refusal: nothing
+    // lands, and the branch head does not move.
     if std::mem::take(&mut s.refuse_next_commit_as_forbidden) {
         return answer(
             200,
@@ -750,6 +755,24 @@ fn append(s: &mut State, vars: &Value) -> Answer {
     if s.fail_commits > 0 {
         s.fail_commits -= 1;
         return answer(502, json!({"message": "fake: the commit did not land"}));
+    }
+    // The ledger only ever appends (global constraints §3.6: "nothing is
+    // ever removed"), so fl never sends a deletion — but the fake must
+    // refuse one outright rather than silently drop it, the same way it
+    // refuses a malformed addition below.
+    let deletions = input
+        .pointer("/fileChanges/deletions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !deletions.is_empty() {
+        return answer(
+            200,
+            json!({"errors": [{
+                "type": "UNPROCESSABLE",
+                "message": "the fake does not support fileChanges.deletions",
+            }]}),
+        );
     }
     let mut changes = Vec::new();
     let additions = input
@@ -1289,6 +1312,28 @@ mod tests {
         assert!(repo["e3"].is_null());
     }
 
+    // Controller fix round 1(a): the git endpoints are served only for the
+    // bound repository (as REST's `a_git_endpoint_is_served_only_for_the_bound_repository`
+    // already checks); `ledgerObjects` must do the same.
+    #[test]
+    fn ledger_objects_against_an_unbound_repository_is_not_found() {
+        let fake = FakeGithub::start("acme/widgets");
+        let head = fake.seed_ledger();
+        fake.reuse_name("acme/other");
+        let a = client(&fake)
+            .graphql_answer(
+                OBJECTS,
+                json!({
+                    "owner": "acme", "name": "other",
+                    "e0": format!("{head}:format"), "e1": format!("{head}:format"),
+                    "e2": format!("{head}:format"), "e3": format!("{head}:format"),
+                }),
+            )
+            .unwrap();
+        assert!(a.data.unwrap()["repository"].is_null());
+        assert_eq!(a.errors[0]["type"], "NOT_FOUND");
+    }
+
     #[test]
     fn an_append_lands_on_the_head_it_expects_and_is_refused_on_any_other() {
         let fake = FakeGithub::start("acme/widgets");
@@ -1401,11 +1446,12 @@ mod tests {
         );
     }
 
-    // ⚠ Modelled — confirmed by a B2 live test: live GraphQL can refuse a
-    // missing permission as an HTTP 200 carrying an error of type FORBIDDEN,
-    // rather than an HTTP 403 with `x-accepted-github-permissions` (as
+    // ⚠ Modelled — confirmed by live test
+    // `create_commit_on_branch_without_contents_write_is_refused`: live
+    // GraphQL can refuse a missing permission as an HTTP 200 carrying an
+    // error of type FORBIDDEN, rather than an HTTP 403 with
+    // `x-accepted-github-permissions` (as
     // `a_commit_refused_for_want_of_a_permission_names_it` models above).
-    // Task 11 judges both shapes.
     #[test]
     fn a_commit_can_also_be_refused_as_an_http_200_with_a_forbidden_error() {
         let fake = FakeGithub::start("acme/widgets");
@@ -1436,6 +1482,116 @@ mod tests {
         assert_eq!(a.errors[0]["type"], "NOT_FOUND");
     }
 
+    // Controller fix round 1(c): `an_append_to_a_branch_that_is_not_there_is_not_found`
+    // above exercises the branch-missing half of the NOT_FOUND check; this
+    // covers the unbound-repository half, with the ledger actually seeded
+    // (so a bug that checked only the branch's existence would miss it).
+    #[test]
+    fn an_append_naming_another_known_repository_is_not_found() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        fake.reuse_name("acme/other");
+        let mut input = append_input(&root, "runs/k/1.jsonl", "a\n");
+        input["input"]["branch"]["repositoryNameWithOwner"] = json!("acme/other");
+        let a = client(&fake).graphql_answer(APPEND, input).unwrap();
+        assert_eq!(a.errors[0]["type"], "NOT_FOUND");
+        assert_eq!(
+            fake.ledger_head(),
+            Some(root),
+            "a refused commit leaves the branch head unchanged"
+        );
+    }
+
+    // Controller fix round 1(d): an addition the fake cannot read is
+    // refused, not silently coerced into an empty path or empty content.
+    #[test]
+    fn an_addition_with_no_path_or_unreadable_base64_is_unprocessable() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let c = client(&fake);
+        let unprocessable = |additions: serde_json::Value| {
+            let mut input = append_input(&root, "unused", "unused");
+            input["input"]["fileChanges"]["additions"] = additions;
+            c.graphql_answer(APPEND, input).unwrap()
+        };
+        let bad_base64 = unprocessable(json!([{"path": "f", "contents": "not base64 !!!"}]));
+        assert_eq!(bad_base64.errors[0]["type"], "UNPROCESSABLE");
+        let no_path = unprocessable(json!([{"contents": "eA=="}]));
+        assert_eq!(no_path.errors[0]["type"], "UNPROCESSABLE");
+        assert_eq!(
+            fake.ledger_head(),
+            Some(root),
+            "a refused commit leaves the branch head unchanged"
+        );
+    }
+
+    // Controller fix round 1 item 4: the fake must refuse a deletion
+    // outright (fl never asks for one — the ledger only ever appends) and
+    // not silently ignore it.
+    #[test]
+    fn an_append_carrying_a_deletion_is_refused_the_fake_does_not_support_it() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let mut input = append_input(&root, "runs/k/1.jsonl", "a\n");
+        input["input"]["fileChanges"]["deletions"] = json!([{"path": "format"}]);
+        let a = client(&fake).graphql_answer(APPEND, input).unwrap();
+        assert_eq!(a.errors[0]["type"], "UNPROCESSABLE");
+        assert_eq!(
+            fake.ledger_head(),
+            Some(root),
+            "a refused commit leaves the branch head unchanged"
+        );
+    }
+
+    /// An append that must succeed, returning the new head — used by
+    /// `each_one_shot_refusal_knob_resets_after_firing` to show a knob does
+    /// not go on refusing past the one commit it names.
+    fn land(c: &Client, head: &str, path: &str, text: &str) -> String {
+        let a = c
+            .graphql_answer(APPEND, append_input(head, path, text))
+            .unwrap();
+        a.data.unwrap()["createCommitOnBranch"]["commit"]["oid"]
+            .as_str()
+            .expect("the commit landed")
+            .to_string()
+    }
+
+    // Controller fix round 1(e): every refusal knob above is one-shot —
+    // after it fires once, the NEXT append on the current head must still
+    // land, not go on being refused forever.
+    #[test]
+    fn each_one_shot_refusal_knob_resets_after_firing() {
+        let fake = FakeGithub::start("acme/widgets");
+        let mut root = fake.seed_ledger();
+        let c = client(&fake);
+
+        fake.state().rate_limit_next_commit = true;
+        c.graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap_err();
+        root = land(&c, &root, "runs/k/1.jsonl", "a\n");
+
+        fake.state().refuse_next_commit_for = Some("contents=write".into());
+        c.graphql_answer(APPEND, append_input(&root, "runs/k/2.jsonl", "b\n"))
+            .unwrap_err();
+        root = land(&c, &root, "runs/k/2.jsonl", "b\n");
+
+        fake.state().refuse_next_commit_as_forbidden = true;
+        let forbidden = c
+            .graphql_answer(APPEND, append_input(&root, "runs/k/3.jsonl", "c\n"))
+            .unwrap();
+        assert_eq!(forbidden.errors[0]["type"], "FORBIDDEN");
+        root = land(&c, &root, "runs/k/3.jsonl", "c\n");
+
+        fake.state().hang_up_after_next_commit = true;
+        c.graphql_answer(APPEND, append_input(&root, "runs/k/4.jsonl", "d\n"))
+            .unwrap_err();
+        // The hung-up commit landed — only its answer was lost — so the
+        // next append must use the head it actually left behind, not the
+        // one it was asked for.
+        root = fake.ledger_head().expect("the hung-up commit landed");
+        land(&c, &root, "runs/k/5.jsonl", "e\n");
+    }
+
     // ⚠ Modelled: blame names, for each line, the commit that last changed
     // it. Confirmed by live test `a_hand_edit_is_detected_and_named`.
     #[test]
@@ -1458,6 +1614,37 @@ mod tests {
                 {"startingLine": 2, "endingLine": 3, "commit": {"oid": second}},
             ])
         );
+    }
+
+    // Controller fix round 1(b): both halves of blame's guard are needed —
+    // not just the bound-repository check: without the commit-existence
+    // check, `s.git.commits[&c]` would panic in the server thread the
+    // moment it tried to walk an unknown commit's first-parent chain.
+    #[test]
+    fn ledger_blame_against_an_unbound_repository_or_an_unknown_commit_answers_null() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        fake.reuse_name("acme/other");
+        let c = client(&fake);
+        // A commit that DOES exist, so only the repository-binding half of
+        // the guard can be what rejects this — not the commit check.
+        let unbound = c
+            .graphql_answer(
+                BLAME,
+                json!({"owner": "acme", "name": "other", "commit": root, "path": "f"}),
+            )
+            .unwrap();
+        assert!(unbound.data.unwrap()["repository"]["object"].is_null());
+        let unknown_commit = c
+            .graphql_answer(
+                BLAME,
+                json!({
+                    "owner": "acme", "name": "widgets",
+                    "commit": "0".repeat(40), "path": "f",
+                }),
+            )
+            .unwrap();
+        assert!(unknown_commit.data.unwrap()["repository"]["object"].is_null());
     }
 
     #[test]
