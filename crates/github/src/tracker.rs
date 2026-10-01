@@ -275,6 +275,12 @@ impl GithubTracker {
         &self.repo
     }
 
+    /// The client this tracker writes through, so the GitHub ledger can
+    /// share its credential and origin guard (GitHub ledger spec §1.1).
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     pub fn describe(&self) -> String {
         self.client.describe()
     }

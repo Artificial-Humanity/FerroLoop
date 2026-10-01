@@ -14,4 +14,5 @@ pub mod tracker;
 
 pub use client::{Client, DEFAULT_API, GraphqlAnswer, Method, Reply};
 pub use creds::{AppCredentials, Credentials, EnvToken};
+pub use ledger::GithubLedger;
 pub use tracker::{GithubTracker, Notice, Repaired, Repo};
