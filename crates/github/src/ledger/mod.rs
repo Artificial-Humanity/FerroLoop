@@ -8,6 +8,7 @@ mod git;
 mod init;
 pub mod layout;
 mod read;
+mod verify;
 
 #[cfg(test)]
 mod fixture;
@@ -27,6 +28,7 @@ pub use append::TRIES;
 pub use disclose::Visibility;
 pub use init::{InitOutcome, Mode, guidance, ruleset_command};
 pub use read::Note;
+pub use verify::{BadCommit, Verified};
 
 /// The GitHub side of mode B, for one repository and one command.
 ///

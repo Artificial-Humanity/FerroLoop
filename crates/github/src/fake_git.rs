@@ -449,7 +449,10 @@ fn get_tree(s: &State, sha: &str, recursive: bool) -> Answer {
             }));
         }
     }
-    answer(200, json!({"sha": sha, "tree": items, "truncated": false}))
+    answer(
+        200,
+        json!({"sha": sha, "tree": items, "truncated": s.truncate_trees}),
+    )
 }
 
 /// ⚠ Modelled: `GET /compare/{base}...{head}` names `status` as

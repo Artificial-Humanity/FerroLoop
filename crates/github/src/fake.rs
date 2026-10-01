@@ -247,6 +247,8 @@ pub struct State {
     /// answers an older commit): a replica that has not learned of the
     /// branch at all yet (ruling 24).
     pub ref_404_next: u32,
+    /// Every recursive tree listing says GitHub cut it short. A setting.
+    pub truncate_trees: bool,
 }
 
 pub struct FakeGithub {

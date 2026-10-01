@@ -7,6 +7,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use fl_core::StoreError;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 
 /// What a path on the branch is at one commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +23,14 @@ pub(crate) struct Entry {
     pub name: String,
     pub oid: String,
     pub is_blob: bool,
+}
+
+/// A commit as the ledger walks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommitObject {
+    pub tree: String,
+    /// First parent first.
+    pub parents: Vec<String>,
 }
 
 const OBJECT_FIELDS: &str =
@@ -200,8 +209,8 @@ impl GithubLedger<'_> {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
-    /// A ledger commit's parents, first parent first.
-    pub(crate) fn parents_of(&self, sha: &str) -> Result<Vec<String>, StoreError> {
+    /// A ledger commit: its tree and its parents.
+    pub(crate) fn commit_object(&self, sha: &str) -> Result<CommitObject, StoreError> {
         let r = self.client.send(
             Method::Get,
             &self.path(&format!("/git/commits/{sha}")),
@@ -213,6 +222,9 @@ impl GithubLedger<'_> {
                 r.status
             )));
         }
+        // ⚠ Checked before `tree`: `parents_of_refuses_a_200_with_no_parents_field`
+        // pins a body with neither field as "no parents" — the message this
+        // fn already gave before `tree` was added.
         let parents = r
             .body
             .get("parents")
@@ -221,10 +233,60 @@ impl GithubLedger<'_> {
                 backend(format!(
                     "GitHub answered ledger commit {sha} with no parents"
                 ))
-            })?;
-        Ok(parents
+            })?
             .iter()
             .filter_map(|p| p.get("sha").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let tree = r
+            .body
+            .pointer("/tree/sha")
+            .and_then(Value::as_str)
+            .ok_or_else(|| backend(format!("GitHub answered ledger commit {sha} with no tree")))?
+            .to_string();
+        Ok(CommitObject { tree, parents })
+    }
+
+    /// A ledger commit's parents, first parent first.
+    pub(crate) fn parents_of(&self, sha: &str) -> Result<Vec<String>, StoreError> {
+        Ok(self.commit_object(sha)?.parents)
+    }
+
+    /// Every file of tree `sha`, path → blob id.
+    ///
+    /// ⚠ A listing GitHub cut short is an error, never read as the whole
+    /// tree: a verify over part of a tree would pass what it never saw.
+    pub(crate) fn tree_files(&self, sha: &str) -> Result<BTreeMap<String, String>, StoreError> {
+        let r = self.client.send(
+            Method::Get,
+            &self.path(&format!("/git/trees/{sha}?recursive=1")),
+            None,
+        )?;
+        if r.status != 200 {
+            return Err(backend(format!(
+                "GitHub answered {} when fl listed ledger tree {sha}; retry",
+                r.status
+            )));
+        }
+        if r.body.get("truncated").and_then(Value::as_bool) == Some(true) {
+            return Err(backend(format!(
+                "GitHub cut its listing of ledger tree {sha} short, so fl cannot check that \
+                 commit; nothing past it was verified"
+            )));
+        }
+        let items = r
+            .body
+            .get("tree")
+            .and_then(Value::as_array)
+            .ok_or_else(|| backend(format!("GitHub listed ledger tree {sha} with no entries")))?;
+        Ok(items
+            .iter()
+            .filter(|e| e["type"].as_str() == Some("blob"))
+            .filter_map(|e| {
+                Some((
+                    e["path"].as_str()?.to_string(),
+                    e["sha"].as_str()?.to_string(),
+                ))
+            })
             .collect())
     }
 

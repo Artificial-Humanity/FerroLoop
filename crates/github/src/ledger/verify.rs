@@ -1,0 +1,654 @@
+//! What a person runs by hand (GitHub ledger spec §3.5, §3.6): `verify`,
+//! which walks every commit from the anchor and checks that each only adds
+//! lines or segments, and `quarantine`, which marks a line readers skip
+//! without removing it.
+
+use super::GithubLedger;
+use super::append::NewLine;
+use super::git::CommitObject;
+use super::layout::{
+    self, BRANCH, FORMAT, FORMAT_FILE, QUARANTINE_FILE, QuarantineLine, README_FILE,
+};
+use fl_core::at::At;
+use fl_core::iri::Iri;
+use fl_core::{LedgerFault, StoreError};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// What `verify` found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    /// How many commits it walked.
+    pub commits: usize,
+    /// The oldest commit that does anything but add, and what it does.
+    pub first_bad: Option<BadCommit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadCommit {
+    pub commit: String,
+    pub what: String,
+}
+
+/// What one verify has already read: blob texts and tree listings, by id.
+#[derive(Default)]
+struct Seen {
+    blobs: BTreeMap<String, String>,
+    trees: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl GithubLedger<'_> {
+    /// `fl github ledger verify` (spec §3.5): every commit from the anchor
+    /// to the head, along first parents, each checked to only add lines or
+    /// segments. About one request per commit, plus the files it compares.
+    pub fn verify(&self) -> Result<Verified, StoreError> {
+        let repo = self.repo.full_name.clone();
+        let (head, anchor) = match (
+            self.branch_head(BRANCH)?,
+            self.local.ledger_root(&self.repo.node_id)?,
+        ) {
+            (Some(h), Some(a)) => (h, a),
+            (None, None) => return Err(LedgerFault::NotSetUp { repo }.into()),
+            (None, Some(root)) => return Err(LedgerFault::Deleted { repo, root }.into()),
+            (Some(_), None) => return Err(LedgerFault::NoAnchor { repo }.into()),
+        };
+        // Newest first: from the head back to the anchor, or to a commit
+        // with no parent that is not the anchor.
+        let mut chain: Vec<(String, CommitObject)> = Vec::new();
+        let mut bad: Vec<(String, String)> = Vec::new();
+        let mut at = head;
+        loop {
+            let c = self.commit_object(&at)?;
+            let parents = c.parents.clone();
+            chain.push((at.clone(), c));
+            if at == anchor {
+                break;
+            }
+            match parents.as_slice() {
+                [] => {
+                    bad.push((
+                        at.clone(),
+                        format!(
+                            "starts a history of its own: it has no parent, and it is not the \
+                             ledger's first commit {anchor}"
+                        ),
+                    ));
+                    break;
+                }
+                [p] => at = p.clone(),
+                [p, ..] => {
+                    bad.push((
+                        at.clone(),
+                        "merges two histories, and fl only ever adds one commit on top of the \
+                         last"
+                            .into(),
+                    ));
+                    at = p.clone();
+                }
+            }
+        }
+        chain.reverse();
+        let mut seen = Seen::default();
+        if chain.first().is_some_and(|(c, _)| *c == anchor) {
+            if let Some(what) = self.fls_first_commit(&chain[0].1, &mut seen)? {
+                bad.push((anchor.clone(), what));
+            }
+            for pair in chain.windows(2) {
+                if let Some(what) = self.only_adds(&pair[0].1, &pair[1].1, &mut seen)? {
+                    bad.push((pair[1].0.clone(), what));
+                }
+            }
+        }
+        let age: BTreeMap<&str, usize> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, (c, _))| (c.as_str(), i))
+            .collect();
+        let first_bad = bad
+            .into_iter()
+            .min_by_key(|(c, _)| age.get(c.as_str()).copied().unwrap_or(0))
+            .map(|(commit, what)| BadCommit { commit, what });
+        Ok(Verified {
+            commits: chain.len(),
+            first_bad,
+        })
+    }
+
+    fn text_of(&self, oid: &str, seen: &mut Seen) -> Result<String, StoreError> {
+        if let Some(t) = seen.blobs.get(oid) {
+            return Ok(t.clone());
+        }
+        let t = self.blob_text(oid)?;
+        seen.blobs.insert(oid.to_string(), t.clone());
+        Ok(t)
+    }
+
+    /// A tree's files, listed once per verify: each commit's tree is both
+    /// the "after" of one comparison and the "before" of the next.
+    fn files_of(
+        &self,
+        tree: &str,
+        seen: &mut Seen,
+    ) -> Result<BTreeMap<String, String>, StoreError> {
+        if let Some(files) = seen.trees.get(tree) {
+            return Ok(files.clone());
+        }
+        let files = self.tree_files(tree)?;
+        seen.trees.insert(tree.to_string(), files.clone());
+        Ok(files)
+    }
+
+    /// What is wrong with the anchor, if anything: it holds exactly
+    /// `format` (reading 1) and `README.md`.
+    fn fls_first_commit(
+        &self,
+        anchor: &CommitObject,
+        seen: &mut Seen,
+    ) -> Result<Option<String>, StoreError> {
+        let files = self.files_of(&anchor.tree, seen)?;
+        let names: BTreeSet<&str> = files.keys().map(String::as_str).collect();
+        if names != BTreeSet::from([FORMAT_FILE, README_FILE]) {
+            return Ok(Some(format!(
+                "starts the ledger with {names:?}, where fl writes only `format` and `README.md`"
+            )));
+        }
+        let format = self.text_of(&files[FORMAT_FILE], seen)?;
+        if format.strip_suffix('\n').unwrap_or(&format) != FORMAT {
+            return Ok(Some(format!(
+                "starts the ledger at format `{}`",
+                format.trim()
+            )));
+        }
+        Ok(None)
+    }
+
+    /// What `after` does besides add, compared with its parent `before`.
+    fn only_adds(
+        &self,
+        before: &CommitObject,
+        after: &CommitObject,
+        seen: &mut Seen,
+    ) -> Result<Option<String>, StoreError> {
+        let old = self.files_of(&before.tree, seen)?;
+        let new = self.files_of(&after.tree, seen)?;
+        for (path, oid) in &old {
+            let Some(now) = new.get(path) else {
+                return Ok(Some(format!("deletes `{path}`")));
+            };
+            if now == oid {
+                continue;
+            }
+            if path == FORMAT_FILE || path == README_FILE {
+                return Ok(Some(format!("changes `{path}`")));
+            }
+            match layout::parse_segment_path(path) {
+                Some((_, dir, n)) => {
+                    let closed = old.keys().any(|p| {
+                        layout::parse_segment_path(p).is_some_and(|(_, d, m)| d == dir && m > n)
+                    });
+                    if closed {
+                        return Ok(Some(format!("changes `{path}` after it was closed")));
+                    }
+                }
+                None if path == QUARANTINE_FILE => {}
+                None => return Ok(Some(format!("changes `{path}`, which fl never writes"))),
+            }
+            let (was, is) = (self.text_of(oid, seen)?, self.text_of(now, seen)?);
+            if !is.starts_with(&was) {
+                return Ok(Some(format!("rewrites lines of `{path}`")));
+            }
+        }
+        let mut numbers: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for path in new.keys() {
+            match layout::parse_segment_path(path) {
+                Some((_, dir, n)) => numbers.entry(dir).or_default().push(n),
+                None if path == QUARANTINE_FILE || old.contains_key(path) => {}
+                None => return Ok(Some(format!("adds `{path}`, which fl never writes"))),
+            }
+        }
+        for (dir, mut ns) in numbers {
+            ns.sort_unstable();
+            if ns.iter().copied().ne(1..=ns.len() as u64) {
+                return Ok(Some(format!("leaves a gap in the segments of `{dir}`")));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `fl github ledger quarantine <file> <line> --by <name> --reason
+    /// <text>` (spec §3.6): readers skip that line from now on.
+    ///
+    /// ⚠ Nothing is removed: the damage and its repair both stay in the
+    /// history. `id` is minted by the caller, so a retry adds one line.
+    pub fn quarantine(
+        &self,
+        id: &Iri,
+        at: &At,
+        file: &str,
+        line: u64,
+        by_name: &str,
+        reason: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let refuse = |why: String| {
+            StoreError::Backend(format!(
+                "fl will not quarantine `{file}` line {line}: {why}"
+            ))
+        };
+        if file == QUARANTINE_FILE {
+            return Err(refuse(
+                "the quarantine file cannot quarantine its own lines; run `fl github ledger \
+                 verify` to find the commit that damaged it"
+                    .into(),
+            ));
+        }
+        let Some((_, dir, _)) = layout::parse_segment_path(file) else {
+            return Err(refuse("it is not a segment of the ledger".into()));
+        };
+        if by_name.trim().is_empty() {
+            return Err(refuse("name who decided, with --by".into()));
+        }
+        if reason.trim().is_empty() {
+            return Err(refuse("say why, with --reason".into()));
+        }
+        let snap = self.snapshot(std::slice::from_ref(&dir))?;
+        let held = snap
+            .dirs
+            .get(&dir)
+            .and_then(|segs| segs.iter().find(|s| s.path == file))
+            .map(|s| layout::lines(&s.text).len() as u64);
+        match held {
+            None => {
+                return Err(refuse(format!(
+                    "the ledger holds no such file at {}",
+                    snap.head
+                )));
+            }
+            Some(n) if line == 0 || line > n => {
+                return Err(refuse(format!("it has {n} lines, numbered from 1")));
+            }
+            Some(_) => {}
+        }
+        let q = QuarantineLine {
+            id: id.clone(),
+            at: at.clone(),
+            file: file.to_string(),
+            line,
+            quarantined_by: by_name.to_string(),
+            reason: reason.to_string(),
+            by: self.identity()?,
+        };
+        self.append(
+            &[],
+            &[NewLine {
+                id: id.clone(),
+                text: q.encode(),
+            }],
+            &format!("fl: quarantine {file} line {line}"),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::Client;
+    use crate::creds::EnvToken;
+    use crate::fake::{FakeGithub, USER_LOGIN};
+    use crate::tracker::Repo;
+    use fl_core::MemStore;
+    use fl_core::conformance::{sample_decision, sample_record_run};
+    use fl_core::ids::{GateId, RecordId, seq_iri};
+    use fl_core::log::GateRun;
+    use fl_core::split::{Batch, RemoteLedger};
+    use fl_core::store::Bindings;
+    use std::time::Duration;
+
+    fn client(fake: &FakeGithub) -> Client {
+        Client::new(
+            &fake.url(),
+            Box::new(EnvToken::from_lookup(|_| Some("t".into())).unwrap()),
+        )
+    }
+
+    fn repo() -> Repo {
+        Repo {
+            full_name: "acme/widgets".into(),
+            node_id: "R_1".into(),
+        }
+    }
+
+    fn world() -> (FakeGithub, MemStore, String) {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let local = MemStore::default();
+        local.set_ledger_root("R_1", &root).unwrap();
+        (fake, local, root)
+    }
+
+    fn open<'a>(c: &'a Client, local: &'a MemStore) -> GithubLedger<'a> {
+        GithubLedger::new(c, repo(), local).with_lag(0, Duration::ZERO)
+    }
+
+    fn gate() -> GateId {
+        GateId(seq_iri(7))
+    }
+
+    fn record() -> RecordId {
+        RecordId(Iri::parse("https://github.com/acme/widgets/issues/1").unwrap())
+    }
+
+    fn run(n: u64) -> GateRun {
+        sample_record_run(n, &gate(), Some(&record()))
+    }
+
+    fn seg(n: u64) -> String {
+        layout::segment_path(&layout::dir(layout::Area::Runs, gate().iri()), n)
+    }
+
+    fn file(lines: &[String]) -> String {
+        lines.iter().map(|l| format!("{l}\n")).collect()
+    }
+
+    fn line(r: &GateRun) -> String {
+        layout::Line::Run(r.clone()).encode("someone")
+    }
+
+    fn publish(l: &GithubLedger<'_>, n: u64) {
+        l.publish(&Batch {
+            decision: sample_decision(n, &record(), vec![run(n).id.unwrap()]),
+            runs: vec![run(n)],
+            attempts: vec![],
+        })
+        .unwrap();
+    }
+
+    // Spec §3.5: a ledger fl wrote only ever adds.
+    #[test]
+    fn a_ledger_fl_wrote_verifies_clean() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        for n in 1..=3 {
+            publish(&l, n);
+        }
+        let v = l.verify().unwrap();
+        assert_eq!(v.first_bad, None, "{v:?}");
+        assert_eq!(v.commits, fake.ledger_commits());
+    }
+
+    // Spec §3.5: verify reports the first commit that does anything but
+    // add lines or segments.
+    #[test]
+    #[allow(clippy::type_complexity)]
+    fn each_departure_is_reported_at_the_commit_that_made_it() {
+        let cases: Vec<(&str, Vec<(String, Option<String>)>, &str)> = vec![
+            ("a deletion", vec![(seg(1), None)], "deletes"),
+            (
+                "the README",
+                vec![(README_FILE.into(), Some("edited".into()))],
+                "changes `README.md`",
+            ),
+            (
+                "the format",
+                vec![(FORMAT_FILE.into(), Some("1\n\n".into()))],
+                "changes `format`",
+            ),
+            (
+                "a rewritten line",
+                vec![(seg(1), Some(file(&[line(&run(9))])))],
+                "rewrites lines",
+            ),
+            (
+                "a stray file",
+                vec![("notes.txt".into(), Some("x".into()))],
+                "adds `notes.txt`",
+            ),
+            ("a gap", vec![(seg(3), Some(file(&[line(&run(3))])))], "gap"),
+        ];
+        for (case, changes, what) in cases {
+            let (fake, local, _root) = world();
+            fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+            let changes: Vec<(&str, Option<&str>)> = changes
+                .iter()
+                .map(|(p, t)| (p.as_str(), t.as_deref()))
+                .collect();
+            let bad = fake.hand_commit(&changes);
+            fake.hand_commit(&[(seg(1).as_str(), None), ("other.txt", Some("y"))]);
+            let c = client(&fake);
+            let v = open(&c, &local).verify().unwrap();
+            let first = v
+                .first_bad
+                .unwrap_or_else(|| panic!("{case}: nothing reported"));
+            assert_eq!(first.commit, bad, "{case}: {first:?}");
+            assert!(first.what.contains(what), "{case}: {}", first.what);
+        }
+    }
+
+    // Spec §3.5 check 4 as `verify` sees it: `quarantine.jsonl` only grows.
+    #[test]
+    fn a_quarantine_file_that_lost_a_line_is_reported() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(QUARANTINE_FILE, Some("a\nb\n"))]);
+        let bad = fake.hand_commit(&[(QUARANTINE_FILE, Some("b\n"))]);
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert!(
+            first.what.contains("rewrites lines of `quarantine.jsonl`"),
+            "{}",
+            first.what
+        );
+    }
+
+    // About one request per commit (spec §3.5): each tree is listed once,
+    // though it is compared twice.
+    #[test]
+    fn verify_lists_each_tree_once() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        for n in 1..=3 {
+            publish(&l, n);
+        }
+        let before = fake.state().requests.len();
+        let v = l.verify().unwrap();
+        let listed = fake.state().requests[before..]
+            .iter()
+            .filter(|r| r.contains("/git/trees/"))
+            .count();
+        assert_eq!(listed, v.commits);
+    }
+
+    #[test]
+    fn a_closed_segment_that_changes_is_reported() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        fake.hand_commit(&[(seg(2).as_str(), Some(file(&[line(&run(2))]).as_str()))]);
+        let bad = fake.hand_commit(&[(
+            seg(1).as_str(),
+            Some(file(&[line(&run(1)), line(&run(3))]).as_str()),
+        )]);
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, bad);
+        assert!(first.what.contains("closed"), "{}", first.what);
+    }
+
+    #[test]
+    fn a_second_history_or_a_merge_is_reported() {
+        let (fake, local, root) = world();
+        let new_root = fake.rewrite_ledger(&[("format", "1\n")]);
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, new_root);
+        assert!(
+            first.what.contains(&root),
+            "names the real first commit: {}",
+            first.what
+        );
+
+        let (fake2, local2, _root2) = world();
+        let merge = fake2.hand_merge();
+        let c2 = client(&fake2);
+        let first = open(&c2, &local2).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, merge);
+        assert!(first.what.contains("merges"), "{}", first.what);
+    }
+
+    #[test]
+    fn a_first_commit_holding_more_than_fl_writes_is_reported() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger_with(&[
+            ("format", "1\n"),
+            ("README.md", "x"),
+            (".github/workflows/ci.yml", "x"),
+        ]);
+        let local = MemStore::default();
+        local.set_ledger_root("R_1", &root).unwrap();
+        let c = client(&fake);
+        let first = open(&c, &local).verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, root);
+    }
+
+    #[test]
+    fn a_tree_listing_cut_short_is_an_error_not_a_pass() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        fake.state().truncate_trees = true;
+        let c = client(&fake);
+        let err = open(&c, &local).verify().unwrap_err();
+        assert!(err.to_string().contains("short"), "{err}");
+    }
+
+    #[test]
+    fn verify_says_why_when_there_is_no_ledger_to_walk() {
+        let fake = FakeGithub::start("acme/widgets");
+        let local = MemStore::default();
+        let c = client(&fake);
+        assert!(matches!(
+            open(&c, &local).verify().unwrap_err(),
+            StoreError::Ledger(LedgerFault::NotSetUp { .. })
+        ));
+        fake.seed_ledger();
+        assert!(matches!(
+            open(&c, &local).verify().unwrap_err(),
+            StoreError::Ledger(LedgerFault::NoAnchor { .. })
+        ));
+    }
+
+    // Spec §3.6: quarantine appends; readers skip the line; nothing is
+    // removed.
+    #[test]
+    fn an_unreadable_line_once_quarantined_is_skipped_and_its_damage_stays() {
+        let (fake, local, _root) = world();
+        let damaged = format!("{}not json\n", file(&[line(&run(1))]));
+        fake.hand_commit(&[(seg(1).as_str(), Some(damaged.as_str()))]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        assert!(l.runs(&gate()).is_err());
+        let committed = l
+            .quarantine(
+                &seq_iri(60),
+                &At::from_unix_millis(60),
+                &seg(1),
+                2,
+                "Ada",
+                "a hand edit",
+            )
+            .unwrap();
+        assert_eq!(committed, fake.ledger_head());
+        assert_eq!(l.runs(&gate()).unwrap(), vec![run(1)]);
+        assert_eq!(l.take_notes().len(), 1);
+        let files = fake.ledger_files();
+        assert!(files[&seg(1)].contains("not json"), "nothing was removed");
+        let q = QuarantineLine::decode(files[QUARANTINE_FILE].trim_end()).unwrap();
+        assert_eq!((q.file.as_str(), q.line), (seg(1).as_str(), 2));
+        assert_eq!(
+            (q.quarantined_by.as_str(), q.by.as_str()),
+            ("Ada", USER_LOGIN)
+        );
+        assert_eq!(
+            l.verify().unwrap().first_bad,
+            None,
+            "a quarantine only adds"
+        );
+    }
+
+    // Ruling 17: a line in the wrong directory can be quarantined too.
+    #[test]
+    fn a_misplaced_line_can_be_quarantined() {
+        let (fake, local, _root) = world();
+        let elsewhere = sample_record_run(1, &GateId(seq_iri(8)), Some(&record()));
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&elsewhere)]).as_str()))]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        l.quarantine(
+            &seq_iri(61),
+            &At::from_unix_millis(61),
+            &seg(1),
+            1,
+            "Ada",
+            "misfiled",
+        )
+        .unwrap();
+        assert!(l.runs(&gate()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_quarantine_retried_after_a_lost_answer_adds_one_line() {
+        let (fake, local, _root) = world();
+        let damaged = format!("{}not json\n", file(&[line(&run(1))]));
+        fake.hand_commit(&[(seg(1).as_str(), Some(damaged.as_str()))]);
+        fake.state().hang_up_after_next_commit = true;
+        let c = client(&fake);
+        let l = open(&c, &local);
+        l.quarantine(
+            &seq_iri(60),
+            &At::from_unix_millis(60),
+            &seg(1),
+            2,
+            "Ada",
+            "r",
+        )
+        .unwrap();
+        l.quarantine(
+            &seq_iri(60),
+            &At::from_unix_millis(60),
+            &seg(1),
+            2,
+            "Ada",
+            "r",
+        )
+        .unwrap();
+        assert_eq!(
+            layout::lines(&fake.ledger_files()[QUARANTINE_FILE]).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_quarantine_must_name_a_line_of_a_segment_and_who_decided_why() {
+        let (fake, local, _root) = world();
+        fake.hand_commit(&[(seg(1).as_str(), Some(file(&[line(&run(1))]).as_str()))]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let at = At::from_unix_millis(60);
+        for (file, line, by, reason, says) in [
+            (QUARANTINE_FILE.to_string(), 1, "Ada", "r", "its own lines"),
+            (FORMAT_FILE.to_string(), 1, "Ada", "r", "not a segment"),
+            (seg(2), 1, "Ada", "r", "no such file"),
+            (seg(1), 0, "Ada", "r", "1 lines"),
+            (seg(1), 2, "Ada", "r", "1 lines"),
+            (seg(1), 1, " ", "r", "--by"),
+            (seg(1), 1, "Ada", "", "--reason"),
+        ] {
+            let err = l
+                .quarantine(&seq_iri(60), &at, &file, line, by, reason)
+                .unwrap_err();
+            assert!(err.to_string().contains(says), "{file} {line}: {err}");
+        }
+        assert!(
+            !fake.ledger_files().contains_key(QUARANTINE_FILE),
+            "nothing written"
+        );
+    }
+}
