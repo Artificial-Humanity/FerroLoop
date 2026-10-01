@@ -77,6 +77,9 @@ invocation). Both are append-only evidence.
     option. Decision 9 applies this rule.
 13. **`fl finding reproduce` checks the finding's state before its gate runs** (confirmed while
     planning), so every refusal after the run is a verdict, recorded and flushed.
+14. **An attempt that ran but could not be published exits with the attempt's own code** (0 or 1)
+    and prints the publish failure as a warning (2026-10-01). Exit 2 means "refused" everywhere
+    else, and a script that retries on it must never re-run an attempt that was already paid for.
 
 ### 0.2 Out of scope
 
@@ -237,7 +240,7 @@ format                              the text 1
 README.md                           what this branch is; never edit it by hand
 runs/<gate-key>/<n>.jsonl           gate runs, one directory per gate
 attempts/<project-key>/<n>.jsonl    attempts, one directory per project
-decisions/<record-key>/<n>.jsonl    decisions, one directory per record or finding
+decisions/<record-key>/<n>.jsonl    decisions, one directory per finding (for a finding decision) or record (otherwise)
 quarantine.jsonl                    one line per quarantined entry
 ```
 
@@ -254,9 +257,10 @@ quarantine.jsonl                    one line per quarantined entry
 
 1. Read the head of `fl/ledger` and the last segment of each directory being appended to.
 2. Run the tamper checks (§3.5).
-3. Add the lines whose `id` is not already in the file. An entry's file follows only from its
-   own `gate`, `project` or record field, never from alias resolution, so this is enough to
-   make a retry safe.
+3. Add the lines whose `id` is not already in the entry's **directory** — every segment, not
+   only the last, since a commit whose answer was lost may have rolled a segment over. An
+   entry's directory follows only from its own `gate`, `project`, finding or record field, never
+   from alias resolution, so this is enough to make a retry safe.
 4. Commit with one GraphQL `createCommitOnBranch`, with `expectedHeadOid` set to the head from
    step 1. GitHub refuses the commit if someone appended first, and signs it otherwise.
 5. The head moved: back to step 1, up to five tries. A timeout: back to step 1 — step 3 skips
@@ -295,7 +299,8 @@ that edit, it cannot prevent it. On every read and every append fl checks:
 3. a closed segment's content never changes;
 4. the open segment starts with fl's cached copy;
 5. the same `id` never appears with different content, locally or on GitHub;
-6. every line's `gate`, `project` or record matches the directory it is in;
+6. every line's `gate`, `project`, finding or record matches the directory it is in (a finding
+   decision under its finding, any other decision under its record);
 7. the `format` is one fl knows.
 
 `fl github ledger verify` goes further: it walks every commit from the anchor and checks each
@@ -323,8 +328,10 @@ comment.
 
 ### 4.2 Content
 
-The comment is rendered only from the ledger — the `Decision` line and the entries it names —
-plus, when posted live, one line saying whether the state change completed.
+The comment is rendered from the ledger — the `Decision` line and the entries it names — plus,
+when posted live, one line saying whether the state change completed. A move's or check's
+decision names transitions, not gates, so finding its runs on the branch uses the local
+catalog's gates for those transitions; recovery runs where the catalog is.
 
 * A header: what was decided, the outcome, who, and a link to the ledger commit.
 * A table: gate, verdict, population, short commit, duration; for an attempt, the adapter,
@@ -391,18 +398,22 @@ Run once per repository, by a person. It can be run again.
    open it. A new fl refuses a manifest format it does not know and says to upgrade; an older
    fl gives its own refusal. Format 1 manifests still import. The person commits the
    manifest, which is how every machine gets its anchor.
-5. If the branch already exists and the manifest lacks `ledger_root` — `init` stopped after
+5. **Every machine records its own cut-over.** A machine whose root came from an imported
+   manifest has no cut-over until it runs `init`, which then records one (and never moves it);
+   until then the pre-flight refuses, naming `init` — otherwise that machine would publish
+   nothing and say so only quietly.
+6. If the branch already exists and the manifest lacks `ledger_root` — `init` stopped after
    step 3 — it walks to the branch's first commit and asks the person to confirm it is the one
    they created. If both exist, it says the ledger is set up and stops. If the manifest has
    `ledger_root` but the branch is gone, it refuses: the ledger was deleted, and creating a new
    one would hide that.
-6. Prints the optional admin step, which fl cannot do because its credential must not have
+7. Prints the optional admin step, which fl cannot do because its credential must not have
    Administration permission: a ruleset on `refs/heads/fl/ledger` with `non_fast_forward` and
    `deletion`, as a ready `gh api` command. Where the plan offers rulesets it is recommended;
    on Free, for a private repository, it is not available, and the ledger runs detection-only.
-7. Recommends protecting the default branch as well, because Contents: write lets fl's
+8. Recommends protecting the default branch as well, because Contents: write lets fl's
    credential push to any branch.
-8. Prints the disclosure limit (§5).
+9. Prints the disclosure limit (§5).
 
 ### 6.2 Modes
 
@@ -411,8 +422,10 @@ Run once per repository, by a person. It can be run again.
 | present and active, with `non_fast_forward` and `deletion` | **protected** | GitHub prevents a rewrite or deletion; fl detects edits (§3.5) |
 | absent, or unavailable on the plan | **detection-only** | fl detects a rewrite, a deletion or an edit (§3.5); nothing prevents them |
 
-`init`, `fl github whoami` and the docs state the mode in force. A ruleset that exists but is
-inactive, or lacks either rule, is reported as detection-only, naming what is missing. The mode
+`init`, `fl github whoami` and the docs state the mode in force. The mode is read from
+`rules/branches`, which lists only rules in force: a ruleset that is inactive, or lacks either
+rule, shows as detection-only, naming the rule that is missing. *(Modelled — confirmed by a
+live test.)* The mode
 is a plan feature, not a correctness one: every purpose of decision 1 works in both.
 *(Invariant — decision 12.)*
 
@@ -429,7 +442,8 @@ repeated error, until it is fixed. The docs and `init` say so.
 
 ## 7. Errors
 
-Every error exits 2 with `error: …` and says what to do.
+Every error exits 2 with `error: …` and says what to do — except the attempt row below, which is
+a warning (decision 14).
 
 | condition | what fl does |
 |---|---|
@@ -441,9 +455,10 @@ Every error exits 2 with `error: …` and says what to do.
 | unknown ledger `format`, or unknown manifest format | names upgrading fl |
 | an unreadable line | names the quarantine command |
 | rate limited, primary or secondary | refuses the decision; gives the reset time when known |
+| the head moved on every try (contention) | refuses the decision; transient, so the runs stay local and the next decision publishes them |
 | unreachable in the pre-flight | refuses; nothing ran |
 | unreachable at a move's, check's or finding's flush | refuses; no state change; the runs stay local |
-| unreachable at an attempt's flush | not refused — it already ran: kept locally, outcome printed, published next time |
+| unreachable at an attempt's flush | not refused — it already ran: kept locally, outcome printed, a warning, published next time; exits with the attempt's own code (decision 14) |
 | a comment fails to post | the state change stands; names `fl github ledger comment <record>` |
 | an unknown `ledger` value | config error |
 
