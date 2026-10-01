@@ -155,7 +155,7 @@ const ALL_ROLES_CASES: usize = 7;
 /// How many cases [`local_handles`] runs. Update deliberately — see [`run_suite`].
 const LOCAL_HANDLES_CASES: usize = 1;
 /// How many cases [`ledger_cache`] runs. Update deliberately — see [`run_suite`].
-const LEDGER_CACHE_CASES: usize = 2;
+const LEDGER_CACHE_CASES: usize = 3;
 
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -257,6 +257,7 @@ pub fn ledger_cache<S: LedgerCache, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
         the_last_head_is_kept_per_repository_and_replaced::<S>,
         a_cached_file_reads_back_by_path_and_by_its_own_directory_only::<S>,
+        a_segment_at_the_same_path_in_another_repository_is_never_returned::<S>,
     ];
     run_suite("ledger-cache", LEDGER_CACHE_CASES, cases, make);
 }
@@ -307,6 +308,38 @@ fn a_cached_file_reads_back_by_path_and_by_its_own_directory_only<S: LedgerCache
             ("runs/aa/2.jsonl".to_string(), "o5".to_string()),
         ],
         "not `runs/aab`, and not another repository's"
+    );
+}
+
+/// ⚠ The case above's `runs/aab` row (meant to probe the DIRECTORY guard)
+/// happens to sort, as a `(repo, path)` key, between `R_1`'s matching rows
+/// and `R_2`'s — so a store that walks a range and stops at the first path
+/// mismatch never even reaches `R_2`'s row there, whether or not it checks
+/// the repository. This case uses the SAME path in both repositories, with
+/// no other row sorting between them, so nothing but the repository check
+/// itself can keep them apart.
+fn a_segment_at_the_same_path_in_another_repository_is_never_returned<S: LedgerCache>(s: &S) {
+    let seg = |oid: &str| CachedSegment {
+        oid: oid.into(),
+        text: format!("{oid}\n"),
+        closed: false,
+    };
+    s.cache("R_1", "runs/aa/1.jsonl", &seg("o1")).unwrap();
+    s.cache("R_2", "runs/aa/1.jsonl", &seg("o2")).unwrap();
+
+    assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), Some(seg("o1")));
+    assert_eq!(s.cached("R_2", "runs/aa/1.jsonl").unwrap(), Some(seg("o2")));
+
+    let under_r1: Vec<(String, String)> = s
+        .cached_under("R_1", "runs/aa")
+        .unwrap()
+        .into_iter()
+        .map(|(p, c)| (p, c.oid))
+        .collect();
+    assert_eq!(
+        under_r1,
+        vec![("runs/aa/1.jsonl".to_string(), "o1".to_string())],
+        "R_2's segment at the identical path must not appear in R_1's read"
     );
 }
 
