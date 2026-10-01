@@ -200,6 +200,34 @@ impl GithubLedger<'_> {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// A ledger commit's parents, first parent first.
+    pub(crate) fn parents_of(&self, sha: &str) -> Result<Vec<String>, StoreError> {
+        let r = self.client.send(
+            Method::Get,
+            &self.path(&format!("/git/commits/{sha}")),
+            None,
+        )?;
+        if r.status != 200 {
+            return Err(backend(format!(
+                "GitHub answered {} when fl read ledger commit {sha}; retry",
+                r.status
+            )));
+        }
+        let parents = r
+            .body
+            .get("parents")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                backend(format!(
+                    "GitHub answered ledger commit {sha} with no parents"
+                ))
+            })?;
+        Ok(parents
+            .iter()
+            .filter_map(|p| p.get("sha").and_then(Value::as_str).map(str::to_string))
+            .collect())
+    }
+
     /// The commit that last changed `line` of `path` at `commit`, for a
     /// message. ⚠ Never an error: a message that cannot name the commit
     /// says so, and still names the file and the line.

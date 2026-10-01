@@ -5,6 +5,7 @@
 mod append;
 pub mod disclose;
 mod git;
+mod init;
 pub mod layout;
 mod read;
 
@@ -24,6 +25,7 @@ use std::time::Duration;
 
 pub use append::TRIES;
 pub use disclose::Visibility;
+pub use init::{InitOutcome, Mode, guidance, ruleset_command};
 pub use read::Note;
 
 /// The GitHub side of mode B, for one repository and one command.
