@@ -276,15 +276,26 @@ pub(crate) fn send(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let rate_limited =
-        matches!(status, 403 | 429) && (remaining.as_deref() == Some("0") || retry_after.is_some());
+    // ⚠ GitHub's SECONDARY rate limit (GitHub ledger spec §1.6): a 403 or
+    // 429 whose message says so. It often leaves `x-ratelimit-remaining`
+    // above zero and may carry no `retry-after`, so neither header alone
+    // finds it. Modelled from GitHub's documentation — "You have exceeded a
+    // secondary rate limit" — and not provoked in a live test, because doing
+    // so would abuse the API.
+    let secondary = matches!(status, 403 | 429)
+        && message
+            .to_ascii_lowercase()
+            .contains("secondary rate limit");
+    let rate_limited = matches!(status, 403 | 429)
+        && (secondary || remaining.as_deref() == Some("0") || retry_after.is_some());
     match status {
         _ if rate_limited => Err(StoreError::RateLimited {
-            reset: match (reset, retry_after) {
-                (Some(r), _) => format!("{r} (unix seconds)"),
-                (None, Some(s)) => format!("{s} seconds from now"),
-                (None, None) => "an unknown time".into(),
-            },
+            reset: reset_time(
+                secondary,
+                remaining.as_deref(),
+                reset.as_deref(),
+                retry_after.as_deref(),
+            ),
         }),
         200..=399 | 404 | 410 | 500..=599 => Ok(Reply {
             status,
@@ -299,6 +310,34 @@ pub(crate) fn send(
             "GitHub answered {status} to {method:?} {url}: {message}"
         ))),
     }
+}
+
+/// When a rate limit lifts, from the headers that say so.
+///
+/// `x-ratelimit-reset` is the PRIMARY window's reset, and means something
+/// only when that window is spent (`remaining` is `0`). A secondary limit
+/// is lifted by `retry-after`, or — GitHub's documentation says — after at
+/// least a minute when it gives no time.
+fn reset_time(
+    secondary: bool,
+    remaining: Option<&str>,
+    reset: Option<&str>,
+    retry_after: Option<&str>,
+) -> String {
+    if remaining == Some("0")
+        && let Some(r) = reset
+    {
+        return format!("{r} (unix seconds)");
+    }
+    if let Some(s) = retry_after {
+        return format!("{s} seconds from now");
+    }
+    if secondary {
+        return "at least a minute from now: GitHub gave no time for its secondary limit, and \
+                its documentation says to wait at least one minute"
+            .into();
+    }
+    "an unknown time".into()
 }
 
 /// The `rel="next"` URL of a `Link` header, if any.
@@ -443,5 +482,52 @@ mod tests {
             .get_all("/repos/acme/widgets/labels?per_page=100")
             .unwrap();
         assert_eq!(all.len(), 3, "every page, followed");
+    }
+
+    // Spec §1.6: GitHub's secondary limit leaves `x-ratelimit-remaining`
+    // above zero and may send no `retry-after`; only its message names it.
+    // The primary `x-ratelimit-reset` is not its reset time.
+    #[test]
+    fn a_secondary_rate_limit_without_a_retry_after_is_rate_limited_not_a_refusal() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().secondary_rate_limit_next = Some((403, None));
+        let err = client(&fake)
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap_err();
+        match err {
+            StoreError::RateLimited { ref reset } => {
+                assert!(reset.contains("at least a minute"), "{reset}");
+                assert!(!reset.contains("1700000000"), "the primary reset: {reset}");
+            }
+            other => panic!("a secondary rate limit answered {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_secondary_rate_limit_with_a_retry_after_names_it() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().secondary_rate_limit_next = Some((429, Some(60)));
+        let err = client(&fake)
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::RateLimited { ref reset } if reset.contains("60 seconds")),
+            "{err:?}"
+        );
+    }
+
+    // The rule reads the message, not the status: a 403 for want of a
+    // permission is a refusal, and says why.
+    #[test]
+    fn a_403_that_is_not_a_rate_limit_stays_a_refusal_naming_its_message() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().forbidden_next = true;
+        let err = client(&fake)
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref m) if m.contains("Resource not accessible")),
+            "{err:?}"
+        );
     }
 }

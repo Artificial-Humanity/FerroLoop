@@ -2,12 +2,14 @@ use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Args;
+use fl_core::decision::Flushed;
 use fl_core::ids::RecordId;
-use fl_core::log::{Attempt, AttemptStatus};
+use fl_core::log::{Attempt, AttemptStatus, PathsTouched};
 use fl_core::store::{Catalog, Ledger};
 use fl_core::{Iri, Kind};
 use fl_exec::adapters::ClaudeAdapter;
 use fl_exec::runner::{AttemptSpec, Runner};
+use fl_exec::stamp;
 
 const KNOWN_ADAPTERS: &str = "claude";
 
@@ -92,7 +94,10 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
 
     // ⚠ Recorded whatever the outcome. A crash, a timeout and a refusal all
     // cost something, even when that something is only the wall clock.
-    store.append_attempt(Attempt {
+    let entry = stamp::entry_id();
+    let attempt = Attempt {
+        id: Some(entry.clone()),
+        at: Some(stamp::now()),
         project: record.project,
         record: record.id,
         adapter: "claude".into(),
@@ -101,9 +106,10 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         tokens_in: outcome.tokens_in,
         tokens_out: outcome.tokens_out,
         cost_usd_micros: outcome.cost_usd_micros,
-        paths_touched: outcome.paths_touched.clone(),
-        output_excerpt: outcome.output_excerpt.clone(),
-    })?;
+        paths_touched: PathsTouched::Listed(outcome.paths_touched.clone()),
+        output_excerpt: Some(outcome.output_excerpt.clone()),
+    };
+    ctx.ledger.append_attempt(attempt.clone())?;
 
     println!("{}\t{}ms", outcome.status.as_wire(), outcome.duration_ms);
     if !outcome.output_excerpt.is_empty() {
@@ -112,8 +118,80 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         }
     }
 
+    let flushed = publish(ctx.ledger, &entry, &attempt)?;
+    crate::ctx::report_flush(&flushed);
+
     Ok(match outcome.status {
         AttemptStatus::Completed => 0,
         _ => 1,
     })
+}
+
+/// Publish the attempt after its local append (GitHub ledger spec §2.2).
+/// It already ran and cost what it cost, so a failure here refuses nothing
+/// (§7): the outcome is printed, the error is reported, and the attempt
+/// goes out with the next flush that succeeds (decision 8).
+fn publish(ledger: &dyn Ledger, id: &Iri, attempt: &Attempt) -> Result<Flushed> {
+    ledger
+        .flush(fl_exec::decision::for_attempt(id, attempt))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "the attempt ran and is recorded in the local store, but it could not be \
+                 published to the shared ledger ({e}). Nothing is lost: the next decision that \
+                 reaches the ledger publishes it."
+            )
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::Flushes;
+    use fl_core::decision::Outcome;
+    use fl_core::ids::{ProjectId, seq_iri};
+
+    fn attempt() -> Attempt {
+        Attempt {
+            id: Some(seq_iri(50)),
+            at: None,
+            project: ProjectId(seq_iri(1)),
+            record: RecordId(seq_iri(2)),
+            adapter: "claude".into(),
+            status: AttemptStatus::Timeout,
+            duration_ms: 1,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd_micros: 0,
+            paths_touched: PathsTouched::Listed(vec![]),
+            output_excerpt: Some(String::new()),
+        }
+    }
+
+    #[test]
+    fn an_attempts_decision_rests_on_the_attempt() {
+        let ledger = Flushes::default();
+        publish(&ledger, &seq_iri(50), &attempt()).unwrap();
+        let decisions = ledger.decisions.borrow();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].record, RecordId(seq_iri(2)));
+        assert_eq!(decisions[0].rests_on, vec![seq_iri(50)]);
+        assert_eq!(
+            decisions[0].outcome,
+            Outcome::Attempt {
+                status: AttemptStatus::Timeout
+            }
+        );
+    }
+
+    // Spec §7 and decision 8: the attempt already ran, so a failed publish
+    // refuses nothing — it is reported, and the attempt is kept for the next
+    // flush.
+    #[test]
+    fn an_attempt_that_cannot_be_published_is_reported_as_kept_not_refused() {
+        let err = publish(&Flushes::refusing(), &seq_iri(50), &attempt()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("recorded in the local store"), "{msg}");
+        assert!(msg.contains("next decision"), "{msg}");
+        assert!(!msg.contains("refused:"), "not a refusal: {msg}");
+    }
 }

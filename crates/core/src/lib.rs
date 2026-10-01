@@ -2,28 +2,34 @@
 
 mod wire;
 
+pub mod at;
 #[cfg(any(test, feature = "conformance"))]
 #[doc(hidden)]
 pub mod conformance;
+pub mod decision;
 pub mod finding;
 pub mod ids;
 pub mod iri;
 pub mod log;
 pub mod mem;
 pub mod model;
+pub mod split;
 pub mod stale;
 pub mod store;
 pub mod verdict;
 
+pub use at::{At, AtError};
+pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 pub use iri::{Iri, IriError};
-pub use log::{Attempt, AttemptStatus, GateRun};
+pub use log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 pub use mem::MemStore;
 pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
+pub use split::{Batch, Coverage, LocalLedger, Outbox, Pending, RemoteLedger, SplitLedger};
 pub use stale::{Staleness, apply_staleness, is_stale};
 pub use store::{
     Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,

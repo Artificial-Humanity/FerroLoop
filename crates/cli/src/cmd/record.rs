@@ -120,6 +120,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
 
             let report =
                 move_record(ctx.roles(), &record, state).map_err(|e| anyhow::anyhow!("{e}"))?;
+            crate::ctx::report_flush(&report.flushed);
             // What the person reads back: the record's handle (or its
             // primary IRI), never the alias or IRI they typed.
             let shown = refs::show(ctx.handles, Kind::Record, record.id.iri())?;

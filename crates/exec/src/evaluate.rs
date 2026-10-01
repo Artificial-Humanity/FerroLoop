@@ -1,7 +1,9 @@
 use crate::command::run_command_gate;
 use crate::git::Git;
 use crate::population::{ExecError, resolve};
+use crate::stamp;
 use fl_core::ids::{GateId, ProjectId, RecordId};
+use fl_core::iri::Iri;
 use fl_core::log::GateRun;
 use fl_core::model::{GateDef, GateKind, Project, Regret, Selector, Transition};
 use fl_core::stale::{Staleness, apply_staleness, is_stale};
@@ -17,6 +19,9 @@ pub struct GateReport {
     pub staleness: Staleness,
     pub output_excerpt: String,
     pub duration_ms: u64,
+    /// The id the run was recorded under, so a decision can name the runs
+    /// it rests on (GitHub ledger spec §2.3).
+    pub run: Iri,
 }
 
 #[derive(Debug)]
@@ -186,14 +191,17 @@ fn run_gate(
     let stale = staleness_for(root, def, head, &population_result);
     let (verdict, staleness) = apply_staleness(raw, stale, regret);
 
+    let run = stamp::entry_id();
     ledger
         .append_gate_run(GateRun {
+            id: Some(run.clone()),
+            at: Some(stamp::now()),
             gate: def.id.clone(),
             record: record.cloned(),
             commit: head.to_string(),
             verdict: verdict.clone(),
             population: verdict.population().unwrap_or(0),
-            output_excerpt: excerpt.clone(),
+            output_excerpt: Some(excerpt.clone()),
             duration_ms,
             cost_usd_micros: 0,
         })
@@ -221,6 +229,7 @@ fn run_gate(
         staleness,
         output_excerpt: excerpt,
         duration_ms,
+        run,
     })
 }
 
@@ -243,13 +252,16 @@ fn project_of(catalog: &dyn Catalog, project: &ProjectId) -> Result<Project, Exe
 ///
 /// Applies staleness at [`Regret::Low`] — a bare gate run is not a
 /// transition, so it warns and never fails for staleness alone — and tags
-/// the appended [`GateRun`] with no record. This is what `attach_reproduction`
-/// and `verify_finding` use to run a gate ad hoc, outside any transition.
+/// the appended [`GateRun`] with `record`: `None` for `gate run`, which
+/// stays local; the finding's record for `attach_reproduction` and
+/// `verify_finding`, so the run is published with their decision (GitHub
+/// ledger spec §2.2, decision 7).
 pub fn run_single_gate(
     catalog: &dyn Catalog,
     ledger: &dyn Ledger,
     project: &ProjectId,
     gate: &GateId,
+    record: Option<&RecordId>,
 ) -> Result<GateReport, ExecError> {
     let proj = project_of(catalog, project)?;
     let root = Path::new(&proj.root);
@@ -262,7 +274,7 @@ pub fn run_single_gate(
     };
 
     let head = Git::head(root)?;
-    run_gate(catalog, ledger, root, &head, &def, Regret::Low, None)
+    run_gate(catalog, ledger, root, &head, &def, Regret::Low, record)
 }
 
 pub fn evaluate_transition(
@@ -480,7 +492,7 @@ mod tests {
         let p = setup(&s, d.path(), "true", "src/**/*.rs", Regret::Low);
         let g = s.list_gates(&p).unwrap()[0].id.clone();
 
-        let err = run_single_gate(&StampRefused(&s), &s, &p, &g)
+        let err = run_single_gate(&StampRefused(&s), &s, &p, &g, None)
             .expect_err("a pass whose mark was lost must not read as a clean pass");
 
         assert!(matches!(err, ExecError::Store(_)), "{err:?}");
@@ -518,6 +530,32 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].population, 1);
         assert!(!runs[0].commit.is_empty());
+    }
+
+    // Spec §1.3: every run is minted an id and a time when it is recorded,
+    // and the report names the run it describes, so a decision can cite it.
+    #[test]
+    fn every_run_is_recorded_under_its_own_id_and_time_and_the_report_names_it() {
+        let d = repo_with(&[("src/a.rs", "fn a() {}")]);
+        let s = MemStore::default();
+        let p = setup(&s, d.path(), "true", "src/**/*.rs", Regret::Low);
+        let first = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
+        let second = evaluate_transition(&s, &s, &p, "launch", None).unwrap();
+        let gate = s.list_gates(&p).unwrap()[0].id.clone();
+        let runs = s.gate_runs(&gate).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].id.as_ref(), Some(&first.gates[0].run));
+        assert_eq!(runs[1].id.as_ref(), Some(&second.gates[0].run));
+        assert_ne!(first.gates[0].run, second.gates[0].run);
+        assert!(first.gates[0].run.as_str().starts_with("urn:uuid:"));
+        // Stamped, not ordered: two runs a moment apart may share a
+        // millisecond, and the wall clock is not this test's to assert.
+        assert!(runs.iter().all(|r| r.at.is_some()));
+        assert_eq!(
+            runs[0].output_excerpt.as_deref(),
+            Some(first.gates[0].output_excerpt.as_str()),
+            "the local copy always keeps the excerpt"
+        );
     }
 
     // ⚠⚠ The regression test for the measured git behaviour. A DELETED file
@@ -762,8 +800,14 @@ mod tests {
     #[test]
     fn a_store_failure_is_reported_as_a_store_failure_and_never_as_git() {
         let store = BrokenStore;
-        let err = run_single_gate(&store, &store, &ProjectId(seq_iri(1)), &GateId(seq_iri(1)))
-            .expect_err("a broken store cannot produce a gate report");
+        let err = run_single_gate(
+            &store,
+            &store,
+            &ProjectId(seq_iri(1)),
+            &GateId(seq_iri(1)),
+            None,
+        )
+        .expect_err("a broken store cannot produce a gate report");
         assert!(
             matches!(err, ExecError::Store(_)),
             "a store failure surfaced as {err:?}"

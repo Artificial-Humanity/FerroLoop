@@ -5,13 +5,14 @@ use fl_core::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
-use fl_core::store::{Catalog, Handles, Ledger, StoreError, Tracker};
+use fl_core::split::{Outbox, Pending};
+use fl_core::store::{Bindings, Catalog, Handles, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
 
 pub mod manifest;
 
-use crate::manifest::{Manifest, ManifestError};
+use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 
 /// Format 2: ids are IRIs, with an ownership index and per-kind handles.
 /// Format 1 keyed every table by a `u64` id from one shared counter.
@@ -45,6 +46,23 @@ const IMPORTS: TableDefinition<&str, &str> = TableDefinition::new("imports");
 /// Additive like `imports`: created by the first bind, and a store without
 /// it has bound nothing. An older fl ignores it, and cannot use GitHub mode.
 const GITHUB_BINDINGS: TableDefinition<&str, &str> = TableDefinition::new("github_bindings");
+/// (repository `node_id`, entry id) → published (GitHub ledger spec §3.2
+/// step 6). Additive, like every table below: created by the first write,
+/// and a store without it has none. An older fl ignores them all: it
+/// publishes nothing.
+const LEDGER_PUBLISHED: TableDefinition<(&str, &str), bool> =
+    TableDefinition::new("ledger_published");
+/// repository `node_id` → the id after which entries are publishable (spec
+/// §2.1).
+const LEDGER_CUTOVERS: TableDefinition<&str, &str> = TableDefinition::new("ledger_cutovers");
+/// Entry id → row key in `gate_runs`, for every run that carries an id AND
+/// a record — the only runs a flush may publish (spec §1.3, §2.1). Written
+/// in the append's own transaction. A plain `fl check` run, and every run
+/// from before ids, never enters it, so a flush never scans them.
+const CANDIDATE_RUNS: TableDefinition<&str, u64> = TableDefinition::new("ledger_candidate_runs");
+/// Entry id → row key in `attempts`, for every attempt that carries an id.
+const CANDIDATE_ATTEMPTS: TableDefinition<&str, u64> =
+    TableDefinition::new("ledger_candidate_attempts");
 
 /// ⚠ The format of a store that holds an import. The first import raises
 /// the store from 2 to 3 in the same transaction, so an older fl — which
@@ -53,6 +71,17 @@ const GITHUB_BINDINGS: TableDefinition<&str, &str> = TableDefinition::new("githu
 /// This build opens both. A store that never imports stays 2 and still
 /// opens in older builds.
 pub const FORMAT_WITH_IMPORTS: u64 = 3;
+
+/// ⚠ The format of a store that records a ledger root. An older fl opens a
+/// store at 2 or 3 and would export its manifest WITHOUT the root — the
+/// anchor every other machine checks the ledger against — so recording one
+/// raises the store to 4, which an older fl refuses. This build opens 2, 3
+/// and 4. A format is only ever raised (`raise_format`).
+pub const FORMAT_WITH_LEDGER_ROOT: u64 = 4;
+
+/// repository `node_id` → the first commit of its `fl/ledger` branch
+/// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
+const LEDGER_ROOTS: TableDefinition<&str, &str> = TableDefinition::new("ledger_roots");
 
 const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
@@ -151,6 +180,96 @@ fn index_new(tx: &redb::WriteTransaction, id: &Iri, kind: Kind) -> Result<(), St
     Ok(())
 }
 
+/// Raise the store's format to at least `to`, inside `tx`. Never lowers it:
+/// an import into a store that records a ledger root must leave it at 4.
+fn raise_format(tx: &redb::WriteTransaction, to: u64) -> Result<(), StoreError> {
+    let mut meta = tx.open_table(META).map_err(backend)?;
+    let now = meta
+        .get(FORMAT_KEY)
+        .map_err(backend)?
+        .map(|v| v.value())
+        .unwrap_or(FORMAT_VERSION);
+    if now < to {
+        meta.insert(FORMAT_KEY, to).map_err(backend)?;
+    }
+    Ok(())
+}
+
+/// ⚠ An anchor never changes (spec §3.5): a different root for a
+/// `node_id` that has one is refused. Asked BEFORE any write, by both
+/// callers of [`record_ledger_root`].
+fn refuse_a_changed_root(
+    node_id: &str,
+    held: Option<String>,
+    commit: &str,
+) -> Result<(), StoreError> {
+    match held {
+        Some(h) if h != commit => Err(StoreError::LedgerRootChanged {
+            node_id: node_id.to_string(),
+            held: h,
+            found: commit.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// Record `commit` as `node_id`'s ledger root inside `tx`, and raise the
+/// store to [`FORMAT_WITH_LEDGER_ROOT`]. The caller has already refused a
+/// changed root.
+fn record_ledger_root(
+    tx: &redb::WriteTransaction,
+    node_id: &str,
+    commit: &str,
+) -> Result<(), StoreError> {
+    tx.open_table(LEDGER_ROOTS)
+        .map_err(backend)?
+        .insert(node_id, commit)
+        .map_err(backend)?;
+    raise_format(tx, FORMAT_WITH_LEDGER_ROOT)
+}
+
+/// The entries `index` lists with an id after `after` that `repo` has not
+/// marked, read from `log` by their row key, in id order.
+fn waiting<T: serde::de::DeserializeOwned>(
+    tx: &redb::ReadTransaction,
+    index: TableDefinition<&str, u64>,
+    log: TableDefinition<u64, &str>,
+    repo: &str,
+    after: &Iri,
+) -> Result<Vec<T>, StoreError> {
+    let candidates = match tx.open_table(index) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+        Err(e) => return Err(backend(e)),
+    };
+    let marks = match tx.open_table(LEDGER_PUBLISHED) {
+        Ok(t) => Some(t),
+        Err(redb::TableError::TableDoesNotExist(_)) => None,
+        Err(e) => return Err(backend(e)),
+    };
+    let rows = tx.open_table(log).map_err(backend)?;
+    let mut out = Vec::new();
+    for entry in candidates.range(after.as_str()..).map_err(backend)? {
+        let (id, seq) = entry.map_err(backend)?;
+        let id = id.value();
+        if id == after.as_str() {
+            continue;
+        }
+        if let Some(m) = &marks
+            && m.get((repo, id)).map_err(backend)?.is_some()
+        {
+            continue;
+        }
+        let Some(row) = rows.get(seq.value()).map_err(backend)? else {
+            return Err(decode(format!(
+                "the ledger's candidate index names {id}, whose row is missing"
+            )));
+        };
+        out.push(serde_json::from_str(row.value()).map_err(decode)?);
+    }
+    Ok(out)
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let label = path.display().to_string();
@@ -172,11 +291,15 @@ impl RedbStore {
         match found {
             // No META table at all: a brand-new file.
             None => Self::create_tables(&db)?,
-            Some(Some(v)) if v == FORMAT_VERSION || v == FORMAT_WITH_IMPORTS => {}
+            Some(Some(v))
+                if v == FORMAT_VERSION
+                    || v == FORMAT_WITH_IMPORTS
+                    || v == FORMAT_WITH_LEDGER_ROOT => {}
             Some(v) => {
                 return Err(StoreError::FormatVersion {
                     found: v,
-                    expected: FORMAT_VERSION,
+                    oldest: FORMAT_VERSION,
+                    newest: FORMAT_WITH_LEDGER_ROOT,
                 });
             }
         }
@@ -314,12 +437,14 @@ impl RedbStore {
     }
 
     /// Log rows are keyed by an internal sequence, not by an id: they are
-    /// never addressed from outside the store.
+    /// never addressed from outside the store. A `candidate` — an index and
+    /// the entry's id — is written in the same transaction as the row.
     fn append_json<T: serde::Serialize>(
         &self,
         counter: &str,
         table: TableDefinition<u64, &str>,
         value: &T,
+        candidate: Option<(TableDefinition<&str, u64>, &Iri)>,
     ) -> Result<(), StoreError> {
         let json = serde_json::to_string(value).map_err(backend)?;
         let tx = self.db.begin_write().map_err(backend)?;
@@ -336,6 +461,12 @@ impl RedbStore {
                 .map_err(backend)?
                 .insert(seq, json.as_str())
                 .map_err(backend)?;
+            if let Some((index, id)) = candidate {
+                tx.open_table(index)
+                    .map_err(backend)?
+                    .insert(id.as_str(), seq)
+                    .map_err(backend)?;
+            }
         }
         tx.commit().map_err(backend)
     }
@@ -442,18 +573,43 @@ impl RedbStore {
         Ok(())
     }
 
-    /// Export `project`, which this store must author.
+    /// Export `project`, which this store must author. `repository_node_id`
+    /// is the repository the project's ledger is in, when its binding names
+    /// one: the export carries that repository's ledger root, if this store
+    /// records one (GitHub ledger spec §6.1 step 4).
     pub fn export_manifest(
         &self,
         project: &ProjectId,
         commit: &str,
         exported_at_unix: u64,
+        repository_node_id: Option<&str>,
     ) -> Result<Manifest, ManifestError> {
         self.check_kind(project.iri(), Kind::Project)?;
         if self.imported_hash(project)?.is_some() {
             return Err(ManifestError::NotAuthoring(project.clone()));
         }
-        manifest::export(self, project, commit, exported_at_unix)
+        let ledger_root = match repository_node_id {
+            None => None,
+            Some(node) => self.ledger_root(node)?.map(|commit| LedgerRoot {
+                repository_node_id: node.to_string(),
+                commit,
+            }),
+        };
+        manifest::export(self, project, commit, exported_at_unix, ledger_root)
+    }
+
+    /// Whether this store records any ledger root. An export that cannot
+    /// tell which repository its project's ledger is in asks this before it
+    /// writes a manifest without one.
+    pub fn holds_a_ledger_root(&self) -> Result<bool, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_ROOTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(backend(e)),
+        };
+        let any = table.iter().map_err(backend)?.next().is_some();
+        Ok(any)
     }
 
     /// Write the manifest's project, gates and transitions under their own
@@ -464,6 +620,14 @@ impl RedbStore {
         m.verify()?;
         let body = &m.body;
         let project = &body.project;
+
+        if let Some(root) = &body.ledger_root {
+            refuse_a_changed_root(
+                &root.repository_node_id,
+                self.ledger_root(&root.repository_node_id)?,
+                &root.commit,
+            )?;
+        }
 
         let held_project = match self.locate(project.iri()) {
             Ok((_, Kind::Project)) => true,
@@ -614,10 +778,10 @@ impl RedbStore {
             .map_err(backend)?
             .insert(project.iri().as_str(), m.content_sha256.as_str())
             .map_err(backend)?;
-        tx.open_table(META)
-            .map_err(backend)?
-            .insert(FORMAT_KEY, FORMAT_WITH_IMPORTS)
-            .map_err(backend)?;
+        if let Some(root) = &body.ledger_root {
+            record_ledger_root(&tx, &root.repository_node_id, &root.commit)?;
+        }
+        raise_format(&tx, FORMAT_WITH_IMPORTS)?;
         tx.commit().map_err(backend)?;
         Ok(report)
     }
@@ -946,11 +1110,16 @@ impl Ledger for RedbStore {
     // `append_*` checks nothing (spec §3.4): the engine already resolved the
     // references it is recording.
     fn append_gate_run(&self, run: GateRun) -> Result<(), StoreError> {
-        self.append_json(NEXT_RUN, GATE_RUNS, &run)
+        let candidate = match (&run.id, &run.record) {
+            (Some(id), Some(_)) => Some((CANDIDATE_RUNS, id)),
+            _ => None,
+        };
+        self.append_json(NEXT_RUN, GATE_RUNS, &run, candidate)
     }
 
     fn append_attempt(&self, attempt: Attempt) -> Result<(), StoreError> {
-        self.append_json(NEXT_ATTEMPT, ATTEMPTS, &attempt)
+        let candidate = attempt.id.as_ref().map(|id| (CANDIDATE_ATTEMPTS, id));
+        self.append_json(NEXT_ATTEMPT, ATTEMPTS, &attempt, candidate)
     }
 
     fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
@@ -963,6 +1132,78 @@ impl Ledger for RedbStore {
         self.check_kind(project.iri(), Kind::Project)?;
         let all: Vec<Attempt> = self.all_log(ATTEMPTS)?;
         Ok(all.into_iter().filter(|a| a.project == *project).collect())
+    }
+}
+
+impl Outbox for RedbStore {
+    fn unpublished(&self, repo: &str, after: &Iri) -> Result<Pending, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        Ok(Pending {
+            runs: waiting(&tx, CANDIDATE_RUNS, GATE_RUNS, repo, after)?,
+            attempts: waiting(&tx, CANDIDATE_ATTEMPTS, ATTEMPTS, repo, after)?,
+        })
+    }
+
+    fn is_published(&self, repo: &str, id: &Iri) -> Result<bool, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_PUBLISHED) {
+            Ok(t) => t,
+            // The first mark creates the table: "nothing marked".
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(backend(e)),
+        };
+        let found = table.get((repo, id.as_str())).map_err(backend)?.is_some();
+        Ok(found)
+    }
+
+    fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        {
+            let mut table = tx.open_table(LEDGER_PUBLISHED).map_err(backend)?;
+            for id in ids {
+                table.insert((repo, id.as_str()), true).map_err(backend)?;
+            }
+        }
+        tx.commit().map_err(backend)
+    }
+
+    fn cutover(&self, repo: &str) -> Result<Option<Iri>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_CUTOVERS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let Some(v) = table.get(repo).map_err(backend)? else {
+            return Ok(None);
+        };
+        Iri::parse(v.value()).map(Some).map_err(decode)
+    }
+
+    fn set_cutover(&self, repo: &str, id: &Iri) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        {
+            let mut table = tx.open_table(LEDGER_CUTOVERS).map_err(backend)?;
+            let held = table
+                .get(repo)
+                .map_err(backend)?
+                .map(|v| v.value().to_string());
+            match held {
+                // Dropping `tx` uncommitted aborts it: nothing was written.
+                Some(h) if h == id.as_str() => return Ok(()),
+                Some(h) => {
+                    return Err(StoreError::CutoverChanged {
+                        node_id: repo.to_string(),
+                        held: Iri::parse(&h).map_err(decode)?,
+                        found: id.clone(),
+                    });
+                }
+                None => {
+                    table.insert(repo, id.as_str()).map_err(backend)?;
+                }
+            }
+        }
+        tx.commit().map_err(backend)
     }
 }
 
@@ -990,7 +1231,7 @@ impl Handles for RedbStore {
     }
 }
 
-impl fl_core::store::Bindings for RedbStore {
+impl Bindings for RedbStore {
     fn bound_node_id(&self, repo: &str) -> Result<Option<String>, StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let table = match tx.open_table(GITHUB_BINDINGS) {
@@ -1012,11 +1253,31 @@ impl fl_core::store::Bindings for RedbStore {
             .map_err(backend)?;
         tx.commit().map_err(backend)
     }
+    fn ledger_root(&self, node_id: &str) -> Result<Option<String>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_ROOTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let found = table
+            .get(node_id)
+            .map_err(backend)?
+            .map(|v| v.value().to_string());
+        Ok(found)
+    }
+    fn set_ledger_root(&self, node_id: &str, commit: &str) -> Result<(), StoreError> {
+        refuse_a_changed_root(node_id, self.ledger_root(node_id)?, commit)?;
+        let tx = self.db.begin_write().map_err(backend)?;
+        record_ledger_root(&tx, node_id, commit)?;
+        tx.commit().map_err(backend)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fl_core::conformance::{entry_iri, sample_record_run};
     use fl_core::ids::seq_iri;
     use fl_core::log::GateRun;
     use fl_core::model::State;
@@ -1134,7 +1395,8 @@ mod tests {
                 err,
                 StoreError::FormatVersion {
                     found: Some(1),
-                    expected: 2
+                    oldest: 2,
+                    newest: 4
                 }
             ),
             "{err:?}"
@@ -1192,12 +1454,14 @@ mod tests {
                 )
                 .unwrap();
             s.append_gate_run(GateRun {
+                id: None,
+                at: None,
                 gate: g.clone(),
                 record: None,
                 commit: "abc".into(),
                 verdict: verdict.clone(),
                 population: 3,
-                output_excerpt: String::new(),
+                output_excerpt: Some(String::new()),
                 duration_ms: 1,
                 cost_usd_micros: 0,
             })
@@ -1426,6 +1690,62 @@ mod tests {
         (s, dir)
     }
 
+    /// A store holding one run and one attempt in the shape every store held
+    /// before entry ids: raw rows, as the current fl writes them. The row
+    /// counters move with them, so a later append cannot overwrite them.
+    fn with_legacy_entries() -> (RedbStore, tempfile::TempDir, ProjectId, GateId) {
+        let (s, d) = fresh();
+        let p = s.add_project("/p").unwrap();
+        let g = s
+            .add_gate(&p, "fmt", kind(), selector(), 1, "abc", "o")
+            .unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let run = format!(
+            r#"{{"gate":"{}","record":"{}","commit":"abc","verdict":{{"pass":{{"population":1}}}},"population":1,"output_excerpt":"ok","duration_ms":1,"cost_usd_micros":0}}"#,
+            g.iri(),
+            r.iri()
+        );
+        let attempt = format!(
+            r#"{{"project":"{}","record":"{}","adapter":"claude","status":"completed","duration_ms":1,"tokens_in":0,"tokens_out":0,"cost_usd_micros":0,"paths_touched":["a.rs"],"output_excerpt":""}}"#,
+            p.iri(),
+            r.iri()
+        );
+        {
+            let tx = s.db.begin_write().unwrap();
+            tx.open_table(GATE_RUNS)
+                .unwrap()
+                .insert(1u64, run.as_str())
+                .unwrap();
+            tx.open_table(ATTEMPTS)
+                .unwrap()
+                .insert(1u64, attempt.as_str())
+                .unwrap();
+            {
+                let mut meta = tx.open_table(META).unwrap();
+                meta.insert(NEXT_RUN, 1u64).unwrap();
+                meta.insert(NEXT_ATTEMPT, 1u64).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        (s, d, p, g)
+    }
+
+    #[test]
+    fn a_run_and_an_attempt_stored_before_entry_ids_still_read() {
+        let (s, _d, p, g) = with_legacy_entries();
+        let runs = s.gate_runs(&g).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!((runs[0].id.as_ref(), runs[0].at.as_ref()), (None, None));
+        assert_eq!(runs[0].output_excerpt.as_deref(), Some("ok"));
+        let attempts = s.attempts(&p).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].id, None);
+        assert_eq!(
+            attempts[0].paths_touched,
+            fl_core::log::PathsTouched::Listed(vec!["a.rs".into()])
+        );
+    }
+
     fn kind() -> GateKind {
         GateKind::Command(fl_core::model::CommandSpec {
             program: "true".into(),
@@ -1455,7 +1775,8 @@ mod tests {
                 err,
                 StoreError::FormatVersion {
                     found: None,
-                    expected: FORMAT_VERSION
+                    oldest: FORMAT_VERSION,
+                    ..
                 }
             ),
             "{err:?}"
@@ -1491,19 +1812,127 @@ mod tests {
 
     #[test]
     fn redb_store_meets_every_role_contract() {
-        use fl_core::conformance::Single;
+        use fl_core::conformance::{Single, SplitOver};
         let single = || {
             let (s, g) = fresh();
             Single(s, g)
         };
+        let split = || {
+            let (s, g) = fresh();
+            SplitOver(s, g)
+        };
         fl_core::conformance::catalog(fresh);
         fl_core::conformance::tracker(single);
-        fl_core::conformance::ledger(fresh);
+        fl_core::conformance::ledger(single);
+        fl_core::conformance::ledger(split);
+        fl_core::conformance::split_ledger(split);
         fl_core::conformance::all_roles(single);
         fl_core::conformance::local_handles(fresh);
     }
 
-    use crate::manifest::{Manifest, ManifestError, content_sha256};
+    /// A project with one gate and one record, in `s`.
+    fn gate_and_record(s: &RedbStore) -> (ProjectId, GateId, RecordId) {
+        let p = s.add_project("/p").unwrap();
+        let g = s
+            .add_gate(&p, "fmt", kind(), selector(), 1, "abc", "o")
+            .unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        (p, g, r)
+    }
+
+    // Spec §3.2 step 6: marks are keyed by the repository's node_id, and
+    // survive a reopen.
+    #[test]
+    fn published_marks_are_per_repository_and_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let id = {
+            let s = RedbStore::open(&path).unwrap();
+            let (_p, g, r) = gate_and_record(&s);
+            let run = sample_record_run(1, &g, Some(&r));
+            let id = run.id.clone().unwrap();
+            s.append_gate_run(run).unwrap();
+            // No mark exists yet, and no table: "nothing marked", not a failure.
+            assert!(!s.is_published("R_1", &id).unwrap());
+            assert_eq!(s.unpublished("R_1", &entry_iri(0)).unwrap().runs.len(), 1);
+            s.mark_published("R_1", std::slice::from_ref(&id)).unwrap();
+            s.mark_published("R_1", std::slice::from_ref(&id)).unwrap();
+            id
+        };
+        let s = RedbStore::open(&path).unwrap();
+        assert!(s.is_published("R_1", &id).unwrap());
+        assert!(
+            !s.is_published("R_2", &id).unwrap(),
+            "a mark is per repository"
+        );
+        assert!(s.unpublished("R_1", &entry_iri(0)).unwrap().runs.is_empty());
+        assert_eq!(s.unpublished("R_2", &entry_iri(0)).unwrap().runs.len(), 1);
+    }
+
+    #[test]
+    fn an_entry_stored_before_ids_is_never_waiting_to_be_published() {
+        let (s, _d, _p, _g) = with_legacy_entries();
+        let pending = s.unpublished("R_1", &entry_iri(0)).unwrap();
+        assert!(pending.runs.is_empty(), "{:?}", pending.runs);
+        assert!(pending.attempts.is_empty(), "{:?}", pending.attempts);
+    }
+
+    // ⚠ Spec §2.1: runs with no record are never candidates, so a plain
+    // `fl check` never lengthens the scan a flush makes.
+    #[test]
+    fn a_run_with_no_record_never_enters_the_candidate_index() {
+        let (s, _d) = fresh();
+        let (_p, g, r) = gate_and_record(&s);
+        s.append_gate_run(sample_record_run(1, &g, None)).unwrap();
+        s.append_gate_run(sample_record_run(2, &g, Some(&r)))
+            .unwrap();
+        let tx = s.db.begin_read().unwrap();
+        let index = tx.open_table(CANDIDATE_RUNS).unwrap();
+        let ids: Vec<String> = index
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().0.value().to_string())
+            .collect();
+        assert_eq!(ids, vec![entry_iri(2).to_string()]);
+    }
+
+    // Spec §2.1: entries recorded before the cut-over stay local.
+    #[test]
+    fn only_entries_after_the_cut_over_are_waiting() {
+        let (s, _d) = fresh();
+        let (_p, g, r) = gate_and_record(&s);
+        for n in [2, 3, 4] {
+            s.append_gate_run(sample_record_run(n, &g, Some(&r)))
+                .unwrap();
+        }
+        let ids: Vec<Option<fl_core::Iri>> = s
+            .unpublished("R_1", &entry_iri(3))
+            .unwrap()
+            .runs
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec![Some(entry_iri(4))]);
+    }
+
+    #[test]
+    fn a_cut_over_is_recorded_once_and_survives_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            assert_eq!(s.cutover("R_1").unwrap(), None);
+            s.set_cutover("R_1", &entry_iri(3)).unwrap();
+            s.set_cutover("R_1", &entry_iri(3)).unwrap();
+            let err = s.set_cutover("R_1", &entry_iri(4)).unwrap_err();
+            assert!(matches!(err, StoreError::CutoverChanged { .. }), "{err:?}");
+        }
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(s.cutover("R_1").unwrap(), Some(entry_iri(3)));
+        assert_eq!(s.cutover("R_2").unwrap(), None);
+    }
+
+    use crate::manifest::{LedgerRoot, Manifest, ManifestError, content_sha256};
     use fl_core::model::{Regret, Transition};
 
     /// An authoring store with one project: gates `fmt` and `lint`, and a
@@ -1538,7 +1967,7 @@ mod tests {
     #[test]
     fn an_import_writes_every_item_under_its_own_iri_and_marks_the_project() {
         let (a, _ga, p, g1, g2) = authoring();
-        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
         let (b, _gb) = fresh();
         let report = b.import_manifest(&m, "/elsewhere").unwrap();
         assert_eq!((report.gates_added, report.transitions), (2, 1));
@@ -1560,7 +1989,7 @@ mod tests {
     #[test]
     fn the_authoring_store_refuses_to_import_its_own_project() {
         let (a, _g, p, _, _) = authoring();
-        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
         let err = a.import_manifest(&m, "/author").unwrap_err();
         assert!(matches!(err, ManifestError::AuthoringStore(_)), "{err}");
     }
@@ -1569,9 +1998,9 @@ mod tests {
     fn an_importing_store_refuses_to_export() {
         let (a, _ga, p, _, _) = authoring();
         let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
             .unwrap();
-        let err = b.export_manifest(&p, "c1", 8).unwrap_err();
+        let err = b.export_manifest(&p, "c1", 8, None).unwrap_err();
         assert!(matches!(err, ManifestError::NotAuthoring(_)), "{err}");
     }
 
@@ -1579,7 +2008,7 @@ mod tests {
     fn an_imported_gate_can_earn_a_pass_mark_but_cannot_be_edited() {
         let (a, _ga, p, g1, _) = authoring();
         let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
             .unwrap();
         stamp(&b, &g1, "c1");
         assert_eq!(
@@ -1618,7 +2047,7 @@ mod tests {
     fn a_reimport_keeps_the_mark_of_an_unchanged_gate_and_drops_a_changed_ones() {
         let (a, _ga, p, g1, g2) = authoring();
         let (b, _gb) = fresh();
-        b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
             .unwrap();
         stamp(&b, &g1, "c1");
         stamp(&b, &g2, "c1");
@@ -1631,7 +2060,7 @@ mod tests {
             .unwrap();
 
         let report = b
-            .import_manifest(&a.export_manifest(&p, "c2", 8).unwrap(), "/x")
+            .import_manifest(&a.export_manifest(&p, "c2", 8, None).unwrap(), "/x")
             .unwrap();
         assert_eq!(
             (
@@ -1657,7 +2086,7 @@ mod tests {
     #[test]
     fn an_import_refuses_a_manifest_it_did_not_verify() {
         let (a, _ga, p, _, _) = authoring();
-        let mut m = a.export_manifest(&p, "c1", 7).unwrap();
+        let mut m = a.export_manifest(&p, "c1", 7, None).unwrap();
         m.body.gates[0].name = "edited".into();
         let (b, _gb) = fresh();
         let err = b.import_manifest(&m, "/x").unwrap_err();
@@ -1671,7 +2100,7 @@ mod tests {
         let (b, _gb) = fresh();
         let local = b.add_project("/x").unwrap();
         let err = b
-            .import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            .import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
             .unwrap_err();
         assert!(
             matches!(err, ManifestError::RootTaken { ref other, .. } if *other == local),
@@ -1683,7 +2112,7 @@ mod tests {
     fn a_reimport_from_another_checkout_moves_the_root_and_says_so() {
         let (a, _ga, p, _, _) = authoring();
         let (b, _gb) = fresh();
-        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
         assert_eq!(b.import_manifest(&m, "/one").unwrap().root_moved, None);
         let report = b.import_manifest(&m, "/two").unwrap();
         assert_eq!(report.root_moved, Some(("/one".into(), "/two".into())));
@@ -1694,7 +2123,7 @@ mod tests {
     fn a_reimport_mirrors_the_manifests_transitions() {
         let (a, _ga, p, _, _) = authoring();
         let (b, _gb) = fresh();
-        let first = a.export_manifest(&p, "c1", 7).unwrap();
+        let first = a.export_manifest(&p, "c1", 7, None).unwrap();
         b.import_manifest(&first, "/x").unwrap();
         let mut body = first.body.clone();
         body.transitions.clear();
@@ -1721,7 +2150,7 @@ mod tests {
         let (a, _ga, p, _, _) = authoring();
         {
             let b = RedbStore::open(&path).unwrap();
-            b.import_manifest(&a.export_manifest(&p, "c1", 7).unwrap(), "/x")
+            b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
                 .unwrap();
         }
         let db = redb::Database::open(&path).unwrap();
@@ -1743,7 +2172,7 @@ mod tests {
     fn a_reimport_that_removes_a_gate_is_refused_and_changes_nothing() {
         let (a, _ga, p, g1, g2) = authoring();
         let (b, _gb) = fresh();
-        let first = a.export_manifest(&p, "c1", 7).unwrap();
+        let first = a.export_manifest(&p, "c1", 7, None).unwrap();
         b.import_manifest(&first, "/x").unwrap();
 
         let mut body = first.body.clone();
@@ -1767,7 +2196,7 @@ mod tests {
     #[test]
     fn a_gate_held_locally_under_another_project_is_refused_and_writes_nothing() {
         let (a, _ga, p, _g1, _g2) = authoring();
-        let m = a.export_manifest(&p, "c1", 7).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
 
         // `b` authors its own project locally and holds a gate under it —
         // the manifest below is rewritten to claim that same gate id for a
@@ -1814,5 +2243,137 @@ mod tests {
             s.bound_node_id("ACME/widgets").unwrap().as_deref(),
             Some("R_1")
         );
+    }
+
+    // Ruling 12: a store a newer fl wrote says to upgrade, not to start over.
+    #[test]
+    fn a_store_from_a_newer_fl_says_to_upgrade_not_to_start_a_new_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.redb");
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let tx = db.begin_write().unwrap();
+            tx.open_table(META)
+                .unwrap()
+                .insert(FORMAT_KEY, FORMAT_WITH_LEDGER_ROOT + 1)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let msg = RedbStore::open(&path).err().unwrap().to_string();
+        assert!(msg.contains("Upgrade fl"), "{msg}");
+        assert!(!msg.contains("start a new store"), "{msg}");
+    }
+
+    // ⚠ An older fl would open a store at format 2 or 3 and export its
+    // manifest WITHOUT the root; format 4 makes it refuse the store instead.
+    #[test]
+    fn a_ledger_root_is_recorded_once_and_raises_the_store_to_format_4() {
+        use fl_core::store::Bindings;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            assert!(!s.holds_a_ledger_root().unwrap());
+            assert_eq!(s.ledger_root("R_1").unwrap(), None);
+            s.set_ledger_root("R_1", "abc").unwrap();
+            s.set_ledger_root("R_1", "abc").unwrap();
+            let err = s.set_ledger_root("R_1", "def").unwrap_err();
+            assert!(
+                matches!(err, StoreError::LedgerRootChanged { ref held, ref found, .. } if held == "abc" && found == "def"),
+                "{err:?}"
+            );
+            assert!(s.holds_a_ledger_root().unwrap());
+        }
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
+            Some(FORMAT_WITH_LEDGER_ROOT),
+            "an older fl must refuse this store rather than export its manifest without the root"
+        );
+        drop(meta);
+        drop(tx);
+        drop(db);
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(s.ledger_root("R_1").unwrap().as_deref(), Some("abc"));
+        assert_eq!(s.ledger_root("R_2").unwrap(), None);
+    }
+
+    #[test]
+    fn an_import_never_lowers_the_format_of_a_store_that_records_a_ledger_root() {
+        use fl_core::store::Bindings;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.redb");
+        let (a, _ga, p, _, _) = authoring();
+        {
+            let b = RedbStore::open(&path).unwrap();
+            b.set_ledger_root("R_9", "abc").unwrap();
+            b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
+                .unwrap();
+        }
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
+            Some(FORMAT_WITH_LEDGER_ROOT)
+        );
+    }
+
+    #[test]
+    fn an_export_carries_the_root_of_the_repository_it_is_told_and_no_other() {
+        use fl_core::store::Bindings;
+        let (a, _ga, p, _, _) = authoring();
+        a.set_ledger_root("R_1", "abc").unwrap();
+        let m = a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap();
+        assert_eq!(m.body.format_version, 2);
+        assert_eq!(
+            m.body.ledger_root,
+            Some(LedgerRoot {
+                repository_node_id: "R_1".into(),
+                commit: "abc".into(),
+            })
+        );
+        for other in [None, Some("R_2")] {
+            let m = a.export_manifest(&p, "c1", 7, other).unwrap();
+            assert_eq!(
+                (m.body.format_version, m.body.ledger_root),
+                (1, None),
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_import_records_the_manifests_ledger_root() {
+        use fl_core::store::Bindings;
+        let (a, _ga, p, _, _) = authoring();
+        a.set_ledger_root("R_1", "abc").unwrap();
+        let (b, _gb) = fresh();
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
+            .unwrap();
+        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn an_import_naming_another_root_for_a_known_repository_is_refused_and_writes_nothing() {
+        use fl_core::store::Bindings;
+        let (a, _ga, p, _, _) = authoring();
+        a.set_ledger_root("R_1", "abc").unwrap();
+        let (b, _gb) = fresh();
+        b.set_ledger_root("R_1", "other").unwrap();
+        let err = b
+            .import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ManifestError::Store(StoreError::LedgerRootChanged { .. })
+            ),
+            "{err}"
+        );
+        assert!(!b.owns(p.iri()).unwrap(), "nothing was written");
+        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("other"));
     }
 }

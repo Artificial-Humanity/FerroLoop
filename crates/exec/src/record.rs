@@ -1,11 +1,16 @@
+use crate::decision;
 use crate::evaluate::{TransitionReport, evaluate_transition};
 use crate::population::ExecError;
+use fl_core::decision::Flushed;
 use fl_core::model::{Record, State, Transition};
 use fl_core::store::Roles;
 
 pub struct MoveReport {
     pub transitions: Vec<TransitionReport>,
     pub outcome: MoveOutcome,
+    /// What the move's flush published, and what it left local and why
+    /// (GitHub ledger spec §2.1) — for the command to report.
+    pub flushed: Flushed,
 }
 
 pub enum MoveOutcome {
@@ -35,11 +40,13 @@ fn store_err(e: impl std::fmt::Display) -> ExecError {
 /// performs. So the move asks which declarations cover (from, to) and runs
 /// every one of them.
 ///
-/// ⚠⚠ Evidence before state (spec §3.5, Invariant). The gate runs are
-/// appended to the ledger inside `evaluate_transition`; only after every one
-/// of them is written does the tracker state change. A crash in between
-/// leaves evidence and no move, which is safe to retry. The reverse order
-/// would leave a move with no evidence.
+/// ⚠⚠ Evidence before state (spec §3.5; GitHub ledger spec §2.2,
+/// Invariant). The gate runs are appended to the ledger inside
+/// `evaluate_transition`; then the move's decision is flushed — one flush
+/// per move, however many transitions, a refused or ungated move included;
+/// only after both does the tracker state change. A failed flush refuses
+/// the move. A crash in between leaves evidence and no move, which is safe
+/// to retry. The reverse order would leave a move with no evidence.
 pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveReport, ExecError> {
     let declared: Vec<Transition> = roles
         .catalog
@@ -48,17 +55,6 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
         .into_iter()
         .filter(|t| t.from == record.state && t.to == to)
         .collect();
-
-    if declared.is_empty() {
-        roles
-            .tracker
-            .set_record_state(&record.id, to)
-            .map_err(store_err)?;
-        return Ok(MoveReport {
-            transitions: vec![],
-            outcome: MoveOutcome::Ungated,
-        });
-    }
 
     let mut transitions = Vec::new();
     let mut worst = 0;
@@ -81,26 +77,39 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
         transitions.push(report);
     }
 
-    if worst != 0 {
-        return Ok(MoveReport {
-            transitions,
-            outcome: MoveOutcome::Refused { code: worst },
-        });
-    }
+    let outcome = if declared.is_empty() {
+        MoveOutcome::Ungated
+    } else if worst != 0 {
+        MoveOutcome::Refused { code: worst }
+    } else {
+        MoveOutcome::Moved
+    };
+    let allowed = !matches!(outcome, MoveOutcome::Refused { .. });
 
-    roles
-        .tracker
-        .set_record_state(&record.id, to)
-        .map_err(store_err)?;
+    let flushed = roles
+        .ledger
+        .flush(decision::for_move(record, to, &transitions, allowed))
+        .map_err(|e| ExecError::Unpublished(e.to_string()))?;
+
+    if allowed {
+        roles
+            .tracker
+            .set_record_state(&record.id, to)
+            .map_err(store_err)?;
+    }
     Ok(MoveReport {
         transitions,
-        outcome: MoveOutcome::Moved,
+        outcome,
+        flushed,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::Journal;
+    use fl_core::decision::Outcome;
+    use fl_core::iri::Iri;
     use fl_core::log::{Attempt, GateRun};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Regret, Selector, Transition};
     use fl_core::store::{Catalog, Ledger, StoreError, Tracker};
@@ -234,5 +243,177 @@ mod tests {
 
         assert!(matches!(report.outcome, MoveOutcome::Ungated));
         assert!(report.transitions.is_empty());
+    }
+
+    /// A project whose `todo → done` is covered by one transition per
+    /// program, each with its own gate over `*.rs`.
+    fn covered_by(store: &MemStore, root: &std::path::Path, programs: &[&str]) -> Record {
+        let head = crate::git::Git::head(root).unwrap();
+        let p = store.add_project(&root.display().to_string()).unwrap();
+        for (i, program) in programs.iter().enumerate() {
+            let g = store
+                .add_gate(
+                    &p,
+                    &format!("g{i}"),
+                    GateKind::Command(CommandSpec {
+                        program: (*program).into(),
+                        args: vec![],
+                        delivery: PopulationDelivery::Args,
+                        timeout_secs: 10,
+                        pass_codes: vec![0],
+                    }),
+                    Selector::Glob {
+                        pattern: "*.rs".into(),
+                    },
+                    1,
+                    &head,
+                    "tester",
+                )
+                .unwrap();
+            store
+                .add_transition(Transition {
+                    project: p.clone(),
+                    name: format!("t{i}"),
+                    from: State::Todo,
+                    to: State::Done,
+                    regret: Regret::Low,
+                    gates: vec![g],
+                })
+                .unwrap();
+        }
+        let r = store.add_record(&p, "t").unwrap();
+        store.get_record(&r).unwrap().unwrap()
+    }
+
+    // ⚠⚠ Spec §2.2 (Invariant): evidence before state. Confirmed by
+    // mutation: moving the flush below the state change turns this test
+    // red.
+    #[test]
+    fn the_decision_is_flushed_before_the_record_moves() {
+        let d = repo();
+        let store = MemStore::default();
+        let record = gated_record(&store, d.path());
+        let j = Journal::new(&store);
+
+        let report = move_record(j.roles(), &record, State::Done).unwrap();
+
+        assert!(matches!(report.outcome, MoveOutcome::Moved));
+        assert_eq!(j.events(), vec!["flush", "set_record_state"]);
+        assert_eq!(
+            report.flushed.commit.as_deref(),
+            Some("c1"),
+            "the report carries what the flush did, for the command to print"
+        );
+    }
+
+    // ⚠ Spec §2.2: a flush failure refuses the decision — no state change —
+    // and the runs stay in the local store.
+    #[test]
+    fn a_move_whose_flush_fails_is_refused_and_the_record_stays() {
+        let d = repo();
+        let store = MemStore::default();
+        let record = gated_record(&store, d.path());
+        let j = Journal::refusing(&store);
+
+        let err = match move_record(j.roles(), &record, State::Done) {
+            Err(e) => e,
+            Ok(_) => panic!("a move whose flush failed must be refused"),
+        };
+
+        assert!(matches!(err, ExecError::Unpublished(_)), "{err:?}");
+        assert!(err.to_string().contains("nothing changed"), "{err}");
+        assert_eq!(
+            store.get_record(&record.id).unwrap().unwrap().state,
+            State::Todo
+        );
+        let gate = &store.list_gates(&record.project).unwrap()[0].id;
+        assert_eq!(
+            store.gate_runs(gate).unwrap().len(),
+            1,
+            "the run is kept in the local store"
+        );
+        assert_eq!(j.events(), vec!["flush"]);
+    }
+
+    // Decision 11: a refused decision is flushed too.
+    #[test]
+    fn a_refused_move_is_flushed_too() {
+        let d = repo();
+        let store = MemStore::default();
+        let record = covered_by(&store, d.path(), &["false"]);
+        let j = Journal::new(&store);
+
+        let report = move_record(j.roles(), &record, State::Done).unwrap();
+
+        assert!(matches!(report.outcome, MoveOutcome::Refused { code: 1 }));
+        assert_eq!(
+            j.events(),
+            vec!["flush"],
+            "flushed, and the state untouched"
+        );
+        match &j.decisions()[0].outcome {
+            Outcome::Move {
+                allowed,
+                transitions,
+                ..
+            } => {
+                assert!(!allowed);
+                assert_eq!(transitions.len(), 1);
+                assert!(!transitions[0].passed);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    // Spec §2.2: one flush per move, however many transitions cover it; the
+    // runs carry the record, and the decision rests on every one of them.
+    #[test]
+    fn one_move_is_one_flush_however_many_transitions_cover_it() {
+        let d = repo();
+        let store = MemStore::default();
+        let record = covered_by(&store, d.path(), &["true", "true"]);
+        let j = Journal::new(&store);
+
+        move_record(j.roles(), &record, State::Done).unwrap();
+
+        assert_eq!(j.events(), vec!["flush", "set_record_state"]);
+        let decisions = j.decisions();
+        assert_eq!(decisions.len(), 1);
+        let runs: Vec<GateRun> = store
+            .list_gates(&record.project)
+            .unwrap()
+            .iter()
+            .flat_map(|g| store.gate_runs(&g.id).unwrap())
+            .collect();
+        assert_eq!(runs.len(), 2);
+        assert!(runs.iter().all(|r| r.record.as_ref() == Some(&record.id)));
+        let mut cited = decisions[0].rests_on.clone();
+        cited.sort();
+        let mut ran: Vec<Iri> = runs.iter().map(|r| r.id.clone().unwrap()).collect();
+        ran.sort();
+        assert_eq!(cited, ran);
+        assert_eq!(decisions[0].record, record.id);
+    }
+
+    #[test]
+    fn an_ungated_move_is_flushed_with_no_transitions() {
+        let d = repo();
+        let store = MemStore::default();
+        let record = gated_record(&store, d.path());
+        let j = Journal::new(&store);
+
+        let report = move_record(j.roles(), &record, State::Doing).unwrap();
+
+        assert!(matches!(report.outcome, MoveOutcome::Ungated));
+        assert_eq!(j.events(), vec!["flush", "set_record_state"]);
+        assert_eq!(
+            j.decisions()[0].outcome,
+            Outcome::Move {
+                from: State::Todo,
+                to: State::Doing,
+                transitions: vec![],
+                allowed: true,
+            }
+        );
     }
 }

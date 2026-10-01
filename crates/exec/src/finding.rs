@@ -1,5 +1,7 @@
+use crate::decision;
 use crate::evaluate::{GateReport, run_single_gate};
 use crate::population::ExecError;
+use fl_core::decision::Flushed;
 use fl_core::finding::FindingState;
 use fl_core::ids::{FindingId, GateId};
 use fl_core::iri::Iri;
@@ -76,6 +78,9 @@ pub struct FixReport {
     pub neighbours: Vec<GateReport>,
     pub regressions: Vec<GateReport>,
     pub closed: bool,
+    /// What the verify's flush published, and what it left local and why
+    /// (GitHub ledger spec §2.1) — for the command to report.
+    pub flushed: Flushed,
 }
 
 impl FixReport {
@@ -135,8 +140,8 @@ pub fn attach_reproduction(
     roles: Roles<'_>,
     finding: &FindingId,
     gate: &GateId,
-) -> Result<GateReport, FindingExecError> {
-    let mut f = roles
+) -> Result<(GateReport, Flushed), FindingExecError> {
+    let f = roles
         .tracker
         .get_finding(finding)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
@@ -147,20 +152,30 @@ pub fn attach_reproduction(
         .map_err(|e| FindingExecError::Store(e.to_string()))?
         .ok_or_else(|| FindingExecError::NoSuchGate(gate.clone()))?;
 
-    let report = run_single_gate(roles.catalog, roles.ledger, &f.project, gate)?;
-    match &report.verdict {
-        Verdict::Pass { population, .. } => {
-            return Err(FindingExecError::ReproductionPasses {
-                name: def.name,
-                population: population.get(),
-            });
-        }
-        Verdict::Error { detail, .. } => {
-            return Err(FindingExecError::ReproductionErrored {
-                name: def.name,
-                detail: detail.clone(),
-            });
-        }
+    // The state change a reproduction would make, checked BEFORE the gate
+    // runs: a finding that cannot take one is refused with nothing run and
+    // nothing decided, so every refusal below is a verdict.
+    let mut next = f.clone();
+    next.attach_reproduction(gate.clone())?;
+
+    // Tagged with the finding's record, so the run is published with the
+    // decision (GitHub ledger spec §2.2, decision 7).
+    let report = run_single_gate(
+        roles.catalog,
+        roles.ledger,
+        &f.project,
+        gate,
+        Some(&f.record),
+    )?;
+    let refusal = match &report.verdict {
+        Verdict::Pass { population, .. } => Some(FindingExecError::ReproductionPasses {
+            name: def.name.clone(),
+            population: population.get(),
+        }),
+        Verdict::Error { detail, .. } => Some(FindingExecError::ReproductionErrored {
+            name: def.name.clone(),
+            detail: detail.clone(),
+        }),
         // An empty-population fail examined nothing, so it is refused for
         // the same reason a Pass is: it is not evidence the defect is
         // present. This must be checked BEFORE the catch-all below, which
@@ -178,21 +193,35 @@ pub fn attach_reproduction(
                 .map_err(|e| FindingExecError::Store(e.to_string()))?
                 .map(|p| p.root)
                 .unwrap_or_default();
-            return Err(FindingExecError::ReproductionEmptyPopulation {
-                name: def.name,
+            Some(FindingExecError::ReproductionEmptyPopulation {
+                name: def.name.clone(),
                 selector: describe_selector(&def.selector),
                 root,
-            });
+            })
         }
-        Verdict::Fail { .. } => {}
-    }
+        Verdict::Fail { .. } => None,
+    };
 
-    f.attach_reproduction(gate.clone())?;
+    // ⚠⚠ Evidence before state (GitHub ledger spec §2.2, Invariant): the
+    // decision — accepted or refused (decision 11) — is flushed before the
+    // finding changes. A failed flush refuses it: the finding stays raised.
+    let flushed = roles
+        .ledger
+        .flush(decision::for_reproduce(
+            &f,
+            gate,
+            &report,
+            refusal.is_none(),
+        ))
+        .map_err(|e| FindingExecError::Exec(ExecError::Unpublished(e.to_string())))?;
+    if let Some(refused) = refusal {
+        return Err(refused);
+    }
     roles
         .tracker
-        .update_finding(&f)
+        .update_finding(&next)
         .map_err(|e| FindingExecError::Store(e.to_string()))?;
-    Ok(report)
+    Ok((report, flushed))
 }
 
 /// The fix-completion check: the reproduction must now pass, and every gate
@@ -210,7 +239,7 @@ pub fn verify_finding(
     roles: Roles<'_>,
     finding: &FindingId,
 ) -> Result<FixReport, FindingExecError> {
-    let mut f = roles
+    let f = roles
         .tracker
         .get_finding(finding)
         .map_err(|e| FindingExecError::Store(e.to_string()))?
@@ -243,7 +272,15 @@ pub fn verify_finding(
         roles.catalog.get_gate(&gate),
     )?;
 
-    let reproduction = run_single_gate(roles.catalog, roles.ledger, &f.project, &gate)?;
+    // Every run is tagged with the finding's record, so it is published
+    // with the decision (GitHub ledger spec §2.2, decision 7).
+    let reproduction = run_single_gate(
+        roles.catalog,
+        roles.ledger,
+        &f.project,
+        &gate,
+        Some(&f.record),
+    )?;
 
     // The baseline is already on disk: a gate with a last_pass_commit passed
     // at some point, so a failure now is a regression rather than news.
@@ -261,7 +298,7 @@ pub fn verify_finding(
     // not a second one — by filtering out whatever did not pass.
     let mut neighbour_reports = Vec::new();
     for id in &neighbours {
-        let r = run_single_gate(roles.catalog, roles.ledger, &f.project, id)?;
+        let r = run_single_gate(roles.catalog, roles.ledger, &f.project, id, Some(&f.record))?;
         neighbour_reports.push(r);
     }
     let regressions: Vec<GateReport> = neighbour_reports
@@ -271,11 +308,27 @@ pub fn verify_finding(
         .collect();
 
     let closed = reproduction.verdict.is_pass() && regressions.is_empty();
+    let mut next = f.clone();
     if closed {
-        f.mark_fixed()?;
+        next.mark_fixed()?;
+    }
+
+    // ⚠⚠ Evidence before state (GitHub ledger spec §2.2, Invariant): flushed
+    // before the finding closes, and flushed when it does not (decision 11).
+    // A failed flush refuses the verify: the finding stays assigned.
+    let flushed = roles
+        .ledger
+        .flush(decision::for_verify(
+            &f,
+            &reproduction,
+            &neighbour_reports,
+            closed,
+        ))
+        .map_err(|e| FindingExecError::Exec(ExecError::Unpublished(e.to_string())))?;
+    if closed {
         roles
             .tracker
-            .update_finding(&f)
+            .update_finding(&next)
             .map_err(|e| FindingExecError::Store(e.to_string()))?;
     }
 
@@ -284,17 +337,20 @@ pub fn verify_finding(
         neighbours: neighbour_reports,
         regressions,
         closed,
+        flushed,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::journal::Journal;
     use fl_core::MemStore;
+    use fl_core::decision::Outcome;
     use fl_core::finding::{Finding, FindingState};
     use fl_core::ids::{ProjectId, RecordId};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
-    use fl_core::store::{Catalog, Roles, Tracker};
+    use fl_core::store::{Catalog, Ledger, Roles, Tracker};
     use fl_core::verdict::FailReason;
     use std::fs;
     use std::process::Command;
@@ -455,7 +511,7 @@ mod tests {
             .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
             .unwrap();
 
-        let report = attach_reproduction(Roles::single(&s), &f, &g).unwrap();
+        let (report, _) = attach_reproduction(Roles::single(&s), &f, &g).unwrap();
         assert!(!report.verdict.is_pass());
         let back = s.get_finding(&f).unwrap().unwrap();
         assert_eq!(back.state, FindingState::Reproduced);
@@ -503,7 +559,7 @@ mod tests {
         // The neighbour passes first, so it earns a last_pass_commit.
         let neighbour = gate(&s, &p, d.path(), "neighbour", "true");
         let rep = gate(&s, &p, d.path(), "reproduction", "false");
-        let _ = crate::evaluate::run_single_gate(&s, &s, &p, &neighbour).unwrap();
+        let _ = crate::evaluate::run_single_gate(&s, &s, &p, &neighbour, None).unwrap();
         assert!(
             s.get_gate(&neighbour)
                 .unwrap()
@@ -563,7 +619,7 @@ mod tests {
         let r = s.add_record(&p, "t").unwrap();
         let neighbour = gate(&s, &p, d.path(), "neighbour", "true");
         let rep = gate(&s, &p, d.path(), "reproduction", "false");
-        let _ = crate::evaluate::run_single_gate(&s, &s, &p, &neighbour).unwrap();
+        let _ = crate::evaluate::run_single_gate(&s, &s, &p, &neighbour, None).unwrap();
 
         let f = s
             .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
@@ -670,5 +726,249 @@ mod tests {
         };
         assert!(err.to_string().contains("dangling"), "got {err}");
         assert!(err.to_string().contains(&f.to_string()), "got {err}");
+    }
+
+    fn set_program(s: &MemStore, g: &GateId, program: &str) {
+        let mut def = s.get_gate(g).unwrap().unwrap();
+        def.kind = GateKind::Command(CommandSpec {
+            program: program.into(),
+            args: vec![],
+            delivery: PopulationDelivery::Args,
+            timeout_secs: 10,
+            pass_codes: vec![0],
+        });
+        s.update_gate(&def).unwrap();
+    }
+
+    // ⚠⚠ Spec §2.2 (Invariant). Confirmed by mutation: moving the flush
+    // below `update_finding` turns this test red.
+    #[test]
+    fn a_reproduction_is_flushed_before_the_finding_changes() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let g = gate(&s, &p, d.path(), "red", "false");
+        let f = s
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
+            .unwrap();
+        let j = Journal::new(&s);
+
+        let (_, flushed) = attach_reproduction(j.roles(), &f, &g).unwrap();
+
+        assert_eq!(j.events(), vec!["flush", "update_finding"]);
+        assert_eq!(flushed.commit.as_deref(), Some("c1"));
+        let decisions = j.decisions();
+        assert_eq!(
+            decisions[0].outcome,
+            Outcome::Reproduce {
+                gate: g.clone(),
+                accepted: true
+            }
+        );
+        assert_eq!(decisions[0].record, r);
+        assert_eq!(decisions[0].finding, Some(f));
+        let runs = s.gate_runs(&g).unwrap();
+        assert_eq!(decisions[0].rests_on, vec![runs[0].id.clone().unwrap()]);
+        assert_eq!(
+            runs[0].record,
+            Some(r),
+            "the run carries the finding's record, so it is published with the decision"
+        );
+    }
+
+    // Decision 11: a refused decision is flushed too.
+    #[test]
+    fn a_refused_reproduction_is_flushed_too_and_the_finding_stays_raised() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let g = gate(&s, &p, d.path(), "green", "true");
+        let f = s
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
+            .unwrap();
+        let j = Journal::new(&s);
+
+        let err = attach_reproduction(j.roles(), &f, &g).unwrap_err();
+
+        assert!(
+            matches!(err, FindingExecError::ReproductionPasses { .. }),
+            "{err}"
+        );
+        assert_eq!(j.events(), vec!["flush"]);
+        assert_eq!(
+            j.decisions()[0].outcome,
+            Outcome::Reproduce {
+                gate: g,
+                accepted: false
+            }
+        );
+        assert_eq!(
+            s.get_finding(&f).unwrap().unwrap().state,
+            FindingState::Raised
+        );
+    }
+
+    #[test]
+    fn a_reproduction_whose_flush_fails_is_refused_and_keeps_its_run_locally() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let g = gate(&s, &p, d.path(), "red", "false");
+        let f = s
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
+            .unwrap();
+        let j = Journal::refusing(&s);
+
+        let err = attach_reproduction(j.roles(), &f, &g).unwrap_err();
+
+        assert!(
+            matches!(err, FindingExecError::Exec(ExecError::Unpublished(_))),
+            "{err}"
+        );
+        assert_eq!(
+            s.get_finding(&f).unwrap().unwrap().state,
+            FindingState::Raised
+        );
+        assert_eq!(s.gate_runs(&g).unwrap().len(), 1, "the run is kept");
+    }
+
+    // A finding that cannot take a reproduction is refused before anything
+    // runs, so every refusal after a run is a verdict — and is flushed.
+    #[test]
+    fn a_finding_that_cannot_take_a_reproduction_is_refused_before_its_gate_runs() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let g = gate(&s, &p, d.path(), "red", "false");
+        let f = s
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
+            .unwrap();
+        let mut fin = s.get_finding(&f).unwrap().unwrap();
+        fin.withdraw("not concrete").unwrap();
+        s.update_finding(&fin).unwrap();
+        let j = Journal::new(&s);
+
+        let err = attach_reproduction(j.roles(), &f, &g).unwrap_err();
+
+        assert!(matches!(err, FindingExecError::Finding(_)), "{err}");
+        assert!(s.gate_runs(&g).unwrap().is_empty(), "nothing ran");
+        assert!(j.events().is_empty(), "nothing was decided or flushed");
+    }
+
+    // ⚠⚠ Spec §2.2 (Invariant). Confirmed by mutation: moving the flush
+    // after the finding closes turns this test red.
+    #[test]
+    fn a_verify_is_flushed_before_the_finding_closes_and_its_runs_carry_the_record() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let f = assigned(&s, &p, &r, &rep);
+        set_program(&s, &rep, "true");
+        let j = Journal::new(&s);
+
+        let report = verify_finding(j.roles(), &f).unwrap();
+
+        assert!(report.closed);
+        assert_eq!(report.flushed.commit.as_deref(), Some("c1"));
+        assert_eq!(j.events(), vec!["flush", "update_finding"]);
+        assert_eq!(
+            j.decisions()[0].outcome,
+            Outcome::Verify {
+                reproduction: rep.clone(),
+                reproduction_passed: true,
+                regressions: vec![],
+                closed: true,
+            }
+        );
+        let runs = s.gate_runs(&rep).unwrap();
+        assert_eq!(
+            runs.len(),
+            2,
+            "the reproduce's run and the verify's run, so the check below cannot pass vacuously"
+        );
+        assert!(
+            runs.iter().all(|run| run.record.as_ref() == Some(&r)),
+            "the reproduce and the verify both tag their runs with the finding's record"
+        );
+    }
+
+    #[test]
+    fn a_verify_that_does_not_close_is_flushed_too_and_names_the_regression() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let neighbour = gate(&s, &p, d.path(), "neighbour", "true");
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        run_single_gate(&s, &s, &p, &neighbour, None).unwrap();
+        let f = assigned(&s, &p, &r, &rep);
+        set_program(&s, &rep, "true");
+        set_program(&s, &neighbour, "false");
+        let j = Journal::new(&s);
+
+        let report = verify_finding(j.roles(), &f).unwrap();
+
+        assert!(!report.closed);
+        assert_eq!(j.events(), vec!["flush"]);
+        let decisions = j.decisions();
+        assert_eq!(
+            decisions[0].outcome,
+            Outcome::Verify {
+                reproduction: rep,
+                reproduction_passed: true,
+                regressions: vec![neighbour.clone()],
+                closed: false,
+            }
+        );
+        assert_eq!(decisions[0].rests_on.len(), 2);
+        assert_eq!(
+            s.get_finding(&f).unwrap().unwrap().state,
+            FindingState::Assigned
+        );
+        let neighbour_runs = s.gate_runs(&neighbour).unwrap();
+        assert_eq!(
+            neighbour_runs.len(),
+            2,
+            "the baseline run (untagged) and the verify's run, so the check below cannot pass vacuously"
+        );
+        assert_eq!(
+            neighbour_runs.last().unwrap().record,
+            Some(r),
+            "the neighbour's verify run carries the finding's record too, so it is \
+             publishable with the decision that rests on it (GitHub mode refuses a decision \
+             whose rests_on cites a run that is not publishable)"
+        );
+    }
+
+    #[test]
+    fn a_verify_whose_flush_fails_does_not_close_the_finding() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let f = assigned(&s, &p, &r, &rep);
+        set_program(&s, &rep, "true");
+        let j = Journal::refusing(&s);
+
+        let err = match verify_finding(j.roles(), &f) {
+            Err(e) => e,
+            Ok(_) => panic!("a verify whose flush failed must be refused"),
+        };
+
+        assert!(
+            matches!(err, FindingExecError::Exec(ExecError::Unpublished(_))),
+            "{err}"
+        );
+        assert_eq!(
+            s.get_finding(&f).unwrap().unwrap().state,
+            FindingState::Assigned
+        );
     }
 }
