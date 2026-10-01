@@ -77,6 +77,9 @@ invocation). Both are append-only evidence.
     option. Decision 9 applies this rule.
 13. **`fl finding reproduce` checks the finding's state before its gate runs** (confirmed while
     planning), so every refusal after the run is a verdict, recorded and flushed.
+14. **An attempt that ran but could not be published exits with the attempt's own code** (0 or 1)
+    and prints the publish failure as a warning (2026-10-01). Exit 2 means "refused" everywhere
+    else, and a script that retries on it must never re-run an attempt that was already paid for.
 
 ### 0.2 Out of scope
 
@@ -429,7 +432,8 @@ repeated error, until it is fixed. The docs and `init` say so.
 
 ## 7. Errors
 
-Every error exits 2 with `error: …` and says what to do.
+Every error exits 2 with `error: …` and says what to do — except the attempt row below, which is
+a warning (decision 14).
 
 | condition | what fl does |
 |---|---|
@@ -443,7 +447,7 @@ Every error exits 2 with `error: …` and says what to do.
 | rate limited, primary or secondary | refuses the decision; gives the reset time when known |
 | unreachable in the pre-flight | refuses; nothing ran |
 | unreachable at a move's, check's or finding's flush | refuses; no state change; the runs stay local |
-| unreachable at an attempt's flush | not refused — it already ran: kept locally, outcome printed, published next time |
+| unreachable at an attempt's flush | not refused — it already ran: kept locally, outcome printed, a warning, published next time; exits with the attempt's own code (decision 14) |
 | a comment fails to post | the state change stands; names `fl github ledger comment <record>` |
 | an unknown `ledger` value | config error |
 
