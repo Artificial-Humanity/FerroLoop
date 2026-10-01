@@ -5,6 +5,7 @@ pub mod client;
 pub mod creds;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
+pub mod ledger;
 pub mod meta;
 pub mod owner;
 pub mod tracker;
