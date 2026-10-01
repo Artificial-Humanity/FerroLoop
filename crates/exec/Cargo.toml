@@ -17,3 +17,9 @@ uuid.workspace = true
 # Not test-only: `run_command_gate`'s FileList delivery writes the resolved
 # population to a NamedTempFile at run time, not just in tests.
 tempfile.workspace = true
+
+[dev-dependencies]
+# The `conformance` feature exposes `MemRemote`, the in-memory double for
+# `SplitLedger`'s GitHub side, so an integration test here can drive the
+# real `SplitLedger` instead of the `Journal` test double.
+fl-core = { path = "../core", features = ["conformance"] }
