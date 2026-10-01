@@ -984,6 +984,55 @@ mod tests {
         assert!(first.what.contains("rewrites lines"), "{}", first.what);
     }
 
+    // Spec §3.6: a quarantined line cut short (no final newline) is
+    // skipped, and the next publish must not lose its entry to it. Written
+    // straight after the cut bytes, the new line would merge into the
+    // quarantined one: readers would skip it too, though the publish
+    // answered with a commit. It starts the next segment instead, and fl's
+    // own commit only adds — the damage stays at the commit that made it.
+    #[test]
+    fn a_publish_after_a_quarantined_cut_line_starts_a_new_segment_and_reads_back() {
+        let (fake, local, _root) = world();
+        let cut = format!("{}{{\"cut", file(&[line(&run(1))]));
+        let damage = fake.hand_commit(&[(seg(1).as_str(), Some(cut.as_str()))]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        l.quarantine(
+            &seq_iri(60),
+            &At::from_unix_millis(60),
+            &seg(1),
+            2,
+            "Ada",
+            "cut short",
+        )
+        .unwrap();
+        let before = fake.ledger_head().unwrap();
+        let published = l
+            .publish(&Batch {
+                decision: sample_decision(2, &record(), vec![run(2).id.unwrap()]),
+                runs: vec![run(2)],
+                attempts: vec![],
+            })
+            .unwrap();
+        assert_eq!(published, fake.ledger_head());
+        assert_eq!(l.runs(&gate()).unwrap(), vec![run(1), run(2)]);
+        let files = fake.ledger_files();
+        assert_eq!(files[&seg(1)], cut, "the cut segment is never rewritten");
+        assert!(files[&seg(2)].ends_with('\n'), "{}", files[&seg(2)]);
+        let mut seen = Seen::default();
+        let (was, is) = (
+            l.commit_object(&before).unwrap(),
+            l.commit_object(&published.unwrap()).unwrap(),
+        );
+        assert_eq!(
+            l.only_adds(&was, &is, &mut seen).unwrap(),
+            None,
+            "fl's own commit only adds"
+        );
+        let first = l.verify().unwrap().first_bad.unwrap();
+        assert_eq!(first.commit, damage, "only the hand edit is reported");
+    }
+
     // Ruling 17: a line in the wrong directory can be quarantined too.
     #[test]
     fn a_misplaced_line_can_be_quarantined() {

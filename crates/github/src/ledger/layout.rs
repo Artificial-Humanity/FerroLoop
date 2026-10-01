@@ -285,8 +285,14 @@ pub fn grows_only(was: &[u8], is: &[u8]) -> bool {
 /// before the new lines, even a line in it that is not UTF-8 (quarantined,
 /// so readers skip it). Text would have to re-encode that line lossily —
 /// a rewrite, which `verify` rightly reports.
+///
+/// ⚠ A last segment whose last line was cut short (no final newline; a
+/// quarantine lets readers skip it) is left as it is, closed, and the new
+/// lines start the next segment: written straight after its bytes, the
+/// first new line would merge into the cut one and be skipped with it.
 pub fn plan_append(segments: &[(u64, Vec<u8>)], new: &[String]) -> Vec<(u64, Vec<u8>)> {
     let (mut n, mut bytes) = match segments.last() {
+        Some((n, b)) if !b.is_empty() && !b.ends_with(b"\n") => (n + 1, Vec::new()),
         Some((n, b)) => (*n, b.clone()),
         None => (1, Vec::new()),
     };
@@ -711,6 +717,23 @@ mod tests {
             ]
         );
         assert!(out.iter().all(|(_, t)| t.len() <= SEGMENT_LIMIT));
+    }
+
+    // A last segment that ends in a line cut short (one a quarantine lets
+    // readers skip): a new line written straight after its bytes would
+    // merge into that line and be skipped with it. The cut segment stays
+    // as it is, closed, and the new lines start the next one.
+    #[test]
+    fn a_last_segment_cut_short_is_closed_and_the_new_lines_start_the_next() {
+        let segments = vec![(1, seg(&["a"])), (2, b"b\n{\"cut".to_vec())];
+        assert_eq!(
+            plan_append(&segments, &["c".into(), "d".into()]),
+            vec![(3, seg(&["c", "d"]))]
+        );
+        assert!(
+            plan_append(&segments, &[]).is_empty(),
+            "nothing to add writes nothing"
+        );
     }
 
     #[test]
