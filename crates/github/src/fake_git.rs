@@ -843,6 +843,16 @@ fn append(s: &mut State, vars: &Value) -> Answer {
         a.hang_up = true;
         return a;
     }
+    if std::mem::take(&mut s.garble_next_commit_answer) {
+        let mut a = answer(200, Value::Null);
+        a.raw_body = Some("<html>fake: not JSON</html>".into());
+        return a;
+    }
+    if std::mem::take(&mut s.break_next_commit_answer) {
+        let mut a = answer(200, Value::Null);
+        a.break_body = true;
+        return a;
+    }
     answer(
         200,
         json!({"data": {"createCommitOnBranch": {"commit": {"oid": oid}}}}),
@@ -1447,6 +1457,39 @@ mod tests {
             2,
             "it landed; only the answer was lost"
         );
+    }
+
+    // The two answers a commit that landed can come back with that are not
+    // an answer at all: a 200 whose body is not JSON, and one whose body
+    // breaks off. The plain client reads each as an error; it landed.
+    #[test]
+    fn a_commit_that_landed_can_be_answered_with_a_garbled_or_broken_body() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let c = client(&fake);
+        fake.state().garble_next_commit_answer = true;
+        let err = c
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref m) if m.contains("not JSON")),
+            "{err:?}"
+        );
+        assert_eq!(fake.ledger_commits(), 2, "it landed");
+        let head = fake.ledger_head().unwrap();
+        fake.state().break_next_commit_answer = true;
+        let err = c
+            .graphql_answer(APPEND, append_input(&head, "runs/k/1.jsonl", "a\nb\n"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+        assert_eq!(fake.ledger_commits(), 3, "it landed");
+        let a = c
+            .graphql_answer(
+                APPEND,
+                append_input(&fake.ledger_head().unwrap(), "runs/k/1.jsonl", "a\nb\nc\n"),
+            )
+            .unwrap();
+        assert!(a.data.is_some(), "both knobs are one-shot");
     }
 
     #[test]

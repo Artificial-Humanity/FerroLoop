@@ -2,18 +2,24 @@
 //! of the repository that backs the tracker, where mode B publishes each
 //! decision and the evidence it rests on.
 
+mod append;
 pub mod disclose;
 mod git;
 pub mod layout;
 mod read;
 
-use crate::client::Client;
+use crate::client::{Client, Method};
 use crate::tracker::Repo;
-use fl_core::split::LedgerMemory;
-use std::cell::RefCell;
+use fl_core::StoreError;
+use fl_core::ids::{GateId, ProjectId, RecordId};
+use fl_core::log::{Attempt, GateRun};
+use fl_core::split::{Batch, LedgerMemory, RemoteLedger};
+use serde_json::Value;
+use std::cell::{OnceCell, RefCell};
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+pub use append::TRIES;
 pub use disclose::Visibility;
 pub use read::Note;
 
@@ -32,6 +38,10 @@ pub struct GithubLedger<'a> {
     pub(crate) lag_pause: Duration,
     /// What reads noted without refusing, once each.
     pub(crate) notes: RefCell<BTreeSet<Note>>,
+    /// Read once per `GithubLedger` (spec §5; ruling 21).
+    pub(crate) visibility: OnceCell<Visibility>,
+    /// `by` on every line it writes (spec §3.1; ruling 18).
+    pub(crate) identity: OnceCell<String>,
 }
 
 impl<'a> GithubLedger<'a> {
@@ -43,6 +53,8 @@ impl<'a> GithubLedger<'a> {
             lag_reads: 3,
             lag_pause: Duration::from_millis(500),
             notes: RefCell::new(BTreeSet::new()),
+            visibility: OnceCell::new(),
+            identity: OnceCell::new(),
         }
     }
 
@@ -65,5 +77,65 @@ impl<'a> GithubLedger<'a> {
         std::mem::take(&mut *self.notes.borrow_mut())
             .into_iter()
             .collect()
+    }
+
+    /// The repository's visibility, read live, once per `GithubLedger` —
+    /// one command, one decision (spec §5).
+    ///
+    /// ⚠ A failed read is an error: an unknown visibility is not private.
+    /// An answer that names none is taken as not private, which withholds
+    /// (ruling 21): a published excerpt cannot be taken back.
+    pub fn visibility(&self) -> Result<Visibility, StoreError> {
+        if let Some(v) = self.visibility.get() {
+            return Ok(*v);
+        }
+        let r = self.client.send(Method::Get, &self.path(""), None)?;
+        if r.status != 200 {
+            return Err(StoreError::Backend(format!(
+                "fl could not read the visibility of {} (GitHub answered {}), so it publishes \
+                 nothing to its ledger: an unknown visibility is not private. Retry",
+                self.repo.full_name, r.status
+            )));
+        }
+        let v = Visibility::from_github(
+            r.body
+                .get("visibility")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        );
+        let _ = self.visibility.set(v);
+        Ok(v)
+    }
+
+    /// Who the lines this ledger writes say wrote them, read once.
+    pub(crate) fn identity(&self) -> Result<String, StoreError> {
+        if let Some(by) = self.identity.get() {
+            return Ok(by.clone());
+        }
+        let by = self.client.identity()?;
+        let _ = self.identity.set(by.clone());
+        Ok(by)
+    }
+}
+
+impl RemoteLedger for GithubLedger<'_> {
+    fn repo_node_id(&self) -> &str {
+        &self.repo.node_id
+    }
+
+    fn owns_record(&self, record: &RecordId) -> Result<bool, StoreError> {
+        self.owns(record)
+    }
+
+    fn publish(&self, batch: &Batch) -> Result<Option<String>, StoreError> {
+        self.publish_batch(batch)
+    }
+
+    fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
+        self.runs(gate)
+    }
+
+    fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
+        self.attempts_of(project)
     }
 }

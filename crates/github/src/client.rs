@@ -129,8 +129,34 @@ impl Client {
         query: &str,
         variables: Value,
     ) -> Result<GraphqlAnswer, StoreError> {
+        self.graphql_reply(query, variables, true)
+    }
+
+    /// Like [`Self::graphql_answer`], for a write whose answer may be lost
+    /// after it landed (the ledger's commit, GitHub ledger spec §3.2 step
+    /// 5): a 2xx whose body is not JSON, or breaks off, is an answer with
+    /// no `data` and no errors — which says nothing about whether the write
+    /// landed — never an error that would read as "it did not".
+    pub(crate) fn graphql_write(
+        &self,
+        query: &str,
+        variables: Value,
+    ) -> Result<GraphqlAnswer, StoreError> {
+        self.graphql_reply(query, variables, false)
+    }
+
+    fn graphql_reply(
+        &self,
+        query: &str,
+        variables: Value,
+        require_json_on_2xx: bool,
+    ) -> Result<GraphqlAnswer, StoreError> {
         let body = serde_json::json!({ "query": query, "variables": variables });
-        let reply = self.send(Method::Post, "/graphql", Some(&body))?;
+        let reply = if require_json_on_2xx {
+            self.send(Method::Post, "/graphql", Some(&body))?
+        } else {
+            self.send_unchecked_json(Method::Post, "/graphql", Some(&body))?
+        };
         let errors: Vec<Value> = reply
             .body
             .get("errors")

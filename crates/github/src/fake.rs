@@ -222,6 +222,12 @@ pub struct State {
     /// ⚠ Modelled — confirmed by live test
     /// `create_commit_on_branch_without_contents_write_is_refused`.
     pub refuse_next_commit_as_forbidden: bool,
+    /// The next ledger commit lands, then answers 200 with a body that is
+    /// not JSON. One-shot.
+    pub garble_next_commit_answer: bool,
+    /// The next ledger commit lands, then answers 200 with a body that
+    /// breaks off. One-shot.
+    pub break_next_commit_answer: bool,
     /// The first request whose path contains this fragment answers with
     /// this status and body instead of its normal handling — a malformed
     /// GitHub answer none of the fake's real routes produce on their own
