@@ -26,15 +26,31 @@ pub struct Pending {
 
 /// The local store's half of publishing (spec §2.1, §3.2 step 6), keyed by
 /// the repository's `node_id`: its cut-over, and what it already has.
+///
+/// ⚠ The WAITING SET is the store's, not a repository's: an entry
+/// published to one repository, or set aside, leaves it for every
+/// repository. A store binds one tracker — the CLI refuses a store that two
+/// trackers share — so no second repository waits for the same entry. The
+/// published MARKS stay per repository (`is_published`).
 pub trait Outbox {
-    /// Every entry with an id greater than `after`, tied to a record (every
-    /// attempt is), and not marked published to `repo` — in id order. A
-    /// run with no record is never listed (spec §2.1), nor is an entry with
-    /// no id (§1.3).
+    /// Every entry still waiting, with an id greater than `after`, tied to
+    /// a record (every attempt is) — in id order. A run with no record is
+    /// never listed (spec §2.1), nor is an entry with no id (§1.3).
     fn unpublished(&self, repo: &str, after: &Iri) -> Result<Pending, StoreError>;
     fn is_published(&self, repo: &str, id: &Iri) -> Result<bool, StoreError>;
-    /// Idempotent: marking an id twice is not an error.
+    /// Idempotent. ⚠ In the same write, each id leaves the waiting set, so
+    /// the set a flush scans stays bounded by what is actually waiting
+    /// (spec §2.1).
     fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError>;
+    /// What a flush that landed leaves behind, in ONE write: `published` is
+    /// marked and leaves the waiting set; `set_aside` — entries a flush
+    /// skipped because another repository owns their record (spec §2.1) —
+    /// leaves it unmarked: reported once, by the flush that skipped them,
+    /// and never offered again. Idempotent.
+    ///
+    /// ⚠ One write, so a publish that landed is never refused by a second
+    /// write failing after the first.
+    fn settle(&self, repo: &str, published: &[Iri], set_aside: &[Iri]) -> Result<(), StoreError>;
     /// The id after which entries are publishable to `repo`, if its GitHub
     /// ledger was switched on.
     fn cutover(&self, repo: &str) -> Result<Option<Iri>, StoreError>;
@@ -263,6 +279,7 @@ impl Ledger for SplitLedger<'_> {
         };
         let pending = self.local.unpublished(&repo, &cutover)?;
         let mut left_local = Vec::new();
+        let mut set_aside = Vec::new();
         let mut runs = Vec::new();
         for run in pending.runs {
             // `Outbox` lists only runs tied to a record, each with an id.
@@ -272,6 +289,7 @@ impl Ledger for SplitLedger<'_> {
             if self.github.owns_record(&record)? {
                 runs.push(run);
             } else {
+                set_aside.push(id.clone());
                 left_local.push(LeftLocal::OtherRepository { entry: id, record });
             }
         }
@@ -283,6 +301,7 @@ impl Ledger for SplitLedger<'_> {
             if self.github.owns_record(&a.record)? {
                 attempts.push(a);
             } else {
+                set_aside.push(id.clone());
                 left_local.push(LeftLocal::OtherRepository {
                     entry: id,
                     record: a.record.clone(),
@@ -308,8 +327,10 @@ impl Ledger for SplitLedger<'_> {
             attempts,
         })?;
         // Only after the commit landed: a mark written first would hide an
-        // entry GitHub never received.
-        self.local.mark_published(&repo, &ids)?;
+        // entry GitHub never received. ⚠ And set aside only now, by the
+        // flush whose report reaches the command: reported once, never
+        // offered again (spec §2.1). One write for both (ruling 4).
+        self.local.settle(&repo, &ids, &set_aside)?;
         Ok(Flushed { commit, left_local })
     }
 }
@@ -693,6 +714,33 @@ mod tests {
         assert!(
             !s.is_published("R_1", elsewhere.id.as_ref().unwrap())
                 .unwrap()
+        );
+    }
+
+    // ⚠ Ruling 4: a skipped entry is set aside only by a flush that landed,
+    // whose report reaches the command. A flush that failed reported
+    // nothing, so the next one reports it.
+    #[test]
+    fn a_skipped_entry_whose_flush_failed_is_reported_by_the_next_one() {
+        let (s, _p, g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        let theirs = remote.foreign_record();
+        let elsewhere = sample_record_run(1, &g, Some(&theirs));
+        l.append_gate_run(elsewhere.clone()).unwrap();
+        remote.fail_publish(true);
+        assert!(l.flush(sample_decision(1, &r, vec![])).is_err());
+        remote.fail_publish(false);
+        let flushed = l.flush(sample_decision(2, &r, vec![])).unwrap();
+        assert_eq!(
+            flushed.left_local,
+            vec![LeftLocal::OtherRepository {
+                entry: elsewhere.id.clone().unwrap(),
+                record: theirs,
+            }]
         );
     }
 

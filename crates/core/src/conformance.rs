@@ -149,7 +149,7 @@ const TRACKER_CASES: usize = 12;
 /// How many cases [`ledger`] runs. Update deliberately — see [`run_suite`].
 const LEDGER_CASES: usize = 4;
 /// How many cases [`split_ledger`] runs. Update deliberately — see [`run_suite`].
-const SPLIT_LEDGER_CASES: usize = 8;
+const SPLIT_LEDGER_CASES: usize = 10;
 /// How many cases [`all_roles`] runs. Update deliberately — see [`run_suite`].
 const ALL_ROLES_CASES: usize = 7;
 /// How many cases [`local_handles`] runs. Update deliberately — see [`run_suite`].
@@ -209,6 +209,8 @@ pub fn split_ledger<F: SplitFixture>(make: impl Fn() -> F) {
         a_gate_the_local_catalog_never_held_is_not_owned_whatever_github_holds,
         a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush,
         a_pending_entry_of_another_repository_does_not_block_the_decision,
+        a_published_entry_is_never_offered_to_github_again,
+        a_skipped_entry_is_reported_by_one_flush_only,
     ];
     assert_eq!(
         cases.len(),
@@ -871,6 +873,49 @@ fn a_pending_entry_of_another_repository_does_not_block_the_decision(
     assert_eq!(run_ids(ctl.remote().gate_runs(&g).unwrap()), vec![mine.id]);
 }
 
+// ⚠ Spec §2.1, §3.2 step 6: a published entry is marked, so no later flush
+// offers it again. Seen in the batches, because GitHub's de-duplication
+// would hide a missing mark from every read.
+fn a_published_entry_is_never_offered_to_github_again(roles: &Bound<'_>, ctl: &dyn RemoteControl) {
+    let (_p, g, r) = record_world(roles);
+    let first = sample_record_run(1, &g, Some(&r));
+    roles.ledger.append_gate_run(first.clone()).unwrap();
+    roles
+        .ledger
+        .flush(sample_decision(1, &r, vec![first.id.clone().unwrap()]))
+        .unwrap();
+    let second = sample_record_run(2, &g, Some(&r));
+    roles.ledger.append_gate_run(second.clone()).unwrap();
+    roles
+        .ledger
+        .flush(sample_decision(2, &r, vec![second.id.clone().unwrap()]))
+        .unwrap();
+    let batches = ctl.batches();
+    assert_eq!(batches.len(), 2, "one batch per flush");
+    assert_eq!(run_ids(batches[0].runs.clone()), vec![first.id]);
+    assert_eq!(
+        run_ids(batches[1].runs.clone()),
+        vec![second.id],
+        "the first run was published and is not offered again"
+    );
+}
+
+// ⚠ Spec §2.1: an entry another repository owns is reported by the flush
+// that skips it, and by no later one.
+fn a_skipped_entry_is_reported_by_one_flush_only(roles: &Bound<'_>, ctl: &dyn RemoteControl) {
+    let (_p, g, r) = record_world(roles);
+    let other = sample_record_run(1, &g, Some(&ctl.foreign_record()));
+    roles.ledger.append_gate_run(other).unwrap();
+    let first = roles.ledger.flush(sample_decision(1, &r, vec![])).unwrap();
+    assert_eq!(first.left_local.len(), 1, "{first:?}");
+    let second = roles.ledger.flush(sample_decision(2, &r, vec![])).unwrap();
+    assert!(second.left_local.is_empty(), "{second:?}");
+    assert!(
+        ctl.batches().iter().all(|b| b.runs.is_empty()),
+        "never published"
+    );
+}
+
 /// Asserts that every result is `NotOwned` and names `id`. Each result is
 /// labelled with the method that produced it, so a failure says which
 /// method answered for an id its store never held.
@@ -1346,6 +1391,10 @@ pub trait RemoteControl {
     fn foreign_record(&self) -> RecordId;
     /// The remote side itself, read without the local store.
     fn remote(&self) -> &dyn RemoteLedger;
+    /// Every batch the remote side was handed to publish, in order — what
+    /// each flush offered, which GitHub's own de-duplication would hide
+    /// from every read.
+    fn batches(&self) -> Vec<Batch>;
 }
 
 /// The one record [`MemRemote`] does not own.
@@ -1378,6 +1427,7 @@ struct RemoteInner {
     attempts: Vec<Attempt>,
     decisions: Vec<Decision>,
     commits: u64,
+    batches: Vec<Batch>,
 }
 
 impl MemRemote {
@@ -1470,6 +1520,7 @@ impl RemoteLedger for MemRemote {
     fn publish(&self, batch: &Batch) -> Result<Option<String>, StoreError> {
         self.refuse_if_down()?;
         let mut s = self.inner.borrow_mut();
+        s.batches.push(batch.clone());
         if s.fail_publish {
             return Err(self.unreachable("the commit did not land"));
         }
@@ -1541,5 +1592,8 @@ impl RemoteControl for MemRemote {
     }
     fn remote(&self) -> &dyn RemoteLedger {
         self
+    }
+    fn batches(&self) -> Vec<Batch> {
+        self.inner.borrow().batches.clone()
     }
 }

@@ -43,6 +43,9 @@ struct Inner {
     bindings: BTreeMap<String, String>,
     /// (repository `node_id`, entry id) for every entry marked published.
     published: BTreeSet<(String, Iri)>,
+    /// Every entry published to any repository, or set aside: it waits no
+    /// more (spec §2.1).
+    settled: BTreeSet<Iri>,
     /// repository `node_id` → the id after which entries are publishable.
     cutovers: BTreeMap<String, Iri>,
     /// repository `node_id` → its GitHub ledger's first commit.
@@ -409,12 +412,11 @@ impl Ledger for MemStore {
 }
 
 impl Outbox for MemStore {
-    fn unpublished(&self, repo: &str, after: &Iri) -> Result<Pending, StoreError> {
+    fn unpublished(&self, _repo: &str, after: &Iri) -> Result<Pending, StoreError> {
         let s = self.inner.borrow();
         let waiting = |id: &Option<Iri>| {
-            id.as_ref().is_some_and(|id| {
-                id > after && !s.published.contains(&(repo.to_string(), id.clone()))
-            })
+            id.as_ref()
+                .is_some_and(|id| id > after && !s.settled.contains(id))
         };
         let mut runs: Vec<GateRun> = s
             .runs
@@ -445,7 +447,17 @@ impl Outbox for MemStore {
         let mut s = self.inner.borrow_mut();
         for id in ids {
             s.published.insert((repo.to_string(), id.clone()));
+            s.settled.insert(id.clone());
         }
+        Ok(())
+    }
+
+    fn settle(&self, repo: &str, published: &[Iri], set_aside: &[Iri]) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        for id in published {
+            s.published.insert((repo.to_string(), id.clone()));
+        }
+        s.settled.extend(published.iter().chain(set_aside).cloned());
         Ok(())
     }
 
@@ -598,9 +610,27 @@ mod tests {
         assert_eq!(pending.attempts, vec![attempt]);
         assert_eq!(
             s.unpublished("R_2", &entry_iri(3)).unwrap().runs,
-            vec![marked, waiting, late],
+            vec![waiting, late],
+            "the waiting set is the store's: an entry published anywhere waits for no repository"
+        );
+        assert!(
+            !s.is_published("R_2", marked.id.as_ref().unwrap()).unwrap(),
             "a mark is per repository"
         );
+    }
+
+    // Spec §2.1: an entry set aside waits no more, and is not published.
+    #[test]
+    fn an_entry_set_aside_waits_no_more_and_is_not_published() {
+        use crate::conformance::{entry_iri, sample_record_run};
+        use crate::split::Outbox;
+        let (s, g, r, _p) = outbox_world();
+        let aside = sample_record_run(4, &g, Some(&r));
+        s.append_gate_run(aside.clone()).unwrap();
+        s.settle("R_1", &[], &[aside.id.clone().unwrap()]).unwrap();
+        s.settle("R_1", &[], &[aside.id.clone().unwrap()]).unwrap();
+        assert!(s.unpublished("R_1", &entry_iri(0)).unwrap().runs.is_empty());
+        assert!(!s.is_published("R_1", aside.id.as_ref().unwrap()).unwrap());
     }
 
     // Spec §2.1: the cut-over is recorded once, when the GitHub ledger is

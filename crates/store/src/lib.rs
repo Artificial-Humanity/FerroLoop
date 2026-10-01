@@ -270,6 +270,18 @@ fn waiting<T: serde::de::DeserializeOwned>(
     Ok(out)
 }
 
+/// Drop `ids` from the candidate index inside `tx`: published or set aside,
+/// they wait no more, and no flush scans them again (spec §2.1).
+fn drop_candidates(tx: &redb::WriteTransaction, ids: &[Iri]) -> Result<(), StoreError> {
+    for index in [CANDIDATE_RUNS, CANDIDATE_ATTEMPTS] {
+        let mut table = tx.open_table(index).map_err(backend)?;
+        for id in ids {
+            table.remove(id.as_str()).map_err(backend)?;
+        }
+    }
+    Ok(())
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let label = path.display().to_string();
@@ -1157,13 +1169,20 @@ impl Outbox for RedbStore {
     }
 
     fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError> {
+        self.settle(repo, ids, &[])
+    }
+
+    fn settle(&self, repo: &str, published: &[Iri], set_aside: &[Iri]) -> Result<(), StoreError> {
         let tx = self.db.begin_write().map_err(backend)?;
         {
             let mut table = tx.open_table(LEDGER_PUBLISHED).map_err(backend)?;
-            for id in ids {
+            for id in published {
                 table.insert((repo, id.as_str()), true).map_err(backend)?;
             }
         }
+        // ⚠ The same write: a published or set-aside entry waits no more.
+        drop_candidates(&tx, published)?;
+        drop_candidates(&tx, set_aside)?;
         tx.commit().map_err(backend)
     }
 
@@ -1277,7 +1296,7 @@ impl Bindings for RedbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fl_core::conformance::{entry_iri, sample_record_run};
+    use fl_core::conformance::{entry_iri, sample_attempt, sample_record_run};
     use fl_core::ids::seq_iri;
     use fl_core::log::GateRun;
     use fl_core::model::State;
@@ -1866,7 +1885,10 @@ mod tests {
             "a mark is per repository"
         );
         assert!(s.unpublished("R_1", &entry_iri(0)).unwrap().runs.is_empty());
-        assert_eq!(s.unpublished("R_2", &entry_iri(0)).unwrap().runs.len(), 1);
+        assert!(
+            s.unpublished("R_2", &entry_iri(0)).unwrap().runs.is_empty(),
+            "the waiting set is the store's: published anywhere, it waits nowhere"
+        );
     }
 
     #[test]
@@ -1894,6 +1916,52 @@ mod tests {
             .map(|e| e.unwrap().0.value().to_string())
             .collect();
         assert_eq!(ids, vec![entry_iri(2).to_string()]);
+    }
+
+    // ⚠ Spec §2.1: the set a flush scans stays bounded by what is waiting —
+    // a published or set-aside entry leaves the candidate index in the same
+    // write that marks it.
+    #[test]
+    fn a_published_or_set_aside_entry_leaves_the_candidate_index() {
+        let (s, _d) = fresh();
+        let (p, g, r) = gate_and_record(&s);
+        let published = sample_record_run(1, &g, Some(&r));
+        let aside = sample_record_run(2, &g, Some(&r));
+        let waiting = sample_record_run(3, &g, Some(&r));
+        for run in [&published, &aside, &waiting] {
+            s.append_gate_run(run.clone()).unwrap();
+        }
+        let attempt = sample_attempt(4, &p, &r);
+        s.append_attempt(attempt.clone()).unwrap();
+        s.settle(
+            "R_1",
+            &[published.id.clone().unwrap(), attempt.id.clone().unwrap()],
+            &[aside.id.clone().unwrap()],
+        )
+        .unwrap();
+
+        let tx = s.db.begin_read().unwrap();
+        let runs: Vec<String> = tx
+            .open_table(CANDIDATE_RUNS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().0.value().to_string())
+            .collect();
+        assert_eq!(runs, vec![entry_iri(3).to_string()]);
+        let attempts = tx
+            .open_table(CANDIDATE_ATTEMPTS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .count();
+        assert_eq!(attempts, 0);
+        drop(tx);
+        assert!(!s.is_published("R_1", aside.id.as_ref().unwrap()).unwrap());
+        assert_eq!(
+            s.unpublished("R_1", &entry_iri(0)).unwrap().runs,
+            vec![waiting]
+        );
     }
 
     // Spec §2.1: entries recorded before the cut-over stay local.
