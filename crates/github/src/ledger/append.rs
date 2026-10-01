@@ -66,10 +66,26 @@ fn judge(answer: GraphqlAnswer) -> Result<Landed, StoreError> {
                 answer.status
             )));
         }
+        // ⚠ Spec §6.3: only a 403 is a refusal for want of a permission,
+        // named from `x-accepted-github-permissions` when GitHub sends it;
+        // any other refusal (a 400, a 409, a 422) carries no such hint.
         s => {
-            return Err(StoreError::Backend(format!(
-                "GitHub answered {s} to fl's commit to the ledger, so nothing was published"
-            )));
+            let said = answer.message.as_deref().unwrap_or("it gave no message");
+            return Err(StoreError::Backend(if s == 403 {
+                let needs = answer
+                    .needs
+                    .map(|n| format!("; GitHub says this needs: {n}"))
+                    .unwrap_or_default();
+                format!(
+                    "GitHub answered 403 to fl's commit to the ledger ({said}{needs}), so \
+                     nothing was published. {NEEDS}: grant it, then retry"
+                )
+            } else {
+                format!(
+                    "GitHub answered {s} to fl's commit to the ledger ({said}), so nothing was \
+                     published"
+                )
+            }));
         }
     }
     if !answer.errors.is_empty() {
@@ -93,7 +109,15 @@ fn judge(answer: GraphqlAnswer) -> Result<Landed, StoreError> {
                  so nothing was published. {NEEDS}: grant it, then retry"
             )
         } else {
-            format!("GitHub refused fl's commit to the ledger, so nothing was published: {errors}")
+            // ⚠ An error fl does not know may come with a commit that
+            // landed: fl cannot tell, so it claims neither. Nothing is
+            // marked published, and the next flush reads the ledger and
+            // adds only what is missing.
+            format!(
+                "GitHub answered fl's commit to the ledger with an error ({errors}), so fl \
+                 cannot tell whether it was published. Nothing is marked published: the next \
+                 flush reads the ledger and adds only what is missing"
+            )
         }));
     }
     match answer
@@ -232,19 +256,13 @@ impl GithubLedger<'_> {
         // ⚠ `graphql_write`, not `graphql_answer`: a 200 whose body is not
         // JSON, or breaks off, comes back as an answer with no commit in it
         // — "unknown" — never as an error that would read as "it did not
-        // land" and drop the entries.
+        // land" and drop the entries; and every refusal comes back as an
+        // answer for `judge`, which tells a 403 from any other.
         match self.client.graphql_write(APPEND, json!({"input": input})) {
             Ok(answer) => judge(answer),
             // ⚠ The request may have reached GitHub before the connection
             // broke (spec §3.2 step 5): only a fresh read can tell.
             Err(StoreError::Unreachable { cause, .. }) => Ok(Landed::Unknown(cause)),
-            // ⚠ Spec §6.3: what the client refuses outright here is a
-            // refusal of the commit — above all a 403 whose
-            // `x-accepted-github-permissions` GitHub's message carries.
-            Err(StoreError::Backend(m)) => Err(StoreError::Backend(format!(
-                "GitHub refused fl's commit to the ledger, so nothing was published: {m}. \
-                 {NEEDS}: grant any permission GitHub names, then retry"
-            ))),
             Err(e) => Err(e),
         }
     }
@@ -673,6 +691,33 @@ mod tests {
         assert_eq!(fake.ledger_commits(), 1, "nothing landed");
     }
 
+    // ⚠ Ruling 14, the boundary: `Contended` only when EVERY try found the
+    // head moved. Four that did and one answer that said nothing is
+    // `Unreachable` — the one lost answer may hide a commit.
+    #[test]
+    fn tries_whose_causes_are_mixed_are_unreachable_not_contended() {
+        let (fake, local, _root) = world();
+        for n in 0..u64::from(TRIES) - 1 {
+            fake.state().foreign_appends.push((
+                layout::segment_path(&runs_dir(), 1),
+                Line::Run(run(10 + n)).encode("another-machine"),
+            ));
+        }
+        // Not consumed by a stale commit: it answers the fifth try.
+        fake.state().fail_commits = 1;
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let err = l.publish(&batch(1, vec![run(1)], vec![])).unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+        assert!(err.to_string().contains(HEAD_MOVED), "{err}");
+        assert!(err.to_string().contains("502"), "{err}");
+        assert_eq!(
+            fake.ledger_commits(),
+            TRIES as usize,
+            "the start and their four; none of mine"
+        );
+    }
+
     // Spec §6.3: a credential without Contents: write is found by the first
     // flush, whose error names it — not a retry. The first shape: an HTTP
     // 403 naming the permission in `x-accepted-github-permissions`. The
@@ -858,6 +903,23 @@ mod tests {
             .publish(&batch(1, vec![run(1)], vec![]))
             .unwrap_err();
         assert!(err.to_string().contains("visibility"), "{err}");
+        assert!(
+            matches!(err, StoreError::Unreachable { .. }),
+            "a 5xx is transient: {err:?}"
+        );
+        assert!(err.is_transient());
+        // Any other status is an error that retrying does not fix.
+        fake.state().body_next = Some((
+            "/repos/acme/widgets".into(),
+            404,
+            json!({"message": "Not Found"}),
+        ));
+        let err = open(&c, &local)
+            .publish(&batch(1, vec![run(1)], vec![]))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
+        assert!(err.to_string().contains("visibility"), "{err}");
+        assert!(!err.is_transient());
         assert_eq!(fake.ledger_commits(), 1);
     }
 
@@ -972,6 +1034,17 @@ mod tests {
             status,
             data,
             errors,
+            message: None,
+            needs: None,
+        }
+    }
+
+    /// A refusal: `status`, GitHub's message, and what it says was needed.
+    fn refusal(status: u16, needs: Option<&str>) -> GraphqlAnswer {
+        GraphqlAnswer {
+            message: Some("Resource not accessible by integration".into()),
+            needs: needs.map(str::to_string),
+            ..answer(status, None, vec![])
         }
     }
 
@@ -1007,12 +1080,37 @@ mod tests {
             judge(answer(200, None, vec![])).unwrap(),
             Landed::Unknown(_)
         ));
-        let refused = judge(answer(200, None, vec![json!({"type": "NOT_FOUND"})])).unwrap_err();
-        assert!(matches!(refused, StoreError::Backend(_)), "{refused:?}");
+        // An error fl does not know: an error, but one that claims nothing
+        // about whether the commit landed.
+        let unknown = judge(answer(200, None, vec![json!({"type": "NOT_FOUND"})])).unwrap_err();
+        assert!(matches!(unknown, StoreError::Backend(_)), "{unknown:?}");
+        assert!(!unknown.is_transient());
+        let said = unknown.to_string();
+        assert!(!said.contains("Contents: write"), "{said}");
+        assert!(!said.contains("nothing was published"), "{said}");
         assert!(
-            !refused.to_string().contains("Contents: write"),
-            "{refused}"
+            said.contains("cannot tell whether it was published"),
+            "{said}"
         );
+        // Spec §6.3: a 403 names the permission GitHub says it needed, and
+        // the one an append needs.
+        let refused = judge(refusal(403, Some("contents=write"))).unwrap_err();
+        assert!(!refused.is_transient());
+        assert!(refused.to_string().contains("contents=write"), "{refused}");
+        assert!(refused.to_string().contains("Contents: write"), "{refused}");
+        assert!(
+            refused.to_string().contains("Resource not accessible"),
+            "GitHub's own message is kept: {refused}"
+        );
+        // Any other refusal carries no permission hint.
+        for status in [400, 409, 422] {
+            let refused = judge(refusal(status, None)).unwrap_err();
+            assert!(matches!(refused, StoreError::Backend(_)), "{refused:?}");
+            assert!(
+                !refused.to_string().contains("Contents: write"),
+                "{refused}"
+            );
+        }
         // A status that is neither a success nor a server error says the
         // commit was refused; it does not hide one that landed.
         let refused = judge(answer(404, None, vec![])).unwrap_err();

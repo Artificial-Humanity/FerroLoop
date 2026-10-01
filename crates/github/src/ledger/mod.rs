@@ -90,12 +90,26 @@ impl<'a> GithubLedger<'a> {
             return Ok(*v);
         }
         let r = self.client.send(Method::Get, &self.path(""), None)?;
-        if r.status != 200 {
-            return Err(StoreError::Backend(format!(
-                "fl could not read the visibility of {} (GitHub answered {}), so it publishes \
-                 nothing to its ledger: an unknown visibility is not private. Retry",
-                self.repo.full_name, r.status
-            )));
+        let repo = &self.repo.full_name;
+        match r.status {
+            200 => {}
+            // ⚠ A server error says nothing lasting: transient, retry.
+            500..=599 => {
+                return Err(StoreError::Unreachable {
+                    store: format!("the GitHub ledger of {repo}"),
+                    cause: format!(
+                        "GitHub answered {} when fl read the repository's visibility, so fl \
+                         publishes nothing to its ledger: an unknown visibility is not private",
+                        r.status
+                    ),
+                });
+            }
+            s => {
+                return Err(StoreError::Backend(format!(
+                    "fl could not read the visibility of {repo} (GitHub answered {s}), so it \
+                     publishes nothing to its ledger: an unknown visibility is not private"
+                )));
+            }
         }
         let v = Visibility::from_github(
             r.body
