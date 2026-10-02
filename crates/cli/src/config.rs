@@ -22,12 +22,52 @@ pub struct Entry {
 }
 
 /// A project's tracker when it is not the local store (GitHub tracker spec
-/// §1.4): `tracker = { github = "owner/repo", credential = "env" }`.
+/// §1.4): `tracker = { github = "owner/repo", credential = "env" }`, and,
+/// for mode B, `ledger = "github"` (GitHub ledger spec §1.5).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrackerBinding {
     pub github: String,
     pub credential: Credential,
+    /// `Some(Github)`: decisions publish their evidence to the repository's
+    /// `fl/ledger` branch. `None`: the ledger is the local store.
+    ///
+    /// ⚠ Part of the binding's identity: two entries for one store that
+    /// differ here are two trackers, and refused.
+    #[serde(default)]
+    pub ledger: Option<LedgerChoice>,
+}
+
+impl TrackerBinding {
+    /// Whether this binding names the GitHub ledger.
+    pub fn github_ledger(&self) -> bool {
+        self.ledger == Some(LedgerChoice::Github)
+    }
+}
+
+/// The ledger a tracker binding names. One value: the GitHub ledger, which
+/// always lives in the tracker's repository (spec §1.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub enum LedgerChoice {
+    Github,
+}
+
+impl TryFrom<String> for LedgerChoice {
+    type Error = String;
+
+    /// ⚠ Exactly `github`: any other value is refused by name, never read
+    /// as the local ledger — a person who wrote it meant something.
+    fn try_from(value: String) -> Result<Self, String> {
+        match value.as_str() {
+            "github" => Ok(LedgerChoice::Github),
+            other => Err(format!(
+                "`ledger = \"{other}\"` is not a ledger fl knows. Its only value is \"github\", \
+                 the GitHub ledger in the tracker's repository; leave `ledger` out to keep every \
+                 run and decision in the local store"
+            )),
+        }
+    }
 }
 
 /// Where the GitHub credential comes from. One source, and no fallback.
@@ -201,6 +241,7 @@ pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
             .iter()
             .map(|(_, e)| {
                 let tracker = match &e.tracker {
+                    Some(t) if t.github_ledger() => format!("github:{} (ledger github)", t.github),
                     Some(t) => format!("github:{}", t.github),
                     None => "the store's own tracker".to_string(),
                 };
@@ -258,6 +299,7 @@ mod tests {
             Some(TrackerBinding {
                 github: "acme/widgets".into(),
                 credential: Credential::Env,
+                ledger: None,
             })
         );
     }
@@ -289,6 +331,7 @@ mod tests {
                 tracker: Some(TrackerBinding {
                     github: "acme/widgets".into(),
                     credential: Credential::Env,
+                    ledger: None,
                 }),
             },
         ];
@@ -307,6 +350,7 @@ mod tests {
             tracker: Some(TrackerBinding {
                 github: "acme/widgets".into(),
                 credential: Credential::Env,
+                ledger: None,
             }),
         };
         let got = bound_entry(&[e.clone(), e], root.path()).unwrap().unwrap();
@@ -445,5 +489,63 @@ mod tests {
                  directory, so it is likely running as root"
             ),
         }
+    }
+
+    // Spec §1.5: `ledger` is optional, and its only value is "github"; any
+    // other is a config error naming it.
+    #[test]
+    fn the_only_ledger_a_binding_names_is_github() {
+        let with = |ledger: &str| {
+            format!(
+                "[[project]]\nroot = \"/r\"\nstore = \"/s.redb\"\n\
+                 tracker = {{ github = \"acme/widgets\", credential = \"env\"{ledger} }}\n"
+            )
+        };
+        let binding = |text: &str| {
+            load_text(text).unwrap().projects[0]
+                .tracker
+                .clone()
+                .unwrap()
+        };
+        assert!(!binding(&with("")).github_ledger());
+        assert!(binding(&with(", ledger = \"github\"")).github_ledger());
+        for bad in ["local", "GitHub", ""] {
+            let err = load_text(&with(&format!(", ledger = \"{bad}\""))).expect_err(bad);
+            assert!(
+                format!("{err:#}")
+                    .contains(&format!("`ledger = \"{bad}\"` is not a ledger fl knows")),
+                "{bad}: {err:#}"
+            );
+        }
+    }
+
+    // Two entries on one root and one store that differ only in `ledger`
+    // are two trackers: refused, naming which has the GitHub ledger.
+    #[test]
+    fn two_entries_differing_only_by_ledger_are_refused_naming_which_has_it() {
+        let root = tempfile::tempdir().unwrap();
+        let binding = |ledger| TrackerBinding {
+            github: "acme/widgets".into(),
+            credential: Credential::Env,
+            ledger,
+        };
+        let entries = vec![
+            Entry {
+                root: root.path().to_path_buf(),
+                store: PathBuf::from("/tmp/fl-config-test-same.redb"),
+                tracker: Some(binding(None)),
+            },
+            Entry {
+                root: root.path().to_path_buf(),
+                store: PathBuf::from("/tmp/fl-config-test-same.redb"),
+                tracker: Some(binding(Some(LedgerChoice::Github))),
+            },
+        ];
+        let msg = format!("{:#}", bound_entry(&entries, root.path()).unwrap_err());
+        assert!(
+            msg.contains("-> github:acme/widgets (ledger github)"),
+            "{msg}"
+        );
+        assert!(msg.contains("-> github:acme/widgets,"), "{msg}");
     }
 }

@@ -357,6 +357,7 @@ fn same_store(a: &Path, b: &Path) -> bool {
 /// How a config entry's tracker reads in a refusal.
 fn tracker_name(t: Option<&config::TrackerBinding>) -> String {
     match t {
+        Some(t) if t.github_ledger() => format!("GitHub `{}` with its GitHub ledger", t.github),
         Some(t) => format!("GitHub `{}`", t.github),
         None => "the store's own tracker".to_string(),
     }
@@ -668,6 +669,7 @@ mod tests {
             tracker: github.map(|g| config::TrackerBinding {
                 github: g.into(),
                 credential: config::Credential::Env,
+                ledger: None,
             }),
         }
     }
@@ -690,6 +692,28 @@ mod tests {
                 "{msg}"
             );
         }
+    }
+
+    // The ledger is part of a store's one tracker: two entries naming one
+    // store and one repository, one with the GitHub ledger and one
+    // without, are refused, naming which is which.
+    #[test]
+    fn entries_sharing_a_store_but_not_a_ledger_are_refused_naming_each() {
+        let mut a = entry("/a", "/s/shared.redb", Some("acme/widgets"));
+        a.tracker.as_mut().unwrap().ledger = Some(config::LedgerChoice::Github);
+        let b = entry("/b", "/s/shared.redb", Some("acme/widgets"));
+        let entries = [a.clone(), b];
+        let msg = format!(
+            "{:#}",
+            tracker_for(Path::new("/s/shared.redb"), Some(&a), &entries, false).unwrap_err()
+        );
+        assert!(msg.contains("more than one tracker"), "{msg}");
+        assert!(
+            msg.contains("/a -> GitHub `acme/widgets` with its GitHub ledger"),
+            "{msg}"
+        );
+        assert!(msg.contains("/b -> GitHub `acme/widgets`"), "{msg}");
+        assert!(!msg.contains("/b -> GitHub `acme/widgets` with"), "{msg}");
     }
 
     #[test]
