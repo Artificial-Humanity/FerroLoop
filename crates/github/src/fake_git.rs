@@ -241,6 +241,19 @@ pub(crate) fn rest(
     let full = format!("{o}/{r}");
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     Some(match (method, rest) {
+        ("GET", ["git", "matching-refs", prefix @ ..]) => {
+            let prefix = prefix.join("/");
+            let items: Vec<Value> = s
+                .git
+                .refs
+                .iter()
+                .filter(|(name, _)| name.starts_with(&prefix))
+                .map(|(name, sha)| {
+                    json!({"ref": format!("refs/{name}"), "object": {"sha": sha, "type": "commit"}})
+                })
+                .collect();
+            answer(200, Value::Array(items))
+        }
         ("GET", ["git", "ref", name @ ..]) => {
             if s.ref_404_next > 0 {
                 s.ref_404_next -= 1;
@@ -1116,6 +1129,39 @@ mod tests {
         // header is not a promise that a permission was actually missing).
         assert!(err.to_string().contains("Upgrade to GitHub"), "{err}");
         assert!(err.to_string().contains("GitHub says this needs"), "{err}");
+    }
+
+    // ⚠ Modelled: `git/matching-refs/<prefix>` lists every ref whose name
+    // starts with the prefix, and an empty list when none does. Confirmed by
+    // live test `a_branch_under_the_ledger_branch_is_found`.
+    #[test]
+    fn matching_refs_lists_the_refs_under_a_prefix() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let c = client(&fake);
+        let under = |prefix: &str| -> Vec<String> {
+            c.send(
+                Method::Get,
+                &format!("{REPO}/git/matching-refs/{prefix}"),
+                None,
+            )
+            .unwrap()
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["ref"].as_str().unwrap().to_string())
+            .collect()
+        };
+        assert!(under("heads/fl/ledger/").is_empty());
+        fake.state()
+            .git
+            .refs
+            .insert("heads/fl/ledger/old".into(), root);
+        assert_eq!(
+            under("heads/fl/ledger/"),
+            vec!["refs/heads/fl/ledger/old".to_string()]
+        );
     }
 
     // Measured on 2026-10-02: a private repository on GitHub Free, with no

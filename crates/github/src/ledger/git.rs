@@ -142,6 +142,29 @@ impl GithubLedger<'_> {
         }
     }
 
+    /// Every branch under `branch/`, such as `fl/ledger/old` under
+    /// `fl/ledger`, by name.
+    ///
+    /// ⚠ Modelled: `git/matching-refs/heads/<branch>/` lists every ref whose
+    /// name starts with it, and an empty list when none does. Confirmed by
+    /// live test `a_branch_under_the_ledger_branch_is_found`.
+    pub(crate) fn branches_under(&self, branch: &str) -> Result<Vec<String>, StoreError> {
+        self.client
+            .get_all(&self.path(&format!("/git/matching-refs/heads/{branch}/")))?
+            .iter()
+            .map(|r| {
+                r.get("ref")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim_start_matches("refs/heads/").to_string())
+                    .ok_or_else(|| {
+                        backend(format!(
+                            "GitHub listed a branch under `{branch}/` with no name"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     /// How `head` relates to `base` as GitHub's compare names it
     /// (`identical`, `ahead`, `behind`, `diverged`); `None` when GitHub
     /// knows one of the two commits not at all.

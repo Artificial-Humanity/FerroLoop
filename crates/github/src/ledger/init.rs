@@ -91,6 +91,16 @@ impl GithubLedger<'_> {
             // ⚠ Step 6: the ledger was deleted. A new one would hide that.
             (None, Some(root)) => Err(LedgerFault::Deleted { repo, root }.into()),
             (None, None) => {
+                // ⚠ Step 2, the other way round: git cannot hold
+                // `fl/ledger` while a branch under `fl/ledger/` exists.
+                // Refused before anything is created.
+                if let Some(first) = self.branches_under(BRANCH)?.first() {
+                    return Err(StoreError::Backend(format!(
+                        "the repository {repo} has a branch named `{first}`, and git cannot hold \
+                         both it and `fl/ledger`. Rename that branch, then run `fl github ledger \
+                         init` again"
+                    )));
+                }
                 let root = self.create_branch()?;
                 self.record(cutover, &root)?;
                 Ok(InitOutcome::Created { root })
@@ -424,6 +434,42 @@ mod tests {
             l.runs(&GateId(seq_iri(1))).unwrap().is_empty(),
             "and it reads"
         );
+    }
+
+    // ⚠ Spec §6.1 step 2, the other way round: git keeps a branch as a
+    // file, so `fl/ledger` cannot be created while a branch under
+    // `fl/ledger/` exists. Refused before anything is created.
+    #[test]
+    fn init_refuses_a_branch_under_fl_ledger_before_creating_anything() {
+        let fake = FakeGithub::start("acme/widgets");
+        {
+            let mut s = fake.state();
+            let tree = s.git.put_tree(&BTreeMap::new());
+            let c = s.git.put_commit(&tree, vec![], "someone's branch");
+            s.git.refs.insert("heads/fl/ledger/old".into(), c);
+        }
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local).init(&entry_iri(1), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has a branch named `fl/ledger/old`"),
+            "{err}"
+        );
+        assert_eq!(fake.state().git.commits.len(), 1, "no commit was created");
+        assert_eq!(fake.ledger_head(), None);
+        assert_eq!(local.cutover("R_1").unwrap(), None);
+
+        // A listed branch with no name is refused, never skipped.
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state()
+            .body_next
+            .push(("/git/matching-refs/".into(), 200, json!([{}])));
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local).init(&entry_iri(1), None).unwrap_err();
+        assert!(err.to_string().contains("with no name"), "{err}");
+        assert_eq!(fake.ledger_head(), None);
     }
 
     #[test]
