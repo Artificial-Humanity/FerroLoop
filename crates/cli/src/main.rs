@@ -72,8 +72,8 @@ impl Command {
 
     /// The directory whose binding in the config picks the store, when it
     /// is not the current directory: `project add <path>` registers `<path>`,
-    /// so the store bound to `<path>` is the one it belongs in (Final
-    /// review, item 2). Every other command works on the current project.
+    /// so the store bound to `<path>` is the one it belongs in. Every other
+    /// command works on the current project.
     fn project_root(&self) -> Option<&Path> {
         match self {
             Command::Project(c) => c.root(),
@@ -217,12 +217,12 @@ fn explicit_db(flag: Option<PathBuf>) -> Option<PathBuf> {
 /// as-is — used as-is, it would put the store relative to whatever
 /// directory the command happened to run in.
 ///
-/// ⚠ Ruling: `--db` and `$FL_DB` CONFINE the command
-/// to exactly the store they name. An IRI that store does not hold is
-/// `NotOwned` naming only that one store — never a search across every
-/// store any project happens to be bound to in the config. Only the
-/// config-binding and XDG-default tiers search; `choose_store` reads this
-/// back to decide whether to expand its candidate list at all.
+/// ⚠ `--db` and `$FL_DB` CONFINE the command to exactly the store they
+/// name. An IRI that store does not hold is `NotOwned` naming only that one
+/// store — never a search across every store any project happens to be
+/// bound to in the config. Only the config-binding and XDG-default tiers
+/// search; `choose_store` reads this back to decide whether to expand its
+/// candidate list at all.
 ///
 /// ⚠ Every tier ends the same way: the parent directory of the resolved path
 /// is created if it does not exist. Earlier this only happened on the
@@ -257,10 +257,10 @@ fn db_path(explicit: Option<PathBuf>, configured: Option<PathBuf>) -> Result<(Pa
 
 /// A full IRI on the command line selects the store that holds it (spec
 /// §2.6). Handles resolve only in the bound store, so a command with no IRI
-/// uses the bound store. `confined` is true only for `--db`/`$FL_DB` (Fix
-/// round 1, item 0, ruling): an explicit store CONFINES the search to
-/// itself — the config's other stores are never even considered — so an IRI
-/// it does not hold is `NotOwned` naming only that one store.
+/// uses the bound store. `confined` is true only for `--db`/`$FL_DB`: an
+/// explicit store CONFINES the search to itself — the config's other stores
+/// are never even considered — so an IRI it does not hold is `NotOwned`
+/// naming only that one store.
 fn choose_store(
     bound: &Path,
     entries: &[config::Entry],
@@ -368,11 +368,10 @@ fn tracker_name(t: Option<&config::TrackerBinding>) -> String {
 ///
 /// ⚠ Shared by every caller that trusts a config entry's tracker for a
 /// store it did not itself pick by root alone: `tracker_for`, for the
-/// tracker commands, and `manifest export`'s ledger-root binding (whole-
-/// branch review finding 4) — a store bound to more than one tracker in
-/// the config is exactly the config state in which trusting any one
-/// entry's tracker for that store can attribute an item, or a ledger
-/// root, to the wrong repository.
+/// tracker commands, and `manifest export`'s ledger-root binding — a store
+/// bound to more than one tracker in the config is exactly the config state
+/// in which trusting any one entry's tracker for that store can attribute
+/// an item, or a ledger root, to the wrong repository.
 fn store_tracker(
     chosen: &Path,
     entries: &[config::Entry],
@@ -586,6 +585,16 @@ fn run(cli: Cli) -> Result<i32> {
         )),
         _ => None,
     };
+    // Mode B (GitHub ledger spec §1.2, §2.6): every entry goes to the local
+    // store at once; each decision's flush publishes through `github_ledger`.
+    let split = github_ledger.as_ref().map(|gl| fl_core::SplitLedger {
+        local: &store,
+        github: gl,
+    });
+    let ledger: &dyn fl_core::Ledger = match &split {
+        Some(s) => s,
+        None => &store,
+    };
     let (checked, routed);
     let ctx = match &github {
         Some(gh) => {
@@ -600,7 +609,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ctx {
                 store: &store,
                 tracker: &checked,
-                ledger: &store,
+                ledger,
                 handles: &routed,
                 github: Some(gh),
                 github_ledger: github_ledger.as_ref(),
@@ -610,7 +619,7 @@ fn run(cli: Cli) -> Result<i32> {
         None => Ctx {
             store: &store,
             tracker: &store,
-            ledger: &store,
+            ledger,
             handles: &store,
             github: None,
             github_ledger: None,
@@ -624,15 +633,14 @@ fn run(cli: Cli) -> Result<i32> {
     let manifest_binding = if !entry_read || path != bound {
         cmd::manifest::Binding::Unread
     } else {
-        // ⚠⚠ Whole-branch review finding 4: `manifest` never asks for a
-        // tracker (`needs_tracker` is false), so `tracker_for`'s
-        // one-tracker-per-store check never runs for it — unlike `record`,
-        // `finding`, `attempt`, `check --record` and `fl github`. Once the
-        // store holds a ledger root, trusting `here_binding` without that
-        // check could write one repository's root into another project's
-        // manifest, from a config where two entries share this store but
-        // disagree on its tracker. Run the same check, and refuse the same
-        // way, before trusting it.
+        // ⚠⚠ `manifest` never asks for a tracker (`needs_tracker` is
+        // false), so `tracker_for`'s one-tracker-per-store check never runs
+        // for it — unlike `record`, `finding`, `attempt`, `check --record`
+        // and `fl github`. Once the store holds a ledger root, trusting
+        // `here_binding` without that check could write one repository's
+        // root into another project's manifest, from a config where two
+        // entries share this store but disagree on its tracker. Run the same
+        // check, and refuse the same way, before trusting it.
         if store.holds_a_ledger_root()? {
             store_tracker(&path, entries)?;
         }

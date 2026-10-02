@@ -11,7 +11,8 @@ pub struct Ctx<'a> {
     /// The local store, or the GitHub tracker behind `CatalogChecked`.
     pub tracker: &'a dyn Tracker,
     /// Where runs, attempts and decisions are recorded: the local store,
-    /// or — in mode B — a `SplitLedger` over it.
+    /// or — when the binding names the GitHub ledger — a `SplitLedger` over
+    /// the local store and `github_ledger`.
     pub ledger: &'a dyn Ledger,
     /// The local store's handles, or `KindRouted` over the store and GitHub.
     pub handles: &'a dyn Handles,

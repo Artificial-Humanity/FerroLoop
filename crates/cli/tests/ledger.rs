@@ -138,6 +138,69 @@ impl World {
             .assert()
             .success();
     }
+
+    /// A project with one gate over `src/**/*.rs` (`check.sh`), a
+    /// transition `launch` from `todo` to `doing` over it, and one record
+    /// (#1).
+    fn gated(&self) {
+        self.fl().args(["project", "add", "."]).assert().success();
+        self.fl()
+            .args([
+                "gate",
+                "add",
+                "--project",
+                "1",
+                "--name",
+                "no-bug",
+                "--glob",
+                "src/**/*.rs",
+                "--program",
+                "./check.sh",
+            ])
+            .assert()
+            .success();
+        self.fl()
+            .args([
+                "transition",
+                "add",
+                "--project",
+                "1",
+                "--name",
+                "launch",
+                "--from",
+                "todo",
+                "--to",
+                "doing",
+                "--regret",
+                "low",
+                "--gate",
+                "1",
+            ])
+            .assert()
+            .success();
+        self.fl()
+            .args(["record", "add", "--project", "1", "--title", "work"])
+            .assert()
+            .success();
+    }
+
+    /// `gated`, the ledger set up, and the manifest committed: every
+    /// decision can publish.
+    fn ready(&self) {
+        self.gated();
+        self.init();
+        self.export();
+    }
+
+    /// The ledger's files under `area/`, path and text, in path order.
+    fn ledger_files_in(&self, area: &str) -> Vec<(String, String)> {
+        let prefix = format!("{area}/");
+        self.fake
+            .ledger_files()
+            .into_iter()
+            .filter(|(p, _)| p.starts_with(&prefix))
+            .collect()
+    }
 }
 
 // Spec §6.1 step 1.
@@ -387,4 +450,71 @@ fn a_confirmation_of_another_first_commit_than_the_recorded_one_is_refused() {
         Some(head),
         "nothing changed on GitHub"
     );
+}
+
+// Spec §2.2 and §2.3: a move flushes its run and its decision to
+// `fl/ledger`, and moves the record. That the flush comes first is pinned
+// in `fl-exec` (`move_record`'s tests) and the conformance suites.
+#[test]
+fn a_move_publishes_its_run_and_its_decision_and_moves_the_record() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    let runs = w.ledger_files_in("runs");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0].1.lines().count(), 1, "{runs:?}");
+    let decisions = w.ledger_files_in("decisions");
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert!(
+        decisions[0].1.contains(r#""allowed":true"#),
+        "{decisions:?}"
+    );
+    assert!(
+        w.fake
+            .issue(1)
+            .labels
+            .contains(&"fl:record/doing".to_string())
+    );
+}
+
+// Spec §2.2: `check --record` is a decision and publishes; a plain check
+// decides nothing and stays local (decision 6).
+#[test]
+fn a_check_with_a_record_publishes_and_a_plain_check_does_not() {
+    let w = World::new();
+    w.ready();
+    let before = w.fake.ledger_commits();
+    w.fl()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .success();
+    assert_eq!(
+        w.fake.ledger_commits(),
+        before,
+        "a plain check publishes nothing"
+    );
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    assert_eq!(w.fake.ledger_commits(), before + 1);
+    assert!(w.ledger_files_in("decisions")[0].1.contains(r#"{"check":"#));
+}
+
+// Spec §1.5: without `ledger = "github"`, a decision stays in the local
+// store, exactly as in mode A — no flush is even attempted.
+#[test]
+fn without_the_ledger_key_a_move_publishes_nothing() {
+    let w = World::bound(false);
+    w.gated();
+    w.fake.seed_ledger();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success()
+        .stderr(contains("never switched on").not());
+    assert_eq!(w.fake.ledger_commits(), 1);
 }
