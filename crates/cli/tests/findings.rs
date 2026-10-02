@@ -40,7 +40,7 @@ fn fixture() -> F {
 impl F {
     fn cli(&self) -> Command {
         let mut c = Command::cargo_bin("fl").unwrap();
-        // Fix round 1 — Important 5: isolate from the developer's own
+        // Isolate from the developer's own
         // ~/.config/fl/config.toml, which `fl` reads unconditionally even
         // when --db confines which store it uses.
         c.env("XDG_CONFIG_HOME", self.home.path())

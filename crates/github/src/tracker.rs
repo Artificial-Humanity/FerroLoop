@@ -115,7 +115,7 @@ fn backend(msg: String) -> StoreError {
 /// ⚠ Every error inside `after_ambiguous_create` — a failed search for the
 /// create key, and ANY failure of the resend (a transport failure, a rate
 /// limit, a refused credential, a rejected request) — gets the "list before
-/// retrying" advice (final review, item 2). The FIRST attempt failed
+/// retrying" advice. The FIRST attempt failed
 /// ambiguously (a 5xx, or the connection dropping), so by then fl cannot
 /// know whether the issue exists, whatever the later error is about: a plain
 /// "retry" would make a duplicate whenever the first attempt had landed.
@@ -275,6 +275,12 @@ impl GithubTracker {
         &self.repo
     }
 
+    /// The client this tracker writes through, so the GitHub ledger can
+    /// share its credential and origin guard (GitHub ledger spec §1.1).
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+
     pub fn describe(&self) -> String {
         self.client.describe()
     }
@@ -355,8 +361,8 @@ impl GithubTracker {
         Ok(match read_repo(&self.client, &name)? {
             Some((r, _)) if r.node_id == self.repo.node_id => Owner::Ours(n),
             // ⚠ "Now" only when GitHub led the name somewhere under another
-            // name — a redirect after a rename or a transfer (final review,
-            // item 6). A repository answering under the name itself is
+            // name — a redirect after a rename or a transfer. A
+            // repository answering under the name itself is
             // just another repository: fl cannot tell a reused old name of
             // this one from a name it never had, so it claims neither.
             Some((r, _)) if !r.full_name.eq_ignore_ascii_case(&name) => {
@@ -439,8 +445,8 @@ impl GithubTracker {
 
     /// The fl item `id` names, when it is of kind `want`.
     ///
-    /// `remember`: whether this read updates `seen` (fix round 2, item 1 —
-    /// the same rule `list` already follows, fix round 1 item 1). Only a
+    /// `remember`: whether this read updates `seen` (the same rule `list`
+    /// already follows). Only a
     /// read the CALLER directly asked for and directly receives —
     /// `get_record`, `get_finding` — may do that. `add_finding`'s own read
     /// of the record it points at is a validity check, not a hand-off: the
@@ -479,8 +485,8 @@ impl GithubTracker {
     /// the kind's label that does not read as that kind is diverged, and the
     /// list fails — it is never dropped (spec §3.4, §5).
     ///
-    /// `remember`: whether a returned item updates `seen` (fix round 1,
-    /// item 1). Only a read the CALLER directly asked for and directly
+    /// `remember`: whether a returned item updates `seen`. Only a read the
+    /// CALLER directly asked for and directly
     /// receives — `list_records`, `list_findings` — may do that. An
     /// internal scan made in service of resolving something else (an alias,
     /// a withdrawal count) must not: it would silently refresh `seen` for
@@ -556,7 +562,7 @@ impl GithubTracker {
                     });
                 }
                 // ⚠ Not `Diverged`: its remedy is `fl github repair`, which
-                // refuses a pull request (final review, item 7). The remedy
+                // refuses a pull request. The remedy
                 // that works is named instead.
                 Read::NotFl(_) if issue.is_pull_request => {
                     return Err(backend(format!(
@@ -624,7 +630,7 @@ impl GithubTracker {
                 title.chars().count()
             )));
         }
-        // ⚠ Before anything is sent (final review, item 8): GitHub may trim
+        // ⚠ Before anything is sent: GitHub may trim
         // a title, and the check that the create came back as sent would
         // then fail AFTER the issue exists — a landed create reported as an
         // error. (GitHub's trimming is unmeasured; refusing costs nothing.)
@@ -657,9 +663,9 @@ impl GithubTracker {
             .client
             .send_unchecked_json(Method::Post, &path, Some(&sent))
         {
-            // ⚠ ANY 2xx PROVES the create landed (fix round 2, item 2; fix
-            // round 4: not only 201, and a body that broke off counts as
-            // unreadable): an unreadable body is never followed by a
+            // ⚠ ANY 2xx PROVES the create landed (not only 201, and a body
+            // that broke off counts as unreadable): an unreadable body is
+            // never followed by a
             // resend, only a search — resending here risks making exactly
             // the duplicate this whole mechanism exists to avoid.
             Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
@@ -710,7 +716,7 @@ impl GithubTracker {
     /// create sent again. Only for a FIRST-attempt failure where the create
     /// may not have happened at all — a 5xx answer, or the connection
     /// dropping before an answer arrived. See `after_unreadable_create` for
-    /// the case where it certainly did (fix round 2, item 2).
+    /// the case where it certainly did.
     fn after_ambiguous_create(
         &self,
         kind: ItemKind,
@@ -724,7 +730,7 @@ impl GithubTracker {
         if let Some(found) = searched {
             return Ok(found);
         }
-        // ⚠ `send_unchecked_json`, not `send` (fix round 3, item 1): the
+        // ⚠ `send_unchecked_json`, not `send`: the
         // RULE applies to this resend exactly as it does to the first
         // attempt in `create` — once GitHub answers 2xx here, the create
         // has landed for certain, and an unreadable or non-issue body must
@@ -744,7 +750,7 @@ impl GithubTracker {
                 r.status
             ))),
             // ⚠ Every failure of the resend gets the SAME advice as a bad
-            // status (final review, item 2): the first attempt's fate is
+            // status: the first attempt's fate is
             // unknown, so whatever stopped this one — a dropped connection,
             // a rate limit, a refused credential — fl cannot say whether the
             // issue exists. Only a fresh list can settle that.
@@ -755,7 +761,7 @@ impl GithubTracker {
         }
     }
 
-    /// ⚠ A 2xx proves the create landed (fix round 2, item 2): unlike a 5xx
+    /// ⚠ A 2xx proves the create landed: unlike a 5xx
     /// answer or a dropped connection, there is no "may not have happened"
     /// here. A miss on every search is never followed by a resend — that
     /// would risk making exactly the duplicate this whole path exists to
@@ -768,7 +774,7 @@ impl GithubTracker {
     ) -> Result<IssueView, StoreError> {
         // ⚠ The create is certain here — GitHub already answered 2xx — so
         // the search's own failure (not just a miss) carries the same
-        // advice too (fix round 3, item 2): the client's generic "…;
+        // advice too: the client's generic "…;
         // retry" on a failed page read would otherwise reach the caller
         // with no hint that a resend is exactly what must NOT happen.
         let found = self
@@ -1230,7 +1236,7 @@ impl GithubTracker {
         // part: the comment naming who ran it is posted NOW, before anything
         // that could fail — reading the answer, checking it, the window. A
         // rerun after such a failure would find the issue consistent and
-        // post nothing, losing the record (final review, item 3).
+        // post nothing, losing the record.
         let note = json!({"body": format!(
             "`fl github repair`: the fl labels and the open/closed status were rewritten from \
              fl's record (state `{}`) by {by}.",
@@ -1471,7 +1477,7 @@ impl Tracker for GithubTracker {
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         // The record must be an fl record of this repository (spec §3.1).
-        // ⚠ `remember: false` (fix round 2, item 1): this is a validity
+        // ⚠ `remember: false`: this is a validity
         // check, not a read the caller receives the record from.
         let record = match self.item(finding.record.iri(), ItemKind::Record, false)? {
             Found::Item(issue, _, _) => issue,
@@ -1803,7 +1809,7 @@ mod tests {
         assert_eq!(fake.issue_count(), 1, "exactly one issue");
     }
 
-    /// Fix round 1, item 5a: a 201 whose own body cannot be read as an issue
+    /// A 201 whose own body cannot be read as an issue
     /// is exactly as ambiguous as a 5xx or a dropped connection (spec §3.3)
     /// — the create may have landed regardless of whether fl could read
     /// GitHub's answer to it.
@@ -1817,7 +1823,7 @@ mod tests {
         assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
     }
 
-    /// Fix round 1, item 5b: a transport failure on the SECOND create
+    /// A transport failure on the SECOND create
     /// attempt (after the create-key search already came up empty) must
     /// carry the same "list the repository's fl issues before retrying"
     /// remedy as a bad status there — losing that advice on this one path
@@ -1841,7 +1847,7 @@ mod tests {
         );
     }
 
-    /// Fix round 2, item 2: a 201 PROVES the create landed, even when its
+    /// A 201 PROVES the create landed, even when its
     /// own body cannot be read. If the create-key search then misses too
     /// (GitHub's list index lagging indefinitely, say), the right answer is
     /// to refuse and say so — never to send the create again, which would
@@ -1866,10 +1872,10 @@ mod tests {
         );
     }
 
-    /// Final review, item 2: unit-level — once the first attempt was
-    /// ambiguous, EVERY later error carries the advice, whatever its kind.
-    /// (Fix round 2, item 3 had a credential error pass through unchanged;
-    /// the first attempt's fate is unknown regardless of what failed next.)
+    /// Unit-level — once the first attempt was
+    /// ambiguous, EVERY later error carries the advice, whatever its kind:
+    /// a credential error too, since the first attempt's fate is unknown
+    /// regardless of what failed next.
     #[test]
     fn every_error_after_an_ambiguous_create_carries_the_advice() {
         for e in [
@@ -1893,7 +1899,7 @@ mod tests {
         }
     }
 
-    /// Final review, item 2 (the reviewer's probe): the first create lands
+    /// The first create lands
     /// but its answer is lost, and the search for its key then fails. The
     /// error must not say a bare "retry": a retry would make issue #2.
     #[test]
@@ -1912,7 +1918,7 @@ mod tests {
         assert_eq!(fake.issue_count(), 1, "the first create landed; no resend");
     }
 
-    /// Final review, item 2: a resend refused by the rate limit after an
+    /// A resend refused by the rate limit after an
     /// ambiguous first attempt carries the advice too — the first attempt
     /// may have landed.
     #[test]
@@ -1960,7 +1966,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 1: the SAME race as the test above, but the stale
+    /// The SAME race as the test above, but the stale
     /// write is addressed by an ALIAS rather than the finding's own URL.
     /// Resolving an alias scans every fl issue (`locate` → `alias_owner` →
     /// `list`); that scan must not itself update `seen` for the issue it
@@ -2013,7 +2019,7 @@ mod tests {
         assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
     }
 
-    /// Fix round 2, item 1: the reviewer's probe. `add_finding` reads the
+    /// `add_finding` reads the
     /// record it points at (to check it exists and is a record) via the
     /// same `item` a direct `get_record` uses. That read must not move the
     /// record's `seen` baseline — it is a validity check, not something the
@@ -2058,7 +2064,7 @@ mod tests {
         assert!(t.list_records(&p()).is_err(), "never a short list");
     }
 
-    /// Fix round 2, item 4: the flip side of the test below — a list that
+    /// The flip side of the test below — a list that
     /// fits on a single page must not pay for the second-pass stability
     /// check at all. Nothing can have shifted a page onto or off of itself.
     #[test]
@@ -2079,7 +2085,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 2: a list that needed more than one page is read a
+    /// A list that needed more than one page is read a
     /// SECOND time to check the set of issue numbers is stable — a stable
     /// list still succeeds, just at the cost of the extra read.
     #[test]
@@ -2102,7 +2108,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 2: GitHub pages by offset. An issue leaving the
+    /// GitHub pages by offset. An issue leaving the
     /// filtered set between two page reads of the SAME pass shifts every
     /// later issue back by one — which can drop a live item with no error
     /// (spec §3.7). The second, independent read this fake's fix adds must
@@ -2160,7 +2166,7 @@ mod tests {
         }
     }
 
-    /// Final review, item 7: a pull request carrying fl labels stops a list
+    /// A pull request carrying fl labels stops a list
     /// with the remedy that works — removing its fl labels — never
     /// `fl github repair`, which refuses pull requests.
     #[test]
@@ -2180,7 +2186,6 @@ mod tests {
         );
     }
 
-    /// Final review, item 8.
     #[test]
     fn a_title_with_leading_or_trailing_whitespace_is_refused_before_anything_is_sent() {
         let fake = FakeGithub::start("acme/widgets");
@@ -2418,7 +2423,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 4: GitHub also answers 410 on every issue of a
+    /// GitHub also answers 410 on every issue of a
     /// repository that has Issues turned off — indistinguishable, at that
     /// point, from an issue GitHub deleted. Caught once, at `open`, so
     /// `fetch` never has to guess which one it saw.
@@ -2438,7 +2443,7 @@ mod tests {
         );
     }
 
-    /// Fix round 3, item 1: the reviewer's probe, positive case. Once the
+    /// Once the
     /// RESEND itself lands with an unreadable 201, a fresh search finds the
     /// issue it actually created (nothing here makes the fake's list lag),
     /// so the call succeeds — exactly one issue, no third send. This is the
@@ -2462,15 +2467,15 @@ mod tests {
         assert_eq!(posts, 2, "the first attempt and the resend, never a third");
     }
 
-    /// Fix round 3, item 1 (Important): the RULE — once GitHub has answered
+    /// The RULE — once GitHub has answered
     /// 2xx to a create, first send OR resend, every LATER failure is
     /// refused with the advice and never leads to another send. Before the
     /// fix, the resend used the strict `send`, so a 201 with an unreadable
     /// body made `client.send` itself fail with a plain "…not JSON…"
     /// `Backend` error that the resend's error wrapper's `other => other` arm
     /// let straight through — no advice, even though the create had already
-    /// landed (the reviewer's probe: `fail_before_create` +
-    /// `unreadable_create_body_next` → that error, `issue_count == 1`).
+    /// landed (`fail_before_create` + `unreadable_create_body_next` → that
+    /// error, `issue_count == 1`).
     /// Combined with `omit_from_list` here so the follow-up search also
     /// cannot find it, reaching the refusal this test checks for.
     #[test]
@@ -2501,7 +2506,7 @@ mod tests {
         assert_eq!(posts, 2, "no third send");
     }
 
-    /// Fix round 3, item 2 (Minor, same class): once a 201 proves the
+    /// Once a 201 proves the
     /// create landed, a failure of the FOLLOW-UP SEARCH itself (not just a
     /// miss) must also carry the advice — before the fix it passed through
     /// with the client's generic "…; retry" text instead.
@@ -2532,7 +2537,7 @@ mod tests {
             .count()
     }
 
-    /// Fix round 4 (the reviewer's probe): a create answered 201 whose body
+    /// A create answered 201 whose body
     /// then breaks off is a create that landed — the status was read. It
     /// used to surface as `Unreachable`, which took the resend path; with
     /// the search missing too, that resend made a silent duplicate.
@@ -2552,7 +2557,7 @@ mod tests {
         assert_eq!(issue_posts(&fake), 1, "exactly one send");
     }
 
-    /// Fix round 4: the same broken 201, with nothing making the list lag —
+    /// The same broken 201, with nothing making the list lag —
     /// the search finds the issue the one send made.
     #[test]
     fn a_201_whose_body_breaks_off_is_found_by_its_create_key() {
@@ -2565,7 +2570,7 @@ mod tests {
         assert_eq!(issue_posts(&fake), 1, "exactly one send");
     }
 
-    /// Fix round 4: any 2xx answer to a create is a create that landed, not
+    /// Any 2xx answer to a create is a create that landed, not
     /// only 201 — a 200 carrying the issue is the created issue.
     #[test]
     fn a_create_answered_200_with_the_issue_is_the_created_issue() {
@@ -2651,7 +2656,7 @@ mod tests {
         );
     }
 
-    /// Final review, item 6: an unrelated repository is "not the bound
+    /// An unrelated repository is "not the bound
     /// one" — never "now names a different repository", which claims a
     /// history fl does not know. "Now" is kept for a name GitHub redirects
     /// to a repository under another name.
@@ -2716,7 +2721,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1: `current_ref`'s `Moved` branch (a node lookup answers a
+    /// `current_ref`'s `Moved` branch (a node lookup answers a
     /// repository id that is not the one this tracker is bound to — the
     /// issue was transferred elsewhere) was unreachable, because the fake's
     /// node lookup always answered under the bound repository. The fake's
@@ -2972,7 +2977,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 1: GitHub's edit history answers `issue: null` for
+    /// GitHub's edit history answers `issue: null` for
     /// a pull request's number, so a pull request is refused BEFORE the
     /// window is opened.
     #[test]
@@ -2995,7 +3000,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 1: when GitHub's GraphQL finds no issue at a
+    /// When GitHub's GraphQL finds no issue at a
     /// number, the window says what the number is now — never "came back
     /// without `nodes`".
     #[test]
@@ -3013,7 +3018,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 2a: an entry without an id is not "no edit".
+    /// An entry without an id is not "no edit".
     #[test]
     fn an_edit_history_entry_without_an_id_is_an_error_not_a_short_count() {
         let fake = FakeGithub::start("acme/widgets");
@@ -3028,7 +3033,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 2b: if `last: 100` lists the OLDEST entries, the
+    /// If `last: 100` lists the OLDEST entries, the
     /// ids never show a new edit; `totalCount` still counts it.
     #[test]
     fn a_foreign_edit_the_listed_ids_do_not_show_is_counted_by_the_total() {
@@ -3059,7 +3064,7 @@ mod tests {
         assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
     }
 
-    /// Fix round 1, item 3: the SECOND read is the one fl changes. A label
+    /// The SECOND read is the one fl changes. A label
     /// someone adds between the first read and the window is in that read,
     /// so fl's write keeps it and does not count it as foreign.
     #[test]
@@ -3075,7 +3080,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, item 4: the repair landed even though it crossed
+    /// The repair landed even though it crossed
     /// another write, so the record of who ran it is still posted.
     #[test]
     fn a_repair_that_crossed_another_write_still_records_who_ran_it() {
@@ -3093,7 +3098,7 @@ mod tests {
         );
     }
 
-    /// Final review, item 3: the repair PATCH answered 200, then its check
+    /// The repair PATCH answered 200, then its check
     /// failed (GitHub kept the old labels). The repair landed at least in
     /// part, so the comment is posted anyway, and the error says it was — a
     /// rerun could otherwise find nothing to do and never post it.
@@ -3116,7 +3121,7 @@ mod tests {
         assert!(comments[0].contains("by owner"), "{comments:?}");
     }
 
-    /// Final review, item 3: when the comment fails as well as the check,
+    /// When the comment fails as well as the check,
     /// the error says to add the comment by hand.
     #[test]
     fn a_repair_whose_check_and_comment_both_fail_says_to_add_the_comment_by_hand() {
@@ -3138,7 +3143,7 @@ mod tests {
         assert!(fake.issue(1).comments.is_empty());
     }
 
-    /// Fix round 1, items 6 and 7: a timeline item fl cannot classify is an
+    /// A timeline item fl cannot classify is an
     /// error naming a remedy, never skipped.
     #[test]
     fn a_timeline_item_without_a_kind_or_an_id_is_an_error() {

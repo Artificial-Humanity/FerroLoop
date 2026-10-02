@@ -16,13 +16,64 @@ pub enum Method {
 }
 
 /// An answer that is not a transport failure and not already an error:
-/// 2xx, 3xx, 404, 410 and 5xx. The caller decides what each means.
+/// 2xx, 3xx, 404, 410 and 5xx — and, for the one caller that judges every
+/// refusal itself ([`Client::graphql_write`]), any other status but a rate
+/// limit or a 401. The caller decides what each means.
 #[derive(Debug, Clone)]
 pub struct Reply {
     pub status: u16,
     pub body: Value,
     pub location: Option<String>,
+    /// GitHub's `x-accepted-github-permissions`: what a refused request
+    /// needed (spec §6.3), when it says.
+    pub accepted_permissions: Option<String>,
     link_next: Option<String>,
+}
+
+/// A GraphQL answer for a caller that judges it itself (the ledger's
+/// commit, GitHub ledger spec §3.2): the HTTP status (200, or a 5xx a write
+/// may hide behind), `data` when present, and every error.
+#[derive(Debug, Clone)]
+pub struct GraphqlAnswer {
+    pub status: u16,
+    pub data: Option<Value>,
+    pub errors: Vec<Value>,
+    /// GitHub's `message`, when the answer is a refusal that carries one.
+    pub message: Option<String>,
+    /// What a refused request needed, from `x-accepted-github-permissions`.
+    pub needs: Option<String>,
+}
+
+impl GraphqlAnswer {
+    /// The `data` of an answer to a query, judged as [`Client::graphql`]
+    /// judges it: any status but 200 is an error, and so is an `errors`
+    /// member — never partial data. For a caller that reads the status
+    /// first (the ledger's reads, which take a 5xx as transient).
+    pub(crate) fn into_data(self) -> Result<Value, StoreError> {
+        if self.status != 200 {
+            return Err(StoreError::Backend(format!(
+                "GitHub answered {} to a GraphQL query; retry",
+                self.status
+            )));
+        }
+        // GitHub is taken to answer a lookup of a missing node with `null`
+        // data AND a NOT_FOUND error — an answer, not a failure. A reading
+        // of GitHub's docs: unmeasured; no live test checks it yet.
+        if !self.errors.is_empty()
+            && !self
+                .errors
+                .iter()
+                .all(|e| e.get("type").and_then(Value::as_str) == Some("NOT_FOUND"))
+        {
+            return Err(StoreError::Backend(format!(
+                "GitHub refused a GraphQL query: {}",
+                Value::Array(self.errors)
+            )));
+        }
+        self.data.ok_or_else(|| {
+            StoreError::Backend("GitHub answered a GraphQL query with no `data`".into())
+        })
+    }
 }
 
 pub struct Client {
@@ -112,46 +163,84 @@ impl Client {
         self.get_all_paged(path).map(|(items, _)| items)
     }
 
-    /// One GraphQL query. An `errors` member is an error, never partial data.
-    pub fn graphql(&self, query: &str, variables: Value) -> Result<Value, StoreError> {
+    /// One GraphQL request, judged only for a spent rate limit: the caller
+    /// reads the status, the data and the errors.
+    pub fn graphql_answer(
+        &self,
+        query: &str,
+        variables: Value,
+    ) -> Result<GraphqlAnswer, StoreError> {
+        self.graphql_reply(query, variables, Judging::Strict)
+    }
+
+    /// Like [`Self::graphql_answer`], for a write whose answer may be lost
+    /// after it landed (the ledger's commit, GitHub ledger spec §3.2 step
+    /// 5), and whose every refusal the caller judges itself:
+    ///
+    /// - a 2xx whose body is not JSON, or breaks off, is an answer with no
+    ///   `data` and no errors — which says nothing about whether the write
+    ///   landed — never an error that would read as "it did not";
+    /// - any status but a rate limit or a 401 is an answer, with GitHub's
+    ///   `message` and the permission it says was needed, so the caller can
+    ///   tell a 403 for want of a permission from any other refusal.
+    pub(crate) fn graphql_write(
+        &self,
+        query: &str,
+        variables: Value,
+    ) -> Result<GraphqlAnswer, StoreError> {
+        self.graphql_reply(query, variables, Judging::CallerJudges)
+    }
+
+    fn graphql_reply(
+        &self,
+        query: &str,
+        variables: Value,
+        judging: Judging,
+    ) -> Result<GraphqlAnswer, StoreError> {
         let body = serde_json::json!({ "query": query, "variables": variables });
-        let reply = self.send(Method::Post, "/graphql", Some(&body))?;
-        if reply.status != 200 {
-            return Err(StoreError::Backend(format!(
-                "GitHub answered {} to a GraphQL query; retry",
-                reply.status
-            )));
-        }
-        // GitHub is taken to answer a lookup of a missing node with `null`
-        // data AND a NOT_FOUND error — an answer, not a failure — and a
-        // spent GraphQL rate limit the same way, as a 200 with an error of
-        // type RATE_LIMITED. Both are readings of GitHub's docs: unmeasured;
-        // no live test checks either yet.
-        if let Some(errors) = reply
+        let url = self.url("/graphql")?;
+        let token = self.creds.token()?;
+        let reply = exchange(
+            &self.agent,
+            Method::Post,
+            &url,
+            &token,
+            Some(&body),
+            &self.api,
+            judging,
+        )?;
+        let errors: Vec<Value> = reply
             .body
             .get("errors")
             .and_then(Value::as_array)
-            .filter(|e| !e.is_empty())
+            .cloned()
+            .unwrap_or_default();
+        // A spent GraphQL rate limit is taken to be a 200 with an error of
+        // type RATE_LIMITED: a reading of GitHub's docs, unmeasured.
+        if errors
+            .iter()
+            .any(|e| e.get("type").and_then(Value::as_str) == Some("RATE_LIMITED"))
         {
-            let kinds: Vec<&str> = errors
-                .iter()
-                .map(|e| e.get("type").and_then(Value::as_str).unwrap_or(""))
-                .collect();
-            if kinds.contains(&"RATE_LIMITED") {
-                return Err(StoreError::RateLimited {
-                    reset: "GitHub's GraphQL limit resets (it did not say when)".into(),
-                });
-            }
-            if !kinds.iter().all(|k| *k == "NOT_FOUND") {
-                return Err(StoreError::Backend(format!(
-                    "GitHub refused a GraphQL query: {}",
-                    Value::Array(errors.clone())
-                )));
-            }
+            return Err(StoreError::RateLimited {
+                reset: "GitHub's GraphQL limit resets (it did not say when)".into(),
+            });
         }
-        reply.body.get("data").cloned().ok_or_else(|| {
-            StoreError::Backend("GitHub answered a GraphQL query with no `data`".into())
+        Ok(GraphqlAnswer {
+            status: reply.status,
+            data: reply.body.get("data").cloned(),
+            errors,
+            message: reply
+                .body
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            needs: reply.accepted_permissions,
         })
+    }
+
+    /// One GraphQL query. An `errors` member is an error, never partial data.
+    pub fn graphql(&self, query: &str, variables: Value) -> Result<Value, StoreError> {
+        self.graphql_answer(query, variables)?.into_data()
     }
 
     /// Who GitHub says fl writes as (spec §5.4).
@@ -209,6 +298,37 @@ pub(crate) fn send(
     origin: &str,
     require_json_on_2xx: bool,
 ) -> Result<Reply, StoreError> {
+    let judging = if require_json_on_2xx {
+        Judging::Strict
+    } else {
+        Judging::Unchecked2xx
+    };
+    exchange(agent, method, url, token, body, origin, judging)
+}
+
+/// How much of an answer the client judges before its caller sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Judging {
+    /// Every caller but two: a 2xx must be JSON; a refusal is an error.
+    Strict,
+    /// An issue create or edit: a 2xx body that cannot be read is
+    /// `Value::Null`; a refusal is still an error.
+    Unchecked2xx,
+    /// The ledger's commit: as `Unchecked2xx`, and any status but a rate
+    /// limit or a 401 is a reply the caller judges.
+    CallerJudges,
+}
+
+fn exchange(
+    agent: &ureq::Agent,
+    method: Method,
+    url: &str,
+    token: &str,
+    body: Option<&Value>,
+    origin: &str,
+    judging: Judging,
+) -> Result<Reply, StoreError> {
+    let require_json_on_2xx = judging == Judging::Strict;
     let unreachable = |e: ureq::Error| StoreError::Unreachable {
         store: origin.to_string(),
         cause: e.to_string(),
@@ -234,6 +354,13 @@ pub(crate) fn send(
     let remaining = header("x-ratelimit-remaining");
     let reset = header("x-ratelimit-reset");
     let retry_after = header("retry-after");
+    // ⚠ Spec §6.3: GitHub names the permission a refused request needed.
+    // Modelled from GitHub's documentation; no live test provokes it. The
+    // header can ride along on ANY 403 — including a secondary rate limit,
+    // or the rulesets-unavailable upgrade refusal — so it is read here but
+    // only ever consulted by the LAST arm below, after every other 403
+    // reading (rate-limited first) has had its chance to claim the status.
+    let accepted = header("x-accepted-github-permissions");
     let is_2xx = (200..300).contains(&status);
     let text = match resp.body_mut().read_to_string() {
         Ok(text) => text,
@@ -247,6 +374,7 @@ pub(crate) fn send(
                 status,
                 body: Value::Null,
                 location,
+                accepted_permissions: accepted,
                 link_next,
             });
         }
@@ -301,10 +429,30 @@ pub(crate) fn send(
             status,
             body,
             location,
+            accepted_permissions: accepted,
             link_next,
         }),
         401 => Err(StoreError::Credential(format!(
             "GitHub refused the credential ({message}). Check the credential the binding names"
+        ))),
+        // ⚠ The ledger's commit judges every refusal itself (a 403 for
+        // want of a permission is told from a 422 by its status there).
+        _ if judging == Judging::CallerJudges => Ok(Reply {
+            status,
+            body,
+            location,
+            accepted_permissions: accepted,
+            link_next,
+        }),
+        // ⚠ Worded neutrally: the header can be present on a 403 that is
+        // not a missing-permission refusal at all (a secondary rate limit,
+        // or the rulesets upgrade refusal both carry it in this fake's
+        // model), and GitHub's own `message` is kept verbatim so a reader
+        // of the error still sees what actually happened, not just a
+        // permission name.
+        403 if accepted.is_some() => Err(StoreError::Backend(format!(
+            "GitHub answered 403 to {method:?} {url}: {message}. GitHub says this needs: {}",
+            accepted.unwrap_or_default()
         ))),
         _ => Err(StoreError::Backend(format!(
             "GitHub answered {status} to {method:?} {url}: {message}"
@@ -529,5 +677,122 @@ mod tests {
             matches!(err, StoreError::Backend(ref m) if m.contains("Resource not accessible")),
             "{err:?}"
         );
+    }
+
+    // The ledger judges a GraphQL answer itself: a stale commit is an
+    // error it acts on, not one to report. Only a spent rate limit is
+    // still refused here.
+    #[test]
+    fn a_graphql_answer_hands_its_errors_and_status_to_the_caller() {
+        let fake = FakeGithub::start("acme/widgets");
+        let c = client(&fake);
+        let a = c
+            .graphql_answer(
+                "query($id: ID!) { node(id: $id) { ... on Issue { url } } }",
+                serde_json::json!({"id": "I_404"}),
+            )
+            .unwrap();
+        assert_eq!(a.status, 200);
+        assert_eq!(a.errors.len(), 1);
+        assert_eq!(
+            a.errors[0]["type"].as_str(),
+            Some("NOT_FOUND"),
+            "{:?}",
+            a.errors
+        );
+        assert_eq!(a.data, Some(serde_json::json!({"node": null})));
+        fake.state().graphql_rate_limited = true;
+        let err = c
+            .graphql_answer("query { viewer { login } }", serde_json::json!({}))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
+    }
+
+    // `graphql` keeps refusing what it refused before `graphql_answer`
+    // existed: a 5xx is not data.
+    #[test]
+    fn a_graphql_query_answered_with_a_5xx_is_an_error_not_data() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().html_502_next = true;
+        let err = client(&fake)
+            .graphql("query { viewer { login } }", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref m) if m.contains("502")),
+            "{err:?}"
+        );
+    }
+
+    // Spec §6.3: a missing permission is found by the first write, and the
+    // error names it from GitHub's `x-accepted-github-permissions`.
+    // Modelled from GitHub's documentation; no live test provokes it.
+    #[test]
+    fn a_refusal_for_want_of_a_permission_names_the_permission() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().permission_refused_next = Some("contents=write".into());
+        let err = client(&fake)
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
+        assert!(err.to_string().contains("contents=write"), "{err}");
+    }
+
+    // The ledger's commit judges every refusal itself: `graphql_write`
+    // hands back a 403 with the permission it names, and a 422 with its
+    // message, as answers — where `graphql_answer` refuses the 403. A
+    // spent rate limit is still an error.
+    #[test]
+    fn a_graphql_write_hands_every_refusal_to_the_caller() {
+        let fake = FakeGithub::start("acme/widgets");
+        let c = client(&fake);
+        let q = "mutation { x }";
+        fake.state().permission_refused_next = Some("contents=write".into());
+        let a = c.graphql_write(q, serde_json::json!({})).unwrap();
+        assert_eq!(a.status, 403);
+        assert_eq!(a.needs.as_deref(), Some("contents=write"));
+        assert!(a.message.is_some(), "{a:?}");
+        fake.state().body_next.push((
+            "/graphql".into(),
+            422,
+            serde_json::json!({"message": "Unprocessable"}),
+        ));
+        let a = c.graphql_write(q, serde_json::json!({})).unwrap();
+        assert_eq!((a.status, a.needs), (422, None));
+        assert_eq!(a.message.as_deref(), Some("Unprocessable"));
+        fake.state().permission_refused_next = Some("contents=write".into());
+        let err = c.graphql_answer(q, serde_json::json!({})).unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
+        fake.state().rate_limited = true;
+        let err = c.graphql_write(q, serde_json::json!({})).unwrap_err();
+        assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
+    }
+
+    // `graphql`'s production path (not `graphql_answer`'s): an error whose
+    // type is neither RATE_LIMITED nor NOT_FOUND is still a refusal, never
+    // read as partial data.
+    #[test]
+    fn a_graphql_error_that_is_not_all_not_found_is_refused() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().graphql_error_next = Some("FORBIDDEN".into());
+        let err = client(&fake)
+            .graphql("query { viewer { login } }", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref m) if m.contains("FORBIDDEN")),
+            "{err:?}"
+        );
+    }
+
+    // GitHub's `x-accepted-github-permissions` header can ride along on any
+    // 403, including a secondary rate limit's — the rate-limit reading must
+    // still win over the permission-named reading.
+    #[test]
+    fn a_secondary_rate_limit_still_rate_limits_even_carrying_a_permission_header() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().secondary_rate_limit_next = Some((403, None));
+        let err = client(&fake)
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
     }
 }

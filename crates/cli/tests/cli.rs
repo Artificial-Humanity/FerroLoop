@@ -8,7 +8,7 @@ fn db(dir: &tempfile::TempDir) -> String {
 
 fn cli(dir: &tempfile::TempDir) -> Command {
     let mut c = Command::cargo_bin("fl").unwrap();
-    // Fix round 1 — Important 5: every `fl` invocation reads the user's
+    // Every `fl` invocation reads the user's
     // config unconditionally (even `--db`, which only confines which store
     // it uses — the config file is still read and validated), so every
     // test that drives the real binary must not read the developer's own
@@ -157,7 +157,7 @@ fn an_unknown_state_name_is_refused_and_lists_the_valid_ones() {
         .stderr(contains("needs_human"));
 }
 
-// Fix round 1 — Important 1: `db_path`'s four tiers must behave identically.
+// `db_path`'s four tiers must behave identically.
 // `--db` and `$FL_DB` previously returned the path unchecked, so a missing
 // parent directory surfaced as a raw redb I/O error instead of being
 // created, the way the `$XDG_DATA_HOME`/`$HOME` tier already did. These two
@@ -220,7 +220,7 @@ fn a_missing_parent_directory_for_fl_db_is_created_the_same_way_as_the_db_flag()
     );
 }
 
-// Fix round 1 — Important 2: `transition` had no coverage at all, including
+// `transition` had no coverage at all, including
 // the one piece of genuinely new logic in this task (the `--gate`-existence
 // refusal). Pin `add`, `show` round-tripping what was stored, and the
 // refusal naming the missing gate id.

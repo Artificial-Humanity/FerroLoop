@@ -593,7 +593,7 @@ mod tests {
         assert_eq!(title_of("short\nrest"), "short");
     }
 
-    /// Fix round 1, guard 1: `read_item`'s "exactly one kind label" check
+    /// `read_item`'s "exactly one kind label" check
     /// (`let [kind] = kinds.as_slice() else …`).
     #[test]
     fn zero_or_two_kind_labels_are_diverged_naming_the_kind_labels() {
@@ -616,7 +616,7 @@ mod tests {
         );
     }
 
-    /// Fix round 1, guard 2: `read_item`'s stray-label check
+    /// `read_item`'s stray-label check
     /// (`if !stray.is_empty() { … }`).
     #[test]
     fn a_stray_label_is_diverged_naming_it() {
@@ -630,7 +630,7 @@ mod tests {
         assert!(err.contains("fl:finding/raised"), "{err}");
     }
 
-    /// Fix round 1, guard 3a: `#[serde(deny_unknown_fields)]` on `Meta`
+    /// `#[serde(deny_unknown_fields)]` on `Meta`
     /// itself — an unknown top-level field in the block is damaged.
     #[test]
     fn an_unknown_top_level_field_in_the_block_is_damaged() {
@@ -641,7 +641,7 @@ mod tests {
         assert!(matches!(parse_body(&bad), Err(BodyError::Damaged(_))));
     }
 
-    /// Fix round 1, guard 3b: `#[serde(deny_unknown_fields)]` on
+    /// `#[serde(deny_unknown_fields)]` on
     /// `RecordRef` — an unknown field nested inside `record` is damaged
     /// too, independently of `Meta`'s own guard.
     #[test]

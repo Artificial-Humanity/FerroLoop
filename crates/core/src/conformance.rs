@@ -13,6 +13,7 @@
 
 use crate::at::At;
 use crate::decision::{Decision, LeftLocal, Outcome, TransitionOutcome};
+use crate::fault::LedgerFault;
 use crate::finding::{Finding, FindingState};
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
@@ -20,7 +21,7 @@ use crate::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 use crate::model::{
     CommandSpec, GateDef, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
-use crate::split::{Batch, Outbox, RemoteLedger, SplitLedger};
+use crate::split::{Batch, CachedSegment, LedgerCache, Outbox, RemoteLedger, SplitLedger};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use crate::verdict::Verdict;
 use std::cell::RefCell;
@@ -88,7 +89,7 @@ pub trait SplitFixture {
 
 /// `SplitLedger` over a local store `S` and a [`MemRemote`] for `R_1`,
 /// whose ledger was switched on (a cut-over before every sample entry). A
-/// [`Fixture`] too, so the shared ledger suite runs over it. Plan B's
+/// [`Fixture`] too, so the shared ledger suite runs over it. `fl_github`'s
 /// fixture swaps `MemRemote` for `GithubLedger` over the fake GitHub.
 pub struct SplitOver<S, G>(pub S, pub G);
 
@@ -148,11 +149,13 @@ const TRACKER_CASES: usize = 12;
 /// How many cases [`ledger`] runs. Update deliberately — see [`run_suite`].
 const LEDGER_CASES: usize = 4;
 /// How many cases [`split_ledger`] runs. Update deliberately — see [`run_suite`].
-const SPLIT_LEDGER_CASES: usize = 8;
+const SPLIT_LEDGER_CASES: usize = 10;
 /// How many cases [`all_roles`] runs. Update deliberately — see [`run_suite`].
 const ALL_ROLES_CASES: usize = 7;
 /// How many cases [`local_handles`] runs. Update deliberately — see [`run_suite`].
 const LOCAL_HANDLES_CASES: usize = 1;
+/// How many cases [`ledger_cache`] runs. Update deliberately — see [`run_suite`].
+const LEDGER_CACHE_CASES: usize = 6;
 
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -208,6 +211,8 @@ pub fn split_ledger<F: SplitFixture>(make: impl Fn() -> F) {
         a_gate_the_local_catalog_never_held_is_not_owned_whatever_github_holds,
         a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush,
         a_pending_entry_of_another_repository_does_not_block_the_decision,
+        a_published_entry_is_never_offered_to_github_again,
+        a_skipped_entry_is_reported_by_one_flush_only,
     ];
     assert_eq!(
         cases.len(),
@@ -244,6 +249,235 @@ pub fn all_roles<F: Fixture>(make: impl Fn() -> F) {
 pub fn local_handles<S: Catalog + Tracker + Ledger + Handles, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[handles_are_per_kind_and_start_at_one::<S>];
     run_suite("local-handles", LOCAL_HANDLES_CASES, cases, make);
+}
+
+/// What a local store remembers of a GitHub ledger, per repository `node_id`
+/// (GitHub ledger spec §3.2 step 6, §3.3, §3.5 checks 2–4).
+pub fn ledger_cache<S: LedgerCache, G>(make: impl Fn() -> (S, G)) {
+    let cases: &[fn(&S)] = &[
+        the_last_head_is_kept_per_repository_and_replaced::<S>,
+        a_cached_file_reads_back_by_path_and_by_its_own_directory_only::<S>,
+        a_segment_at_the_same_path_in_another_repository_is_never_returned::<S>,
+        cached_under_scans_from_the_directory_not_from_the_start_of_the_repository::<S>,
+        remember_commits_the_head_and_every_segment_together::<S>,
+        a_cached_file_keeps_bytes_that_are_not_utf8_exactly::<S>,
+    ];
+    run_suite("ledger-cache", LEDGER_CACHE_CASES, cases, make);
+}
+
+fn the_last_head_is_kept_per_repository_and_replaced<S: LedgerCache>(s: &S) {
+    assert_eq!(s.last_head("R_1").unwrap(), None);
+    s.set_last_head("R_1", "c1").unwrap();
+    s.set_last_head("R_1", "c2").unwrap();
+    assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c2"));
+    assert_eq!(s.last_head("R_2").unwrap(), None);
+}
+
+fn a_cached_file_reads_back_by_path_and_by_its_own_directory_only<S: LedgerCache>(s: &S) {
+    let seg = |oid: &str, closed: bool| CachedSegment {
+        oid: oid.into(),
+        bytes: format!("{oid}\n").into_bytes(),
+        closed,
+    };
+    assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), None);
+    assert!(s.cached_under("R_1", "runs/aa").unwrap().is_empty());
+    s.cache("R_1", "runs/aa/1.jsonl", &seg("o1", true)).unwrap();
+    s.cache("R_1", "runs/aa/2.jsonl", &seg("o2", false))
+        .unwrap();
+    s.cache("R_1", "runs/aab/1.jsonl", &seg("o3", false))
+        .unwrap();
+    s.cache("R_2", "runs/aa/1.jsonl", &seg("o4", false))
+        .unwrap();
+    s.cache("R_1", "runs/aa/2.jsonl", &seg("o5", true)).unwrap();
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(seg("o1", true))
+    );
+    assert_eq!(
+        s.cached("R_1", "runs/aa/2.jsonl").unwrap(),
+        Some(seg("o5", true)),
+        "a second write replaces the first"
+    );
+    let under: Vec<(String, String)> = s
+        .cached_under("R_1", "runs/aa")
+        .unwrap()
+        .into_iter()
+        .map(|(p, c)| (p, c.oid))
+        .collect();
+    assert_eq!(
+        under,
+        vec![
+            ("runs/aa/1.jsonl".to_string(), "o1".to_string()),
+            ("runs/aa/2.jsonl".to_string(), "o5".to_string()),
+        ],
+        "not `runs/aab`, and not another repository's"
+    );
+}
+
+/// ⚠ The case above's `runs/aab` row (meant to probe the DIRECTORY guard)
+/// happens to sort, as a `(repo, path)` key, between `R_1`'s matching rows
+/// and `R_2`'s — so a store that walks a range and stops at the first path
+/// mismatch never even reaches `R_2`'s row there, whether or not it checks
+/// the repository. This case uses the SAME path in both repositories, with
+/// no other row sorting between them, so nothing but the repository check
+/// itself can keep them apart.
+fn a_segment_at_the_same_path_in_another_repository_is_never_returned<S: LedgerCache>(s: &S) {
+    let seg = |oid: &str| CachedSegment {
+        oid: oid.into(),
+        bytes: format!("{oid}\n").into_bytes(),
+        closed: false,
+    };
+    s.cache("R_1", "runs/aa/1.jsonl", &seg("o1")).unwrap();
+    s.cache("R_2", "runs/aa/1.jsonl", &seg("o2")).unwrap();
+
+    assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), Some(seg("o1")));
+    assert_eq!(s.cached("R_2", "runs/aa/1.jsonl").unwrap(), Some(seg("o2")));
+
+    let under_r1: Vec<(String, String)> = s
+        .cached_under("R_1", "runs/aa")
+        .unwrap()
+        .into_iter()
+        .map(|(p, c)| (p, c.oid))
+        .collect();
+    assert_eq!(
+        under_r1,
+        vec![("runs/aa/1.jsonl".to_string(), "o1".to_string())],
+        "R_2's segment at the identical path must not appear in R_1's read"
+    );
+}
+
+/// ⚠ Pins `cached_under`'s scan START, not just its stopping condition.
+/// `R_1`'s `format` row sorts, as a `(repo, path)` key, before `runs/aa/` —
+/// and `R_1`'s `runs/a9/1.jsonl` sorts between `format` and `runs/aa/` too,
+/// since `'9'` is less than `'a'`. A scan that starts too early (the whole
+/// table, or the repository's own first row) hits one of these before ever
+/// reaching `runs/aa`, and an implementation that stops at the first
+/// mismatch breaks right there — silently returning an empty or short list,
+/// never an error.
+fn cached_under_scans_from_the_directory_not_from_the_start_of_the_repository<S: LedgerCache>(
+    s: &S,
+) {
+    let seg = |oid: &str| CachedSegment {
+        oid: oid.into(),
+        bytes: format!("{oid}\n").into_bytes(),
+        closed: false,
+    };
+    s.cache("R_1", "format", &seg("meta")).unwrap();
+    s.cache("R_1", "runs/a9/1.jsonl", &seg("a9")).unwrap();
+    s.cache("R_1", "runs/aa/1.jsonl", &seg("r1a")).unwrap();
+    s.cache("R_2", "runs/aa/1.jsonl", &seg("r2a")).unwrap();
+    s.cache("R_2", "runs/aa/2.jsonl", &seg("r2b")).unwrap();
+
+    let r1: Vec<(String, String)> = s
+        .cached_under("R_1", "runs/aa")
+        .unwrap()
+        .into_iter()
+        .map(|(p, c)| (p, c.oid))
+        .collect();
+    assert_eq!(
+        r1,
+        vec![("runs/aa/1.jsonl".to_string(), "r1a".to_string())],
+        "neither `format` nor `runs/a9` belong under `runs/aa`"
+    );
+
+    let r2: Vec<(String, String)> = s
+        .cached_under("R_2", "runs/aa")
+        .unwrap()
+        .into_iter()
+        .map(|(p, c)| (p, c.oid))
+        .collect();
+    assert_eq!(
+        r2,
+        vec![
+            ("runs/aa/1.jsonl".to_string(), "r2a".to_string()),
+            ("runs/aa/2.jsonl".to_string(), "r2b".to_string()),
+        ],
+        "in path order"
+    );
+}
+
+/// `remember` is the write a read commits with: the head and every segment
+/// it validated land together, and a later call only touches what it names
+/// — it adds and replaces, it does not wipe what an earlier call cached.
+fn remember_commits_the_head_and_every_segment_together<S: LedgerCache>(s: &S) {
+    let seg = |oid: &str, closed: bool| CachedSegment {
+        oid: oid.into(),
+        bytes: format!("{oid}\n").into_bytes(),
+        closed,
+    };
+    assert_eq!(s.last_head("R_1").unwrap(), None);
+    s.remember(
+        "R_1",
+        "c1",
+        &[
+            ("format".to_string(), seg("f1", true)),
+            ("runs/aa/1.jsonl".to_string(), seg("r1", false)),
+        ],
+    )
+    .unwrap();
+    assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c1"));
+    assert_eq!(s.cached("R_1", "format").unwrap(), Some(seg("f1", true)));
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(seg("r1", false))
+    );
+
+    // A head-only `remember` (no directory read, as `check_format` makes)
+    // still advances the head, and leaves earlier segments alone.
+    s.remember("R_1", "c2", &[]).unwrap();
+    assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c2"));
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(seg("r1", false)),
+        "a head-only remember must not touch a segment it does not name"
+    );
+
+    // A segment an earlier call cached, that this call does not mention,
+    // survives this call: `remember` adds and replaces, it never wipes.
+    s.remember(
+        "R_1",
+        "c3",
+        &[("runs/aa/2.jsonl".to_string(), seg("r2", true))],
+    )
+    .unwrap();
+    assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c3"));
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(seg("r1", false)),
+        "a segment this call did not name is untouched"
+    );
+    assert_eq!(
+        s.cached("R_1", "runs/aa/2.jsonl").unwrap(),
+        Some(seg("r2", true))
+    );
+}
+
+/// ⚠ A file is cached as the bytes GitHub sent, exactly — through `cache`
+/// and through `remember` alike. A store that keeps text would have to
+/// decode a damaged line lossily, and two different damaged lines would
+/// then compare equal (check 4).
+fn a_cached_file_keeps_bytes_that_are_not_utf8_exactly<S: LedgerCache>(s: &S) {
+    let seg = |oid: &str, bytes: &[u8]| CachedSegment {
+        oid: oid.into(),
+        bytes: bytes.to_vec(),
+        closed: false,
+    };
+    let one = seg("o1", &[b'a', b'\n', 0xff, b'\n']);
+    let two = seg("o2", &[0xfe, b'\n']);
+    s.cache("R_1", "runs/aa/1.jsonl", &one).unwrap();
+    s.remember("R_1", "c1", &[("runs/aa/2.jsonl".to_string(), two.clone())])
+        .unwrap();
+    assert_eq!(
+        s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(one.clone())
+    );
+    assert_eq!(
+        s.cached_under("R_1", "runs/aa").unwrap(),
+        vec![
+            ("runs/aa/1.jsonl".to_string(), one),
+            ("runs/aa/2.jsonl".to_string(), two),
+        ]
+    );
 }
 
 fn a_project_round_trips<S: Catalog>(s: &S) {
@@ -473,7 +707,7 @@ pub fn add_alias_resolves_through_an_existing_alias_to_the_true_primary(roles: &
     assert!(via_second.also_known_as.contains(&second));
 }
 
-/// Fix round 1, item 1: `set_record_state` and `update_finding` both take an
+/// `set_record_state` and `update_finding` both take an
 /// id/struct the caller may have addressed by alias. Either must land on —
 /// and stay keyed by — the primary: no phantom second row, no double count.
 pub fn set_record_state_and_update_finding_through_an_alias_touch_the_primary_once(
@@ -534,7 +768,7 @@ pub fn set_record_state_and_update_finding_through_an_alias_touch_the_primary_on
     );
 }
 
-/// Fix round 1, item 6: `add_finding` must store the referenced record's
+/// `add_finding` must store the referenced record's
 /// PRIMARY id, never whatever alias the caller happened to raise against
 /// (e.g. the CLI stores exactly what the user typed) — otherwise two
 /// findings against "the same" record could disagree on which IRI names it.
@@ -552,7 +786,7 @@ pub fn a_finding_raised_against_a_record_alias_stores_the_primary(roles: &Bound<
     assert_eq!(f.record, r, "the finding stores the record's primary id");
 }
 
-/// Final review, item 12: `update_finding` keeps the STORED
+/// `update_finding` keeps the STORED
 /// `also_known_as` and ignores the caller's. A caller holding a copy read
 /// before an `add_alias` must not erase that alias from the item while the
 /// alias index still resolves it; a caller that edits the list must not add
@@ -812,7 +1046,9 @@ fn a_gate_the_local_catalog_never_held_is_not_owned_whatever_github_holds(
 }
 
 // ⚠ Spec §3.2 step 5 and §8.3: a commit that landed before its answer was
-// lost reads, to fl, as a failure; the retry must not add a second copy.
+// lost may read, to fl, as an outright failure — or, if the remote rereads
+// the ledger and finds its own commit, as a success. Either way, the run is
+// never published twice.
 fn a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush(
     roles: &Bound<'_>,
     ctl: &dyn RemoteControl,
@@ -822,13 +1058,17 @@ fn a_commit_whose_answer_was_lost_is_not_duplicated_by_the_next_flush(
     let id = run.id.clone().unwrap();
     roles.ledger.append_gate_run(run).unwrap();
     ctl.lose_next_answer();
-    assert!(
-        roles
-            .ledger
-            .flush(sample_decision(1, &r, vec![id.clone()]))
-            .is_err(),
-        "an answer that never came is not a landed commit, as far as fl can tell"
-    );
+    let first = roles.ledger.flush(sample_decision(1, &r, vec![id.clone()]));
+    if first.is_ok() {
+        // A remote that reread the ledger already landed the run on this
+        // first flush: the second flush below must find it already there,
+        // not add a second copy of its own.
+        assert_eq!(
+            run_ids(ctl.remote().gate_runs(&g).unwrap()),
+            vec![Some(id.clone())],
+            "the run already landed before the second flush"
+        );
+    }
     let flushed = roles
         .ledger
         .flush(sample_decision(2, &r, vec![id.clone()]))
@@ -868,6 +1108,58 @@ fn a_pending_entry_of_another_repository_does_not_block_the_decision(
         }]
     );
     assert_eq!(run_ids(ctl.remote().gate_runs(&g).unwrap()), vec![mine.id]);
+}
+
+// ⚠ Spec §2.1, §3.2 step 6: a published entry is marked, so no later flush
+// offers it again. Seen in the batches, because GitHub's de-duplication
+// would hide a missing mark from every read.
+fn a_published_entry_is_never_offered_to_github_again(roles: &Bound<'_>, ctl: &dyn RemoteControl) {
+    let (_p, g, r) = record_world(roles);
+    let first = sample_record_run(1, &g, Some(&r));
+    roles.ledger.append_gate_run(first.clone()).unwrap();
+    roles
+        .ledger
+        .flush(sample_decision(1, &r, vec![first.id.clone().unwrap()]))
+        .unwrap();
+    let second = sample_record_run(2, &g, Some(&r));
+    roles.ledger.append_gate_run(second.clone()).unwrap();
+    roles
+        .ledger
+        .flush(sample_decision(2, &r, vec![second.id.clone().unwrap()]))
+        .unwrap();
+    let batches = ctl.batches();
+    assert_eq!(batches.len(), 2, "one batch per flush");
+    assert_eq!(run_ids(batches[0].runs.clone()), vec![first.id]);
+    assert_eq!(
+        run_ids(batches[1].runs.clone()),
+        vec![second.id],
+        "the first run was published and is not offered again"
+    );
+}
+
+// ⚠ Spec §2.1: an entry another repository owns is reported by the flush
+// that skips it, and by no later one. A foreign ATTEMPT is skipped the same
+// way as a foreign run — covering both guards the attempt branch's own
+// `set_aside` push, which a run-only case cannot catch.
+fn a_skipped_entry_is_reported_by_one_flush_only(roles: &Bound<'_>, ctl: &dyn RemoteControl) {
+    let (p, g, r) = record_world(roles);
+    let theirs = ctl.foreign_record();
+    let other = sample_record_run(1, &g, Some(&theirs));
+    let elsewhere = sample_attempt(2, &p, &theirs);
+    roles.ledger.append_gate_run(other).unwrap();
+    roles.ledger.append_attempt(elsewhere).unwrap();
+    let first = roles.ledger.flush(sample_decision(1, &r, vec![])).unwrap();
+    assert_eq!(first.left_local.len(), 2, "{first:?}");
+    let second = roles.ledger.flush(sample_decision(2, &r, vec![])).unwrap();
+    assert!(second.left_local.is_empty(), "{second:?}");
+    let batches = ctl.batches();
+    assert_eq!(batches.len(), 2, "one batch per flush");
+    assert!(
+        batches
+            .iter()
+            .all(|b| b.runs.is_empty() && b.attempts.is_empty()),
+        "never published"
+    );
 }
 
 /// Asserts that every result is `NotOwned` and names `id`. Each result is
@@ -1027,7 +1319,7 @@ fn assert_all_wrong_kind(
     }
 }
 
-// Final review, item 1: an id this store DOES hold, but as another kind,
+// An id this store DOES hold, but as another kind,
 // passed where a project (or `add_finding`'s record) is needed. An empty
 // list would claim the store looked at a project and found nothing in it;
 // `NotOwned` would claim the store never held the id. Both are false, so
@@ -1155,7 +1447,7 @@ fn handles_are_per_kind_and_start_at_one<S: Catalog + Tracker + Ledger + Handles
     assert_eq!(s.resolve_handle(Kind::Finding, 0).unwrap(), None);
 }
 
-// Final review, item 11: `refs::show` prints a handle only when
+// `refs::show` prints a handle only when
 // `handle_of(kind, id)` answers `Some`, so an id held under another kind must
 // answer `None` — never the handle it has under its OWN kind. A store that
 // ignored `kind` would answer `Some` in every row that must be `None`.
@@ -1333,7 +1625,8 @@ pub fn sample_decision(n: u64, record: &RecordId, rests_on: Vec<Iri>) -> Decisio
 }
 
 /// Drives a split ledger's GitHub side. `MemRemote` implements it here;
-/// plan B's fixture implements it over `GithubLedger` and the fake GitHub.
+/// `fl_github`'s fixture implements it over `GithubLedger` and the fake
+/// GitHub.
 pub trait RemoteControl {
     /// While down, every remote read and write fails as unreachable.
     /// Ownership is a local check (spec §2.1) and keeps answering.
@@ -1345,6 +1638,10 @@ pub trait RemoteControl {
     fn foreign_record(&self) -> RecordId;
     /// The remote side itself, read without the local store.
     fn remote(&self) -> &dyn RemoteLedger;
+    /// Every batch the remote side was handed to publish, in order — what
+    /// each flush offered, which GitHub's own de-duplication would hide
+    /// from every read.
+    fn batches(&self) -> Vec<Batch>;
 }
 
 /// The one record [`MemRemote`] does not own.
@@ -1369,12 +1666,15 @@ pub struct MemRemote {
 struct RemoteInner {
     down: bool,
     fail_publish: bool,
+    damaged: bool,
+    rate_limited: bool,
     lose_next_answer: bool,
     foreign: BTreeSet<RecordId>,
     runs: Vec<GateRun>,
     attempts: Vec<Attempt>,
     decisions: Vec<Decision>,
     commits: u64,
+    batches: Vec<Batch>,
 }
 
 impl MemRemote {
@@ -1393,6 +1693,36 @@ impl MemRemote {
     /// answers.
     pub fn fail_publish(&self, on: bool) {
         self.inner.borrow_mut().fail_publish = on;
+    }
+
+    /// Every read answers that the ledger was altered — a damaged ledger,
+    /// not an unreachable one — while publishing still works.
+    pub fn damage(&self, on: bool) {
+        self.inner.borrow_mut().damaged = on;
+    }
+
+    /// Every read answers that GitHub's rate limit is spent.
+    pub fn rate_limit_reads(&self, on: bool) {
+        self.inner.borrow_mut().rate_limited = on;
+    }
+
+    /// A read refused for a spent rate limit or a damaged ledger.
+    fn refuse_read(&self) -> Result<(), StoreError> {
+        if self.inner.borrow().rate_limited {
+            return Err(StoreError::RateLimited {
+                reset: "1700000000 (unix seconds)".into(),
+            });
+        }
+        if self.inner.borrow().damaged {
+            return Err(LedgerFault::Altered {
+                repo: self.node_id.clone(),
+                file: "runs/0/1.jsonl".into(),
+                what: "was changed by the test".into(),
+                commit: "commit-0".into(),
+            }
+            .into());
+        }
+        Ok(())
     }
 
     /// A run as GitHub holds it — another machine's, or an altered copy —
@@ -1437,6 +1767,7 @@ impl RemoteLedger for MemRemote {
     fn publish(&self, batch: &Batch) -> Result<Option<String>, StoreError> {
         self.refuse_if_down()?;
         let mut s = self.inner.borrow_mut();
+        s.batches.push(batch.clone());
         if s.fail_publish {
             return Err(self.unreachable("the commit did not land"));
         }
@@ -1471,6 +1802,7 @@ impl RemoteLedger for MemRemote {
 
     fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
         self.refuse_if_down()?;
+        self.refuse_read()?;
         Ok(self
             .inner
             .borrow()
@@ -1483,6 +1815,7 @@ impl RemoteLedger for MemRemote {
 
     fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
         self.refuse_if_down()?;
+        self.refuse_read()?;
         Ok(self
             .inner
             .borrow()
@@ -1506,5 +1839,8 @@ impl RemoteControl for MemRemote {
     }
     fn remote(&self) -> &dyn RemoteLedger {
         self
+    }
+    fn batches(&self) -> Vec<Batch> {
+        self.inner.borrow().batches.clone()
     }
 }

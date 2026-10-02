@@ -2,7 +2,6 @@ use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Args;
-use fl_core::decision::Flushed;
 use fl_core::ids::RecordId;
 use fl_core::log::{Attempt, AttemptStatus, PathsTouched};
 use fl_core::store::{Catalog, Ledger};
@@ -31,7 +30,7 @@ pub struct Cmd {
 
 impl Cmd {
     /// The one item this command names, by `Ref` — the single source
-    /// `iris()` and `has_handle()` both derive from (Fix round 2, item 5).
+    /// `iris()` and `has_handle()` both derive from.
     fn refs(&self) -> Vec<&Ref> {
         vec![&self.record]
     }
@@ -118,29 +117,48 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         }
     }
 
-    let flushed = publish(ctx.ledger, &entry, &attempt)?;
-    crate::ctx::report_flush(&flushed);
-
-    Ok(match outcome.status {
-        AttemptStatus::Completed => 0,
-        _ => 1,
-    })
+    Ok(finish(ctx.ledger, &entry, &attempt))
 }
 
-/// Publish the attempt after its local append (GitHub ledger spec §2.2).
-/// It already ran and cost what it cost, so a failure here refuses nothing
-/// (§7): the outcome is printed, the error is reported, and the attempt
-/// goes out with the next flush that succeeds (decision 8).
-fn publish(ledger: &dyn Ledger, id: &Iri, attempt: &Attempt) -> Result<Flushed> {
-    ledger
-        .flush(fl_exec::decision::for_attempt(id, attempt))
-        .map_err(|e| {
-            anyhow::anyhow!(
+/// Publish the attempt and give its exit code.
+///
+/// ⚠⚠ Decision 14: the attempt already ran and cost what it cost, so the
+/// code is the attempt's own — 0 when it completed, 1 otherwise — whatever
+/// became of its publish. Exit 2 means "refused" everywhere else, and a
+/// script that retries on 2 must never run a paid attempt again.
+fn finish(ledger: &dyn Ledger, id: &Iri, attempt: &Attempt) -> i32 {
+    if let Some(warning) = conclude(ledger, id, attempt) {
+        eprintln!("warning: {warning}");
+    }
+    match attempt.status {
+        AttemptStatus::Completed => 0,
+        _ => 1,
+    }
+}
+
+/// Publish the attempt after its local append (GitHub ledger spec §2.2) and
+/// report what stayed local. A failure refuses nothing (§7): it comes back
+/// as the warning to print, and the attempt goes out with the next flush
+/// that succeeds (decision 8).
+fn conclude(ledger: &dyn Ledger, id: &Iri, attempt: &Attempt) -> Option<String> {
+    match ledger.flush(fl_exec::decision::for_attempt(id, attempt)) {
+        Ok(flushed) => {
+            crate::ctx::report_flush(&flushed);
+            None
+        }
+        Err(e) => {
+            let after = if e.is_transient() {
+                "Nothing is lost: the next decision that reaches the ledger publishes it."
+            } else {
+                "It stays there until the cause above is fixed; the first decision that reaches \
+                 the ledger after that publishes it."
+            };
+            Some(format!(
                 "the attempt ran and is recorded in the local store, but it could not be \
-                 published to the shared ledger ({e}). Nothing is lost: the next decision that \
-                 reaches the ledger publishes it."
-            )
-        })
+                 published to the shared ledger ({e}). {after}"
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -149,15 +167,16 @@ mod tests {
     use crate::testing::Flushes;
     use fl_core::decision::Outcome;
     use fl_core::ids::{ProjectId, seq_iri};
+    use fl_core::store::StoreError;
 
-    fn attempt() -> Attempt {
+    fn attempt(status: AttemptStatus) -> Attempt {
         Attempt {
             id: Some(seq_iri(50)),
             at: None,
             project: ProjectId(seq_iri(1)),
             record: RecordId(seq_iri(2)),
             adapter: "claude".into(),
-            status: AttemptStatus::Timeout,
+            status,
             duration_ms: 1,
             tokens_in: 0,
             tokens_out: 0,
@@ -170,7 +189,10 @@ mod tests {
     #[test]
     fn an_attempts_decision_rests_on_the_attempt() {
         let ledger = Flushes::default();
-        publish(&ledger, &seq_iri(50), &attempt()).unwrap();
+        assert_eq!(
+            conclude(&ledger, &seq_iri(50), &attempt(AttemptStatus::Timeout)),
+            None
+        );
         let decisions = ledger.decisions.borrow();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].record, RecordId(seq_iri(2)));
@@ -183,15 +205,44 @@ mod tests {
         );
     }
 
-    // Spec §7 and decision 8: the attempt already ran, so a failed publish
-    // refuses nothing — it is reported, and the attempt is kept for the next
-    // flush.
+    // ⚠ Decision 14: an attempt that ran but could not be published exits
+    // with the attempt's own code — never 2, which a script retries on —
+    // and the publish failure is a warning.
     #[test]
-    fn an_attempt_that_cannot_be_published_is_reported_as_kept_not_refused() {
-        let err = publish(&Flushes::refusing(), &seq_iri(50), &attempt()).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("recorded in the local store"), "{msg}");
-        assert!(msg.contains("next decision"), "{msg}");
-        assert!(!msg.contains("refused:"), "not a refusal: {msg}");
+    fn an_attempt_that_cannot_be_published_keeps_its_own_exit_code() {
+        for (status, code) in [(AttemptStatus::Completed, 0), (AttemptStatus::Timeout, 1)] {
+            assert_eq!(
+                finish(&Flushes::refusing(), &seq_iri(50), &attempt(status)),
+                code,
+                "{status:?}"
+            );
+        }
+    }
+
+    // Spec §7 and decision 8: kept, not refused; and the next decision
+    // publishes it only when the failure was transient.
+    #[test]
+    fn the_warning_promises_a_later_publish_only_when_one_can_work() {
+        let w = conclude(
+            &Flushes::refusing(),
+            &seq_iri(50),
+            &attempt(AttemptStatus::Timeout),
+        )
+        .expect("a warning");
+        assert!(w.contains("recorded in the local store"), "{w}");
+        assert!(w.contains("next decision"), "{w}");
+        assert!(!w.contains("refused:"), "not a refusal: {w}");
+
+        let w = conclude(
+            &Flushes::refusing_with(|| StoreError::Tampered {
+                id: seq_iri(99),
+                detail: "edited".into(),
+            }),
+            &seq_iri(50),
+            &attempt(AttemptStatus::Timeout),
+        )
+        .expect("a warning");
+        assert!(w.contains("recorded in the local store"), "{w}");
+        assert!(!w.contains("next decision"), "{w}");
     }
 }

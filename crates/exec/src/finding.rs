@@ -1,6 +1,6 @@
 use crate::decision;
 use crate::evaluate::{GateReport, run_single_gate};
-use crate::population::ExecError;
+use crate::population::{ExecError, refused_publish};
 use fl_core::decision::Flushed;
 use fl_core::finding::FindingState;
 use fl_core::ids::{FindingId, GateId};
@@ -70,8 +70,8 @@ pub enum FindingExecError {
 /// `neighbours` whose verdict did not pass. It is not additional data, and
 /// it is not re-run to produce — `verify_finding` filters it out of the same
 /// single pass over `neighbours`. It stays a first-class field (rather than
-/// a method) because `closed`/`exit_code()`'s contract is pinned by a
-/// reviewer's mutation testing and existing callers already read it as a
+/// a method) because `closed`/`exit_code()`'s contract is pinned by
+/// mutation-checked tests and existing callers already read it as a
 /// field.
 pub struct FixReport {
     pub reproduction: GateReport,
@@ -213,7 +213,7 @@ pub fn attach_reproduction(
             &report,
             refusal.is_none(),
         ))
-        .map_err(|e| FindingExecError::Exec(ExecError::Unpublished(e.to_string())))?;
+        .map_err(|e| FindingExecError::Exec(refused_publish(e)))?;
     if let Some(refused) = refusal {
         return Err(refused);
     }
@@ -324,7 +324,7 @@ pub fn verify_finding(
             &neighbour_reports,
             closed,
         ))
-        .map_err(|e| FindingExecError::Exec(ExecError::Unpublished(e.to_string())))?;
+        .map_err(|e| FindingExecError::Exec(refused_publish(e)))?;
     if closed {
         roles
             .tracker
@@ -350,7 +350,7 @@ mod tests {
     use fl_core::finding::{Finding, FindingState};
     use fl_core::ids::{ProjectId, RecordId};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
-    use fl_core::store::{Catalog, Ledger, Roles, Tracker};
+    use fl_core::store::{Catalog, Ledger, Roles, StoreError, Tracker};
     use fl_core::verdict::FailReason;
     use std::fs;
     use std::process::Command;
@@ -677,7 +677,7 @@ mod tests {
         f
     }
 
-    // Fix round 1, item 3: `verify_finding`'s two `follow_ref` calls (for
+    // `verify_finding`'s two `follow_ref` calls (for
     // `f.project` and `f.reproduction`) had no test — deleting either left
     // the whole suite green. Each is pinned here by corrupting the
     // finding's own stored reference, after it is legitimately `Assigned`,
@@ -970,5 +970,45 @@ mod tests {
             s.get_finding(&f).unwrap().unwrap().state,
             FindingState::Assigned
         );
+    }
+
+    fn tampered() -> StoreError {
+        StoreError::Tampered {
+            id: fl_core::ids::seq_iri(99),
+            detail: "edited".into(),
+        }
+    }
+
+    // Spec §7: the reproduce and verify flush sites promise a retry only
+    // for a transient refusal, like the move.
+    #[test]
+    fn a_reproduce_or_verify_refused_for_a_cause_a_retry_cannot_cure_promises_no_retry() {
+        let d = repo();
+        let s = MemStore::default();
+        let p = s.add_project(&d.path().display().to_string()).unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let red = gate(&s, &p, d.path(), "red", "false");
+        let f = s
+            .add_finding(Finding::raise(p.clone(), r.clone(), "reviewer", "claim"))
+            .unwrap();
+        let j = Journal::refusing_with(&s, tampered);
+        let err = attach_reproduction(j.roles(), &f, &red).unwrap_err();
+        assert!(
+            matches!(err, FindingExecError::Exec(ExecError::PublishRefused(_))),
+            "{err}"
+        );
+
+        let rep = gate(&s, &p, d.path(), "reproduction", "false");
+        let assigned_one = assigned(&s, &p, &r, &rep);
+        set_program(&s, &rep, "true");
+        let err = match verify_finding(j.roles(), &assigned_one) {
+            Err(e) => e,
+            Ok(_) => panic!("a verify whose flush failed must be refused"),
+        };
+        assert!(
+            matches!(err, FindingExecError::Exec(ExecError::PublishRefused(_))),
+            "{err}"
+        );
+        assert!(!err.to_string().contains("next decision"), "{err}");
     }
 }

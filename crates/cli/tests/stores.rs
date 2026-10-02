@@ -282,7 +282,7 @@ fn a_store_that_cannot_be_opened_during_an_iri_search_is_an_error_not_a_skip() {
         .stderr(contains(b.to_str().unwrap()));
 }
 
-// Fix round 1 — Important 2 (integration half): guard `bound`'s
+// Guard `bound`'s
 // canonicalization of a config entry's `root` (config.rs's unit test
 // `bound_resolves_a_symlinked_cwd_passed_directly` guards the `cwd` side;
 // Task 6's `a_symlinked_working_directory_binds_like_the_real_one` above
@@ -331,7 +331,6 @@ fn a_gate_iri_in(env: &Env, repo: &Path) -> String {
     json["id"].as_str().unwrap().to_string()
 }
 
-// Fix round 1 — Ruling (item 0), extended in fix round 2 (items 2, 3):
 // `--db`/`$FL_DB` CONFINE the command to the one store they name. An IRI
 // that store does not hold is `NotOwned` naming only that store — never a
 // search across every store any project happens to be bound to in the
@@ -345,7 +344,7 @@ fn an_explicit_db_confines_the_search_and_never_names_another_configured_store()
     // `other.redb` is a THIRD path, not registered in the config at all —
     // confinement must hold whether or not it happens to overlap with a
     // configured store, and it must not itself get created merely by being
-    // looked in (Fix round 2, item 2): `RedbStore::open` calls
+    // looked in: `RedbStore::open` calls
     // `Database::create`, so opening a nonexistent confined store to check
     // whether it owns an id would leave a fresh, empty store file behind —
     // exactly the "created a store while searching" bug item 3 already
@@ -364,7 +363,7 @@ fn an_explicit_db_confines_the_search_and_never_names_another_configured_store()
     );
 }
 
-// Fix round 2, item 3: the $FL_DB confinement tier had no test of its own —
+// The $FL_DB confinement tier had no test of its own —
 // flipping `db_path`'s `$FL_DB` branch from `confined = true` to `false`
 // failed nothing. Mirrors the `--db` test above through `$FL_DB` instead,
 // including item 2's never-creates-the-store assertion.
@@ -389,7 +388,7 @@ fn fl_db_confines_the_search_and_never_names_another_configured_store() {
     );
 }
 
-// Fix round 1 — Important 1: a handle resolves only in the store it was
+// A handle resolves only in the store it was
 // read from. Mixing one into a command whose IRI sends the search to a
 // DIFFERENT store than the bound one must refuse rather than silently
 // resolve the handle against that other store's numbering.
@@ -440,7 +439,7 @@ fn a_handle_mixed_with_an_iri_held_by_a_different_store_is_refused() {
         .stderr(contains("declares no transition named `launch`"));
 }
 
-// Fix round 1 — Important 3: `choose_store` must never create a candidate
+// `choose_store` must never create a candidate
 // store merely by checking whether it owns an id.
 #[test]
 fn searching_for_an_iri_never_creates_a_candidate_store_that_does_not_exist() {
@@ -469,7 +468,7 @@ fn searching_for_an_iri_never_creates_a_candidate_store_that_does_not_exist() {
     );
 }
 
-// Fix round 1 — Important 4a: IRIs in one command held by different stores.
+// IRIs in one command held by different stores.
 // `choose_store` treats every `Iri` `Cmd::iris()` collects the same way
 // regardless of which flag it came from — there is no `finding show`/`get`
 // in this CLI that could print a raw finding IRI (`finding list` always
@@ -568,7 +567,7 @@ fn iris_in_one_command_held_by_different_stores_is_refused_naming_both() {
         .stderr(contains(b.to_str().unwrap()));
 }
 
-// Fix round 1 — Important 4b: one id owned by two stores at once.
+// One id owned by two stores at once.
 #[test]
 fn an_id_owned_by_two_stores_at_once_is_refused_naming_both() {
     let env = Env::new();
@@ -629,7 +628,7 @@ fn registered(env: &Env) -> tempfile::TempDir {
     repo
 }
 
-// Final review, item 1: an IRI the store holds as a GATE, passed as
+// An IRI the store holds as a GATE, passed as
 // `--project`, must be refused (exit 2) — never listed as an empty project,
 // and never reported as `attempts: 0`.
 #[test]
@@ -653,7 +652,7 @@ fn a_gate_iri_passed_as_a_project_is_refused_not_listed_as_empty() {
     }
 }
 
-// Final review, item 2: `project add <path>` registers `<path>` in the
+// `project add <path>` registers `<path>` in the
 // store the config binds `<path>` to — not the store bound to the directory
 // the command happens to run in.
 #[test]
@@ -692,7 +691,7 @@ fn project_add_uses_the_store_bound_to_the_path_not_the_current_directory() {
     assert!(!env.default_store().exists(), "the default store was used");
 }
 
-// Final review, item 5: an empty or relative `$XDG_DATA_HOME` is ignored,
+// An empty or relative `$XDG_DATA_HOME` is ignored,
 // as `$XDG_CONFIG_HOME`'s is — used as-is it would create the store under
 // whatever directory the command ran in.
 #[test]
@@ -719,7 +718,7 @@ fn an_empty_or_relative_xdg_data_home_falls_back_to_home_not_the_cwd() {
     }
 }
 
-// Final review, item 6: with no store anywhere, `NotOwned` must say that no
+// With no store anywhere, `NotOwned` must say that no
 // store exists yet — not print `(searched: )`, an empty list that reads
 // like a search that ran.
 #[test]
@@ -737,7 +736,7 @@ fn an_iri_on_a_fresh_install_says_no_store_exists_yet() {
         );
 }
 
-// Final review, item 9: success output names an item by its handle when it
+// Success output names an item by its handle when it
 // has one, even when the person typed its full IRI.
 #[test]
 fn gate_affirm_by_iri_prints_the_handle_not_the_iri() {
@@ -752,7 +751,7 @@ fn gate_affirm_by_iri_prints_the_handle_not_the_iri() {
         .stdout(predicates::str::starts_with("1\t").and(contains("urn:uuid:").not()));
 }
 
-// Final review, item 8: an attempt names its record by the record's PRIMARY
+// An attempt names its record by the record's PRIMARY
 // id, even when the person typed an alias.
 #[test]
 fn an_attempt_through_a_record_alias_stores_the_primary() {

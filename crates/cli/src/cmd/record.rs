@@ -30,7 +30,7 @@ pub enum Cmd {
 impl Cmd {
     /// Every item this command names, by `Ref` — the single source `iris()`
     /// and `has_handle()` both derive from, so a `Ref` field added to a
-    /// variant here is picked up by both at once (Fix round 2, item 5). A
+    /// variant here is picked up by both at once. A
     /// target state is not an id and never appears here.
     fn refs(&self) -> Vec<&Ref> {
         match self {

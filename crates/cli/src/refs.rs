@@ -100,8 +100,7 @@ pub fn iris(refs: &[&Ref]) -> Vec<Iri> {
 /// Whether `refs` includes a handle. A handle resolves only in the store it
 /// was read from — if an IRI elsewhere among the same command's items sends
 /// the search to a different store, a handle alongside it must not be
-/// silently resolved against that other store's numbering (Fix round 1,
-/// item 1).
+/// silently resolved against that other store's numbering.
 pub fn has_handle(refs: &[&Ref]) -> bool {
     refs.iter().any(|r| matches!(r, Ref::Handle(_)))
 }

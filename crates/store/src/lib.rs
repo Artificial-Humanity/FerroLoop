@@ -5,7 +5,7 @@ use fl_core::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
-use fl_core::split::{Outbox, Pending};
+use fl_core::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use fl_core::store::{Bindings, Catalog, Handles, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::path::Path;
@@ -82,6 +82,13 @@ pub const FORMAT_WITH_LEDGER_ROOT: u64 = 4;
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
 const LEDGER_ROOTS: TableDefinition<&str, &str> = TableDefinition::new("ledger_roots");
+/// repository `node_id` → the last head of its GitHub ledger this machine
+/// checked (GitHub ledger spec §3.2 step 6). Additive.
+const LEDGER_HEADS: TableDefinition<&str, &str> = TableDefinition::new("ledger_heads");
+/// (repository `node_id`, path on the branch) → that file as last read, as
+/// JSON (`CachedSegment`). Additive.
+const LEDGER_SEGMENTS: TableDefinition<(&str, &str), &str> =
+    TableDefinition::new("ledger_segments");
 
 const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
@@ -268,6 +275,18 @@ fn waiting<T: serde::de::DeserializeOwned>(
         out.push(serde_json::from_str(row.value()).map_err(decode)?);
     }
     Ok(out)
+}
+
+/// Drop `ids` from the candidate index inside `tx`: published or set aside,
+/// they wait no more, and no flush scans them again (spec §2.1).
+fn drop_candidates(tx: &redb::WriteTransaction, ids: &[Iri]) -> Result<(), StoreError> {
+    for index in [CANDIDATE_RUNS, CANDIDATE_ATTEMPTS] {
+        let mut table = tx.open_table(index).map_err(backend)?;
+        for id in ids {
+            table.remove(id.as_str()).map_err(backend)?;
+        }
+    }
+    Ok(())
 }
 
 impl RedbStore {
@@ -1157,13 +1176,20 @@ impl Outbox for RedbStore {
     }
 
     fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError> {
+        self.settle(repo, ids, &[])
+    }
+
+    fn settle(&self, repo: &str, published: &[Iri], set_aside: &[Iri]) -> Result<(), StoreError> {
         let tx = self.db.begin_write().map_err(backend)?;
         {
             let mut table = tx.open_table(LEDGER_PUBLISHED).map_err(backend)?;
-            for id in ids {
+            for id in published {
                 table.insert((repo, id.as_str()), true).map_err(backend)?;
             }
         }
+        // ⚠ The same write: a published or set-aside entry waits no more.
+        drop_candidates(&tx, published)?;
+        drop_candidates(&tx, set_aside)?;
         tx.commit().map_err(backend)
     }
 
@@ -1274,10 +1300,112 @@ impl Bindings for RedbStore {
     }
 }
 
+impl LedgerCache for RedbStore {
+    fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_HEADS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let found = table
+            .get(repo)
+            .map_err(backend)?
+            .map(|v| v.value().to_string());
+        Ok(found)
+    }
+
+    fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        tx.open_table(LEDGER_HEADS)
+            .map_err(backend)?
+            .insert(repo, head)
+            .map_err(backend)?;
+        tx.commit().map_err(backend)
+    }
+
+    fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_SEGMENTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let found = match table.get((repo, path)).map_err(backend)? {
+            Some(v) => Some(serde_json::from_str(v.value()).map_err(decode)?),
+            None => None,
+        };
+        Ok(found)
+    }
+
+    fn cached_under(
+        &self,
+        repo: &str,
+        dir: &str,
+    ) -> Result<Vec<(String, CachedSegment)>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(LEDGER_SEGMENTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(vec![]),
+            Err(e) => return Err(backend(e)),
+        };
+        let prefix = format!("{dir}/");
+        let mut out = Vec::new();
+        for entry in table.range((repo, prefix.as_str())..).map_err(backend)? {
+            let (k, v) = entry.map_err(backend)?;
+            let (r, p) = k.value();
+            if r != repo || !p.starts_with(&prefix) {
+                break;
+            }
+            out.push((
+                p.to_string(),
+                serde_json::from_str(v.value()).map_err(decode)?,
+            ));
+        }
+        Ok(out)
+    }
+
+    fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError> {
+        let json = serde_json::to_string(segment).map_err(backend)?;
+        let tx = self.db.begin_write().map_err(backend)?;
+        tx.open_table(LEDGER_SEGMENTS)
+            .map_err(backend)?
+            .insert((repo, path), json.as_str())
+            .map_err(backend)?;
+        tx.commit().map_err(backend)
+    }
+
+    /// One write transaction: the head and every segment land together, or
+    /// (on any error before `commit()`) none of them do — `redb`'s
+    /// `WriteTransaction` aborts on drop when it was never completed.
+    fn remember(
+        &self,
+        repo: &str,
+        head: &str,
+        segments: &[(String, CachedSegment)],
+    ) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        tx.open_table(LEDGER_HEADS)
+            .map_err(backend)?
+            .insert(repo, head)
+            .map_err(backend)?;
+        {
+            let mut table = tx.open_table(LEDGER_SEGMENTS).map_err(backend)?;
+            for (path, segment) in segments {
+                let json = serde_json::to_string(segment).map_err(backend)?;
+                table
+                    .insert((repo, path.as_str()), json.as_str())
+                    .map_err(backend)?;
+            }
+        }
+        tx.commit().map_err(backend)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fl_core::conformance::{entry_iri, sample_record_run};
+    use fl_core::conformance::{entry_iri, sample_attempt, sample_record_run};
     use fl_core::ids::seq_iri;
     use fl_core::log::GateRun;
     use fl_core::model::State;
@@ -1476,7 +1604,7 @@ mod tests {
         assert_eq!(runs[0].verdict.population(), Some(3));
     }
 
-    /// Fix round 1, rewritten for handles: pins that minting, indexing,
+    /// Pins that minting, indexing,
     /// the handle bump and the row write inside `insert_new_with_id` commit
     /// as one unit. If they didn't, a failed insert would still leave the
     /// handle counter advanced and the id in `IDS` — a burned handle, and an
@@ -1658,7 +1786,7 @@ mod tests {
         );
     }
 
-    // Final review, item 7: `IDS` naming an id as a record whose row is
+    // `IDS` naming an id as a record whose row is
     // missing is on-disk damage, and `add_alias` must report it as `Decode`
     // — as `alias_primary` reports its own damaged cases — never panic.
     #[test]
@@ -1828,6 +1956,7 @@ mod tests {
         fl_core::conformance::split_ledger(split);
         fl_core::conformance::all_roles(single);
         fl_core::conformance::local_handles(fresh);
+        fl_core::conformance::ledger_cache(fresh);
     }
 
     /// A project with one gate and one record, in `s`.
@@ -1866,7 +1995,10 @@ mod tests {
             "a mark is per repository"
         );
         assert!(s.unpublished("R_1", &entry_iri(0)).unwrap().runs.is_empty());
-        assert_eq!(s.unpublished("R_2", &entry_iri(0)).unwrap().runs.len(), 1);
+        assert!(
+            s.unpublished("R_2", &entry_iri(0)).unwrap().runs.is_empty(),
+            "the waiting set is the store's: published anywhere, it waits nowhere"
+        );
     }
 
     #[test]
@@ -1894,6 +2026,52 @@ mod tests {
             .map(|e| e.unwrap().0.value().to_string())
             .collect();
         assert_eq!(ids, vec![entry_iri(2).to_string()]);
+    }
+
+    // ⚠ Spec §2.1: the set a flush scans stays bounded by what is waiting —
+    // a published or set-aside entry leaves the candidate index in the same
+    // write that marks it.
+    #[test]
+    fn a_published_or_set_aside_entry_leaves_the_candidate_index() {
+        let (s, _d) = fresh();
+        let (p, g, r) = gate_and_record(&s);
+        let published = sample_record_run(1, &g, Some(&r));
+        let aside = sample_record_run(2, &g, Some(&r));
+        let waiting = sample_record_run(3, &g, Some(&r));
+        for run in [&published, &aside, &waiting] {
+            s.append_gate_run(run.clone()).unwrap();
+        }
+        let attempt = sample_attempt(4, &p, &r);
+        s.append_attempt(attempt.clone()).unwrap();
+        s.settle(
+            "R_1",
+            &[published.id.clone().unwrap(), attempt.id.clone().unwrap()],
+            &[aside.id.clone().unwrap()],
+        )
+        .unwrap();
+
+        let tx = s.db.begin_read().unwrap();
+        let runs: Vec<String> = tx
+            .open_table(CANDIDATE_RUNS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|e| e.unwrap().0.value().to_string())
+            .collect();
+        assert_eq!(runs, vec![entry_iri(3).to_string()]);
+        let attempts = tx
+            .open_table(CANDIDATE_ATTEMPTS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .count();
+        assert_eq!(attempts, 0);
+        drop(tx);
+        assert!(!s.is_published("R_1", aside.id.as_ref().unwrap()).unwrap());
+        assert_eq!(
+            s.unpublished("R_1", &entry_iri(0)).unwrap().runs,
+            vec![waiting]
+        );
     }
 
     // Spec §2.1: entries recorded before the cut-over stay local.
@@ -1932,8 +2110,62 @@ mod tests {
         assert_eq!(s.cutover("R_2").unwrap(), None);
     }
 
+    #[test]
+    fn the_ledger_cache_survives_a_reopen() {
+        use fl_core::split::{CachedSegment, LedgerCache};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let seg = CachedSegment {
+            oid: "o1".into(),
+            bytes: b"{}\n".to_vec(),
+            closed: false,
+        };
+        {
+            let s = RedbStore::open(&path).unwrap();
+            s.set_last_head("R_1", "c1").unwrap();
+            s.cache("R_1", "runs/aa/1.jsonl", &seg).unwrap();
+        }
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c1"));
+        assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), Some(seg));
+    }
+
+    // ⚠ A ledger cache written before `CachedSegment` held bytes (its
+    // `text` a JSON string) reads back unchanged: the change is additive,
+    // nothing to migrate or download again.
+    #[test]
+    fn a_ledger_cache_row_written_as_text_still_reads() {
+        use fl_core::split::{CachedSegment, LedgerCache};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            let tx = s.db.begin_write().unwrap();
+            tx.open_table(LEDGER_SEGMENTS)
+                .unwrap()
+                .insert(
+                    ("R_1", "runs/aa/1.jsonl"),
+                    r#"{"oid":"o1","text":"{}\n","closed":true}"#,
+                )
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(
+            s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+            Some(CachedSegment {
+                oid: "o1".into(),
+                bytes: b"{}\n".to_vec(),
+                closed: true,
+            })
+        );
+    }
+
     use crate::manifest::{LedgerRoot, Manifest, ManifestError, content_sha256};
     use fl_core::model::{Regret, Transition};
+
+    /// A well-formed ledger root (ruling 20).
+    const ROOT_A: &str = "0123456789abcdef0123456789abcdef01234567";
 
     /// An authoring store with one project: gates `fmt` and `lint`, and a
     /// transition over both. Returns the store's guard too.
@@ -2325,14 +2557,14 @@ mod tests {
     fn an_export_carries_the_root_of_the_repository_it_is_told_and_no_other() {
         use fl_core::store::Bindings;
         let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", "abc").unwrap();
+        a.set_ledger_root("R_1", ROOT_A).unwrap();
         let m = a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap();
         assert_eq!(m.body.format_version, 2);
         assert_eq!(
             m.body.ledger_root,
             Some(LedgerRoot {
                 repository_node_id: "R_1".into(),
-                commit: "abc".into(),
+                commit: ROOT_A.into(),
             })
         );
         for other in [None, Some("R_2")] {
@@ -2349,18 +2581,27 @@ mod tests {
     fn an_import_records_the_manifests_ledger_root() {
         use fl_core::store::Bindings;
         let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", "abc").unwrap();
+        a.set_ledger_root("R_1", ROOT_A).unwrap();
         let (b, _gb) = fresh();
         b.import_manifest(&a.export_manifest(&p, "c1", 7, Some("R_1")).unwrap(), "/x")
             .unwrap();
-        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("abc"));
+        assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some(ROOT_A));
+        // ⚠ An import that records a root makes the
+        // store one an older fl refuses, not one it opens and exports
+        // without the root.
+        let tx = b.db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        assert_eq!(
+            meta.get(FORMAT_KEY).unwrap().map(|v| v.value()),
+            Some(FORMAT_WITH_LEDGER_ROOT)
+        );
     }
 
     #[test]
     fn an_import_naming_another_root_for_a_known_repository_is_refused_and_writes_nothing() {
         use fl_core::store::Bindings;
         let (a, _ga, p, _, _) = authoring();
-        a.set_ledger_root("R_1", "abc").unwrap();
+        a.set_ledger_root("R_1", ROOT_A).unwrap();
         let (b, _gb) = fresh();
         b.set_ledger_root("R_1", "other").unwrap();
         let err = b

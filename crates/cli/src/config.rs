@@ -64,7 +64,7 @@ struct File {
 /// The XDG config base directory: `xdg_config_home` if it is a non-empty,
 /// ABSOLUTE path, else `home/.config`. Per the XDG base directory spec, a
 /// relative `$XDG_CONFIG_HOME` (including empty, which is not absolute)
-/// must be treated as unset rather than used as-is (Fix round 1, item 9).
+/// must be treated as unset rather than used as-is.
 /// Pure and dependency-free so it can be unit-tested without touching this
 /// process's own environment.
 fn base_dir(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
@@ -73,8 +73,8 @@ fn base_dir(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<P
 
 /// The XDG data base directory, by the same rule as [`base_dir`]:
 /// `xdg_data_home` if it is an ABSOLUTE path, else `home/.local/share`. An
-/// empty or relative `$XDG_DATA_HOME` is treated as unset (Final review,
-/// item 5) — used as-is it would put the store under the current directory.
+/// empty or relative `$XDG_DATA_HOME` is treated as unset — used as-is it
+/// would put the store under the current directory.
 pub fn data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
     xdg_base(xdg_data_home, home, ".local/share")
 }
@@ -153,7 +153,7 @@ pub fn is_owner_repo(s: &str) -> bool {
 /// Any OTHER failure, such as a permission error partway down the tree, IS
 /// an error naming the path: silently treating it the same as "does not
 /// exist" would fall through to the default store, putting a project's
-/// records in a store nobody chose (Fix round 1, item 7).
+/// records in a store nobody chose.
 fn canonicalize(path: &Path) -> Result<Option<PathBuf>> {
     match path.canonicalize() {
         Ok(p) => Ok(Some(p)),
@@ -169,8 +169,7 @@ fn canonicalize(path: &Path) -> Result<Option<PathBuf>> {
 /// §2.6 binds a project to exactly one store, and a project has one
 /// tracker. Two (or more) entries whose canonical `root` is identical — the
 /// longest match is therefore tied — but whose `(store, tracker)` differs
-/// are refused rather than silently picking one: nothing chose between them
-/// (Fix round 1, item 8).
+/// are refused rather than silently picking one: nothing chose between them.
 pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
     let Some(cwd) = canonicalize(cwd)? else {
         return Ok(None);
@@ -368,7 +367,7 @@ mod tests {
         // Linux, so that test cannot tell `bound`'s own `cwd.canonicalize()`
         // apart from a naive string comparison. Calling `bound` directly
         // here, with a raw symlink path nothing else has resolved first,
-        // closes that gap (Fix round 1, item 2).
+        // closes that gap.
         let real = tempfile::tempdir().unwrap();
         let stores = tempfile::tempdir().unwrap();
         let store = stores.path().join("a.redb");

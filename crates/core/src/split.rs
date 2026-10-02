@@ -4,16 +4,18 @@
 //! the decision.
 //!
 //! The GitHub side is a [`RemoteLedger`]: `fl_github::GithubLedger`
-//! implements it (plan B), and `conformance::MemRemote` is the in-memory
+//! implements it, and `conformance::MemRemote` is the in-memory
 //! double every test here uses.
 
 use crate::at::At;
 use crate::decision::{Decision, Flushed, LeftLocal};
+use crate::fault::LedgerFault;
 use crate::ids::{GateId, ProjectId, RecordId};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun, PathsTouched, WITHHELD_ERROR_DETAIL};
-use crate::store::{Ledger, StoreError};
+use crate::store::{Bindings, Ledger, StoreError};
 use crate::verdict::Verdict;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Local entries waiting to be published to one repository.
@@ -25,26 +27,151 @@ pub struct Pending {
 
 /// The local store's half of publishing (spec §2.1, §3.2 step 6), keyed by
 /// the repository's `node_id`: its cut-over, and what it already has.
+///
+/// ⚠ The WAITING SET is the store's, not a repository's: an entry
+/// published to one repository, or set aside, leaves it for every
+/// repository. A store binds one tracker — the CLI refuses a store that two
+/// trackers share — so no second repository waits for the same entry. The
+/// published MARKS stay per repository (`is_published`).
 pub trait Outbox {
-    /// Every entry with an id greater than `after`, tied to a record (every
-    /// attempt is), and not marked published to `repo` — in id order. A
-    /// run with no record is never listed (spec §2.1), nor is an entry with
-    /// no id (§1.3).
+    /// Every entry still waiting, with an id greater than `after`, tied to
+    /// a record (every attempt is) — in id order. A run with no record is
+    /// never listed (spec §2.1), nor is an entry with no id (§1.3).
     fn unpublished(&self, repo: &str, after: &Iri) -> Result<Pending, StoreError>;
     fn is_published(&self, repo: &str, id: &Iri) -> Result<bool, StoreError>;
-    /// Idempotent: marking an id twice is not an error.
+    /// Idempotent. ⚠ In the same write, each id leaves the waiting set, so
+    /// the set a flush scans stays bounded by what is actually waiting
+    /// (spec §2.1).
     fn mark_published(&self, repo: &str, ids: &[Iri]) -> Result<(), StoreError>;
+    /// What a flush that landed leaves behind, in ONE write: `published` is
+    /// marked and leaves the waiting set; `set_aside` — entries a flush
+    /// skipped because another repository owns their record (spec §2.1) —
+    /// leaves it unmarked: reported once, by the flush that skipped them,
+    /// and never offered again. Idempotent.
+    ///
+    /// ⚠ One write, so a publish that landed is never refused by a second
+    /// write failing after the first.
+    fn settle(&self, repo: &str, published: &[Iri], set_aside: &[Iri]) -> Result<(), StoreError>;
     /// The id after which entries are publishable to `repo`, if its GitHub
     /// ledger was switched on.
     fn cutover(&self, repo: &str) -> Result<Option<Iri>, StoreError>;
-    /// Recorded once, by `fl github ledger init` (plan B). ⚠ The same id
-    /// again is a no-op; a different one is `CutoverChanged`.
+    /// Recorded once, by `fl github ledger init`. ⚠ The same id again is a
+    /// no-op; a different one is `CutoverChanged`.
     fn set_cutover(&self, repo: &str, id: &Iri) -> Result<(), StoreError>;
 }
 
 /// What a split ledger's local side must be.
 pub trait LocalLedger: Ledger + Outbox {}
 impl<T: Ledger + Outbox> LocalLedger for T {}
+
+/// One file of a GitHub ledger as this machine last read it (GitHub ledger
+/// spec §3.3, §3.5 checks 3 and 4).
+///
+/// ⚠ Stored as JSON. Bytes that are valid UTF-8 — every file fl writes —
+/// are stored as the string `text`, exactly the shape a cache written
+/// before `bytes` existed holds, so such a cache reads back unchanged.
+/// Bytes that are not (a damaged line) are stored as `bytes`, an array of
+/// numbers, so they round-trip exactly: a lossy string would make two
+/// different damaged lines compare equal (check 4) and hand back data the
+/// ledger does not hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(into = "CachedSegmentJson", try_from = "CachedSegmentJson")]
+pub struct CachedSegment {
+    /// The blob's object id when it was read.
+    pub oid: String,
+    /// The blob's bytes as read, exactly — never decoded.
+    pub bytes: Vec<u8>,
+    /// Whether a later segment of its directory existed when it was read.
+    /// ⚠ A closed segment never changes.
+    pub closed: bool,
+}
+
+/// [`CachedSegment`] as stored: exactly one of `text` and `bytes`.
+#[derive(Serialize, Deserialize)]
+struct CachedSegmentJson {
+    oid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bytes: Option<Vec<u8>>,
+    closed: bool,
+}
+
+impl From<CachedSegment> for CachedSegmentJson {
+    fn from(s: CachedSegment) -> Self {
+        let (text, bytes) = match String::from_utf8(s.bytes) {
+            Ok(text) => (Some(text), None),
+            Err(e) => (None, Some(e.into_bytes())),
+        };
+        CachedSegmentJson {
+            oid: s.oid,
+            text,
+            bytes,
+            closed: s.closed,
+        }
+    }
+}
+
+impl TryFrom<CachedSegmentJson> for CachedSegment {
+    type Error = String;
+
+    fn try_from(j: CachedSegmentJson) -> Result<Self, String> {
+        let bytes = match (j.text, j.bytes) {
+            (Some(text), None) => text.into_bytes(),
+            (None, Some(bytes)) => bytes,
+            _ => {
+                return Err(format!(
+                    "the cached copy of blob {} holds neither or both of `text` and `bytes`",
+                    j.oid
+                ));
+            }
+        };
+        Ok(CachedSegment {
+            oid: j.oid,
+            bytes,
+            closed: j.closed,
+        })
+    }
+}
+
+/// What this machine remembers of each repository's GitHub ledger, keyed
+/// by the repository's `node_id` (spec §3.2 step 6, §3.3): the last head it
+/// checked, and every file it read — so a closed segment is downloaded
+/// once, and an altered one is caught.
+pub trait LedgerCache {
+    fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError>;
+    fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError>;
+    fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError>;
+    /// Every file cached under the directory `dir` (such as `runs/<key>`),
+    /// with its path, in path order. Not a directory whose name merely
+    /// starts with `dir`.
+    fn cached_under(
+        &self,
+        repo: &str,
+        dir: &str,
+    ) -> Result<Vec<(String, CachedSegment)>, StoreError>;
+    /// Replaces what was cached at `path`.
+    fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError>;
+    /// Commits `head` as the last seen, and every `(path, segment)` a read
+    /// validated, together in ONE write (GitHub ledger spec §3.5 checks 3
+    /// and 4). A read that fails partway must leave neither applied: a
+    /// segment cached from a read that never finished, while the last head
+    /// stayed behind it, would hold a position (open or closed) or a
+    /// content a later read AT THAT SAME, unmoved head never itself
+    /// confirmed — raising a false alarm the next time that head is read.
+    fn remember(
+        &self,
+        repo: &str,
+        head: &str,
+        segments: &[(String, CachedSegment)],
+    ) -> Result<(), StoreError>;
+}
+
+/// Everything the GitHub ledger keeps on this machine: the repository
+/// bindings and ledger roots, the cut-over and published marks, and the
+/// branch cache.
+pub trait LedgerMemory: Bindings + LedgerCache + Outbox {}
+impl<T: Bindings + LedgerCache + Outbox> LedgerMemory for T {}
 
 /// One flush: the decision and every entry it publishes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,11 +288,10 @@ fn merge<T: Entry>(local: Vec<T>, remote: Vec<T>) -> Result<Vec<T>, StoreError> 
     }
     for e in remote {
         let Some(id) = e.entry_id().cloned() else {
-            return Err(StoreError::Backend(
-                "the shared ledger holds an entry with no id, and every published entry carries \
-                 one"
-                .into(),
-            ));
+            return Err(LedgerFault::Unidentified {
+                detail: "an entry read back from the shared ledger".into(),
+            }
+            .into());
         };
         match seen.get(&id) {
             Some(&i) => {
@@ -199,12 +325,16 @@ impl SplitLedger<'_> {
         let local = self.local.attempts(project)?;
         match self.github.attempts(project) {
             Ok(remote) => Ok((merge(local, remote)?, Coverage::Complete)),
-            Err(e) => Ok((
+            // ⚠ Only a GitHub that could not be READ falls back. A ledger
+            // that was read and is damaged is an error: a count over the
+            // local half would hide the damage.
+            Err(e) if e.is_transient() => Ok((
                 local,
                 Coverage::LocalOnly {
                     reason: format!("GitHub could not be read: {e}"),
                 },
             )),
+            Err(e) => Err(e),
         }
     }
 }
@@ -259,6 +389,7 @@ impl Ledger for SplitLedger<'_> {
         };
         let pending = self.local.unpublished(&repo, &cutover)?;
         let mut left_local = Vec::new();
+        let mut set_aside = Vec::new();
         let mut runs = Vec::new();
         for run in pending.runs {
             // `Outbox` lists only runs tied to a record, each with an id.
@@ -268,6 +399,7 @@ impl Ledger for SplitLedger<'_> {
             if self.github.owns_record(&record)? {
                 runs.push(run);
             } else {
+                set_aside.push(id.clone());
                 left_local.push(LeftLocal::OtherRepository { entry: id, record });
             }
         }
@@ -279,6 +411,7 @@ impl Ledger for SplitLedger<'_> {
             if self.github.owns_record(&a.record)? {
                 attempts.push(a);
             } else {
+                set_aside.push(id.clone());
                 left_local.push(LeftLocal::OtherRepository {
                     entry: id,
                     record: a.record.clone(),
@@ -292,13 +425,10 @@ impl Ledger for SplitLedger<'_> {
             .collect();
         for cited in &decision.rests_on {
             if !ids.contains(cited) && !self.local.is_published(&repo, cited)? {
-                return Err(StoreError::Backend(format!(
-                    "decision {} rests on {cited}, which is neither being published nor \
-                     published. A run tied to no record, one recorded before the GitHub ledger \
-                     was switched on, or one tied to another repository's record stays local, \
-                     so a decision cannot rest on it. Nothing was published.",
-                    decision.id
-                )));
+                return Err(StoreError::RestsOnLocalEntry {
+                    decision: decision.id.clone(),
+                    entry: cited.clone(),
+                });
             }
         }
         let commit = self.github.publish(&Batch {
@@ -307,8 +437,10 @@ impl Ledger for SplitLedger<'_> {
             attempts,
         })?;
         // Only after the commit landed: a mark written first would hide an
-        // entry GitHub never received.
-        self.local.mark_published(&repo, &ids)?;
+        // entry GitHub never received. ⚠ And set aside only now, by the
+        // flush whose report reaches the command: reported once, never
+        // offered again (spec §2.1). One write for both (ruling 4).
+        self.local.settle(&repo, &ids, &set_aside)?;
         Ok(Flushed { commit, left_local })
     }
 }
@@ -323,6 +455,49 @@ mod tests {
     use crate::ids::seq_iri;
     use crate::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
     use crate::store::{Catalog, Tracker};
+
+    // ⚠ The stored shape is additive: a cache written before `bytes`
+    // existed reads back, and a file fl wrote (always UTF-8) is still
+    // stored in exactly that shape.
+    #[test]
+    fn a_cached_segment_stores_utf8_as_text_exactly_as_before() {
+        let old = r#"{"oid":"o1","text":"{}\n","closed":false}"#;
+        let seg: CachedSegment = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            seg,
+            CachedSegment {
+                oid: "o1".into(),
+                bytes: b"{}\n".to_vec(),
+                closed: false,
+            }
+        );
+        assert_eq!(serde_json::to_string(&seg).unwrap(), old);
+    }
+
+    // ⚠ Bytes that are not UTF-8 round-trip exactly — never as a lossy
+    // string, under which two different damaged lines would compare equal.
+    #[test]
+    fn a_cached_segment_keeps_bytes_that_are_not_utf8_exactly() {
+        let seg = CachedSegment {
+            oid: "o1".into(),
+            bytes: vec![b'a', b'\n', 0xff, b'\n'],
+            closed: true,
+        };
+        let json = serde_json::to_string(&seg).unwrap();
+        assert_eq!(json, r#"{"oid":"o1","bytes":[97,10,255,10],"closed":true}"#);
+        assert_eq!(serde_json::from_str::<CachedSegment>(&json).unwrap(), seg);
+    }
+
+    #[test]
+    fn a_cached_segment_with_neither_or_both_contents_is_refused() {
+        for json in [
+            r#"{"oid":"o1","closed":false}"#,
+            r#"{"oid":"o1","text":"a\n","bytes":[97,10],"closed":false}"#,
+        ] {
+            let err = serde_json::from_str::<CachedSegment>(json).unwrap_err();
+            assert!(err.to_string().contains("neither or both"), "{json}: {err}");
+        }
+    }
 
     /// A project with one gate and one record, with no cut-over recorded.
     fn bare_world() -> (MemStore, ProjectId, GateId, RecordId) {
@@ -441,7 +616,7 @@ mod tests {
     // never published); one that arrives with none anyway is damage, not a
     // legacy entry, and `merge` refuses it rather than silently keeping it.
     #[test]
-    fn a_published_entry_with_no_id_is_a_backend_error() {
+    fn a_published_entry_with_no_id_is_a_ledger_fault() {
         let (s, _p, g, r) = world();
         let remote = MemRemote::new("R_1");
         let l = SplitLedger {
@@ -453,7 +628,10 @@ mod tests {
         remote.insert_run(headless);
 
         let err = l.gate_runs(&g).unwrap_err();
-        assert!(matches!(err, StoreError::Backend(_)), "{err:?}");
+        assert!(
+            matches!(err, StoreError::Ledger(LedgerFault::Unidentified { .. })),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -560,6 +738,46 @@ mod tests {
         assert_eq!(l.attempts_for_stats(&p).unwrap().1, Coverage::Complete);
     }
 
+    // ⚠ Spec §2.5: local-only is for a GitHub that cannot be READ. A ledger
+    // that was read and found damaged is an error: a report over the local
+    // half would hide the damage.
+    #[test]
+    fn stats_refuse_a_damaged_ledger_rather_than_fall_back() {
+        let (s, p, _g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        l.append_attempt(sample_attempt(1, &p, &r)).unwrap();
+        remote.damage(true);
+        let err = l.attempts_for_stats(&p).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Ledger(LedgerFault::Altered { .. })),
+            "{err:?}"
+        );
+    }
+
+    // Spec §2.5: a spent rate limit is "cannot be read" too — stats fall
+    // back, saying why — not only an unreachable GitHub.
+    #[test]
+    fn stats_fall_back_when_the_rate_limit_is_spent() {
+        let (s, p, _g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        l.append_attempt(sample_attempt(1, &p, &r)).unwrap();
+        remote.rate_limit_reads(true);
+        let (attempts, coverage) = l.attempts_for_stats(&p).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert!(
+            matches!(coverage, Coverage::LocalOnly { ref reason } if reason.contains("rate limit")),
+            "{coverage:?}"
+        );
+    }
+
     // Spec §2.1: a flush publishes the pending entries tied to a record this
     // binding owns, and marks them.
     #[test]
@@ -649,6 +867,33 @@ mod tests {
         assert!(
             !s.is_published("R_1", elsewhere.id.as_ref().unwrap())
                 .unwrap()
+        );
+    }
+
+    // ⚠ Ruling 4: a skipped entry is set aside only by a flush that landed,
+    // whose report reaches the command. A flush that failed reported
+    // nothing, so the next one reports it.
+    #[test]
+    fn a_skipped_entry_whose_flush_failed_is_reported_by_the_next_one() {
+        let (s, _p, g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        let theirs = remote.foreign_record();
+        let elsewhere = sample_record_run(1, &g, Some(&theirs));
+        l.append_gate_run(elsewhere.clone()).unwrap();
+        remote.fail_publish(true);
+        assert!(l.flush(sample_decision(1, &r, vec![])).is_err());
+        remote.fail_publish(false);
+        let flushed = l.flush(sample_decision(2, &r, vec![])).unwrap();
+        assert_eq!(
+            flushed.left_local,
+            vec![LeftLocal::OtherRepository {
+                entry: elsewhere.id.clone().unwrap(),
+                record: theirs,
+            }]
         );
     }
 
@@ -767,6 +1012,14 @@ mod tests {
             .flush(sample_decision(1, &r, vec![untied.id.clone().unwrap()]))
             .unwrap_err();
         assert!(
+            matches!(
+                err,
+                StoreError::RestsOnLocalEntry { ref entry, .. }
+                    if Some(entry) == untied.id.as_ref()
+            ),
+            "{err:?}"
+        );
+        assert!(
             err.to_string()
                 .contains(untied.id.as_ref().unwrap().as_str()),
             "{err}"
@@ -788,5 +1041,27 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
         assert!(remote.decisions().is_empty());
+    }
+
+    // ⚠ Spec §3.2 step 5: `MemRemote` reports a lost answer as a failure;
+    // the next flush carries the run, and adds no second copy.
+    #[test]
+    fn a_lost_answer_refuses_the_flush_and_the_next_one_adds_nothing_twice() {
+        let (s, _p, g, r) = world();
+        let remote = MemRemote::new("R_1");
+        let l = SplitLedger {
+            local: &s,
+            github: &remote,
+        };
+        let run = sample_record_run(1, &g, Some(&r));
+        l.append_gate_run(run.clone()).unwrap();
+        remote.lose_next_answer();
+        assert!(
+            l.flush(sample_decision(1, &r, vec![run.id.clone().unwrap()]))
+                .is_err()
+        );
+        l.flush(sample_decision(2, &r, vec![run.id.clone().unwrap()]))
+            .unwrap();
+        assert_eq!(published_ids(&remote, &g), vec![run.id]);
     }
 }

@@ -7,6 +7,7 @@ pub mod at;
 #[doc(hidden)]
 pub mod conformance;
 pub mod decision;
+pub mod fault;
 pub mod finding;
 pub mod ids;
 pub mod iri;
@@ -20,6 +21,7 @@ pub mod verdict;
 
 pub use at::{At, AtError};
 pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
+pub use fault::LedgerFault;
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 pub use iri::{Iri, IriError};
@@ -29,11 +31,14 @@ pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
-pub use split::{Batch, Coverage, LocalLedger, Outbox, Pending, RemoteLedger, SplitLedger};
+pub use split::{
+    Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,
+    RemoteLedger, SplitLedger,
+};
 pub use stale::{Staleness, apply_staleness, is_stale};
 pub use store::{
     Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,
-    follow,
+    follow, ledger_root_shape, node_id_shape,
 };
 pub use verdict::{FailReason, Population, Verdict};
 

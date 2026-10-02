@@ -51,7 +51,7 @@ pub enum Cmd {
 impl Cmd {
     /// Every item this command names, by `Ref` — the single source `iris()`
     /// and `has_handle()` both derive from, so a `Ref` field added to a
-    /// variant here is picked up by both at once (Fix round 2, item 5). A
+    /// variant here is picked up by both at once. A
     /// claim, an assignee and a withdrawal reason are strings, not ids.
     fn refs(&self) -> Vec<&Ref> {
         match self {

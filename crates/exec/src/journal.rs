@@ -16,7 +16,15 @@ pub struct Journal<'a> {
     pub store: &'a MemStore,
     events: RefCell<Vec<&'static str>>,
     decisions: RefCell<Vec<Decision>>,
-    refuse_flush: bool,
+    /// What every flush fails with, when flushes fail.
+    refuse_flush: Option<fn() -> StoreError>,
+}
+
+fn unreachable() -> StoreError {
+    StoreError::Unreachable {
+        store: "github:acme/widgets".into(),
+        cause: "connection refused".into(),
+    }
 }
 
 impl<'a> Journal<'a> {
@@ -25,14 +33,19 @@ impl<'a> Journal<'a> {
             store,
             events: RefCell::new(vec![]),
             decisions: RefCell::new(vec![]),
-            refuse_flush: false,
+            refuse_flush: None,
         }
     }
 
     /// Every flush fails as GitHub unreachable.
     pub fn refusing(store: &'a MemStore) -> Self {
+        Self::refusing_with(store, unreachable)
+    }
+
+    /// Every flush fails with `cause()`.
+    pub fn refusing_with(store: &'a MemStore, cause: fn() -> StoreError) -> Self {
         Self {
-            refuse_flush: true,
+            refuse_flush: Some(cause),
             ..Self::new(store)
         }
     }
@@ -70,11 +83,8 @@ impl Ledger for Journal<'_> {
     }
     fn flush(&self, decision: Decision) -> Result<Flushed, StoreError> {
         self.events.borrow_mut().push("flush");
-        if self.refuse_flush {
-            return Err(StoreError::Unreachable {
-                store: "github:acme/widgets".into(),
-                cause: "connection refused".into(),
-            });
+        if let Some(cause) = self.refuse_flush {
+            return Err(cause());
         }
         self.decisions.borrow_mut().push(decision);
         Ok(Flushed {

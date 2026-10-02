@@ -1,4 +1,5 @@
 use crate::decision::{Decision, Flushed};
+use crate::fault::LedgerFault;
 use crate::finding::Finding;
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use crate::iri::Iri;
@@ -181,6 +182,26 @@ pub enum StoreError {
          `{visibility}`. Use a local tracker for it, or bind a private repository."
     )]
     SecurityNotPrivate { repo: String, visibility: String },
+    /// ⚠ The shared ledger is not there, or not as fl wrote it (GitHub
+    /// ledger spec §3.5, §7).
+    #[error("{0}")]
+    Ledger(#[from] LedgerFault),
+    /// ⚠ A decision may rest only on entries it publishes or that are
+    /// already published (ruling 8).
+    #[error(
+        "decision {decision} rests on {entry}, which is neither being published nor published. \
+         A run tied to no record, one recorded before the GitHub ledger was switched on, or one \
+         tied to another repository's record stays local, so a decision cannot rest on it. \
+         Nothing was published."
+    )]
+    RestsOnLocalEntry { decision: Iri, entry: Iri },
+    /// ⚠ Others appended to the ledger before each of fl's tries landed
+    /// (GitHub ledger spec §3.2 step 5). Nothing was lost.
+    #[error(
+        "{store} was appended to by someone else before each of fl's {tries} tries could land, \
+         so fl's own append did not. Nothing was lost; retry"
+    )]
+    Contended { store: String, tries: u32 },
 }
 
 /// Follow a stored reference. `Ok(None)` from the owning store means the
@@ -220,6 +241,21 @@ fn format_version_message(found: Option<u64>, oldest: u64, newest: u64) -> Strin
                 None => "none (written before format versioning)".to_string(),
             }
         ),
+    }
+}
+
+impl StoreError {
+    /// Whether retrying later can succeed with nothing fixed first: GitHub
+    /// could not be reached, its rate limit is spent, or others kept
+    /// appending to the ledger. Only these may promise that the next
+    /// decision publishes what this one could not (GitHub ledger spec §7).
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Unreachable { .. }
+                | StoreError::RateLimited { .. }
+                | StoreError::Contended { .. }
+        )
     }
 }
 
@@ -473,6 +509,46 @@ pub trait Bindings {
     fn set_ledger_root(&self, node_id: &str, commit: &str) -> Result<(), StoreError>;
 }
 
+/// Whether `node_id` and `commit` can be a ledger root (GitHub ledger spec
+/// §6.1 step 4). `commit` is a full commit id: 40 lowercase hexadecimal
+/// digits (SHA-1), or 64 (SHA-256). `node_id` is a GitHub node id: 1 to 128
+/// of `A-Za-z0-9_=+/-`, starting with a letter.
+///
+/// ⚠ A root is the anchor every tamper check rests on (§3.5), so a value
+/// that cannot be one is refused where it enters: the manifest's
+/// consistency check and `init`. The `Err` says which part is wrong.
+pub fn ledger_root_shape(node_id: &str, commit: &str) -> Result<(), String> {
+    let hex = commit
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !(commit.len() == 40 || commit.len() == 64) || !hex {
+        return Err(format!(
+            "`{commit}` is not a full commit id: 40 or 64 lowercase hexadecimal digits"
+        ));
+    }
+    node_id_shape(node_id)
+}
+
+/// Whether `node_id` can be a GitHub node id: 1 to 128 of `A-Za-z0-9_=+/-`,
+/// starting with a letter. `init` asks this before it creates anything, so
+/// a malformed binding leaves no branch behind.
+pub fn node_id_shape(node_id: &str) -> Result<(), String> {
+    let first = node_id
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic());
+    let chars = node_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '=' | '+' | '/'));
+    if !first || !chars || node_id.len() > 128 {
+        return Err(format!(
+            "`{node_id}` is not a GitHub node id: 1 to 128 letters, digits and `_-=+/`, \
+             starting with a letter"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,5 +743,101 @@ mod tests {
         );
         assert_eq!(s.ledger_root("R_1").unwrap().as_deref(), Some("abc"));
         assert_eq!(s.ledger_root("R_2").unwrap(), None);
+    }
+
+    // Spec §7: only a GitHub that could not be reached, a spent rate limit,
+    // or a ledger others kept appending to clears up by waiting. Every
+    // other refusal names something to fix first.
+    #[test]
+    fn only_an_unreachable_a_rate_limited_or_a_contended_ledger_is_transient() {
+        use crate::fault::LedgerFault;
+        let transient = [
+            StoreError::Unreachable {
+                store: "s".into(),
+                cause: "c".into(),
+            },
+            StoreError::RateLimited { reset: "r".into() },
+            StoreError::Contended {
+                store: "s".into(),
+                tries: 5,
+            },
+        ];
+        for e in &transient {
+            assert!(e.is_transient(), "{e}");
+        }
+        let lasting = [
+            StoreError::Backend("b".into()),
+            StoreError::Credential("c".into()),
+            StoreError::Tampered {
+                id: seq_iri(1),
+                detail: "d".into(),
+            },
+            StoreError::NotOwned {
+                id: seq_iri(1),
+                searched: vec![],
+            },
+            StoreError::RestsOnLocalEntry {
+                decision: seq_iri(1),
+                entry: seq_iri(2),
+            },
+            StoreError::Ledger(LedgerFault::NotSetUp {
+                repo: "acme/widgets".into(),
+            }),
+        ];
+        for e in &lasting {
+            assert!(!e.is_transient(), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_ledger_fault_reads_as_itself() {
+        use crate::fault::LedgerFault;
+        let fault = LedgerFault::NotSetUp {
+            repo: "acme/widgets".into(),
+        };
+        let e: StoreError = fault.clone().into();
+        assert_eq!(e.to_string(), fault.to_string());
+    }
+
+    // Ruling 20: a root is the anchor every tamper check rests on, so a
+    // value that cannot be one is refused where it enters.
+    #[test]
+    fn a_ledger_root_is_a_full_commit_id_and_a_github_node_id() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        for (node, commit) in [
+            ("R_1", sha1),
+            ("R_kgDOAbCdEf", sha256),
+            ("MDEwOlJlcG9zaXRvcnkxMjk2MjY5", sha1),
+            ("MDEwOlJlcG9zaXRvcnkx+/==", sha1),
+        ] {
+            assert_eq!(ledger_root_shape(node, commit), Ok(()), "{node} {commit}");
+        }
+        for (node, commit, names) in [
+            ("R_1", "abc", "abc"),
+            (
+                "R_1",
+                "0123456789ABCDEF0123456789ABCDEF01234567",
+                "0123456789ABCDEF",
+            ),
+            (
+                "R_1",
+                "0123456789abcdef0123456789abcdef0123456",
+                "0123456789abcdef0123456",
+            ),
+            ("R_1", "g123456789abcdef0123456789abcdef01234567", "g123"),
+            ("", sha1, "``"),
+            ("1R", sha1, "1R"),
+            ("R 1", sha1, "R 1"),
+            ("R_1;", sha1, "R_1;"),
+        ] {
+            let why = ledger_root_shape(node, commit).expect_err(node);
+            assert!(why.contains(names), "{why}");
+        }
+        let longest = format!("R{}", "a".repeat(127));
+        assert_eq!(longest.len(), 128);
+        assert_eq!(ledger_root_shape(&longest, sha1), Ok(()), "128 characters");
+        let long = format!("R{}", "a".repeat(128));
+        assert!(ledger_root_shape(&long, sha1).is_err(), "129 characters");
     }
 }

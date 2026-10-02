@@ -16,7 +16,7 @@ pub enum Cmd {
 impl Cmd {
     /// Every item this command names, by `Ref` — the single source `iris()`
     /// and `has_handle()` both derive from, so a `Ref` field added to a
-    /// variant here is picked up by both at once (Fix round 2, item 5).
+    /// variant here is picked up by both at once.
     /// Neither variant names an existing item: `Add`'s `path` is a
     /// filesystem path for a project not yet registered, and `List` takes
     /// none at all.
@@ -34,8 +34,7 @@ impl Cmd {
 
     /// The directory `Add` registers. The store is chosen by ITS binding in
     /// the config, not the current directory's: a project registered from
-    /// elsewhere must land in the store it is bound to (Final review, item
-    /// 2).
+    /// elsewhere must land in the store it is bound to.
     pub fn root(&self) -> Option<&std::path::Path> {
         match self {
             Cmd::Add { path } => Some(std::path::Path::new(path)),

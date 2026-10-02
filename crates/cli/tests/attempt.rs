@@ -6,7 +6,7 @@ use std::process::Command as Sys;
 
 fn cli(db: &str) -> Command {
     let mut c = Command::cargo_bin("fl").unwrap();
-    // Fix round 1 — Important 5: isolate from the developer's own
+    // Isolate from the developer's own
     // ~/.config/fl/config.toml, which `fl` reads unconditionally even when
     // --db confines which store it uses. `db`'s own parent directory is a
     // scratch TempDir the caller already holds, so it doubles as an empty
