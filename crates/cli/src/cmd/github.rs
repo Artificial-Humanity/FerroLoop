@@ -5,7 +5,6 @@ use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::Iri;
-use fl_github::ledger::Mode;
 use std::path::Path;
 
 #[derive(Subcommand)]
@@ -59,10 +58,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, root: Option<&Path>) -> Result<i32> {
                     println!("ledger\tgithub");
                     // Spec §6.2: the mode in force, and what is missing when
                     // it is not protected.
-                    match gl.mode()? {
-                        Mode::Protected => println!("mode\tprotected"),
-                        Mode::DetectionOnly { why } => println!("mode\tdetection-only\t{why}"),
-                    }
+                    println!("{}", crate::cmd::ledger::mode_line(&gl.mode()?));
                 }
             }
         }

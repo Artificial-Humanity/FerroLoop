@@ -173,7 +173,9 @@ fn init_creates_the_ledger_and_says_what_the_person_does_next() {
         .success()
         .stdout(
             contains("set up\tfl/ledger\t")
-                .and(contains("mode\tdetection-only\n"))
+                // Spec §6.2: detection-only names what is missing.
+                .and(contains("\nmode\tdetection-only\t"))
+                .and(contains("this machine's cut-over is recorded").not())
                 .and(contains("Protect the default branch").not())
                 .and(contains("Next:").not()),
         );
@@ -204,6 +206,34 @@ fn init_whose_rules_cannot_be_read_creates_nothing_and_a_rerun_says_what_to_do()
         .stdout(contains("created\tfl/ledger\t").and(contains("Next: run `fl manifest export")));
 }
 
+// ⚠ The mode before the manifest's import too: on a machine that imports
+// the manifest, a rules read that fails leaves its store as it was.
+#[test]
+fn init_whose_rules_cannot_be_read_imports_nothing_on_a_machine_that_imports() {
+    let w = World::new();
+    w.project_and_record();
+    w.init();
+    w.export();
+    let head = w.fake.ledger_head();
+    let two = w.machine();
+    w.fake.state().fail_rules_next = true;
+    w.fl_on(&two)
+        .args(["github", "ledger", "init"])
+        .assert()
+        .code(2)
+        .stderr(contains("rules/branches/fl/ledger"))
+        .stdout(contains("imported\t").not());
+    let store = fl_store::RedbStore::open(&two.store()).unwrap();
+    assert!(!store.holds_a_ledger_root().unwrap(), "no ledger root");
+    assert!(
+        fl_core::store::Catalog::list_projects(&store)
+            .unwrap()
+            .is_empty(),
+        "no project"
+    );
+    assert_eq!(w.fake.ledger_head(), head, "nothing changed on GitHub");
+}
+
 // ⚠ The manifest first: a machine that never imported it learns the
 // ledger's first commit before `init` touches GitHub, and records its own
 // cut-over (spec §6.1 steps 4 and 5).
@@ -231,8 +261,7 @@ fn a_second_machine_learns_the_ledger_from_the_manifest_and_records_its_own_cut_
 // ⚠ Without the manifest's root, this machine would create a second
 // ledger and hide the deletion (spec §6.1 step 6).
 #[test]
-fn a_machine_that_never_imported_the_manifest_does_not_create_a_second_ledger_where_one_was_deleted()
- {
+fn a_machine_that_never_imported_the_manifest_does_not_replace_a_deleted_ledger() {
     let w = World::new();
     w.project_and_record();
     w.init();
@@ -319,4 +348,43 @@ fn whoami_states_the_ledger_and_the_mode_in_force() {
         .assert()
         .success()
         .stdout(contains("mode\tprotected\n"));
+}
+
+// ⚠ Spec §6.1 step 6: a confirmation is never passed over. The branch it
+// confirmed was deleted since — a new ledger in its place would hide that.
+#[test]
+fn a_confirmation_of_a_branch_since_deleted_creates_no_new_ledger() {
+    let w = World::new();
+    let root = w.fake.seed_ledger();
+    w.fake.delete_ledger();
+    w.fl()
+        .args(["github", "ledger", "init", "--confirm", &root])
+        .assert()
+        .code(2)
+        .stderr(contains("that branch no longer exists"));
+    assert_eq!(w.fake.ledger_head(), None, "nothing was created");
+}
+
+// A confirmation that names another first commit than the one this machine
+// records is refused, naming both.
+#[test]
+fn a_confirmation_of_another_first_commit_than_the_recorded_one_is_refused() {
+    let w = World::new();
+    w.init();
+    let head = w.fake.ledger_head().expect("the branch");
+    let other = "0123456789abcdef0123456789abcdef01234567";
+    w.fl()
+        .args(["github", "ledger", "init", "--confirm", other])
+        .assert()
+        .code(2)
+        .stderr(
+            contains("but this machine records")
+                .and(contains(other))
+                .and(contains(head.as_str())),
+        );
+    assert_eq!(
+        w.fake.ledger_head(),
+        Some(head),
+        "nothing changed on GitHub"
+    );
 }

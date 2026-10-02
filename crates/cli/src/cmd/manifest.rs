@@ -401,4 +401,27 @@ mod tests {
         let err = ensure_publishable(&store, &p1, Some(&g2)).unwrap_err();
         assert!(err.to_string().contains("belongs to project"), "{err}");
     }
+
+    // A manifest outside a git working tree is refused before it is
+    // imported: the gates it carries run over a working tree.
+    #[test]
+    fn init_imports_no_manifest_outside_a_git_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let author = RedbStore::open(&dir.path().join("author.redb")).unwrap();
+        let p = author.add_project("/one").unwrap();
+        let m = author
+            .export_manifest(&p, "0123456789abcdef0123456789abcdef01234567", 0, None)
+            .unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        let path = plain.path().join(MANIFEST_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, m.to_json()).unwrap();
+        let other = RedbStore::open(&dir.path().join("other.redb")).unwrap();
+        let err = import_before_ledger_init(&other, plain.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("is not a git working tree"),
+            "{err:#}"
+        );
+        assert!(!other.owns(p.iri()).unwrap(), "nothing was imported");
+    }
 }

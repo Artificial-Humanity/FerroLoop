@@ -68,6 +68,10 @@ impl GithubLedger<'_> {
     /// `cutover` is this machine's cut-over, minted by the caller; it is
     /// recorded only when the machine has none. `confirmed` is the first
     /// commit the person confirmed after an earlier `Confirm`.
+    ///
+    /// ⚠ A confirmation is never ignored: where the branch it confirmed no
+    /// longer exists, or this machine records a different first commit, it
+    /// is refused before anything is created or recorded.
     pub fn init(&self, cutover: &Iri, confirmed: Option<&str>) -> Result<InitOutcome, StoreError> {
         let repo = self.repo.full_name.clone();
         // ⚠ Ruling 20: a node id that cannot be one is refused before
@@ -91,6 +95,17 @@ impl GithubLedger<'_> {
             // ⚠ Step 6: the ledger was deleted. A new one would hide that.
             (None, Some(root)) => Err(LedgerFault::Deleted { repo, root }.into()),
             (None, None) => {
+                // ⚠ Step 6: the person confirmed a first commit, so a
+                // branch existed; it is gone now. A new ledger in its place
+                // would hide that.
+                if let Some(c) = confirmed {
+                    return Err(StoreError::Backend(format!(
+                        "you confirmed {c} as the first commit of {repo}'s `fl/ledger` branch, \
+                         but that branch no longer exists, so fl will not set up another ledger \
+                         in its place. Find out who deleted it before running `fl github ledger \
+                         init` without `--confirm`"
+                    )));
+                }
                 // ⚠ Step 2, the other way round: git cannot hold
                 // `fl/ledger` while a branch under `fl/ledger/` exists.
                 // Refused before anything is created.
@@ -106,6 +121,16 @@ impl GithubLedger<'_> {
                 Ok(InitOutcome::Created { root })
             }
             (Some(_), Some(root)) => {
+                // ⚠ A confirmation that names another first commit than the
+                // one this machine records is refused, never passed over.
+                if let Some(c) = confirmed.filter(|c| *c != root) {
+                    return Err(StoreError::Backend(format!(
+                        "you confirmed {c} as the first commit of {repo}'s `fl/ledger` branch, \
+                         but this machine records {root} as its first commit. Run `fl github \
+                         ledger init` without `--confirm`, or find out which commit started the \
+                         ledger"
+                    )));
+                }
                 self.check_head()?;
                 let cutover_recorded = self.record_cutover(cutover)?;
                 Ok(InitOutcome::AlreadySetUp {
