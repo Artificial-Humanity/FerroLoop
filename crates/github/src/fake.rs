@@ -71,6 +71,10 @@ pub struct State {
     /// must still refuse it. One-shot.
     pub graphql_error_next: Option<String>,
     pub fail_repo_read: bool,
+    /// The repository read that follows this many more answers 500;
+    /// `Some(0)` is the next one. Lets a test pass over the reads a command
+    /// makes before the one it means to fail. One-shot.
+    pub fail_repo_read_after: Option<u32>,
     pub drop_labels: bool,
     pub fail_after_create: bool,
     /// The create lands, then the connection breaks mid-answer.
@@ -170,8 +174,10 @@ pub struct State {
     pub git: crate::fake_git::Git,
     /// Rulesets; only `active` ones apply. A setting, not one-shot.
     pub rulesets: Vec<crate::fake_git::Ruleset>,
-    /// `rules/branches` answers 403 with GitHub's upgrade message — rulesets
-    /// unavailable on the plan. Modelled — confirmed by live test
+    /// `rules/branches` answers 403 with an "Upgrade to GitHub" message.
+    /// ⚠ Defensive only: no live answer has shown it. Measured on
+    /// 2026-10-02, a private repository on GitHub Free answers `200 []` —
+    /// the fake's default, with no ruleset — confirmed by live test
     /// `a_private_repository_without_a_ruleset_is_detection_only`.
     pub rules_need_upgrade: bool,
     /// Every request breaks off before an answer: GitHub unreachable. A
@@ -652,7 +658,12 @@ impl State {
     }
 
     /// One page of `items`, with a `Link` header when more remain.
-    fn page(&self, path: &str, q: &BTreeMap<String, String>, items: Vec<Value>) -> Answer {
+    pub(crate) fn page(
+        &self,
+        path: &str,
+        q: &BTreeMap<String, String>,
+        items: Vec<Value>,
+    ) -> Answer {
         let asked: usize = q.get("per_page").and_then(|v| v.parse().ok()).unwrap_or(30);
         let cap = if self.max_per_page == 0 {
             100
@@ -795,6 +806,14 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             if s.fail_repo_read {
                 s.fail_repo_read = false;
                 return answer(500, json!({"message": "fake repository failure"}));
+            }
+            match s.fail_repo_read_after {
+                Some(0) => {
+                    s.fail_repo_read_after = None;
+                    return answer(500, json!({"message": "fake repository failure"}));
+                }
+                Some(n) => s.fail_repo_read_after = Some(n - 1),
+                None => {}
             }
             let name = format!("{o}/{r}");
             if let Some(repo) = s.repo_named(&name) {

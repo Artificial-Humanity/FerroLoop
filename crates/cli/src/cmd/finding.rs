@@ -169,6 +169,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             if ctx.github.is_some() {
                 crate::cmd::manifest::ensure_publishable(store, &f.project, Some(&gid))?;
             }
+            crate::preflight::check(ctx, &f.project)?;
             let (report, flushed) = attach_reproduction(ctx.roles(), &fid, &gid)
                 .map_err(|e| explain(e, &finding, Some(&gate)))?;
             crate::ctx::report_flush(&flushed);
@@ -191,6 +192,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         Cmd::Verify { finding } => {
             let f = self::finding(ctx, &finding)?;
             crate::cmd::manifest::ensure_import_current(store, &f.project)?;
+            crate::preflight::check(ctx, &f.project)?;
             let id = f.id;
             let report =
                 verify_finding(ctx.roles(), &id).map_err(|e| explain(e, &finding, None))?;

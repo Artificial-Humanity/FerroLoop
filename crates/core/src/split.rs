@@ -138,9 +138,12 @@ impl TryFrom<CachedSegmentJson> for CachedSegment {
 /// by the repository's `node_id` (spec §3.2 step 6, §3.3): the last head it
 /// checked, and every file it read — so a closed segment is downloaded
 /// once, and an altered one is caught.
+///
+/// ⚠ `remember` is the ONLY write: the last head and the segments checked
+/// at it always move together, so no code can record a head without the
+/// files it was checked with, or cache a file no recorded head confirmed.
 pub trait LedgerCache {
     fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError>;
-    fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError>;
     fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError>;
     /// Every file cached under the directory `dir` (such as `runs/<key>`),
     /// with its path, in path order. Not a directory whose name merely
@@ -150,15 +153,14 @@ pub trait LedgerCache {
         repo: &str,
         dir: &str,
     ) -> Result<Vec<(String, CachedSegment)>, StoreError>;
-    /// Replaces what was cached at `path`.
-    fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError>;
     /// Commits `head` as the last seen, and every `(path, segment)` a read
     /// validated, together in ONE write (GitHub ledger spec §3.5 checks 3
-    /// and 4). A read that fails partway must leave neither applied: a
-    /// segment cached from a read that never finished, while the last head
-    /// stayed behind it, would hold a position (open or closed) or a
-    /// content a later read AT THAT SAME, unmoved head never itself
-    /// confirmed — raising a false alarm the next time that head is read.
+    /// and 4); a segment already cached at a path is replaced. A read that
+    /// fails partway must leave neither applied: a segment cached from a
+    /// read that never finished, while the last head stayed behind it,
+    /// would hold a position (open or closed) or a content a later read AT
+    /// THAT SAME, unmoved head never itself confirmed — raising a false
+    /// alarm the next time that head is read.
     fn remember(
         &self,
         repo: &str,
@@ -189,7 +191,7 @@ pub trait RemoteLedger {
     ///
     /// ⚠ A LOCAL answer, from the record's IRI and what the local store
     /// remembers — never a network call (spec §2.1). `GithubLedger` answers
-    /// with `fl_github::owner::issue_of_repository` (Task 9).
+    /// with `fl_github::owner::issue_of_repository`.
     fn owns_record(&self, record: &RecordId) -> Result<bool, StoreError>;
     /// Append `batch` in one commit, and return only once it has landed:
     /// the commit, or `None` when nothing was left to add. An entry whose

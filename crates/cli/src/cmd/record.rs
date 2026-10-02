@@ -117,6 +117,10 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             if gated {
                 crate::cmd::manifest::ensure_import_current(store, &record.project)?;
             }
+            // Every move is a decision, gated or not — it is flushed (GitHub
+            // ledger spec §2.2) — so its evidence must be publishable before
+            // the first gate runs.
+            crate::preflight::check(ctx, &record.project)?;
 
             let report =
                 move_record(ctx.roles(), &record, state).map_err(|e| anyhow::anyhow!("{e}"))?;

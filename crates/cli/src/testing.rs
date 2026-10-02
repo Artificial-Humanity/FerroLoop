@@ -7,10 +7,12 @@ use fl_core::store::{Ledger, StoreError};
 use std::cell::RefCell;
 
 /// A ledger that keeps every decision it is asked to flush — or, built with
-/// [`Flushes::refusing`] or [`Flushes::refusing_with`], refuses every one.
+/// [`Flushes::refusing`] or [`Flushes::refusing_with`], refuses every one;
+/// built with [`Flushes::failing_append`], fails every attempt's save.
 #[derive(Default)]
 pub struct Flushes {
     refuse: Option<fn() -> StoreError>,
+    fail_append: bool,
     pub decisions: RefCell<Vec<Decision>>,
 }
 
@@ -34,6 +36,14 @@ impl Flushes {
             ..Self::default()
         }
     }
+
+    /// Every attempt's local save fails, as a full disk would.
+    pub fn failing_append() -> Self {
+        Self {
+            fail_append: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Ledger for Flushes {
@@ -41,6 +51,9 @@ impl Ledger for Flushes {
         Ok(())
     }
     fn append_attempt(&self, _: Attempt) -> Result<(), StoreError> {
+        if self.fail_append {
+            return Err(StoreError::Backend("the disk is full.".into()));
+        }
         Ok(())
     }
     fn gate_runs(&self, _: &GateId) -> Result<Vec<GateRun>, StoreError> {

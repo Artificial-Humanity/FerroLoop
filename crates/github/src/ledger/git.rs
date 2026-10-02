@@ -142,13 +142,42 @@ impl GithubLedger<'_> {
         }
     }
 
+    /// Every branch under `branch/`, such as `fl/ledger/old` under
+    /// `fl/ledger`, by name.
+    ///
+    /// ⚠ Modelled: `git/matching-refs/heads/<branch>/` lists every ref whose
+    /// name starts with it, and an empty list when none does. Confirmed by
+    /// live test `a_branch_under_the_ledger_branch_is_found`.
+    pub(crate) fn branches_under(&self, branch: &str) -> Result<Vec<String>, StoreError> {
+        self.client
+            .get_all(&self.path(&format!("/git/matching-refs/heads/{branch}/")))?
+            .iter()
+            .map(|r| {
+                r.get("ref")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim_start_matches("refs/heads/").to_string())
+                    .ok_or_else(|| {
+                        backend(format!(
+                            "GitHub listed a branch under `{branch}/` with no name"
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     /// How `head` relates to `base` as GitHub's compare names it
     /// (`identical`, `ahead`, `behind`, `diverged`); `None` when GitHub
     /// knows one of the two commits not at all.
+    ///
+    /// ⚠ One commit per page: fl reads only `status`, and a compare
+    /// otherwise answers with up to 250 commits and every file they changed,
+    /// however far the head has moved since `base`. *Modelled* — `status`
+    /// describes the whole comparison whatever the page; confirmed by live
+    /// test `a_hand_edit_is_detected_and_named`.
     pub(crate) fn compare(&self, base: &str, head: &str) -> Result<Option<String>, StoreError> {
         let r = self.client.send(
             Method::Get,
-            &self.path(&format!("/compare/{base}...{head}")),
+            &self.path(&format!("/compare/{base}...{head}?per_page=1")),
             None,
         )?;
         match r.status {
@@ -336,8 +365,14 @@ impl GithubLedger<'_> {
             if e["type"].as_str() == Some("tree") {
                 continue;
             }
+            // ⚠ Fail closed, as `parse_object` does: a file with no path or
+            // no id is refused, never skipped — a verify that skipped it
+            // would pass a file it never saw.
             let (Some(path), Some(oid)) = (e["path"].as_str(), e["sha"].as_str()) else {
-                continue;
+                return Err(backend(format!(
+                    "GitHub listed an entry of ledger tree {sha} with no path or no id, so fl \
+                     cannot check that commit; nothing past it was verified"
+                )));
             };
             // ⚠ A regular file (a blob, mode `100644`) is the only shape
             // fl ever writes. A gitlink (`type` `commit`), a symlink
@@ -736,6 +771,51 @@ mod tests {
         );
         let err = open(&c, &local).tree_files(&tree_sha).unwrap_err();
         assert!(err.to_string().contains("no entries"), "{err}");
+    }
+
+    // ⚠ Fail closed, as `parse_object` does: a file entry with no path or
+    // no id is refused, never skipped — a verify that skipped it would pass
+    // a file it never saw.
+    #[test]
+    fn tree_files_refuses_an_entry_with_no_path_or_no_id() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let tree_sha = fake.state().git.commits[&root].tree.clone();
+        let local = MemStore::default();
+        for entry in [
+            json!({"mode": "100644", "type": "blob", "sha": "a".repeat(40)}),
+            json!({"path": "format", "mode": "100644", "type": "blob"}),
+        ] {
+            let c = client(&fake);
+            body_next(
+                &fake,
+                &format!("/git/trees/{tree_sha}"),
+                200,
+                json!({"sha": tree_sha, "truncated": false, "tree": [entry.clone()]}),
+            );
+            let err = open(&c, &local).tree_files(&tree_sha).unwrap_err();
+            assert!(
+                err.to_string().contains("no path or no id"),
+                "{entry}: {err}"
+            );
+        }
+    }
+
+    // A compare otherwise answers with up to 250 commits and every file
+    // they changed; fl reads only `status`.
+    #[test]
+    fn a_compare_asks_for_one_commit_per_page() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let local = MemStore::default();
+        let c = client(&fake);
+        assert_eq!(
+            open(&c, &local).compare(&root, &root).unwrap().as_deref(),
+            Some("identical")
+        );
+        let requests = fake.state().requests.clone();
+        let asked = format!("GET /repos/acme/widgets/compare/{root}...{root}?per_page=1");
+        assert!(requests.contains(&asked), "{requests:?}");
     }
 
     // ⚠ A gitlink, a symlink or an executable is not a shape fl ever

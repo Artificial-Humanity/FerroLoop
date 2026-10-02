@@ -415,6 +415,162 @@ mod tests {
         );
     }
 
+    // ⚠ The bytes every machine reads back. `decode` accepts a line only
+    // when it is byte-for-byte what `encode` writes, so a change to any of
+    // these strings makes every line already published unreadable: it is a
+    // new format (spec §3.1), never a fix.
+    #[test]
+    fn each_line_kind_is_written_as_exactly_these_bytes() {
+        use crate::ledger::disclose::{self, Visibility};
+        use fl_core::decision::TransitionOutcome;
+        use fl_core::log::AttemptStatus;
+        use fl_core::verdict::Verdict;
+        let at = |s: &str| At::parse(s).unwrap();
+
+        let run = GateRun {
+            id: Some(seq_iri(9)),
+            at: Some(at("2026-10-02T00:00:00.000Z")),
+            gate: GateId(seq_iri(1)),
+            record: Some(record()),
+            commit: "abc".into(),
+            verdict: Verdict::from_predicate(true, 3),
+            population: 3,
+            output_excerpt: Some("ok".into()),
+            duration_ms: 5,
+            cost_usd_micros: 0,
+        };
+        let run_line = concat!(
+            r#"{"at":"2026-10-02T00:00:00.000Z","by":"fake-user","commit":"abc","#,
+            r#""cost_usd_micros":0,"duration_ms":5,"#,
+            r#""gate":"urn:uuid:00000000-0000-7000-8000-000000000001","#,
+            r#""id":"urn:uuid:00000000-0000-7000-8000-000000000009","output_excerpt":"ok","#,
+            r#""population":3,"record":"https://github.com/acme/widgets/issues/1","#,
+            r#""verdict":{"pass":{"population":3}}}"#,
+        );
+        assert_eq!(Line::Run(run.clone()).encode("fake-user"), run_line);
+        assert_eq!(
+            decode(Area::Runs, run_line).unwrap(),
+            (Line::Run(run), "fake-user".to_string())
+        );
+
+        let attempt = Attempt {
+            id: Some(seq_iri(10)),
+            at: Some(at("2026-10-02T00:00:01.000Z")),
+            project: ProjectId(seq_iri(2)),
+            record: record(),
+            adapter: "claude".into(),
+            status: AttemptStatus::Completed,
+            duration_ms: 7,
+            tokens_in: 11,
+            tokens_out: 13,
+            cost_usd_micros: 17,
+            paths_touched: PathsTouched::Listed(vec!["src/a.rs".into()]),
+            output_excerpt: Some("done".into()),
+        };
+        let attempt_line = concat!(
+            r#"{"adapter":"claude","at":"2026-10-02T00:00:01.000Z","by":"fake-user","#,
+            r#""cost_usd_micros":17,"duration_ms":7,"#,
+            r#""id":"urn:uuid:00000000-0000-7000-8000-00000000000a","#,
+            r#""output_excerpt":"done","paths_touched":["src/a.rs"],"#,
+            r#""project":"urn:uuid:00000000-0000-7000-8000-000000000002","#,
+            r#""record":"https://github.com/acme/widgets/issues/1","status":"completed","#,
+            r#""tokens_in":11,"tokens_out":13}"#,
+        );
+        assert_eq!(
+            Line::Attempt(attempt.clone()).encode("fake-user"),
+            attempt_line
+        );
+        assert_eq!(
+            decode(Area::Attempts, attempt_line).unwrap(),
+            (Line::Attempt(attempt.clone()), "fake-user".to_string())
+        );
+
+        // Decision 2's projection: `null` for the excerpt, a count for the
+        // paths.
+        let withheld = disclose::attempt(&attempt, Visibility::NotPrivate);
+        let withheld_line = concat!(
+            r#"{"adapter":"claude","at":"2026-10-02T00:00:01.000Z","by":"fake-user","#,
+            r#""cost_usd_micros":17,"duration_ms":7,"#,
+            r#""id":"urn:uuid:00000000-0000-7000-8000-00000000000a","#,
+            r#""output_excerpt":null,"paths_touched":1,"#,
+            r#""project":"urn:uuid:00000000-0000-7000-8000-000000000002","#,
+            r#""record":"https://github.com/acme/widgets/issues/1","status":"completed","#,
+            r#""tokens_in":11,"tokens_out":13}"#,
+        );
+        assert_eq!(
+            Line::Attempt(withheld.clone()).encode("fake-user"),
+            withheld_line
+        );
+        assert_eq!(
+            decode(Area::Attempts, withheld_line).unwrap(),
+            (Line::Attempt(withheld), "fake-user".to_string())
+        );
+
+        let decision = Decision {
+            id: seq_iri(11),
+            at: at("2026-10-02T00:00:02.000Z"),
+            record: record(),
+            finding: None,
+            outcome: Outcome::Move {
+                from: State::Review,
+                to: State::Done,
+                transitions: vec![TransitionOutcome {
+                    transition: "launch".into(),
+                    passed: true,
+                }],
+                allowed: true,
+            },
+            rests_on: vec![seq_iri(9)],
+        };
+        let decision_line = concat!(
+            r#"{"at":"2026-10-02T00:00:02.000Z","by":"fake-user","finding":null,"#,
+            r#""id":"urn:uuid:00000000-0000-7000-8000-00000000000b","#,
+            r#""outcome":{"move":{"allowed":true,"from":"review","to":"done","#,
+            r#""transitions":[{"passed":true,"transition":"launch"}]}},"#,
+            r#""record":"https://github.com/acme/widgets/issues/1","#,
+            r#""rests_on":["urn:uuid:00000000-0000-7000-8000-000000000009"]}"#,
+        );
+        assert_eq!(
+            Line::Decision(decision.clone()).encode("fake-user"),
+            decision_line
+        );
+        assert_eq!(
+            decode(Area::Decisions, decision_line).unwrap(),
+            (Line::Decision(decision), "fake-user".to_string())
+        );
+
+        // A quarantine line is a struct, encoded in field order.
+        let q = QuarantineLine {
+            id: seq_iri(12),
+            at: at("2026-10-02T00:00:03.000Z"),
+            file: "runs/0123456789abcdef0123456789abcdef/1.jsonl".into(),
+            line: 2,
+            quarantined_by: "maintainer".into(),
+            reason: "a hand edit".into(),
+            by: "fake-user".into(),
+        };
+        let q_line = concat!(
+            r#"{"id":"urn:uuid:00000000-0000-7000-8000-00000000000c","#,
+            r#""at":"2026-10-02T00:00:03.000Z","#,
+            r#""file":"runs/0123456789abcdef0123456789abcdef/1.jsonl","line":2,"#,
+            r#""quarantined_by":"maintainer","reason":"a hand edit","by":"fake-user"}"#,
+        );
+        assert_eq!(q.encode(), q_line);
+        assert_eq!(QuarantineLine::decode(q_line).unwrap(), q);
+    }
+
+    // ⚠ `serde_json`'s `preserve_order` feature must stay off. With it, a
+    // `Value` keeps keys in insertion order: every line would encode in
+    // field order instead of sorted order, and every line already published
+    // would fail `decode`'s byte-for-byte check. Cargo unifies features
+    // across the workspace, so any dependency that turns it on turns this
+    // test red.
+    #[test]
+    fn json_objects_encode_with_their_keys_sorted() {
+        let v: Value = serde_json::from_str(r#"{"b":1,"a":2}"#).unwrap();
+        assert_eq!(v.to_string(), r#"{"a":2,"b":1}"#);
+    }
+
     #[test]
     fn segment_names_are_canonical_numbers_from_one() {
         assert_eq!(segment_number("1.jsonl"), Some(1));

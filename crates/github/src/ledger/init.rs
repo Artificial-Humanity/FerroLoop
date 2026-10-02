@@ -68,6 +68,10 @@ impl GithubLedger<'_> {
     /// `cutover` is this machine's cut-over, minted by the caller; it is
     /// recorded only when the machine has none. `confirmed` is the first
     /// commit the person confirmed after an earlier `Confirm`.
+    ///
+    /// ⚠ A confirmation is never ignored: where the branch it confirmed no
+    /// longer exists, or this machine records a different first commit, it
+    /// is refused before anything is created or recorded.
     pub fn init(&self, cutover: &Iri, confirmed: Option<&str>) -> Result<InitOutcome, StoreError> {
         let repo = self.repo.full_name.clone();
         // ⚠ Ruling 20: a node id that cannot be one is refused before
@@ -91,11 +95,42 @@ impl GithubLedger<'_> {
             // ⚠ Step 6: the ledger was deleted. A new one would hide that.
             (None, Some(root)) => Err(LedgerFault::Deleted { repo, root }.into()),
             (None, None) => {
+                // ⚠ Step 6: the person confirmed a first commit, so a
+                // branch existed; it is gone now. A new ledger in its place
+                // would hide that.
+                if let Some(c) = confirmed {
+                    return Err(StoreError::Backend(format!(
+                        "you confirmed {c} as the first commit of {repo}'s `fl/ledger` branch, \
+                         but that branch no longer exists, so fl will not set up another ledger \
+                         in its place. Find out who deleted it before running `fl github ledger \
+                         init` without `--confirm`"
+                    )));
+                }
+                // ⚠ Step 2, the other way round: git cannot hold
+                // `fl/ledger` while a branch under `fl/ledger/` exists.
+                // Refused before anything is created.
+                if let Some(first) = self.branches_under(BRANCH)?.first() {
+                    return Err(StoreError::Backend(format!(
+                        "the repository {repo} has a branch named `{first}`, and git cannot hold \
+                         both it and `fl/ledger`. Rename that branch, then run `fl github ledger \
+                         init` again"
+                    )));
+                }
                 let root = self.create_branch()?;
                 self.record(cutover, &root)?;
                 Ok(InitOutcome::Created { root })
             }
             (Some(_), Some(root)) => {
+                // ⚠ A confirmation that names another first commit than the
+                // one this machine records is refused, never passed over.
+                if let Some(c) = confirmed.filter(|c| *c != root) {
+                    return Err(StoreError::Backend(format!(
+                        "you confirmed {c} as the first commit of {repo}'s `fl/ledger` branch, \
+                         but this machine records {root} as its first commit. Run `fl github \
+                         ledger init` without `--confirm`, or find out which commit started the \
+                         ledger"
+                    )));
+                }
                 self.check_head()?;
                 let cutover_recorded = self.record_cutover(cutover)?;
                 Ok(InitOutcome::AlreadySetUp {
@@ -252,17 +287,27 @@ impl GithubLedger<'_> {
     /// `fl/ledger`.
     ///
     /// ⚠ Modelled: `rules/branches` lists only the rules in force, so a
-    /// disabled or evaluate-only ruleset shows as the rules missing; a plan
-    /// without rulesets answers 403 with an upgrade message. Confirmed by
-    /// live tests `rules_on_the_ledger_branch_are_readable` and
+    /// disabled or evaluate-only ruleset shows as the rules missing, and it
+    /// is paged like every list GitHub answers. Confirmed by live test
+    /// `rules_on_the_ledger_branch_are_readable`. Measured on 2026-10-02: a
+    /// private repository on GitHub Free answers `200 []` — detection-only,
+    /// never a refusal (decision 12); confirmed by live test
     /// `a_private_repository_without_a_ruleset_is_detection_only`.
+    ///
+    /// The "Upgrade to GitHub" 403 arm is defensive: no live answer has
+    /// shown it, and it is kept so a plan that refuses outright still reads
+    /// as detection-only.
     pub fn mode(&self) -> Result<Mode, StoreError> {
-        let r = match self.client.send(
-            Method::Get,
-            &self.path(&format!("/rules/branches/{BRANCH}")),
-            None,
-        ) {
-            Ok(r) => r,
+        // ⚠ Every page (`get_all`): a rule on a later page is in force all
+        // the same. A page that fails, or is not a list, is an error —
+        // never read as "no rules": an unreadable answer and an absence of
+        // rules are different facts, and conflating them would turn "fl
+        // cannot tell what rules apply" into "no rules apply".
+        let rules = match self
+            .client
+            .get_all(&self.path(&format!("/rules/branches/{BRANCH}?per_page=100")))
+        {
+            Ok(rules) => rules,
             Err(StoreError::Backend(m)) if m.contains("Upgrade to GitHub") => {
                 return Ok(Mode::DetectionOnly {
                     why: "rulesets are not available on this repository's plan, so nothing \
@@ -271,24 +316,6 @@ impl GithubLedger<'_> {
                 });
             }
             Err(e) => return Err(e),
-        };
-        if r.status != 200 {
-            return Err(StoreError::Backend(format!(
-                "GitHub answered {} when fl read the rules on `fl/ledger`; retry",
-                r.status
-            )));
-        }
-        // ⚠ Like the sibling readers (`objects`'s trees, `get_all_paged`'s
-        // pages): something that is not a list is an error, never read as
-        // an empty one — an empty list and an unreadable answer are
-        // different facts, and conflating them would turn "fl cannot tell
-        // what rules apply" into "no rules apply".
-        let Some(rules) = r.body.as_array() else {
-            return Err(StoreError::Backend(
-                "GitHub answered the rules on `fl/ledger` with something that is not a list; \
-                 retry"
-                    .into(),
-            ));
         };
         let in_force: BTreeSet<&str> = rules
             .iter()
@@ -304,9 +331,9 @@ impl GithubLedger<'_> {
         }
         Ok(Mode::DetectionOnly {
             why: format!(
-                "no active ruleset on `fl/ledger` has {} (a ruleset that is disabled or only \
-                 evaluating applies none), so nothing stops a rewrite or a deletion; fl \
-                 detects them",
+                "no ruleset in force on `fl/ledger` has {} — none exists, it is disabled or \
+                 only evaluating, or the plan offers none for this repository — so nothing \
+                 stops a rewrite or a deletion; fl detects them",
                 missing.join(" or ")
             ),
         })
@@ -432,6 +459,42 @@ mod tests {
             l.runs(&GateId(seq_iri(1))).unwrap().is_empty(),
             "and it reads"
         );
+    }
+
+    // ⚠ Spec §6.1 step 2, the other way round: git keeps a branch as a
+    // file, so `fl/ledger` cannot be created while a branch under
+    // `fl/ledger/` exists. Refused before anything is created.
+    #[test]
+    fn init_refuses_a_branch_under_fl_ledger_before_creating_anything() {
+        let fake = FakeGithub::start("acme/widgets");
+        {
+            let mut s = fake.state();
+            let tree = s.git.put_tree(&BTreeMap::new());
+            let c = s.git.put_commit(&tree, vec![], "someone's branch");
+            s.git.refs.insert("heads/fl/ledger/old".into(), c);
+        }
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local).init(&entry_iri(1), None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("has a branch named `fl/ledger/old`"),
+            "{err}"
+        );
+        assert_eq!(fake.state().git.commits.len(), 1, "no commit was created");
+        assert_eq!(fake.ledger_head(), None);
+        assert_eq!(local.cutover("R_1").unwrap(), None);
+
+        // A listed branch with no name is refused, never skipped.
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state()
+            .body_next
+            .push(("/git/matching-refs/".into(), 200, json!([{}])));
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local).init(&entry_iri(1), None).unwrap_err();
+        assert!(err.to_string().contains("with no name"), "{err}");
+        assert_eq!(fake.ledger_head(), None);
     }
 
     #[test]
@@ -728,6 +791,25 @@ mod tests {
         assert!(err.to_string().contains("not a list"), "{err}");
     }
 
+    // `rules/branches` is a list GitHub pages: a rule on a later page is in
+    // force all the same.
+    #[test]
+    fn the_mode_reads_every_page_of_the_rules() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.seed_ledger();
+        {
+            let mut s = fake.state();
+            s.rulesets = vec![Ruleset::on_ledger(
+                "active",
+                &["non_fast_forward", "deletion"],
+            )];
+            s.max_per_page = 1;
+        }
+        let local = MemStore::default();
+        let c = client(&fake);
+        assert_eq!(open(&c, &local).mode().unwrap(), Mode::Protected);
+    }
+
     /// A local store whose cut-over cannot be written.
     struct NoCutover<'a>(&'a MemStore);
     impl Bindings for NoCutover<'_> {
@@ -748,9 +830,6 @@ mod tests {
         fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError> {
             self.0.last_head(repo)
         }
-        fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError> {
-            self.0.set_last_head(repo, head)
-        }
         fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError> {
             self.0.cached(repo, path)
         }
@@ -760,9 +839,6 @@ mod tests {
             dir: &str,
         ) -> Result<Vec<(String, CachedSegment)>, StoreError> {
             self.0.cached_under(repo, dir)
-        }
-        fn cache(&self, repo: &str, path: &str, s: &CachedSegment) -> Result<(), StoreError> {
-            self.0.cache(repo, path, s)
         }
         fn remember(
             &self,

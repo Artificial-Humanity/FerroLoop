@@ -767,6 +767,25 @@ mod tests {
         assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
     }
 
+    // A refused credential is not a refusal the ledger's commit can judge:
+    // it is the credential's, whatever the caller asked to judge.
+    #[test]
+    fn a_graphql_write_refused_for_its_credential_is_a_credential_error() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().body_next.push((
+            "/graphql".into(),
+            401,
+            serde_json::json!({"message": "Bad credentials"}),
+        ));
+        let err = client(&fake)
+            .graphql_write("mutation { x }", serde_json::json!({}))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Credential(ref m) if m.contains("Bad credentials")),
+            "{err:?}"
+        );
+    }
+
     // `graphql`'s production path (not `graphql_answer`'s): an error whose
     // type is neither RATE_LIMITED nor NOT_FOUND is still a refusal, never
     // read as partial data.

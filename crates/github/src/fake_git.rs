@@ -241,6 +241,19 @@ pub(crate) fn rest(
     let full = format!("{o}/{r}");
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     Some(match (method, rest) {
+        ("GET", ["git", "matching-refs", prefix @ ..]) => {
+            let prefix = prefix.join("/");
+            let items: Vec<Value> = s
+                .git
+                .refs
+                .iter()
+                .filter(|(name, _)| name.starts_with(&prefix))
+                .map(|(name, sha)| {
+                    json!({"ref": format!("refs/{name}"), "object": {"sha": sha, "type": "commit"}})
+                })
+                .collect();
+            answer(200, Value::Array(items))
+        }
         ("GET", ["git", "ref", name @ ..]) => {
             if s.ref_404_next > 0 {
                 s.ref_404_next -= 1;
@@ -291,7 +304,7 @@ pub(crate) fn rest(
             None => not_found(),
         },
         ("GET", ["compare", spec]) => compare(s, spec),
-        ("GET", ["rules", "branches", name @ ..]) => rules(s, &full, &name.join("/")),
+        ("GET", ["rules", "branches", name @ ..]) => rules(s, &full, &name.join("/"), q),
         _ => return None,
     })
 }
@@ -486,11 +499,14 @@ fn compare(s: &mut State, spec: &str) -> Answer {
 }
 
 /// ⚠ Modelled: `GET /rules/branches/{branch}` lists the rules IN FORCE on
-/// the branch — a disabled or evaluate-only ruleset contributes none — and
-/// a plan without rulesets answers 403 with an upgrade message. Confirmed
-/// by live tests `rules_on_the_ledger_branch_are_readable` and
-/// `a_private_repository_without_a_ruleset_is_detection_only`.
-fn rules(s: &mut State, full: &str, branch: &str) -> Answer {
+/// the branch — a disabled or evaluate-only ruleset contributes none —
+/// paged like every list. Confirmed by live test
+/// `rules_on_the_ledger_branch_are_readable`. With no ruleset it answers
+/// `200 []`: measured on 2026-10-02 for a private repository on GitHub
+/// Free, and confirmed by live test
+/// `a_private_repository_without_a_ruleset_is_detection_only`. The 403
+/// behind `rules_need_upgrade` is defensive and unmeasured.
+fn rules(s: &mut State, full: &str, branch: &str, q: &BTreeMap<String, String>) -> Answer {
     if std::mem::take(&mut s.fail_rules_next) {
         return answer(500, json!({"message": "fake rules failure"}));
     }
@@ -523,7 +539,7 @@ fn rules(s: &mut State, full: &str, branch: &str) -> Answer {
             })
         })
         .collect();
-    answer(200, Value::Array(items))
+    s.page(&format!("/repos/{full}/rules/branches/{branch}"), q, items)
 }
 
 /// The ledger's GraphQL operations, told apart by operation name; `None`
@@ -1065,9 +1081,8 @@ mod tests {
         assert_eq!(status(&root, &next), (200, "ahead".into()), "and then not");
     }
 
-    // Spec §6.2 and §8.1: rules in force only, and the plan's refusal.
-    // Modelled — confirmed by live tests `rules_on_the_ledger_branch_are_readable`
-    // and `a_private_repository_without_a_ruleset_is_detection_only`.
+    // Spec §6.2 and §8.1: rules in force only; the 403 is defensive.
+    // Modelled — confirmed by live test `rules_on_the_ledger_branch_are_readable`.
     #[test]
     fn the_rules_on_a_branch_are_those_of_active_rulesets() {
         let fake = FakeGithub::start("acme/widgets");
@@ -1114,6 +1129,55 @@ mod tests {
         // header is not a promise that a permission was actually missing).
         assert!(err.to_string().contains("Upgrade to GitHub"), "{err}");
         assert!(err.to_string().contains("GitHub says this needs"), "{err}");
+    }
+
+    // ⚠ Modelled: `git/matching-refs/<prefix>` lists every ref whose name
+    // starts with the prefix, and an empty list when none does. Confirmed by
+    // live test `a_branch_under_the_ledger_branch_is_found`.
+    #[test]
+    fn matching_refs_lists_the_refs_under_a_prefix() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let c = client(&fake);
+        let under = |prefix: &str| -> Vec<String> {
+            c.send(
+                Method::Get,
+                &format!("{REPO}/git/matching-refs/{prefix}"),
+                None,
+            )
+            .unwrap()
+            .body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["ref"].as_str().unwrap().to_string())
+            .collect()
+        };
+        assert!(under("heads/fl/ledger/").is_empty());
+        fake.state()
+            .git
+            .refs
+            .insert("heads/fl/ledger/old".into(), root);
+        assert_eq!(
+            under("heads/fl/ledger/"),
+            vec!["refs/heads/fl/ledger/old".to_string()]
+        );
+    }
+
+    // Measured on 2026-10-02: a private repository on GitHub Free, with no
+    // ruleset, answers `200 []`. Confirmed by live test
+    // `a_private_repository_without_a_ruleset_is_detection_only`.
+    #[test]
+    fn a_branch_with_no_ruleset_answers_an_empty_list() {
+        let fake = FakeGithub::start("acme/widgets");
+        let r = client(&fake)
+            .send(
+                Method::Get,
+                &format!("{REPO}/rules/branches/fl/ledger"),
+                None,
+            )
+            .unwrap();
+        assert_eq!((r.status, r.body), (200, json!([])));
     }
 
     #[test]

@@ -11,12 +11,16 @@ pub struct Ctx<'a> {
     /// The local store, or the GitHub tracker behind `CatalogChecked`.
     pub tracker: &'a dyn Tracker,
     /// Where runs, attempts and decisions are recorded: the local store,
-    /// or — in mode B — a `SplitLedger` over it.
+    /// or — when the binding names the GitHub ledger — a `SplitLedger` over
+    /// the local store and `github_ledger`.
     pub ledger: &'a dyn Ledger,
     /// The local store's handles, or `KindRouted` over the store and GitHub.
     pub handles: &'a dyn Handles,
     /// The GitHub tracker, for `fl github` and the publish check.
     pub github: Option<&'a fl_github::GithubTracker>,
+    /// The GitHub ledger, when the binding names it (GitHub ledger spec
+    /// §1.5): over the tracker's client and the local store.
+    pub github_ledger: Option<&'a fl_github::GithubLedger<'a>>,
     /// Where records and findings live, for messages.
     pub tracker_label: String,
 }
@@ -77,6 +81,7 @@ mod tests {
             ledger: &flushes,
             handles: &store,
             github: None,
+            github_ledger: None,
             tracker_label: String::new(),
         };
         assert!(

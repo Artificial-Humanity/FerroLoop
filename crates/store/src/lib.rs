@@ -1315,15 +1315,6 @@ impl LedgerCache for RedbStore {
         Ok(found)
     }
 
-    fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError> {
-        let tx = self.db.begin_write().map_err(backend)?;
-        tx.open_table(LEDGER_HEADS)
-            .map_err(backend)?
-            .insert(repo, head)
-            .map_err(backend)?;
-        tx.commit().map_err(backend)
-    }
-
     fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let table = match tx.open_table(LEDGER_SEGMENTS) {
@@ -1363,16 +1354,6 @@ impl LedgerCache for RedbStore {
             ));
         }
         Ok(out)
-    }
-
-    fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError> {
-        let json = serde_json::to_string(segment).map_err(backend)?;
-        let tx = self.db.begin_write().map_err(backend)?;
-        tx.open_table(LEDGER_SEGMENTS)
-            .map_err(backend)?
-            .insert((repo, path), json.as_str())
-            .map_err(backend)?;
-        tx.commit().map_err(backend)
     }
 
     /// One write transaction: the head and every segment land together, or
@@ -2122,8 +2103,8 @@ mod tests {
         };
         {
             let s = RedbStore::open(&path).unwrap();
-            s.set_last_head("R_1", "c1").unwrap();
-            s.cache("R_1", "runs/aa/1.jsonl", &seg).unwrap();
+            s.remember("R_1", "c1", &[("runs/aa/1.jsonl".to_string(), seg.clone())])
+                .unwrap();
         }
         let s = RedbStore::open(&path).unwrap();
         assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c1"));

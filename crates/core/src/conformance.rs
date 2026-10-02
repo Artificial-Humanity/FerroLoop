@@ -267,10 +267,17 @@ pub fn ledger_cache<S: LedgerCache, G>(make: impl Fn() -> (S, G)) {
 
 fn the_last_head_is_kept_per_repository_and_replaced<S: LedgerCache>(s: &S) {
     assert_eq!(s.last_head("R_1").unwrap(), None);
-    s.set_last_head("R_1", "c1").unwrap();
-    s.set_last_head("R_1", "c2").unwrap();
+    s.remember("R_1", "c1", &[]).unwrap();
+    s.remember("R_1", "c2", &[]).unwrap();
     assert_eq!(s.last_head("R_1").unwrap().as_deref(), Some("c2"));
     assert_eq!(s.last_head("R_2").unwrap(), None);
+}
+
+/// Caches `segment` at `path` in `repo`, as a read that validated it at a
+/// head `h` does: through `remember`, the only write.
+fn put<S: LedgerCache>(s: &S, repo: &str, path: &str, segment: CachedSegment) {
+    s.remember(repo, "h", &[(path.to_string(), segment)])
+        .unwrap();
 }
 
 fn a_cached_file_reads_back_by_path_and_by_its_own_directory_only<S: LedgerCache>(s: &S) {
@@ -281,14 +288,11 @@ fn a_cached_file_reads_back_by_path_and_by_its_own_directory_only<S: LedgerCache
     };
     assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), None);
     assert!(s.cached_under("R_1", "runs/aa").unwrap().is_empty());
-    s.cache("R_1", "runs/aa/1.jsonl", &seg("o1", true)).unwrap();
-    s.cache("R_1", "runs/aa/2.jsonl", &seg("o2", false))
-        .unwrap();
-    s.cache("R_1", "runs/aab/1.jsonl", &seg("o3", false))
-        .unwrap();
-    s.cache("R_2", "runs/aa/1.jsonl", &seg("o4", false))
-        .unwrap();
-    s.cache("R_1", "runs/aa/2.jsonl", &seg("o5", true)).unwrap();
+    put(s, "R_1", "runs/aa/1.jsonl", seg("o1", true));
+    put(s, "R_1", "runs/aa/2.jsonl", seg("o2", false));
+    put(s, "R_1", "runs/aab/1.jsonl", seg("o3", false));
+    put(s, "R_2", "runs/aa/1.jsonl", seg("o4", false));
+    put(s, "R_1", "runs/aa/2.jsonl", seg("o5", true));
     assert_eq!(
         s.cached("R_1", "runs/aa/1.jsonl").unwrap(),
         Some(seg("o1", true))
@@ -327,8 +331,8 @@ fn a_segment_at_the_same_path_in_another_repository_is_never_returned<S: LedgerC
         bytes: format!("{oid}\n").into_bytes(),
         closed: false,
     };
-    s.cache("R_1", "runs/aa/1.jsonl", &seg("o1")).unwrap();
-    s.cache("R_2", "runs/aa/1.jsonl", &seg("o2")).unwrap();
+    put(s, "R_1", "runs/aa/1.jsonl", seg("o1"));
+    put(s, "R_2", "runs/aa/1.jsonl", seg("o2"));
 
     assert_eq!(s.cached("R_1", "runs/aa/1.jsonl").unwrap(), Some(seg("o1")));
     assert_eq!(s.cached("R_2", "runs/aa/1.jsonl").unwrap(), Some(seg("o2")));
@@ -362,11 +366,11 @@ fn cached_under_scans_from_the_directory_not_from_the_start_of_the_repository<S:
         bytes: format!("{oid}\n").into_bytes(),
         closed: false,
     };
-    s.cache("R_1", "format", &seg("meta")).unwrap();
-    s.cache("R_1", "runs/a9/1.jsonl", &seg("a9")).unwrap();
-    s.cache("R_1", "runs/aa/1.jsonl", &seg("r1a")).unwrap();
-    s.cache("R_2", "runs/aa/1.jsonl", &seg("r2a")).unwrap();
-    s.cache("R_2", "runs/aa/2.jsonl", &seg("r2b")).unwrap();
+    put(s, "R_1", "format", seg("meta"));
+    put(s, "R_1", "runs/a9/1.jsonl", seg("a9"));
+    put(s, "R_1", "runs/aa/1.jsonl", seg("r1a"));
+    put(s, "R_2", "runs/aa/1.jsonl", seg("r2a"));
+    put(s, "R_2", "runs/aa/2.jsonl", seg("r2b"));
 
     let r1: Vec<(String, String)> = s
         .cached_under("R_1", "runs/aa")
@@ -452,8 +456,8 @@ fn remember_commits_the_head_and_every_segment_together<S: LedgerCache>(s: &S) {
     );
 }
 
-/// ⚠ A file is cached as the bytes GitHub sent, exactly — through `cache`
-/// and through `remember` alike. A store that keeps text would have to
+/// ⚠ A file is cached as the bytes GitHub sent, exactly — through every
+/// `remember`, whatever head it names. A store that keeps text would have to
 /// decode a damaged line lossily, and two different damaged lines would
 /// then compare equal (check 4).
 fn a_cached_file_keeps_bytes_that_are_not_utf8_exactly<S: LedgerCache>(s: &S) {
@@ -464,7 +468,7 @@ fn a_cached_file_keeps_bytes_that_are_not_utf8_exactly<S: LedgerCache>(s: &S) {
     };
     let one = seg("o1", &[b'a', b'\n', 0xff, b'\n']);
     let two = seg("o2", &[0xfe, b'\n']);
-    s.cache("R_1", "runs/aa/1.jsonl", &one).unwrap();
+    put(s, "R_1", "runs/aa/1.jsonl", one.clone());
     s.remember("R_1", "c1", &[("runs/aa/2.jsonl".to_string(), two.clone())])
         .unwrap();
     assert_eq!(

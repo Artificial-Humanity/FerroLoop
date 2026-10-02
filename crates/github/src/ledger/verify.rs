@@ -7,7 +7,7 @@ use super::GithubLedger;
 use super::append::NewLine;
 use super::git::{CommitObject, TreeFile};
 use super::layout::{
-    self, BRANCH, FORMAT, FORMAT_FILE, QUARANTINE_FILE, QuarantineLine, README_FILE,
+    self, BRANCH, FORMAT, FORMAT_FILE, Line, QUARANTINE_FILE, QuarantineLine, README_FILE,
 };
 use fl_core::at::At;
 use fl_core::iri::Iri;
@@ -21,12 +21,43 @@ pub struct Verified {
     pub commits: usize,
     /// The oldest commit that does anything but add, and what it does.
     pub first_bad: Option<BadCommit>,
+    /// One id carried by two different lines at the head (spec §3.5 check
+    /// 5, across directories).
+    pub same_id: Option<SameId>,
+}
+
+/// One id on two different lines: where each is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SameId {
+    pub id: Iri,
+    /// The segment and the line, from 1, of the copy met first in path
+    /// order.
+    pub first: (String, u64),
+    pub second: (String, u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BadCommit {
     pub commit: String,
     pub what: String,
+}
+
+/// How many commits `verify` walks before it stops and says so — far more
+/// than a ledger gathers in years of decisions, so reaching it means the
+/// head does not lead back to the ledger's first commit along a history fl
+/// wrote.
+pub const VERIFY_LIMIT: usize = 100_000;
+
+/// Which of `verify_with`'s three passes a progress call is about: the
+/// commit walk from the head to the anchor, the adjacent-pair compare that
+/// follows it, or the head's segments, read once each for one id on two
+/// lines. Each phase's count starts over at 1, since a long ledger's
+/// request count differs by phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyPhase {
+    Walk,
+    Compare,
+    Segments,
 }
 
 /// What one verify has already read: blob bytes and tree listings, by id.
@@ -56,6 +87,20 @@ impl GithubLedger<'_> {
     /// to the head, along first parents, each checked to only add lines or
     /// segments. About one request per commit, plus the files it compares.
     pub fn verify(&self) -> Result<Verified, StoreError> {
+        self.verify_with(VERIFY_LIMIT, &mut |_, _| {})
+    }
+
+    /// [`Self::verify`], walking at most `limit` commits and telling
+    /// `progress` its phase and how far it has gotten within it, so a long
+    /// history never looks like a hang: `(Walk, _)` for each commit walked,
+    /// `(Compare, _)` for each adjacent pair compared, and `(Segments, _)`
+    /// for each segment read at the head, for one id on two lines (§3.5
+    /// check 5): about one request per segment more.
+    pub fn verify_with(
+        &self,
+        limit: usize,
+        progress: &mut dyn FnMut(VerifyPhase, usize),
+    ) -> Result<Verified, StoreError> {
         let repo = self.repo.full_name.clone();
         let (head, anchor) = match (
             self.branch_head(BRANCH)?,
@@ -72,9 +117,21 @@ impl GithubLedger<'_> {
         let mut bad: Vec<(String, String)> = Vec::new();
         let mut at = head;
         loop {
+            // ⚠ Bounded: a history that does not reach the anchor (one the
+            // branch name was reused for) is refused here, never walked to
+            // its end one request at a time.
+            if chain.len() >= limit {
+                return Err(StoreError::Backend(format!(
+                    "fl walked back {limit} commits from the head of {repo}'s `fl/ledger` \
+                     without reaching the ledger's first commit {anchor}, and stopped. If the \
+                     ledger really is that long, run `fl github ledger verify --max-commits \
+                     <n>` with a larger number"
+                )));
+            }
             let c = self.commit_object(&at)?;
             let parents = c.parents.clone();
             chain.push((at.clone(), c));
+            progress(VerifyPhase::Walk, chain.len());
             if at == anchor {
                 break;
             }
@@ -107,10 +164,13 @@ impl GithubLedger<'_> {
             if let Some(what) = self.fls_first_commit(&chain[0].1, &mut seen)? {
                 bad.push((anchor.clone(), what));
             }
+            let mut pairs = 0usize;
             for pair in chain.windows(2) {
                 if let Some(what) = self.only_adds(&pair[0].1, &pair[1].1, &mut seen)? {
                     bad.push((pair[1].0.clone(), what));
                 }
+                pairs += 1;
+                progress(VerifyPhase::Compare, pairs);
             }
         }
         let age: BTreeMap<&str, usize> = chain
@@ -122,9 +182,14 @@ impl GithubLedger<'_> {
             .into_iter()
             .min_by_key(|(c, _)| age.get(c.as_str()).copied().unwrap_or(0))
             .map(|(commit, what)| BadCommit { commit, what });
+        let same_id = match chain.last() {
+            Some((_, head)) => self.same_id_at(head, &mut seen, progress)?,
+            None => None,
+        };
         Ok(Verified {
             commits: chain.len(),
             first_bad,
+            same_id,
         })
     }
 
@@ -183,6 +248,78 @@ impl GithubLedger<'_> {
                 "starts the ledger at format `{}`",
                 format.trim()
             )));
+        }
+        Ok(None)
+    }
+
+    /// Two different lines at `head` carrying one id (spec §3.5 check 5).
+    /// A reader checks this within the one directory it reads; this looks
+    /// across every directory AND every kind (a run, an attempt and a
+    /// decision are compared on equal footing — an id is never scoped to
+    /// its own kind).
+    ///
+    /// ⚠ A line a reader cannot decode is not compared here — reading it
+    /// reports it, naming the quarantine command — and a quarantined line is
+    /// skipped, as readers skip it. Two identical lines are one entry, as
+    /// readers read them once.
+    fn same_id_at(
+        &self,
+        head: &CommitObject,
+        seen: &mut Seen,
+        progress: &mut dyn FnMut(VerifyPhase, usize),
+    ) -> Result<Option<SameId>, StoreError> {
+        let files = self.files_of(&head.tree, seen)?;
+        let mut skipped: BTreeSet<(String, u64)> = BTreeSet::new();
+        if let Some(q) = files.get(QUARANTINE_FILE) {
+            let bytes = self.bytes_of(&q.oid, seen)?;
+            for (_, text) in layout::lines(&bytes) {
+                if let Ok(q) = text
+                    .map_err(str::to_string)
+                    .and_then(QuarantineLine::decode)
+                {
+                    skipped.insert((q.file, q.line));
+                }
+            }
+        }
+        let mut first: BTreeMap<Iri, (String, u64, Line)> = BTreeMap::new();
+        let mut segments = 0usize;
+        for (path, file) in &files {
+            let Some((area, _, _)) = layout::parse_segment_path(path) else {
+                continue;
+            };
+            if file.irregular.is_some() {
+                continue;
+            }
+            let bytes = self.bytes_of(&file.oid, seen)?;
+            for (n, text) in layout::lines(&bytes) {
+                if skipped.contains(&(path.clone(), n)) {
+                    continue;
+                }
+                let Ok((line, _by)) = text
+                    .map_err(str::to_string)
+                    .and_then(|t| layout::decode(area, t))
+                else {
+                    continue;
+                };
+                let Some(id) = line.id().cloned() else {
+                    continue;
+                };
+                match first.get(&id) {
+                    Some((at, m, held)) if *held != line => {
+                        return Ok(Some(SameId {
+                            id,
+                            first: (at.clone(), *m),
+                            second: (path.clone(), n),
+                        }));
+                    }
+                    Some(_) => {}
+                    None => {
+                        first.insert(id, (path.clone(), n, line));
+                    }
+                }
+            }
+            segments += 1;
+            progress(VerifyPhase::Segments, segments);
         }
         Ok(None)
     }
@@ -470,6 +607,179 @@ mod tests {
         let v = l.verify().unwrap();
         assert_eq!(v.first_bad, None, "{v:?}");
         assert_eq!(v.commits, fake.ledger_commits());
+    }
+
+    /// A line carrying `run(1)`'s id but about another gate, filed by hand
+    /// in that gate's own directory. Returns its segment.
+    fn same_id_elsewhere(fake: &FakeGithub) -> String {
+        let mut other = run(1);
+        other.gate = GateId(seq_iri(77));
+        let path = layout::segment_path(&layout::dir(layout::Area::Runs, other.gate.iri()), 1);
+        fake.hand_commit(&[(path.as_str(), Some(file(&[line(&other)]).as_str()))]);
+        path
+    }
+
+    // ⚠ A history that never reaches the anchor within the limit is
+    // refused, naming the flag — never walked to its end one request at a
+    // time.
+    #[test]
+    fn a_history_longer_than_the_limit_is_refused_naming_the_flag() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        for n in 1..=3 {
+            publish(&l, n);
+        }
+        let err = l.verify_with(2, &mut |_, _| {}).unwrap_err();
+        assert!(err.to_string().contains("walked back 2 commits"), "{err}");
+        assert!(err.to_string().contains("--max-commits"), "{err}");
+        // Pins the boundary itself (an off-by-one that only mutation
+        // testing catches): the ledger holds exactly 4 commits, so one
+        // short of that must still be refused, not merely some arbitrarily
+        // smaller limit.
+        assert!(l.verify_with(3, &mut |_, _| {}).is_err(), "one short of 4");
+        assert_eq!(l.verify_with(4, &mut |_, _| {}).unwrap().commits, 4);
+    }
+
+    // A long history must never look like a hang.
+    #[test]
+    fn progress_is_told_each_commit_walked() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        publish(&l, 1);
+        publish(&l, 2);
+        let mut seen = Vec::new();
+        let v = l
+            .verify_with(VERIFY_LIMIT, &mut |phase, n| {
+                if phase == VerifyPhase::Walk {
+                    seen.push(n);
+                }
+            })
+            .unwrap();
+        assert_eq!(seen, (1..=v.commits).collect::<Vec<_>>());
+    }
+
+    // Neither the compare pass (one request per adjacent pair, run after
+    // the walk) nor the segments pass (one request per segment at the
+    // head, run after that) may look like a hang either — each must be
+    // told progress of its own, never folded silently into the walk's.
+    #[test]
+    fn progress_also_covers_the_compare_and_segments_phases() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        publish(&l, 1);
+        publish(&l, 2);
+        let mut compare = 0usize;
+        let mut segments = 0usize;
+        l.verify_with(VERIFY_LIMIT, &mut |phase, n| match phase {
+            VerifyPhase::Walk => {}
+            VerifyPhase::Compare => compare = compare.max(n),
+            VerifyPhase::Segments => segments = segments.max(n),
+        })
+        .unwrap();
+        assert!(compare > 0, "the compare pass reports progress");
+        assert!(segments > 0, "the segments pass reports progress");
+    }
+
+    // Spec §3.5 check 5 across directories: a reader sees one directory at
+    // a time, so only `verify` can see one id carried by two different
+    // lines.
+    #[test]
+    fn one_id_on_two_different_lines_in_two_directories_is_reported() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        publish(&l, 1);
+        let other = same_id_elsewhere(&fake);
+        let v = l.verify().unwrap();
+        assert_eq!(v.first_bad, None, "adding a directory only adds");
+        let same = v.same_id.expect("the shared id is reported");
+        assert_eq!(same.id, run(1).id.unwrap());
+        assert_eq!(
+            BTreeSet::from([same.first, same.second]),
+            BTreeSet::from([(seg(1), 1), (other, 1)])
+        );
+    }
+
+    // A quarantined copy is skipped, as readers skip it.
+    #[test]
+    fn a_quarantined_copy_of_a_shared_id_is_not_reported() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        publish(&l, 1);
+        let other = same_id_elsewhere(&fake);
+        l.quarantine(
+            &seq_iri(500),
+            &At::from_unix_millis(9),
+            &other,
+            1,
+            "maintainer",
+            "a copy",
+        )
+        .unwrap();
+        assert_eq!(l.verify().unwrap().same_id, None);
+    }
+
+    // The same line twice is one entry, as readers read it once.
+    #[test]
+    fn an_identical_copy_of_a_line_is_not_reported() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        publish(&l, 1);
+        let text = fake.ledger_files()[&seg(1)].clone();
+        let first = text.lines().next().unwrap().to_string();
+        fake.hand_commit(&[(seg(2).as_str(), Some(format!("{first}\n").as_str()))]);
+        let v = l.verify().unwrap();
+        assert_eq!(v.first_bad, None);
+        assert_eq!(v.same_id, None);
+    }
+
+    // A symlink is a departure, never read as a segment: its lines are not
+    // compared, even when shaped like one.
+    #[test]
+    fn a_symlinked_segment_is_not_read_for_ids() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        publish(&l, 1);
+        let other = same_id_elsewhere(&fake);
+        let head = fake.ledger_head().unwrap();
+        make_a_symlink(&fake, &head, &other);
+        let v = l.verify().unwrap();
+        assert_eq!(v.first_bad.map(|b| b.commit), Some(head));
+        assert_eq!(v.same_id, None);
+    }
+
+    // Spec §3.5 check 5, extended: ids are compared across every KIND, not
+    // only across directories — a decision that reuses a run's id is
+    // something no reader, scoped to one directory and one kind, could
+    // ever catch, and `verify` must.
+    #[test]
+    fn a_decision_reusing_a_runs_id_is_reported_across_kinds() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        publish(&l, 1);
+        // A different record: its own, brand-new directory, never one
+        // `publish` already filed a decision under.
+        let elsewhere = RecordId(Iri::parse("https://github.com/acme/widgets/issues/2").unwrap());
+        let mut d = sample_decision(2, &elsewhere, vec![]);
+        d.id = run(1).id.unwrap();
+        let path = layout::segment_path(&layout::dir(layout::Area::Decisions, elsewhere.iri()), 1);
+        let text = format!("{}\n", layout::Line::Decision(d).encode("someone"));
+        fake.hand_commit(&[(path.as_str(), Some(text.as_str()))]);
+        let v = l.verify().unwrap();
+        assert_eq!(v.first_bad, None, "adding a directory only adds");
+        let same = v.same_id.expect("the shared id is reported across kinds");
+        assert_eq!(same.id, run(1).id.unwrap());
+        assert_eq!(
+            BTreeSet::from([same.first, same.second]),
+            BTreeSet::from([(seg(1), 1), (path, 1)])
+        );
     }
 
     // Spec §3.5: verify reports the first commit that does anything but

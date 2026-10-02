@@ -209,9 +209,9 @@ comment can be rendered from the ledger alone (§4).
 Before any gate or adapter runs, every decision in mode B checks, cheapest first: visibility
 (live, every decision); the ruleset's presence, which sets the mode (§6); the branch; the head
 descends from the anchor and from the last head seen (§3.5); and `ensure_publishable(project,
-None)`, so no gate IRI the manifest does not list reaches the shared ledger. The ruleset,
-branch and anchor results are cached for the life of one command. A failure refuses the
-decision before anything runs or is spent.
+None)`, so no gate IRI the manifest does not list reaches the shared ledger. The ruleset and
+anchor results are cached for the life of one command, and the append re-reads the head (§3.2
+step 1). A failure refuses the decision before anything runs or is spent.
 
 ### 2.5 Reads
 
@@ -448,8 +448,8 @@ repeated error, until it is fixed. The docs and `init` say so.
 
 ## 7. Errors
 
-Every error exits 2 with `error: …` and says what to do — except the attempt row below, which is
-a warning (decision 14).
+Every error exits 2 with `error: …` and says what to do — except the two attempt rows below,
+which are not refusals (decisions 14 and 15).
 
 | condition | what fl does |
 |---|---|
@@ -465,6 +465,7 @@ a warning (decision 14).
 | unreachable in the pre-flight | refuses; nothing ran |
 | unreachable at a move's, check's or finding's flush | refuses; no state change; the runs stay local |
 | unreachable at an attempt's flush | not refused — it already ran: kept locally, outcome printed, a warning, published next time; exits with the attempt's own code (decision 14) |
+| the attempt's local save fails | not refused, because the attempt already ran: its outcome prints first, then `error: …`; it is not published; fl exits with the attempt's own code (decision 15) |
 | a comment fails to post | the state change stands; names `fl github ledger comment <record>` |
 | an unknown `ledger` value | config error |
 

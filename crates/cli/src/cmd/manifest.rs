@@ -63,6 +63,31 @@ pub fn read(root: &Path) -> Result<Manifest> {
     Manifest::parse(&text).with_context(|| format!("{} was refused", path.display()))
 }
 
+/// The manifest at `root`, or — when there is none — a refusal naming what
+/// writes it: `fl manifest export` on the store that authors `project`
+/// (`authoring`), and on any other a restore from git and an import.
+fn manifest_of(root: &Path, project: &ProjectId, authoring: bool) -> Result<Manifest> {
+    let path = root.join(MANIFEST_PATH);
+    if !path
+        .try_exists()
+        .with_context(|| format!("could not look for {}", path.display()))?
+    {
+        if authoring {
+            bail!(
+                "there is no manifest at {}. Run `fl manifest export --project {project}` and \
+                 commit the file it writes",
+                path.display()
+            );
+        }
+        bail!(
+            "there is no manifest at {}. It comes from the machine that authors the project: \
+             restore it from git (pull, or check it out), then run `fl manifest import`",
+            path.display()
+        );
+    }
+    read(root)
+}
+
 fn root_of(store: &RedbStore, project: &ProjectId) -> Result<PathBuf> {
     let Some(p) = store.get_project(project)? else {
         bail!("{project} is held by this store, but it is not a project");
@@ -77,7 +102,7 @@ pub fn ensure_import_current(store: &RedbStore, project: &ProjectId) -> Result<(
         return Ok(());
     };
     let root = root_of(store, project)?;
-    let m = read(&root)?;
+    let m = manifest_of(&root, project, false)?;
     if m.content_sha256 != recorded {
         bail!(
             "the manifest at {} changed since this store imported it (imported {recorded}, \
@@ -116,7 +141,7 @@ pub fn ensure_publishable(
     if store.imported_hash(project)?.is_some() {
         ensure_import_current(store, project)?;
     } else {
-        let m = read(&root)?;
+        let m = manifest_of(&root, project, true)?;
         // ⚠ A manifest for another project would otherwise pass vacuously
         // for a project with no gates.
         if m.body.project != *project {
@@ -183,6 +208,110 @@ pub fn ensure_publishable(
         );
     }
     Ok(())
+}
+
+/// Spec §6.1 step 4, §7 ("`ledger_root` missing from the manifest"): the
+/// project's committed manifest carries the GitHub ledger's first commit
+/// `held`, which this store records for the repository `node_id` — the one
+/// way every other machine learns the ledger's anchor.
+pub fn ensure_manifest_carries_root(
+    store: &RedbStore,
+    project: &ProjectId,
+    node_id: &str,
+    held: &str,
+) -> Result<()> {
+    let root = root_of(store, project)?;
+    let m = read(&root)?;
+    let carried = m
+        .body
+        .ledger_root
+        .as_ref()
+        .map(|r| (r.repository_node_id.as_str(), r.commit.as_str()));
+    if carried == Some((node_id, held)) {
+        return Ok(());
+    }
+    let path = root.join(MANIFEST_PATH);
+    // ⚠ Only the store that authors the project can export its manifest
+    // (`export_manifest` refuses any other): elsewhere the fix is the
+    // authoring machine's export and commit, then a pull and an import here.
+    if store.imported_hash(project)?.is_some() {
+        bail!(
+            "{} does not carry the GitHub ledger's first commit {held}, which this machine \
+             checks the ledger against. On the machine that authors the project, run `fl \
+             manifest export --project {project}` and commit it; then pull here and run `fl \
+             manifest import`",
+            path.display()
+        );
+    }
+    bail!(
+        "{} does not carry the GitHub ledger's first commit {held}, so no other machine can \
+         check the ledger against it. Run `fl manifest export --project {project}` here, then \
+         commit it",
+        path.display()
+    )
+}
+
+/// What an import did, for a person: the project, its gates and
+/// transitions, and each gate's handle in this store.
+fn print_import(store: &RedbStore, m: &Manifest, report: &fl_store::ImportReport) -> Result<()> {
+    if let Some((old, new)) = &report.root_moved {
+        println!("moved\tthe project's gates now run over {new}, not {old}");
+    }
+    println!(
+        "imported\t{}\tgates: {} added, {} changed, {} unchanged\ttransitions: {}",
+        refs::show(store, Kind::Project, report.project.iri())?,
+        report.gates_added,
+        report.gates_changed,
+        report.gates_unchanged,
+        report.transitions
+    );
+    // ⚠ This store numbers handles on its own: they can differ from the
+    // authoring machine's, so the person needs to see them here.
+    for g in &m.body.gates {
+        println!(
+            "gate\t{}\t{}",
+            refs::show(store, Kind::Gate, g.id.iri())?,
+            g.name
+        );
+    }
+    for name in &report.transitions_removed {
+        println!("removed\ttransition\t{name}");
+    }
+    Ok(())
+}
+
+/// What `fl github ledger init` learns from the project's committed
+/// manifest before it touches GitHub (GitHub ledger spec §6.1 step 4): on a
+/// machine that does not author the project, the manifest is imported as
+/// `fl manifest import` imports it — which records the ledger's first
+/// commit when the manifest carries one. The authoring store wrote that
+/// root into the manifest itself; a project with no manifest yet has
+/// nothing to teach.
+///
+/// ⚠ Without it, a machine that never imported the manifest knows no first
+/// commit: where the ledger was deleted it would create a second one and
+/// hide the deletion, and it would offer an existing ledger for
+/// confirmation as if no machine knew it.
+pub fn import_before_ledger_init(store: &RedbStore, root: &Path) -> Result<()> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("`{}` could not be resolved", root.display()))?;
+    let path = root.join(MANIFEST_PATH);
+    if !path
+        .try_exists()
+        .with_context(|| format!("could not look for {}", path.display()))?
+    {
+        return Ok(());
+    }
+    let m = read(&root)?;
+    let project = &m.body.project;
+    if store.owns(project.iri())? && store.imported_hash(project)?.is_none() {
+        return Ok(());
+    }
+    Git::head(&root)
+        .map_err(|e| anyhow::anyhow!("`{}` is not a git working tree: {e}", root.display()))?;
+    let report = store.import_manifest(&m, &root.display().to_string())?;
+    print_import(store, &m, &report)
 }
 
 /// What `manifest export` knows of the repository its project's ledger is
@@ -294,29 +423,7 @@ pub fn run(store: &RedbStore, cmd: Cmd, binding: &Binding) -> Result<i32> {
             })?;
             let m = read(&root)?;
             let report = store.import_manifest(&m, &root.display().to_string())?;
-            if let Some((old, new)) = &report.root_moved {
-                println!("moved\tthe project's gates now run over {new}, not {old}");
-            }
-            println!(
-                "imported\t{}\tgates: {} added, {} changed, {} unchanged\ttransitions: {}",
-                refs::show(store, Kind::Project, report.project.iri())?,
-                report.gates_added,
-                report.gates_changed,
-                report.gates_unchanged,
-                report.transitions
-            );
-            // ⚠ This store numbers handles on its own: they can differ from
-            // the authoring machine's, so the person needs to see them here.
-            for g in &m.body.gates {
-                println!(
-                    "gate\t{}\t{}",
-                    refs::show(store, Kind::Gate, g.id.iri())?,
-                    g.name
-                );
-            }
-            for name in &report.transitions_removed {
-                println!("removed\ttransition\t{name}");
-            }
+            print_import(store, &m, &report)?;
         }
         Cmd::Check { project } => {
             let p = ProjectId(refs::resolve(
@@ -359,5 +466,92 @@ mod tests {
         let g2 = store.add_gate(&p2, "g", kind, sel, 1, "c", "o").unwrap();
         let err = ensure_publishable(&store, &p1, Some(&g2)).unwrap_err();
         assert!(err.to_string().contains("belongs to project"), "{err}");
+    }
+
+    // Spec §6.1 step 4, §7: a manifest whose `ledger_root` carries a
+    // different commit for the same node is not the anchor this machine
+    // was given, so it is refused rather than silently accepted.
+    #[test]
+    fn ensure_manifest_carries_root_refuses_another_commit_for_the_same_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let p = store
+            .add_project(&root.path().display().to_string())
+            .unwrap();
+        store.set_ledger_root("R_1", &"a".repeat(40)).unwrap();
+        let m = store
+            .export_manifest(
+                &p,
+                "0123456789abcdef0123456789abcdef01234567",
+                0,
+                Some("R_1"),
+            )
+            .unwrap();
+        let path = root.path().join(MANIFEST_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, m.to_json()).unwrap();
+
+        let err = ensure_manifest_carries_root(&store, &p, "R_1", &"b".repeat(40)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not carry the GitHub ledger's first commit"),
+            "{err}"
+        );
+    }
+
+    // Spec §6.1 step 4, §7: a manifest whose `ledger_root` carries a
+    // different node's anchor is not the anchor this machine was given,
+    // even when the commit text matches.
+    #[test]
+    fn ensure_manifest_carries_root_refuses_another_node_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let p = store
+            .add_project(&root.path().display().to_string())
+            .unwrap();
+        store.set_ledger_root("R_2", &"a".repeat(40)).unwrap();
+        let m = store
+            .export_manifest(
+                &p,
+                "0123456789abcdef0123456789abcdef01234567",
+                0,
+                Some("R_2"),
+            )
+            .unwrap();
+        let path = root.path().join(MANIFEST_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, m.to_json()).unwrap();
+
+        let err = ensure_manifest_carries_root(&store, &p, "R_1", &"a".repeat(40)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not carry the GitHub ledger's first commit"),
+            "{err}"
+        );
+    }
+
+    // A manifest outside a git working tree is refused before it is
+    // imported: the gates it carries run over a working tree.
+    #[test]
+    fn init_imports_no_manifest_outside_a_git_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let author = RedbStore::open(&dir.path().join("author.redb")).unwrap();
+        let p = author.add_project("/one").unwrap();
+        let m = author
+            .export_manifest(&p, "0123456789abcdef0123456789abcdef01234567", 0, None)
+            .unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        let path = plain.path().join(MANIFEST_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, m.to_json()).unwrap();
+        let other = RedbStore::open(&dir.path().join("other.redb")).unwrap();
+        let err = import_before_ledger_init(&other, plain.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("is not a git working tree"),
+            "{err:#}"
+        );
+        assert!(!other.owns(p.iri()).unwrap(), "nothing was imported");
     }
 }
