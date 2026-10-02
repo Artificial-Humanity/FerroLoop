@@ -1,6 +1,7 @@
 mod cmd;
 mod config;
 mod ctx;
+mod preflight;
 mod refs;
 #[cfg(test)]
 mod testing;

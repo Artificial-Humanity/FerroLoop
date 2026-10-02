@@ -63,6 +63,31 @@ pub fn read(root: &Path) -> Result<Manifest> {
     Manifest::parse(&text).with_context(|| format!("{} was refused", path.display()))
 }
 
+/// The manifest at `root`, or — when there is none — a refusal naming what
+/// writes it: `fl manifest export` on the store that authors `project`
+/// (`authoring`), and on any other a restore from git and an import.
+fn manifest_of(root: &Path, project: &ProjectId, authoring: bool) -> Result<Manifest> {
+    let path = root.join(MANIFEST_PATH);
+    if !path
+        .try_exists()
+        .with_context(|| format!("could not look for {}", path.display()))?
+    {
+        if authoring {
+            bail!(
+                "there is no manifest at {}. Run `fl manifest export --project {project}` and \
+                 commit the file it writes",
+                path.display()
+            );
+        }
+        bail!(
+            "there is no manifest at {}. It comes from the machine that authors the project: \
+             restore it from git (pull, or check it out), then run `fl manifest import`",
+            path.display()
+        );
+    }
+    read(root)
+}
+
 fn root_of(store: &RedbStore, project: &ProjectId) -> Result<PathBuf> {
     let Some(p) = store.get_project(project)? else {
         bail!("{project} is held by this store, but it is not a project");
@@ -77,7 +102,7 @@ pub fn ensure_import_current(store: &RedbStore, project: &ProjectId) -> Result<(
         return Ok(());
     };
     let root = root_of(store, project)?;
-    let m = read(&root)?;
+    let m = manifest_of(&root, project, false)?;
     if m.content_sha256 != recorded {
         bail!(
             "the manifest at {} changed since this store imported it (imported {recorded}, \
@@ -116,7 +141,7 @@ pub fn ensure_publishable(
     if store.imported_hash(project)?.is_some() {
         ensure_import_current(store, project)?;
     } else {
-        let m = read(&root)?;
+        let m = manifest_of(&root, project, true)?;
         // ⚠ A manifest for another project would otherwise pass vacuously
         // for a project with no gates.
         if m.body.project != *project {
@@ -183,6 +208,47 @@ pub fn ensure_publishable(
         );
     }
     Ok(())
+}
+
+/// Spec §6.1 step 4, §7 ("`ledger_root` missing from the manifest"): the
+/// project's committed manifest carries the GitHub ledger's first commit
+/// `held`, which this store records for the repository `node_id` — the one
+/// way every other machine learns the ledger's anchor.
+pub fn ensure_manifest_carries_root(
+    store: &RedbStore,
+    project: &ProjectId,
+    node_id: &str,
+    held: &str,
+) -> Result<()> {
+    let root = root_of(store, project)?;
+    let m = read(&root)?;
+    let carried = m
+        .body
+        .ledger_root
+        .as_ref()
+        .map(|r| (r.repository_node_id.as_str(), r.commit.as_str()));
+    if carried == Some((node_id, held)) {
+        return Ok(());
+    }
+    let path = root.join(MANIFEST_PATH);
+    // ⚠ Only the store that authors the project can export its manifest
+    // (`export_manifest` refuses any other): elsewhere the fix is the
+    // authoring machine's export and commit, then a pull and an import here.
+    if store.imported_hash(project)?.is_some() {
+        bail!(
+            "{} does not carry the GitHub ledger's first commit {held}, which this machine \
+             checks the ledger against. On the machine that authors the project, run `fl \
+             manifest export --project {project}` and commit it; then pull here and run `fl \
+             manifest import`",
+            path.display()
+        );
+    }
+    bail!(
+        "{} does not carry the GitHub ledger's first commit {held}, so no other machine can \
+         check the ledger against it. Run `fl manifest export --project {project}` here, then \
+         commit it",
+        path.display()
+    )
 }
 
 /// What an import did, for a person: the project, its gates and

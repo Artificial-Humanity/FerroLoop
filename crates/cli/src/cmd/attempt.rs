@@ -74,6 +74,8 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             refs::show(ctx.handles, Kind::Project, record.project.iri())?
         );
     };
+    // ⚠ Decision 8: GitHub is checked before the adapter spends anything.
+    crate::preflight::check(ctx, &record.project)?;
 
     let adapter = ClaudeAdapter::new(cmd.binary);
     let spec = AttemptSpec {

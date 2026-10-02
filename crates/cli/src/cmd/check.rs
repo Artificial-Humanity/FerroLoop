@@ -71,6 +71,11 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         None => None,
     };
     crate::cmd::manifest::ensure_import_current(store, &project)?;
+    // A check tied to a record is a decision (GitHub ledger spec §2.2): its
+    // evidence must be publishable before the first gate runs. A plain
+    // check opens no tracker, so it has no GitHub ledger and the pre-flight
+    // checks nothing.
+    crate::preflight::check(ctx, &project)?;
     let roles = ctx.roles();
     let report = evaluate_transition(
         roles.catalog,

@@ -3,6 +3,7 @@
 //! The `fl` binary reaches the fake through `FL_GITHUB_API_URL`.
 
 use assert_cmd::Command;
+use fl_core::store::{Catalog, Ledger};
 use fl_github::fake::FakeGithub;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
@@ -10,6 +11,9 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Sys;
+
+/// What every pre-flight refusal starts with (GitHub ledger spec §2.4).
+const PREFLIGHT: &str = "refused before any gate or adapter ran: ";
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Sys::new("git")
@@ -200,6 +204,29 @@ impl World {
             .into_iter()
             .filter(|(p, _)| p.starts_with(&prefix))
             .collect()
+    }
+
+    /// How many gate runs `m`'s store holds, over every gate.
+    fn runs(&self, m: &Machine) -> usize {
+        let store = fl_store::RedbStore::open(&m.store()).unwrap();
+        store
+            .list_projects()
+            .unwrap()
+            .iter()
+            .flat_map(|p| store.list_gates(&p.id).unwrap())
+            .map(|g| store.gate_runs(&g.id).unwrap().len())
+            .sum()
+    }
+
+    /// How many attempts `m`'s store holds.
+    fn attempts(&self, m: &Machine) -> usize {
+        let store = fl_store::RedbStore::open(&m.store()).unwrap();
+        store
+            .list_projects()
+            .unwrap()
+            .iter()
+            .map(|p| store.attempts(&p.id).unwrap().len())
+            .sum()
     }
 }
 
@@ -742,4 +769,295 @@ fn a_decision_that_reads_past_a_quarantined_line_notes_it() {
         .stderr(contains(format!(
             "note: `{path}` line 1 of the GitHub ledger is quarantined (a test)"
         )));
+}
+
+// Spec §2.4, §7: no ledger yet — refused, naming `init`, before the move's
+// gate runs; the record stays.
+#[test]
+fn a_move_on_a_repository_with_no_ledger_is_refused_before_its_gate_runs() {
+    let w = World::new();
+    w.gated();
+    w.export();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("has no GitHub ledger yet")));
+    assert_eq!(w.runs(&w.one), 0, "no gate ran");
+    assert!(
+        w.fake
+            .issue(1)
+            .labels
+            .contains(&"fl:record/todo".to_string())
+    );
+}
+
+// Spec §2.2: an ungated move is flushed too, so it pre-flights like any
+// other.
+#[test]
+fn an_ungated_move_on_a_repository_with_no_ledger_is_refused() {
+    let w = World::new();
+    w.gated();
+    w.export();
+    w.fl()
+        .args(["record", "move", "1", "--to", "done"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("has no GitHub ledger yet")));
+    assert!(
+        w.fake
+            .issue(1)
+            .labels
+            .contains(&"fl:record/todo".to_string())
+    );
+}
+
+// Spec §7, "`ledger_root` missing from the manifest": on this machine a
+// manifest committed without the ledger's first commit is refused at the
+// first decision, naming the export — so `init`'s instruction cannot be
+// lost.
+#[test]
+fn a_decision_on_a_manifest_without_the_ledgers_first_commit_is_refused_naming_export() {
+    let w = World::new();
+    w.gated();
+    w.export();
+    w.init();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(2)
+        .stderr(
+            contains(PREFLIGHT)
+                .and(contains("does not carry the GitHub ledger's first commit"))
+                .and(contains("here, then commit it")),
+        );
+    assert_eq!(w.runs(&w.one), 0);
+    w.export();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+}
+
+// The same refusal on a machine that does not author the project: its
+// root came from `init --confirm`, because the manifest it imported was
+// exported before the ledger existed. It cannot export, so the refusal
+// names the authoring machine's export and an import here.
+#[test]
+fn a_manifest_without_the_first_commit_on_an_importing_machine_names_the_import() {
+    let w = World::new();
+    w.gated();
+    w.export();
+    w.init();
+    let root = w.fake.ledger_head().expect("the branch");
+    let two = w.machine();
+    w.fl_on(&two)
+        .args(["manifest", "import"])
+        .assert()
+        .success();
+    w.fl_on(&two)
+        .args(["github", "ledger", "init"])
+        .assert()
+        .code(1)
+        .stdout(contains(format!("confirm\tfl/ledger\t{root}")));
+    w.fl_on(&two)
+        .args(["github", "ledger", "init", "--confirm", &root])
+        .assert()
+        .success();
+    w.fl_on(&two)
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("then pull here and run `fl manifest import`")));
+    assert_eq!(w.runs(&two), 0);
+}
+
+// Spec §2.4, §6.1 step 4: no manifest at all is refused naming the export
+// on the store that authors the project.
+#[test]
+fn a_decision_on_a_project_with_no_manifest_names_the_export() {
+    let w = World::new();
+    w.gated();
+    w.init();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(2)
+        .stderr(
+            contains(PREFLIGHT)
+                .and(contains("there is no manifest at"))
+                .and(contains("and commit the file it writes")),
+        );
+    assert_eq!(w.runs(&w.one), 0);
+}
+
+// On a machine that imported the project, a missing manifest names where
+// it comes from and the import.
+#[test]
+fn a_missing_manifest_on_an_importing_machine_names_where_it_comes_from() {
+    let w = World::new();
+    w.ready();
+    let two = w.machine();
+    w.fl_on(&two)
+        .args(["manifest", "import"])
+        .assert()
+        .success();
+    fs::remove_file(w.repo.path().join(".fl/manifest.json")).unwrap();
+    w.fl_on(&two)
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains(
+            "It comes from the machine that authors the project",
+        ));
+}
+
+// Spec §2.4: the manifest must list every gate before a run can reach the
+// shared ledger.
+#[test]
+fn a_check_on_a_project_whose_manifest_lacks_a_gate_is_refused_before_it_runs() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "late",
+            "--glob",
+            "src/**/*.rs",
+            "--program",
+            "true",
+        ])
+        .assert()
+        .success();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("gate `late` is not in the manifest")));
+    assert_eq!(w.runs(&w.one), 0);
+}
+
+// ⚠ Spec §6.1 step 5: a machine that knows the ledger only
+// from the manifest has no cut-over until it runs `init` — refused, naming
+// it, before anything runs.
+#[test]
+fn a_machine_with_no_cut_over_is_refused_naming_init() {
+    let w = World::new();
+    w.ready();
+    let two = w.machine();
+    w.fl_on(&two)
+        .args(["manifest", "import"])
+        .assert()
+        .success();
+    w.fl_on(&two)
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("has no cut-over")));
+    assert_eq!(w.runs(&two), 0);
+    w.fl_on(&two)
+        .args(["github", "ledger", "init"])
+        .assert()
+        .success();
+    w.fl_on(&two)
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+}
+
+// Spec §2.4, §5: visibility is read live, first.
+#[test]
+fn a_visibility_that_cannot_be_read_is_refused_before_the_gate_runs() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_repo_read_after = Some(1);
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("read the repository's visibility")));
+    assert_eq!(w.runs(&w.one), 0);
+}
+
+// Spec §2.4: the mode is read before anything runs; rules fl cannot read
+// refuse.
+#[test]
+fn rules_that_cannot_be_read_are_refused_before_the_gate_runs() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_rules_next = true;
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("rules/branches/fl/ledger")));
+    assert_eq!(w.runs(&w.one), 0);
+}
+
+#[test]
+fn a_reproduction_on_a_repository_with_no_ledger_is_refused_before_its_gate_runs() {
+    let w = World::new();
+    w.gated();
+    w.export();
+    fs::write(w.repo.path().join("bug"), "").unwrap();
+    w.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "a bug", "--by", "reviewer",
+        ])
+        .assert()
+        .success();
+    w.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("has no GitHub ledger yet")));
+    assert_eq!(w.runs(&w.one), 0);
+}
+
+#[test]
+fn a_verification_on_a_deleted_ledger_is_refused_before_its_gates_run() {
+    let w = World::new();
+    w.ready();
+    fs::write(w.repo.path().join("bug"), "").unwrap();
+    w.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "a bug", "--by", "reviewer",
+        ])
+        .assert()
+        .success();
+    w.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .success();
+    w.fl()
+        .args(["finding", "assign", "2", "--to", "fixer"])
+        .assert()
+        .success();
+    fs::remove_file(w.repo.path().join("bug")).unwrap();
+    let before = w.runs(&w.one);
+    w.fake.delete_ledger();
+    w.fl()
+        .args(["finding", "verify", "2"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("fl will not start a new ledger")));
+    assert_eq!(w.runs(&w.one), before, "no gate ran");
+}
+
+// Decision 8: GitHub is checked before the adapter spends anything.
+#[test]
+fn an_attempt_on_a_repository_with_no_ledger_is_refused_before_the_adapter_runs() {
+    let w = World::new();
+    w.gated();
+    w.export();
+    w.fl()
+        .args(["attempt", "1", "--budget-usd-micros", "0"])
+        .assert()
+        .code(2)
+        .stderr(contains(PREFLIGHT).and(contains("has no GitHub ledger yet")));
+    assert_eq!(w.attempts(&w.one), 0);
 }

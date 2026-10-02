@@ -137,8 +137,8 @@ impl GithubLedger<'_> {
     }
 
     /// The checked head (checks 1 and 2) whose `format` this fl reads
-    /// (check 7), recorded as the last head seen (ruling 10). What B2's
-    /// pre-flight asks before any gate or adapter runs (spec §2.4).
+    /// (check 7), recorded as the last head seen. The
+    /// pre-flight asks it before any gate or adapter runs (spec §2.4).
     pub fn check_format(&self) -> Result<String, StoreError> {
         let head = self.check_head()?;
         let found = self.objects(&head, &[FORMAT_FILE.to_string()])?;
