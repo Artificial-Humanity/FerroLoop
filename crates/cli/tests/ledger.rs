@@ -1228,3 +1228,18 @@ fn stats_with_no_credential_is_refused_not_counted_locally() {
         .code(2)
         .stderr(contains("FL_GITHUB_TOKEN or GITHUB_TOKEN"));
 }
+
+// `stats_reads_github` is gated on `is_stats`: every other command stays
+// local-only even on a project bound with the GitHub ledger in its own
+// directory (GitHub ledger spec §2.5 names only `fl stats`).
+#[test]
+fn a_non_stats_command_on_a_ledger_bound_project_opens_no_tracker() {
+    let w = World::new();
+    w.ready();
+    let before = w.fake.state().requests.len();
+    w.fl()
+        .args(["gate", "list", "--project", "1"])
+        .assert()
+        .success();
+    assert_eq!(w.fake.state().requests.len(), before, "no request");
+}
