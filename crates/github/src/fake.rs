@@ -170,8 +170,10 @@ pub struct State {
     pub git: crate::fake_git::Git,
     /// Rulesets; only `active` ones apply. A setting, not one-shot.
     pub rulesets: Vec<crate::fake_git::Ruleset>,
-    /// `rules/branches` answers 403 with GitHub's upgrade message — rulesets
-    /// unavailable on the plan. Modelled — confirmed by live test
+    /// `rules/branches` answers 403 with an "Upgrade to GitHub" message.
+    /// ⚠ Defensive only: no live answer has shown it. Measured on
+    /// 2026-10-02, a private repository on GitHub Free answers `200 []` —
+    /// the fake's default, with no ruleset — confirmed by live test
     /// `a_private_repository_without_a_ruleset_is_detection_only`.
     pub rules_need_upgrade: bool,
     /// Every request breaks off before an answer: GitHub unreachable. A
@@ -652,7 +654,12 @@ impl State {
     }
 
     /// One page of `items`, with a `Link` header when more remain.
-    fn page(&self, path: &str, q: &BTreeMap<String, String>, items: Vec<Value>) -> Answer {
+    pub(crate) fn page(
+        &self,
+        path: &str,
+        q: &BTreeMap<String, String>,
+        items: Vec<Value>,
+    ) -> Answer {
         let asked: usize = q.get("per_page").and_then(|v| v.parse().ok()).unwrap_or(30);
         let cap = if self.max_per_page == 0 {
             100
