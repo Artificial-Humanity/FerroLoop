@@ -185,6 +185,69 @@ pub fn ensure_publishable(
     Ok(())
 }
 
+/// What an import did, for a person: the project, its gates and
+/// transitions, and each gate's handle in this store.
+fn print_import(store: &RedbStore, m: &Manifest, report: &fl_store::ImportReport) -> Result<()> {
+    if let Some((old, new)) = &report.root_moved {
+        println!("moved\tthe project's gates now run over {new}, not {old}");
+    }
+    println!(
+        "imported\t{}\tgates: {} added, {} changed, {} unchanged\ttransitions: {}",
+        refs::show(store, Kind::Project, report.project.iri())?,
+        report.gates_added,
+        report.gates_changed,
+        report.gates_unchanged,
+        report.transitions
+    );
+    // ⚠ This store numbers handles on its own: they can differ from the
+    // authoring machine's, so the person needs to see them here.
+    for g in &m.body.gates {
+        println!(
+            "gate\t{}\t{}",
+            refs::show(store, Kind::Gate, g.id.iri())?,
+            g.name
+        );
+    }
+    for name in &report.transitions_removed {
+        println!("removed\ttransition\t{name}");
+    }
+    Ok(())
+}
+
+/// What `fl github ledger init` learns from the project's committed
+/// manifest before it touches GitHub (GitHub ledger spec §6.1 step 4): on a
+/// machine that does not author the project, the manifest is imported as
+/// `fl manifest import` imports it — which records the ledger's first
+/// commit when the manifest carries one. The authoring store wrote that
+/// root into the manifest itself; a project with no manifest yet has
+/// nothing to teach.
+///
+/// ⚠ Without it, a machine that never imported the manifest knows no first
+/// commit: where the ledger was deleted it would create a second one and
+/// hide the deletion, and it would offer an existing ledger for
+/// confirmation as if no machine knew it.
+pub fn import_before_ledger_init(store: &RedbStore, root: &Path) -> Result<()> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("`{}` could not be resolved", root.display()))?;
+    let path = root.join(MANIFEST_PATH);
+    if !path
+        .try_exists()
+        .with_context(|| format!("could not look for {}", path.display()))?
+    {
+        return Ok(());
+    }
+    let m = read(&root)?;
+    let project = &m.body.project;
+    if store.owns(project.iri())? && store.imported_hash(project)?.is_none() {
+        return Ok(());
+    }
+    Git::head(&root)
+        .map_err(|e| anyhow::anyhow!("`{}` is not a git working tree: {e}", root.display()))?;
+    let report = store.import_manifest(&m, &root.display().to_string())?;
+    print_import(store, &m, &report)
+}
+
 /// What `manifest export` knows of the repository its project's ledger is
 /// in (GitHub ledger spec §6.1 step 4) — or that it cannot know.
 pub enum Binding {
@@ -294,29 +357,7 @@ pub fn run(store: &RedbStore, cmd: Cmd, binding: &Binding) -> Result<i32> {
             })?;
             let m = read(&root)?;
             let report = store.import_manifest(&m, &root.display().to_string())?;
-            if let Some((old, new)) = &report.root_moved {
-                println!("moved\tthe project's gates now run over {new}, not {old}");
-            }
-            println!(
-                "imported\t{}\tgates: {} added, {} changed, {} unchanged\ttransitions: {}",
-                refs::show(store, Kind::Project, report.project.iri())?,
-                report.gates_added,
-                report.gates_changed,
-                report.gates_unchanged,
-                report.transitions
-            );
-            // ⚠ This store numbers handles on its own: they can differ from
-            // the authoring machine's, so the person needs to see them here.
-            for g in &m.body.gates {
-                println!(
-                    "gate\t{}\t{}",
-                    refs::show(store, Kind::Gate, g.id.iri())?,
-                    g.name
-                );
-            }
-            for name in &report.transitions_removed {
-                println!("removed\ttransition\t{name}");
-            }
+            print_import(store, &m, &report)?;
         }
         Cmd::Check { project } => {
             let p = ProjectId(refs::resolve(

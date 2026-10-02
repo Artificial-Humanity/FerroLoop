@@ -85,10 +85,11 @@ signed token for an installation token, which it renews before it expires. The k
 from the file; it never appears on a command line, and a message may name the file's path
 but never its contents.
 
-`fl github whoami`, run inside the project's checkout, prints three lines: the identity
-GitHub reports for the credential (a user's login, or an App's `<slug>[bot]`), where the
-credential came from (the environment variable, or the App's id), and the repository fl
-binds. It asks GitHub; it does not repeat the config back.
+`fl github whoami`, run inside the project's checkout, prints the identity GitHub reports for
+the credential (a user's login, or an App's `<slug>[bot]`), where the credential came from (the
+environment variable, or the App's id), the repository fl binds, and the ledger: `local`, or
+`github` followed by the mode in force — `protected`, or `detection-only` with what is missing.
+It asks GitHub; it does not repeat the config back.
 
 ## What an issue looks like
 

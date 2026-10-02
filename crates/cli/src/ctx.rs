@@ -17,6 +17,9 @@ pub struct Ctx<'a> {
     pub handles: &'a dyn Handles,
     /// The GitHub tracker, for `fl github` and the publish check.
     pub github: Option<&'a fl_github::GithubTracker>,
+    /// The GitHub ledger, when the binding names it (GitHub ledger spec
+    /// §1.5): over the tracker's client and the local store.
+    pub github_ledger: Option<&'a fl_github::GithubLedger<'a>>,
     /// Where records and findings live, for messages.
     pub tracker_label: String,
 }
@@ -77,6 +80,7 @@ mod tests {
             ledger: &flushes,
             handles: &store,
             github: None,
+            github_ledger: None,
             tracker_label: String::new(),
         };
         assert!(

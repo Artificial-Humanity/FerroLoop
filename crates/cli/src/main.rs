@@ -574,6 +574,18 @@ fn run(cli: Cli) -> Result<i32> {
         (Some(b), true) => Some(open_github(b, cfg.github.as_ref(), &store)?),
         _ => None,
     };
+    // The GitHub ledger, when the binding names it (GitHub ledger spec
+    // §1.5): over the tracker's client — one credential, one origin guard
+    // (§1.1) — and the local store, which keeps its anchor, cut-over and
+    // cache.
+    let github_ledger = match (&github, &binding) {
+        (Some(gh), Some(b)) if b.github_ledger() => Some(fl_github::GithubLedger::new(
+            gh.client(),
+            gh.repo().clone(),
+            &store,
+        )),
+        _ => None,
+    };
     let (checked, routed);
     let ctx = match &github {
         Some(gh) => {
@@ -591,6 +603,7 @@ fn run(cli: Cli) -> Result<i32> {
                 ledger: &store,
                 handles: &routed,
                 github: Some(gh),
+                github_ledger: github_ledger.as_ref(),
                 tracker_label: format!("github:{}", gh.repo().full_name),
             }
         }
@@ -600,6 +613,7 @@ fn run(cli: Cli) -> Result<i32> {
             ledger: &store,
             handles: &store,
             github: None,
+            github_ledger: None,
             tracker_label: store.label().to_string(),
         },
     };
@@ -637,7 +651,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Attempt(c) => cmd::attempt::run(&ctx, c),
         Command::Stats(c) => cmd::stats::run(&store, c),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
-        Command::Github(c) => cmd::github::run(&ctx, c),
+        Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
     }
 }
 

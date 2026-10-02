@@ -3,6 +3,7 @@ pub mod check;
 pub mod finding;
 pub mod gate;
 pub mod github;
+pub mod ledger;
 pub mod manifest;
 pub mod project;
 pub mod record;
