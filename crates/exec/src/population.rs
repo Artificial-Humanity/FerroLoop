@@ -20,10 +20,10 @@ pub enum ExecError {
     /// ⚠ The decision's evidence could not be published (GitHub ledger spec
     /// §2.2), so the decision is refused and nothing changed. The runs are
     /// in the local store, and the next decision that reaches the ledger
-    /// publishes them.
+    /// publishes them. The cause is a clause (`fl_core::as_clause`).
     #[error(
         "refused: the evidence for this decision could not be published to the shared ledger, \
-         so nothing changed ({0}). The runs are kept in the local store, and the next decision \
+         so nothing changed: {0}. The runs are kept in the local store, and the next decision \
          that reaches the ledger publishes them"
     )]
     Unpublished(String),
@@ -32,8 +32,8 @@ pub enum ExecError {
     /// are kept in the local store.
     #[error(
         "refused: the evidence for this decision could not be published to the shared ledger, \
-         so nothing changed: {0}. The runs are kept in the local store; fix what is named above \
-         before deciding again"
+         so nothing changed: {0}. The runs are kept in the local store; fix that cause first, \
+         then decide again"
     )]
     PublishRefused(String),
     #[error("command `{0}` could not be run: {1}")]
@@ -163,10 +163,11 @@ pub fn resolve(
 /// contended — promises that the next decision publishes the runs; any
 /// other cause names what to fix first.
 pub fn refused_publish(e: fl_core::StoreError) -> ExecError {
+    let cause = fl_core::as_clause(&e);
     if e.is_transient() {
-        ExecError::Unpublished(e.to_string())
+        ExecError::Unpublished(cause)
     } else {
-        ExecError::PublishRefused(e.to_string())
+        ExecError::PublishRefused(cause)
     }
 }
 
@@ -368,5 +369,26 @@ mod tests {
             !got.iter().any(|p| p.ends_with("link.rs")),
             "symlink appeared in results: {got:?}"
         );
+    }
+
+    // One period after the cause, however its own message ends; no "above"
+    // for a cause on the same line.
+    #[test]
+    fn a_refused_publish_reads_as_one_sentence_around_its_cause() {
+        for e in [
+            fl_core::StoreError::RestsOnLocalEntry {
+                decision: fl_core::ids::seq_iri(1),
+                entry: fl_core::ids::seq_iri(2),
+            },
+            fl_core::StoreError::Unreachable {
+                store: "the GitHub ledger of acme/widgets".into(),
+                cause: "connection refused".into(),
+            },
+        ] {
+            let msg = refused_publish(e).to_string();
+            assert!(!msg.contains(".."), "{msg}");
+            assert!(!msg.contains(".)"), "{msg}");
+            assert!(!msg.contains("above"), "{msg}");
+        }
     }
 }

@@ -126,12 +126,12 @@ fn publish(
                 "Its runs are kept in the local store, and the next decision that reaches the \
                  ledger publishes them."
             } else {
-                "Its runs are kept in the local store. Fix what is named above before deciding \
-                 again."
+                "Its runs are kept in the local store. Fix that cause first, then decide again."
             };
             anyhow::anyhow!(
                 "refused: the check ran, but its decision could not be published to the shared \
-                 ledger ({e}). {after}"
+                 ledger: {}. {after}",
+                fl_core::as_clause(&e)
             )
         })
 }
@@ -237,5 +237,18 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("next decision"), "{err:#}");
+    }
+
+    #[test]
+    fn a_refused_checks_message_has_one_period_after_its_cause_and_no_above() {
+        let ledger = Flushes::refusing_with(|| fl_core::store::StoreError::RestsOnLocalEntry {
+            decision: seq_iri(1),
+            entry: seq_iri(2),
+        });
+        let err = publish(&ledger, Some(&RecordId(seq_iri(3))), &report(true)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(!msg.contains(".."), "{msg}");
+        assert!(!msg.contains(".)"), "{msg}");
+        assert!(!msg.contains("above"), "{msg}");
     }
 }

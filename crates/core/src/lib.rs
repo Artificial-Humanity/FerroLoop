@@ -38,7 +38,7 @@ pub use split::{
 pub use stale::{Staleness, apply_staleness, is_stale};
 pub use store::{
     Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,
-    follow, ledger_root_shape, node_id_shape,
+    as_clause, follow, ledger_root_shape, node_id_shape,
 };
 pub use verdict::{FailReason, Population, Verdict};
 

@@ -150,12 +150,13 @@ fn conclude(ledger: &dyn Ledger, id: &Iri, attempt: &Attempt) -> Option<String> 
             let after = if e.is_transient() {
                 "Nothing is lost: the next decision that reaches the ledger publishes it."
             } else {
-                "It stays there until the cause above is fixed; the first decision that reaches \
-                 the ledger after that publishes it."
+                "It stays there until that cause is fixed; the first decision that reaches the \
+                 ledger afterwards publishes it."
             };
             Some(format!(
                 "the attempt ran and is recorded in the local store, but it could not be \
-                 published to the shared ledger ({e}). {after}"
+                 published to the shared ledger: {}. {after}",
+                fl_core::as_clause(&e)
             ))
         }
     }
@@ -244,5 +245,21 @@ mod tests {
         .expect("a warning");
         assert!(w.contains("recorded in the local store"), "{w}");
         assert!(!w.contains("next decision"), "{w}");
+    }
+
+    #[test]
+    fn a_publish_warning_has_one_period_after_its_cause_and_no_above() {
+        let w = conclude(
+            &Flushes::refusing_with(|| StoreError::RestsOnLocalEntry {
+                decision: seq_iri(1),
+                entry: seq_iri(50),
+            }),
+            &seq_iri(50),
+            &attempt(AttemptStatus::Timeout),
+        )
+        .expect("a warning");
+        assert!(!w.contains(".."), "{w}");
+        assert!(!w.contains(".)"), "{w}");
+        assert!(!w.contains("above"), "{w}");
     }
 }

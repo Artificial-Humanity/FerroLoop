@@ -259,6 +259,17 @@ impl StoreError {
     }
 }
 
+/// `e`'s message as a clause inside a longer sentence: without the one
+/// final period some messages end with, so the sentence around it ends
+/// with exactly one.
+pub fn as_clause(e: &dyn std::fmt::Display) -> String {
+    let text = e.to_string();
+    match text.strip_suffix('.') {
+        Some(clause) => clause.to_string(),
+        None => text,
+    }
+}
+
 /// Definitions: projects, gates, transitions. Rarely changed; each belongs
 /// to a repository.
 ///
@@ -787,6 +798,20 @@ mod tests {
         for e in &lasting {
             assert!(!e.is_transient(), "{e}");
         }
+    }
+
+    #[test]
+    fn a_message_as_a_clause_drops_its_one_final_period() {
+        let e = StoreError::RestsOnLocalEntry {
+            decision: seq_iri(1),
+            entry: seq_iri(2),
+        };
+        assert!(
+            as_clause(&e).ends_with("Nothing was published"),
+            "{}",
+            as_clause(&e)
+        );
+        assert_eq!(as_clause(&"no period"), "no period");
     }
 
     #[test]
