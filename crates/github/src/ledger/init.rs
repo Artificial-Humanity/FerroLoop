@@ -748,9 +748,6 @@ mod tests {
         fn last_head(&self, repo: &str) -> Result<Option<String>, StoreError> {
             self.0.last_head(repo)
         }
-        fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError> {
-            self.0.set_last_head(repo, head)
-        }
         fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError> {
             self.0.cached(repo, path)
         }
@@ -760,9 +757,6 @@ mod tests {
             dir: &str,
         ) -> Result<Vec<(String, CachedSegment)>, StoreError> {
             self.0.cached_under(repo, dir)
-        }
-        fn cache(&self, repo: &str, path: &str, s: &CachedSegment) -> Result<(), StoreError> {
-            self.0.cache(repo, path, s)
         }
         fn remember(
             &self,

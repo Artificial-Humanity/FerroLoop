@@ -751,7 +751,7 @@ mod tests {
         let (fake, local, _root) = world();
         let c = client(&fake);
         let mine = commit_on(&fake, "a\n");
-        local.set_last_head("R_1", &mine).unwrap();
+        local.remember("R_1", &mine, &[]).unwrap();
         fake.state().ref_404_next = 10;
         let before = ref_reads(&fake);
         let err = open(&c, &local).check_head().unwrap_err();
@@ -852,7 +852,7 @@ mod tests {
         let c = client(&fake);
         let mine = commit_on(&fake, "a\n");
         // As after this machine's own append: its commit is the last seen.
-        local.set_last_head("R_1", &mine).unwrap();
+        local.remember("R_1", &mine, &[]).unwrap();
         fake.state().ref_behind_next = 1;
         assert_eq!(open(&c, &local).check_head().unwrap(), mine);
         commit_on(&fake, "a\nb\n");
@@ -861,7 +861,7 @@ mod tests {
             .check_head()
             .expect("a compare that knows the commit after two reads: no alarm");
         let theirs = commit_on(&fake, "a\nb\nc\n");
-        local.set_last_head("R_1", &theirs).unwrap();
+        local.remember("R_1", &theirs, &[]).unwrap();
         commit_on(&fake, "a\nb\nc\nd\n");
         fake.state().compare_unknown_next = 3;
         match open(&c, &local).check_head().unwrap_err() {
@@ -1096,7 +1096,7 @@ mod tests {
         let (fake, local, _root) = world();
         let c = client(&fake);
         let mine = commit_on(&fake, "a\n");
-        local.set_last_head("R_1", &mine).unwrap();
+        local.remember("R_1", &mine, &[]).unwrap();
         fake.state().ref_404_next = 1;
         assert_eq!(
             open(&c, &local).check_head().unwrap(),
@@ -1744,7 +1744,7 @@ mod tests {
             seg(1).as_str(),
             Some(file(&[line(&run(1)), line(&run(2))]).as_str()),
         )]);
-        local.set_last_head("R_1", &mine).unwrap();
+        local.remember("R_1", &mine, &[]).unwrap();
         fake.state().graphql_commit_unknown_next = 2;
         assert_eq!(
             open(&c, &local).runs(&gate()).unwrap(),

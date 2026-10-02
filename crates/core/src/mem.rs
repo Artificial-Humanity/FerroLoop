@@ -486,14 +486,6 @@ impl LedgerCache for MemStore {
         Ok(self.inner.borrow().heads.get(repo).cloned())
     }
 
-    fn set_last_head(&self, repo: &str, head: &str) -> Result<(), StoreError> {
-        self.inner
-            .borrow_mut()
-            .heads
-            .insert(repo.to_string(), head.to_string());
-        Ok(())
-    }
-
     fn cached(&self, repo: &str, path: &str) -> Result<Option<CachedSegment>, StoreError> {
         Ok(self
             .inner
@@ -517,14 +509,6 @@ impl LedgerCache for MemStore {
             .filter(|((r, p), _)| r == repo && p.starts_with(&prefix))
             .map(|((_, p), c)| (p.clone(), c.clone()))
             .collect())
-    }
-
-    fn cache(&self, repo: &str, path: &str, segment: &CachedSegment) -> Result<(), StoreError> {
-        self.inner
-            .borrow_mut()
-            .segments
-            .insert((repo.to_string(), path.to_string()), segment.clone());
-        Ok(())
     }
 
     fn remember(
