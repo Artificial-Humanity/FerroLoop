@@ -1061,3 +1061,35 @@ fn an_attempt_on_a_repository_with_no_ledger_is_refused_before_the_adapter_runs(
         .stderr(contains(PREFLIGHT).and(contains("has no GitHub ledger yet")));
     assert_eq!(w.attempts(&w.one), 0);
 }
+
+// ⚠ Decisions 8 and 14: an attempt that ran but could not
+// be published keeps its own exit code, warns, and rides with the next
+// flush that lands.
+#[test]
+fn an_attempt_whose_publish_fails_warns_keeps_its_exit_code_and_rides_with_the_next() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_commits = fl_github::ledger::TRIES;
+    w.fl()
+        .args(["attempt", "1", "--budget-usd-micros", "0"])
+        .assert()
+        .code(1)
+        .stdout(contains("refused\t"))
+        .stderr(
+            contains("warning: the attempt ran and is recorded in the local store")
+                .and(contains("error:").not()),
+        );
+    assert_eq!(w.attempts(&w.one), 1);
+    assert!(w.ledger_files_in("attempts").is_empty(), "nothing landed");
+    w.fl()
+        .args(["attempt", "1", "--budget-usd-micros", "0"])
+        .assert()
+        .code(1);
+    let attempts = w.ledger_files_in("attempts");
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    assert_eq!(
+        attempts[0].1.lines().count(),
+        2,
+        "the first attempt rode with the second"
+    );
+}

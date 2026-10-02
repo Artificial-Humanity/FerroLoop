@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use clap::Args;
 use fl_core::ids::RecordId;
 use fl_core::log::{Attempt, AttemptStatus, PathsTouched};
-use fl_core::store::{Catalog, Ledger};
+use fl_core::store::{Catalog, Ledger, StoreError};
 use fl_core::{Iri, Kind};
 use fl_exec::adapters::ClaudeAdapter;
 use fl_exec::runner::{AttemptSpec, Runner};
@@ -110,32 +110,72 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         paths_touched: PathsTouched::Listed(outcome.paths_touched.clone()),
         output_excerpt: Some(outcome.output_excerpt.clone()),
     };
-    ctx.ledger.append_attempt(attempt.clone())?;
-
-    println!("{}\t{}ms", outcome.status.as_wire(), outcome.duration_ms);
-    if !outcome.output_excerpt.is_empty() {
-        for line in outcome.output_excerpt.lines().take(40) {
-            println!("\t| {line}");
+    let (code, said) = settle(ctx.ledger, &entry, &attempt);
+    for line in said {
+        match line {
+            Said::Stdout(l) => println!("{l}"),
+            Said::Stderr(l) => eprintln!("{l}"),
         }
     }
-
-    Ok(finish(ctx.ledger, &entry, &attempt))
+    Ok(code)
 }
 
-/// Publish the attempt and give its exit code.
+/// One line the command prints, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Said {
+    Stdout(String),
+    Stderr(String),
+}
+
+/// Save the attempt, publish it, and give its exit code and what to print,
+/// in order.
 ///
-/// ⚠⚠ Decision 14: the attempt already ran and cost what it cost, so the
-/// code is the attempt's own — 0 when it completed, 1 otherwise — whatever
-/// became of its publish. Exit 2 means "refused" everywhere else, and a
-/// script that retries on 2 must never run a paid attempt again.
-fn finish(ledger: &dyn Ledger, id: &Iri, attempt: &Attempt) -> i32 {
-    if let Some(warning) = conclude(ledger, id, attempt) {
-        eprintln!("warning: {warning}");
+/// ⚠⚠ Decisions 14 and 15: the attempt already ran and cost what it cost,
+/// so the code is the attempt's own — 0 when it completed, 1 otherwise —
+/// whatever became of its save or its publish. Exit 2 means "refused"
+/// everywhere else, and a script that retries on 2 must never run a paid
+/// attempt again. The outcome comes first, whatever became of the save,
+/// so a failed save never hides what the attempt did.
+fn settle(ledger: &dyn Ledger, id: &Iri, attempt: &Attempt) -> (i32, Vec<Said>) {
+    let saved = ledger.append_attempt(attempt.clone());
+    let mut said = vec![Said::Stdout(format!(
+        "{}\t{}ms",
+        attempt.status.as_wire(),
+        attempt.duration_ms
+    ))];
+    if let Some(excerpt) = attempt.output_excerpt.as_deref() {
+        said.extend(
+            excerpt
+                .lines()
+                .take(40)
+                .map(|l| Said::Stdout(format!("\t| {l}"))),
+        );
     }
-    match attempt.status {
+    match saved {
+        // ⚠ Published only once saved: a decision cannot rest on an
+        // attempt the local store does not hold.
+        Ok(()) => {
+            if let Some(warning) = conclude(ledger, id, attempt) {
+                said.push(Said::Stderr(format!("warning: {warning}")));
+            }
+        }
+        Err(e) => said.push(Said::Stderr(format!("error: {}", unsaved(&e)))),
+    }
+    let code = match attempt.status {
         AttemptStatus::Completed => 0,
         _ => 1,
-    }
+    };
+    (code, said)
+}
+
+/// What a failed local save says (decision 15).
+fn unsaved(e: &StoreError) -> String {
+    format!(
+        "the attempt ran, but it could not be saved to the local store: {}. It is recorded \
+         nowhere, so it was not published either; what it did is printed above, and what it \
+         cost was spent",
+        fl_core::as_clause(e)
+    )
 }
 
 /// Publish the attempt after its local append (GitHub ledger spec §2.2) and
@@ -170,7 +210,6 @@ mod tests {
     use crate::testing::Flushes;
     use fl_core::decision::Outcome;
     use fl_core::ids::{ProjectId, seq_iri};
-    use fl_core::store::StoreError;
 
     fn attempt(status: AttemptStatus) -> Attempt {
         Attempt {
@@ -215,11 +254,49 @@ mod tests {
     fn an_attempt_that_cannot_be_published_keeps_its_own_exit_code() {
         for (status, code) in [(AttemptStatus::Completed, 0), (AttemptStatus::Timeout, 1)] {
             assert_eq!(
-                finish(&Flushes::refusing(), &seq_iri(50), &attempt(status)),
+                settle(&Flushes::refusing(), &seq_iri(50), &attempt(status)).0,
                 code,
                 "{status:?}"
             );
         }
+    }
+
+    // ⚠ Decision 15: an attempt whose local save fails keeps its own exit
+    // code too, prints its outcome first and the failed save after it as
+    // an error, and is not flushed — a decision cannot rest on an attempt
+    // the local store does not hold.
+    #[test]
+    fn an_attempt_that_cannot_be_saved_keeps_its_own_exit_code_and_is_not_published() {
+        for (status, code) in [(AttemptStatus::Completed, 0), (AttemptStatus::Timeout, 1)] {
+            let ledger = Flushes::failing_append();
+            let (got, said) = settle(&ledger, &seq_iri(50), &attempt(status));
+            assert_eq!(got, code, "{status:?}");
+            assert_eq!(
+                said.first(),
+                Some(&Said::Stdout(format!("{}\t1ms", status.as_wire()))),
+                "the outcome comes first: {said:?}"
+            );
+            assert!(
+                matches!(said.last(), Some(Said::Stderr(l)) if l.starts_with("error: the attempt ran")),
+                "the failed save comes last, as an error: {said:?}"
+            );
+            assert!(
+                ledger.decisions.borrow().is_empty(),
+                "{status:?}: nothing flushed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_save_says_the_attempt_ran_and_names_its_cause_once() {
+        let msg = unsaved(&StoreError::Backend("the disk is full.".into()));
+        assert!(
+            msg.starts_with(
+                "the attempt ran, but it could not be saved to the local store: backend \
+                 failure: the disk is full. It is recorded nowhere"
+            ),
+            "{msg}"
+        );
     }
 
     // Spec §7 and decision 8: kept, not refused; and the next decision
