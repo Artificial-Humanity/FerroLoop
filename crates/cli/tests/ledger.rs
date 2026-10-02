@@ -518,3 +518,180 @@ fn without_the_ledger_key_a_move_publishes_nothing() {
         .stderr(contains("never switched on").not());
     assert_eq!(w.fake.ledger_commits(), 1);
 }
+
+// Spec §3.5: `verify` passes a ledger fl wrote, and names the commit of a
+// hand edit.
+#[test]
+fn verify_passes_a_ledger_fl_wrote_and_names_the_commit_of_a_hand_edit() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    w.fl()
+        .args(["github", "ledger", "verify"])
+        .assert()
+        .success()
+        .stdout(contains("verified\t2 commits"));
+    let (path, _) = w.ledger_files_in("runs").remove(0);
+    let bad = w.fake.hand_commit(&[(path.as_str(), Some("edited\n"))]);
+    w.fl()
+        .args(["github", "ledger", "verify"])
+        .assert()
+        .code(1)
+        .stdout(contains(format!("BAD\t{bad}\trewrites lines of `{path}`")));
+}
+
+#[test]
+fn verify_stops_at_its_limit_and_names_the_flag() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    w.fl()
+        .args(["github", "ledger", "verify", "--max-commits", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("walked back 1 commits").and(contains("--max-commits <n>")));
+}
+
+// Spec §3.5 check 5: one id on two different lines is not a clean ledger.
+#[test]
+fn verify_reports_one_id_on_two_lines_and_exits_1() {
+    use fl_github::ledger::layout;
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let (_, text) = w.ledger_files_in("runs").remove(0);
+    // The published run, about another gate, filed in that gate's own
+    // directory: the same id on a different line. Keys stay sorted, so the
+    // line is byte-for-byte what fl would write.
+    let mut line: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    let other = "urn:uuid:00000000-0000-7000-8000-000000000077";
+    line["gate"] = serde_json::Value::String(other.into());
+    let other_iri = fl_core::Iri::parse(other).unwrap();
+    let seg = layout::segment_path(&layout::dir(layout::Area::Runs, &other_iri), 1);
+    w.fake
+        .hand_commit(&[(seg.as_str(), Some(format!("{line}\n").as_str()))]);
+    w.fl()
+        .args(["github", "ledger", "verify"])
+        .assert()
+        .code(1)
+        .stdout(contains("SAME ID\t").and(contains("verified\t").not()));
+}
+
+#[test]
+fn verify_refuses_a_limit_of_no_commits() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["github", "ledger", "verify", "--max-commits", "0"])
+        .assert()
+        .code(2)
+        .stderr(contains("`--max-commits` must be at least 1"));
+}
+
+// ⚠ Decision 16: on a repository that is not private,
+// `--by` and `--reason` are public for good — warned, then appended.
+#[test]
+fn quarantine_on_a_repository_that_is_not_private_warns_then_appends() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let (path, _) = w.ledger_files_in("runs").remove(0);
+    w.fake.state().repos[0].visibility = "public".into();
+    w.fl()
+        .args([
+            "github",
+            "ledger",
+            "quarantine",
+            &path,
+            "1",
+            "--by",
+            "maintainer",
+            "--reason",
+            "a test",
+        ])
+        .assert()
+        .success()
+        .stderr(contains(
+            "warning: acme/widgets is not private: once appended",
+        ))
+        .stdout(contains(format!("quarantined\t{path}\tline 1\t")));
+    assert!(w.fake.ledger_files()["quarantine.jsonl"].contains(r#""quarantined_by":"maintainer""#));
+}
+
+#[test]
+fn quarantine_on_a_private_repository_says_the_text_is_permanent_without_a_warning() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let (path, _) = w.ledger_files_in("runs").remove(0);
+    w.fl()
+        .args([
+            "github",
+            "ledger",
+            "quarantine",
+            &path,
+            "1",
+            "--by",
+            "maintainer",
+            "--reason",
+            "a test",
+        ])
+        .assert()
+        .success()
+        .stderr(
+            contains(concat!(
+                "note: once appended, `--by` and `--reason` are written to the ledger of ",
+                "acme/widgets"
+            ))
+            .and(contains("warning:").not()),
+        );
+}
+
+// Spec §3.3, §3.6: a quarantined line is skipped and noted by the command
+// whose read skipped it.
+#[test]
+fn a_decision_that_reads_past_a_quarantined_line_notes_it() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let (path, _) = w.ledger_files_in("runs").remove(0);
+    w.fl()
+        .args([
+            "github",
+            "ledger",
+            "quarantine",
+            &path,
+            "1",
+            "--by",
+            "maintainer",
+            "--reason",
+            "a test",
+        ])
+        .assert()
+        .success();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success()
+        .stderr(contains(format!(
+            "note: `{path}` line 1 of the GitHub ledger is quarantined (a test)"
+        )));
+}

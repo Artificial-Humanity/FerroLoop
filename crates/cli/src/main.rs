@@ -649,7 +649,7 @@ fn run(cli: Cli) -> Result<i32> {
             None => cmd::manifest::Binding::Local,
         }
     };
-    match cli.command {
+    let result = match cli.command {
         Command::Project(c) => cmd::project::run(&store, c),
         Command::Gate(c) => cmd::gate::run(&store, c),
         Command::Transition(c) => cmd::transition::run(&store, c),
@@ -660,7 +660,16 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Stats(c) => cmd::stats::run(&store, c),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
+    };
+    // What the GitHub ledger's reads noted without refusing — a quarantined
+    // line skipped (spec §3.3, §3.6) — once each, whatever became of the
+    // command.
+    if let Some(gl) = &github_ledger {
+        for note in gl.take_notes() {
+            eprintln!("note: {note}");
+        }
     }
+    result
 }
 
 #[cfg(test)]

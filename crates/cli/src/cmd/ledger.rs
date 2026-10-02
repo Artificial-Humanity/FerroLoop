@@ -5,8 +5,9 @@
 use crate::ctx::Ctx;
 use anyhow::{Result, bail};
 use clap::Subcommand;
+use fl_exec::stamp;
 use fl_github::GithubLedger;
-use fl_github::ledger::{InitOutcome, Mode, guidance};
+use fl_github::ledger::{InitOutcome, Mode, VERIFY_LIMIT, VerifyPhase, Visibility, guidance};
 use std::path::Path;
 
 #[derive(Subcommand)]
@@ -18,6 +19,27 @@ pub enum Cmd {
         /// confirm.
         #[arg(long)]
         confirm: Option<String>,
+    },
+    /// Walk every commit of `fl/ledger` from its first and check that each
+    /// only adds lines or segments; then check that no id is on two
+    /// different lines. About one request per commit, plus one per segment.
+    Verify {
+        /// Stop after walking back this many commits.
+        #[arg(long, default_value_t = VERIFY_LIMIT)]
+        max_commits: usize,
+    },
+    /// Mark one line of the ledger for readers to skip. Nothing is removed.
+    Quarantine {
+        /// The segment, as a path on the branch (`runs/<key>/<n>.jsonl`).
+        file: String,
+        /// The line, from 1.
+        line: u64,
+        /// Who decided. Written to the ledger permanently.
+        #[arg(long)]
+        by: String,
+        /// Why. Written to the ledger permanently.
+        #[arg(long)]
+        reason: String,
     },
 }
 
@@ -58,6 +80,13 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, root: Option<&Path>) -> Result<i32> {
             };
             init(ctx, gl, root, confirm.as_deref())
         }
+        Cmd::Verify { max_commits } => verify(gl, max_commits),
+        Cmd::Quarantine {
+            file,
+            line,
+            by,
+            reason,
+        } => quarantine(gl, &file, line, &by, &reason),
     }
 }
 
@@ -72,7 +101,7 @@ fn init(ctx: &Ctx<'_>, gl: &GithubLedger<'_>, root: &Path, confirm: Option<&str>
     // learns it there, before anything is created on GitHub.
     crate::cmd::manifest::import_before_ledger_init(ctx.store, root)?;
     let repo = gl.repo().full_name.clone();
-    let outcome = gl.init(&fl_exec::stamp::entry_id(), confirm)?;
+    let outcome = gl.init(&stamp::entry_id(), confirm)?;
     match &outcome {
         InitOutcome::Created { root } => println!("created\tfl/ledger\t{root}"),
         InitOutcome::Adopted { root } => println!("adopted\tfl/ledger\t{root}"),
@@ -116,6 +145,81 @@ fn init(ctx: &Ctx<'_>, gl: &GithubLedger<'_>, root: &Path, confirm: Option<&str>
     Ok(0)
 }
 
+/// How often `verify` says how far it has gotten, in each phase.
+const PROGRESS_EVERY: usize = 100;
+
+/// What `verify` says after `n` steps of `phase`: a line every
+/// [`PROGRESS_EVERY`], in every phase, so a long history never looks like
+/// a hang — not during the walk, nor the compare or the segment reads
+/// after it.
+fn progress_line(phase: VerifyPhase, n: usize) -> Option<String> {
+    (n > 0 && n.is_multiple_of(PROGRESS_EVERY)).then(|| match phase {
+        VerifyPhase::Walk => format!("verify: walked back {n} commits so far"),
+        VerifyPhase::Compare => format!("verify: compared {n} pairs of commits so far"),
+        VerifyPhase::Segments => format!("verify: read {n} segments so far"),
+    })
+}
+
+/// `fl github ledger verify` (spec §3.5). Exit 1 when it found anything.
+fn verify(gl: &GithubLedger<'_>, max_commits: usize) -> Result<i32> {
+    // A limit of 0 could never verify anything.
+    if max_commits == 0 {
+        bail!("`--max-commits` must be at least 1: a walk of no commits verifies nothing");
+    }
+    let v = gl.verify_with(max_commits, &mut |phase, n| {
+        if let Some(line) = progress_line(phase, n) {
+            eprintln!("{line}");
+        }
+    })?;
+    if let Some(bad) = &v.first_bad {
+        println!("BAD\t{}\t{}", bad.commit, bad.what);
+    }
+    if let Some(same) = &v.same_id {
+        println!(
+            "SAME ID\t{}\t`{}` line {}\t`{}` line {}",
+            same.id, same.first.0, same.first.1, same.second.0, same.second.1
+        );
+    }
+    if v.first_bad.is_none() && v.same_id.is_none() {
+        println!(
+            "verified\t{} commits\teach only adds, and no id is on two lines",
+            v.commits
+        );
+        return Ok(0);
+    }
+    println!("walked\t{} commits", v.commits);
+    Ok(1)
+}
+
+/// `fl github ledger quarantine` (spec §3.6).
+///
+/// ⚠ Decision 16: decision 2's projection covers the entries, not the
+/// text a person writes to publish. Said every time; warned before the
+/// append where the repository is not private.
+fn quarantine(gl: &GithubLedger<'_>, file: &str, line: u64, by: &str, reason: &str) -> Result<i32> {
+    let repo = &gl.repo().full_name;
+    match gl.visibility()? {
+        // Said before the library checks the arguments, so worded for the
+        // append that may not happen.
+        Visibility::Private => eprintln!(
+            "note: once appended, `--by` and `--reason` are written to the ledger of {repo} \
+             permanently; nothing is ever removed from it"
+        ),
+        Visibility::NotPrivate => eprintln!(
+            "warning: {repo} is not private: once appended, `--by` and `--reason` are \
+             published permanently — anyone who can read {repo} can read them, and nothing \
+             is ever removed from its ledger"
+        ),
+    }
+    let commit = gl.quarantine(&stamp::entry_id(), &stamp::now(), file, line, by, reason)?;
+    // A fresh id always adds a line, so `quarantine` names a commit; `None`
+    // would mean nothing was added, which the library allows only for an id
+    // already present.
+    let commit = commit.unwrap_or_else(|| "no commit: the line was already there".into());
+    println!("quarantined\t{file}\tline {line}\t{commit}");
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +258,31 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(fake.ledger_head(), None, "nothing was created");
+    }
+
+    // A long walk reports every hundred steps, in every phase, and only
+    // then.
+    #[test]
+    fn progress_is_reported_every_hundred_commits() {
+        // 10 and 110: a multiple of a smaller step is not a hundredth step.
+        for n in [0, 1, 10, 99, 101, 110, 199] {
+            assert_eq!(progress_line(VerifyPhase::Walk, n), None, "{n}");
+        }
+        assert_eq!(
+            progress_line(VerifyPhase::Walk, 100).as_deref(),
+            Some("verify: walked back 100 commits so far")
+        );
+        assert!(progress_line(VerifyPhase::Walk, 200).is_some());
+        assert_eq!(
+            progress_line(VerifyPhase::Compare, 100).as_deref(),
+            Some("verify: compared 100 pairs of commits so far")
+        );
+        assert_eq!(
+            progress_line(VerifyPhase::Segments, 100).as_deref(),
+            Some("verify: read 100 segments so far")
+        );
+        for phase in [VerifyPhase::Compare, VerifyPhase::Segments] {
+            assert_eq!(progress_line(phase, 99), None, "{phase:?}");
+        }
     }
 }
