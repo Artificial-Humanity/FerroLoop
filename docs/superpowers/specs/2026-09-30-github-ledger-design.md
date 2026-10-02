@@ -80,6 +80,12 @@ invocation). Both are append-only evidence.
 14. **An attempt that ran but could not be published exits with the attempt's own code** (0 or 1)
     and prints the publish failure as a warning (2026-10-01). Exit 2 means "refused" everywhere
     else, and a script that retries on it must never re-run an attempt that was already paid for.
+15. **An attempt whose local save fails also keeps the attempt's own exit code** (2026-10-02): fl prints
+    the attempt's outcome first, reports the failed save as an error message, and exits 0 or 1 as the
+    attempt did — for decision 14's reason.
+16. **Quarantine on a repository that is not private warns, then proceeds** (2026-10-02): `--by` and
+    `--reason` are text the person writes to publish; the command says they are published permanently,
+    then appends.
 
 ### 0.2 Out of scope
 
