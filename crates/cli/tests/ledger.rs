@@ -609,6 +609,7 @@ fn quarantine_on_a_repository_that_is_not_private_warns_then_appends() {
         .success();
     let (path, _) = w.ledger_files_in("runs").remove(0);
     w.fake.state().repos[0].visibility = "public".into();
+    w.fake.state().requests.clear();
     w.fl()
         .args([
             "github",
@@ -628,6 +629,53 @@ fn quarantine_on_a_repository_that_is_not_private_warns_then_appends() {
         ))
         .stdout(contains(format!("quarantined\t{path}\tline 1\t")));
     assert!(w.fake.ledger_files()["quarantine.jsonl"].contains(r#""quarantined_by":"maintainer""#));
+    // ⚠ The visibility is read, and the warning given, before fl touches
+    // the ledger: no repository read comes after the first ledger request.
+    let requests = w.fake.state().requests.clone();
+    let first_ledger = requests
+        .iter()
+        .position(|r| r.contains("/git/") || r == "POST /graphql")
+        .expect("the append touched the ledger");
+    let last_repo_read = requests
+        .iter()
+        .rposition(|r| r == "GET /repos/acme/widgets")
+        .expect("the visibility was read");
+    assert!(last_repo_read < first_ledger, "{requests:#?}");
+}
+
+// Decision 2: a visibility that cannot be read is not private; quarantine
+// refuses before it appends anything.
+#[test]
+fn quarantine_whose_visibility_cannot_be_read_refuses_and_appends_nothing() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let (path, _) = w.ledger_files_in("runs").remove(0);
+    let head = w.fake.ledger_head();
+    // The command's first repository read binds the tracker; the second is
+    // the visibility read, which fails.
+    w.fake.state().fail_repo_read_after = Some(1);
+    w.fl()
+        .args([
+            "github",
+            "ledger",
+            "quarantine",
+            &path,
+            "1",
+            "--by",
+            "maintainer",
+            "--reason",
+            "a test",
+        ])
+        .assert()
+        .code(2)
+        .stderr(contains("when fl read the repository's visibility"))
+        .stdout(contains("quarantined\t").not());
+    assert_eq!(w.fake.ledger_head(), head, "nothing was appended");
+    assert!(!w.fake.ledger_files().contains_key("quarantine.jsonl"));
 }
 
 #[test]

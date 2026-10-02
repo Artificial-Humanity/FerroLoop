@@ -71,6 +71,10 @@ pub struct State {
     /// must still refuse it. One-shot.
     pub graphql_error_next: Option<String>,
     pub fail_repo_read: bool,
+    /// The repository read that follows this many more answers 500;
+    /// `Some(0)` is the next one. Lets a test pass over the reads a command
+    /// makes before the one it means to fail. One-shot.
+    pub fail_repo_read_after: Option<u32>,
     pub drop_labels: bool,
     pub fail_after_create: bool,
     /// The create lands, then the connection breaks mid-answer.
@@ -802,6 +806,14 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             if s.fail_repo_read {
                 s.fail_repo_read = false;
                 return answer(500, json!({"message": "fake repository failure"}));
+            }
+            match s.fail_repo_read_after {
+                Some(0) => {
+                    s.fail_repo_read_after = None;
+                    return answer(500, json!({"message": "fake repository failure"}));
+                }
+                Some(n) => s.fail_repo_read_after = Some(n - 1),
+                None => {}
             }
             let name = format!("{o}/{r}");
             if let Some(repo) = s.repo_named(&name) {
