@@ -1093,3 +1093,138 @@ fn an_attempt_whose_publish_fails_warns_keeps_its_exit_code_and_rides_with_the_n
         "the first attempt rode with the second"
     );
 }
+
+// Spec §2.5: the report merges the local store and GitHub by id — one
+// attempt published is counted once — and adds no note.
+#[test]
+fn stats_in_mode_b_counts_a_published_attempt_once_and_adds_no_note() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["attempt", "1", "--budget-usd-micros", "0"])
+        .assert()
+        .code(1);
+    w.fl()
+        .args(["stats", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("attempts: 1\n").and(contains("note: this covers").not()));
+}
+
+// ⚠ Spec §2.5: unreachable is not a total.
+#[test]
+fn stats_when_github_cannot_be_reached_covers_the_local_store_and_says_so() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().down = true;
+    w.fl()
+        .args(["stats", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "note: this covers the local store only, because GitHub could not be read",
+        ));
+}
+
+#[test]
+fn stats_under_db_says_it_covers_the_local_store_only() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .arg("--db")
+        .arg(w.one.store())
+        .args(["stats", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("because --db (or $FL_DB) names the store"));
+}
+
+#[test]
+fn stats_without_the_ledger_key_on_a_store_that_records_one_says_so() {
+    let w = World::new();
+    w.ready();
+    w.configure(&w.one, false);
+    w.fl()
+        .args(["stats", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains(
+            "names no `ledger = \"github\"`, though this store records",
+        ));
+}
+
+// A project named by IRI from a directory bound to another store: the
+// command runs on the project's store, which is not this directory's, so
+// it does not read the GitHub ledger from here — even though this
+// directory's binding names one.
+#[test]
+fn stats_on_another_projects_store_says_it_covers_the_local_store_only() {
+    let w = World::new();
+    w.ready();
+    let iri = {
+        let store = fl_store::RedbStore::open(&w.one.store()).unwrap();
+        store.list_projects().unwrap()[0]
+            .id
+            .iri()
+            .as_str()
+            .to_string()
+    };
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = w.one.home.path().join("config/fl/config.toml");
+    let mut cfg = fs::read_to_string(&path).unwrap();
+    cfg.push_str(&format!(
+        "[[project]]\nroot = \"{}\"\nstore = \"{}\"\n\
+         tracker = {{ github = \"acme/widgets\", credential = \"env\", ledger = \"github\" }}\n",
+        elsewhere.path().canonicalize().unwrap().display(),
+        w.one.home.path().join("elsewhere.redb").display()
+    ));
+    fs::write(&path, cfg).unwrap();
+    w.fl()
+        .current_dir(elsewhere.path())
+        .args(["stats", "--project", &iri])
+        .assert()
+        .success()
+        .stdout(contains(
+            "because the project is held by another project's store",
+        ));
+}
+
+#[test]
+fn stats_on_a_project_without_a_github_ledger_adds_no_note_and_asks_nothing() {
+    let w = World::bound(false);
+    w.gated();
+    let before = w.fake.state().requests.len();
+    w.fl()
+        .args(["stats", "--project", "1"])
+        .assert()
+        .success()
+        .stdout(contains("attempts: 0\n").and(contains("note: this covers").not()));
+    assert_eq!(w.fake.state().requests.len(), before, "no request");
+}
+
+// A ledger never set up is lasting, not "cannot be read" (spec §2.5): an
+// error naming `init`, never a local count.
+#[test]
+fn stats_on_a_ledger_never_set_up_is_refused_naming_init() {
+    let w = World::new();
+    w.gated();
+    w.fl()
+        .args(["stats", "--project", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("has no GitHub ledger yet"));
+}
+
+// Only GitHub that cannot be reached falls back: a missing credential is
+// the person's to fix, and refused as it is for every tracker command.
+#[test]
+fn stats_with_no_credential_is_refused_not_counted_locally() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .env_remove("FL_GITHUB_TOKEN")
+        .args(["stats", "--project", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("FL_GITHUB_TOKEN or GITHUB_TOKEN"));
+}

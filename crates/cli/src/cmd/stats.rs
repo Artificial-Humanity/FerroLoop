@@ -3,11 +3,22 @@ use anyhow::Result;
 use clap::Args;
 use fl_core::ids::ProjectId;
 use fl_core::log::Attempt;
-use fl_core::split::Coverage;
+use fl_core::split::{Coverage, SplitLedger};
 use fl_core::store::Ledger;
 use fl_core::{Iri, Kind};
 use fl_store::RedbStore;
 use std::collections::BTreeMap;
+
+/// Where `fl stats` reads attempts from (GitHub ledger spec §2.5, §2.6).
+pub enum Source<'a> {
+    /// No GitHub ledger is involved: the local store is the whole ledger.
+    Local,
+    /// The store records a GitHub ledger this command does not read, and
+    /// why: the count covers the local store only, and says so.
+    LocalOnly(String),
+    /// The local store and the project's GitHub ledger, merged.
+    Split(&'a SplitLedger<'a>),
+}
 
 #[derive(Args)]
 pub struct Cmd {
@@ -32,18 +43,21 @@ impl Cmd {
     }
 }
 
-pub fn run(store: &RedbStore, cmd: Cmd) -> Result<i32> {
+pub fn run(store: &RedbStore, cmd: Cmd, source: Source<'_>) -> Result<i32> {
     let project = ProjectId(refs::resolve(
         store,
         store.label(),
         Kind::Project,
         &cmd.project,
     )?);
-    // The local store is the whole ledger here. Once a project binds the
-    // GitHub ledger, this reads through a `SplitLedger` and passes the
-    // coverage it answers.
-    let attempts = store.attempts(&project)?;
-    for line in report(&attempts, &Coverage::Complete) {
+    let (attempts, coverage) = match source {
+        Source::Local => (store.attempts(&project)?, Coverage::Complete),
+        Source::LocalOnly(reason) => (store.attempts(&project)?, Coverage::LocalOnly { reason }),
+        // ⚠ Falls back to the local store only when GitHub could not be
+        // read; a damaged or missing ledger is an error.
+        Source::Split(split) => split.attempts_for_stats(&project)?,
+    };
+    for line in report(&attempts, &coverage) {
         println!("{line}");
     }
     Ok(0)

@@ -408,6 +408,25 @@ fn store_tracker(
     Ok(trackers.first().copied().flatten().cloned())
 }
 
+/// Why `fl stats` reads only the local store of a store that records a
+/// GitHub ledger root (GitHub ledger spec §2.5): a count that silently
+/// omitted GitHub would read as the total.
+fn local_only_reason(explicit: bool, elsewhere: bool) -> String {
+    if explicit {
+        "--db (or $FL_DB) names the store, so fl reads neither the project's config entry nor \
+         its GitHub ledger"
+            .into()
+    } else if elsewhere {
+        "the project is held by another project's store, so fl does not read its GitHub \
+         ledger from here"
+            .into()
+    } else {
+        "this project's tracker binding names no `ledger = \"github\"`, though this store \
+         records a GitHub ledger"
+            .into()
+    }
+}
+
 /// The tracker for a command that reads or writes records or findings, and
 /// works on the store at `chosen`.
 ///
@@ -493,6 +512,7 @@ fn run(cli: Cli) -> Result<i32> {
         None => cwd.clone(),
     };
     let needs_tracker = cli.command.needs_tracker();
+    let is_stats = matches!(cli.command, Command::Stats(_));
     let explicit = explicit_db(cli.db);
     // The project's config entry, read once, and only when something needs
     // it: without `--db`/`$FL_DB` it picks the store; for a command that
@@ -549,8 +569,19 @@ fn run(cli: Cli) -> Result<i32> {
     // this directory's tracker would write one project's records into the
     // other's tracker. Before the store is opened: a refused command writes
     // nothing to it.
+    // `fl stats` reads the GitHub ledger when the store it runs on is this
+    // directory's and the binding names the GitHub ledger (GitHub ledger
+    // spec §2.5). Under `--db`/`$FL_DB` the entry is not read for `stats`,
+    // so `here_binding` is `None` and this is false already.
+    let stats_reads_github = is_stats
+        && path == bound
+        && here_binding
+            .as_ref()
+            .is_some_and(config::TrackerBinding::github_ledger);
     let binding = if needs_tracker {
         tracker_for(&path, entry.as_ref(), entries, explicit_given)?
+    } else if stats_reads_github {
+        store_tracker(&path, entries)?
     } else {
         None
     };
@@ -570,9 +601,24 @@ fn run(cli: Cli) -> Result<i32> {
     }
     let store = RedbStore::open(&path)
         .with_context(|| format!("could not open the store at {}", path.display()))?;
-    let github = match (&binding, needs_tracker) {
-        (Some(b), true) => Some(open_github(b, cfg.github.as_ref(), &store)?),
-        _ => None,
+    // Why `fl stats` could not read GitHub, when it could not reach it.
+    let mut unread: Option<String> = None;
+    let github = match &binding {
+        Some(b) if needs_tracker => Some(open_github(b, cfg.github.as_ref(), &store)?),
+        // ⚠ A report falls back to the local store, and says so, when
+        // GitHub cannot be reached (§2.5); any other failure is an error.
+        Some(b) => match open_github(b, cfg.github.as_ref(), &store) {
+            Ok(gh) => Some(gh),
+            Err(e)
+                if e.downcast_ref::<StoreError>()
+                    .is_some_and(StoreError::is_transient) =>
+            {
+                unread = Some(format!("GitHub could not be read: {e:#}"));
+                None
+            }
+            Err(e) => return Err(e),
+        },
+        None => None,
     };
     // The GitHub ledger, when the binding names it (GitHub ledger spec
     // §1.5): over the tracker's client — one credential, one origin guard
@@ -650,6 +696,17 @@ fn run(cli: Cli) -> Result<i32> {
             None => cmd::manifest::Binding::Local,
         }
     };
+    let stats_source = if !is_stats {
+        cmd::stats::Source::Local
+    } else if let Some(s) = &split {
+        cmd::stats::Source::Split(s)
+    } else if let Some(reason) = unread {
+        cmd::stats::Source::LocalOnly(reason)
+    } else if store.holds_a_ledger_root()? {
+        cmd::stats::Source::LocalOnly(local_only_reason(explicit_given, path != bound))
+    } else {
+        cmd::stats::Source::Local
+    };
     let result = match cli.command {
         Command::Project(c) => cmd::project::run(&store, c),
         Command::Gate(c) => cmd::gate::run(&store, c),
@@ -658,7 +715,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Check(c) => cmd::check::run(&ctx, c),
         Command::Finding(c) => cmd::finding::run(&ctx, c),
         Command::Attempt(c) => cmd::attempt::run(&ctx, c),
-        Command::Stats(c) => cmd::stats::run(&store, c),
+        Command::Stats(c) => cmd::stats::run(&store, c, stats_source),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
     };
