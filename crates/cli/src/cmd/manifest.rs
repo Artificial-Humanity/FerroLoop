@@ -468,6 +468,70 @@ mod tests {
         assert!(err.to_string().contains("belongs to project"), "{err}");
     }
 
+    // Spec §6.1 step 4, §7: a manifest whose `ledger_root` carries a
+    // different commit for the same node is not the anchor this machine
+    // was given, so it is refused rather than silently accepted.
+    #[test]
+    fn ensure_manifest_carries_root_refuses_another_commit_for_the_same_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let p = store
+            .add_project(&root.path().display().to_string())
+            .unwrap();
+        store.set_ledger_root("R_1", &"a".repeat(40)).unwrap();
+        let m = store
+            .export_manifest(
+                &p,
+                "0123456789abcdef0123456789abcdef01234567",
+                0,
+                Some("R_1"),
+            )
+            .unwrap();
+        let path = root.path().join(MANIFEST_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, m.to_json()).unwrap();
+
+        let err = ensure_manifest_carries_root(&store, &p, "R_1", &"b".repeat(40)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not carry the GitHub ledger's first commit"),
+            "{err}"
+        );
+    }
+
+    // Spec §6.1 step 4, §7: a manifest whose `ledger_root` carries a
+    // different node's anchor is not the anchor this machine was given,
+    // even when the commit text matches.
+    #[test]
+    fn ensure_manifest_carries_root_refuses_another_node_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let p = store
+            .add_project(&root.path().display().to_string())
+            .unwrap();
+        store.set_ledger_root("R_2", &"a".repeat(40)).unwrap();
+        let m = store
+            .export_manifest(
+                &p,
+                "0123456789abcdef0123456789abcdef01234567",
+                0,
+                Some("R_2"),
+            )
+            .unwrap();
+        let path = root.path().join(MANIFEST_PATH);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, m.to_json()).unwrap();
+
+        let err = ensure_manifest_carries_root(&store, &p, "R_1", &"a".repeat(40)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("does not carry the GitHub ledger's first commit"),
+            "{err}"
+        );
+    }
+
     // A manifest outside a git working tree is refused before it is
     // imported: the gates it carries run over a working tree.
     #[test]

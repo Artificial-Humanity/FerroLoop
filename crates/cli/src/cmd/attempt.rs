@@ -262,14 +262,17 @@ mod tests {
     }
 
     // ⚠ Decision 15: an attempt whose local save fails keeps its own exit
-    // code too, prints its outcome first and the failed save after it as
-    // an error, and is not flushed — a decision cannot rest on an attempt
-    // the local store does not hold.
+    // code too, prints its outcome first, then every excerpt line, and the
+    // failed save last as an error — never spliced between the status and
+    // the excerpt — and is not flushed — a decision cannot rest on an
+    // attempt the local store does not hold.
     #[test]
     fn an_attempt_that_cannot_be_saved_keeps_its_own_exit_code_and_is_not_published() {
         for (status, code) in [(AttemptStatus::Completed, 0), (AttemptStatus::Timeout, 1)] {
             let ledger = Flushes::failing_append();
-            let (got, said) = settle(&ledger, &seq_iri(50), &attempt(status));
+            let mut a = attempt(status);
+            a.output_excerpt = Some("one\ntwo\nthree".into());
+            let (got, said) = settle(&ledger, &seq_iri(50), &a);
             assert_eq!(got, code, "{status:?}");
             assert_eq!(
                 said.first(),
@@ -277,8 +280,19 @@ mod tests {
                 "the outcome comes first: {said:?}"
             );
             assert!(
-                matches!(said.last(), Some(Said::Stderr(l)) if l.starts_with("error: the attempt ran")),
-                "the failed save comes last, as an error: {said:?}"
+                said.len() >= 3,
+                "the status, every excerpt line, and the save error: {said:?}"
+            );
+            let (last, before) = said.split_last().expect("not empty");
+            for line in before {
+                assert!(
+                    matches!(line, Said::Stdout(_)),
+                    "every line before the save error is stdout: {said:?}"
+                );
+            }
+            assert!(
+                matches!(last, Said::Stderr(l) if l.starts_with("error: the attempt ran")),
+                "the save error is last, and the only stderr line: {said:?}"
             );
             assert!(
                 ledger.decisions.borrow().is_empty(),

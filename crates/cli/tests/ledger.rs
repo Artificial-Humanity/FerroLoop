@@ -408,6 +408,14 @@ fn init_adopts_an_existing_branch_only_once_its_first_commit_is_confirmed() {
         .assert()
         .success()
         .stdout(contains(format!("adopted\tfl/ledger\t{root}")));
+    // Re-running with the same, matching root on a machine that already
+    // adopted it succeeds: it is the ordinary "already set up" case, not a
+    // second confirmation.
+    w.fl()
+        .args(["github", "ledger", "init", "--confirm", &root])
+        .assert()
+        .success()
+        .stdout(contains(format!("set up\tfl/ledger\t{root}")));
 }
 
 // Spec §6.2: `whoami` states the ledger, and the mode in force.

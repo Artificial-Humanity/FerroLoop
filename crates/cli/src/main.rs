@@ -226,16 +226,12 @@ fn explicit_db(flag: Option<PathBuf>) -> Option<PathBuf> {
 /// candidate list at all.
 ///
 /// ⚠ Every tier ends the same way: the parent directory of the resolved path
-/// is created if it does not exist. Earlier this only happened on the
-/// `$XDG_DATA_HOME`/`$HOME` branch, so setting `$FL_DB` (or `--db`) to a path
-/// whose directory did not exist yet fell straight through to a raw redb I/O
-/// error — the same class of silent inconsistency this task's actionable-
-/// refusal rule exists to close, just moved one layer down into the
-/// database open call instead of being refused here. Rather than add a
-/// fourth distinct refusal message for that case, every tier now gets the
-/// same treatment `$XDG_DATA_HOME`/`$HOME` already had: create the directory
-/// that will hold the store. `--db path/to/db` and `$FL_DB=path/to/db`
-/// behave identically to each other and to the XDG fallback again.
+/// is created if it does not exist. Without that, naming a path whose
+/// directory does not exist yet — via `--db` or `$FL_DB`, not only the
+/// `$XDG_DATA_HOME`/`$HOME` fallback — would fall straight through to a raw
+/// redb I/O error instead of a clear refusal from this function. `--db
+/// path/to/db` and `$FL_DB=path/to/db` behave identically to each other and
+/// to the XDG fallback.
 fn db_path(explicit: Option<PathBuf>, configured: Option<PathBuf>) -> Result<(PathBuf, bool)> {
     let (path, confined) = if let Some(p) = explicit {
         (p, true)
