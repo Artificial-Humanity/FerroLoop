@@ -258,6 +258,12 @@ pub struct State {
     pub ref_404_next: u32,
     /// Every recursive tree listing says GitHub cut it short. A setting.
     pub truncate_trees: bool,
+    /// Every git data request answers 409, as for a repository with no
+    /// commit. A setting.
+    pub empty_repository: bool,
+    /// The next commit lands, and its answer is GitHub's timeout error: a
+    /// 200 with no data and an error saying it may be a timeout. One-shot.
+    pub timeout_after_next_commit: bool,
 }
 
 pub struct FakeGithub {

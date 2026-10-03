@@ -562,6 +562,61 @@ mod tests {
         assert_eq!(local.cutover("R_1").unwrap(), Some(entry_iri(5)));
     }
 
+    // ⚠ A repository with no commit keeps no branch: `init` says to push
+    // a first commit, and creates nothing. A decision there reads the same
+    // refusal.
+    #[test]
+    fn init_on_an_empty_repository_says_to_push_a_first_commit_and_creates_nothing() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().empty_repository = true;
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local)
+            .init(&entry_iri(1), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is empty: GitHub keeps no branch until"),
+            "{err}"
+        );
+        assert!(
+            err.contains("then run `fl github ledger init` again"),
+            "{err}"
+        );
+        assert!(fake.state().git.trees.is_empty(), "no tree was created");
+        assert_eq!(local.cutover("R_1").unwrap(), None);
+
+        let known = MemStore::default();
+        known
+            .set_ledger_root("R_1", "0123456789abcdef0123456789abcdef01234567")
+            .unwrap();
+        let err = open(&c, &known).check_head().unwrap_err().to_string();
+        assert!(
+            err.contains("is empty: GitHub keeps no branch until"),
+            "{err}"
+        );
+    }
+
+    // A 409 that does not say the repository is empty stays the error it
+    // was: no "push a first commit" for a conflict of another kind.
+    #[test]
+    fn a_409_for_another_reason_is_not_read_as_an_empty_repository() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().body_next.push((
+            "/git/ref/heads/fl".into(),
+            409,
+            json!({"message": "Conflict"}),
+        ));
+        let local = MemStore::default();
+        let c = client(&fake);
+        let err = open(&c, &local)
+            .init(&entry_iri(1), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("GitHub answered 409"), "{err}");
+        assert!(!err.contains("is empty"), "{err}");
+    }
+
     // Spec §6.1 step 2.
     #[test]
     fn init_refuses_when_a_branch_named_fl_exists() {

@@ -121,11 +121,29 @@ impl GithubLedger<'_> {
     /// The commit `branch` points at; `None` when there is no such branch.
     /// ⚠ An exact name: `fl` is not `fl/ledger`.
     pub(crate) fn branch_head(&self, branch: &str) -> Result<Option<String>, StoreError> {
-        let r = self.client.send(
+        let r = match self.client.send(
             Method::Get,
             &self.path(&format!("/git/ref/heads/{branch}")),
             None,
-        )?;
+        ) {
+            Ok(r) => r,
+            // ⚠ Modelled: GitHub answers a ref read on a repository with no
+            // commit 409 "Git Repository is empty". No retry cures it.
+            // Confirmed by live test
+            // `an_empty_repository_is_refused_naming_a_first_commit`.
+            Err(StoreError::Backend(m))
+                if m.starts_with("GitHub answered 409 ")
+                    && m.contains("Git Repository is empty") =>
+            {
+                let repo = &self.repo.full_name;
+                return Err(backend(format!(
+                    "the repository {repo} is empty: GitHub keeps no branch until a repository \
+                     has a first commit, so fl cannot keep a ledger there yet. Push a first \
+                     commit to {repo} (a README will do), then run `fl github ledger init` again"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
         match r.status {
             200 => r
                 .body
