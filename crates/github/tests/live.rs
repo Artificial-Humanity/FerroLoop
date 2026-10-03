@@ -8,7 +8,8 @@
 //! again on what earlier runs left.
 //!
 //! - `FL_GITHUB_LIVE_REPO`: a private repository (the tracker's tests, and
-//!   most of the ledger's).
+//!   most of the ledger's) holding at least one commit: `init` refuses an
+//!   empty repository.
 //! - `FL_GITHUB_LIVE_PUBLIC_REPO`: a public repository holding only test
 //!   data and one commit, with an active ruleset on `refs/heads/fl/ledger`
 //!   holding `non_fast_forward` and `deletion` (`fl github ledger init`
@@ -22,6 +23,11 @@
 //!
 //! A ledger test whose variable is unset skips, saying which; the tracker's
 //! tests still fail without `FL_GITHUB_LIVE_REPO`.
+//!
+//! GitHub's replicas can lag a write. fl's ledger allows for that on its own
+//! path; a test that writes around fl, or reads GitHub directly after a
+//! write, first waits until GitHub shows the write, and fails only once the
+//! same allowance — five reads, a second apart — is spent.
 //!
 //! Export each token in your shell first, from a secret store (never typed
 //! inline, where shell history keeps it), then:
@@ -46,7 +52,7 @@ use fl_core::ids::{GateId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::GateRun;
 use fl_core::model::State;
-use fl_core::split::{Batch, RemoteLedger};
+use fl_core::split::{Batch, LedgerCache, RemoteLedger};
 use fl_core::store::Bindings;
 use fl_core::store::{StoreError, Tracker};
 use fl_core::verdict::Verdict;
@@ -152,6 +158,25 @@ const APPEND: &str = "mutation ledgerAppend($input: CreateCommitOnBranchInput!) 
 /// Where the first run on a repository leaves the ledger's first commit.
 const ROOT_BRANCH: &str = "fl-live/root";
 
+/// GitHub's replicas can lag a write: read again this many times, this far
+/// apart, before a lag counts.
+const LAG_READS: u32 = 5;
+const LAG_PAUSE: Duration = Duration::from_secs(1);
+
+/// `read`, then read again within the lag allowance until `done` holds.
+/// Returns the last read, whether `done` held or not: the caller asserts.
+fn eventually<T>(mut read: impl FnMut() -> T, done: impl Fn(&T) -> bool) -> T {
+    let mut got = read();
+    for _ in 0..LAG_READS {
+        if done(&got) {
+            break;
+        }
+        std::thread::sleep(LAG_PAUSE);
+        got = read();
+    }
+    got
+}
+
 /// Whether `var` is unset: then the test skips, saying which variable it
 /// needs. A resource the owner has not provided is no failure of fl's.
 fn unset(var: &str) -> bool {
@@ -218,11 +243,10 @@ impl Live {
         Live::on("FL_GITHUB_LIVE_REPO", true)
     }
 
-    /// GitHub's replicas can lag a write: read again five times, a second
-    /// apart, before a lag counts.
+    /// The ledger, with the same lag allowance the tests take.
     fn ledger(&self) -> GithubLedger<'_> {
         GithubLedger::new(&self.client, self.repo.clone(), &self.local)
-            .with_lag(5, Duration::from_secs(1))
+            .with_lag(LAG_READS, LAG_PAUSE)
     }
 
     fn path(&self, rest: &str) -> String {
@@ -255,6 +279,58 @@ impl Live {
         self.head_of(BRANCH).expect("the ledger's branch")
     }
 
+    /// Waits until the ledger's branch shows `oid`, within the lag
+    /// allowance; a branch that never does fails the test, naming `oid`.
+    fn settle(&self, oid: &str) {
+        let seen = eventually(|| self.head_of(BRANCH), |h| h.as_deref() == Some(oid));
+        assert_eq!(
+            seen.as_deref(),
+            Some(oid),
+            "the ledger's branch did not show commit {oid} within {LAG_READS} more reads, a \
+             second apart"
+        );
+    }
+
+    /// The commit this machine's last publish recorded, once GitHub shows
+    /// it on the ledger's branch.
+    fn published_head(&self) -> String {
+        let head = self
+            .local
+            .last_head(&self.repo.node_id)
+            .unwrap()
+            .expect("a head this machine recorded");
+        self.settle(&head);
+        head
+    }
+
+    /// The parents of commit `oid`. A commit never changes, so a lagging
+    /// replica can only not have it yet: read until it does.
+    fn parents(&self, oid: &str) -> Vec<String> {
+        let r = eventually(
+            || {
+                self.client
+                    .send(
+                        Method::Get,
+                        &self.path(&format!("/git/commits/{oid}")),
+                        None,
+                    )
+                    .expect("read a commit")
+            },
+            |r| r.status == 200,
+        );
+        assert_eq!(
+            r.status, 200,
+            "GitHub answered {} for commit {oid}",
+            r.status
+        );
+        r.body["parents"]
+            .as_array()
+            .expect("its parents")
+            .iter()
+            .map(|p| p["sha"].as_str().expect("a parent").to_string())
+            .collect()
+    }
+
     /// This `Live`'s record, for entries to be tied to.
     fn record(&self) -> RecordId {
         self.record.clone()
@@ -283,7 +359,10 @@ impl Live {
             return root;
         }
         let root = match l.init(&fresh(), None).expect("init") {
-            InitOutcome::Created { root } => root,
+            InitOutcome::Created { root } => {
+                self.settle(&root);
+                root
+            }
             InitOutcome::Confirm { root } => {
                 match l.init(&fresh(), Some(&root)).expect("confirm") {
                     InitOutcome::Adopted { root } => root,
@@ -305,7 +384,7 @@ impl Live {
     }
 
     /// One commit on the ledger writing `text` at `path`, as anyone with
-    /// write access can. Returns it.
+    /// write access can. Returns it once GitHub shows it.
     fn hand_commit(&self, path: &str, text: &str) -> String {
         let answer = self
             .client
@@ -325,13 +404,15 @@ impl Live {
             )
             .expect("an answer");
         assert!(answer.errors.is_empty(), "{:?}", answer.errors);
-        answer
+        let oid = answer
             .data
             .as_ref()
             .and_then(|d| d.pointer("/createCommitOnBranch/commit/oid"))
             .and_then(Value::as_str)
             .expect("the commit")
-            .to_string()
+            .to_string();
+        self.settle(&oid);
+        oid
     }
 
     /// The id of what a POST to `rest` created.
@@ -709,15 +790,7 @@ fn init_sets_up_a_ledger_on_a_private_repository() {
     }
     let live = Live::private();
     let root = live.set_up();
-    let commit = live
-        .client
-        .send(
-            Method::Get,
-            &live.path(&format!("/git/commits/{root}")),
-            None,
-        )
-        .unwrap();
-    assert_eq!(commit.body["parents"], json!([]), "an orphan");
+    assert_eq!(live.parents(&root), Vec::<String>::new(), "an orphan");
     let tree = live
         .client
         .send(Method::Get, &live.path(&format!("/git/trees/{root}")), None)
@@ -767,10 +840,13 @@ fn two_flushes_racing_both_land() {
     if unset("FL_GITHUB_LIVE_REPO") {
         return;
     }
-    Live::private().set_up();
+    let live = Live::private();
+    live.set_up();
     let gate = GateId(fresh());
     let barrier = Barrier::new(2);
-    let ids: Vec<Iri> = std::thread::scope(|s| {
+    // ⚠ A racer cannot wait for its own commit to show: the other's may
+    // already stand on top of it. Each returns the head it recorded instead.
+    let (ids, heads): (Vec<Iri>, Vec<String>) = std::thread::scope(|s| {
         let racers: Vec<_> = (0..2)
             .map(|i| {
                 let (gate, barrier) = (&gate, &barrier);
@@ -783,12 +859,26 @@ fn two_flushes_racing_both_land() {
                     live.ledger()
                         .publish(&batch(&live.record(), vec![run]))
                         .expect("each flush lands");
-                    id
+                    let head = live.local.last_head(&live.repo.node_id).unwrap();
+                    (id, head.expect("the head this racer's flush recorded"))
                 })
             })
             .collect();
-        racers.into_iter().map(|h| h.join().unwrap()).collect()
+        racers.into_iter().map(|h| h.join().unwrap()).unzip()
     });
+    // Two commits, one on top of the other: the later is the one whose
+    // parent is the earlier.
+    assert_ne!(heads[0], heads[1], "each flush is a commit of its own");
+    let later = if live.parents(&heads[0]).contains(&heads[1]) {
+        &heads[0]
+    } else {
+        assert!(
+            live.parents(&heads[1]).contains(&heads[0]),
+            "neither racer's commit stands on the other's: {heads:?}"
+        );
+        &heads[1]
+    };
+    live.settle(later);
     let reader = Live::private();
     reader.set_up();
     let back: Vec<Option<Iri>> = reader
@@ -827,7 +917,7 @@ fn create_commit_on_branch_is_refused_when_the_head_moved() {
         vec![run_on(&GateId(fresh()), &record, "moves the head")],
     ))
     .unwrap();
-    let after = live.head();
+    let after = live.published_head();
     assert_ne!(before, after);
     let probe = run_on(&GateId(fresh()), &record, "a stale append");
     let path = layout::segment_path(&layout::dir(Area::Runs, probe.gate.iri()), 1);
@@ -882,6 +972,7 @@ fn a_hand_edit_is_detected_and_named() {
     let run = run_on(&gate, &record, "as published");
     l.publish(&batch(&record, vec![run.clone()]))
         .expect("published");
+    live.published_head();
     assert_eq!(l.runs(&gate).expect("read, and cached").len(), 1);
     let seg = layout::segment_path(&layout::dir(Area::Runs, gate.iri()), 1);
     let mut edited = run;
@@ -1017,11 +1108,9 @@ fn a_branch_under_the_ledger_branch_is_found() {
             .map(|r| r["ref"].as_str().expect("a ref").to_string())
             .collect()
     };
-    let found = under("fl-live/");
-    assert!(
-        found.contains(&format!("refs/heads/{ROOT_BRANCH}")),
-        "{found:?}"
-    );
+    let root_ref = format!("refs/heads/{ROOT_BRANCH}");
+    let found = eventually(|| under("fl-live/"), |f| f.contains(&root_ref));
+    assert!(found.contains(&root_ref), "{found:?}");
     assert!(
         found.iter().all(|r| r.starts_with("refs/heads/fl-live/")),
         "{found:?}"
@@ -1100,19 +1189,28 @@ fn a_near_full_segment_lands_through_create_commit_on_branch() {
     assert!(bytes > SEGMENT_LIMIT - 16 * 1024, "near full: {bytes}");
     l.publish(&batch(&record, first.clone()))
         .expect("a near-full segment lands");
+    live.published_head();
     let second: Vec<GateRun> = (0..4).map(|_| run_on(&gate, &record, &excerpt)).collect();
     l.publish(&batch(&record, second.clone()))
         .expect("the rollover lands");
+    let head = live.published_head();
     assert_eq!(l.runs(&gate).unwrap().len(), first.len() + second.len());
     let dir = layout::dir(Area::Runs, gate.iri());
-    let listing = live
-        .client
-        .send(
-            Method::Get,
-            &live.path(&format!("/contents/{dir}?ref=fl%2Fledger")),
-            None,
-        )
-        .unwrap();
+    // At the commit itself, which never changes: a lagging replica can
+    // only not have it yet.
+    let listing = eventually(
+        || {
+            live.client
+                .send(
+                    Method::Get,
+                    &live.path(&format!("/contents/{dir}?ref={head}")),
+                    None,
+                )
+                .unwrap()
+        },
+        |r| r.status == 200,
+    );
+    assert_eq!(listing.status, 200, "the directory at {head}");
     let names: Vec<&str> = listing
         .body
         .as_array()
