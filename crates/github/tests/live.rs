@@ -57,13 +57,16 @@ use fl_core::store::Bindings;
 use fl_core::store::{StoreError, Tracker};
 use fl_core::verdict::Verdict;
 use fl_github::ledger::layout::{self, Area, BRANCH, Line, SEGMENT_LIMIT};
+use fl_github::ledger::render::{self, DecisionView, RunRow};
 use fl_github::ledger::{InitOutcome, Mode};
+use fl_github::ledger::{Visibility, ruleset_command};
 use fl_github::{
     AppCredentials, Client, Credentials, DEFAULT_API, EnvToken, GithubTracker, Method,
 };
 use fl_github::{GithubLedger, Repo};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Barrier;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1219,4 +1222,375 @@ fn a_near_full_segment_lands_through_create_commit_on_branch() {
         .filter_map(|e| e["name"].as_str())
         .collect();
     assert_eq!(names, vec!["1.jsonl", "2.jsonl"]);
+}
+
+impl Live {
+    /// The public throwaway with a ruleset on `fl/ledger`,
+    /// `FL_GITHUB_LIVE_PUBLIC_REPO`.
+    fn public() -> Live {
+        Live::on("FL_GITHUB_LIVE_PUBLIC_REPO", false)
+    }
+}
+
+/// ⚠ Spec §4.2, §4.3, §8.4: a decision comment posted on an fl record
+/// keeps its marker through GitHub's storage and is found among the
+/// issue's comments as fl's own; and GitHub's rendering of it makes no
+/// mention and no issue link of its `@`, `#` and `GH-` text. A control
+/// comment posted raw must render its `#<n>` as a link, so the check
+/// cannot pass by recognising nothing.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn a_decision_comment_round_trips_with_its_marker() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    live.set_up();
+    let record = tracker()
+        .add_record(&project(), "fl live test: a decision comment")
+        .unwrap();
+    let decision = Decision {
+        id: fresh(),
+        at: now(),
+        record: record.clone(),
+        finding: None,
+        outcome: Outcome::Check {
+            transition: TransitionOutcome {
+                transition: "live".into(),
+                passed: true,
+            },
+        },
+        rests_on: vec![],
+    };
+    let (_, n) = fl_github::meta::parse_issue_url(record.iri()).expect("an issue URL");
+    let view = DecisionView {
+        decision: decision.clone(),
+        by: live.by(),
+        commit: None,
+        rows: vec![RunRow {
+            role: "live".into(),
+            gate: format!("@fl-live-test-nobody #{n} GH-{n}"),
+            run: run_on(&GateId(fresh()), &record, "an excerpt"),
+        }],
+        attempt: None,
+        missing: vec![],
+    };
+    let body = render::render(
+        &view,
+        &live.repo.full_name,
+        Visibility::Private,
+        Some("A check changes no state."),
+    );
+    let l = live.ledger();
+    l.post_comment(record.iri(), &body).expect("posted");
+    // Each read after a write waits until GitHub shows it, and asserts on
+    // its last read.
+    let at = eventually(|| l.issue_at(record.iri()), Result::is_ok).expect("the issue");
+    assert_eq!(at.moved_to, None);
+    let posted = eventually(
+        || l.posted(&at, &BTreeSet::new()).expect("listed"),
+        |p| p.contains(&decision.id),
+    );
+    assert!(posted.contains(&decision.id), "{posted:?}");
+    assert!(!posted.contains(&fresh()));
+    let ours_in = |listed: &[Value]| -> Option<String> {
+        listed
+            .iter()
+            .filter_map(|c| c["body"].as_str())
+            .find(|b| render::marked(b).as_ref() == Some(&decision.id))
+            .map(str::to_string)
+    };
+    let listed = eventually(
+        || {
+            live.client
+                .get_all(&format!("{}?per_page=100", at.comments))
+                .expect("listed")
+        },
+        |listed| ours_in(listed).is_some(),
+    );
+    let back = ours_in(&listed).expect("the comment");
+    println!(
+        "GitHub kept the comment {}",
+        if back == body {
+            "byte for byte"
+        } else {
+            "with changes"
+        }
+    );
+    assert!(back.contains("@&#8203;fl-live-test-nobody"), "{back}");
+
+    // What GitHub renders: GraphQL's `bodyHTML` (REST's `body_html` needs
+    // an Accept header fl's client does not send).
+    l.post_comment(record.iri(), &format!("fl live test control: #{n} GH-{n}"))
+        .expect("the control posted");
+    let (owner, name) = live.repo.full_name.split_once('/').unwrap();
+    let holds = |nodes: &[Value], part: &str| {
+        nodes
+            .iter()
+            .any(|c| c["body"].as_str().is_some_and(|b| b.contains(part)))
+    };
+    let nodes = eventually(
+        || {
+            let data = live
+                .client
+                .graphql(
+                    "query($owner: String!, $name: String!, $n: Int!) { repository(owner: \
+                     $owner, name: $name) { issue(number: $n) { comments(last: 20) { nodes { \
+                     body bodyHTML } } } } }",
+                    json!({"owner": owner, "name": name, "n": n}),
+                )
+                .expect("the rendered comments");
+            data["repository"]["issue"]["comments"]["nodes"]
+                .as_array()
+                .expect("the comments")
+                .clone()
+        },
+        |nodes| holds(nodes, "fl live test control") && holds(nodes, decision.id.as_str()),
+    );
+    let html_of = |part: &str| -> String {
+        nodes
+            .iter()
+            .find(|c| c["body"].as_str().is_some_and(|b| b.contains(part)))
+            .and_then(|c| c["bodyHTML"].as_str())
+            .unwrap_or_else(|| panic!("no rendered comment holds {part}"))
+            .to_string()
+    };
+    let control = html_of("fl live test control");
+    assert!(
+        control.contains("issue-link"),
+        "the control links: {control}"
+    );
+    let ours = html_of(decision.id.as_str());
+    println!("rendered: {ours}");
+    // No raw mention is posted as a control: it could notify a real
+    // account. Instead the cell must have rendered its `@` text, with the
+    // zero-width space after it, so the check below looked at something;
+    // if GitHub renamed `user-mention`, this test's printout shows it.
+    assert!(
+        ours.contains("@\u{200b}fl-live-test-nobody")
+            || ours.contains("@&#8203;fl-live-test-nobody"),
+        "the gate's cell rendered: {ours}"
+    );
+    assert!(!ours.contains("user-mention"), "a mention: {ours}");
+    assert!(!ours.contains("issue-link"), "an issue link: {ours}");
+    assert!(
+        !ours.contains(&format!("/issues/{n}\"")),
+        "a link to #{n}: {ours}"
+    );
+}
+
+/// ⚠ Confirms what `judge` takes: a credential without Contents: write is refused
+/// — a 403 naming the permission, or a 200 with `FORBIDDEN` — and nothing
+/// lands.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO, FL_GITHUB_LIVE_READ_ONLY_TOKEN and a credential"]
+fn create_commit_on_branch_without_contents_write_is_refused() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    if unset("FL_GITHUB_LIVE_READ_ONLY_TOKEN") {
+        return;
+    }
+    let live = Live::private();
+    live.set_up();
+    let token = std::env::var("FL_GITHUB_LIVE_READ_ONLY_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+        .expect(
+            "set FL_GITHUB_LIVE_READ_ONLY_TOKEN to a fine-grained token on FL_GITHUB_LIVE_REPO \
+             with Contents: read only",
+        );
+    let reader = Client::new(
+        DEFAULT_API,
+        Box::new(
+            EnvToken::from_lookup(move |k| (k == "FL_GITHUB_TOKEN").then(|| token.clone()))
+                .unwrap(),
+        ),
+    );
+    let l =
+        GithubLedger::new(&reader, live.repo.clone(), &live.local).with_lag(LAG_READS, LAG_PAUSE);
+    let head = live.head();
+    let record = live.record();
+    let err = l
+        .publish(&batch(
+            &record,
+            vec![run_on(&GateId(fresh()), &record, "refused")],
+        ))
+        .expect_err("a read-only credential cannot append")
+        .to_string();
+    assert!(err.contains("Contents: write"), "{err}");
+    assert_eq!(live.head(), head, "nothing landed");
+}
+
+/// ⚠ Confirms what `branch_head` and the fake take: a repository with no commit
+/// answers a ref read 409, and `init` says to push a first commit.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_EMPTY_REPO and a credential"]
+fn an_empty_repository_is_refused_naming_a_first_commit() {
+    if unset("FL_GITHUB_LIVE_EMPTY_REPO") {
+        return;
+    }
+    let name = std::env::var("FL_GITHUB_LIVE_EMPTY_REPO")
+        .expect("set FL_GITHUB_LIVE_EMPTY_REPO=owner/repo: a private repository with no commit");
+    let client = client_for(&name);
+    // ⚠ First: the repository really has no commit, so `init` below cannot
+    // create anything.
+    let raw = client.send(
+        Method::Get,
+        &format!("/repos/{name}/git/ref/heads/fl"),
+        None,
+    );
+    let err = raw
+        .expect_err("a ref read on a repository with no commit is refused")
+        .to_string();
+    assert!(
+        err.contains("GitHub answered 409 ") && err.contains("Git Repository is empty"),
+        "{err}"
+    );
+    let r = client
+        .send(Method::Get, &format!("/repos/{name}"), None)
+        .expect("the repository");
+    let repo = Repo {
+        full_name: r.body["full_name"].as_str().expect("a name").into(),
+        node_id: r.body["node_id"].as_str().expect("a node").into(),
+    };
+    let local = MemStore::default();
+    let l = GithubLedger::new(&client, repo, &local);
+    // `fl github ledger init` reads the mode before it calls `init`: on a
+    // repository with no commit, the rules must still read, or the person
+    // would see a rules error instead of "push a first commit".
+    let mode = l.mode();
+    println!("the mode of a repository with no commit: {mode:?}");
+    assert!(mode.is_ok(), "{mode:?}");
+    let err = l
+        .init(&fresh(), None)
+        .expect_err("init is refused")
+        .to_string();
+    assert!(
+        err.contains("is empty: GitHub keeps no branch until"),
+        "{err}"
+    );
+}
+
+/// ⚠ Confirms what `mode()` takes: the token reads `rules/branches/fl/ledger`, and
+/// an active ruleset with both rules reads as protected.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_PUBLIC_REPO and a credential"]
+fn rules_on_the_ledger_branch_are_readable() {
+    if unset("FL_GITHUB_LIVE_PUBLIC_REPO") {
+        return;
+    }
+    let live = Live::public();
+    let mode = live
+        .ledger()
+        .mode()
+        .expect("the rules are readable by the token");
+    assert_eq!(
+        mode,
+        Mode::Protected,
+        "`{}` needs an active ruleset on `fl/ledger` with `non_fast_forward` and `deletion`. \
+         An administrator adds it with:\n{}",
+        live.repo.full_name,
+        ruleset_command(&live.repo.full_name)
+    );
+}
+
+/// ⚠ Spec §6.2, §8.4: under the ruleset GitHub refuses a force update and a
+/// deletion of `fl/ledger`, and the ledger stays as it was.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_PUBLIC_REPO and a credential"]
+fn a_force_update_and_a_deletion_of_the_ledger_are_refused() {
+    if unset("FL_GITHUB_LIVE_PUBLIC_REPO") {
+        return;
+    }
+    let live = Live::public();
+    // ⚠ First: without the ruleset in force, or with a credential that may
+    // bypass it, what follows would succeed and destroy this repository's
+    // ledger — or pass by never being refused. Nothing is written until
+    // both are known.
+    assert_eq!(
+        live.ledger().mode().expect("the rules"),
+        Mode::Protected,
+        "refusing to try a force update without the ruleset in force"
+    );
+    let rules = live
+        .client
+        .get_all(&live.path(&format!("/rules/branches/{BRANCH}?per_page=100")))
+        .expect("the rules");
+    let mut ids: Vec<u64> = rules
+        .iter()
+        .map(|r| r["ruleset_id"].as_u64().expect("a ruleset id"))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    assert!(!ids.is_empty(), "no ruleset names fl/ledger");
+    for id in ids {
+        let set = live
+            .client
+            .send(Method::Get, &live.path(&format!("/rulesets/{id}")), None)
+            .expect("the ruleset");
+        let can = set.body["current_user_can_bypass"].as_str();
+        assert_eq!(
+            can,
+            Some("never"),
+            "refusing to try: the credential's bypass of ruleset {id} is {can:?} (bypass list: {})",
+            set.body["bypass_actors"]
+        );
+    }
+    let root = live.set_up();
+    let record = live.record();
+    live.ledger()
+        .publish(&batch(
+            &record,
+            vec![run_on(&GateId(fresh()), &record, "public test data")],
+        ))
+        .expect("an append lands under the ruleset");
+    let head = live.published_head();
+    assert_ne!(head, root);
+
+    // fl sends no DELETE and never forces a ref: both requests go straight
+    // through ureq, with the same credential, to this repository's
+    // `fl/ledger` only. A refusal is GitHub's 4xx; a 401 (the credential)
+    // or a 404 (no such ref) is not the ruleset's refusal, and nor is an
+    // answer that never came.
+    let token = credentials_for(&live.repo.full_name)
+        .token()
+        .expect("a token");
+    let auth = format!("Bearer {token}");
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .build(),
+    );
+    fn with_headers<B>(rb: ureq::RequestBuilder<B>, auth: &str) -> ureq::RequestBuilder<B> {
+        rb.header("Authorization", auth)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "fl-live-test")
+    }
+    let answer = |what: &str, r: Result<ureq::http::Response<ureq::Body>, ureq::Error>| {
+        let mut r = r.unwrap_or_else(|e| panic!("{what}: no answer from GitHub: {e}"));
+        let status = r.status().as_u16();
+        let text = r.body_mut().read_to_string().unwrap_or_default();
+        println!("{what}: {status} {text}");
+        assert!(
+            (400..500).contains(&status) && status != 401 && status != 404,
+            "GitHub did not refuse {what} of fl/ledger: {status} {text}"
+        );
+    };
+    let url = format!(
+        "{DEFAULT_API}/repos/{}/git/refs/heads/{BRANCH}",
+        live.repo.full_name
+    );
+    answer(
+        "a force update",
+        with_headers(agent.patch(&url), &auth).send_json(json!({"sha": root, "force": true})),
+    );
+    answer("a deletion", with_headers(agent.delete(&url), &auth).call());
+    assert_eq!(
+        live.head_of(BRANCH).as_deref(),
+        Some(head.as_str()),
+        "the ledger is as it was"
+    );
 }
