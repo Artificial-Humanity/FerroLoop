@@ -1,8 +1,30 @@
-//! Against GitHub itself (GitHub tracker spec §8.3). Ignored by default.
+//! Against GitHub itself (GitHub tracker spec §8.3; GitHub ledger spec
+//! §8.4). Ignored by default.
 //!
-//! Run against a PRIVATE THROWAWAY repository — these tests create issues
-//! and never delete them. Export the token in your shell first, from a
-//! secret store (never typed inline, where shell history keeps it), then:
+//! Run only against THROWAWAY repositories. The tracker's tests create
+//! issues and never delete them. The ledger's append to `fl/ledger`, leave
+//! a branch `fl-live/root` at its first commit, and delete nothing: a
+//! ledger under a ruleset cannot be deleted, so every test is safe to run
+//! again on what earlier runs left.
+//!
+//! - `FL_GITHUB_LIVE_REPO`: a private repository (the tracker's tests, and
+//!   most of the ledger's).
+//! - `FL_GITHUB_LIVE_PUBLIC_REPO`: a public repository holding only test
+//!   data and one commit, with an active ruleset on `refs/heads/fl/ledger`
+//!   holding `non_fast_forward` and `deletion` (`fl github ledger init`
+//!   prints the command that adds it), which the credential cannot bypass:
+//!   the force-update test reads the ruleset and refuses to write unless
+//!   GitHub says the credential's bypass is `never`.
+//! - `FL_GITHUB_LIVE_EMPTY_REPO`: a private repository with no commit at
+//!   all.
+//! - `FL_GITHUB_LIVE_READ_ONLY_TOKEN`: a fine-grained token on
+//!   `FL_GITHUB_LIVE_REPO` only, with Contents: read and Metadata: read.
+//!
+//! A ledger test whose variable is unset skips, saying which; the tracker's
+//! tests still fail without `FL_GITHUB_LIVE_REPO`.
+//!
+//! Export each token in your shell first, from a secret store (never typed
+//! inline, where shell history keeps it), then:
 //!
 //!   FL_GITHUB_LIVE_REPO=owner/repo \
 //!     cargo test -p fl-github --test live -- --ignored --nocapture --test-threads=1
@@ -10,20 +32,35 @@
 //! The token is read from FL_GITHUB_TOKEN, then GITHUB_TOKEN. For the App
 //! instead, set BOTH FL_GITHUB_APP_ID and FL_GITHUB_APP_KEY (the path of its
 //! private key file); one without the other is refused, never a fallback to
-//! the token.
+//! the token. No test prints a token, a header or a client.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use fl_core::LedgerFault;
 use fl_core::MemStore;
+use fl_core::at::At;
+use fl_core::decision::{Decision, Outcome, TransitionOutcome};
 use fl_core::finding::Finding;
 use fl_core::ids::ProjectId;
+use fl_core::ids::{GateId, RecordId};
 use fl_core::iri::Iri;
+use fl_core::log::GateRun;
 use fl_core::model::State;
+use fl_core::split::{Batch, RemoteLedger};
+use fl_core::store::Bindings;
 use fl_core::store::{StoreError, Tracker};
+use fl_core::verdict::Verdict;
+use fl_github::ledger::layout::{self, Area, BRANCH, Line, SEGMENT_LIMIT};
+use fl_github::ledger::{InitOutcome, Mode};
 use fl_github::{
     AppCredentials, Client, Credentials, DEFAULT_API, EnvToken, GithubTracker, Method,
 };
+use fl_github::{GithubLedger, Repo};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Barrier;
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn repo() -> String {
     std::env::var("FL_GITHUB_LIVE_REPO").expect(
@@ -31,16 +68,18 @@ fn repo() -> String {
     )
 }
 
-fn client() -> Client {
+/// The credential for `repo`: the App when both of its variables are set,
+/// else the token.
+fn credentials_for(repo: &str) -> Box<dyn Credentials> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
-    let creds: Box<dyn Credentials> = match (var("FL_GITHUB_APP_ID"), var("FL_GITHUB_APP_KEY")) {
+    match (var("FL_GITHUB_APP_ID"), var("FL_GITHUB_APP_KEY")) {
         (Some(id), Some(key)) => Box::new(
             AppCredentials::from_file(
                 DEFAULT_API,
                 id.parse()
                     .expect("FL_GITHUB_APP_ID must be the App's numeric id"),
                 key.as_ref(),
-                &repo(),
+                repo,
             )
             .expect("the App credential"),
         ),
@@ -55,8 +94,15 @@ fn client() -> Client {
              App, or neither to use the token"
         ),
         (None, None) => Box::new(EnvToken::from_env().expect("FL_GITHUB_TOKEN or GITHUB_TOKEN")),
-    };
-    Client::new(DEFAULT_API, creds)
+    }
+}
+
+fn client_for(repo: &str) -> Client {
+    Client::new(DEFAULT_API, credentials_for(repo))
+}
+
+fn client() -> Client {
+    client_for(&repo())
 }
 
 fn tracker() -> GithubTracker {
@@ -84,6 +130,257 @@ fn tracker() -> GithubTracker {
 
 fn project() -> ProjectId {
     ProjectId(Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).unwrap())
+}
+
+/// A fresh id: UUIDv7, so a re-run never meets its own earlier entries.
+fn fresh() -> Iri {
+    Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).unwrap()
+}
+
+fn now() -> At {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("a clock after 1970")
+        .as_millis();
+    At::from_unix_millis(ms as u64)
+}
+
+/// `createCommitOnBranch`, as fl sends it.
+const APPEND: &str = "mutation ledgerAppend($input: CreateCommitOnBranchInput!) { \
+    createCommitOnBranch(input: $input) { commit { oid } } }";
+
+/// Where the first run on a repository leaves the ledger's first commit.
+const ROOT_BRANCH: &str = "fl-live/root";
+
+/// Whether `var` is unset: then the test skips, saying which variable it
+/// needs. A resource the owner has not provided is no failure of fl's.
+fn unset(var: &str) -> bool {
+    let missing = std::env::var(var).map_or(true, |v| v.trim().is_empty());
+    if missing {
+        eprintln!("skipped: set {var} to run this live test");
+    }
+    missing
+}
+
+/// One live repository, a fresh machine's memory of its ledger, and a
+/// record of its own for entries to be tied to.
+struct Live {
+    client: Client,
+    repo: Repo,
+    local: MemStore,
+    record: RecordId,
+}
+
+impl Live {
+    /// The repository `var` names, checked to be private, or not, as
+    /// `private` says.
+    fn on(var: &str, private: bool) -> Live {
+        let name = std::env::var(var)
+            .unwrap_or_else(|_| panic!("set {var}=owner/repo to run this live test"));
+        let client = client_for(&name);
+        let r = client
+            .send(Method::Get, &format!("/repos/{name}"), None)
+            .expect("read the live repository");
+        assert_eq!(
+            r.status, 200,
+            "GitHub answered {} when the live test read `{name}` ({var})",
+            r.status
+        );
+        let is_private = r.body["visibility"].as_str() == Some("private");
+        let want = if private { "private" } else { "public" };
+        assert_eq!(is_private, private, "`{name}` ({var}) must be {want}");
+        let text = |k: &str| {
+            r.body[k]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{name}` has no `{k}`"))
+                .to_string()
+        };
+        let repo = Repo {
+            full_name: text("full_name"),
+            node_id: text("node_id"),
+        };
+        // A record of its own, so a re-run never reads the decisions the
+        // runs before it filed; the issue need not exist for the ledger.
+        let n = uuid::Uuid::now_v7().as_u128() as u64 % 1_000_000_000 + 1_000_000;
+        let record = RecordId(
+            Iri::parse(&format!("https://github.com/{}/issues/{n}", repo.full_name)).unwrap(),
+        );
+        Live {
+            client,
+            repo,
+            local: MemStore::default(),
+            record,
+        }
+    }
+
+    /// The private throwaway, `FL_GITHUB_LIVE_REPO`.
+    fn private() -> Live {
+        Live::on("FL_GITHUB_LIVE_REPO", true)
+    }
+
+    /// GitHub's replicas can lag a write: read again five times, a second
+    /// apart, before a lag counts.
+    fn ledger(&self) -> GithubLedger<'_> {
+        GithubLedger::new(&self.client, self.repo.clone(), &self.local)
+            .with_lag(5, Duration::from_secs(1))
+    }
+
+    fn path(&self, rest: &str) -> String {
+        format!("/repos/{}{rest}", self.repo.full_name)
+    }
+
+    /// The commit `branch` points at, if the branch exists.
+    fn head_of(&self, branch: &str) -> Option<String> {
+        let r = self
+            .client
+            .send(
+                Method::Get,
+                &self.path(&format!("/git/ref/heads/{branch}")),
+                None,
+            )
+            .expect("read a branch");
+        match r.status {
+            200 => Some(
+                r.body["object"]["sha"]
+                    .as_str()
+                    .expect("a commit")
+                    .to_string(),
+            ),
+            404 => None,
+            s => panic!("GitHub answered {s} for the branch `{branch}`"),
+        }
+    }
+
+    fn head(&self) -> String {
+        self.head_of(BRANCH).expect("the ledger's branch")
+    }
+
+    /// This `Live`'s record, for entries to be tied to.
+    fn record(&self) -> RecordId {
+        self.record.clone()
+    }
+
+    fn by(&self) -> String {
+        self.client.identity().expect("who the credential is")
+    }
+
+    /// The ledger, set up and recorded on this machine with a cut-over.
+    ///
+    /// ⚠ Safe to run again, and never a walk of the history: the first run
+    /// on a repository leaves `fl-live/root` at the ledger's first commit,
+    /// and every later run records that commit, as an imported manifest
+    /// would, and runs `init` through its "already set up" path.
+    fn set_up(&self) -> String {
+        let l = self.ledger();
+        if let Some(root) = self.head_of(ROOT_BRANCH) {
+            self.local
+                .set_ledger_root(&self.repo.node_id, &root)
+                .unwrap();
+            match l.init(&fresh(), None).expect("init over the recorded root") {
+                InitOutcome::AlreadySetUp { root: r, .. } => assert_eq!(r, root),
+                other => panic!("expected the ledger set up, got {other:?}"),
+            }
+            return root;
+        }
+        let root = match l.init(&fresh(), None).expect("init") {
+            InitOutcome::Created { root } => root,
+            InitOutcome::Confirm { root } => {
+                match l.init(&fresh(), Some(&root)).expect("confirm") {
+                    InitOutcome::Adopted { root } => root,
+                    other => panic!("expected the ledger adopted, got {other:?}"),
+                }
+            }
+            other => panic!("a machine with no root got {other:?}"),
+        };
+        let made = self
+            .client
+            .send(
+                Method::Post,
+                &self.path("/git/refs"),
+                Some(&json!({"ref": format!("refs/heads/{ROOT_BRANCH}"), "sha": root})),
+            )
+            .expect("create the root's branch");
+        assert_eq!(made.status, 201, "{:?}", made.body);
+        root
+    }
+
+    /// One commit on the ledger writing `text` at `path`, as anyone with
+    /// write access can. Returns it.
+    fn hand_commit(&self, path: &str, text: &str) -> String {
+        let answer = self
+            .client
+            .graphql_answer(
+                APPEND,
+                json!({"input": {
+                    "branch": {
+                        "repositoryNameWithOwner": self.repo.full_name,
+                        "branchName": BRANCH,
+                    },
+                    "message": {"headline": "fl live test: a hand edit"},
+                    "expectedHeadOid": self.head(),
+                    "fileChanges": {"additions": [
+                        {"path": path, "contents": STANDARD.encode(text)},
+                    ]},
+                }}),
+            )
+            .expect("an answer");
+        assert!(answer.errors.is_empty(), "{:?}", answer.errors);
+        answer
+            .data
+            .as_ref()
+            .and_then(|d| d.pointer("/createCommitOnBranch/commit/oid"))
+            .and_then(Value::as_str)
+            .expect("the commit")
+            .to_string()
+    }
+
+    /// The id of what a POST to `rest` created.
+    fn created(&self, rest: &str, body: Value) -> String {
+        let r = self
+            .client
+            .send(Method::Post, &self.path(rest), Some(&body))
+            .expect("an answer");
+        assert_eq!(r.status, 201, "{:?}", r.body);
+        r.body["sha"].as_str().expect("an id").to_string()
+    }
+}
+
+/// A run of `gate` tied to `record`, stamped now, with `excerpt`.
+fn run_on(gate: &GateId, record: &RecordId, excerpt: &str) -> GateRun {
+    GateRun {
+        id: Some(fresh()),
+        at: Some(now()),
+        gate: gate.clone(),
+        record: Some(record.clone()),
+        commit: "live".into(),
+        verdict: Verdict::from_predicate(true, 1),
+        population: 1,
+        output_excerpt: Some(excerpt.into()),
+        duration_ms: 1,
+        cost_usd_micros: 0,
+    }
+}
+
+/// A `check` about `record`, resting on `runs`, published with them.
+fn batch(record: &RecordId, runs: Vec<GateRun>) -> Batch {
+    let rests_on = runs.iter().filter_map(|r| r.id.clone()).collect();
+    Batch {
+        decision: Decision {
+            id: fresh(),
+            at: now(),
+            record: record.clone(),
+            finding: None,
+            outcome: Outcome::Check {
+                transition: TransitionOutcome {
+                    transition: "live".into(),
+                    passed: true,
+                },
+            },
+            rests_on,
+        },
+        runs,
+        attempts: vec![],
+    }
 }
 
 #[test]
@@ -398,4 +695,430 @@ fn the_edit_history_and_timeline_counts_match_fls_model() {
         (0, 0, 0, 1, 0),
         "a reopen is one `reopened` event"
     );
+}
+
+/// ⚠ Spec §6.1: `init`'s first commit holds `format` and `README.md` and
+/// no parent; a second `fl/ledger` is refused with 422 "Reference already
+/// exists" (modelled in `create_branch`); and a machine that records the
+/// root records its own cut-over once.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn init_sets_up_a_ledger_on_a_private_repository() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    let root = live.set_up();
+    let commit = live
+        .client
+        .send(
+            Method::Get,
+            &live.path(&format!("/git/commits/{root}")),
+            None,
+        )
+        .unwrap();
+    assert_eq!(commit.body["parents"], json!([]), "an orphan");
+    let tree = live
+        .client
+        .send(Method::Get, &live.path(&format!("/git/trees/{root}")), None)
+        .unwrap();
+    let paths: Vec<&str> = tree.body["tree"]
+        .as_array()
+        .expect("the tree")
+        .iter()
+        .filter_map(|e| e["path"].as_str())
+        .collect();
+    assert_eq!(paths, vec!["README.md", "format"], "and no `.github/`");
+    let again = live.client.send(
+        Method::Post,
+        &live.path("/git/refs"),
+        Some(&json!({"ref": format!("refs/heads/{BRANCH}"), "sha": root})),
+    );
+    let err = again
+        .expect_err("a second fl/ledger is refused")
+        .to_string();
+    assert!(err.contains("already exists"), "{err}");
+    let other = Live::private();
+    other
+        .local
+        .set_ledger_root(&other.repo.node_id, &root)
+        .unwrap();
+    assert!(matches!(
+        other.ledger().init(&fresh(), None).unwrap(),
+        InitOutcome::AlreadySetUp {
+            cutover_recorded: true,
+            ..
+        }
+    ));
+    assert!(matches!(
+        other.ledger().init(&fresh(), None).unwrap(),
+        InitOutcome::AlreadySetUp {
+            cutover_recorded: false,
+            ..
+        }
+    ));
+}
+
+/// ⚠ Spec §3.2, §8.4: two machines appending at once both land; neither
+/// entry is lost or written twice.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn two_flushes_racing_both_land() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    Live::private().set_up();
+    let gate = GateId(fresh());
+    let barrier = Barrier::new(2);
+    let ids: Vec<Iri> = std::thread::scope(|s| {
+        let racers: Vec<_> = (0..2)
+            .map(|i| {
+                let (gate, barrier) = (&gate, &barrier);
+                s.spawn(move || {
+                    let live = Live::private();
+                    live.set_up();
+                    let run = run_on(gate, &live.record(), &format!("racer {i}"));
+                    let id = run.id.clone().unwrap();
+                    barrier.wait();
+                    live.ledger()
+                        .publish(&batch(&live.record(), vec![run]))
+                        .expect("each flush lands");
+                    id
+                })
+            })
+            .collect();
+        racers.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let reader = Live::private();
+    reader.set_up();
+    let back: Vec<Option<Iri>> = reader
+        .ledger()
+        .runs(&gate)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(back.len(), 2, "{back:?}");
+    for id in &ids {
+        assert_eq!(
+            back.iter().filter(|b| b.as_ref() == Some(id)).count(),
+            1,
+            "{id}"
+        );
+    }
+}
+
+/// ⚠ Confirms what `judge` and the fake take: a stale `expectedHeadOid` is refused
+/// with `STALE_DATA`, or a message saying where the branch was expected to
+/// point, and nothing lands.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn create_commit_on_branch_is_refused_when_the_head_moved() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    live.set_up();
+    let l = live.ledger();
+    let before = l.check_format().unwrap();
+    let record = live.record();
+    l.publish(&batch(
+        &record,
+        vec![run_on(&GateId(fresh()), &record, "moves the head")],
+    ))
+    .unwrap();
+    let after = live.head();
+    assert_ne!(before, after);
+    let probe = run_on(&GateId(fresh()), &record, "a stale append");
+    let path = layout::segment_path(&layout::dir(Area::Runs, probe.gate.iri()), 1);
+    let text = format!("{}\n", Line::Run(probe).encode(&live.by()));
+    let answer = live
+        .client
+        .graphql_answer(
+            APPEND,
+            json!({"input": {
+                "branch": {
+                    "repositoryNameWithOwner": live.repo.full_name,
+                    "branchName": BRANCH,
+                },
+                "message": {"headline": "fl live test: a stale append"},
+                "expectedHeadOid": before,
+                "fileChanges": {"additions": [{"path": path, "contents": STANDARD.encode(text)}]},
+            }}),
+        )
+        .expect("an answer");
+    println!(
+        "a stale append: status {}, errors {:?}",
+        answer.status, answer.errors
+    );
+    assert_eq!(answer.status, 200);
+    let moved = answer.errors.iter().any(|e| {
+        e["type"] == "STALE_DATA"
+            || e["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("Expected branch to point to"))
+    });
+    assert!(moved, "refused as a moved head: {:?}", answer.errors);
+    assert_eq!(live.head(), after, "nothing landed");
+}
+
+/// ⚠ Spec §3.5: an edit of a line this machine read is caught (check 4),
+/// naming the file and the commit; a line fl cannot read is named with the
+/// commit that added it — GitHub's blame (modelled in `git.rs`); and a
+/// compare asked one commit per page still says `ahead` across many
+/// (modelled in `compare`).
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn a_hand_edit_is_detected_and_named() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    let root = live.set_up();
+    let l = live.ledger();
+    let record = live.record();
+
+    let gate = GateId(fresh());
+    let run = run_on(&gate, &record, "as published");
+    l.publish(&batch(&record, vec![run.clone()]))
+        .expect("published");
+    assert_eq!(l.runs(&gate).expect("read, and cached").len(), 1);
+    let seg = layout::segment_path(&layout::dir(Area::Runs, gate.iri()), 1);
+    let mut edited = run;
+    edited.output_excerpt = Some("edited by hand".into());
+    let edit = live.hand_commit(&seg, &format!("{}\n", Line::Run(edited).encode(&live.by())));
+    let err = l
+        .runs(&gate)
+        .expect_err("an edited line is caught")
+        .to_string();
+    assert!(
+        err.contains(&format!("`{seg}`")) && err.contains(&edit),
+        "{err}"
+    );
+
+    let other = GateId(fresh());
+    let seg2 = layout::segment_path(&layout::dir(Area::Runs, other.iri()), 1);
+    let added = live.hand_commit(&seg2, "not a line fl wrote\n");
+    match l.runs(&other) {
+        Err(StoreError::Ledger(LedgerFault::Unreadable {
+            file, line, commit, ..
+        })) => assert_eq!((file, line, commit), (seg2, 1, added)),
+        got => panic!("expected an unreadable line named by its commit, got {got:?}"),
+    }
+
+    let head = live.head();
+    let r = live
+        .client
+        .send(
+            Method::Get,
+            &live.path(&format!("/compare/{root}...{head}?per_page=1")),
+            None,
+        )
+        .expect("a compare");
+    assert_eq!(r.body["status"], "ahead", "{}", r.body["status"]);
+    assert!(
+        r.body["total_commits"].as_u64().unwrap_or(0) > 1,
+        "{}",
+        r.body["total_commits"]
+    );
+    assert!(r.body["commits"].as_array().map_or(0, Vec::len) <= 1);
+    let machine = Live::private();
+    machine.set_up();
+    assert_eq!(
+        machine
+            .ledger()
+            .check_head()
+            .expect("checked from the root"),
+        head
+    );
+}
+
+/// ⚠ Confirms what `git.rs` takes: GraphQL sends `TreeEntry.mode` as an Int whose
+/// value is the octal mode; REST sends it as a string.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn tree_entry_modes_are_integers() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    let root = live.set_up();
+    let (owner, name) = live.repo.full_name.split_once('/').unwrap();
+    let data = live
+        .client
+        .graphql(
+            "query($owner: String!, $name: String!, $e: String!) { repository(owner: $owner, \
+             name: $name) { object(expression: $e) { ... on Tree { entries { name mode } } } } }",
+            json!({"owner": owner, "name": name, "e": format!("{root}:")}),
+        )
+        .unwrap();
+    let entries = data["repository"]["object"]["entries"]
+        .as_array()
+        .expect("the first commit's tree");
+    let format = entries
+        .iter()
+        .find(|e| e["name"] == "format")
+        .expect("`format`");
+    assert_eq!(format["mode"], json!(0o100644), "{format}");
+    let rest = live
+        .client
+        .send(Method::Get, &live.path(&format!("/git/trees/{root}")), None)
+        .unwrap();
+    let listed = rest.body["tree"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "format")
+        .cloned()
+        .expect("`format`");
+    assert_eq!(listed["mode"], json!("100644"), "{listed}");
+}
+
+/// ⚠ Measured on 2026-10-02 and pinned here: a private repository on
+/// GitHub Free answers `rules/branches/fl/ledger` with `200 []`, which
+/// `mode()` reads as detection-only (decision 12).
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn a_private_repository_without_a_ruleset_is_detection_only() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    let r = live
+        .client
+        .send(
+            Method::Get,
+            &live.path(&format!("/rules/branches/{BRANCH}?per_page=100")),
+            None,
+        )
+        .expect("the rules are readable");
+    assert_eq!((r.status, &r.body), (200, &json!([])), "{:?}", r.body);
+    let mode = live.ledger().mode().unwrap();
+    assert!(matches!(mode, Mode::DetectionOnly { .. }), "{mode:?}");
+}
+
+/// ⚠ Confirms what `branches_under` takes: `git/matching-refs/heads/<prefix>`
+/// lists every branch whose name starts with the prefix, and `200 []`
+/// when none does. A branch under `fl/ledger/` cannot sit beside
+/// `fl/ledger`, so the listing is checked on `fl-live/`.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn a_branch_under_the_ledger_branch_is_found() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    live.set_up();
+    let under = |prefix: &str| -> Vec<String> {
+        live.client
+            .get_all(&live.path(&format!("/git/matching-refs/heads/{prefix}")))
+            .expect("matching-refs")
+            .iter()
+            .map(|r| r["ref"].as_str().expect("a ref").to_string())
+            .collect()
+    };
+    let found = under("fl-live/");
+    assert!(
+        found.contains(&format!("refs/heads/{ROOT_BRANCH}")),
+        "{found:?}"
+    );
+    assert!(
+        found.iter().all(|r| r.starts_with("refs/heads/fl-live/")),
+        "{found:?}"
+    );
+    assert_eq!(under("fl/ledger/"), Vec::<String>::new());
+}
+
+/// Spec §3.5 check 1: a head whose history is not the anchor's is read
+/// as a rewrite, whatever GitHub answers a compare of unrelated histories
+/// (printed).
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn an_unrelated_history_is_read_as_a_rewrite() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    live.set_up();
+    let tree = live.created(
+        "/git/trees",
+        json!({"tree": [
+            {"path": "probe", "mode": "100644", "type": "blob", "content": "unrelated\n"},
+        ]}),
+    );
+    let stray = live.created(
+        "/git/commits",
+        json!({"message": "fl live test: an unrelated history", "tree": tree, "parents": []}),
+    );
+    let head = live.head();
+    let raw = live.client.send(
+        Method::Get,
+        &live.path(&format!("/compare/{stray}...{head}?per_page=1")),
+        None,
+    );
+    match &raw {
+        Ok(r) => println!("a compare of unrelated histories: {} {}", r.status, r.body),
+        Err(e) => println!("a compare of unrelated histories: {e}"),
+    }
+    let other = Live::private();
+    other
+        .local
+        .set_ledger_root(&other.repo.node_id, &stray)
+        .unwrap();
+    let err = other.ledger().check_head().unwrap_err();
+    assert!(
+        matches!(err, StoreError::Ledger(LedgerFault::Rewritten { .. })),
+        "{err:?}"
+    );
+}
+
+/// Spec §3.1: a segment filled near its 256 KB limit lands through
+/// `createCommitOnBranch`, and the next lines roll over to a second.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn a_near_full_segment_lands_through_create_commit_on_branch() {
+    if unset("FL_GITHUB_LIVE_REPO") {
+        return;
+    }
+    let live = Live::private();
+    live.set_up();
+    let l = live.ledger();
+    let by = live.by();
+    let record = live.record();
+    let gate = GateId(fresh());
+    let excerpt = "x".repeat(4_000);
+    let (mut first, mut bytes) = (Vec::new(), 0usize);
+    loop {
+        let r = run_on(&gate, &record, &excerpt);
+        let len = Line::Run(r.clone()).encode(&by).len() + 1;
+        if bytes + len > SEGMENT_LIMIT - 8 * 1024 {
+            break;
+        }
+        bytes += len;
+        first.push(r);
+    }
+    assert!(bytes > SEGMENT_LIMIT - 16 * 1024, "near full: {bytes}");
+    l.publish(&batch(&record, first.clone()))
+        .expect("a near-full segment lands");
+    let second: Vec<GateRun> = (0..4).map(|_| run_on(&gate, &record, &excerpt)).collect();
+    l.publish(&batch(&record, second.clone()))
+        .expect("the rollover lands");
+    assert_eq!(l.runs(&gate).unwrap().len(), first.len() + second.len());
+    let dir = layout::dir(Area::Runs, gate.iri());
+    let listing = live
+        .client
+        .send(
+            Method::Get,
+            &live.path(&format!("/contents/{dir}?ref=fl%2Fledger")),
+            None,
+        )
+        .unwrap();
+    let names: Vec<&str> = listing
+        .body
+        .as_array()
+        .expect("the directory")
+        .iter()
+        .filter_map(|e| e["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["1.jsonl", "2.jsonl"]);
 }
