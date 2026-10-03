@@ -43,11 +43,11 @@ the whole file rather than ignoring the key and writing records to a local track
 chose. Two entries for the same project root that name different stores or trackers are
 refused too.
 
-Only the commands that read or write records or findings use the binding: `fl record`,
-`fl finding`, `fl attempt`, `fl check` with `--record`, and `fl github`. The catalog
-commands — `fl project`, `fl gate`, `fl transition` and `fl manifest` — never contact GitHub,
-and `fl stats` does only to count a project's attempts on its GitHub ledger
-([github-ledger.md](github-ledger.md)).
+Only the commands that read or write records or findings use the binding — `fl record`,
+`fl finding`, `fl attempt`, `fl check` with `--record`, and `fl github` — and `fl stats` when
+the binding names the GitHub ledger. The catalog commands — `fl project`, `fl gate`,
+`fl transition` and `fl manifest` — never contact GitHub, and `fl stats` does only to count a
+project's attempts on its GitHub ledger ([github-ledger.md](github-ledger.md)).
 
 `--db` and `$FL_DB` cannot be combined with a GitHub binding for a command that uses it. The
 repository's identity (see [Identity](#identity)) and the project's catalog live in the store

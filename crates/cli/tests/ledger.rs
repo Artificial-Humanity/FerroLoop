@@ -1602,14 +1602,19 @@ fn a_steady_state_decision_costs_what_the_docs_say() {
             containing("/git/blobs/"),
             requests_equal(&w, "GET /user"),
             requests_equal(&w, "POST /repos/acme/widgets/issues/1/comments"),
+            requests_equal(&w, "GET /repos/acme/widgets/issues/1"),
         ],
         // The tracker's own read and the visibility; the rules; the head
         // twice; no compare; the format's listing, the directories'
         // listing and the commit; the two segments the last decision grew;
-        // who fl writes as; the comment.
-        [2, 1, 2, 0, 3, 2, 1, 1],
+        // who fl writes as; the comment; the tracker's two reads of the
+        // record's issue.
+        [2, 1, 2, 0, 3, 2, 1, 1, 2],
         "{requests:#?}"
     );
+    // ⚠ Every request, of any kind: eleven for the ledger and three for the
+    // tracker. A request of a kind not counted above shows here.
+    assert_eq!(requests.len(), 14, "{requests:#?}");
 }
 
 // ⚠ Spec §4.2, §8.3: a gate named with a pipe, backticks, a mention, a
