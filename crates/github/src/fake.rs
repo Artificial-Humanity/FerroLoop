@@ -88,6 +88,10 @@ pub struct State {
     pub fail_before_create: bool,
     /// The next comment answers 500 and is not posted. One-shot.
     pub fail_comment_next: bool,
+    /// The comment post that follows this many more answers 500 and is
+    /// not posted; `Some(0)` is the next one. Lets a test pass over the
+    /// posts a command makes before the one it means to fail. One-shot.
+    pub fail_comment_after: Option<u32>,
     /// The next create that `fail_before_create` does not fail answers 403
     /// with GitHub's rate-limit headers, and nothing lands. One-shot.
     pub rate_limited_next_create: bool,
@@ -1112,6 +1116,14 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         ("POST", ["repos", o, r, "issues", n, "comments"]) if s.is_bound(o, r) => {
             if std::mem::take(&mut s.fail_comment_next) {
                 return answer(500, json!({"message": "fake comment failure"}));
+            }
+            match s.fail_comment_after {
+                Some(0) => {
+                    s.fail_comment_after = None;
+                    return answer(500, json!({"message": "fake comment failure"}));
+                }
+                Some(n) => s.fail_comment_after = Some(n - 1),
+                None => {}
             }
             let by = author(auth);
             match n.parse::<u64>().ok().and_then(|n| s.issues.get_mut(&n)) {

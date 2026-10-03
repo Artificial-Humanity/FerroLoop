@@ -32,8 +32,13 @@ fn named(item: &Iri) -> String {
 }
 
 /// The command that posts `item`'s missing comments (spec §4.3).
+///
+/// ⚠ It names `item` in full, never by its number: the ledger files a
+/// decision under the IRI it was made with, and after a rename a number
+/// resolves under the repository's new name — another directory, where
+/// recovery would find nothing and say so as success.
 pub fn recovery(item: &Iri) -> String {
-    format!("fl github ledger comment {}", named(item))
+    format!("fl github ledger comment {item}")
 }
 
 /// Post the comment of each decision this command flushed (spec §4.1),
@@ -262,8 +267,11 @@ mod tests {
     }
 
     #[test]
-    fn the_recovery_command_names_the_issue_by_its_number() {
-        assert_eq!(recovery(&issue(3)), "fl github ledger comment 3");
+    fn the_recovery_command_names_the_item_by_its_full_iri() {
+        assert_eq!(
+            recovery(&issue(3)),
+            "fl github ledger comment https://github.com/acme/widgets/issues/3"
+        );
         assert_eq!(
             recovery(&seq_iri(5)),
             format!("fl github ledger comment {}", seq_iri(5))

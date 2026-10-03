@@ -18,6 +18,10 @@ const PREFLIGHT: &str = "refused before any gate or adapter ran: ";
 /// What a comment that could not be posted warns. No other path writes it.
 const NOT_POSTED: &str = "warning: the decision's comment was not posted on issue ";
 
+/// The recovery command a failed comment on record #1 names: the record in
+/// full, never its number.
+const RECOVER_1: &str = "fl github ledger comment https://github.com/acme/widgets/issues/1";
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Sys::new("git")
         .args(args)
@@ -767,10 +771,10 @@ fn a_move_whose_comment_fails_keeps_its_exit_code_and_names_the_recovery() {
         .success()
         .stderr(
             contains(format!("{NOT_POSTED}1: "))
-                .and(contains(
-                    "The decision and its state change stand; run `fl github ledger comment 1`",
-                ))
-                .and(contains("run `fl github ledger comment 1` to post it")),
+                .and(contains(format!(
+                    "The decision and its state change stand; run `{RECOVER_1}`"
+                )))
+                .and(contains(format!("run `{RECOVER_1}` to post it"))),
         );
     assert!(w.fake.issue(1).comments.is_empty());
     assert!(
@@ -798,9 +802,7 @@ fn a_move_whose_state_change_and_comment_both_fail_says_only_the_decision_stands
         .code(2)
         .stderr(
             contains(format!("{NOT_POSTED}1: "))
-                .and(contains(
-                    "The decision stands; run `fl github ledger comment 1`",
-                ))
+                .and(contains(format!("The decision stands; run `{RECOVER_1}`")))
                 .and(contains("state change stand").not()),
         );
     assert_eq!(w.decision_ids().len(), 1, "the decision was published");
@@ -1017,7 +1019,7 @@ fn an_attempts_comment_that_fails_keeps_the_attempts_exit_code() {
         .args(["attempt", "1", "--budget-usd-micros", "0"])
         .assert()
         .code(1)
-        .stderr(contains(NOT_POSTED).and(contains("fl github ledger comment 1")));
+        .stderr(contains(NOT_POSTED).and(contains(RECOVER_1)));
     assert_eq!(w.fake.issue(1).comments.len(), 1);
 }
 
@@ -1137,6 +1139,88 @@ fn comment_posts_oldest_first_and_a_rerun_after_a_failed_post_posts_the_rest() {
         comments[1].contains("### fl check: passed"),
         "{}",
         comments[1]
+    );
+}
+
+// ⚠ A post that fails after another landed: the one that landed is said
+// as it lands, and the command fails.
+#[test]
+fn a_post_that_fails_after_one_landed_names_the_one_posted_and_exits_2() {
+    let w = World::new();
+    w.ready();
+    for args in [
+        &["record", "move", "1", "--to", "doing"][..],
+        &["check", "launch", "--project", "1", "--record", "1"][..],
+    ] {
+        w.fake.state().fail_comment_next = true;
+        w.fl()
+            .args(args)
+            .assert()
+            .success()
+            .stderr(contains(NOT_POSTED));
+    }
+    let ids = w.decision_ids();
+    assert_eq!(ids.len(), 2, "{ids:?}");
+    w.fake.state().fail_comment_after = Some(1);
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .code(2)
+        .stdout(
+            contains(format!("posted\t{}\n", ids[0]))
+                .and(contains(format!("posted\t{}", ids[1])).not())
+                .and(contains("comments\t").not()),
+        );
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("### fl move: allowed"),
+        "{}",
+        comments[0]
+    );
+}
+
+// ⚠ A decision made by handle before a rename is filed under the IRI it
+// was made with, under the old name. The command its warning names still
+// finds it after the rename.
+#[test]
+fn the_recovery_a_warning_names_finds_its_decision_after_a_rename() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_comment_next = true;
+    let out = w
+        .fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success()
+        .stderr(contains(NOT_POSTED))
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8(out).unwrap();
+    let warning = stderr
+        .lines()
+        .find(|l| l.starts_with(NOT_POSTED))
+        .expect("the warning");
+    let (_, tail) = warning.split_once("; run `").expect("the command it names");
+    let (command, _) = tail.split_once('`').expect("the command's end");
+    let args: Vec<&str> = command
+        .strip_prefix("fl ")
+        .expect("an fl command")
+        .split(' ')
+        .collect();
+    w.fake.rename("acme/gadgets");
+    w.fl()
+        .args(&args)
+        .assert()
+        .success()
+        .stdout(contains("comments\t1 posted, 0 already there"));
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("### fl move: allowed"),
+        "{}",
+        comments[0]
     );
 }
 
@@ -1413,7 +1497,8 @@ fn comment_skips_a_decision_whose_id_fl_does_not_write() {
         .assert()
         .success();
     let hostile = fl_core::Decision {
-        id: fl_core::Iri::parse("urn:x:a--><b>").unwrap(),
+        // A control character too: the id is printed escaped, never raw.
+        id: fl_core::Iri::parse("urn:x:a-->\u{7}<b>").unwrap(),
         at: fl_core::At::from_unix_millis(1),
         record: fl_core::RecordId(
             fl_core::Iri::parse("https://github.com/acme/widgets/issues/1").unwrap(),
@@ -1435,7 +1520,11 @@ fn comment_skips_a_decision_whose_id_fl_does_not_write() {
         .args(["github", "ledger", "comment", "1"])
         .assert()
         .code(1)
-        .stderr(contains("skipped\t").and(contains("is not one fl writes")))
+        .stderr(
+            contains("skipped\turn:x:a-->\\u{7}<b>\t")
+                .and(contains("is not one fl writes"))
+                .and(contains("\u{7}").not()),
+        )
         .stdout(contains("comments\t0 posted, 1 already there"));
     assert_eq!(
         w.fake.issue(1).comments.len(),
