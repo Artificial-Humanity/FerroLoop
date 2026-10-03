@@ -2108,6 +2108,58 @@ mod tests {
         assert_eq!(l.commit_of(&head, &published[0]), None);
     }
 
+    // ⚠ A decision past the first segment is named by its own segment and
+    // its line within that segment, which is what the blame of that file
+    // counts: not segment 1, and not its place in the whole directory.
+    #[test]
+    fn a_decision_in_a_later_segment_names_that_segment_its_line_there_and_its_commit() {
+        let (fake, local, _root) = world();
+        let ddir = layout::dir(Area::Decisions, record().iri());
+        let encode =
+            |n: u64| Line::Decision(sample_decision(n, &record(), vec![])).encode(USER_LOGIN);
+        // Segment 1 holds as many lines as fit, so the next one rolls over.
+        let mut fill = String::new();
+        let mut n = 100;
+        // `<` is `+ 1 <=`: the line and its newline fit.
+        while fill.len() + encode(n).len() < layout::SEGMENT_LIMIT {
+            fill.push_str(&encode(n));
+            fill.push('\n');
+            n += 1;
+        }
+        let filled = n - 100;
+        assert!(filled > 2, "segment 1 holds many lines: {filled}");
+        assert!(
+            fill.len() + encode(1).len() + 1 > layout::SEGMENT_LIMIT,
+            "the next decision's line does not fit in segment 1"
+        );
+        fake.hand_commit(&[(layout::segment_path(&ddir, 1).as_str(), Some(fill.as_str()))]);
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let (b1, b2) = (decision_batch(1, vec![]), decision_batch(2, vec![]));
+        let c1 = l.publish(&b1).unwrap();
+        let c2 = l.publish(&b2).unwrap();
+        let (head, published) = l.published_decisions(record().iri()).unwrap();
+        assert_eq!(published.len() as u64, filled + 2);
+        let seg1 = layout::segment_path(&ddir, 1);
+        let seg2 = layout::segment_path(&ddir, 2);
+        let last_of_1 = &published[published.len() - 3];
+        assert_eq!(
+            (last_of_1.file.as_str(), last_of_1.line),
+            (seg1.as_str(), filled)
+        );
+        let (p1, p2) = (
+            &published[published.len() - 2],
+            &published[published.len() - 1],
+        );
+        assert_eq!(p1.decision, b1.decision);
+        assert_eq!((p1.file.as_str(), p1.line), (seg2.as_str(), 1));
+        assert_eq!(p2.decision, b2.decision);
+        assert_eq!((p2.file.as_str(), p2.line), (seg2.as_str(), 2));
+        assert!(c1.is_some() && c2.is_some() && c1 != c2);
+        assert_eq!(l.commit_of(&head, p1), c1);
+        assert_eq!(l.commit_of(&head, p2), c2);
+    }
+
     #[test]
     fn runs_of_reads_every_gate_at_one_head_in_one_listing() {
         let (fake, local, _root) = world();

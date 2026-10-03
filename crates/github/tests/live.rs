@@ -200,8 +200,9 @@ struct Live {
 }
 
 impl Live {
-    /// The repository `var` names, checked to be private, or not, as
-    /// `private` says.
+    /// The repository `var` names, checked to be private or public, as
+    /// `private` says. ⚠ Exactly: an `internal` repository is neither, so
+    /// a test that needs a public one never runs on it.
     fn on(var: &str, private: bool) -> Live {
         let name = std::env::var(var)
             .unwrap_or_else(|_| panic!("set {var}=owner/repo to run this live test"));
@@ -214,9 +215,12 @@ impl Live {
             "GitHub answered {} when the live test read `{name}` ({var})",
             r.status
         );
-        let is_private = r.body["visibility"].as_str() == Some("private");
         let want = if private { "private" } else { "public" };
-        assert_eq!(is_private, private, "`{name}` ({var}) must be {want}");
+        assert_eq!(
+            r.body["visibility"].as_str(),
+            Some(want),
+            "`{name}` ({var}) must be {want}"
+        );
         let text = |k: &str| {
             r.body[k]
                 .as_str()

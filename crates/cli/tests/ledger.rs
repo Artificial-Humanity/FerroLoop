@@ -1225,6 +1225,47 @@ fn the_recovery_a_warning_names_finds_its_decision_after_a_rename() {
     );
 }
 
+// ⚠ Recovery by number reads only the decisions filed under the issue's
+// current URL, and names that URL on stderr: after a rename, its "0
+// posted" is visibly about the new URL, not the old one the decision is
+// filed under. Given the URL itself, it names nothing more.
+#[test]
+fn recovery_by_number_names_the_url_whose_decisions_it_read() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success()
+        .stderr(contains(NOT_POSTED));
+    w.fake.rename("acme/gadgets");
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stderr(contains("read\thttps://github.com/acme/gadgets/issues/1\n"))
+        .stdout(contains("comments\t0 posted, 0 already there").and(contains("moved\t").not()));
+    assert!(w.fake.issue(1).comments.is_empty());
+    w.fl()
+        .args(["github", "ledger", "comment", "#1"])
+        .assert()
+        .success()
+        .stderr(contains("read\thttps://github.com/acme/gadgets/issues/1\n"));
+    w.fl()
+        .args([
+            "github",
+            "ledger",
+            "comment",
+            "https://github.com/acme/widgets/issues/1",
+        ])
+        .assert()
+        .success()
+        .stderr(contains("read\t").not())
+        .stdout(contains("comments\t1 posted, 0 already there"));
+    assert_eq!(w.fake.issue(1).comments.len(), 1);
+}
+
 // ⚠ Spec §4.3: a marker on a later page still counts.
 #[test]
 fn comment_finds_its_markers_on_every_page() {
@@ -1648,6 +1689,36 @@ fn a_gate_named_with_markup_is_escaped_in_its_comment() {
         1,
         "only the marker opens a comment: {c}"
     );
+}
+
+// ⚠ A carriage return is dropped from a comment, so one inside a reference
+// or a URL must not hide it from the escaping: each is neutralised as
+// though the carriage return were not there.
+#[test]
+fn a_gate_named_with_a_carriage_return_inside_a_reference_or_a_url_is_escaped() {
+    let w = World::new();
+    w.gated_as("GH\r-1 G\rH-2 https:/\r/evil.example www\r.evil.example");
+    w.init();
+    w.export();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    let c = &comments[0];
+    assert!(
+        c.contains(
+            "| launch | GH-&#8203;1 GH-&#8203;2 https:/&#8203;/evil.example \
+             www&#8203;.evil.example | PASS |"
+        ),
+        "{c}"
+    );
+    assert!(!c.contains("GH-1"), "{c}");
+    assert!(!c.contains("GH-2"), "{c}");
+    assert!(!c.contains("https://evil"), "{c}");
+    assert!(!c.contains("www.evil"), "{c}");
+    assert!(!c.contains('\r'), "{c:?}");
 }
 
 /// What names this machine, read now and never written down. Paths (the

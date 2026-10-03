@@ -276,7 +276,9 @@ fn after_www(before: &[char]) -> bool {
     matches!(before, [.., 'w' | 'W', 'w' | 'W', 'w' | 'W'])
 }
 
-/// `c`, which follows `before`, as it is written in `ctx`.
+/// `c`, which follows `before`, as it is written in `ctx`. ⚠ Neither holds
+/// a carriage return: [`escape_in`] strips them first, so `before` is the
+/// text as written.
 fn push_escaped(out: &mut String, c: char, before: &[char], ctx: Context) {
     match c {
         '&' => out.push_str("&amp;"),
@@ -292,7 +294,6 @@ fn push_escaped(out: &mut String, c: char, before: &[char], ctx: Context) {
         // it (spec §4.2).
         '/' if after_scheme(before) => out.push_str("&#8203;/"),
         '.' if after_www(before) => out.push_str("&#8203;."),
-        '\r' => {}
         '\n' if ctx == Context::Markdown => out.push_str("<br>"),
         '\n' => out.push(' '),
         // `$` too: GitHub renders `$…$` as math. Not `!`: it matters only
@@ -311,7 +312,11 @@ fn push_escaped(out: &mut String, c: char, before: &[char], ctx: Context) {
 /// `s` escaped for `ctx`, holding at most `limit` bytes: cut after a whole
 /// escaped character, and ending in `…` when cut.
 fn escape_in(s: &str, limit: usize, ctx: Context) -> String {
-    let chars: Vec<char> = s.chars().collect();
+    // ⚠ Carriage returns go before anything is decided: one dropped while
+    // escaping would sit between the parts of a reference or a URL (`GH\r-1`,
+    // `https:/\r/`), hide it from the text before, and still let the output
+    // form it.
+    let chars: Vec<char> = s.chars().filter(|c| *c != '\r').collect();
     let mut full = String::with_capacity(s.len());
     // How long the escaped text is after each character.
     let mut ends = Vec::with_capacity(chars.len());
@@ -662,8 +667,10 @@ fn largest(mut lo: usize, mut hi: usize, fits: impl Fn(usize) -> bool) -> usize 
 }
 
 /// The comment for `view` on `repo` (spec §4.2), at most
-/// [`COMMENT_LIMIT`] bytes. `state`: the line a comment posted as the
-/// decision is made adds; `None` for one recovered later.
+/// [`COMMENT_LIMIT`] bytes. `repo` must be GitHub's resolved `owner/name`:
+/// the link to the ledger commit is built from it. `state`: the line a
+/// comment posted as the decision is made adds; `None` for one recovered
+/// later.
 ///
 /// ⚠ Over the limit, excerpts go first — each cut to the largest equal
 /// share that fits, then left out — and only then the table's last rows.
@@ -674,6 +681,17 @@ pub fn render(
     visibility: Visibility,
     state: Option<&str>,
 ) -> String {
+    let body = fitted(view, repo, visibility, state);
+    debug_assert!(
+        body.len() <= COMMENT_LIMIT,
+        "a rendered comment holds {} bytes, over the limit",
+        body.len()
+    );
+    body
+}
+
+/// [`render`]'s body: the largest comment that fits, chosen as it says.
+fn fitted(view: &DecisionView, repo: &str, visibility: Visibility, state: Option<&str>) -> String {
     // ⚠ Decision 2: excerpts only on a private repository.
     let blocks = match visibility {
         Visibility::Private => blocks(view),
@@ -858,6 +876,31 @@ mod tests {
         assert_eq!(
             escape_html_capped("http://x www.y", CELL_LIMIT),
             "http:/&#8203;/x www&#8203;.y"
+        );
+    }
+
+    // ⚠ A carriage return is dropped from the output, so it must be gone
+    // before anything is decided: one between the parts of a reference or a
+    // URL would hide it from the check while the output still forms it.
+    #[test]
+    fn a_carriage_return_inside_a_reference_or_a_url_hides_nothing() {
+        let cases = [
+            ("GH\r-1", "GH-&#8203;1"),
+            ("G\rH-1", "GH-&#8203;1"),
+            ("https:/\r/evil.example", "https:/&#8203;/evil.example"),
+            ("www\r.evil.example", "www&#8203;.evil.example"),
+        ];
+        // Every input in both contexts, compared at once: a failure shows
+        // each case that leaks, not only the first.
+        let got = cases.map(|(raw, _)| (raw, escape(raw), escape_html_capped(raw, CELL_LIMIT)));
+        let want = cases.map(|(raw, n)| (raw, n.to_string(), n.to_string()));
+        assert_eq!(got, want, "(input, markdown, html)");
+        // The cap measures the text as written: carriage returns take no
+        // room, so ten of them before `ab` still leave it whole in 2 bytes.
+        assert_eq!(escape_capped(&format!("{}ab", "\r".repeat(10)), 2), "ab");
+        assert_eq!(
+            escape_html_capped(&format!("{}ab", "\r".repeat(10)), 2),
+            "ab"
         );
     }
 
@@ -1516,6 +1559,55 @@ mod tests {
             );
             assert!(body.len() <= COMMENT_LIMIT, "{size}: {} bytes", body.len());
             assert_eq!(marked(&body), Some(seq_iri(90)), "{size}");
+        }
+    }
+
+    // ⚠ Escapes and fences grow a comment past its raw text: names that
+    // swell when escaped (`&`, `@`, `GH-`) and excerpts whose backtick runs
+    // lengthen their fences still fit, and stay marked — with every excerpt
+    // whole, cut, left out, and the table's last rows dropped.
+    #[test]
+    fn a_comment_heavy_with_escapes_and_backtick_runs_fits_and_is_marked() {
+        let swelling = "&@GH-#".repeat(60);
+        let excerpt = format!(
+            "{}x{}\n{}",
+            "`".repeat(4_000),
+            "`".repeat(8_000),
+            "&@".repeat(2_000)
+        );
+        // Each size, and what it leaves out: excerpts cut, excerpts left
+        // out, the table's last rows dropped.
+        let steps = [
+            (1u64, [false, false, false]),
+            (4, [true, false, false]),
+            (30, [true, false, false]),
+            (100, [false, true, false]),
+            (400, [false, true, true]),
+        ];
+        for (n, step) in steps {
+            let mut v = many(n, &swelling, Some(&excerpt));
+            for r in &mut v.rows {
+                r.role = swelling.clone();
+            }
+            v.by = swelling.repeat(10);
+            v.missing = (0..30)
+                .map(|i| Iri::parse(&format!("urn:x:{i}{}", "&@GH-#".repeat(40))).unwrap())
+                .collect();
+            let body = render(
+                &v,
+                "acme/widgets",
+                Visibility::Private,
+                Some("A check changes no state."),
+            );
+            assert!(body.len() <= COMMENT_LIMIT, "{n}: {} bytes", body.len());
+            assert_eq!(marked(&body), Some(seq_iri(90)), "{n}");
+            let said = [
+                "Excerpts were cut to fit in one comment.",
+                "Output excerpts are not shown",
+                "more runs: the ledger commit holds every one.",
+            ]
+            .map(|p| body.contains(p));
+            assert_eq!(said, step, "{n}: what the comment says it left out");
         }
     }
 

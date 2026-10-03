@@ -254,12 +254,22 @@ fn comment(ctx: &Ctx<'_>, gl: &GithubLedger<'_>, item: &Ref) -> Result<i32> {
         bail!("`fl github ledger comment` needs the project bound to a GitHub repository");
     };
     let iri = match item {
-        Ref::Handle(n) => gh.issue_url(*n),
+        // ⚠ A number names the issue's current URL, and only the decisions
+        // filed under it are read: said, so a count after a rename is
+        // visibly about that URL and not the one the decisions may be
+        // filed under.
+        Ref::Handle(n) => {
+            let iri = gh.issue_url(*n);
+            eprintln!("read\t{iri}");
+            iri
+        }
         Ref::Iri(i) => i.clone(),
     };
     let at = gl.issue_at(&iri)?;
-    // ⚠ GitHub redirects a transferred issue, and also one whose repository
-    // was renamed; the address says where it is, not why it moved.
+    // ⚠ GitHub redirects a transferred issue, so it is followed and said.
+    // After a repository rename the address read is usually already the new
+    // one, so no redirect comes and nothing is said; when one does come, the
+    // address says where the issue is, not why it moved.
     if let Some(to) = &at.moved_to {
         println!("moved\t{to}");
     }

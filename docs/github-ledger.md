@@ -108,20 +108,20 @@ command warns before it appends.
 
 ## Decision comments
 
-Once its state change is done, each decision posts one comment on the issue it concerns: a
-move, a `check --record` and an attempt on the record's issue; a reproduction and a
-verification on the finding's issue. A refused decision gets one too, saying it was refused.
-The comment shows what was decided, the outcome, who decided, a link to the ledger commit, a
-table of the runs it rests on — or the attempt's adapter, status, duration, tokens and cost —
-and one line saying whether the state change completed. Output excerpts appear only on a
-private repository, folded in a `<details>` block. Every name is escaped. `@`, `#` and the `-`
-of `GH-` are followed by a zero-width space, and a URL in any text the comment quotes outside
-its excerpts is broken by one too — between the two slashes of `scheme://`, and before the dot
-of `www.` — so a comment mentions no one and links no issue and no URL by accident. Its one
-link is fl's own, to the ledger commit ([Limits](#limits) says what that costs a copied URL). A
-comment holds at most 60,000 bytes: past that, excerpts are cut first, then left out, then the
-table's last rows, and the comment says so — the ledger commit holds everything. Decisions made
-before the GitHub ledger was switched on get no comment.
+Once its state change is done, each decision posts one comment on the issue it concerns: a move,
+a `check --record` and an attempt on the record's issue; a reproduction and a verification on
+the finding's issue. A refused decision gets one too, saying it was refused. The comment shows
+what was decided, the outcome, who decided, a link to the ledger commit, a table of the runs it
+rests on — or the attempt's adapter, status, duration, tokens and cost — and one line saying
+whether the state change completed. Output excerpts appear only on a private repository, folded
+in a `<details>` block. Every name is escaped. `@`, `#` and the `-` of `GH-` are followed by a
+zero-width space, and a URL in any text the comment quotes outside its excerpts is broken by one
+too — between the two slashes of `scheme://`, and before the dot of `www.` — so a comment
+mentions no one and links no issue and no URL by accident. The link fl writes is to the ledger
+commit ([Limits](#limits) says what that costs a copied URL, and what GitHub may link on its
+own). A comment holds at most 60,000 bytes: past that, excerpts are cut first, then left out,
+then the table's last rows, and the comment says so — the ledger commit holds everything.
+Decisions made before the GitHub ledger was switched on get no comment.
 
 The ledger is the record and a comment is its view. Each comment carries a hidden marker,
 `<!-- fl:decision {"id":"<decision id>"} -->`, and a comment marks the decision its first
@@ -140,17 +140,18 @@ works after the repository is renamed.
 
 `fl github ledger comment <item>` — the record's or finding's issue number (`41` or `#41`),
 `owner/repo#41`, or its URL — lists every comment on the issue, every page, and posts each
-decision filed under that item whose comment is missing, oldest first, rendered from the
-ledger. It prints `posted` and the decision's id for each, then how many it posted and how many
-were already there. A decision whose id is not one fl writes gets no comment: the command names
-it on stderr, with the quarantine command for its line, and exits 1. Run it again at any time:
-a decision whose comment is there is skipped. A comment posted seconds earlier may not be
-listed yet, so at worst it posts a harmless duplicate. If the issue was transferred, or its
-repository renamed, it prints `moved` and where the issue is now, and posts there. Given a
-number, it reads only the decisions filed under the issue's current URL ([Limits](#limits)). A
-recovered comment has no line about the state change: the ledger does not record whether it
-completed. Run it where the project's catalog is: a comment names gates by the local catalog's
-names.
+decision filed under that item whose comment is missing, oldest first, rendered from the ledger.
+It prints `posted` and the decision's id for each, then how many it posted and how many were
+already there. A decision whose id is not one fl writes gets no comment: the command names it on
+stderr, with the quarantine command for its line, and exits 1. Run it again at any time: a
+decision whose comment is there is skipped. A comment posted seconds earlier may not be listed
+yet, so at worst it posts a harmless duplicate. If the issue was transferred, it prints `moved`
+and where the issue is now, and posts there. After a repository rename it usually prints no
+`moved`: the old name resolves to the new one before the issue is read. Given a number, it reads
+only the decisions filed under the issue's current URL, and prints `read` and that URL on
+stderr ([Limits](#limits)). A recovered comment has no line about the state change: the
+ledger does not record whether it completed. Run it where the project's catalog is: a comment
+names gates by the local catalog's names.
 
 ## What a decision costs
 
@@ -226,12 +227,16 @@ again with a larger number.
 - **A renamed repository.** Decisions are filed under the record's or finding's URL as it was
   when the decision was made. `fl github ledger comment` given the issue's number reads only
   the issue's current URL, so after a rename it misses the decisions filed under the old one.
+  Its `read` line on stderr names the URL it read, so a `0 posted` there is about that URL.
   Run the command a failed comment's warning prints: it names the URL they are filed under.
 - **Copied URLs.** Every URL in the text a comment quotes outside its excerpts — names, the
   header, table cells — is broken by a zero-width space, so it is not linked; a URL copied from
   there carries that invisible U+200B. Copy IRIs from `fl`'s own output. Two URLs are left
   whole: fl's link to the ledger commit, and any URL in an output excerpt, which sits in a code
   block GitHub does not link.
+- **GitHub's own links.** GitHub may link the 7-character commit id in the table of runs to a
+  commit of the repository, if one matches. That link is harmless: it mentions no one and
+  references no issue.
 - **Whose comments count.** A comment counts as posted when the account fl posts as wrote it,
   or an account that wrote a decision under that item, and only by its first marker line
   outside a code block. A collaborator who wrote a decision under the item can therefore mark
