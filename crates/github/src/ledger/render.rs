@@ -62,7 +62,8 @@ struct Block {
 /// HTML comment: `urn:uuid:` and a lowercase, hyphenated UUID, the only
 /// form fl mints. ⚠ Nothing else: `Iri::parse` accepts `urn:x:a--><b>`,
 /// and a hand-written ledger line can carry it; written into a marker it
-/// would close the comment early.
+/// would close the comment early. `Iri::parse` already folds a `urn:uuid`
+/// to lowercase; the range check here is defence in depth.
 pub fn markable(id: &Iri) -> bool {
     let Some(uuid) = id.as_str().strip_prefix("urn:uuid:") else {
         return false;
@@ -145,6 +146,18 @@ fn after_gh(before: &[char]) -> bool {
     matches!(before, [.., 'g' | 'G', 'h' | 'H'])
 }
 
+/// Whether the text before ends in `:/`: a `/` there would complete a
+/// `scheme://` URL, which GitHub links.
+fn after_scheme(before: &[char]) -> bool {
+    matches!(before, [.., ':', '/'])
+}
+
+/// Whether the text before ends in `www`, any case: a `.` there would start
+/// a `www.` URL, which GitHub links.
+fn after_www(before: &[char]) -> bool {
+    matches!(before, [.., 'w' | 'W', 'w' | 'W', 'w' | 'W'])
+}
+
 /// `c`, which follows `before`, as it is written in `ctx`.
 fn push_escaped(out: &mut String, c: char, before: &[char], ctx: Context) {
     match c {
@@ -156,6 +169,11 @@ fn push_escaped(out: &mut String, c: char, before: &[char], ctx: Context) {
         '@' => out.push_str("@&#8203;"),
         '#' => out.push_str("#&#8203;"),
         '-' if after_gh(before) => out.push_str("-&#8203;"),
+        // A zero-width space before each: `https://…` and `www.…` are no
+        // longer URLs, so an issue's URL neither links nor cross-references
+        // it (spec §4.2).
+        '/' if after_scheme(before) => out.push_str("&#8203;/"),
+        '.' if after_www(before) => out.push_str("&#8203;."),
         '\r' => {}
         '\n' if ctx == Context::Markdown => out.push_str("<br>"),
         '\n' => out.push(' '),
@@ -186,6 +204,10 @@ fn escape_in(s: &str, limit: usize, ctx: Context) -> String {
     if full.len() <= limit {
         return full;
     }
+    // Not even the ellipsis fits: nothing does.
+    if limit < '…'.len_utf8() {
+        return String::new();
+    }
     let room = limit.saturating_sub('…'.len_utf8());
     let keep = ends
         .iter()
@@ -199,9 +221,9 @@ fn escape_in(s: &str, limit: usize, ctx: Context) -> String {
 }
 
 /// `s` as markdown text in a comment (spec §4.2): HTML and markdown
-/// escaped, `@`, `#` and `GH-` neutralised, a newline a `<br>` — so a
-/// name never notifies anyone, links an issue, opens a tag or breaks a
-/// table.
+/// escaped, `@`, `#`, `GH-` and the URLs GitHub links (`scheme://`,
+/// `www.`) neutralised, a newline a `<br>` — so a name never notifies
+/// anyone, links an issue or a URL, opens a tag or breaks a table.
 pub fn escape(s: &str) -> String {
     escape_in(s, usize::MAX, Context::Markdown)
 }
@@ -211,8 +233,8 @@ pub fn escape_capped(s: &str, limit: usize) -> String {
     escape_in(s, limit, Context::Markdown)
 }
 
-/// `s` inside an HTML element: entities and the neutralised `@`, `#` and
-/// `GH-` only, a newline a space; at most `limit` bytes.
+/// `s` inside an HTML element: entities and the neutralised `@`, `#`,
+/// `GH-` and URLs only, a newline a space; at most `limit` bytes.
 fn escape_html_capped(s: &str, limit: usize) -> String {
     escape_in(s, limit, Context::Html)
 }
@@ -614,9 +636,15 @@ mod tests {
         );
         assert_eq!(escape("a > b"), "a &gt; b");
         assert_eq!(
-            escape("plain-text.v1: ok/fine-G-H-"),
-            "plain-text.v1: ok/fine-G-H-",
-            "nothing else changes, and a `-` not after `GH` stays"
+            escape("plain-text.v1: ok/fine-G-H- a//b c:/e ww.x"),
+            "plain-text.v1: ok/fine-G-H- a//b c:/e ww.x",
+            "nothing else changes: a `-` not after `GH`, a `/` not after `:/`, a `.` not after \
+             `www` stay"
+        );
+        // URLs GitHub would link, an issue's included: no longer URLs.
+        assert_eq!(
+            escape("https://github.com/acme/other/issues/1 www.example.com WwW.x"),
+            "https:/&#8203;/github.com/acme/other/issues/1 www&#8203;.example.com WwW&#8203;.x"
         );
     }
 
@@ -628,6 +656,10 @@ mod tests {
             escape_html_capped("a|b_c @x #1 <i> GH-1 & \\\nz", CELL_LIMIT),
             r"a|b_c @&#8203;x #&#8203;1 &lt;i&gt; GH-&#8203;1 &amp; \ z"
         );
+        assert_eq!(
+            escape_html_capped("http://x www.y", CELL_LIMIT),
+            "http:/&#8203;/x www&#8203;.y"
+        );
     }
 
     #[test]
@@ -637,6 +669,11 @@ mod tests {
         assert!(cut.len() <= CELL_LIMIT && cut.ends_with('…'), "{cut}");
         // Never half an escape: four `&` in ten bytes keep one whole `&amp;`.
         assert_eq!(escape_capped("&&&&", 10), "&amp;…");
+        // Not even one whole escape fits: the ellipsis alone, never half one.
+        assert_eq!(escape_capped("&&&&", 4), "…");
+        // Not even the ellipsis fits: nothing, never more than the limit.
+        assert_eq!(escape_capped("abcdef", 2), "");
+        assert_eq!(escape_capped("ab", 2), "ab", "a text that fits is whole");
         // Exactly at the limit: whole.
         assert_eq!(
             escape_capped(&"a".repeat(CELL_LIMIT), CELL_LIMIT),
@@ -675,6 +712,17 @@ mod tests {
             marked(&format!("{m}\n{other}")),
             Some(id.clone()),
             "only the first"
+        );
+        // Indented, a marker still counts, and a fence still hides one.
+        assert_eq!(
+            marked(&format!("  {m}\nbody")),
+            Some(id.clone()),
+            "indented"
+        );
+        assert_eq!(
+            marked(&format!("  ````\n{other}\n  ````\n")),
+            None,
+            "indented fence"
         );
         // A broken marker-like line above the real one is passed over.
         assert_eq!(
@@ -1029,6 +1077,12 @@ mod tests {
         assert!(named.contains("… and 2 more entries not found."), "{named}");
         v.missing.truncate(1);
         assert!(!missing(&v).contains("more entries"));
+        // A hand-written id is escaped like any name.
+        v.missing = vec![Iri::parse("urn:x:@x#1<b>|").unwrap()];
+        assert_eq!(
+            missing(&v),
+            "\nNot found in the ledger: urn:x:@&#8203;x#&#8203;1&lt;b&gt;\\|.\n"
+        );
     }
 
     // ⚠ Spec §4.2: excerpts only on a private repository, each in a fence
