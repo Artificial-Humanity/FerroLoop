@@ -109,6 +109,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
 
     let flushed = publish(roles.ledger, record.as_ref(), &report)?;
     crate::ctx::report_flush(&flushed);
+    // Spec §4.1: a check tied to a record changes no state; its comment
+    // follows its flush. A plain check flushed nothing.
+    crate::comment::after(ctx, &project, true);
     Ok(code)
 }
 

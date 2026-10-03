@@ -3,11 +3,13 @@
 //! decision and the evidence it rests on.
 
 mod append;
+mod comment;
 pub mod disclose;
 mod git;
 mod init;
 pub mod layout;
 mod read;
+pub mod render;
 mod verify;
 
 #[cfg(test)]
@@ -25,9 +27,10 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub use append::TRIES;
+pub use comment::IssueAt;
 pub use disclose::Visibility;
 pub use init::{InitOutcome, Mode, guidance, ruleset_command};
-pub use read::Note;
+pub use read::{Note, Published};
 pub use verify::{BadCommit, SameId, VERIFY_LIMIT, Verified, VerifyPhase};
 
 /// The GitHub side of mode B, for one repository and one command.

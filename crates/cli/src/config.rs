@@ -519,6 +519,20 @@ mod tests {
         }
     }
 
+    // `ledger = true` is not the string "github": refused when the config
+    // is read, never taken as the local ledger.
+    #[test]
+    fn a_ledger_key_that_is_not_a_string_is_refused() {
+        let text = "[[project]]\nroot = \"/r\"\nstore = \"/s.redb\"\n\
+                    tracker = { github = \"acme/widgets\", credential = \"env\", ledger = true }\n";
+        let msg = format!(
+            "{:#}",
+            load_text(text).expect_err("`ledger = true` is refused")
+        );
+        assert!(msg.contains("invalid type: boolean `true`"), "{msg}");
+        assert!(msg.contains("expected a string"), "{msg}");
+    }
+
     // Two entries on one root and one store that differ only in `ledger`
     // are two trackers: refused, naming which has the GitHub ledger.
     #[test]

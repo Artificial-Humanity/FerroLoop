@@ -51,12 +51,12 @@ has never heard of an import and would happily let someone edit an imported gate
 open it at all, rather than opening it and quietly ignoring the mark.
 
 A store that records a GitHub ledger root is format 4. Importing a manifest that carries one
-(manifest format 2, written for a project whose GitHub ledger is switched on) raises the store to
-format 4 — the same thing happens when the GitHub ledger is set up directly. An older `fl` refuses
-a format 4 store — it would otherwise export the manifest without the root every other machine
-checks the ledger against. The remedy is to upgrade `fl`: nothing is wrong with the store, and
-starting a new one would lose its history. From this release on, `fl` itself says so when it meets
-a store newer than it reads.
+(manifest format 2: it carries `ledger_root`, the first commit of the project's GitHub ledger —
+see [github-ledger.md](github-ledger.md)) raises the store to format 4 — the same thing happens
+when the GitHub ledger is set up directly. An older `fl` refuses a format 4 store — it would
+otherwise export the manifest without the root every other machine checks the ledger against. The
+remedy is to upgrade `fl`: nothing is wrong with the store, and starting a new one would lose its
+history. From this release on, `fl` itself says so when it meets a store newer than it reads.
 
 ## Check
 

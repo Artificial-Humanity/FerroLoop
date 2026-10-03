@@ -15,6 +15,9 @@ File naming in this directory follows
   a committed manifest: export, import and check.
 * [github-tracker.md](github-tracker.md) — keep a project's records and findings in a GitHub
   repository's Issues: binding, credentials, repair, conflicts and limits.
+* [github-ledger.md](github-ledger.md) — publish each decision's evidence to the tracker's
+  repository and comment it on its issue: setup, modes, disclosure, comments and their
+  recovery, cost, errors and limits.
 
 No anchor document exists yet.
 
