@@ -41,7 +41,7 @@ GitHub tracker and a local store at the same time, an id must work in both.
 |---|---|---|---|
 | Local | local | local | the product default |
 | GitHub mode A | GitHub | local, or a CI artifact | closer to our own end state |
-| GitHub mode B | GitHub | GitHub | where we start |
+| GitHub mode B | GitHub | GitHub: the local store keeps every run; each decision publishes to `fl/ledger` ([github-ledger.md](../../github-ledger.md)) | where we start |
 | Two-tier | local for developer-level items, GitHub for human-level items | local | the flow we recommend |
 
 In the two-tier flow the two trackers carry **different subject matter**. The local

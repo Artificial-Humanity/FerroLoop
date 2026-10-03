@@ -1574,6 +1574,44 @@ fn comment_without_the_ledger_key_is_refused() {
         .stderr(contains("does not name the GitHub ledger"));
 }
 
+// docs/github-ledger.md "What a decision costs", and spec §3.4: the
+// requests a steady-state `check --record` makes, by kind. A count that
+// changes changes the doc and §3.4 in the same commit.
+#[test]
+fn a_steady_state_decision_costs_what_the_docs_say() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    w.fake.state().requests.clear();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let requests = w.fake.state().requests.clone();
+    let containing = |part: &str| requests.iter().filter(|r| r.contains(part)).count();
+    assert_eq!(
+        [
+            requests_equal(&w, "GET /repos/acme/widgets"),
+            containing("/rules/branches/fl/ledger"),
+            containing("/git/ref/heads/fl/ledger"),
+            containing("/compare/"),
+            requests_equal(&w, "POST /graphql"),
+            containing("/git/blobs/"),
+            requests_equal(&w, "GET /user"),
+            requests_equal(&w, "POST /repos/acme/widgets/issues/1/comments"),
+        ],
+        // The tracker's own read and the visibility; the rules; the head
+        // twice; no compare; the format's listing, the directories'
+        // listing and the commit; the two segments the last decision grew;
+        // who fl writes as; the comment.
+        [2, 1, 2, 0, 3, 2, 1, 1],
+        "{requests:#?}"
+    );
+}
+
 // ⚠ Spec §4.2, §8.3: a gate named with a pipe, backticks, a mention, a
 // reference (`#1` and `GH-1`), a comment opener and a newline is escaped
 // in its comment — it notifies no one, links nothing, opens nothing,
