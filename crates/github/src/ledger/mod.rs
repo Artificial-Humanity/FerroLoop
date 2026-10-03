@@ -3,6 +3,7 @@
 //! decision and the evidence it rests on.
 
 mod append;
+mod comment;
 pub mod disclose;
 mod git;
 mod init;
@@ -26,6 +27,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 pub use append::TRIES;
+pub use comment::IssueAt;
 pub use disclose::Visibility;
 pub use init::{InitOutcome, Mode, guidance, ruleset_command};
 pub use read::{Note, Published};
