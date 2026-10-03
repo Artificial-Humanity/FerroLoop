@@ -1612,8 +1612,7 @@ fn a_gate_named_with_markup_is_escaped_in_its_comment() {
 /// match whole and only from four letters on — a two-letter host name
 /// would match ordinary text.
 struct MachineNames {
-    /// The working tree, as given and canonical: one entry when they agree.
-    tree: Vec<String>,
+    tree: Tree,
     home: String,
     /// `$USER` and the host name, each only when it can be checked.
     words: Vec<String>,
@@ -1623,11 +1622,10 @@ impl MachineNames {
     fn of(w: &World) -> MachineNames {
         let home = std::env::var("HOME").expect("HOME is set");
         assert!(home.len() > 1, "a home to look for");
-        let mut tree = vec![
-            w.repo.path().display().to_string(),
-            w.repo.path().canonicalize().unwrap().display().to_string(),
-        ];
-        tree.dedup();
+        let tree = Tree {
+            given: w.repo.path().display().to_string(),
+            canonical: w.repo.path().canonicalize().unwrap().display().to_string(),
+        };
         let host = Sys::new("hostname")
             .output()
             .ok()
@@ -1657,35 +1655,56 @@ impl MachineNames {
         MachineNames { tree, home, words }
     }
 
-    /// Every path the scan matches anywhere.
-    fn paths(&self) -> Vec<&str> {
-        self.tree
-            .iter()
-            .map(String::as_str)
-            .chain([self.home.as_str()])
-            .collect()
-    }
-
     /// Every name there is to find, read from the fields themselves.
+    /// The working tree stands for itself by its canonical form.
     fn all(&self) -> BTreeSet<String> {
-        self.tree
-            .iter()
-            .chain([&self.home])
+        [&self.tree.canonical, &self.home]
+            .into_iter()
             .chain(&self.words)
             .cloned()
             .collect()
     }
 }
 
-/// Every name in `names` that some text in `texts` holds: a path anywhere,
-/// a word whole.
+/// The working tree: one name in two forms, the path as given and the
+/// canonical one. They differ where the temporary directory is reached
+/// through a symlink, and `fl` runs its gates in the canonical one.
+struct Tree {
+    given: String,
+    canonical: String,
+}
+
+impl Tree {
+    /// Whether `text` holds either form.
+    fn in_text(&self, text: &str) -> bool {
+        text.contains(self.given.as_str()) || text.contains(self.canonical.as_str())
+    }
+}
+
+#[test]
+fn the_working_tree_is_found_in_either_form() {
+    let tree = Tree {
+        given: "/home/someone/link/w".into(),
+        canonical: "/home/someone/real/w".into(),
+    };
+    assert!(
+        tree.in_text("ran in /home/someone/real/w"),
+        "canonical only"
+    );
+    assert!(tree.in_text("ran in /home/someone/link/w"), "as given only");
+    assert!(!tree.in_text("ran in /home/someone"), "neither");
+}
+
+/// Every name in `names` that some text in `texts` holds: a path anywhere
+/// (the working tree in either form), a word whole.
 fn found(texts: &[String], names: &MachineNames) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for text in texts {
-        for p in names.paths() {
-            if text.contains(p) {
-                out.insert(p.to_string());
-            }
+        if names.tree.in_text(text) {
+            out.insert(names.tree.canonical.clone());
+        }
+        if text.contains(names.home.as_str()) {
+            out.insert(names.home.clone());
         }
         for word in &names.words {
             if holds_word(text, word) {
@@ -1762,7 +1781,10 @@ fn json_strings(v: &serde_json::Value, out: &mut Vec<String>) {
 #[test]
 fn the_scan_sees_a_name_through_the_escapes_it_is_published_under() {
     let names = MachineNames {
-        tree: vec!["/home/someone/bin/lint".into()],
+        tree: Tree {
+            given: "/home/someone/bin/lint".into(),
+            canonical: "/home/someone/bin/lint".into(),
+        },
         home: "/home/someone".into(),
         words: vec!["ci_runner".into()],
     };
