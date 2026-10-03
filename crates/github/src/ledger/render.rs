@@ -471,20 +471,85 @@ fn block(title: &str, text: &str) -> String {
     format!("<details><summary>{title}</summary>\n\n{fence}\n{text}{end}{fence}\n\n</details>\n")
 }
 
-fn assemble(view: &DecisionView, repo: &str, state: Option<&str>, blocks: &[Block]) -> String {
+/// How much of each excerpt a comment keeps.
+#[derive(Debug, Clone, Copy)]
+enum Share {
+    All,
+    /// At most this many bytes of each, cut on a whole character.
+    Bytes(usize),
+    None,
+}
+
+/// `s` cut to at most `n` bytes, on a whole character.
+fn cut_at(s: &str, n: usize) -> &str {
+    let mut i = n.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    &s[..i]
+}
+
+/// The comment with the first `rows` runs and each excerpt as `share` says,
+/// saying what it left out.
+fn assemble(
+    view: &DecisionView,
+    repo: &str,
+    state: Option<&str>,
+    rows: usize,
+    blocks: &[Block],
+    share: Share,
+) -> String {
     let mut out = head(view, repo, state);
-    out.push_str(&table(view, view.rows.len()));
+    out.push_str(&table(view, rows));
     out.push_str(&missing(view));
+    if blocks.is_empty() {
+        return out;
+    }
+    if let Share::None = share {
+        out.push_str(
+            "\nOutput excerpts are not shown: they do not fit in one comment. The ledger commit \
+             holds them.\n",
+        );
+        return out;
+    }
+    let mut cut = false;
     for b in blocks {
+        let text = match share {
+            Share::Bytes(n) => cut_at(&b.text, n),
+            Share::All | Share::None => b.text.as_str(),
+        };
+        cut |= text.len() < b.text.len();
         out.push('\n');
-        out.push_str(&block(&b.title, &b.text));
+        out.push_str(&block(&b.title, text));
+    }
+    if cut {
+        out.push_str(
+            "\nExcerpts were cut to fit in one comment. The ledger commit holds them in full.\n",
+        );
     }
     out
 }
 
-/// The comment for `view` on `repo` (spec §4.2). `state`: the line a
-/// comment posted as the decision is made adds; `None` for one recovered
-/// later.
+/// The largest `n` in `lo..=hi` for which `fits(n)`, given `fits(lo)`.
+fn largest(mut lo: usize, mut hi: usize, fits: impl Fn(usize) -> bool) -> usize {
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if fits(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
+/// The comment for `view` on `repo` (spec §4.2), at most
+/// [`COMMENT_LIMIT`] bytes. `state`: the line a comment posted as the
+/// decision is made adds; `None` for one recovered later.
+///
+/// ⚠ Over the limit, excerpts go first — each cut to the largest equal
+/// share that fits, then left out — and only then the table's last rows.
+/// Each step says so.
 pub fn render(
     view: &DecisionView,
     repo: &str,
@@ -496,7 +561,23 @@ pub fn render(
         Visibility::Private => blocks(view),
         Visibility::NotPrivate => Vec::new(),
     };
-    assemble(view, repo, state, &blocks)
+    let all = view.rows.len();
+    let fits = |rows: usize, share: Share| {
+        assemble(view, repo, state, rows, &blocks, share).len() <= COMMENT_LIMIT
+    };
+    if fits(all, Share::All) {
+        return assemble(view, repo, state, all, &blocks, Share::All);
+    }
+    if fits(all, Share::None) {
+        if !fits(all, Share::Bytes(1)) {
+            return assemble(view, repo, state, all, &blocks, Share::None);
+        }
+        let longest = blocks.iter().map(|b| b.text.len()).max().unwrap_or(1);
+        let n = largest(1, longest, |n| fits(all, Share::Bytes(n)));
+        return assemble(view, repo, state, all, &blocks, Share::Bytes(n));
+    }
+    let rows = largest(0, all, |r| fits(r, Share::None));
+    assemble(view, repo, state, rows, &blocks, Share::None)
 }
 
 /// Where a name is written: in markdown text (a table cell, the header),
@@ -1161,5 +1242,162 @@ mod tests {
         );
         v.attempt = Some(attempt(Some("")));
         assert!(!render(&v, "acme/widgets", Visibility::Private, None).contains("<details>"));
+    }
+
+    /// `n` runs of gate `gate`, each with `excerpt`, in one move.
+    fn many(n: u64, gate: &str, excerpt: Option<&str>) -> DecisionView {
+        let rows = (1..=n)
+            .map(|i| {
+                row(
+                    "launch",
+                    gate,
+                    run(i, Verdict::from_predicate(false, 1), excerpt),
+                )
+            })
+            .collect();
+        view_of(moved(false), rows)
+    }
+
+    #[test]
+    fn a_body_that_fits_is_left_whole() {
+        let excerpt = "x".repeat(1_000);
+        let body = render(
+            &many(1, "g", Some(&excerpt)),
+            "acme/widgets",
+            Visibility::Private,
+            None,
+        );
+        assert!(
+            body.contains(&format!("\n{excerpt}\n")),
+            "the whole excerpt"
+        );
+        assert!(!body.contains("to fit in one comment"), "{body}");
+    }
+
+    // ⚠ Spec §4.2: excerpts first, each to the largest equal share that
+    // fits; every row stays, a short excerpt stays whole, and the comment
+    // says what was cut.
+    #[test]
+    fn a_body_over_the_limit_cuts_excerpts_first_using_the_room_left_and_says_so() {
+        let mut v = many(20, "g", Some(&"x".repeat(10_000)));
+        v.rows.push(row(
+            "launch",
+            "g",
+            run(21, Verdict::from_predicate(false, 1), Some("short")),
+        ));
+        let body = render(&v, "acme/widgets", Visibility::Private, None);
+        assert!(body.len() <= COMMENT_LIMIT, "{} bytes", body.len());
+        assert!(
+            body.len() > COMMENT_LIMIT - 100,
+            "the room is used: {} bytes",
+            body.len()
+        );
+        assert_eq!(
+            body.matches("| launch | g |").count(),
+            21,
+            "every row stays"
+        );
+        assert_eq!(
+            body.matches("<details>").count(),
+            21,
+            "every excerpt stays, cut"
+        );
+        assert!(body.contains("\nshort\n"), "a short excerpt stays whole");
+        assert!(
+            body.contains(
+                "Excerpts were cut to fit in one comment. The ledger commit holds them \
+                           in full."
+            ),
+            "{body}"
+        );
+        assert_eq!(marked(&body), Some(seq_iri(90)));
+    }
+
+    // An excerpt is cut on a whole character: `render` returns a `String`,
+    // so a cut inside one would panic.
+    #[test]
+    fn an_excerpt_is_cut_on_a_whole_character() {
+        let body = render(
+            &many(1, "g", Some(&"é".repeat(40_000))),
+            "acme/widgets",
+            Visibility::Private,
+            None,
+        );
+        assert!(body.len() <= COMMENT_LIMIT, "{} bytes", body.len());
+        assert!(
+            body.contains("é\n```\n\n</details>"),
+            "the fence closes after a whole é"
+        );
+    }
+
+    // When even a byte of each excerpt does not fit, excerpts are left out,
+    // the table stays whole, and the comment says so.
+    #[test]
+    fn excerpts_that_do_not_fit_even_cut_are_left_out_and_the_comment_says_so() {
+        let body = render(
+            &many(200, &"g".repeat(190), Some(&"y".repeat(500))),
+            "acme/widgets",
+            Visibility::Private,
+            None,
+        );
+        assert!(body.len() <= COMMENT_LIMIT, "{} bytes", body.len());
+        assert!(!body.contains("<details>"), "no excerpt");
+        assert!(
+            body.contains(
+                "Output excerpts are not shown: they do not fit in one comment. The \
+                           ledger commit holds them."
+            ),
+            "{body}"
+        );
+        assert_eq!(
+            body.matches("| launch | ggg").count(),
+            200,
+            "every row stays"
+        );
+    }
+
+    // Then the table's last rows, as many as fit, saying how many went —
+    // and nothing about excerpts where there are none to show: none were
+    // kept (`None`), or the repository is not private.
+    #[test]
+    fn a_table_too_long_for_one_comment_drops_its_last_rows_and_says_so() {
+        let cases = [
+            (many(1_000, &"g".repeat(190), None), Visibility::Private),
+            (
+                many(1_000, &"g".repeat(190), Some("y")),
+                Visibility::NotPrivate,
+            ),
+        ];
+        for (v, visibility) in cases {
+            let body = render(&v, "acme/widgets", visibility, None);
+            assert!(body.len() <= COMMENT_LIMIT, "{} bytes", body.len());
+            assert!(
+                body.len() > COMMENT_LIMIT - 1_000,
+                "as many rows as fit: {} bytes",
+                body.len()
+            );
+            assert!(
+                body.contains("more runs: the ledger commit holds every one."),
+                "{body}"
+            );
+            assert!(!body.contains("Output excerpts are not shown"), "{body}");
+            assert!(!body.contains("<details>"), "{body}");
+            assert_eq!(marked(&body), Some(seq_iri(90)));
+        }
+    }
+
+    // ⚠ Whatever the excerpt, the comment fits and is marked.
+    #[test]
+    fn every_comment_fits_and_is_marked() {
+        for size in [0, 1, 59_000, 60_000, 61_000, 500_000] {
+            let body = render(
+                &many(1, "g", Some(&"z".repeat(size))),
+                "acme/widgets",
+                Visibility::Private,
+                Some("A check changes no state."),
+            );
+            assert!(body.len() <= COMMENT_LIMIT, "{size}: {} bytes", body.len());
+            assert_eq!(marked(&body), Some(seq_iri(90)), "{size}");
+        }
     }
 }
