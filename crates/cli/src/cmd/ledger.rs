@@ -251,6 +251,7 @@ mod tests {
             handles: &store,
             github: None,
             github_ledger: Some(&gl),
+            witness: None,
             tracker_label: String::new(),
         };
         let err = run(&ctx, Cmd::Init { confirm: None }, None).unwrap_err();

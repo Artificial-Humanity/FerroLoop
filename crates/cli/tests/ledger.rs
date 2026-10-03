@@ -15,6 +15,9 @@ use std::process::Command as Sys;
 /// What every pre-flight refusal starts with (GitHub ledger spec §2.4).
 const PREFLIGHT: &str = "refused before any gate or adapter ran: ";
 
+/// What a comment that could not be posted warns. No other path writes it.
+const NOT_POSTED: &str = "warning: the decision's comment was not posted on issue ";
+
 fn git(dir: &Path, args: &[&str]) {
     let out = Sys::new("git")
         .args(args)
@@ -62,7 +65,8 @@ impl World {
         fs::create_dir_all(repo.path().join("src")).unwrap();
         fs::write(repo.path().join("src/a.rs"), "fn a() {}").unwrap();
         let check = repo.path().join("check.sh");
-        fs::write(&check, "#!/bin/sh\n[ ! -e bug ]\n").unwrap();
+        // `checked` is every run's excerpt.
+        fs::write(&check, "#!/bin/sh\necho checked\n[ ! -e bug ]\n").unwrap();
         fs::set_permissions(&check, fs::Permissions::from_mode(0o755)).unwrap();
         git(repo.path(), &["add", "-A"]);
         git(repo.path(), &["commit", "-qm", "first"]);
@@ -143,10 +147,10 @@ impl World {
             .success();
     }
 
-    /// A project with one gate over `src/**/*.rs` (`check.sh`), a
-    /// transition `launch` from `todo` to `doing` over it, and one record
-    /// (#1).
-    fn gated(&self) {
+    /// A project with one gate named `gate` over `src/**/*.rs`, running
+    /// `program`, a transition `launch` from `todo` to `doing` over it, and
+    /// one record (#1).
+    fn gated_with(&self, gate: &str, program: &str) {
         self.fl().args(["project", "add", "."]).assert().success();
         self.fl()
             .args([
@@ -155,11 +159,11 @@ impl World {
                 "--project",
                 "1",
                 "--name",
-                "no-bug",
+                gate,
                 "--glob",
                 "src/**/*.rs",
                 "--program",
-                "./check.sh",
+                program,
             ])
             .assert()
             .success();
@@ -188,6 +192,16 @@ impl World {
             .success();
     }
 
+    /// `gated_with(gate, "./check.sh")`.
+    fn gated_as(&self, gate: &str) {
+        self.gated_with(gate, "./check.sh");
+    }
+
+    /// `gated_as("no-bug")`.
+    fn gated(&self) {
+        self.gated_as("no-bug");
+    }
+
     /// `gated`, the ledger set up, and the manifest committed: every
     /// decision can publish.
     fn ready(&self) {
@@ -212,6 +226,23 @@ impl World {
         let mut files = self.ledger_files_in(area);
         assert_eq!(files.len(), 1, "one file under {area}/: {files:?}");
         files.remove(0)
+    }
+
+    /// Every decision id the ledger holds, in path order.
+    fn decision_ids(&self) -> Vec<String> {
+        self.ledger_files_in("decisions")
+            .iter()
+            .flat_map(|(_, text)| {
+                text.lines()
+                    .map(|l| {
+                        serde_json::from_str::<serde_json::Value>(l).unwrap()["id"]
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// How many gate runs `m`'s store holds, over every gate.
@@ -547,6 +578,232 @@ fn a_check_with_a_record_publishes_and_a_plain_check_does_not() {
     assert!(w.only_file_in("decisions").1.contains(r#"{"check":"#));
 }
 
+// Spec §4.1: the ledger commit, then the state change, then the comment —
+// one, on the record's issue.
+#[test]
+fn a_move_posts_its_comment_on_the_record_after_the_state_change() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().requests.clear();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success()
+        .stderr(contains(NOT_POSTED).not());
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    let ids = w.decision_ids();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    let c = &comments[0];
+    assert!(
+        c.starts_with(&format!("<!-- fl:decision {{\"id\":\"{}\"}} -->\n", ids[0])),
+        "{c}"
+    );
+    assert!(c.contains("### fl move: allowed"), "{c}");
+    assert!(c.contains("From `todo` to `doing`."), "{c}");
+    assert!(
+        c.contains("The state change completed: the record is now `doing`."),
+        "{c}"
+    );
+    let head = w.fake.ledger_head().expect("the ledger");
+    assert!(
+        c.contains(&format!("(https://github.com/acme/widgets/commit/{head})")),
+        "{c}"
+    );
+    assert!(c.contains("| launch | no-bug | PASS | 1 |"), "{c}");
+    assert!(
+        c.contains("<details><summary>launch / no-bug: PASS</summary>"),
+        "a private repository shows the excerpt: {c}"
+    );
+    let requests = w.fake.state().requests.clone();
+    let moved = requests
+        .iter()
+        .position(|r| r == "PATCH /repos/acme/widgets/issues/1")
+        .expect("the state change");
+    let commented = requests
+        .iter()
+        .position(|r| r == "POST /repos/acme/widgets/issues/1/comments")
+        .expect("the comment");
+    assert!(moved < commented, "{requests:#?}");
+    assert!(
+        requests[commented..]
+            .iter()
+            .all(|r| !r.contains("/git/") && r != "POST /graphql" && !r.starts_with("PATCH")),
+        "nothing is published or changed after the comment: {requests:#?}"
+    );
+}
+
+// Decision 11: a refused move is commented, saying it was refused.
+#[test]
+fn a_refused_move_is_commented_as_refused() {
+    let w = World::new();
+    w.ready();
+    fs::write(w.repo.path().join("bug"), "").unwrap();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .code(1);
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("### fl move: refused"),
+        "{}",
+        comments[0]
+    );
+    assert!(
+        comments[0].contains("The move was refused: the record stays `todo`."),
+        "{}",
+        comments[0]
+    );
+}
+
+// Decision 2: a comment on a repository that is not private shows no
+// excerpt.
+#[test]
+fn a_moves_comment_on_a_repository_that_is_not_private_shows_no_excerpt() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().repos[0].visibility = "public".into();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(!comments[0].contains("<details>"), "{}", comments[0]);
+    assert!(!comments[0].contains("checked"), "{}", comments[0]);
+}
+
+// ⚠ Decision 2 at the command line: a gate that cannot start names its
+// program's path in its detail. On a repository that is not private the
+// comment shows neither that detail nor the text that stands in for it;
+// on a private one it shows the detail, so the test sees what it checks.
+#[test]
+fn a_comment_on_a_repository_that_is_not_private_shows_no_error_detail() {
+    for private in [true, false] {
+        let w = World::new();
+        let program = w.repo.path().join("no-such-gate");
+        w.gated_with("no-bug", program.to_str().unwrap());
+        w.init();
+        w.export();
+        if !private {
+            w.fake.state().repos[0].visibility = "public".into();
+        }
+        w.fl()
+            .args(["record", "move", "1", "--to", "doing"])
+            .assert()
+            .code(2);
+        let comments = w.fake.issue(1).comments;
+        assert_eq!(comments.len(), 1, "{comments:?}");
+        let c = &comments[0];
+        assert!(c.contains("| ERROR |"), "{c}");
+        assert_eq!(
+            c.contains("no-such-gate"),
+            private,
+            "the detail, private only: {c}"
+        );
+        assert_eq!(c.contains("<details>"), private, "{c}");
+        assert!(!c.contains("withheld"), "{c}");
+    }
+}
+
+#[test]
+fn a_check_with_a_record_posts_its_comment_and_a_plain_check_posts_none() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1"])
+        .assert()
+        .success();
+    assert!(
+        w.fake.issue(1).comments.is_empty(),
+        "a plain check decides nothing"
+    );
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("### fl check: passed"),
+        "{}",
+        comments[0]
+    );
+    assert!(
+        comments[0].contains("A check changes no state."),
+        "{}",
+        comments[0]
+    );
+}
+
+// ⚠ A comment that cannot be posted leaves the decision and its state
+// change standing: a warning naming the recovery command, and the
+// command's own exit code.
+#[test]
+fn a_move_whose_comment_fails_keeps_its_exit_code_and_names_the_recovery() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success()
+        .stderr(
+            contains(format!("{NOT_POSTED}1: "))
+                .and(contains("run `fl github ledger comment 1` to post it")),
+        );
+    assert!(w.fake.issue(1).comments.is_empty());
+    assert!(
+        w.fake
+            .issue(1)
+            .labels
+            .contains(&"fl:record/doing".to_string()),
+        "the move stands"
+    );
+}
+
+// ⚠ CI reads `check`'s exit code: a comment that cannot be posted never
+// turns a pass or a fail into a refusal.
+#[test]
+fn a_check_whose_comment_fails_keeps_the_checks_own_exit_code() {
+    let w = World::new();
+    w.ready();
+    for (bug, code) in [(false, 0), (true, 1)] {
+        if bug {
+            fs::write(w.repo.path().join("bug"), "").unwrap();
+        }
+        w.fake.state().fail_comment_next = true;
+        w.fl()
+            .args(["check", "launch", "--project", "1", "--record", "1"])
+            .assert()
+            .code(code)
+            .stderr(contains(NOT_POSTED));
+    }
+}
+
+// ⚠ Spec §4.2: the comment says whether the state change completed. One
+// that fails after the flush is commented too; the command still exits 2
+// with the tracker's error.
+#[test]
+fn a_move_whose_state_change_fails_after_its_flush_says_so_in_its_comment() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().foreign_label_on_next_patch = true;
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .code(2);
+    assert_eq!(w.decision_ids().len(), 1, "the decision was published");
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("The move was allowed, but its state change did not complete"),
+        "{}",
+        comments[0]
+    );
+}
+
 // Spec §1.5: without `ledger = "github"`, a decision stays in the local
 // store, exactly as in mode A — no request touches the ledger at all.
 #[test]
@@ -571,6 +828,7 @@ fn without_the_ledger_key_a_move_publishes_nothing() {
         .filter(|r| r.contains("/git/") || r.contains("/rules/") || r.contains("/compare/"))
         .collect();
     assert!(ledger.is_empty(), "no ledger request: {ledger:#?}");
+    assert!(w.fake.issue(1).comments.is_empty(), "no comment in mode A");
     assert_eq!(w.fake.ledger_commits(), 1);
 }
 

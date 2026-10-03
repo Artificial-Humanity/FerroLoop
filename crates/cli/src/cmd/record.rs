@@ -122,8 +122,12 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             // the first gate runs.
             crate::preflight::check(ctx, &record.project)?;
 
-            let report =
-                move_record(ctx.roles(), &record, state).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let moved = move_record(ctx.roles(), &record, state);
+            // Spec §4.1: the ledger commit, then the state change, then the
+            // comment — posted whether the state change completed or not,
+            // saying which (§4.2), before an error becomes the exit.
+            crate::comment::after(ctx, &record.project, moved.is_ok());
+            let report = moved.map_err(|e| anyhow::anyhow!("{e}"))?;
             crate::ctx::report_flush(&report.flushed);
             // What the person reads back: the record's handle (or its
             // primary IRI), never the alias or IRI they typed.
