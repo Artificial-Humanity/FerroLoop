@@ -57,6 +57,25 @@ pub(crate) struct Snapshot {
     pub quarantine: Vec<u8>,
 }
 
+/// One line of a directory, who wrote it, and where it is.
+pub(crate) struct Located {
+    pub line: Line,
+    pub by: String,
+    pub file: String,
+    /// The line, from 1.
+    pub n: u64,
+}
+
+/// A decision as the ledger holds it: who wrote its line, and where.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Published {
+    pub decision: Decision,
+    pub by: String,
+    pub file: String,
+    /// The line, from 1.
+    pub line: u64,
+}
+
 impl GithubLedger<'_> {
     pub(crate) fn altered(&self, file: &str, what: impl Into<String>, commit: &str) -> StoreError {
         LedgerFault::Altered {
@@ -416,21 +435,21 @@ impl GithubLedger<'_> {
         Ok(out)
     }
 
-    /// Every line of `dir` in `snap`, parsed strictly (spec §3.3), checked
-    /// (§3.5 checks 5 and 6), each id once. A quarantined line is skipped
-    /// and noted (§3.6).
-    pub(crate) fn lines(
+    /// Every line of `dir` in `snap`, with who wrote it and where, parsed
+    /// strictly (spec §3.3), checked (§3.5 checks 5 and 6), each id once. A
+    /// quarantined line is skipped and noted (§3.6).
+    pub(crate) fn located(
         &self,
         snap: &Snapshot,
         area: Area,
         dir: &str,
-    ) -> Result<Vec<Line>, StoreError> {
+    ) -> Result<Vec<Located>, StoreError> {
         let skipped: BTreeMap<(String, u64), String> = self
             .quarantine_lines(snap)?
             .into_iter()
             .map(|q| ((q.file, q.line), q.reason))
             .collect();
-        let mut out: Vec<Line> = Vec::new();
+        let mut out: Vec<Located> = Vec::new();
         let mut seen: BTreeMap<Iri, (String, u64, usize)> = BTreeMap::new();
         for seg in snap.dirs.get(dir).map(Vec::as_slice).unwrap_or_default() {
             for (n, text) in layout::lines(&seg.bytes) {
@@ -442,11 +461,11 @@ impl GithubLedger<'_> {
                     });
                     continue;
                 }
-                let line = match text
+                let (line, by) = match text
                     .map_err(str::to_string)
                     .and_then(|t| layout::decode(area, t))
                 {
-                    Ok((line, _by)) => line,
+                    Ok((line, by)) => (line, by),
                     Err(cause) => {
                         return Err(LedgerFault::Unreadable {
                             repo: self.repo.full_name.clone(),
@@ -478,7 +497,7 @@ impl GithubLedger<'_> {
                     // ⚠ Check 5: the same id never appears with different
                     // content. An identical copy is read once.
                     Some((file, at, i)) => {
-                        if out[*i] != line {
+                        if out[*i].line != line {
                             return Err(StoreError::Tampered {
                                 id,
                                 detail: format!(
@@ -491,12 +510,32 @@ impl GithubLedger<'_> {
                     }
                     None => {
                         seen.insert(id, (seg.path.clone(), n, out.len()));
-                        out.push(line);
+                        out.push(Located {
+                            line,
+                            by,
+                            file: seg.path.clone(),
+                            n,
+                        });
                     }
                 }
             }
         }
         Ok(out)
+    }
+
+    /// Every line of `dir` in `snap`, each id once ([`Self::located`]
+    /// without who wrote it or where).
+    pub(crate) fn lines(
+        &self,
+        snap: &Snapshot,
+        area: Area,
+        dir: &str,
+    ) -> Result<Vec<Line>, StoreError> {
+        Ok(self
+            .located(snap, area, dir)?
+            .into_iter()
+            .map(|l| l.line)
+            .collect())
     }
 
     fn read(&self, area: Area, subject: &Iri) -> Result<Vec<Line>, StoreError> {
@@ -541,6 +580,62 @@ impl GithubLedger<'_> {
             .collect())
     }
 
+    /// The decisions filed under `subject`, in ledger order, each with who
+    /// wrote it and where — and the checked head they were read at, for
+    /// [`Self::commit_of`] (spec §4.3).
+    pub fn published_decisions(
+        &self,
+        subject: &Iri,
+    ) -> Result<(String, Vec<Published>), StoreError> {
+        let dir = layout::dir(Area::Decisions, subject);
+        let snap = self.snapshot(std::slice::from_ref(&dir))?;
+        let out = self
+            .located(&snap, Area::Decisions, &dir)?
+            .into_iter()
+            .filter_map(|l| match l.line {
+                Line::Decision(decision) => Some(Published {
+                    decision,
+                    by: l.by,
+                    file: l.file,
+                    line: l.n,
+                }),
+                _ => None,
+            })
+            .collect();
+        Ok((snap.head, out))
+    }
+
+    /// The commit that added `p`'s line, as GitHub's blame names it at
+    /// `head`. ⚠ `None` when the blame names no commit: its message is
+    /// never taken for one.
+    pub fn commit_of(&self, head: &str, p: &Published) -> Option<String> {
+        let c = self.blame(head, &p.file, p.line);
+        super::render::is_sha(&c).then_some(c)
+    }
+
+    /// Every run of `gates`, read at one checked head in one listing — the
+    /// directories a recovered comment's decisions may rest on (spec
+    /// §4.2). No gate, no request.
+    pub fn runs_of(&self, gates: &[GateId]) -> Result<Vec<GateRun>, StoreError> {
+        if gates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dirs: Vec<String> = gates
+            .iter()
+            .map(|g| layout::dir(Area::Runs, g.iri()))
+            .collect();
+        let snap = self.snapshot(&dirs)?;
+        let mut out = Vec::new();
+        for dir in &dirs {
+            for l in self.lines(&snap, Area::Runs, dir)? {
+                if let Line::Run(r) = l {
+                    out.push(r);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether `record` is an issue of this repository. ⚠ A local answer,
     /// never a request (spec §2.1).
     pub fn owns(&self, record: &RecordId) -> Result<bool, StoreError> {
@@ -560,6 +655,8 @@ mod tests {
     use crate::client::Client;
     use crate::creds::EnvToken;
     use crate::fake::FakeGithub;
+    use crate::fake::USER_LOGIN;
+    use crate::ledger::{disclose, render};
     use crate::tracker::Repo;
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -567,8 +664,10 @@ mod tests {
     use fl_core::at::At;
     use fl_core::conformance::{sample_attempt, sample_decision, sample_record_run};
     use fl_core::ids::seq_iri;
+    use fl_core::split::{Batch, RemoteLedger};
     use fl_core::split::{Coverage, LedgerCache, SplitLedger};
     use fl_core::store::{Bindings, Catalog, Ledger as _, Tracker as _};
+    use fl_core::verdict::Verdict;
     use serde_json::{Value, json};
     use std::time::Duration;
 
@@ -1944,5 +2043,136 @@ mod tests {
             good,
             "a cut-short read must not replace the trusted baseline"
         );
+    }
+
+    fn decision_batch(n: u64, runs: Vec<GateRun>) -> Batch {
+        Batch {
+            decision: sample_decision(
+                n,
+                &record(),
+                runs.iter().filter_map(|r| r.id.clone()).collect(),
+            ),
+            runs,
+            attempts: vec![],
+        }
+    }
+
+    // Spec §4.2: who wrote each decision, and where its line is.
+    #[test]
+    fn published_decisions_name_who_wrote_each_and_where() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let (b1, b2) = (decision_batch(1, vec![]), decision_batch(2, vec![]));
+        l.publish(&b1).unwrap();
+        l.publish(&b2).unwrap();
+        let (head, published) = l.published_decisions(record().iri()).unwrap();
+        assert_eq!(Some(head), fake.ledger_head());
+        let seg = layout::segment_path(&layout::dir(Area::Decisions, record().iri()), 1);
+        assert_eq!(
+            published,
+            vec![
+                Published {
+                    decision: b1.decision,
+                    by: USER_LOGIN.into(),
+                    file: seg.clone(),
+                    line: 1,
+                },
+                Published {
+                    decision: b2.decision,
+                    by: USER_LOGIN.into(),
+                    file: seg,
+                    line: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn commit_of_names_the_commit_that_added_the_line_or_nothing() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let c1 = l.publish(&decision_batch(1, vec![])).unwrap();
+        let c2 = l.publish(&decision_batch(2, vec![])).unwrap();
+        let (head, published) = l.published_decisions(record().iri()).unwrap();
+        assert_eq!(l.commit_of(&head, &published[0]), c1);
+        assert_eq!(l.commit_of(&head, &published[1]), c2);
+        // A blame that names no commit gives none — never its message as one.
+        body_next(
+            &fake,
+            "/graphql",
+            200,
+            json!({"data": {"repository": {"object": null}}}),
+        );
+        assert_eq!(l.commit_of(&head, &published[0]), None);
+    }
+
+    #[test]
+    fn runs_of_reads_every_gate_at_one_head_in_one_listing() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let other = GateId(seq_iri(8));
+        let (a, b) = (run(1), sample_record_run(2, &other, Some(&record())));
+        l.publish(&decision_batch(1, vec![a.clone(), b.clone()]))
+            .unwrap();
+        fake.state().requests.clear();
+        assert_eq!(l.runs_of(&[gate(), other]).unwrap(), vec![a, b]);
+        let listings = fake
+            .state()
+            .requests
+            .iter()
+            .filter(|r| *r == "POST /graphql")
+            .count();
+        assert_eq!(listings, 1, "one listing for every gate");
+        fake.state().requests.clear();
+        assert!(l.runs_of(&[]).unwrap().is_empty());
+        assert!(fake.state().requests.is_empty(), "no gate, no request");
+    }
+
+    // ⚠ Spec §4.2: a comment recovered from the ledger renders exactly as
+    // the one posted live did, from the local copies projected as
+    // published — on either visibility.
+    #[test]
+    fn a_recovered_decision_renders_as_the_live_one_did() {
+        for visibility in ["private", "public"] {
+            let (fake, local, _root) = world();
+            fake.state().repos[0].visibility = visibility.into();
+            let c = client(&fake);
+            let l = open(&c, &local);
+            let mut r = run(1);
+            r.verdict = Verdict::error("spawn failed at /home/someone/bin/lint");
+            let b = decision_batch(1, vec![r.clone()]);
+            let commit = l.publish(&b).unwrap();
+            let seen = l.visibility().unwrap();
+            let mut cat = render::Catalogued::default();
+            cat.names.insert(gate(), "no-bug".into());
+            cat.transitions.insert("launch".into(), vec![gate()]);
+            let live = render::view(
+                b.decision.clone(),
+                USER_LOGIN.into(),
+                commit,
+                &[disclose::run(&r, seen)],
+                &[],
+                &cat,
+            );
+            let (head, published) = l.published_decisions(record().iri()).unwrap();
+            let p = &published[0];
+            let gates = render::candidate_gates(&p.decision.outcome, &cat);
+            let recovered = render::view(
+                p.decision.clone(),
+                p.by.clone(),
+                l.commit_of(&head, p),
+                &l.runs_of(&gates).unwrap(),
+                &[],
+                &cat,
+            );
+            assert_eq!(
+                render::render(&recovered, "acme/widgets", seen, None),
+                render::render(&live, "acme/widgets", seen, None),
+                "{visibility}"
+            );
+        }
     }
 }

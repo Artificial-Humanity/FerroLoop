@@ -5,10 +5,12 @@
 
 use super::disclose::Visibility;
 use fl_core::decision::{Decision, Outcome};
+use fl_core::ids::GateId;
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::verdict::Verdict;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 /// The most a comment's body may hold, in bytes of UTF-8 — under GitHub's
 /// 65,536-character limit however it counts (spec §4.2).
@@ -56,6 +58,122 @@ pub struct DecisionView {
 struct Block {
     title: String,
     text: String,
+}
+
+/// What the local catalog says of a project, for a comment (spec §4.2):
+/// each gate's name, and each transition's gates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Catalogued {
+    pub names: BTreeMap<GateId, String>,
+    pub transitions: BTreeMap<String, Vec<GateId>>,
+}
+
+/// The gates whose runs a decision may rest on, found through the local
+/// catalog (spec §4.2), each once: a move's or a check's transitions'
+/// gates; a reproduction's gate; for a verify its reproduction, its
+/// regressions and every other gate of the project — its passing
+/// neighbours are named nowhere else. None for an attempt.
+pub fn candidate_gates(outcome: &Outcome, cat: &Catalogued) -> Vec<GateId> {
+    let mut out: Vec<GateId> = Vec::new();
+    let mut add = |g: &GateId| {
+        if !out.contains(g) {
+            out.push(g.clone());
+        }
+    };
+    let of = |name: &str| cat.transitions.get(name).into_iter().flatten();
+    match outcome {
+        Outcome::Move { transitions, .. } => {
+            for t in transitions {
+                of(&t.transition).for_each(&mut add);
+            }
+        }
+        Outcome::Check { transition } => of(&transition.transition).for_each(&mut add),
+        Outcome::Reproduce { gate, .. } => add(gate),
+        Outcome::Verify {
+            reproduction,
+            regressions,
+            ..
+        } => {
+            add(reproduction);
+            regressions.iter().for_each(&mut add);
+            cat.names.keys().for_each(&mut add);
+        }
+        Outcome::Attempt { .. } => {}
+    }
+    out
+}
+
+/// What a run was for, in a decision with `outcome`.
+fn role(outcome: &Outcome, gate: &GateId, cat: &Catalogued) -> String {
+    match outcome {
+        Outcome::Move { transitions, .. } => transitions
+            .iter()
+            .find(|t| {
+                cat.transitions
+                    .get(&t.transition)
+                    .is_some_and(|gs| gs.contains(gate))
+            })
+            .map(|t| t.transition.clone())
+            .unwrap_or_default(),
+        Outcome::Check { transition } => transition.transition.clone(),
+        Outcome::Reproduce { .. } => "reproduction".into(),
+        Outcome::Verify {
+            reproduction,
+            regressions,
+            ..
+        } => {
+            let what = if gate == reproduction {
+                "reproduction"
+            } else if regressions.contains(gate) {
+                "regression"
+            } else {
+                "neighbour"
+            };
+            what.into()
+        }
+        Outcome::Attempt { .. } => String::new(),
+    }
+}
+
+/// The view of `decision` over the entries found (spec §4.2): each run it
+/// rests on, in the order it names them, with what it was for and its
+/// gate's name; its attempt; and each entry it names that was not found.
+pub fn view(
+    decision: Decision,
+    by: String,
+    commit: Option<String>,
+    runs: &[GateRun],
+    attempts: &[Attempt],
+    cat: &Catalogued,
+) -> DecisionView {
+    let mut rows = Vec::new();
+    let mut attempt = None;
+    let mut missing = Vec::new();
+    for id in &decision.rests_on {
+        if let Some(run) = runs.iter().find(|r| r.id.as_ref() == Some(id)) {
+            rows.push(RunRow {
+                role: role(&decision.outcome, &run.gate, cat),
+                gate: cat
+                    .names
+                    .get(&run.gate)
+                    .cloned()
+                    .unwrap_or_else(|| run.gate.iri().to_string()),
+                run: run.clone(),
+            });
+        } else if let Some(a) = attempts.iter().find(|a| a.id.as_ref() == Some(id)) {
+            attempt = Some(a.clone());
+        } else {
+            missing.push(id.clone());
+        }
+    }
+    DecisionView {
+        decision,
+        by,
+        commit,
+        rows,
+        attempt,
+        missing,
+    }
 }
 
 /// Whether `id` is one fl writes, and so may stand inside a marker — an
@@ -1399,5 +1517,170 @@ mod tests {
             assert!(body.len() <= COMMENT_LIMIT, "{size}: {} bytes", body.len());
             assert_eq!(marked(&body), Some(seq_iri(90)), "{size}");
         }
+    }
+
+    fn t(name: &str) -> TransitionOutcome {
+        TransitionOutcome {
+            transition: name.into(),
+            passed: true,
+        }
+    }
+
+    fn verify_of(reproduction: &GateId, regressions: &[&GateId]) -> Outcome {
+        Outcome::Verify {
+            reproduction: reproduction.clone(),
+            reproduction_passed: true,
+            regressions: regressions.iter().map(|g| (*g).clone()).collect(),
+            closed: false,
+        }
+    }
+
+    fn gates3() -> (GateId, GateId, GateId) {
+        (GateId(seq_iri(1)), GateId(seq_iri(2)), GateId(seq_iri(3)))
+    }
+
+    // Spec §4.2: a decision names transitions, not gates; its runs are
+    // found through the local catalog. A verify's passing neighbours are
+    // named nowhere but the catalog.
+    #[test]
+    fn a_decisions_gates_are_found_through_the_local_catalog() {
+        let (g1, g2, g3) = gates3();
+        let mut cat = Catalogued::default();
+        for (n, g) in [(1, &g1), (2, &g2), (3, &g3)] {
+            cat.names.insert(g.clone(), format!("g{n}"));
+        }
+        cat.transitions
+            .insert("launch".into(), vec![g1.clone(), g2.clone()]);
+        cat.transitions
+            .insert("ship".into(), vec![g2.clone(), g3.clone()]);
+        let mv = Outcome::Move {
+            from: State::Review,
+            to: State::Done,
+            transitions: vec![t("launch"), t("ship")],
+            allowed: true,
+        };
+        assert_eq!(
+            candidate_gates(&mv, &cat),
+            vec![g1.clone(), g2.clone(), g3.clone()],
+            "each once"
+        );
+        assert_eq!(
+            candidate_gates(
+                &Outcome::Check {
+                    transition: t("ship")
+                },
+                &cat
+            ),
+            vec![g2.clone(), g3.clone()]
+        );
+        assert!(
+            candidate_gates(
+                &Outcome::Check {
+                    transition: t("gone")
+                },
+                &cat
+            )
+            .is_empty(),
+            "a transition the catalog no longer holds"
+        );
+        assert_eq!(
+            candidate_gates(
+                &Outcome::Reproduce {
+                    gate: g3.clone(),
+                    accepted: true
+                },
+                &cat
+            ),
+            vec![g3.clone()]
+        );
+        assert_eq!(
+            candidate_gates(&verify_of(&g2, &[&g3]), &cat),
+            vec![g2.clone(), g3.clone(), g1.clone()]
+        );
+        assert!(
+            candidate_gates(
+                &Outcome::Attempt {
+                    status: AttemptStatus::Completed
+                },
+                &cat
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_view_shows_each_entry_in_the_order_the_decision_names_it() {
+        let (g1, g2, g3) = gates3();
+        let mut cat = Catalogued::default();
+        cat.names.insert(g1.clone(), "one".into());
+        cat.names.insert(g2.clone(), "two".into());
+        cat.transitions.insert("launch".into(), vec![g1.clone()]);
+        cat.transitions.insert("ship".into(), vec![g2.clone()]);
+        let on = |n: u64, g: &GateId| {
+            let mut r = run(n, Verdict::from_predicate(true, 1), None);
+            r.gate = g.clone();
+            r
+        };
+        let runs = vec![on(11, &g1), on(12, &g2), on(13, &g3), on(14, &g1)];
+        let mv = Outcome::Move {
+            from: State::Review,
+            to: State::Done,
+            transitions: vec![t("launch"), t("ship")],
+            allowed: true,
+        };
+        let d = decision(mv, vec![seq_iri(13), seq_iri(11), seq_iri(99), seq_iri(12)]);
+        let v = view(d.clone(), "fake-user".into(), None, &runs, &[], &cat);
+        let shown: Vec<(&str, &str)> = v
+            .rows
+            .iter()
+            .map(|r| (r.role.as_str(), r.gate.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![("", g3.iri().as_str()), ("launch", "one"), ("ship", "two")]
+        );
+        assert_eq!(v.missing, vec![seq_iri(99)]);
+        assert_eq!(
+            (v.decision, v.by, v.commit),
+            (d, "fake-user".to_string(), None)
+        );
+
+        let d = decision(
+            verify_of(&g1, &[&g2]),
+            vec![seq_iri(11), seq_iri(12), seq_iri(13)],
+        );
+        let roles: Vec<String> = view(d, String::new(), None, &runs, &[], &cat)
+            .rows
+            .into_iter()
+            .map(|r| r.role)
+            .collect();
+        assert_eq!(roles, vec!["reproduction", "regression", "neighbour"]);
+
+        let d = decision(
+            Outcome::Check {
+                transition: t("launch"),
+            },
+            vec![seq_iri(11)],
+        );
+        assert_eq!(
+            view(d, String::new(), None, &runs, &[], &cat).rows[0].role,
+            "launch"
+        );
+
+        let d = decision(reproduce(true), vec![seq_iri(13)]);
+        assert_eq!(
+            view(d, String::new(), None, &runs, &[], &cat).rows[0].role,
+            "reproduction"
+        );
+
+        let a = attempt(Some("x"));
+        let d = decision(
+            Outcome::Attempt {
+                status: AttemptStatus::Completed,
+            },
+            vec![seq_iri(50)],
+        );
+        let v = view(d, String::new(), None, &[], std::slice::from_ref(&a), &cat);
+        assert_eq!((v.attempt, v.missing.len()), (Some(a), 0));
     }
 }

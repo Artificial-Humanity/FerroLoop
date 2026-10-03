@@ -28,7 +28,7 @@ use std::time::Duration;
 pub use append::TRIES;
 pub use disclose::Visibility;
 pub use init::{InitOutcome, Mode, guidance, ruleset_command};
-pub use read::Note;
+pub use read::{Note, Published};
 pub use verify::{BadCommit, SameId, VERIFY_LIMIT, Verified, VerifyPhase};
 
 /// The GitHub side of mode B, for one repository and one command.
