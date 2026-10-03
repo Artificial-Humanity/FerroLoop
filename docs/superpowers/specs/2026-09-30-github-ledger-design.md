@@ -86,6 +86,10 @@ invocation). Both are append-only evidence.
 16. **Quarantine on a repository that is not private warns, then proceeds** (2026-10-02): `--by` and
     `--reason` are text the person writes to publish; the command says they are published permanently,
     then appends.
+17. **A decision comment that fails to post is a warning, not a refusal** (2026-10-03): the decision and
+    any state change stand; fl prints a `warning:` naming `fl github ledger comment <item>` and exits
+    with the command's own code — for decision 14's reason, and because a check's exit code is CI's
+    verdict.
 
 ### 0.2 Out of scope
 
@@ -448,8 +452,8 @@ repeated error, until it is fixed. The docs and `init` say so.
 
 ## 7. Errors
 
-Every error exits 2 with `error: …` and says what to do — except the two attempt rows below,
-which are not refusals (decisions 14 and 15).
+Every error exits 2 with `error: …` and says what to do — except the two attempt rows and the
+comment row below, which are not refusals (decisions 14, 15 and 17).
 
 | condition | what fl does |
 |---|---|
@@ -466,7 +470,7 @@ which are not refusals (decisions 14 and 15).
 | unreachable at a move's, check's or finding's flush | refuses; no state change; the runs stay local |
 | unreachable at an attempt's flush | not refused — it already ran: kept locally, outcome printed, a warning, published next time; exits with the attempt's own code (decision 14) |
 | the attempt's local save fails | not refused, because the attempt already ran: its outcome prints first, then `error: …`; it is not published; fl exits with the attempt's own code (decision 15) |
-| a comment fails to post | the state change stands; names `fl github ledger comment <record>` |
+| a comment fails to post | not refused — the decision and any state change stand: a `warning:` naming `fl github ledger comment <item>`; fl exits with the command's own code (decision 17) |
 | an unknown `ledger` value | config error |
 
 ---
