@@ -8,6 +8,7 @@ mod git;
 mod init;
 pub mod layout;
 mod read;
+pub mod render;
 mod verify;
 
 #[cfg(test)]
