@@ -615,6 +615,10 @@ fn a_move_posts_its_comment_on_the_record_after_the_state_change() {
         c.contains("<details><summary>launch / no-bug: PASS</summary>"),
         "a private repository shows the excerpt: {c}"
     );
+    assert!(
+        c.contains("checked"),
+        "the excerpt the public test looks for: {c}"
+    );
     let requests = w.fake.state().requests.clone();
     let moved = requests
         .iter()
@@ -751,6 +755,9 @@ fn a_move_whose_comment_fails_keeps_its_exit_code_and_names_the_recovery() {
         .success()
         .stderr(
             contains(format!("{NOT_POSTED}1: "))
+                .and(contains(
+                    "The decision and its state change stand; run `fl github ledger comment 1`",
+                ))
                 .and(contains("run `fl github ledger comment 1` to post it")),
         );
     assert!(w.fake.issue(1).comments.is_empty());
@@ -761,6 +768,31 @@ fn a_move_whose_comment_fails_keeps_its_exit_code_and_names_the_recovery() {
             .contains(&"fl:record/doing".to_string()),
         "the move stands"
     );
+}
+
+// ⚠ A state change is said to stand only when it completed: a move whose
+// state change failed and whose comment cannot be posted leaves only the
+// decision standing, and says so; the command still exits 2 with the
+// tracker's error.
+#[test]
+fn a_move_whose_state_change_and_comment_both_fail_says_only_the_decision_stands() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().foreign_label_on_next_patch = true;
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .code(2)
+        .stderr(
+            contains(format!("{NOT_POSTED}1: "))
+                .and(contains(
+                    "The decision stands; run `fl github ledger comment 1`",
+                ))
+                .and(contains("state change stand").not()),
+        );
+    assert_eq!(w.decision_ids().len(), 1, "the decision was published");
+    assert!(w.fake.issue(1).comments.is_empty());
 }
 
 // ⚠ CI reads `check`'s exit code: a comment that cannot be posted never

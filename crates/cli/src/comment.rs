@@ -41,8 +41,9 @@ pub fn recovery(item: &Iri) -> String {
 /// returned without error (§4.2).
 ///
 /// ⚠ A comment that cannot be posted is a warning, never an error: the
-/// decision and its state change stand, and the command keeps its own exit
-/// code. Each warning names the command that posts the comment later.
+/// decision stands, and so does its state change when it made one that
+/// completed ([`what_stands`]); the command keeps its own exit code. Each
+/// warning names the command that posts the comment later.
 pub fn post_after(ctx: &Ctx<'_>, project: &ProjectId, completed: bool) -> Vec<String> {
     let Some(witness) = ctx.witness else {
         return Vec::new();
