@@ -1,13 +1,18 @@
-//! `fl github ledger` (GitHub ledger spec §3.5, §3.6, §6.1): set up the
-//! GitHub ledger, walk its history, and quarantine a line. Each is run by a
-//! person, by hand.
+//! `fl github ledger` (GitHub ledger spec §3.5, §3.6, §4.3, §6.1): set up
+//! the GitHub ledger, walk its history, quarantine a line, and post the
+//! decision comments an item's issue is missing. Each is run by a person,
+//! by hand.
 
 use crate::ctx::Ctx;
+use crate::refs::Ref;
 use anyhow::{Result, bail};
 use clap::Subcommand;
+use fl_core::decision::Outcome;
 use fl_exec::stamp;
 use fl_github::GithubLedger;
 use fl_github::ledger::{InitOutcome, Mode, VERIFY_LIMIT, VerifyPhase, Visibility, guidance};
+use fl_github::ledger::{Published, render};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Subcommand)]
@@ -41,6 +46,24 @@ pub enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// Post every decision comment missing from a record's or a finding's
+    /// issue, rendered from the ledger. Safe to run again: a decision whose
+    /// comment is there is skipped.
+    Comment {
+        /// The record or finding: its issue number (`41` or `#41`),
+        /// `owner/repo#41`, or its URL.
+        item: Ref,
+    },
+}
+
+impl Cmd {
+    /// Every item this command names, by `Ref`.
+    pub fn refs(&self) -> Vec<&Ref> {
+        match self {
+            Cmd::Comment { item } => vec![item],
+            Cmd::Init { .. } | Cmd::Verify { .. } | Cmd::Quarantine { .. } => vec![],
+        }
+    }
 }
 
 /// The GitHub ledger the binding names, or the refusal that says how to
@@ -87,6 +110,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, root: Option<&Path>) -> Result<i32> {
             by,
             reason,
         } => quarantine(gl, &file, line, &by, &reason),
+        Cmd::Comment { item } => comment(ctx, gl, &item),
     }
 }
 
@@ -221,6 +245,96 @@ fn quarantine(gl: &GithubLedger<'_>, file: &str, line: u64, by: &str, reason: &s
     Ok(0)
 }
 
+/// `fl github ledger comment <item>` (spec §4.3): every decision filed
+/// under the item whose comment no comment on its issue marks — all pages
+/// read — rendered from the ledger and posted where the issue is now,
+/// oldest first.
+fn comment(ctx: &Ctx<'_>, gl: &GithubLedger<'_>, item: &Ref) -> Result<i32> {
+    let Some(gh) = ctx.github else {
+        bail!("`fl github ledger comment` needs the project bound to a GitHub repository");
+    };
+    let iri = match item {
+        Ref::Handle(n) => gh.issue_url(*n),
+        Ref::Iri(i) => i.clone(),
+    };
+    let at = gl.issue_at(&iri)?;
+    // ⚠ GitHub redirects a transferred issue, and also one whose repository
+    // was renamed; the address says where it is, not why it moved.
+    if let Some(to) = &at.moved_to {
+        println!("moved\t{to}");
+    }
+    let (head, published) = gl.published_decisions(&iri)?;
+    // Whose comments may mark a decision here: fl's own login, which
+    // `posted` adds, and everyone who wrote a decision under the item (spec
+    // §4.3; a colleague's machine posts under its own login).
+    let writers: BTreeSet<String> = published.iter().map(|p| p.by.clone()).collect();
+    let posted = gl.posted(&at, &writers)?;
+    let missing: Vec<&Published> = published
+        .iter()
+        .filter(|p| !posted.contains(&p.decision.id))
+        .collect();
+    let already = published.len() - missing.len();
+    // ⚠ A decision whose id fl does not write gets no comment: its marker
+    // could close the HTML comment early (`render::markable`). Said, and
+    // never posted.
+    let (missing, unmarkable): (Vec<&Published>, Vec<&Published>) = missing
+        .into_iter()
+        .partition(|p| render::markable(&p.decision.id));
+    for p in &unmarkable {
+        eprintln!(
+            "skipped\t{}\tits id is not one fl writes, so it gets no comment; quarantine its \
+             line (`fl github ledger quarantine {} {} --by <name> --reason <text>`)",
+            p.decision.id.as_str().escape_debug(),
+            p.file,
+            p.line
+        );
+    }
+    // Nothing missing: nothing more to read.
+    if !missing.is_empty() {
+        let cat = crate::comment::catalogued(ctx.store, &at.project)?;
+        let mut gates = Vec::new();
+        for p in &missing {
+            for g in render::candidate_gates(&p.decision.outcome, &cat) {
+                if !gates.contains(&g) {
+                    gates.push(g);
+                }
+            }
+        }
+        let runs = gl.runs_of(&gates)?;
+        // The project's attempts are read only when an attempt's comment is
+        // missing.
+        let attempts = if missing
+            .iter()
+            .any(|p| matches!(p.decision.outcome, Outcome::Attempt { .. }))
+        {
+            gl.attempts_of(&at.project)?
+        } else {
+            Vec::new()
+        };
+        let visibility = gl.visibility()?;
+        let repo = &gl.repo().full_name;
+        for p in &missing {
+            let view = render::view(
+                p.decision.clone(),
+                p.by.clone(),
+                gl.commit_of(&head, p),
+                &runs,
+                &attempts,
+                &cat,
+            );
+            // No state line: the ledger does not record whether the state
+            // change completed.
+            gl.post_at(&at, &render::render(&view, repo, visibility, None))?;
+            println!("posted\t{}", p.decision.id);
+        }
+    }
+    println!(
+        "comments\t{} posted, {already} already there",
+        missing.len()
+    );
+    Ok(if unmarkable.is_empty() { 0 } else { 1 })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,6 +374,32 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(fake.ledger_head(), None, "nothing was created");
+    }
+
+    // The item `comment` names reaches the store's choice and the handle
+    // check, as every command's items do.
+    #[test]
+    fn the_item_comment_names_is_one_of_its_refs() {
+        use crate::cmd::github::Cmd as Github;
+        assert!(
+            Github::Ledger(Cmd::Comment {
+                item: Ref::Handle(3)
+            })
+            .has_handle()
+        );
+        let iri = fl_core::Iri::parse("https://github.com/acme/widgets/issues/3").unwrap();
+        assert_eq!(
+            Github::Ledger(Cmd::Comment {
+                item: Ref::Iri(iri.clone())
+            })
+            .iris(),
+            vec![iri]
+        );
+        assert!(
+            Github::Ledger(Cmd::Verify { max_commits: 1 })
+                .iris()
+                .is_empty()
+        );
     }
 
     // A long walk reports every hundred steps, in every phase, and only

@@ -1021,6 +1021,495 @@ fn an_attempts_comment_that_fails_keeps_the_attempts_exit_code() {
     assert_eq!(w.fake.issue(1).comments.len(), 1);
 }
 
+/// How many of the fake's requests since the last clear are `line`.
+fn requests_equal(w: &World, line: &str) -> usize {
+    w.fake
+        .state()
+        .requests
+        .iter()
+        .filter(|r| *r == line)
+        .count()
+}
+
+// ⚠ Spec §4.3: only what no comment marks, rendered from the ledger with
+// no state line — the ledger does not record whether the state change
+// completed. A second run posts nothing, and reads nothing past the
+// listing.
+#[test]
+fn comment_posts_only_what_is_missing_and_a_second_run_posts_nothing() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success()
+        .stderr(contains(NOT_POSTED));
+    assert_eq!(w.fake.issue(1).comments.len(), 1);
+    w.fake.state().requests.clear();
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t1 posted, 1 already there"));
+    assert_eq!(
+        requests_equal(&w, "POST /graphql"),
+        3,
+        "the decisions' listing, the runs' listing, and one blame"
+    );
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[1].contains("### fl check: passed"),
+        "{}",
+        comments[1]
+    );
+    assert!(
+        comments[1].contains("| launch | no-bug | PASS |"),
+        "{}",
+        comments[1]
+    );
+    assert!(
+        !comments[1].contains("A check changes no state."),
+        "{}",
+        comments[1]
+    );
+    w.fake.state().requests.clear();
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t0 posted, 2 already there").and(contains("posted\turn").not()));
+    assert_eq!(w.fake.issue(1).comments.len(), 2);
+    assert_eq!(
+        requests_equal(&w, "POST /graphql"),
+        1,
+        "only the decisions' listing"
+    );
+    assert_eq!(
+        requests_equal(&w, "GET /repos/acme/widgets"),
+        1,
+        "the tracker's own read; no visibility read when nothing is missing"
+    );
+}
+
+// Oldest first; a post that fails is refused and names nothing posted; a
+// re-run posts what is left.
+#[test]
+fn comment_posts_oldest_first_and_a_rerun_after_a_failed_post_posts_the_rest() {
+    let w = World::new();
+    w.ready();
+    for args in [
+        &["record", "move", "1", "--to", "doing"][..],
+        &["check", "launch", "--project", "1", "--record", "1"][..],
+    ] {
+        w.fake.state().fail_comment_next = true;
+        w.fl()
+            .args(args)
+            .assert()
+            .success()
+            .stderr(contains(NOT_POSTED));
+    }
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .code(2)
+        .stdout(contains("posted\t").not());
+    assert!(w.fake.issue(1).comments.is_empty());
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t2 posted, 0 already there"));
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[0].contains("### fl move: allowed"),
+        "{}",
+        comments[0]
+    );
+    assert!(
+        comments[1].contains("### fl check: passed"),
+        "{}",
+        comments[1]
+    );
+}
+
+// ⚠ Spec §4.3: a marker on a later page still counts.
+#[test]
+fn comment_finds_its_markers_on_every_page() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    {
+        let mut s = w.fake.state();
+        s.issues
+            .get_mut(&1)
+            .unwrap()
+            .comments
+            .push("thanks!".into());
+        s.max_per_page = 1;
+    }
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t0 posted, 2 already there"));
+    assert_eq!(w.fake.issue(1).comments.len(), 3);
+}
+
+// ⚠ A page that fails is an error, never "none posted, so post them all".
+#[test]
+fn a_comment_page_that_cannot_be_read_posts_nothing() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    {
+        let mut s = w.fake.state();
+        s.issues
+            .get_mut(&1)
+            .unwrap()
+            .comments
+            .push("thanks!".into());
+        s.max_per_page = 1;
+        s.fail_page = Some(("/repos/acme/widgets/issues/1/comments".into(), 2));
+    }
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .code(2)
+        .stdout(contains("posted\t").not());
+    assert_eq!(w.fake.issue(1).comments.len(), 2, "nothing posted");
+}
+
+// Spec §4.1: a transferred issue gets its comment where it is now.
+#[test]
+fn comment_on_a_transferred_issue_posts_where_it_is_now() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    w.fake.transfer(1);
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(
+            contains("moved\thttps://github.com/elsewhere/transferred/issues/1\n")
+                .and(contains("comments\t1 posted, 0 already there")),
+        );
+    let s = w.fake.state();
+    assert_eq!(s.transferred[&1].comments.len(), 1);
+    assert!(s.transferred[&1].comments[0].contains("### fl move: allowed"));
+    assert!(
+        s.issues[&1].comments.is_empty(),
+        "nothing at the old address"
+    );
+}
+
+#[test]
+fn comment_on_a_finding_posts_its_decisions_on_the_findings_issue() {
+    let w = World::new();
+    w.finding_raised();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .success();
+    w.fl()
+        .args(["github", "ledger", "comment", "2"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t1 posted, 0 already there"));
+    let comments = w.fake.issue(2).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("### fl reproduce: accepted"),
+        "{}",
+        comments[0]
+    );
+    assert!(
+        comments[0].contains("| reproduction | no-bug | FAIL |"),
+        "{}",
+        comments[0]
+    );
+    assert!(w.fake.issue(1).comments.is_empty());
+}
+
+// Spec §4.2: a recovered comment links the commit that holds its
+// decision, not the ledger's head.
+#[test]
+fn a_recovered_comment_links_the_commit_that_holds_its_decision() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    let decided = w.fake.ledger_head().expect("the move's commit");
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    assert_ne!(w.fake.ledger_head(), Some(decided.clone()));
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t1 posted, 1 already there"));
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[1].contains("### fl move: allowed"),
+        "{}",
+        comments[1]
+    );
+    assert!(
+        comments[1].contains(&format!("/commit/{decided})")),
+        "{}",
+        comments[1]
+    );
+}
+
+#[test]
+fn comment_recovers_an_attempts_comment_from_the_ledger() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["attempt", "1", "--budget-usd-micros", "0"])
+        .assert()
+        .code(1);
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t1 posted, 0 already there"));
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("### fl attempt: refused"),
+        "{}",
+        comments[0]
+    );
+    assert!(
+        comments[0].contains("| claude | refused |"),
+        "{}",
+        comments[0]
+    );
+}
+
+// ⚠ A marker in a comment someone else wrote does not stop recovery.
+#[test]
+fn a_marker_someone_else_posted_does_not_stop_recovery() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let ids = w.decision_ids();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    {
+        let mut s = w.fake.state();
+        let i = s.issues.get_mut(&1).unwrap();
+        i.comments.push(format!(
+            "<!-- fl:decision {{\"id\":\"{}\"}} -->\n\nnot fl",
+            ids[0]
+        ));
+        i.comment_authors = vec!["someone-else".into()];
+    }
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t1 posted, 0 already there"));
+    assert_eq!(w.fake.issue(1).comments.len(), 2);
+}
+
+// ⚠ Several developers hold a token each: a comment a colleague's machine
+// posted, under a login that wrote a decision under the item, counts —
+// recovery run here does not post that decision again.
+#[test]
+fn a_comment_by_another_account_that_published_under_the_item_counts() {
+    use fl_github::ledger::layout;
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let id = "urn:uuid:00000000-0000-7000-8000-0000000000c1";
+    let theirs = fl_core::Decision {
+        id: fl_core::Iri::parse(id).unwrap(),
+        at: fl_core::At::from_unix_millis(1),
+        record: fl_core::RecordId(
+            fl_core::Iri::parse("https://github.com/acme/widgets/issues/1").unwrap(),
+        ),
+        finding: None,
+        outcome: fl_core::Outcome::Check {
+            transition: fl_core::TransitionOutcome {
+                transition: "launch".into(),
+                passed: true,
+            },
+        },
+        rests_on: vec![],
+    };
+    let (path, text) = w.only_file_in("decisions");
+    let line = layout::Line::Decision(theirs).encode("colleague");
+    w.fake
+        .hand_commit(&[(path.as_str(), Some(format!("{text}{line}\n").as_str()))]);
+    {
+        let mut s = w.fake.state();
+        let i = s.issues.get_mut(&1).unwrap();
+        assert_eq!(i.comments.len(), 1, "the check's own comment");
+        i.comments.push(format!(
+            "<!-- fl:decision {{\"id\":\"{id}\"}} -->\n\ntheirs"
+        ));
+        i.comment_authors = vec!["fake-user".into(), "colleague".into()];
+    }
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t0 posted, 2 already there"));
+    assert_eq!(w.fake.issue(1).comments.len(), 2, "nothing posted twice");
+}
+
+// ⚠ A decision line whose id fl does not write is skipped, said on
+// stderr, and the command exits 1; nothing is posted for it.
+#[test]
+fn comment_skips_a_decision_whose_id_fl_does_not_write() {
+    use fl_github::ledger::layout;
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .success();
+    let hostile = fl_core::Decision {
+        id: fl_core::Iri::parse("urn:x:a--><b>").unwrap(),
+        at: fl_core::At::from_unix_millis(1),
+        record: fl_core::RecordId(
+            fl_core::Iri::parse("https://github.com/acme/widgets/issues/1").unwrap(),
+        ),
+        finding: None,
+        outcome: fl_core::Outcome::Check {
+            transition: fl_core::TransitionOutcome {
+                transition: "launch".into(),
+                passed: true,
+            },
+        },
+        rests_on: vec![],
+    };
+    let (path, text) = w.only_file_in("decisions");
+    let line = layout::Line::Decision(hostile).encode("fake-user");
+    w.fake
+        .hand_commit(&[(path.as_str(), Some(format!("{text}{line}\n").as_str()))]);
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .code(1)
+        .stderr(contains("skipped\t").and(contains("is not one fl writes")))
+        .stdout(contains("comments\t0 posted, 1 already there"));
+    assert_eq!(
+        w.fake.issue(1).comments.len(),
+        1,
+        "only the check's own comment"
+    );
+}
+
+// Decision 2: a comment recovered on a repository that is not private
+// shows no error detail, and no stand-in for one.
+#[test]
+fn comment_on_a_repository_that_is_not_private_recovers_no_error_detail() {
+    let w = World::new();
+    let program = w.repo.path().join("no-such-gate");
+    w.gated_with("no-bug", program.to_str().unwrap());
+    w.init();
+    w.export();
+    w.fake.state().repos[0].visibility = "public".into();
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .code(2);
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t1 posted, 0 already there"));
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    let c = &comments[0];
+    assert!(c.contains("| ERROR |"), "{c}");
+    assert!(!c.contains("<details>"), "{c}");
+    assert!(!c.contains("withheld"), "{c}");
+    assert!(!c.contains("no-such-gate"), "{c}");
+}
+
+#[test]
+fn comment_without_the_ledger_key_is_refused() {
+    let w = World::bound(false);
+    w.gated();
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("does not name the GitHub ledger"));
+}
+
+// ⚠ An issue another repository holds is refused before any request
+// touches an issue: recovery never posts outside the bound repository.
+#[test]
+fn comment_on_an_issue_another_repository_holds_is_refused() {
+    let w = World::new();
+    w.ready();
+    w.fake.state().requests.clear();
+    w.fl()
+        .args([
+            "github",
+            "ledger",
+            "comment",
+            "https://github.com/acme/other/issues/1",
+        ])
+        .assert()
+        .code(2)
+        .stderr(contains("searched: the issues of acme/widgets"))
+        .stdout(contains("comments\t").not());
+    let requests = w.fake.state().requests.clone();
+    assert!(
+        !requests.iter().any(|r| r.contains("/issues/")),
+        "{requests:?}"
+    );
+    assert!(w.fake.issue(1).comments.is_empty());
+}
+
 // Spec §1.5: without `ledger = "github"`, a decision stays in the local
 // store, exactly as in mode A — no request touches the ledger at all.
 #[test]

@@ -232,6 +232,35 @@ mod tests {
         assert_eq!(what_stands(&attempt, true), only);
     }
 
+    // ⚠ A verify's comment reads every gate in `names` as a neighbour
+    // (`render::candidate_gates`), so another project's gate must never be
+    // in it.
+    #[test]
+    fn the_catalog_a_comment_reads_holds_only_the_projects_own_gates() {
+        use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&dir.path().join("s.redb")).unwrap();
+        let gate = |p: &ProjectId, name: &str| {
+            let kind = GateKind::Command(CommandSpec {
+                program: "true".into(),
+                args: vec![],
+                delivery: PopulationDelivery::Args,
+                timeout_secs: 5,
+                pass_codes: vec![0],
+            });
+            let sel = Selector::Glob {
+                pattern: "**/*".into(),
+            };
+            store.add_gate(p, name, kind, sel, 1, "c", "o").unwrap()
+        };
+        let ours = store.add_project("/ours").unwrap();
+        let theirs = store.add_project("/theirs").unwrap();
+        let own = gate(&ours, "own");
+        gate(&theirs, "foreign");
+        let cat = catalogued(&store, &ours).unwrap();
+        assert_eq!(cat.names.keys().collect::<Vec<_>>(), vec![&own], "{cat:?}");
+    }
+
     #[test]
     fn the_recovery_command_names_the_issue_by_its_number() {
         assert_eq!(recovery(&issue(3)), "fl github ledger comment 3");
