@@ -97,6 +97,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         .block_on(adapter.attempt(spec))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    let project_id = record.project.clone();
     // ⚠ Recorded whatever the outcome. A crash, a timeout and a refusal all
     // cost something, even when that something is only the wall clock.
     let entry = stamp::entry_id();
@@ -121,6 +122,10 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             Said::Stderr(l) => eprintln!("{l}"),
         }
     }
+    // Spec §4.1: the attempt's comment, on its record's issue. ⚠ One that
+    // cannot be posted is a warning: the exit code stays the attempt's own
+    // (decision 14).
+    crate::comment::after(ctx, &project_id, true);
     Ok(code)
 }
 

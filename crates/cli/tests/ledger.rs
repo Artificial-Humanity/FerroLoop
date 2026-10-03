@@ -210,6 +210,18 @@ impl World {
         self.export();
     }
 
+    /// `ready`, a file named `bug`, and a finding (#2) on record #1.
+    fn finding_raised(&self) {
+        self.ready();
+        fs::write(self.repo.path().join("bug"), "").unwrap();
+        self.fl()
+            .args([
+                "finding", "raise", "--record", "1", "--claim", "a bug", "--by", "reviewer",
+            ])
+            .assert()
+            .success();
+    }
+
     /// The ledger's files under `area/`, path and text, in path order.
     fn ledger_files_in(&self, area: &str) -> Vec<(String, String)> {
         let prefix = format!("{area}/");
@@ -834,6 +846,158 @@ fn a_move_whose_state_change_fails_after_its_flush_says_so_in_its_comment() {
         "{}",
         comments[0]
     );
+}
+
+// Spec §4.1: a finding's decisions comment on the finding's issue.
+#[test]
+fn a_reproduction_posts_its_comment_on_the_findings_issue() {
+    let w = World::new();
+    w.finding_raised();
+    w.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .success();
+    let comments = w.fake.issue(2).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    let c = &comments[0];
+    assert!(c.contains("### fl reproduce: accepted"), "{c}");
+    assert!(
+        c.contains(
+            "The state change completed: the finding records this gate as its reproduction."
+        ),
+        "{c}"
+    );
+    assert!(c.contains("| reproduction | no-bug | FAIL |"), "{c}");
+    assert!(
+        w.fake.issue(1).comments.is_empty(),
+        "nothing on the record's issue"
+    );
+}
+
+// Decision 11: a refused reproduction is flushed and commented, and the
+// command is refused as before.
+#[test]
+fn a_refused_reproduction_is_commented_as_refused() {
+    let w = World::new();
+    w.finding_raised();
+    fs::remove_file(w.repo.path().join("bug")).unwrap();
+    w.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .code(2)
+        .stderr(contains("currently PASSES"));
+    let comments = w.fake.issue(2).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0].contains("### fl reproduce: refused"),
+        "{}",
+        comments[0]
+    );
+    assert!(
+        comments[0].contains("The reproduction was refused: the finding is unchanged."),
+        "{}",
+        comments[0]
+    );
+}
+
+/// `finding_raised`, reproduced, assigned, and the bug fixed.
+fn ready_to_verify(w: &World) {
+    w.finding_raised();
+    w.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .success();
+    w.fl()
+        .args(["finding", "assign", "2", "--to", "fixer"])
+        .assert()
+        .success();
+    fs::remove_file(w.repo.path().join("bug")).unwrap();
+}
+
+#[test]
+fn a_verification_that_closes_its_finding_posts_its_comment() {
+    let w = World::new();
+    ready_to_verify(&w);
+    w.fl().args(["finding", "verify", "2"]).assert().success();
+    let comments = w.fake.issue(2).comments;
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[1].contains("### fl verify: closed"),
+        "{}",
+        comments[1]
+    );
+    assert!(
+        comments[1].contains("The state change completed: the finding is closed."),
+        "{}",
+        comments[1]
+    );
+}
+
+// A verification that ran but did not close is commented, saying the
+// finding stays open.
+#[test]
+fn a_verification_that_does_not_close_its_finding_posts_its_comment() {
+    let w = World::new();
+    ready_to_verify(&w);
+    fs::write(w.repo.path().join("bug"), "").unwrap();
+    w.fl().args(["finding", "verify", "2"]).assert().code(1);
+    let comments = w.fake.issue(2).comments;
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[1].contains("### fl verify: not closed"),
+        "{}",
+        comments[1]
+    );
+    assert!(
+        comments[1].contains("The finding stays open: the repair is not done."),
+        "{}",
+        comments[1]
+    );
+}
+
+// ⚠ Spec §4.2: a verification whose closing fails after its flush is
+// commented too, saying so; the command exits 2 as before.
+#[test]
+fn a_verification_whose_closing_fails_says_so_in_its_comment() {
+    let w = World::new();
+    ready_to_verify(&w);
+    w.fake.state().foreign_label_on_next_patch = true;
+    w.fl().args(["finding", "verify", "2"]).assert().code(2);
+    let comments = w.fake.issue(2).comments;
+    assert_eq!(comments.len(), 2, "{comments:?}");
+    assert!(
+        comments[1]
+            .contains("The finding passed its verification, but closing it did not complete."),
+        "{}",
+        comments[1]
+    );
+}
+
+// Spec §4.1 and decision 14: an attempt's comment, on the record's issue;
+// one that cannot be posted is a warning, and the exit code stays the
+// attempt's own.
+#[test]
+fn an_attempts_comment_that_fails_keeps_the_attempts_exit_code() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["attempt", "1", "--budget-usd-micros", "0"])
+        .assert()
+        .code(1)
+        .stderr(contains(NOT_POSTED).not());
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    let c = &comments[0];
+    assert!(c.contains("### fl attempt: refused"), "{c}");
+    assert!(c.contains("An attempt changes no state."), "{c}");
+    assert!(c.contains("| claude | refused |"), "{c}");
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["attempt", "1", "--budget-usd-micros", "0"])
+        .assert()
+        .code(1)
+        .stderr(contains(NOT_POSTED).and(contains("fl github ledger comment 1")));
+    assert_eq!(w.fake.issue(1).comments.len(), 1);
 }
 
 // Spec §1.5: without `ledger = "github"`, a decision stays in the local
