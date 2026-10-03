@@ -900,6 +900,27 @@ fn a_refused_reproduction_is_commented_as_refused() {
     );
 }
 
+// ⚠ Spec §4.2: a reproduction whose state change fails after its flush is
+// commented too, saying so; the command exits 2 as before.
+#[test]
+fn a_reproduction_whose_state_change_fails_says_so_in_its_comment() {
+    let w = World::new();
+    w.finding_raised();
+    w.fake.state().foreign_label_on_next_patch = true;
+    w.fl()
+        .args(["finding", "reproduce", "2", "--gate", "1"])
+        .assert()
+        .code(2);
+    let comments = w.fake.issue(2).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    assert!(
+        comments[0]
+            .contains("The reproduction was accepted, but its state change did not complete."),
+        "{}",
+        comments[0]
+    );
+}
+
 /// `finding_raised`, reproduced, assigned, and the bug fixed.
 fn ready_to_verify(w: &World) {
     w.finding_raised();
