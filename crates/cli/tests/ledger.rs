@@ -206,6 +206,14 @@ impl World {
             .collect()
     }
 
+    /// The one ledger file under `area/`, path and text — refused unless
+    /// there is exactly one.
+    fn only_file_in(&self, area: &str) -> (String, String) {
+        let mut files = self.ledger_files_in(area);
+        assert_eq!(files.len(), 1, "one file under {area}/: {files:?}");
+        files.remove(0)
+    }
+
     /// How many gate runs `m`'s store holds, over every gate.
     fn runs(&self, m: &Machine) -> usize {
         let store = fl_store::RedbStore::open(&m.store()).unwrap();
@@ -536,21 +544,33 @@ fn a_check_with_a_record_publishes_and_a_plain_check_does_not() {
         .assert()
         .success();
     assert_eq!(w.fake.ledger_commits(), before + 1);
-    assert!(w.ledger_files_in("decisions")[0].1.contains(r#"{"check":"#));
+    assert!(w.only_file_in("decisions").1.contains(r#"{"check":"#));
 }
 
 // Spec §1.5: without `ledger = "github"`, a decision stays in the local
-// store, exactly as in mode A — no flush is even attempted.
+// store, exactly as in mode A — no request touches the ledger at all.
 #[test]
 fn without_the_ledger_key_a_move_publishes_nothing() {
     let w = World::bound(false);
     w.gated();
     w.fake.seed_ledger();
+    w.fake.state().requests.clear();
     w.fl()
         .args(["record", "move", "1", "--to", "doing"])
         .assert()
-        .success()
-        .stderr(contains("never switched on").not());
+        .success();
+    let requests = w.fake.state().requests.clone();
+    assert!(
+        requests
+            .iter()
+            .any(|r| r == "PATCH /repos/acme/widgets/issues/1"),
+        "the move reached GitHub: {requests:#?}"
+    );
+    let ledger: Vec<&String> = requests
+        .iter()
+        .filter(|r| r.contains("/git/") || r.contains("/rules/") || r.contains("/compare/"))
+        .collect();
+    assert!(ledger.is_empty(), "no ledger request: {ledger:#?}");
     assert_eq!(w.fake.ledger_commits(), 1);
 }
 
@@ -569,7 +589,7 @@ fn verify_passes_a_ledger_fl_wrote_and_names_the_commit_of_a_hand_edit() {
         .assert()
         .success()
         .stdout(contains("verified\t2 commits"));
-    let (path, _) = w.ledger_files_in("runs").remove(0);
+    let (path, _) = w.only_file_in("runs");
     let bad = w.fake.hand_commit(&[(path.as_str(), Some("edited\n"))]);
     w.fl()
         .args(["github", "ledger", "verify"])
@@ -590,7 +610,7 @@ fn verify_stops_at_its_limit_and_names_the_flag() {
         .args(["github", "ledger", "verify", "--max-commits", "1"])
         .assert()
         .code(2)
-        .stderr(contains("walked back 1 commits").and(contains("--max-commits <n>")));
+        .stderr(contains("walked back 1 commit from the head").and(contains("--max-commits <n>")));
 }
 
 // Spec §3.5 check 5: one id on two different lines is not a clean ledger.
@@ -603,7 +623,7 @@ fn verify_reports_one_id_on_two_lines_and_exits_1() {
         .args(["check", "launch", "--project", "1", "--record", "1"])
         .assert()
         .success();
-    let (_, text) = w.ledger_files_in("runs").remove(0);
+    let (_, text) = w.only_file_in("runs");
     // The published run, about another gate, filed in that gate's own
     // directory: the same id on a different line. Keys stay sorted, so the
     // line is byte-for-byte what fl would write.
@@ -642,7 +662,7 @@ fn quarantine_on_a_repository_that_is_not_private_warns_then_appends() {
         .args(["check", "launch", "--project", "1", "--record", "1"])
         .assert()
         .success();
-    let (path, _) = w.ledger_files_in("runs").remove(0);
+    let (path, _) = w.only_file_in("runs");
     w.fake.state().repos[0].visibility = "public".into();
     w.fake.state().requests.clear();
     w.fl()
@@ -688,7 +708,7 @@ fn quarantine_whose_visibility_cannot_be_read_refuses_and_appends_nothing() {
         .args(["check", "launch", "--project", "1", "--record", "1"])
         .assert()
         .success();
-    let (path, _) = w.ledger_files_in("runs").remove(0);
+    let (path, _) = w.only_file_in("runs");
     let head = w.fake.ledger_head();
     // The command's first repository read binds the tracker; the second is
     // the visibility read, which fails.
@@ -721,7 +741,7 @@ fn quarantine_on_a_private_repository_says_the_text_is_permanent_without_a_warni
         .args(["check", "launch", "--project", "1", "--record", "1"])
         .assert()
         .success();
-    let (path, _) = w.ledger_files_in("runs").remove(0);
+    let (path, _) = w.only_file_in("runs");
     w.fl()
         .args([
             "github",
@@ -738,10 +758,11 @@ fn quarantine_on_a_private_repository_says_the_text_is_permanent_without_a_warni
         .success()
         .stderr(
             contains(concat!(
-                "note: once appended, `--by` and `--reason` are written to the ledger of ",
-                "acme/widgets"
+                "permanent: once appended, `--by` and `--reason` are written to the ledger of ",
+                "acme/widgets permanently"
             ))
-            .and(contains("warning:").not()),
+            .and(contains("warning:").not())
+            .and(contains("note:").not()),
         );
 }
 
@@ -755,7 +776,7 @@ fn a_decision_that_reads_past_a_quarantined_line_notes_it() {
         .args(["check", "launch", "--project", "1", "--record", "1"])
         .assert()
         .success();
-    let (path, _) = w.ledger_files_in("runs").remove(0);
+    let (path, _) = w.only_file_in("runs");
     w.fl()
         .args([
             "github",
@@ -1171,11 +1192,9 @@ fn stats_on_another_projects_store_says_it_covers_the_local_store_only() {
     w.ready();
     let iri = {
         let store = fl_store::RedbStore::open(&w.one.store()).unwrap();
-        store.list_projects().unwrap()[0]
-            .id
-            .iri()
-            .as_str()
-            .to_string()
+        let projects = store.list_projects().unwrap();
+        assert_eq!(projects.len(), 1, "{projects:?}");
+        projects[0].id.iri().as_str().to_string()
     };
     let elsewhere = tempfile::tempdir().unwrap();
     let path = w.one.home.path().join("config/fl/config.toml");

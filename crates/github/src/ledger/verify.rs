@@ -121,8 +121,9 @@ impl GithubLedger<'_> {
             // branch name was reused for) is refused here, never walked to
             // its end one request at a time.
             if chain.len() >= limit {
+                let commits = if limit == 1 { "commit" } else { "commits" };
                 return Err(StoreError::Backend(format!(
-                    "fl walked back {limit} commits from the head of {repo}'s `fl/ledger` \
+                    "fl walked back {limit} {commits} from the head of {repo}'s `fl/ledger` \
                      without reaching the ledger's first commit {anchor}, and stopped. If the \
                      ledger really is that long, run `fl github ledger verify --max-commits \
                      <n>` with a larger number"
@@ -639,6 +640,17 @@ mod tests {
         // smaller limit.
         assert!(l.verify_with(3, &mut |_, _| {}).is_err(), "one short of 4");
         assert_eq!(l.verify_with(4, &mut |_, _| {}).unwrap().commits, 4);
+    }
+
+    // One commit is "1 commit", not "1 commits".
+    #[test]
+    fn a_limit_of_one_commit_is_named_in_the_singular() {
+        let (fake, local, _root) = world();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        publish(&l, 1);
+        let err = l.verify_with(1, &mut |_, _| {}).unwrap_err().to_string();
+        assert!(err.contains("walked back 1 commit from the head"), "{err}");
     }
 
     // A long history must never look like a hang.

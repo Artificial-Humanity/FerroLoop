@@ -12,6 +12,10 @@ use fl_exec::stamp;
 
 const KNOWN_ADAPTERS: &str = "claude";
 
+/// How many lines of an attempt's excerpt the command prints. The local
+/// store keeps the whole excerpt.
+const EXCERPT_LINES: usize = 40;
+
 #[derive(Args)]
 pub struct Cmd {
     pub record: Ref,
@@ -147,7 +151,7 @@ fn settle(ledger: &dyn Ledger, id: &Iri, attempt: &Attempt) -> (i32, Vec<Said>) 
         said.extend(
             excerpt
                 .lines()
-                .take(40)
+                .take(EXCERPT_LINES)
                 .map(|l| Said::Stdout(format!("\t| {l}"))),
         );
     }
@@ -245,6 +249,27 @@ mod tests {
                 status: AttemptStatus::Timeout
             }
         );
+    }
+
+    // What a person reads back of a long excerpt: its first lines, and no
+    // more. The local store keeps all of it.
+    #[test]
+    fn an_attempts_excerpt_is_printed_up_to_forty_lines() {
+        let mut a = attempt(AttemptStatus::Completed);
+        a.output_excerpt = Some(
+            (1..=50)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let (_, said) = settle(&Flushes::default(), &seq_iri(50), &a);
+        let excerpt: Vec<&Said> = said
+            .iter()
+            .filter(|s| matches!(s, Said::Stdout(l) if l.starts_with("\t| ")))
+            .collect();
+        assert_eq!(excerpt.len(), EXCERPT_LINES, "{said:?}");
+        assert_eq!(EXCERPT_LINES, 40);
+        assert_eq!(excerpt.last(), Some(&&Said::Stdout("\t| line 40".into())));
     }
 
     // ⚠ Decision 14: an attempt that ran but could not be published exits

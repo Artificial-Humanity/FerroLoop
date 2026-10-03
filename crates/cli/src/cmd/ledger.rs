@@ -200,10 +200,11 @@ fn quarantine(gl: &GithubLedger<'_>, file: &str, line: u64, by: &str, reason: &s
     let repo = &gl.repo().full_name;
     match gl.visibility()? {
         // Said before the library checks the arguments, so worded for the
-        // append that may not happen.
+        // append that may not happen. ⚠ Its own prefix: a read's notes are
+        // `note:`.
         Visibility::Private => eprintln!(
-            "note: once appended, `--by` and `--reason` are written to the ledger of {repo} \
-             permanently; nothing is ever removed from it"
+            "permanent: once appended, `--by` and `--reason` are written to the ledger of \
+             {repo} permanently; nothing is ever removed from it"
         ),
         Visibility::NotPrivate => eprintln!(
             "warning: {repo} is not private: once appended, `--by` and `--reason` are \

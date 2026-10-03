@@ -482,6 +482,7 @@ mod tests {
             "{err}"
         );
         assert_eq!(fake.state().git.commits.len(), 1, "no commit was created");
+        assert_eq!(fake.state().git.trees.len(), 1, "no tree was created");
         assert_eq!(fake.ledger_head(), None);
         assert_eq!(local.cutover("R_1").unwrap(), None);
 
@@ -495,6 +496,27 @@ mod tests {
         let err = open(&c, &local).init(&entry_iri(1), None).unwrap_err();
         assert!(err.to_string().contains("with no name"), "{err}");
         assert_eq!(fake.ledger_head(), None);
+    }
+
+    // `fl/ledgers` sits beside `fl/ledger`, not under it: git holds both,
+    // so it is no reason to refuse.
+    #[test]
+    fn init_does_not_refuse_a_sibling_branch_named_like_the_ledger() {
+        let fake = FakeGithub::start("acme/widgets");
+        {
+            let mut s = fake.state();
+            let tree = s.git.put_tree(&BTreeMap::new());
+            let c = s.git.put_commit(&tree, vec![], "someone's branch");
+            s.git.refs.insert("heads/fl/ledgers".into(), c);
+        }
+        let local = MemStore::default();
+        let c = client(&fake);
+        let outcome = open(&c, &local).init(&entry_iri(1), None).unwrap();
+        assert!(
+            matches!(outcome, InitOutcome::Created { .. }),
+            "{outcome:?}"
+        );
+        assert!(fake.ledger_head().is_some());
     }
 
     #[test]
