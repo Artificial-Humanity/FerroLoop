@@ -266,27 +266,29 @@ fn parse_pem(pem: &str) -> Result<RsaKeyPair, StoreError> {
     key.map_err(|e| refuse(&e.to_string()))
 }
 
+/// A throwaway RSA key, made by the `openssl` CLI so no private key is
+/// ever committed. `traditional` selects PKCS#1 over PKCS#8. Tests only:
+/// these tests and any other that opens a client as the App.
+#[cfg(test)]
+pub(crate) fn throwaway_key(traditional: bool) -> String {
+    let mut args = vec!["genrsa"];
+    if traditional {
+        args.push("-traditional");
+    }
+    args.push("2048");
+    let out = std::process::Command::new("openssl")
+        .args(&args)
+        .output()
+        .expect("these tests need the `openssl` CLI to make a throwaway key");
+    assert!(out.status.success(), "openssl genrsa failed");
+    String::from_utf8(out.stdout).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fake::FakeGithub;
     use ring::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
-
-    /// A throwaway RSA key, made by the `openssl` CLI so no private key is
-    /// ever committed. `traditional` selects PKCS#1 over PKCS#8.
-    fn throwaway_key(traditional: bool) -> String {
-        let mut args = vec!["genrsa"];
-        if traditional {
-            args.push("-traditional");
-        }
-        args.push("2048");
-        let out = std::process::Command::new("openssl")
-            .args(&args)
-            .output()
-            .expect("these tests need the `openssl` CLI to make a throwaway key");
-        assert!(out.status.success(), "openssl genrsa failed");
-        String::from_utf8(out.stdout).unwrap()
-    }
 
     #[test]
     fn the_environment_token_is_read_in_order_and_its_absence_is_refused() {

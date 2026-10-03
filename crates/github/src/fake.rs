@@ -765,6 +765,10 @@ fn comment_items(i: &Issue) -> Vec<Value> {
 
 /// Who a request's credential writes as: the App's bot for its
 /// installation token, else the token's user.
+///
+/// Unmeasured for the App: that an installation token's comment is
+/// authored by `{slug}[bot]`, the login `GET /app` names, is GitHub's
+/// documentation; the live run as the App is still owed.
 fn author(auth: &str) -> String {
     if auth == format!("Bearer {INSTALLATION_TOKEN}") {
         format!("{APP_SLUG}[bot]")

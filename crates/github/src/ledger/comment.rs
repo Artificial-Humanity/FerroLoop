@@ -69,14 +69,26 @@ impl GithubLedger<'_> {
         let r = self.client.send(Method::Get, &here, None)?;
         let (r, base, moved) = match r.status {
             200 => (r, here, false),
+            // GitHub answers a transferred issue's read with 301; the other
+            // redirects are followed the same way, defensively, and no test
+            // tells them apart.
             301 | 302 | 307 | 308 => {
                 let to = r.location.clone().unwrap_or_default();
                 let again = self.client.send(Method::Get, &to, None)?;
-                if again.status != 200 {
-                    return Err(backend(format!(
-                        "GitHub answered {} when fl read issue {n} where it moved, {to}",
-                        again.status
-                    )));
+                match again.status {
+                    200 => {}
+                    // Not there either: no retry finds it.
+                    404 | 410 => {
+                        return Err(backend(format!(
+                            "GitHub answered {} when fl read issue {n} where it moved, {to}",
+                            again.status
+                        )));
+                    }
+                    // ⚠ As at the first address: a server error is transient.
+                    s => {
+                        return Err(self
+                            .read_refused(s, &format!("read issue {n} at {to}, where it moved")));
+                    }
                 }
                 (again, to, true)
             }
@@ -351,6 +363,34 @@ mod tests {
         );
     }
 
+    // ⚠ Where a transferred issue is now, a server error is as transient as
+    // at its first address, while a 404 or 410 there is not.
+    #[test]
+    fn a_server_error_where_the_issue_moved_is_transient() {
+        let fake = with_record();
+        let (c, local) = (client(&fake), MemStore::default());
+        let l = GithubLedger::new(&c, repo(), &local);
+        fake.transfer(1);
+        let to = format!("/repositories/{}/issues/1", crate::fake::TRANSFERRED_REPO);
+        fake.state()
+            .body_next
+            .push((to.clone(), 502, serde_json::Value::Null));
+        let err = l.issue_at(&issue(1)).unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+        for status in [404, 410] {
+            fake.state()
+                .body_next
+                .push((to.clone(), status, json!({"message": "gone"})));
+            let err = l.issue_at(&issue(1)).unwrap_err();
+            assert!(matches!(err, StoreError::Backend(_)), "{status}: {err:?}");
+            assert!(
+                err.to_string()
+                    .contains("when fl read issue 1 where it moved"),
+                "{err}"
+            );
+        }
+    }
+
     // A server error reading the issue says nothing lasting: transient.
     #[test]
     fn a_server_error_reading_the_issue_is_transient() {
@@ -435,6 +475,33 @@ mod tests {
         );
     }
 
+    // ⚠ fl running as the App posts as the App's bot, and reads that bot's
+    // comment as its own: otherwise every recovery would post it again.
+    #[test]
+    fn a_comment_fl_posts_as_the_app_is_one_it_wrote() {
+        let fake = with_record();
+        let app = crate::creds::AppCredentials::new(
+            &fake.url(),
+            42,
+            &crate::creds::throwaway_key(true),
+            "acme/widgets",
+        )
+        .unwrap();
+        let (c, local) = (Client::new(&fake.url(), Box::new(app)), MemStore::default());
+        let l = GithubLedger::new(&c, repo(), &local);
+        l.post_comment(&issue(1), &format!("{}\n\nbody", mark(10)))
+            .unwrap();
+        assert_eq!(
+            fake.issue(1).comment_authors,
+            vec![format!("{}[bot]", crate::fake::APP_SLUG)]
+        );
+        let at = l.issue_at(&issue(1)).unwrap();
+        assert_eq!(
+            l.posted(&at, &none()).unwrap(),
+            BTreeSet::from([seq_iri(10)])
+        );
+    }
+
     // ⚠ A comment by another account that wrote a decision under the item
     // counts — a colleague's machine posted it — so recovery does not post
     // it again; the same comment by an account that wrote none does not.
@@ -491,6 +558,15 @@ mod tests {
         assert!(
             l.posted(&at, &none()).unwrap().is_empty(),
             "no author, no one's"
+        );
+        fake.state().body_next.push((
+            "/issues/1/comments".into(),
+            200,
+            json!([{"id": 1, "body": mark(10), "user": null}]),
+        ));
+        assert!(
+            l.posted(&at, &none()).unwrap().is_empty(),
+            "a null author, no one's"
         );
     }
 
