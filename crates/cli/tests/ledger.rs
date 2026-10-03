@@ -7,6 +7,7 @@ use fl_core::store::{Catalog, Ledger};
 use fl_github::fake::FakeGithub;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -1606,25 +1607,183 @@ fn a_gate_named_with_markup_is_escaped_in_its_comment() {
     );
 }
 
-/// What names this machine, read now and never written down: paths (the
-/// working tree, `$HOME`), matched anywhere; and words (`$USER`, the host
-/// name), matched whole and only from four letters on — a two-letter host
-/// name would match ordinary text.
-fn machine_names(w: &World) -> (Vec<String>, Vec<String>) {
-    let home = std::env::var("HOME").expect("HOME is set");
-    assert!(home.len() > 1, "a home to look for");
-    let paths = vec![
-        w.repo.path().display().to_string(),
-        w.repo.path().canonicalize().unwrap().display().to_string(),
-        home,
-    ];
-    let host = Sys::new("hostname")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    let user = std::env::var("USER").unwrap_or_default();
-    let words = [host, user].into_iter().filter(|n| n.len() >= 4).collect();
-    (paths, words)
+/// What names this machine, read now and never written down. Paths (the
+/// working tree, `$HOME`) match anywhere; words (`$USER`, the host name)
+/// match whole and only from four letters on — a two-letter host name
+/// would match ordinary text.
+struct MachineNames {
+    /// The working tree, as given and canonical: one entry when they agree.
+    tree: Vec<String>,
+    home: String,
+    /// `$USER` and the host name, each only when it can be checked.
+    words: Vec<String>,
+}
+
+impl MachineNames {
+    fn of(w: &World) -> MachineNames {
+        let home = std::env::var("HOME").expect("HOME is set");
+        assert!(home.len() > 1, "a home to look for");
+        let mut tree = vec![
+            w.repo.path().display().to_string(),
+            w.repo.path().canonicalize().unwrap().display().to_string(),
+        ];
+        tree.dedup();
+        let host = Sys::new("hostname")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|h| !h.is_empty())
+            .or_else(|| {
+                fs::read_to_string("/proc/sys/kernel/hostname")
+                    .ok()
+                    .map(|h| h.trim().to_string())
+            })
+            .unwrap_or_default();
+        let user = std::env::var("USER").unwrap_or_default();
+        let mut words = Vec::new();
+        for (what, name) in [("the host name", host), ("$USER", user)] {
+            if name.is_empty() {
+                eprintln!("scan: {what} is unset, so it is not checked");
+            } else if name.chars().count() < 4 {
+                eprintln!(
+                    "scan: {what} has fewer than 4 letters, so it is not checked: \
+                     it would match ordinary text"
+                );
+            } else {
+                words.push(name);
+            }
+        }
+        MachineNames { tree, home, words }
+    }
+
+    /// Every path the scan matches anywhere.
+    fn paths(&self) -> Vec<&str> {
+        self.tree
+            .iter()
+            .map(String::as_str)
+            .chain([self.home.as_str()])
+            .collect()
+    }
+
+    /// Every name there is to find, read from the fields themselves.
+    fn all(&self) -> BTreeSet<String> {
+        self.tree
+            .iter()
+            .chain([&self.home])
+            .chain(&self.words)
+            .cloned()
+            .collect()
+    }
+}
+
+/// Every name in `names` that some text in `texts` holds: a path anywhere,
+/// a word whole.
+fn found(texts: &[String], names: &MachineNames) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for text in texts {
+        for p in names.paths() {
+            if text.contains(p) {
+                out.insert(p.to_string());
+            }
+        }
+        for word in &names.words {
+            if holds_word(text, word) {
+                out.insert(word.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Comments as published and as read: each raw, and again with its
+/// escapes undone, so `ci\_runner` reads `ci_runner`.
+fn comment_texts(comments: &[String]) -> Vec<String> {
+    comments
+        .iter()
+        .flat_map(|c| [c.clone(), unescape_comment(c)])
+        .collect()
+}
+
+/// `c` with a comment's escapes undone: each zero-width space dropped,
+/// `<br>` a newline, a backslash before ASCII punctuation dropped, then
+/// `&lt;`, `&gt;` and, last, `&amp;` decoded.
+fn unescape_comment(c: &str) -> String {
+    let c = c.replace("&#8203;", "").replace("<br>", "\n");
+    let mut out = String::with_capacity(c.len());
+    let mut chars = c.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match chars.peek() {
+            Some(&next) if ch == '\\' && next.is_ascii_punctuation() => {
+                out.push(next);
+                chars.next();
+            }
+            _ => out.push(ch),
+        }
+    }
+    out.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+}
+
+/// Ledger files as published and as read: each file raw, and every string
+/// and key of every `.jsonl` line decoded — a JSON escape such as `\n`
+/// before a name would otherwise hide it.
+fn line_texts(files: &BTreeMap<String, String>) -> Vec<String> {
+    let mut out: Vec<String> = files.values().cloned().collect();
+    for (path, text) in files.iter().filter(|(p, _)| p.ends_with(".jsonl")) {
+        for line in text.lines().filter(|l| !l.is_empty()) {
+            let v: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("{path}: {e}: {line}"));
+            json_strings(&v, &mut out);
+        }
+    }
+    out
+}
+
+/// Every string and key in `v`, at any depth.
+fn json_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(a) => a.iter().for_each(|v| json_strings(v, out)),
+        serde_json::Value::Object(o) => {
+            for (k, v) in o {
+                out.push(k.clone());
+                json_strings(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+// The scan reads a name through each escape it can be published under: a
+// comment's backslash, and a ledger line's `\n` and `\u` escapes. Fixture
+// names only, so the test holds on any machine.
+#[test]
+fn the_scan_sees_a_name_through_the_escapes_it_is_published_under() {
+    let names = MachineNames {
+        tree: vec!["/home/someone/bin/lint".into()],
+        home: "/home/someone".into(),
+        words: vec!["ci_runner".into()],
+    };
+    let comment = vec![r"| broken | on ci\_runner |".to_string()];
+    assert!(
+        found(&comment, &names).is_empty(),
+        "raw, the escape hides it"
+    );
+    assert_eq!(
+        found(&comment_texts(&comment), &names),
+        BTreeSet::from(["ci_runner".to_string()])
+    );
+    let files = BTreeMap::from([(
+        "runs/k/1.jsonl".to_string(),
+        "{\"output_excerpt\":\"pwd\\nci_runner\"}\n\
+         {\"d\":\"\\u002fhome\\u002fsomeone\\u002fbin\\u002flint\"}\n"
+            .to_string(),
+    )]);
+    let raw: Vec<String> = files.values().cloned().collect();
+    assert!(found(&raw, &names).is_empty(), "raw, the escapes hide them");
+    assert_eq!(found(&line_texts(&files), &names), names.all());
 }
 
 /// Whether `text` holds `word` with no letter, digit, `-` or `_` on
@@ -1706,46 +1865,60 @@ fn telling(private: bool) -> World {
 
 // ⚠ Decision 2, spec §8.3: on a repository that is not private, no
 // comment, published line or commit message names this machine. The same
-// decisions on a private repository do — in comments and in ledger lines
-// — so the scan cannot pass by looking at nothing.
+// decisions on a private repository show every name — in comments and in
+// ledger lines, each on its own — so the scan cannot pass by looking at
+// nothing, and the public repository publishes as many lines and commits.
 #[test]
 fn comments_and_lines_on_a_repository_that_is_not_private_hold_no_path_home_or_host_name() {
     let private = telling(true);
-    let (paths, _) = machine_names(&private);
-    let tree = &paths[..2];
-    let shown = [
+    let names = MachineNames::of(&private);
+    let comments = [
         private.fake.issue(1).comments,
         private.fake.issue(2).comments,
     ]
     .concat();
-    assert_eq!(shown.len(), 6, "every kind of comment: {shown:?}");
-    let shown = shown.join("\n");
-    assert!(
-        tree.iter().any(|t| shown.contains(t.as_str())),
-        "a private comment shows it: {shown}"
-    );
-    let lines: String = private.fake.ledger_files().into_values().collect();
-    assert!(
-        tree.iter().any(|t| lines.contains(t.as_str())),
-        "a private line holds it"
-    );
+    assert_eq!(comments.len(), 6, "every kind of comment: {comments:?}");
+    let surfaces = [
+        ("comments", comment_texts(&comments)),
+        ("ledger lines", line_texts(&private.fake.ledger_files())),
+    ];
+    for (surface, texts) in &surfaces {
+        assert_eq!(
+            found(texts, &names),
+            names.all(),
+            "the private {surface} show every name"
+        );
+    }
+    let decisions = private.decision_ids().len();
+    let messages = private.fake.ledger_commit_messages().len();
+    assert!(decisions > 0 && messages > 0, "{decisions} {messages}");
 
     let public = telling(false);
-    let mut published = [public.fake.issue(1).comments, public.fake.issue(2).comments].concat();
-    assert_eq!(published.len(), 6, "{published:?}");
-    published.extend(public.fake.ledger_files().into_values());
-    published.extend(public.fake.ledger_commit_messages());
-    let (paths, words) = machine_names(&public);
-    for text in &published {
-        for p in &paths {
-            assert!(!text.contains(p.as_str()), "a path is published: {text}");
-        }
-        for word in &words {
-            assert!(
-                !holds_word(text, word),
-                "a machine's name is published: {text}"
-            );
-        }
+    let names = MachineNames::of(&public);
+    let comments = [public.fake.issue(1).comments, public.fake.issue(2).comments].concat();
+    assert_eq!(comments.len(), 6, "{comments:?}");
+    assert_eq!(
+        public.decision_ids().len(),
+        decisions,
+        "as many decision lines"
+    );
+    let published_messages = public.fake.ledger_commit_messages();
+    assert_eq!(
+        published_messages.len(),
+        messages,
+        "as many commit messages"
+    );
+    let surfaces = [
+        ("comments", comment_texts(&comments)),
+        ("ledger lines", line_texts(&public.fake.ledger_files())),
+        ("commit messages", published_messages),
+    ];
+    for (surface, texts) in &surfaces {
+        assert_eq!(
+            found(texts, &names),
+            BTreeSet::new(),
+            "the public {surface} name this machine"
+        );
     }
 }
 
