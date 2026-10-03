@@ -1573,6 +1573,182 @@ fn comment_without_the_ledger_key_is_refused() {
         .stderr(contains("does not name the GitHub ledger"));
 }
 
+// ⚠ Spec §4.2, §8.3: a gate named with a pipe, backticks, a mention, a
+// reference (`#1` and `GH-1`), a comment opener and a newline is escaped
+// in its comment — it notifies no one, links nothing, opens nothing,
+// breaks no table.
+#[test]
+fn a_gate_named_with_markup_is_escaped_in_its_comment() {
+    let w = World::new();
+    w.gated_as("a|b `c` @someone #1 GH-1 <!-- x\ny");
+    w.init();
+    w.export();
+    w.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    let comments = w.fake.issue(1).comments;
+    assert_eq!(comments.len(), 1, "{comments:?}");
+    let c = &comments[0];
+    assert!(
+        c.contains(
+            r"| launch | a\|b \`c\` @&#8203;someone #&#8203;1 GH-&#8203;1 &lt;!-- x<br>y | PASS |"
+        ),
+        "{c}"
+    );
+    assert!(!c.contains("@someone"), "{c}");
+    assert!(!c.contains("#1 "), "{c}");
+    assert!(!c.contains("GH-1"), "{c}");
+    assert_eq!(
+        c.matches("<!--").count(),
+        1,
+        "only the marker opens a comment: {c}"
+    );
+}
+
+/// What names this machine, read now and never written down: paths (the
+/// working tree, `$HOME`), matched anywhere; and words (`$USER`, the host
+/// name), matched whole and only from four letters on — a two-letter host
+/// name would match ordinary text.
+fn machine_names(w: &World) -> (Vec<String>, Vec<String>) {
+    let home = std::env::var("HOME").expect("HOME is set");
+    assert!(home.len() > 1, "a home to look for");
+    let paths = vec![
+        w.repo.path().display().to_string(),
+        w.repo.path().canonicalize().unwrap().display().to_string(),
+        home,
+    ];
+    let host = Sys::new("hostname")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let user = std::env::var("USER").unwrap_or_default();
+    let words = [host, user].into_iter().filter(|n| n.len() >= 4).collect();
+    (paths, words)
+}
+
+/// Whether `text` holds `word` with no letter, digit, `-` or `_` on
+/// either side.
+fn holds_word(text: &str, word: &str) -> bool {
+    let edge = |c: Option<char>| !c.is_some_and(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    text.match_indices(word).any(|(i, _)| {
+        edge(text[..i].chars().next_back()) && edge(text[i + word.len()..].chars().next())
+    })
+}
+
+/// A world whose gate prints where it runs and fails, with a second gate
+/// whose program does not exist (its detail names its path), and every
+/// kind of comment: a refused move and a failed check posted live; a check
+/// whose comment failed, recovered from the ledger; an attempt; a
+/// reproduction by the gate that errors (refused) and by the one that
+/// fails (accepted).
+fn telling(private: bool) -> World {
+    let w = World::new();
+    fs::write(
+        w.repo.path().join("check.sh"),
+        "#!/bin/sh\npwd\necho \"$HOME\"\necho \"$USER\"\nhostname\n[ ! -e bug ]\n",
+    )
+    .unwrap();
+    w.gated();
+    let broken = w.repo.path().join("no-such-gate");
+    w.fl()
+        .args([
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "broken",
+            "--glob",
+            "src/**/*.rs",
+            "--program",
+            broken.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    w.init();
+    w.export();
+    if !private {
+        w.fake.state().repos[0].visibility = "public".into();
+    }
+    fs::write(w.repo.path().join("bug"), "").unwrap();
+    let decide = |args: &[&str], code: i32| {
+        w.fl()
+            .args(args)
+            .assert()
+            .code(code)
+            .stderr(contains(NOT_POSTED).not());
+    };
+    decide(&["record", "move", "1", "--to", "doing"], 1);
+    decide(&["check", "launch", "--project", "1", "--record", "1"], 1);
+    w.fake.state().fail_comment_next = true;
+    w.fl()
+        .args(["check", "launch", "--project", "1", "--record", "1"])
+        .assert()
+        .code(1)
+        .stderr(contains(NOT_POSTED));
+    w.fl()
+        .args(["github", "ledger", "comment", "1"])
+        .assert()
+        .success()
+        .stdout(contains("comments\t1 posted"));
+    decide(&["attempt", "1", "--budget-usd-micros", "0"], 1);
+    w.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "a bug", "--by", "reviewer",
+        ])
+        .assert()
+        .success();
+    decide(&["finding", "reproduce", "2", "--gate", "2"], 2);
+    decide(&["finding", "reproduce", "2", "--gate", "1"], 0);
+    w
+}
+
+// ⚠ Decision 2, spec §8.3: on a repository that is not private, no
+// comment, published line or commit message names this machine. The same
+// decisions on a private repository do — in comments and in ledger lines
+// — so the scan cannot pass by looking at nothing.
+#[test]
+fn comments_and_lines_on_a_repository_that_is_not_private_hold_no_path_home_or_host_name() {
+    let private = telling(true);
+    let (paths, _) = machine_names(&private);
+    let tree = &paths[..2];
+    let shown = [
+        private.fake.issue(1).comments,
+        private.fake.issue(2).comments,
+    ]
+    .concat();
+    assert_eq!(shown.len(), 6, "every kind of comment: {shown:?}");
+    let shown = shown.join("\n");
+    assert!(
+        tree.iter().any(|t| shown.contains(t.as_str())),
+        "a private comment shows it: {shown}"
+    );
+    let lines: String = private.fake.ledger_files().into_values().collect();
+    assert!(
+        tree.iter().any(|t| lines.contains(t.as_str())),
+        "a private line holds it"
+    );
+
+    let public = telling(false);
+    let mut published = [public.fake.issue(1).comments, public.fake.issue(2).comments].concat();
+    assert_eq!(published.len(), 6, "{published:?}");
+    published.extend(public.fake.ledger_files().into_values());
+    published.extend(public.fake.ledger_commit_messages());
+    let (paths, words) = machine_names(&public);
+    for text in &published {
+        for p in &paths {
+            assert!(!text.contains(p.as_str()), "a path is published: {text}");
+        }
+        for word in &words {
+            assert!(
+                !holds_word(text, word),
+                "a machine's name is published: {text}"
+            );
+        }
+    }
+}
+
 // ⚠ An issue another repository holds is refused before any request
 // touches an issue: recovery never posts outside the bound repository.
 #[test]
