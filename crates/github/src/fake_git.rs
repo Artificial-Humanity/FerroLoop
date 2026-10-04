@@ -238,6 +238,14 @@ pub(crate) fn rest(
     if !s.is_bound(o, r) {
         return None;
     }
+    // ⚠ Modelled: a repository with no commit answers a ref read 409 "Git
+    // Repository is empty". Confirmed by live test
+    // `an_empty_repository_is_refused_naming_a_first_commit`. Unmeasured:
+    // the fake answers every other git data request the same way; fl reads
+    // a ref before it sends any other.
+    if s.empty_repository && rest.first() == Some(&"git") {
+        return Some(answer(409, json!({"message": "Git Repository is empty."})));
+    }
     let full = format!("{o}/{r}");
     let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
     Some(match (method, rest) {
@@ -863,6 +871,15 @@ fn append(s: &mut State, vars: &Value) -> Answer {
         .unwrap_or("")
         .to_string();
     let oid = s.git.commit_on(&branch, &changes, &headline);
+    if std::mem::take(&mut s.timeout_after_next_commit) {
+        return answer(
+            200,
+            json!({"data": null, "errors": [{"message": "Something went wrong while executing \
+                your query. This may be the result of a timeout, or it could be a GitHub bug. \
+                Please include `0000:0000:0000000:0000000:00000000` when reporting this \
+                issue."}]}),
+        );
+    }
     if std::mem::take(&mut s.hang_up_after_next_commit) {
         let mut a = answer(200, Value::Null);
         a.hang_up = true;

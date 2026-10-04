@@ -1,4 +1,5 @@
 mod cmd;
+mod comment;
 mod config;
 mod ctx;
 mod preflight;
@@ -634,8 +635,11 @@ fn run(cli: Cli) -> Result<i32> {
         local: &store,
         github: gl,
     });
-    let ledger: &dyn fl_core::Ledger = match &split {
-        Some(s) => s,
+    // Each decision this command flushes, remembered so its comment can be
+    // posted once the state change is done (GitHub ledger spec §4.1).
+    let witness = split.as_ref().map(|s| ctx::Witness::new(s));
+    let ledger: &dyn fl_core::Ledger = match &witness {
+        Some(w) => w,
         None => &store,
     };
     let (checked, routed);
@@ -656,6 +660,7 @@ fn run(cli: Cli) -> Result<i32> {
                 handles: &routed,
                 github: Some(gh),
                 github_ledger: github_ledger.as_ref(),
+                witness: witness.as_ref(),
                 tracker_label: format!("github:{}", gh.repo().full_name),
             }
         }
@@ -666,6 +671,7 @@ fn run(cli: Cli) -> Result<i32> {
             handles: &store,
             github: None,
             github_ledger: None,
+            witness: None,
             tracker_label: store.label().to_string(),
         },
     };

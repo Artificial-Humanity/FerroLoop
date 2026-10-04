@@ -13,6 +13,8 @@ use std::thread::JoinHandle;
 pub const INSTALLATION_TOKEN: &str = "fake-installation-token";
 pub const USER_LOGIN: &str = "fake-user";
 pub const APP_SLUG: &str = "fake-app";
+/// The id of the repository a transferred issue moves to.
+pub const TRANSFERRED_REPO: u64 = 99;
 
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -42,6 +44,9 @@ pub struct Issue {
     /// Ids of the body's edit history, oldest first.
     pub edits: Vec<String>,
     pub comments: Vec<String>,
+    /// Who wrote each comment, by index. A comment this does not list was
+    /// written by [`USER_LOGIN`].
+    pub comment_authors: Vec<String>,
 }
 
 /// Everything the fake holds, and the knobs a test turns. Every knob is
@@ -83,6 +88,10 @@ pub struct State {
     pub fail_before_create: bool,
     /// The next comment answers 500 and is not posted. One-shot.
     pub fail_comment_next: bool,
+    /// The comment post that follows this many more answers 500 and is
+    /// not posted; `Some(0)` is the next one. Lets a test pass over the
+    /// posts a command makes before the one it means to fail. One-shot.
+    pub fail_comment_after: Option<u32>,
     /// The next create that `fail_before_create` does not fail answers 403
     /// with GitHub's rate-limit headers, and nothing lands. One-shot.
     pub rate_limited_next_create: bool,
@@ -144,6 +153,10 @@ pub struct State {
     /// Modelled: this is the fake's guess at the shape of GitHub's real
     /// answer (unmeasured; no live test checks it yet). Not one-shot.
     pub transferred_nodes: BTreeSet<String>,
+    /// Issues transferred out of the bound repository, by number, as GitHub
+    /// serves them where they are now:
+    /// `/repositories/{TRANSFERRED_REPO}/issues/{n}`.
+    pub transferred: BTreeMap<u64, Issue>,
     /// On the next timeline read, before answering, someone else adds the
     /// label `bug` to that issue (with its `labeled` event) — a write landing
     /// between fl's first read and its window. One-shot.
@@ -258,6 +271,12 @@ pub struct State {
     pub ref_404_next: u32,
     /// Every recursive tree listing says GitHub cut it short. A setting.
     pub truncate_trees: bool,
+    /// Every git data request answers 409, as for a repository with no
+    /// commit. A setting.
+    pub empty_repository: bool,
+    /// The next commit lands, and its answer is GitHub's timeout error: a
+    /// 200 with no data and an error saying it may be a timeout. One-shot.
+    pub timeout_after_next_commit: bool,
 }
 
 pub struct FakeGithub {
@@ -429,6 +448,20 @@ impl FakeGithub {
         let issue = s.issues.get_mut(&n).expect("an issue to edit");
         f(issue);
         issue.events.push((e, "labeled".into()));
+    }
+
+    /// Transfers issue `n` to another repository, as GitHub does: the old
+    /// address answers `301` to where the issue is now, and the issue —
+    /// its body and its comments so far — is served there. Returns that
+    /// address.
+    pub fn transfer(&self, n: u64) -> String {
+        let mut s = self.state();
+        let to = format!("{}/repositories/{TRANSFERRED_REPO}/issues/{n}", s.base);
+        let issue = s.issues.get_mut(&n).expect("an issue to transfer");
+        let moved = issue.clone();
+        issue.moved_to = Some(to.clone());
+        s.transferred.insert(n, moved);
+        to
     }
 
     /// An issue fl did not make: `labels` as given, no block.
@@ -712,6 +745,52 @@ fn installation(s: &State, repo: Option<u64>) -> Answer {
         Some(inst) => answer(200, json!({"id": inst})),
         None => answer(404, json!({"message": "Not Found"})),
     }
+}
+
+/// A `301` to `to`, as GitHub answers for an issue that moved.
+fn redirect(to: &str) -> Answer {
+    let mut a = answer(301, json!({"message": "Moved Permanently"}));
+    a.headers.push(("Location".into(), to.to_string()));
+    a
+}
+
+/// An issue's comments as GitHub lists them, oldest first, each with its
+/// author.
+fn comment_items(i: &Issue) -> Vec<Value> {
+    i.comments
+        .iter()
+        .enumerate()
+        .map(|(k, body)| {
+            let by = i.comment_authors.get(k).map_or(USER_LOGIN, String::as_str);
+            json!({"id": k as u64 + 1, "body": body, "user": {"login": by}})
+        })
+        .collect()
+}
+
+/// Who a request's credential writes as: the App's bot for its
+/// installation token, else the token's user.
+///
+/// Unmeasured for the App: that an installation token's comment is
+/// authored by `{slug}[bot]`, the login `GET /app` names, is GitHub's
+/// documentation; the live run as the App is still owed.
+fn author(auth: &str) -> String {
+    if auth == format!("Bearer {INSTALLATION_TOKEN}") {
+        format!("{APP_SLUG}[bot]")
+    } else {
+        USER_LOGIN.to_string()
+    }
+}
+
+/// Appends the comment a `POST` carries in `body` to `i`, written by `by`,
+/// and answers as GitHub does for a comment it took.
+fn add_comment(i: &mut Issue, body: &str, by: String) -> Answer {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let k = i.comments.len();
+    i.comment_authors.resize(k, USER_LOGIN.to_string());
+    i.comment_authors.push(by);
+    i.comments
+        .push(v["body"].as_str().unwrap_or("").to_string());
+    answer(201, json!({"id": i.comments.len()}))
 }
 
 /// Every route the fake serves. Later tasks add arms above the final `_`.
@@ -1038,14 +1117,80 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             if std::mem::take(&mut s.fail_comment_next) {
                 return answer(500, json!({"message": "fake comment failure"}));
             }
-            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            match s.fail_comment_after {
+                Some(0) => {
+                    s.fail_comment_after = None;
+                    return answer(500, json!({"message": "fake comment failure"}));
+                }
+                Some(n) => s.fail_comment_after = Some(n - 1),
+                None => {}
+            }
+            let by = author(auth);
             match n.parse::<u64>().ok().and_then(|n| s.issues.get_mut(&n)) {
                 None => answer(404, json!({"message": "Not Found"})),
-                Some(i) => {
-                    i.comments
-                        .push(v["body"].as_str().unwrap_or("").to_string());
-                    answer(201, json!({"id": i.comments.len()}))
+                // Unmeasured: GitHub's answers for a deleted or transferred
+                // issue's comments, as its documentation describes them; no
+                // live test deletes or transfers an issue.
+                Some(i) if i.gone => answer(410, json!({"message": "This issue was deleted"})),
+                Some(i) if i.moved_to.is_some() => redirect(i.moved_to.as_deref().unwrap_or("")),
+                Some(i) => add_comment(i, body, by),
+            }
+        }
+        // ⚠ Modelled: an issue's comments are listed with each one's `body`
+        // and its author's `user.login`. Confirmed by live test
+        // `a_decision_comment_round_trips_with_its_marker`, which reads one
+        // page; paging is the `Link` header every list GitHub answers uses.
+        ("GET", ["repos", o, r, "issues", n, "comments"]) if s.is_bound(o, r) => {
+            let items = match n.parse::<u64>().ok().and_then(|n| s.issues.get(&n)) {
+                None => return answer(404, json!({"message": "Not Found"})),
+                Some(i) if i.gone => {
+                    return answer(410, json!({"message": "This issue was deleted"}));
                 }
+                Some(i) if i.moved_to.is_some() => {
+                    return redirect(i.moved_to.as_deref().unwrap_or(""));
+                }
+                Some(i) => comment_items(i),
+            };
+            s.page(&path, &q, items)
+        }
+        // Unmeasured: a transferred issue, its comments and a post there,
+        // as GitHub's documentation describes them; no live test transfers
+        // an issue.
+        ("GET", ["repositories", id, "issues", n])
+            if id.parse::<u64>().ok() == Some(TRANSFERRED_REPO) =>
+        {
+            match n.parse::<u64>().ok().and_then(|n| s.transferred.get(&n)) {
+                None => answer(404, json!({"message": "Not Found"})),
+                Some(i) => {
+                    let mut v = s.issue_json(i);
+                    v["html_url"] = json!(format!(
+                        "https://github.com/elsewhere/transferred/issues/{}",
+                        i.number
+                    ));
+                    answer(200, v)
+                }
+            }
+        }
+        ("GET", ["repositories", id, "issues", n, "comments"])
+            if id.parse::<u64>().ok() == Some(TRANSFERRED_REPO) =>
+        {
+            let items = match n.parse::<u64>().ok().and_then(|n| s.transferred.get(&n)) {
+                None => return answer(404, json!({"message": "Not Found"})),
+                Some(i) => comment_items(i),
+            };
+            s.page(&path, &q, items)
+        }
+        ("POST", ["repositories", id, "issues", n, "comments"])
+            if id.parse::<u64>().ok() == Some(TRANSFERRED_REPO) =>
+        {
+            let by = author(auth);
+            match n
+                .parse::<u64>()
+                .ok()
+                .and_then(|n| s.transferred.get_mut(&n))
+            {
+                None => answer(404, json!({"message": "Not Found"})),
+                Some(i) => add_comment(i, body, by),
             }
         }
         ("PATCH", ["repos", o, r, "issues", n]) if s.is_bound(o, r) => {

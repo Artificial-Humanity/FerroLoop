@@ -6,11 +6,13 @@ finding is then an issue, which anyone with access to the repository can read, a
 every machine that works on the project sees the same way.
 
 Only records and findings move. The catalog — the project, its gates and its transitions —
-and the ledger of gate runs and attempts stay in the local store. Other machines get the
-gates from the committed manifest, as [sharing-gates.md](sharing-gates.md) describes; they
-never read another machine's store. Because a finding's reproduction names a gate that other
-machines will read, `fl finding reproduce` on a project bound to GitHub first checks that the
-committed manifest carries that gate as this store has it, and refuses until it does.
+stays in the local store, and so does every gate run and attempt. With `ledger = "github"` in
+the binding, each decision also publishes its evidence to the repository's `fl/ledger` branch
+and posts a comment on its issue; [github-ledger.md](github-ledger.md) says how. Other machines
+get the gates from the committed manifest, as [sharing-gates.md](sharing-gates.md) describes;
+they never read another machine's store. Because a finding's reproduction names a gate that
+other machines will read, `fl finding reproduce` on a project bound to GitHub first checks that
+the committed manifest carries that gate as this store has it, and refuses until it does.
 
 ## Binding a project to a repository
 
@@ -41,10 +43,11 @@ the whole file rather than ignoring the key and writing records to a local track
 chose. Two entries for the same project root that name different stores or trackers are
 refused too.
 
-Only the commands that read or write records or findings use the binding: `fl record`,
-`fl finding`, `fl attempt`, `fl check` with `--record`, and `fl github`. The catalog
-commands — `fl project`, `fl gate`, `fl transition`, `fl stats` and `fl manifest` — never
-contact GitHub.
+Only the commands that read or write records or findings use the binding — `fl record`,
+`fl finding`, `fl attempt`, `fl check` with `--record`, and `fl github` — and `fl stats` when
+the binding names the GitHub ledger. The catalog commands — `fl project`, `fl gate`,
+`fl transition` and `fl manifest` — never contact GitHub, and `fl stats` does only to count a
+project's attempts on its GitHub ledger ([github-ledger.md](github-ledger.md)).
 
 `--db` and `$FL_DB` cannot be combined with a GitHub binding for a command that uses it. The
 repository's identity (see [Identity](#identity)) and the project's catalog live in the store
@@ -74,16 +77,16 @@ as that person. Running inside GitHub Actions with its own `GITHUB_TOKEN` is unt
 writes as there, and whether `fl github whoami` works with that token, are not yet checked. A
 `GITHUB_TOKEN` already set for other tools is used when `FL_GITHUB_TOKEN` is not, so set
 `FL_GITHUB_TOKEN` when the two should differ. The token needs to read the repository and to
-read and write its issues.
+read and write its issues; with the GitHub ledger, also to read and write its contents.
 
 **`credential = "app"`** writes as a GitHub App. The repository owner registers the App with
-two repository permissions, **Issues: read and write** and **Metadata: read**, installs it on
-the bound repository only, and downloads a private key for it. `private_key` is the path of
-that key file: an RSA key in PEM form, as GitHub hands it out. fl signs a short-lived token
-with the key, looks up the App's installation on the bound repository, and exchanges the
-signed token for an installation token, which it renews before it expires. The key is read
-from the file; it never appears on a command line, and a message may name the file's path
-but never its contents.
+the repository permissions **Issues: read and write** and **Metadata: read** — and, when the
+binding names the GitHub ledger, **Contents: read and write** — installs it on the bound
+repository only, and downloads a private key for it. `private_key` is the path of that key
+file: an RSA key in PEM form, as GitHub hands it out. fl signs a short-lived token with the
+key, looks up the App's installation on the bound repository, and exchanges the signed token
+for an installation token, which it renews before it expires. The key is read from the file; it
+never appears on a command line, and a message may name the file's path but never its contents.
 
 `fl github whoami`, run inside the project's checkout, prints the identity GitHub reports for
 the credential (a user's login, or an App's `<slug>[bot]`), where the credential came from (the
@@ -346,3 +349,6 @@ FL_GITHUB_LIVE_REPO=acme/fl-live cargo test -p fl-github --test live -- --ignore
 The concurrency test prints how many rounds were clean, how many were caught as conflicts, and
 how many were lost; record those counts with the change that ran them. If the edit-history
 test fails, the model is wrong: fix the conflict check and the fake together.
+
+The GitHub ledger has live tests of its own in the same file;
+[github-ledger.md](github-ledger.md#the-live-tests) says what they need.

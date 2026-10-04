@@ -292,9 +292,13 @@ that added it and the quarantine command.
 
 ### 3.4 Cost
 
-A decision costs about three requests, plus one per new segment, plus its comment. GitHub
-answers a rate limit, primary or secondary, as `RateLimited` with the reset time when known;
-the decision is refused.
+A decision costs about ten requests: four for the pre-flight — the repository's visibility,
+the rules on `fl/ledger`, the branch's head and its `format` file; four for the flush — the
+head again, one listing of the directories it appends to, who fl writes as (once per command)
+and the commit; one download for each segment that grew since this machine last read it — in
+steady state, each directory the previous decision appended to; and one for its comment. A
+head another machine moved adds a compare. GitHub answers a rate limit, primary or secondary,
+as `RateLimited` with the reset time when known; the decision is refused.
 
 ### 3.5 Tampering
 

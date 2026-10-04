@@ -102,6 +102,24 @@ fn judge(answer: GraphqlAnswer) -> Result<Landed, StoreError> {
             .errors
             .iter()
             .any(|e| e.get("type").and_then(Value::as_str) == Some("FORBIDDEN"));
+        // ⚠ Modelled from GitHub's documented error shape, with no live
+        // test: a request that runs past GitHub's time limit is answered 200
+        // with an error saying it "may be the result of a timeout", and the
+        // commit may have landed; only a fresh read can tell (spec §3.2
+        // step 5). Provoking it takes a request built to run past GitHub's
+        // limit, which would abuse the API. A refusal for want of a
+        // permission stays a refusal.
+        let timed_out = answer.errors.iter().any(|e| {
+            e.get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|m| m.to_ascii_lowercase().contains("timeout"))
+        });
+        if timed_out && !forbidden {
+            return Ok(Landed::Unknown(format!(
+                "GitHub answered fl's commit with a timeout ({})",
+                Value::Array(answer.errors)
+            )));
+        }
         let errors = Value::Array(answer.errors);
         return Err(StoreError::Backend(if forbidden {
             format!(
@@ -602,6 +620,24 @@ mod tests {
         );
         assert_eq!(l.runs(&gate()).unwrap(), vec![run(1)]);
         assert_eq!(l.decisions(record().iri()).unwrap(), vec![b.decision]);
+    }
+
+    // ⚠ Spec §3.2 step 5: a timeout is read again. The commit landed, so
+    // nothing is added twice and no empty commit follows.
+    #[test]
+    fn a_commit_answered_with_a_timeout_is_read_again_and_lands_once() {
+        let (fake, local, _root) = world();
+        fake.state().timeout_after_next_commit = true;
+        let c = client(&fake);
+        let l = open(&c, &local);
+        let b = batch(1, vec![run(1)], vec![]);
+        assert_eq!(l.publish(&b).unwrap(), fake.ledger_head());
+        assert_eq!(
+            fake.ledger_commits(),
+            2,
+            "one commit, none empty, none twice"
+        );
+        assert_eq!(l.runs(&gate()).unwrap(), vec![run(1)]);
     }
 
     // ⚠ Ruling 8: a lost answer whose commit rolled a segment over — the
@@ -1192,6 +1228,38 @@ mod tests {
         ))
         .unwrap_err();
         assert!(matches!(refused, StoreError::Backend(_)), "{refused:?}");
+        assert!(refused.to_string().contains("Contents: write"), "{refused}");
+    }
+
+    // A timeout says nothing about whether the commit landed: unknown,
+    // whatever its case. A refusal for want of a permission that rides
+    // along with one is still a refusal.
+    #[test]
+    fn a_timeout_is_an_unknown_landing_and_a_forbidden_answer_stays_refused() {
+        let timeout = json!({"message": "Something went wrong while executing your query. \
+            This may be the result of a timeout, or it could be a GitHub bug."});
+        assert!(matches!(
+            judge(answer(200, None, vec![timeout.clone()])).unwrap(),
+            Landed::Unknown(_)
+        ));
+        assert!(matches!(
+            judge(answer(
+                200,
+                None,
+                vec![json!({"message": "Request TIMEOUT"})]
+            ))
+            .unwrap(),
+            Landed::Unknown(_)
+        ));
+        let refused = judge(answer(
+            200,
+            None,
+            vec![
+                json!({"type": "FORBIDDEN", "message": "Resource not accessible"}),
+                timeout,
+            ],
+        ))
+        .unwrap_err();
         assert!(refused.to_string().contains("Contents: write"), "{refused}");
     }
 }

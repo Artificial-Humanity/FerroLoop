@@ -170,8 +170,12 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 crate::cmd::manifest::ensure_publishable(store, &f.project, Some(&gid))?;
             }
             crate::preflight::check(ctx, &f.project)?;
-            let (report, flushed) = attach_reproduction(ctx.roles(), &fid, &gid)
-                .map_err(|e| explain(e, &finding, Some(&gate)))?;
+            let reproduced = attach_reproduction(ctx.roles(), &fid, &gid);
+            // Spec §4.1: on the finding's issue, once the state change is
+            // done — a refused reproduction's too (decision 11) — before an
+            // error becomes the exit.
+            crate::comment::after(ctx, &f.project, reproduced.is_ok());
+            let (report, flushed) = reproduced.map_err(|e| explain(e, &finding, Some(&gate)))?;
             crate::ctx::report_flush(&flushed);
             println!(
                 "{}\treproduced\tgate {} failed over {} items",
@@ -194,8 +198,11 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             crate::cmd::manifest::ensure_import_current(store, &f.project)?;
             crate::preflight::check(ctx, &f.project)?;
             let id = f.id;
-            let report =
-                verify_finding(ctx.roles(), &id).map_err(|e| explain(e, &finding, None))?;
+            let verified = verify_finding(ctx.roles(), &id);
+            // Spec §4.1–§4.2: on the finding's issue, saying whether the
+            // finding closed, before an error becomes the exit.
+            crate::comment::after(ctx, &f.project, verified.is_ok());
+            let report = verified.map_err(|e| explain(e, &finding, None))?;
             crate::ctx::report_flush(&report.flushed);
 
             if report.reproduction.verdict.is_pass() {

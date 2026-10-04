@@ -21,7 +21,8 @@ pub enum Cmd {
         #[arg(long)]
         by: String,
     },
-    /// The GitHub ledger: set it up, walk its history, quarantine a line.
+    /// The GitHub ledger: set it up, walk its history, quarantine a line,
+    /// post the decision comments an issue is missing.
     #[command(subcommand)]
     Ledger(crate::cmd::ledger::Cmd),
 }
@@ -29,7 +30,8 @@ pub enum Cmd {
 impl Cmd {
     fn refs(&self) -> Vec<&Ref> {
         match self {
-            Cmd::Whoami | Cmd::Ledger(_) => vec![],
+            Cmd::Whoami => vec![],
+            Cmd::Ledger(c) => c.refs(),
             Cmd::Repair { id, .. } => vec![id],
         }
     }

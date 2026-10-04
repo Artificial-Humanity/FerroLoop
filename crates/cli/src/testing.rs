@@ -8,11 +8,14 @@ use std::cell::RefCell;
 
 /// A ledger that keeps every decision it is asked to flush — or, built with
 /// [`Flushes::refusing`] or [`Flushes::refusing_with`], refuses every one;
-/// built with [`Flushes::failing_append`], fails every attempt's save.
+/// built with [`Flushes::failing_append`], fails every attempt's save;
+/// built with [`Flushes::publishing_nothing`], lands every flush and names
+/// no commit.
 #[derive(Default)]
 pub struct Flushes {
     refuse: Option<fn() -> StoreError>,
     fail_append: bool,
+    no_commit: bool,
     pub decisions: RefCell<Vec<Decision>>,
 }
 
@@ -44,6 +47,14 @@ impl Flushes {
             ..Self::default()
         }
     }
+
+    /// Every flush lands and names no commit: it published nothing.
+    pub fn publishing_nothing() -> Self {
+        Self {
+            no_commit: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Ledger for Flushes {
@@ -68,7 +79,7 @@ impl Ledger for Flushes {
         }
         self.decisions.borrow_mut().push(decision);
         Ok(Flushed {
-            commit: Some("c1".into()),
+            commit: (!self.no_commit).then(|| "c1".into()),
             left_local: vec![],
         })
     }

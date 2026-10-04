@@ -2,9 +2,12 @@
 //! §2.6): the local store for the catalog, whichever tracker the project is
 //! bound to, and whichever ledger it is bound to.
 
-use fl_core::decision::{Flushed, LeftLocal};
-use fl_core::store::{Handles, Ledger, Roles, Tracker};
+use fl_core::decision::{Decision, Flushed, LeftLocal};
+use fl_core::ids::{GateId, ProjectId};
+use fl_core::log::{Attempt, GateRun};
+use fl_core::store::{Handles, Ledger, Roles, StoreError, Tracker};
 use fl_store::RedbStore;
+use std::cell::RefCell;
 
 pub struct Ctx<'a> {
     pub store: &'a RedbStore,
@@ -21,6 +24,10 @@ pub struct Ctx<'a> {
     /// The GitHub ledger, when the binding names it (GitHub ledger spec
     /// §1.5): over the tracker's client and the local store.
     pub github_ledger: Option<&'a fl_github::GithubLedger<'a>>,
+    /// The bound ledger as decisions see it, remembering each decision
+    /// whose flush landed, for its comment (GitHub ledger spec §4.1). Set
+    /// with the GitHub ledger, and only then.
+    pub witness: Option<&'a Witness<'a>>,
     /// Where records and findings live, for messages.
     pub tracker_label: String,
 }
@@ -32,6 +39,65 @@ impl Ctx<'_> {
             tracker: self.tracker,
             ledger: self.ledger,
         }
+    }
+}
+
+/// One decision this command flushed, and what its flush did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flush {
+    pub decision: Decision,
+    pub flushed: Flushed,
+}
+
+/// The bound ledger, remembering each decision whose flush landed, so the
+/// command can post its comment once the state change is done (GitHub
+/// ledger spec §4.1). Every call goes through to the ledger it wraps.
+pub struct Witness<'a> {
+    inner: &'a dyn Ledger,
+    seen: RefCell<Vec<Flush>>,
+}
+
+impl<'a> Witness<'a> {
+    pub fn new(inner: &'a dyn Ledger) -> Self {
+        Self {
+            inner,
+            seen: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// The decisions flushed since the last call, oldest first.
+    pub fn take(&self) -> Vec<Flush> {
+        std::mem::take(&mut *self.seen.borrow_mut())
+    }
+}
+
+impl Ledger for Witness<'_> {
+    fn append_gate_run(&self, run: GateRun) -> Result<(), StoreError> {
+        self.inner.append_gate_run(run)
+    }
+
+    fn append_attempt(&self, attempt: Attempt) -> Result<(), StoreError> {
+        self.inner.append_attempt(attempt)
+    }
+
+    fn gate_runs(&self, gate: &GateId) -> Result<Vec<GateRun>, StoreError> {
+        self.inner.gate_runs(gate)
+    }
+
+    fn attempts(&self, project: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
+        self.inner.attempts(project)
+    }
+
+    /// ⚠ Remembered only once the flush returned: a refused flush
+    /// published nothing for a comment to show.
+    fn flush(&self, decision: Decision) -> Result<Flushed, StoreError> {
+        let kept = decision.clone();
+        let flushed = self.inner.flush(decision)?;
+        self.seen.borrow_mut().push(Flush {
+            decision: kept,
+            flushed: flushed.clone(),
+        });
+        Ok(flushed)
     }
 }
 
@@ -82,12 +148,50 @@ mod tests {
             handles: &store,
             github: None,
             github_ledger: None,
+            witness: None,
             tracker_label: String::new(),
         };
         assert!(
             std::ptr::addr_eq(ctx.roles().ledger, &flushes as &dyn Ledger),
             "the roles carry the bound ledger"
         );
+    }
+
+    fn check_decision() -> fl_core::decision::Decision {
+        fl_core::decision::Decision {
+            id: fl_core::ids::seq_iri(9),
+            at: fl_core::at::At::from_unix_millis(1),
+            record: RecordId(Iri::parse("https://github.com/acme/widgets/issues/1").unwrap()),
+            finding: None,
+            outcome: fl_core::decision::Outcome::Check {
+                transition: fl_core::decision::TransitionOutcome {
+                    transition: "launch".into(),
+                    passed: true,
+                },
+            },
+            rests_on: vec![],
+        }
+    }
+
+    // Spec §4.1: only a decision whose flush landed has a comment to post;
+    // the flush itself goes through unchanged.
+    #[test]
+    fn the_witness_remembers_only_a_flush_that_landed_and_forwards_it() {
+        let landed = Flushes::default();
+        let w = Witness::new(&landed);
+        assert_eq!(
+            w.flush(check_decision()).unwrap().commit.as_deref(),
+            Some("c1")
+        );
+        assert_eq!(landed.decisions.borrow().len(), 1, "forwarded");
+        let seen = w.take();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].decision, check_decision());
+        assert!(w.take().is_empty(), "taken once");
+        let refused = Flushes::refusing();
+        let w = Witness::new(&refused);
+        assert!(w.flush(check_decision()).is_err());
+        assert!(w.take().is_empty());
     }
 
     #[test]
