@@ -555,16 +555,26 @@ fn concurrent_writers_are_detected_never_silently_lost() {
 /// edit history, and how many of each state-changing timeline event fl
 /// counts — replayed as fl replays them (`tracker::counted_events`), so a
 /// `labeled` event GitHub records a second time, for a label already on, is
-/// not counted here either.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// not counted here either. `raw` is printed, never asserted.
+#[derive(Debug, Clone)]
 struct Seen {
     edits: u64,
     events: BTreeMap<String, u64>,
+    /// The `labeled` and `unlabeled` events as GitHub lists them, copies
+    /// included — printed so a live run shows how often GitHub records a
+    /// label event twice.
+    raw: BTreeMap<String, u64>,
 }
 
 impl Seen {
     fn events(&self, kind: &str) -> u64 {
         self.events.get(kind).copied().unwrap_or(0)
+    }
+
+    /// What the model check compares: the edits and the counted changes,
+    /// never the raw label events.
+    fn counted(&self) -> (u64, &BTreeMap<String, u64>) {
+        (self.edits, &self.events)
     }
 }
 
@@ -600,9 +610,19 @@ fn seen(raw: &Client, repo: &str, n: u64) -> Seen {
     for e in tracker::counted_events(n, &items).unwrap() {
         *events.entry(e.kind).or_default() += 1;
     }
+    let mut raw_labels = BTreeMap::new();
+    for e in &items {
+        if let Some(k) = e["event"]
+            .as_str()
+            .filter(|k| ["labeled", "unlabeled"].contains(k))
+        {
+            *raw_labels.entry(k.to_string()).or_default() += 1;
+        }
+    }
     Seen {
         edits: total,
         events,
+        raw: raw_labels,
     }
 }
 
@@ -623,9 +643,17 @@ fn after_fl_write(raw: &Client, repo: &str, n: u64, what: &str) -> Seen {
     let immediate = seen(raw, repo, n);
     std::thread::sleep(Duration::from_secs(2));
     let settled = seen(raw, repo, n);
-    println!("{what}: immediately {immediate:?}; after 2 s {settled:?}");
+    println!(
+        "{what}: immediately {:?} (raw label events {:?}); after 2 s {:?} (raw label events \
+         {:?})",
+        immediate.counted(),
+        immediate.raw,
+        settled.counted(),
+        settled.raw
+    );
     assert_eq!(
-        immediate, settled,
+        immediate.counted(),
+        settled.counted(),
         "{what}: GitHub showed more two seconds after fl's write returned than at once. fl \
          waits only until its OWN write shows, so something that lands later — its own or \
          someone else's — falls in the next write's window, or is missed"
