@@ -243,8 +243,8 @@ pub struct State {
     pub refuse_next_commit_as_forbidden: bool,
     /// The next ledger commit refused for a moved head answers with a
     /// GraphQL error of type FORBIDDEN saying where the branch is, rather
-    /// than STALE_DATA — the shape a race lost while GitHub moves the
-    /// branch takes. One-shot. Measured live on 2026-10-05.
+    /// than STALE_DATA — the shape a lost race took when observed live on
+    /// 2026-10-05. One-shot.
     pub lose_next_race_as_forbidden: bool,
     /// The next ledger commit lands, then answers 200 with a body that is
     /// not JSON. One-shot.

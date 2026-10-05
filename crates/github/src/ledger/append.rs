@@ -53,15 +53,33 @@ enum Landed {
 /// JSON, or broke off), may hide a commit that landed. Confirmed by live
 /// test `create_commit_on_branch_is_refused_when_the_head_moved`.
 ///
-/// ⚠ Measured live on 2026-10-05 (`two_flushes_racing_both_land`): a race
-/// lost while GitHub moves the branch is refused with an error of type
-/// `FORBIDDEN` whose message says the branch "is at" one commit "but
-/// expected" another. That is a moved head, not a missing permission.
+/// ⚠ Observed once live, on 2026-10-05, by the losing flush of
+/// `two_flushes_racing_both_land`: a 200 carrying
+/// `{"type": "FORBIDDEN", "path": ["createCommitOnBranch"], "message": "is at
+/// 2f4befc022adbf7d97077306abea79d23d07e734 but expected
+/// 89bef3b68d7ca1dc30eed0a98197473d70d7502c"}`. Read as a moved head, not a
+/// missing permission. Why GitHub chose this shape over `STALE_DATA` is
+/// inferred, not measured: the branch moved after GitHub's own check.
 ///
 /// ⚠ Modelled: a missing permission can come back as a 200 carrying an
 /// error of type `FORBIDDEN` rather than as a 403 naming it — refused, and
 /// named (spec §6.3). Confirmed by live test
 /// `create_commit_on_branch_without_contents_write_is_refused`.
+/// Whether `message` says the branch "is at" one commit "but expected"
+/// another, each named by its full id — the moved-head refusal observed
+/// live. Words that merely resemble it, with no ids, are not one.
+fn names_two_heads(message: &str) -> bool {
+    let is_oid = |w: &str| (40..=64).contains(&w.len()) && w.bytes().all(|b| b.is_ascii_hexdigit());
+    message.match_indices("is at ").any(|(i, _)| {
+        let mut words = message[i + "is at ".len()..].split_whitespace();
+        matches!(
+            (words.next(), words.next(), words.next(), words.next()),
+            (Some(at), Some("but"), Some("expected"), Some(exp))
+                if is_oid(at) && is_oid(exp.trim_end_matches('.'))
+        )
+    })
+}
+
 fn judge(answer: GraphqlAnswer) -> Result<Landed, StoreError> {
     match answer.status {
         200..=299 => {}
@@ -94,13 +112,12 @@ fn judge(answer: GraphqlAnswer) -> Result<Landed, StoreError> {
         }
     }
     if !answer.errors.is_empty() {
-        // ⚠ Checked before FORBIDDEN below: a race lost while GitHub moves
-        // the branch is FORBIDDEN too, and is a moved head.
+        // ⚠ Checked before FORBIDDEN below: a lost race has also come back
+        // as FORBIDDEN, and is a moved head.
         let moved = answer.errors.iter().any(|e| {
             e.get("type").and_then(Value::as_str) == Some("STALE_DATA")
                 || e.get("message").and_then(Value::as_str).is_some_and(|m| {
-                    m.contains("Expected branch to point to")
-                        || (m.contains("is at ") && m.contains(" but expected "))
+                    m.contains("Expected branch to point to") || names_two_heads(m)
                 })
         });
         if moved {
@@ -515,7 +532,7 @@ mod tests {
     }
 
     // ⚠ The same invariant when GitHub reports the lost race as FORBIDDEN,
-    // the shape measured live on 2026-10-05: it is a moved head, never a
+    // the shape observed live on 2026-10-05: it is a moved head, never a
     // missing permission.
     #[test]
     fn a_race_lost_as_forbidden_is_read_again_and_lands() {
@@ -1198,12 +1215,12 @@ mod tests {
         for e in [
             json!({"type": "STALE_DATA"}),
             json!({"message": "Expected branch to point to \"c0\" but it did not."}),
-            // Measured live on 2026-10-05: a race lost while GitHub moves
-            // the branch comes back as FORBIDDEN, not as STALE_DATA.
+            // The shape a lost race took live on 2026-10-05.
             json!({
                 "type": "FORBIDDEN",
                 "path": ["createCommitOnBranch"],
-                "message": "is at c2 but expected c0",
+                "message": "is at 2f4befc022adbf7d97077306abea79d23d07e734 but expected \
+                            89bef3b68d7ca1dc30eed0a98197473d70d7502c",
             }),
         ] {
             assert_eq!(
@@ -1267,6 +1284,15 @@ mod tests {
         ))
         .unwrap_err();
         assert!(matches!(refused, StoreError::Backend(_)), "{refused:?}");
+        assert!(refused.to_string().contains("Contents: write"), "{refused}");
+        // A moved head is read only from two commit ids: words that merely
+        // look like one are not a race.
+        let refused = judge(answer(
+            200,
+            None,
+            vec![json!({"type": "FORBIDDEN", "message": "is at least 1 but expected 2"})],
+        ))
+        .unwrap_err();
         assert!(refused.to_string().contains("Contents: write"), "{refused}");
     }
 
