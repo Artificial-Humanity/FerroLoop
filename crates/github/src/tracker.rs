@@ -119,7 +119,9 @@ fn created_at(node: &Value) -> Result<At, StoreError> {
 }
 
 /// One state-changing timeline event: its kind and, for a label event,
-/// the label.
+/// the label. Public, with `counted_events`, for one reader: the live
+/// tests (`tests/live.rs`); hidden from the documentation.
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub id: u64,
@@ -133,6 +135,7 @@ pub struct Event {
 /// on. Public for one reader: the live tests (`tests/live.rs`) must count
 /// GitHub's timeline exactly as fl does, or a `labeled` event GitHub
 /// records twice fails their model check while fl itself handles it.
+#[doc(hidden)]
 pub fn counted_events(n: u64, items: &[Value]) -> Result<Vec<Event>, StoreError> {
     let events = parse_events(n, items)?;
     Ok(changes(&events).into_iter().cloned().collect())
