@@ -879,9 +879,11 @@ impl GithubTracker {
         Ok(None)
     }
 
-    /// ⚠ The list GitHub serves may lag a create that just landed, so the
-    /// key is searched for first; only when EVERY search misses is the
-    /// create sent again. Only for a FIRST-attempt failure where the create
+    /// ⚠ The list GitHub serves may lag a create that just landed (GraphQL's
+    /// showed one within 1 s, 5 of 5, measured live on 2026-10-05; the REST
+    /// list, which fl does not use, took 31-93 s), so the key is searched
+    /// for `settle` apart; only when EVERY search misses is the create sent
+    /// again. Only for a FIRST-attempt failure where the create
     /// may not have happened at all — a 5xx answer, or the connection
     /// dropping before an answer arrived. See `after_unreadable_create` for
     /// the case where it certainly did.
@@ -2497,9 +2499,10 @@ mod tests {
         assert_eq!(t.resolve_handle(Kind::Record, 99).unwrap(), None);
     }
 
-    /// Measured live: a create's `labeled` events reach the timeline 1.5-3.5 s
-    /// after GitHub answers. Unless the create waits for them, they land in
-    /// the NEXT write's window and read as someone else's.
+    /// Measured live on 2026-10-05: the `labeled` events of the labels a
+    /// create adds by their own call reach the timeline 1-2 s after it.
+    /// Unless the create waits for them, they land in the NEXT write's
+    /// window and read as someone else's.
     #[test]
     fn a_create_waits_until_its_labels_show_in_the_timeline() {
         let fake = FakeGithub::start("acme/widgets");
