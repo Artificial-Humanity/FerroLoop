@@ -223,9 +223,11 @@ The detection rests on a model of what GitHub records. The live tests measured m
   a label already on the issue cannot be anyone's write. fl replays the issue's timeline to
   know which labels are on at each event, and does not count such an event — as a change by
   someone else, or as a sign that its own write shows. It always counts a label removed.
-  Not measured: that the timeline records every label change. If deleting a label from the
-  repository leaves no event on its issues, a later `labeled` event for that label is not
-  counted.
+  Measured on 2026-10-05 (one sample): deleting a label from the repository records a
+  label-removed event on each issue that carried it, so that does not upset the replay. Not
+  measured: that the timeline records every other label change, and that an event that shows
+  means every earlier one shows too. A label change with no event would make fl skip a later
+  `labeled` event for that label.
 - **Line endings.** fl takes a body rewrite that only changes line endings to count as an
   edit. If GitHub records none for it, someone else's edit in the same window can be missed.
   Measured: GitHub recorded one entry for such a rewrite, as modelled.

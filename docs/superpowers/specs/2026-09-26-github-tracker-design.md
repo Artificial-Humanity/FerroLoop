@@ -307,9 +307,12 @@ fl writes it; fl never reads state from it.
   conflict check, the wait for fl's own write, and the wait after a create. It never drops an
   `unlabeled` event or any other kind. Which labels are on comes from the timeline, never from
   an issue fl read, which can already hold a label someone added inside the window.
-  *(Modelled, not measured: the timeline records every label change. A label deleted from the
-  repository may leave its issues with no `unlabeled` event; a later `labeled` event for it
-  would then be dropped.)*
+  Measured live on 2026-10-05 (one sample): deleting a label from the repository records an
+  `unlabeled` event for it on each issue that carried it, and adding it again after it is
+  re-created records a new `labeled`. *(Modelled, not measured: the timeline records every
+  label change, and an event that shows means every earlier one shows too. A label change
+  with no event would leave the replay wrong, and a later `labeled` event for that label could
+  then be dropped.)*
 * **The timeline and the edit history lag a write.** Measured live on 2026-09-29: an update's
   events showed on the first read after it (about 0.5 s) and its edit-history entries about
   0.5 s later. Measured live on 2026-10-05: the `labeled` event of a create's label call,

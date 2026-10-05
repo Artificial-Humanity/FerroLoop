@@ -137,10 +137,14 @@ struct Event {
 /// replayed from the timeline itself, from none: never from an issue fl
 /// read, which can already hold a label someone added inside the window.
 /// An `unlabeled` event, and every other kind, is always kept.
+/// Measured live on 2026-10-05 (one sample): deleting a label from the
+/// repository records an `unlabeled` event on each issue that carried it,
+/// and adding it again after it is re-created records a new `labeled`, so
+/// that path keeps the replay right.
 /// ⚠ Modelled: the timeline records every label change of the issue, in
-/// order. A label deleted from the repository leaves its issues with no
-/// `unlabeled` event (unmeasured); a later `labeled` event for it would
-/// then be taken for noise.
+/// order, and an event that shows means every earlier one shows too. A
+/// label change with no event would leave the replay wrong; a later
+/// `labeled` event for that label could then be taken for noise.
 fn changes(events: &[Event]) -> Vec<&Event> {
     let mut on = BTreeSet::new();
     events
