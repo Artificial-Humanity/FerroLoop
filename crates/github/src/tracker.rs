@@ -121,10 +121,67 @@ fn created_at(node: &Value) -> Result<At, StoreError> {
 /// One state-changing timeline event: its kind and, for a label event,
 /// the label.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Event {
-    id: u64,
-    kind: String,
-    label: Option<String>,
+pub struct Event {
+    pub id: u64,
+    pub kind: String,
+    pub label: Option<String>,
+}
+
+/// The state-changing events of issue `n`'s raw timeline items (oldest
+/// first) that fl counts as changes: parsed as fl parses them, then
+/// replayed by `changes`, which drops a `labeled` event for a label already
+/// on. Public for one reader: the live tests (`tests/live.rs`) must count
+/// GitHub's timeline exactly as fl does, or a `labeled` event GitHub
+/// records twice fails their model check while fl itself handles it.
+pub fn counted_events(n: u64, items: &[Value]) -> Result<Vec<Event>, StoreError> {
+    let events = parse_events(n, items)?;
+    Ok(changes(&events).into_iter().cloned().collect())
+}
+
+/// Issue `n`'s raw timeline items, oldest first, as its state-changing
+/// events. ⚠ An item fl cannot classify is an error, never skipped.
+fn parse_events(n: u64, items: &[Value]) -> Result<Vec<Event>, StoreError> {
+    let mut events = Vec::new();
+    for e in items {
+        // ⚠ No `event` field is not "not a state event": fl cannot tell
+        // what it was, so it cannot rule it out.
+        let kind = e.get("event").and_then(Value::as_str).ok_or_else(|| {
+            backend(format!(
+                "GitHub sent a timeline item on issue {n} without an `event` kind, so fl \
+                 cannot tell whether someone else changed the issue; retry"
+            ))
+        })?;
+        if !STATE_EVENTS.contains(&kind) {
+            continue;
+        }
+        let id = e.get("id").and_then(Value::as_u64).ok_or_else(|| {
+            backend(format!(
+                "a `{kind}` event on issue {n} has no id, so fl cannot tell it from its own \
+                 write; retry"
+            ))
+        })?;
+        // ⚠ A label event without its label cannot be told from noise.
+        let label = match kind {
+            "labeled" | "unlabeled" => Some(
+                e.pointer("/label/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        backend(format!(
+                            "a `{kind}` event on issue {n} names no label, so fl cannot tell \
+                             whether it changed the issue; retry"
+                        ))
+                    })?,
+            ),
+            _ => None,
+        };
+        events.push(Event {
+            id,
+            kind: kind.to_string(),
+            label,
+        });
+    }
+    Ok(events)
 }
 
 /// The events of a whole timeline (oldest first) that can record a change.
@@ -1279,50 +1336,10 @@ impl GithubTracker {
     /// The issue's state-changing timeline events, by id. ⚠ Never
     /// `remember`s: it reads no item.
     fn state_events(&self, n: u64) -> Result<Vec<Event>, StoreError> {
-        let mut events = Vec::new();
-        for e in self
+        let items = self
             .client
-            .get_all(&self.path(&format!("/issues/{n}/timeline?per_page=100")))?
-        {
-            // ⚠ No `event` field is not "not a state event": fl cannot tell
-            // what it was, so it cannot rule it out.
-            let kind = e.get("event").and_then(Value::as_str).ok_or_else(|| {
-                backend(format!(
-                    "GitHub sent a timeline item on issue {n} without an `event` kind, so fl \
-                     cannot tell whether someone else changed the issue; retry"
-                ))
-            })?;
-            if !STATE_EVENTS.contains(&kind) {
-                continue;
-            }
-            let id = e.get("id").and_then(Value::as_u64).ok_or_else(|| {
-                backend(format!(
-                    "a `{kind}` event on issue {n} has no id, so fl cannot tell it from its own \
-                     write; retry"
-                ))
-            })?;
-            // ⚠ A label event without its label cannot be told from noise.
-            let label = match kind {
-                "labeled" | "unlabeled" => Some(
-                    e.pointer("/label/name")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .ok_or_else(|| {
-                            backend(format!(
-                                "a `{kind}` event on issue {n} names no label, so fl cannot \
-                                 tell whether it changed the issue; retry"
-                            ))
-                        })?,
-                ),
-                _ => None,
-            };
-            events.push(Event {
-                id,
-                kind: kind.to_string(),
-                label,
-            });
-        }
-        Ok(events)
+            .get_all(&self.path(&format!("/issues/{n}/timeline?per_page=100")))?;
+        parse_events(n, &items)
     }
 
     /// The body's edit history: its entries' ids and its `totalCount`.
@@ -3894,6 +3911,30 @@ mod tests {
             msg.contains("names no label") && msg.contains("retry"),
             "{msg}"
         );
+    }
+
+    /// What the live tests count: raw timeline items, parsed and replayed
+    /// as fl parses and replays them.
+    #[test]
+    fn counted_events_parses_raw_timeline_items_and_drops_noise() {
+        let items = vec![
+            json!({"id": 1, "event": "labeled", "label": {"name": "a"}}),
+            json!({"id": 2, "event": "commented"}),
+            json!({"id": 3, "event": "labeled", "label": {"name": "a"}}),
+            json!({"id": 4, "event": "renamed"}),
+        ];
+        let kinds: Vec<(u64, String)> = counted_events(7, &items)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.id, e.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [(1, "labeled".to_string()), (4, "renamed".to_string())]
+        );
+        let bad = vec![json!({"id": 5, "event": "labeled"})];
+        let e = counted_events(7, &bad).unwrap_err().to_string();
+        assert!(e.contains("names no label"), "{e}");
     }
 
     /// The replay behind the conflict window: a `labeled` event for a
