@@ -66,6 +66,12 @@ pub struct GithubTracker {
 /// mention does not, and is not a conflict.
 const STATE_EVENTS: [&str; 5] = ["labeled", "unlabeled", "closed", "reopened", "renamed"];
 
+/// The order a list of issues is read in, by creation.
+#[derive(Debug, Clone, Copy)]
+enum Order {
+    OldestFirst,
+}
+
 /// What GitHub has recorded about an issue's changes at one moment.
 struct Window {
     events: BTreeMap<u64, String>,
@@ -332,20 +338,92 @@ impl GithubTracker {
         format!("/repos/{}{rest}", self.repo.full_name)
     }
 
-    /// Oldest first: an issue created while a list is read lands on its last
-    /// page, so it cannot shift an earlier page's issues onto the next one.
-    /// ⚠ The opposite hazard remains, because GitHub's paging is by offset,
-    /// not a cursor: an issue LEAVING the filtered set mid-read (a label
-    /// removed, closed out from under a state filter) shifts every later
-    /// issue one position earlier, which can drop a live item from a page
-    /// already served — silently, with no error (spec §3.7). `list` catches
-    /// this itself, by re-reading and comparing issue numbers whenever more
-    /// than one page was needed.
-    fn list_path(&self, labels: &[String]) -> String {
-        self.path(&format!(
-            "/issues?state=all&sort=created&direction=asc&per_page=100&labels={}",
-            labels.join(",")
-        ))
+    /// Every issue carrying `label` (every issue, for `None`), read from
+    /// GraphQL's `issues` connection a page at a time in `order`, each node
+    /// handed to `each` until it answers `false` (spec §3.7). Each node is
+    /// one `IssueView::from_graphql` reads, plus `createdAt`.
+    ///
+    /// ⚠ GraphQL, never the REST issue list. Measured live on 2026-10-05:
+    /// the REST list left a new issue out for 31-93 s (once more than
+    /// 180 s), and showed a label change 30-100 s late; this connection
+    /// showed a new issue within 1 s (5 of 5) and a label change within
+    /// 2-3 s (5 of 5). Read through REST, a list was silently short, an
+    /// alias scan could miss an owner, and a create-key search could miss
+    /// a create that landed and send it again.
+    /// ⚠ A failed page, or a page with no readable `issues` connection, is
+    /// an ERROR, never a short list.
+    fn each_issue(
+        &self,
+        label: Option<&str>,
+        order: Order,
+        mut each: impl FnMut(&Value) -> Result<bool, StoreError>,
+    ) -> Result<(), StoreError> {
+        let (owner, name) = self
+            .repo
+            .full_name
+            .split_once('/')
+            .expect("a full name is owner/name");
+        // Two spellings rather than `labels: null` for "no filter": what
+        // GitHub makes of an explicit null filter is unmeasured.
+        let (declared, filter) = match label {
+            Some(_) => (", $labels: [String!]!", "labels: $labels, "),
+            None => ("", ""),
+        };
+        let query = format!(
+            "query($owner: String!, $name: String!, $after: String, $direction: \
+             OrderDirection!{declared}) {{ repository(owner: $owner, name: $name) {{ \
+             issues({filter}states: [OPEN, CLOSED], first: 100, after: $after, orderBy: \
+             {{field: CREATED_AT, direction: $direction}}) {{ pageInfo {{ hasNextPage \
+             endCursor }} nodes {{ number id url title body state stateReason createdAt \
+             labels(first: 100) {{ totalCount nodes {{ name }} }} }} }} }} }}"
+        );
+        let direction = match order {
+            Order::OldestFirst => "ASC",
+        };
+        let what = label.map_or_else(|| "the full".to_string(), |l| format!("the `{l}`"));
+        let mut after: Option<String> = None;
+        loop {
+            let mut vars = json!({"owner": owner, "name": name, "after": after,
+                                  "direction": direction});
+            if let Some(l) = label {
+                vars["labels"] = json!([l]);
+            }
+            let data = self.client.graphql(&query, vars)?;
+            let issues = data.pointer("/repository/issues");
+            let (Some(nodes), Some(more)) = (
+                issues
+                    .and_then(|i| i.get("nodes"))
+                    .and_then(Value::as_array),
+                issues
+                    .and_then(|i| i.pointer("/pageInfo/hasNextPage"))
+                    .and_then(Value::as_bool),
+            ) else {
+                return Err(backend(format!(
+                    "GitHub answered a page of {what} issue list of {} without its `issues` \
+                     connection. A list with a missing page is not a list; retry",
+                    self.repo.full_name
+                )));
+            };
+            for node in nodes {
+                if !each(node)? {
+                    return Ok(());
+                }
+            }
+            if !more {
+                return Ok(());
+            }
+            let cursor = issues
+                .and_then(|i| i.pointer("/pageInfo/endCursor"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    backend(format!(
+                        "GitHub said {what} issue list of {} has another page but gave no \
+                         cursor to it; retry",
+                        self.repo.full_name
+                    ))
+                })?;
+            after = Some(cursor.to_string());
+        }
     }
 
     /// Whether `id` is an issue of THIS repository (spec §2.2, §2.4). A URL
@@ -499,42 +577,29 @@ impl GithubTracker {
         state: Option<&str>,
         remember: bool,
     ) -> Result<Vec<(IssueView, Meta, String)>, StoreError> {
-        let mut labels = vec![meta::kind_label(kind)];
-        if let Some(s) = state {
-            labels.push(meta::state_label(kind, s));
-        }
-        let path = self.list_path(&labels);
-        let (raw, pages) = self.client.get_all_paged(&path)?;
-        if pages > 1 {
-            // ⚠ GitHub pages by offset, not a cursor (spec §3.7): an issue
-            // leaving the filtered set mid-read shifts every later issue
-            // back by one, which can drop a live item with no error. A
-            // second, independent read is compared by issue number; any
-            // difference means the set changed while fl was reading it, and
-            // the whole list is refused rather than returned short. A single
-            // page cannot have shifted anything onto or off of itself, so it
-            // costs nothing here.
-            let (again, _) = self.client.get_all_paged(&path)?;
-            let first: BTreeSet<u64> = raw
-                .iter()
-                .filter_map(|v| v.get("number").and_then(Value::as_u64))
-                .collect();
-            let second: BTreeSet<u64> = again
-                .iter()
-                .filter_map(|v| v.get("number").and_then(Value::as_u64))
-                .collect();
-            if first != second {
-                return Err(backend(format!(
-                    "the list of {} issues changed while fl read it; retry",
-                    kind.as_wire()
-                )));
-            }
-        }
+        // ⚠ One label, never two: whether GraphQL's `labels` filter means
+        // AND or OR is unmeasured, and for one label both agree. A state
+        // label names its kind; the kind label is checked from the read.
+        let label = match state {
+            Some(s) => meta::state_label(kind, s),
+            None => meta::kind_label(kind),
+        };
+        // Read once. ⚠ Modelled: GitHub's cursor names the last issue
+        // served, not an offset, so an issue leaving the filtered set
+        // mid-read (a label removed) cannot shift a live item across a page
+        // boundary, and the REST list's second read and comparison are not
+        // needed. A reading of GitHub's docs; unmeasured; no live test
+        // checks it yet. Oldest first, so an issue created mid-read lands
+        // on the last page.
+        let mut raw = Vec::new();
+        self.each_issue(Some(&label), Order::OldestFirst, |node| {
+            raw.push(IssueView::from_graphql(node)?);
+            Ok(true)
+        })?;
         let mut out = Vec::new();
         let mut numbers = BTreeSet::new();
-        for v in raw {
-            let issue = IssueView::from_json(&v)?;
-            // Pages are read one by one; an issue seen twice is counted once.
+        for issue in raw {
+            // An issue served twice is counted once.
             if !numbers.insert(issue.number) {
                 continue;
             }
@@ -544,8 +609,8 @@ impl GithubTracker {
                     meta,
                     prose,
                 } if k == kind => {
-                    // The label filter is taken to mean AND; the block is
-                    // checked too, so a looser filter cannot widen the list.
+                    // The block is checked too, so a looser filter cannot
+                    // widen the list.
                     if state.is_some_and(|st| meta.state != st) {
                         continue;
                     }
@@ -560,19 +625,6 @@ impl GithubTracker {
                         id: issue.url.clone(),
                         detail: "its kind label and its block disagree".into(),
                     });
-                }
-                // ⚠ Not `Diverged`: its remedy is `fl github repair`, which
-                // refuses a pull request. The remedy
-                // that works is named instead.
-                Read::NotFl(_) if issue.is_pull_request => {
-                    return Err(backend(format!(
-                        "{} is a pull request carrying fl labels, so fl cannot list the {}s \
-                         of {}: fl keeps items only in issues, and `fl github repair` does not \
-                         rewrite a pull request. Remove its fl labels",
-                        issue.url,
-                        kind.as_wire(),
-                        self.repo.full_name
-                    )));
                 }
                 Read::NotFl(what) => {
                     return Err(StoreError::Diverged {
@@ -802,18 +854,19 @@ impl GithubTracker {
         kind: ItemKind,
         key: &str,
     ) -> Result<Option<IssueView>, StoreError> {
-        for v in self
-            .client
-            .get_all(&self.list_path(&[meta::kind_label(kind)]))?
-        {
-            let issue = IssueView::from_json(&v)?;
+        let mut found = None;
+        let label = meta::kind_label(kind);
+        self.each_issue(Some(&label), Order::OldestFirst, |node| {
+            let issue = IssueView::from_graphql(node)?;
             if let Ok((_, m)) = meta::parse_body(&issue.body)
                 && m.create_key == key
             {
-                return Ok(Some(issue));
+                found = Some(issue);
+                return Ok(false);
             }
-        }
-        Ok(None)
+            Ok(true)
+        })?;
+        Ok(found)
     }
 
     /// Read, change, write, and check the answer. `missing` is the error for
@@ -1907,7 +1960,7 @@ mod tests {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake).without_settle();
         fake.state().hang_up_after_create = true;
-        fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 1));
+        fake.state().fail_issues_query_after = Some(0);
         let err = t.add_record(&p(), "t").unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -2060,76 +2113,103 @@ mod tests {
         fake.state().max_per_page = 2;
         assert_eq!(t.list_records(&p()).unwrap().len(), 5);
         assert!(t.list_records(&ProjectId(seq_iri(2))).unwrap().is_empty());
-        fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 2));
+        fake.state().fail_issues_query_after = Some(1);
         assert!(t.list_records(&p()).is_err(), "never a short list");
     }
 
-    /// The flip side of the test below — a list that
-    /// fits on a single page must not pay for the second-pass stability
-    /// check at all. Nothing can have shifted a page onto or off of itself.
+    /// A page that answers with no `issues` connection is not an empty
+    /// page: the list fails (spec §3.7).
     #[test]
-    fn a_single_page_list_is_read_once() {
+    fn a_list_page_without_an_issues_connection_is_an_error_not_an_empty_list() {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake);
         t.add_record(&p(), "a").unwrap();
-        t.add_record(&p(), "b").unwrap();
-        let before = fake.state().requests.len();
-        assert_eq!(t.list_records(&p()).unwrap().len(), 2);
-        let issue_list_requests = fake.state().requests[before..]
-            .iter()
-            .filter(|r| r.starts_with("GET /repos/acme/widgets/issues?"))
-            .count();
-        assert_eq!(
-            issue_list_requests, 1,
-            "a single page must not be read twice"
-        );
-    }
-
-    /// A list that needed more than one page is read a
-    /// SECOND time to check the set of issue numbers is stable — a stable
-    /// list still succeeds, just at the cost of the extra read.
-    #[test]
-    fn a_stable_multi_page_list_is_read_twice_and_still_succeeds() {
-        let fake = FakeGithub::start("acme/widgets");
-        let t = open(&fake);
-        for i in 0..5 {
-            t.add_record(&p(), &format!("r{i}")).unwrap();
-        }
-        fake.state().max_per_page = 2;
-        let before = fake.state().requests.len();
-        assert_eq!(t.list_records(&p()).unwrap().len(), 5);
-        let issue_list_requests = fake.state().requests[before..]
-            .iter()
-            .filter(|r| r.starts_with("GET /repos/acme/widgets/issues?"))
-            .count();
-        assert_eq!(
-            issue_list_requests, 6,
-            "3 pages needed for 5 records at 2 per page, read twice"
-        );
-    }
-
-    /// GitHub pages by offset. An issue leaving the
-    /// filtered set between two page reads of the SAME pass shifts every
-    /// later issue back by one — which can drop a live item with no error
-    /// (spec §3.7). The second, independent read this fake's fix adds must
-    /// catch the mismatch rather than returning what looks like a complete
-    /// but short list.
-    #[test]
-    fn a_list_that_changes_shape_between_the_two_passes_is_an_error_not_a_short_list() {
-        let fake = FakeGithub::start("acme/widgets");
-        let t = open(&fake);
-        for i in 0..5 {
-            t.add_record(&p(), &format!("r{i}")).unwrap();
-        }
-        fake.state().max_per_page = 2;
-        // Issue 1 vanishes right as the first pass's second page is served
-        // (its first page already went out with issue 1 still in it).
-        fake.state().vanish_after_list_request = Some((2, 1));
-        let err = t.list_records(&p()).unwrap_err();
+        fake.state().issues_query_without_connection_next = true;
+        let e = t.list_records(&p()).unwrap_err().to_string();
         assert!(
-            matches!(err, StoreError::Backend(ref m) if m.contains("changed while fl read it")),
-            "{err:?}"
+            e.contains("without its `issues`") && e.contains("retry"),
+            "{e}"
         );
+    }
+
+    /// Measured live on 2026-10-05: GitHub's REST issue list left a new
+    /// issue out for 31-93 s, once for more than 180 s; GraphQL's `issues`
+    /// connection showed it within 1 s. Every list fl makes — records,
+    /// findings, a withdrawal count, an alias scan — reads GraphQL, so none
+    /// is short while the REST list lags.
+    #[test]
+    fn every_list_sees_a_just_created_issue_the_rest_list_leaves_out() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().rest_list_lags = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        let f = t
+            .add_finding(Finding::raise(p(), r.clone(), "hasty", "c"))
+            .unwrap();
+        let alias = Iri::parse("https://github.com/elsewhere/old/issues/3").unwrap();
+        t.add_alias(f.iri(), alias.clone()).unwrap();
+        let mut fin = t.get_finding(&f).unwrap().unwrap();
+        fin.withdraw("w").unwrap();
+        t.update_finding(&fin).unwrap();
+        assert_eq!(t.list_records(&p()).unwrap().len(), 1);
+        assert_eq!(t.list_findings(&p()).unwrap().len(), 1);
+        assert_eq!(t.withdrawals_by("hasty").unwrap(), 1);
+        assert_eq!(
+            t.get_finding(&FindingId(alias.clone()))
+                .unwrap()
+                .unwrap()
+                .id,
+            f
+        );
+        let other = t.add_record(&p(), "u").unwrap();
+        assert!(matches!(
+            t.add_alias(other.iri(), alias),
+            Err(StoreError::AlreadyExists(_))
+        ));
+    }
+
+    /// GitHub's cursor names the last issue served, not an offset, so a
+    /// list is read once, a page at a time.
+    #[test]
+    fn a_multi_page_list_is_read_once_by_cursor() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        for i in 0..5 {
+            t.add_record(&p(), &format!("r{i}")).unwrap();
+        }
+        fake.state().max_per_page = 2;
+        let before = fake.state().list_issue_requests;
+        assert_eq!(t.list_records(&p()).unwrap().len(), 5);
+        assert_eq!(
+            fake.state().list_issue_requests - before,
+            3,
+            "3 pages for 5 records at 2 per page, read once"
+        );
+    }
+
+    /// An issue leaving the filtered set between two pages of one read
+    /// moves no other issue across a page boundary: the cursor names a
+    /// position, not an offset (spec §3.7). Under offset paging this drops
+    /// a live record with no error.
+    #[test]
+    fn an_issue_leaving_the_list_mid_read_drops_no_other() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        for i in 0..5 {
+            t.add_record(&p(), &format!("r{i}")).unwrap();
+        }
+        fake.state().max_per_page = 2;
+        // Issue 1 vanishes right as the second page is served; the first
+        // page already went out with it.
+        let next = fake.state().list_issue_requests + 2;
+        fake.state().vanish_after_list_request = Some((next, 1));
+        let titles: Vec<String> = t
+            .list_records(&p())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.title)
+            .collect();
+        assert_eq!(titles, ["r0", "r1", "r2", "r3", "r4"]);
     }
 
     /// The row of spec §8.2 that makes the others meaningful: a store that
@@ -2166,24 +2246,16 @@ mod tests {
         }
     }
 
-    /// A pull request carrying fl labels stops a list
-    /// with the remedy that works — removing its fl labels — never
-    /// `fl github repair`, which refuses pull requests.
+    /// GraphQL's `issues` connection lists issues only, so a pull request
+    /// carrying fl labels is not in a list; named directly, it is refused
+    /// as not an fl item (`deleted_moved_absent_and_foreign_issues_are_told_apart`).
     #[test]
-    fn a_pull_request_with_fl_labels_in_a_list_names_removing_the_labels() {
+    fn a_pull_request_with_fl_labels_is_not_in_a_list() {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake);
         t.add_record(&p(), "t").unwrap();
         fake.plain_issue(&["fl:record", "fl:record/todo"], true);
-        let msg = t.list_records(&p()).unwrap_err().to_string();
-        assert!(
-            msg.contains("is a pull request") && msg.contains("Remove its fl labels"),
-            "{msg}"
-        );
-        assert!(
-            !msg.contains("Run `fl github repair"),
-            "the remedy must not be the command that refuses a pull request: {msg}"
-        );
+        assert_eq!(t.list_records(&p()).unwrap().len(), 1);
     }
 
     #[test]
@@ -2515,7 +2587,7 @@ mod tests {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake).without_settle();
         fake.state().unreadable_create_body_next = true;
-        fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 1));
+        fake.state().fail_issues_query_after = Some(0);
         let err = t.add_record(&p(), "t").unwrap_err();
         assert!(
             err.to_string()

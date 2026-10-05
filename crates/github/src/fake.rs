@@ -47,6 +47,13 @@ pub struct Issue {
     /// Who wrote each comment, by index. A comment this does not list was
     /// written by [`USER_LOGIN`].
     pub comment_authors: Vec<String>,
+    /// When the issue was created, in milliseconds after the Unix epoch:
+    /// the fake's clock at the create. GraphQL answers it as `createdAt`,
+    /// to the second, as GitHub spells it.
+    pub created_ms: u64,
+    /// Created while `rest_list_lags` was set: the REST issue list leaves
+    /// it out.
+    pub rest_list_hidden: bool,
 }
 
 /// Everything the fake holds, and the knobs a test turns. Every knob is
@@ -110,14 +117,29 @@ pub struct State {
     /// The next issue PATCH answers 200 with a body that cannot be read as
     /// an issue. The PATCH is still applied. One-shot.
     pub unreadable_patch_body_next: bool,
-    /// How many requests the issues-LIST endpoint (not a single-issue GET)
-    /// has answered so far, this fake's lifetime.
+    /// How many requests for a list of issues — the REST list endpoint or
+    /// GraphQL's `issues` connection, not a single-issue GET — the fake has
+    /// answered so far, this fake's lifetime.
     pub list_issue_requests: u32,
     /// (request number, issue number): right before answering that request
-    /// to the issues list, mark that issue `gone` — simulating the filtered
-    /// set changing while a multi-page read is under way (spec §3.7). Counts
-    /// every list request across every `list()` call, both passes. One-shot.
+    /// for a list of issues, mark that issue `gone` — simulating the
+    /// filtered set changing while a multi-page read is under way (spec
+    /// §3.7). Counts every list request, REST and GraphQL. One-shot.
     pub vanish_after_list_request: Option<(u32, u64)>,
+    /// GitHub's REST issue list lags a create. Measured live on 2026-10-05
+    /// against a private repository: `GET /repos/o/r/issues?labels=…`
+    /// left a new issue out for 31–93 s, once for more than 180 s, while
+    /// GraphQL's `issues` connection showed it within 1 s (5 of 5). While
+    /// this is set, every issue created is left out of the REST list for
+    /// good; GraphQL is not affected. A setting, not one-shot.
+    pub rest_list_lags: bool,
+    /// The GraphQL `issues` request that follows this many more answers
+    /// 502; `Some(0)` is the next one. Lets a test fail a later page of one
+    /// list. One-shot.
+    pub fail_issues_query_after: Option<u32>,
+    /// The next GraphQL `issues` request answers 200 with a `repository`
+    /// that holds no `issues` connection. One-shot.
+    pub issues_query_without_connection_next: bool,
     /// GitHub's timeline lags a write: an event made by a request stays
     /// out of that issue's timeline for this many timeline reads after it.
     /// Measured live: a create's `labeled` events appeared 1.5-3.5 s after
@@ -135,10 +157,9 @@ pub struct State {
     /// Edit id → edit-history reads left before it shows.
     pub(crate) edit_lag_left: BTreeMap<String, u32>,
     /// This issue exists (and a direct `GET` of it succeeds), but every
-    /// issues-LIST answer omits it — simulating GitHub's list index lagging
-    /// a create indefinitely, so a create-key search can never find it. Not
-    /// one-shot: the point is that every one of the search's attempts
-    /// misses, not just the first.
+    /// list of issues — REST and GraphQL — omits it, so a create-key search
+    /// can never find it. Not one-shot: the point is that every one of the
+    /// search's attempts misses, not just the first.
     pub omit_from_list: Option<u64>,
     /// The create lands and its answer's status line and headers arrive
     /// (201), but its body breaks off partway, so it cannot be read in
@@ -476,6 +497,7 @@ impl FakeGithub {
             labels: labels.iter().map(|l| l.to_string()).collect(),
             state: "open".into(),
             pull_request,
+            created_ms: now_ms(),
             ..Issue::default()
         };
         s.issues.insert(n, issue);
@@ -793,6 +815,131 @@ fn add_comment(i: &mut Issue, body: &str, by: String) -> Answer {
     answer(201, json!({"id": i.comments.len()}))
 }
 
+/// The fake's clock: milliseconds after the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `createdAt` as GitHub's GraphQL spells it: RFC 3339, UTC, to the second.
+fn created_at(ms: u64) -> String {
+    let at = fl_core::At::from_unix_millis(ms);
+    format!("{}Z", &at.as_str()[..19])
+}
+
+/// Where an issue sorts by creation, and what a cursor names: the fake's
+/// cursor is `{created_ms}:{number}`, a position, never an offset.
+fn sort_key(i: &Issue) -> (u64, u64) {
+    (i.created_ms, i.number)
+}
+
+/// One page of GraphQL's `repository.issues` connection (spec §3.7): label
+/// filter, `orderBy: {field: CREATED_AT, direction: $direction}`, and
+/// `after: $cursor` with a real `pageInfo`. The page size is `max_per_page`
+/// (0 = 100), whatever `first` asks.
+///
+/// ⚠ Modelled: the connection lists issues only, never a pull request
+/// (GitHub's schema keeps those in `pullRequests`); its cursor names the
+/// last issue served, so an issue leaving the filtered set cannot shift
+/// another across a page boundary; and its `labels` filter matches an issue
+/// carrying ANY of the labels given (a reading of reports, not of GitHub's
+/// docs, which do not say). fl filters by one label, so OR and AND agree.
+/// Unmeasured; no live test checks the cursor or the filter yet.
+fn issues_page(s: &mut State, vars: &Value) -> Answer {
+    s.list_issue_requests += 1;
+    if let Some((request, issue)) = s.vanish_after_list_request
+        && s.list_issue_requests == request
+    {
+        s.vanish_after_list_request = None;
+        if let Some(i) = s.issues.get_mut(&issue) {
+            i.gone = true;
+        }
+    }
+    match s.fail_issues_query_after {
+        Some(0) => {
+            s.fail_issues_query_after = None;
+            return answer(502, json!({"message": "fake issues page failure"}));
+        }
+        Some(n) => s.fail_issues_query_after = Some(n - 1),
+        None => {}
+    }
+    if std::mem::take(&mut s.issues_query_without_connection_next) {
+        return answer(200, json!({"data": {"repository": {}}}));
+    }
+    let known = match (vars["owner"].as_str(), vars["name"].as_str()) {
+        (Some(o), Some(n)) => s.is_bound(o, n),
+        _ => false,
+    };
+    if !known {
+        return answer(
+            200,
+            json!({"data": {"repository": null}, "errors": [{"type": "NOT_FOUND"}]}),
+        );
+    }
+    let want = str_list(&vars["labels"]);
+    let newest_first = vars["direction"].as_str() == Some("DESC");
+    let after = vars["after"].as_str().map(|c| {
+        let (ms, n) = c.split_once(':').unwrap_or(("0", "0"));
+        (ms.parse().unwrap_or(0), n.parse().unwrap_or(0))
+    });
+    let mut items: Vec<&Issue> = s
+        .issues
+        .values()
+        .filter(|i| !i.gone && i.moved_to.is_none() && !i.pull_request)
+        .filter(|i| s.omit_from_list != Some(i.number))
+        .filter(|i| want.is_empty() || want.iter().any(|w| i.labels.contains(w)))
+        .collect();
+    items.sort_by_key(|i| sort_key(i));
+    if newest_first {
+        items.reverse();
+    }
+    if let Some(cursor) = after {
+        items.retain(|i| {
+            if newest_first {
+                sort_key(i) < cursor
+            } else {
+                sort_key(i) > cursor
+            }
+        });
+    }
+    let size = if s.max_per_page == 0 {
+        100
+    } else {
+        s.max_per_page
+    };
+    let page: Vec<&Issue> = items.iter().take(size).copied().collect();
+    let end = page
+        .last()
+        .map(|i| format!("{}:{}", i.created_ms, i.number));
+    let nodes: Vec<Value> = page
+        .iter()
+        .map(|i| {
+            json!({
+                "number": i.number,
+                "id": i.node_id,
+                "url": format!("https://github.com/{}/issues/{}", s.bound().full_name, i.number),
+                "title": i.title,
+                "body": i.body,
+                "state": i.state.to_ascii_uppercase(),
+                "stateReason": i.state_reason.as_deref().map(str::to_ascii_uppercase),
+                "createdAt": created_at(i.created_ms),
+                "labels": {
+                    "totalCount": i.labels.len(),
+                    "nodes": i.labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
+                },
+            })
+        })
+        .collect();
+    answer(
+        200,
+        json!({"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": items.len() > size, "endCursor": end},
+            "nodes": nodes,
+        }}}}),
+    )
+}
+
 /// Every route the fake serves. Later tasks add arms above the final `_`.
 pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &str) -> Answer {
     s.requests.push(format!("{method} {url}"));
@@ -1010,6 +1157,8 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 labels,
                 state: "open".into(),
                 events,
+                created_ms: now_ms(),
+                rest_list_hidden: s.rest_list_lags,
                 ..Issue::default()
             };
             s.issues.insert(n, issue);
@@ -1058,6 +1207,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 .values()
                 .filter(|i| !i.gone && i.moved_to.is_none())
                 .filter(|i| s.omit_from_list != Some(i.number))
+                .filter(|i| !i.rest_list_hidden)
                 .filter(|i| want.iter().all(|w| i.labels.contains(w)))
                 .map(|i| s.issue_json(i))
                 .collect();
@@ -1342,6 +1492,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     200,
                     json!({"data": {"repository": {"issue": {"userContentEdits": {"totalCount": total, "nodes": nodes}}}}}),
                 );
+            }
+            if query.contains("issues(") {
+                return issues_page(s, &v["variables"]);
             }
             let id = v
                 .pointer("/variables/id")
