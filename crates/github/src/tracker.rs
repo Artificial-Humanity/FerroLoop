@@ -118,9 +118,57 @@ fn created_at(node: &Value) -> Result<At, StoreError> {
     })
 }
 
+/// One state-changing timeline event: its kind and, for a label event,
+/// the label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Event {
+    id: u64,
+    kind: String,
+    label: Option<String>,
+}
+
+/// The events of a whole timeline (oldest first) that can record a change.
+/// ⚠ A `labeled` event for a label already on the issue is dropped as noise.
+/// Measured live on 2026-10-05: GitHub sometimes records a `labeled` event a
+/// second time, about 0-1 s after the first (4 of 10 calls that added two
+/// labels; 2 of 33 issues fl created adding one label per call), and
+/// re-adding a label the issue already carries records no event at all. So
+/// such an event cannot be anyone's write. Which labels are on the issue is
+/// replayed from the timeline itself, from none: never from an issue fl
+/// read, which can already hold a label someone added inside the window.
+/// An `unlabeled` event, and every other kind, is always kept.
+/// ⚠ Modelled: the timeline records every label change of the issue, in
+/// order. A label deleted from the repository leaves its issues with no
+/// `unlabeled` event (unmeasured); a later `labeled` event for it would
+/// then be taken for noise.
+fn changes(events: &[Event]) -> Vec<&Event> {
+    let mut on = BTreeSet::new();
+    events
+        .iter()
+        .filter(|e| match (e.kind.as_str(), &e.label) {
+            ("labeled", Some(l)) => on.insert(l.clone()),
+            ("unlabeled", Some(l)) => {
+                on.remove(l);
+                true
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// The changes `after` shows that `before` did not, in timeline order.
+fn new_changes<'a>(before: &Window, after: &'a Window) -> Vec<&'a Event> {
+    let old: BTreeSet<u64> = before.events.iter().map(|e| e.id).collect();
+    changes(&after.events)
+        .into_iter()
+        .filter(|e| !old.contains(&e.id))
+        .collect()
+}
+
 /// What GitHub has recorded about an issue's changes at one moment.
 struct Window {
-    events: BTreeMap<u64, String>,
+    /// The state-changing events, in timeline order.
+    events: Vec<Event>,
     edits: BTreeSet<String>,
     /// The edit history's `totalCount`, which does not depend on the order
     /// GitHub lists the entries in.
@@ -880,7 +928,7 @@ impl GithubTracker {
             ));
         }
         let issue = self.label_created(issue, &labels)?;
-        self.await_create_events(issue.number, labels.len());
+        self.await_create_events(issue.number, &labels);
         self.kinds.borrow_mut().insert(issue.number, kind);
         self.remember(issue.number, meta, prose, title);
         Ok(issue)
@@ -1238,8 +1286,8 @@ impl GithubTracker {
 
     /// The issue's state-changing timeline events, by id. ⚠ Never
     /// `remember`s: it reads no item.
-    fn state_events(&self, n: u64) -> Result<BTreeMap<u64, String>, StoreError> {
-        let mut events = BTreeMap::new();
+    fn state_events(&self, n: u64) -> Result<Vec<Event>, StoreError> {
+        let mut events = Vec::new();
         for e in self
             .client
             .get_all(&self.path(&format!("/issues/{n}/timeline?per_page=100")))?
@@ -1261,7 +1309,26 @@ impl GithubTracker {
                      write; retry"
                 ))
             })?;
-            events.insert(id, kind.to_string());
+            // ⚠ A label event without its label cannot be told from noise.
+            let label = match kind {
+                "labeled" | "unlabeled" => Some(
+                    e.pointer("/label/name")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            backend(format!(
+                                "a `{kind}` event on issue {n} names no label, so fl cannot \
+                                 tell whether it changed the issue; retry"
+                            ))
+                        })?,
+                ),
+                _ => None,
+            };
+            events.push(Event {
+                id,
+                kind: kind.to_string(),
+                label,
+            });
         }
         Ok(events)
     }
@@ -1360,10 +1427,8 @@ impl GithubTracker {
             edits: own_edits,
         } = own_write(before, old, new);
         let mut foreign = Vec::new();
-        for (eid, kind) in &after.events {
-            if before.events.contains_key(eid) {
-                continue;
-            }
+        for e in new_changes(before, after) {
+            let kind = &e.kind;
             match expected.get_mut(kind.as_str()) {
                 Some(left) if *left > 0 => *left -= 1,
                 _ => foreign.push(format!("a `{kind}` event")),
@@ -1435,17 +1500,26 @@ impl GithubTracker {
     /// ⚠ Never an error: the issue exists by now, and `add_record` mints a
     /// new create key on every call, so an error here would invite a retry
     /// that makes a DUPLICATE. A failed read ends the wait like a timeout.
-    /// ⚠ Counts every `labeled` event, not the create's own labels: one added
-    /// by someone else can stand in for a lagging one of fl's, which then
-    /// lands in the next write's window — a conflict, the safe side.
-    fn await_create_events(&self, n: u64, labels: usize) {
+    /// ⚠ Waits for the labels themselves, as the timeline's changes add
+    /// them (`changes`): a `labeled` event that is noise never ends the wait.
+    fn await_create_events(&self, n: u64, labels: &[String]) {
         let start = std::time::Instant::now();
         loop {
             let Ok(events) = self.state_events(n) else {
                 return;
             };
-            let shown = events.values().filter(|k| *k == "labeled").count();
-            if shown >= labels || start.elapsed() >= self.visible_within {
+            let mut on = BTreeSet::new();
+            for e in changes(&events) {
+                if let Some(l) = &e.label {
+                    if e.kind == "labeled" {
+                        on.insert(l.as_str());
+                    } else {
+                        on.remove(l.as_str());
+                    }
+                }
+            }
+            let shown = labels.iter().all(|l| on.contains(l.as_str()));
+            if shown || start.elapsed() >= self.visible_within {
                 return;
             }
             std::thread::sleep(self.poll);
@@ -1982,10 +2056,8 @@ fn new_edits(before: &Window, after: &Window) -> Option<usize> {
 /// shrunken history counts as shown, so `check_window` reports it.
 fn shows(before: &Window, after: &Window, own: &Own) -> bool {
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    for (eid, kind) in &after.events {
-        if !before.events.contains_key(eid) {
-            *seen.entry(kind.as_str()).or_default() += 1;
-        }
+    for e in new_changes(before, after) {
+        *seen.entry(e.kind.as_str()).or_default() += 1;
     }
     own.events
         .iter()
@@ -1997,7 +2069,7 @@ fn shows(before: &Window, after: &Window, own: &Own) -> bool {
 mod tests {
     use super::*;
     use crate::creds::EnvToken;
-    use crate::fake::FakeGithub;
+    use crate::fake::{Copies, FakeGithub};
     use fl_core::MemStore;
     use fl_core::ids::seq_iri;
     use std::time::Duration;
@@ -2826,25 +2898,129 @@ mod tests {
         assert_eq!(t.list_records(&p()).unwrap().len(), 1);
     }
 
-    /// Measured live on 2026-10-05: two labels added in one call doubled
-    /// each `labeled` event, about 0-1 s apart, in 4 of 10 calls; one label
-    /// per call never did (0 of 14). A late second pair lands in the next
-    /// update's window and reads as someone else's, so fl adds one label
-    /// per call.
+    /// Measured live on 2026-10-05: GitHub sometimes records a `labeled`
+    /// event twice, about 0-1 s apart (4 of 10 two-label calls; 2 of 33
+    /// issues fl created, one label per call). Re-adding a label the issue
+    /// already carries makes no event, so a `labeled` event for a label
+    /// already on the issue cannot be anyone's write: it is not counted.
+    /// Here the copies of a create's two events land in the next update's
+    /// window.
     #[test]
-    fn a_create_adds_one_label_per_call_so_no_doubled_event_reaches_the_next_update() {
+    fn a_create_whose_label_events_github_records_twice_is_not_followed_by_a_conflict() {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake).with_visibility(Duration::from_millis(50), Duration::from_millis(5));
-        fake.state().multi_label_add_doubles = true;
+        fake.state().labeled_copies = Some(Copies::Held);
         let r = t.add_record(&p(), "t").unwrap();
+        fake.state().labeled_copies = None;
         t.set_record_state(&r, State::Doing).unwrap();
-        let label_calls = fake
-            .state()
-            .requests
-            .iter()
-            .filter(|q| *q == "POST /repos/acme/widgets/issues/1/labels")
-            .count();
-        assert_eq!(label_calls, 2, "one call per label");
+        t.set_record_state(&r, State::Review).unwrap();
+    }
+
+    /// The same for an update's own `labeled` event, recorded again in the
+    /// next update's window.
+    #[test]
+    fn an_updates_label_event_recorded_twice_is_not_a_conflict_in_the_next_window() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().labeled_copies = Some(Copies::Held);
+        t.set_record_state(&r, State::Doing).unwrap();
+        fake.state().labeled_copies = None;
+        t.set_record_state(&r, State::Review).unwrap();
+    }
+
+    /// A copy of fl's own `labeled` event in the same window, before or
+    /// after it, is one change, not two.
+    #[test]
+    fn a_copy_of_fls_own_label_event_in_its_window_is_not_a_conflict() {
+        for copies in [Copies::Before, Copies::After] {
+            let fake = FakeGithub::start("acme/widgets");
+            let t = open(&fake);
+            let r = t.add_record(&p(), "t").unwrap();
+            fake.state().labeled_copies = Some(copies);
+            t.set_record_state(&r, State::Doing)
+                .unwrap_or_else(|e| panic!("{copies:?}: {e}"));
+            fake.state().labeled_copies = None;
+            t.set_record_state(&r, State::Review)
+                .unwrap_or_else(|e| panic!("{copies:?}: {e}"));
+        }
+    }
+
+    /// A repair that adds two labels at once, whose events GitHub records
+    /// twice, followed at once by an update: the copies land in the
+    /// update's window and are not counted.
+    #[test]
+    fn an_update_right_after_a_two_label_repair_is_not_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels = vec!["bug".into()]);
+        fake.state().labeled_copies = Some(Copies::Held);
+        assert!(t.repair(r.iri(), "owner").unwrap().changed);
+        fake.state().labeled_copies = None;
+        t.set_record_state(&r, State::Doing).unwrap();
+    }
+
+    /// A copy of an earlier `labeled` event must not stand in for fl's own,
+    /// lagging one: if the wait ended on the copy, fl's own events would
+    /// land in the next write's window as someone else's.
+    #[test]
+    fn a_copy_of_an_earlier_label_event_does_not_end_the_wait_for_fls_own() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().labeled_copies = Some(Copies::Held);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().labeled_copies = None;
+        fake.web_edit(1, |i| i.labels = vec![]);
+        // The repair's own two `labeled` events lag two timeline reads; the
+        // create's held copies show at once.
+        fake.state().timeline_lag_reads = 2;
+        assert!(t.repair(r.iri(), "owner").unwrap().changed);
+        fake.state().timeline_lag_reads = 0;
+        t.set_record_state(&r, State::Doing).unwrap();
+    }
+
+    /// Removing a label is never noise: someone else's removal inside fl's
+    /// window is a conflict.
+    #[test]
+    fn a_foreign_label_removal_inside_fls_write_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels.push("bug".into()));
+        fake.state().foreign_label_changes_on_next_patch = vec![("unlabeled".into(), "bug".into())];
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// A label removed and added back inside fl's window leaves the labels
+    /// as they were, but the removal is someone else's write.
+    #[test]
+    fn a_foreign_label_removed_and_added_back_inside_fls_write_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels.push("bug".into()));
+        fake.state().foreign_label_changes_on_next_patch = vec![
+            ("unlabeled".into(), "bug".into()),
+            ("labeled".into(), "bug".into()),
+        ];
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// A label someone adds after fl's window opens, before fl reads the
+    /// issue inside it, is in the issue fl writes from. Its event is still
+    /// a change: whether a `labeled` event is noise is read from the
+    /// timeline, never from the issue fl read.
+    #[test]
+    fn a_label_added_just_after_fls_window_opens_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().foreign_label_after_next_timeline = true;
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
     }
 
     /// An update's own events can lag too: unless it waits for them, they
@@ -3722,6 +3898,40 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("has no id") && msg.contains("retry"), "{msg}");
+        // A label event that names no label cannot be told from noise.
+        fake.state().odd_timeline_item_next = Some(json!({"id": 98, "event": "unlabeled"}));
+        let msg = t
+            .set_record_state(&r, State::Doing)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("names no label") && msg.contains("retry"),
+            "{msg}"
+        );
+    }
+
+    /// The replay behind the conflict window: a `labeled` event for a
+    /// label already on the issue is dropped, by the labels the timeline
+    /// itself has added and removed; every other event is kept.
+    #[test]
+    fn a_labeled_event_for_a_label_already_on_is_dropped_and_nothing_else_is() {
+        let ev = |id: u64, kind: &str, label: Option<&str>| Event {
+            id,
+            kind: kind.into(),
+            label: label.map(str::to_string),
+        };
+        let events = vec![
+            ev(1, "labeled", Some("a")),
+            ev(2, "labeled", Some("a")),
+            ev(3, "labeled", Some("b")),
+            ev(4, "unlabeled", Some("a")),
+            ev(5, "unlabeled", Some("a")),
+            ev(6, "labeled", Some("a")),
+            ev(7, "closed", None),
+            ev(8, "labeled", Some("b")),
+        ];
+        let kept: Vec<u64> = changes(&events).iter().map(|e| e.id).collect();
+        assert_eq!(kept, [1, 3, 4, 5, 6, 7]);
     }
 
     fn raise_security(t: &GithubTracker) -> Result<FindingId, StoreError> {
