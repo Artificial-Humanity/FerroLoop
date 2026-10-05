@@ -53,6 +53,11 @@ enum Landed {
 /// JSON, or broke off), may hide a commit that landed. Confirmed by live
 /// test `create_commit_on_branch_is_refused_when_the_head_moved`.
 ///
+/// ⚠ Measured live on 2026-10-05 (`two_flushes_racing_both_land`): a race
+/// lost while GitHub moves the branch is refused with an error of type
+/// `FORBIDDEN` whose message says the branch "is at" one commit "but
+/// expected" another. That is a moved head, not a missing permission.
+///
 /// ⚠ Modelled: a missing permission can come back as a 200 carrying an
 /// error of type `FORBIDDEN` rather than as a 403 naming it — refused, and
 /// named (spec §6.3). Confirmed by live test
@@ -89,11 +94,14 @@ fn judge(answer: GraphqlAnswer) -> Result<Landed, StoreError> {
         }
     }
     if !answer.errors.is_empty() {
+        // ⚠ Checked before FORBIDDEN below: a race lost while GitHub moves
+        // the branch is FORBIDDEN too, and is a moved head.
         let moved = answer.errors.iter().any(|e| {
             e.get("type").and_then(Value::as_str) == Some("STALE_DATA")
-                || e.get("message")
-                    .and_then(Value::as_str)
-                    .is_some_and(|m| m.contains("Expected branch to point to"))
+                || e.get("message").and_then(Value::as_str).is_some_and(|m| {
+                    m.contains("Expected branch to point to")
+                        || (m.contains("is at ") && m.contains(" but expected "))
+                })
         });
         if moved {
             return Ok(Landed::HeadMoved);
@@ -495,6 +503,30 @@ mod tests {
         fake.state()
             .foreign_appends
             .push((layout::segment_path(&runs_dir(), 1), theirs));
+        let c = client(&fake);
+        let l = open(&c, &local);
+        l.publish(&batch(1, vec![run(1)], vec![])).unwrap();
+        assert_eq!(
+            l.runs(&gate()).unwrap(),
+            vec![run(5), run(1)],
+            "theirs, then mine; each once"
+        );
+        assert_eq!(fake.ledger_commits(), 3, "the start, theirs, mine");
+    }
+
+    // ⚠ The same invariant when GitHub reports the lost race as FORBIDDEN,
+    // the shape measured live on 2026-10-05: it is a moved head, never a
+    // missing permission.
+    #[test]
+    fn a_race_lost_as_forbidden_is_read_again_and_lands() {
+        let (fake, local, _root) = world();
+        let theirs = Line::Run(run(5)).encode("another-machine");
+        {
+            let mut s = fake.state();
+            s.foreign_appends
+                .push((layout::segment_path(&runs_dir(), 1), theirs));
+            s.lose_next_race_as_forbidden = true;
+        }
         let c = client(&fake);
         let l = open(&c, &local);
         l.publish(&batch(1, vec![run(1)], vec![])).unwrap();
@@ -1166,6 +1198,13 @@ mod tests {
         for e in [
             json!({"type": "STALE_DATA"}),
             json!({"message": "Expected branch to point to \"c0\" but it did not."}),
+            // Measured live on 2026-10-05: a race lost while GitHub moves
+            // the branch comes back as FORBIDDEN, not as STALE_DATA.
+            json!({
+                "type": "FORBIDDEN",
+                "path": ["createCommitOnBranch"],
+                "message": "is at c2 but expected c0",
+            }),
         ] {
             assert_eq!(
                 judge(answer(200, None, vec![e])).unwrap(),

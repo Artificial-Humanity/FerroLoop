@@ -241,6 +241,11 @@ pub struct State {
     /// ⚠ Modelled — confirmed by live test
     /// `create_commit_on_branch_without_contents_write_is_refused`.
     pub refuse_next_commit_as_forbidden: bool,
+    /// The next ledger commit refused for a moved head answers with a
+    /// GraphQL error of type FORBIDDEN saying where the branch is, rather
+    /// than STALE_DATA — the shape a race lost while GitHub moves the
+    /// branch takes. One-shot. Measured live on 2026-10-05.
+    pub lose_next_race_as_forbidden: bool,
     /// The next ledger commit lands, then answers 200 with a body that is
     /// not JSON. One-shot.
     pub garble_next_commit_answer: bool,

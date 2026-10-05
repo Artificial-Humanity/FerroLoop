@@ -807,6 +807,18 @@ fn append(s: &mut State, vars: &Value) -> Answer {
     let head = s.git.head(&branch).expect("checked above");
     let expected = input["expectedHeadOid"].as_str().unwrap_or("");
     if expected != head {
+        if std::mem::take(&mut s.lose_next_race_as_forbidden) {
+            return answer(
+                200,
+                json!({
+                    "data": {"createCommitOnBranch": null},
+                    "errors": [{
+                        "type": "FORBIDDEN", "path": ["createCommitOnBranch"],
+                        "message": format!("is at {head} but expected {expected}"),
+                    }],
+                }),
+            );
+        }
         return answer(
             200,
             json!({
