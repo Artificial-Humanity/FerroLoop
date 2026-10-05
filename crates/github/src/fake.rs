@@ -170,6 +170,16 @@ pub struct State {
     /// The next `POST /issues/{n}/labels` answers 500 and adds nothing.
     /// One-shot.
     pub fail_label_add_next: bool,
+    /// The label add that follows this many more answers 500 and adds
+    /// nothing; `Some(0)` is the next one. One-shot.
+    pub fail_label_add_after: Option<u32>,
+    /// Adding two or more labels in one call records each `labeled` event
+    /// twice. Measured live on 2026-10-05 (plain `gh api`): two labels in
+    /// one `POST /issues/{n}/labels` or one `PATCH` doubled every event,
+    /// about 0-1 s apart, in 4 of 10 calls; one label per call never did
+    /// (0 of 14). Modelled here as: the second copy is held back until the
+    /// issue's next PATCH, whose window it then lands in. A setting.
+    pub multi_label_add_doubles: bool,
     /// GitHub's timeline lags a write: an event made by a request stays
     /// out of that issue's timeline for this many timeline reads after it.
     /// Measured live on 2026-10-05: the `labeled` events of labels added
@@ -1345,6 +1355,14 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             if std::mem::take(&mut s.fail_label_add_next) {
                 return answer(500, json!({"message": "fake label failure"}));
             }
+            match s.fail_label_add_after {
+                Some(0) => {
+                    s.fail_label_add_after = None;
+                    return answer(500, json!({"message": "fake label failure"}));
+                }
+                Some(k) => s.fail_label_add_after = Some(k - 1),
+                None => {}
+            }
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let Some(n) = n.parse::<u64>().ok().filter(|n| s.issues.contains_key(n)) else {
                 return answer(404, json!({"message": "Not Found"}));
@@ -1360,12 +1378,18 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     }
                 }
             }
+            let doubles = s.multi_label_add_doubles && added.len() > 1;
             for l in added {
                 s.labels.insert(l.clone());
                 let e = s.tick();
                 let i = s.issues.get_mut(&n).unwrap();
                 i.labels.push(l);
                 i.events.push((e, "labeled".into()));
+                if doubles {
+                    let again = s.tick();
+                    let i = s.issues.get_mut(&n).unwrap();
+                    i.held_events.push((again, "labeled".into()));
+                }
             }
             let names: Vec<Value> = s.issues[&n]
                 .labels
