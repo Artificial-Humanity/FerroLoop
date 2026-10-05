@@ -83,6 +83,17 @@ enum Order {
 /// cannot be older than the attempt by more than the skew.
 const CREATE_SEARCH_MARGIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
+/// Issues per page of a list filtered by an fl label: GitHub's largest.
+const LIST_PAGE: u64 = 100;
+
+/// Issues per page of the create-key search, which reads every issue —
+/// fl's or not — with its whole body. Small, so a page of large bodies
+/// stays under the client's limit on an answer's size (ureq reads at most
+/// 10 MB; GitHub allows a body of 65,536 characters, which JSON escaping
+/// can make several times longer). The search usually stops within its
+/// first page.
+const SEARCH_PAGE: u64 = 25;
+
 /// This machine's clock, in milliseconds after the Unix epoch.
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
@@ -421,8 +432,9 @@ impl GithubTracker {
 
     /// Every issue carrying `label` (every issue, for `None`), read from
     /// GraphQL's `issues` connection a page at a time in `order`, each node
-    /// handed to `each` until it answers `false` (spec §3.7). Each node is
-    /// one `IssueView::from_graphql` reads, plus `createdAt`.
+    /// handed to `each` until it answers `false` (spec §3.7), `page` issues
+    /// to a page. Each node is one `IssueView::from_graphql` reads, plus
+    /// `createdAt`.
     ///
     /// ⚠ GraphQL, never the REST issue list. Measured live on 2026-10-05:
     /// the REST list left a new issue out for 31-93 s (once more than
@@ -437,6 +449,7 @@ impl GithubTracker {
         &self,
         label: Option<&str>,
         order: Order,
+        page: u64,
         mut each: impl FnMut(&Value) -> Result<bool, StoreError>,
     ) -> Result<(), StoreError> {
         let (owner, name) = self
@@ -451,9 +464,9 @@ impl GithubTracker {
             None => ("", ""),
         };
         let query = format!(
-            "query($owner: String!, $name: String!, $after: String, $direction: \
+            "query($owner: String!, $name: String!, $first: Int!, $after: String, $direction: \
              OrderDirection!{declared}) {{ repository(owner: $owner, name: $name) {{ \
-             issues({filter}states: [OPEN, CLOSED], first: 100, after: $after, orderBy: \
+             issues({filter}states: [OPEN, CLOSED], first: $first, after: $after, orderBy: \
              {{field: CREATED_AT, direction: $direction}}) {{ pageInfo {{ hasNextPage \
              endCursor }} nodes {{ number id url title body state stateReason createdAt \
              labels(first: 100) {{ totalCount nodes {{ name }} }} }} }} }} }}"
@@ -465,8 +478,8 @@ impl GithubTracker {
         let what = label.map_or_else(|| "the full".to_string(), |l| format!("the `{l}`"));
         let mut after: Option<String> = None;
         loop {
-            let mut vars = json!({"owner": owner, "name": name, "after": after,
-                                  "direction": direction});
+            let mut vars = json!({"owner": owner, "name": name, "first": page,
+                                  "after": after, "direction": direction});
             if let Some(l) = label {
                 vars["labels"] = json!([l]);
             }
@@ -691,7 +704,7 @@ impl GithubTracker {
         // not of GitHub's own docs; unmeasured; no live test checks it yet.
         // Oldest first, so an issue created mid-read lands on the last page.
         let mut raw = Vec::new();
-        self.each_issue(Some(&label), Order::OldestFirst, |node| {
+        self.each_issue(Some(&label), Order::OldestFirst, LIST_PAGE, |node| {
             raw.push(IssueView::from_graphql(node)?);
             Ok(true)
         })?;
@@ -1057,7 +1070,7 @@ impl GithubTracker {
         let since =
             At::from_unix_millis(started.saturating_sub(CREATE_SEARCH_MARGIN.as_millis() as u64));
         let mut found = None;
-        self.each_issue(None, Order::NewestFirst, |node| {
+        self.each_issue(None, Order::NewestFirst, SEARCH_PAGE, |node| {
             if created_at(node)? < since {
                 return Ok(false);
             }
@@ -2147,6 +2160,22 @@ mod tests {
             3,
             "three searches of one page each"
         );
+    }
+
+    /// The create-key search reads every issue, fl's or not, with whole
+    /// bodies: small pages, so a page of large bodies stays under the
+    /// client's answer-size limit (it usually needs one page). A list,
+    /// filtered to fl's issues, reads a hundred to a page.
+    #[test]
+    fn the_create_key_search_reads_small_pages_and_a_list_full_ones() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().hang_up_after_create = true;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.state().issues_firsts, vec![Some(25)]);
+        fake.state().issues_firsts.clear();
+        t.list_records(&p()).unwrap();
+        assert_eq!(fake.state().issues_firsts, vec![Some(100)]);
     }
 
     /// GitHub's clock may run behind this machine's, so an issue the

@@ -149,6 +149,8 @@ pub struct State {
     /// fake answers 502, so a reader that never stops still ends. A
     /// setting.
     pub issues_cursor_stuck: bool,
+    /// The `first` each GraphQL `issues` request asked for, in order.
+    pub issues_firsts: Vec<Option<u64>>,
     /// GraphQL `issues` pages served under `issues_cursor_stuck`.
     pub(crate) stuck_pages: u32,
     /// The next GraphQL `issues` page is empty and says another follows.
@@ -874,8 +876,8 @@ fn sort_key(i: &Issue) -> (u64, u64) {
 
 /// One page of GraphQL's `repository.issues` connection (spec §3.7): label
 /// filter, `orderBy: {field: CREATED_AT, direction: $direction}`, and
-/// `after: $cursor` with a real `pageInfo`. The page size is `max_per_page`
-/// (0 = 100), whatever `first` asks.
+/// `after: $cursor` with a real `pageInfo`. The page size is `first`, at
+/// most `max_per_page` (0 = 100).
 ///
 /// ⚠ Modelled: the connection lists issues only, never a pull request
 /// (GitHub's schema keeps those in `pullRequests`); its cursor names the
@@ -886,6 +888,8 @@ fn sort_key(i: &Issue) -> (u64, u64) {
 /// Unmeasured; no live test checks the cursor or the filter yet.
 fn issues_page(s: &mut State, vars: &Value) -> Answer {
     s.list_issue_requests += 1;
+    let first = vars["first"].as_u64();
+    s.issues_firsts.push(first);
     if let Some((request, issue)) = s.vanish_after_list_request
         && s.list_issue_requests == request
     {
@@ -956,11 +960,12 @@ fn issues_page(s: &mut State, vars: &Value) -> Answer {
             }
         });
     }
-    let size = if s.max_per_page == 0 {
+    let cap = if s.max_per_page == 0 {
         100
     } else {
         s.max_per_page
     };
+    let size = first.map_or(cap, |f| (f as usize).min(cap)).max(1);
     let page: Vec<&Issue> = items.iter().take(size).copied().collect();
     let end = page
         .last()
