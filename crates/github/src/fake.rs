@@ -54,6 +54,10 @@ pub struct Issue {
     /// Created while `rest_list_lags` was set: the REST issue list leaves
     /// it out.
     pub rest_list_hidden: bool,
+    /// `labeled` events of labels set in the create while
+    /// `creation_labels_late` was set: they join `events` at the issue's
+    /// next PATCH.
+    pub held_events: Vec<(u64, String)>,
 }
 
 /// Everything the fake holds, and the knobs a test turns. Every knob is
@@ -143,11 +147,24 @@ pub struct State {
     /// GitHub's clock runs this many milliseconds behind this machine's:
     /// an issue created now is stamped that much earlier. A setting.
     pub clock_behind_ms: u64,
+    /// Labels set IN a create (`POST /issues` with `labels`) show their
+    /// `labeled` events late. Measured live on 2026-10-05: 28-88 s after
+    /// the create, once more than 180 s, in the REST and GraphQL timelines
+    /// alike — past fl's wait, so they landed in the next update's window.
+    /// Labels added by their own call after the create showed in 1-2 s
+    /// (3 of 3). Modelled here as: held back until that issue's next PATCH,
+    /// whose window they then land in. A setting, not one-shot.
+    pub creation_labels_late: bool,
+    /// The next `POST /issues/{n}/labels` answers 500 and adds nothing.
+    /// One-shot.
+    pub fail_label_add_next: bool,
     /// GitHub's timeline lags a write: an event made by a request stays
     /// out of that issue's timeline for this many timeline reads after it.
-    /// Measured live: a create's `labeled` events appeared 1.5-3.5 s after
-    /// the create was answered. Events made during a timeline read, and by
-    /// `web_edit`, are not lagged. A setting, not one-shot.
+    /// Measured live on 2026-10-05: the `labeled` events of labels added
+    /// to a new issue by their own call appeared 1-2 s after it (labels set
+    /// in the create itself: see `creation_labels_late`). Events made
+    /// during a timeline read, and by `web_edit`, are not lagged. A
+    /// setting, not one-shot.
     pub timeline_lag_reads: u32,
     /// Event id → timeline reads left before it shows.
     pub(crate) lag_left: BTreeMap<u64, u32>,
@@ -1152,6 +1169,11 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 s.labels.insert(l.clone());
                 events.push((s.tick(), "labeled".to_string()));
             }
+            let held_events = if s.creation_labels_late {
+                std::mem::take(&mut events)
+            } else {
+                Vec::new()
+            };
             let issue = Issue {
                 number: n,
                 node_id: format!("I_{n}"),
@@ -1162,6 +1184,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 events,
                 created_ms: now_ms().saturating_sub(s.clock_behind_ms),
                 rest_list_hidden: s.rest_list_lags,
+                held_events,
                 ..Issue::default()
             };
             s.issues.insert(n, issue);
@@ -1266,6 +1289,42 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 }
             }
         }
+        // Adds labels to an issue and answers every label it now carries.
+        // `drop_labels` makes GitHub keep the old ones silently, as for a
+        // PATCH (a reading of the docs for this call; unmeasured).
+        ("POST", ["repos", o, r, "issues", n, "labels"]) if s.is_bound(o, r) => {
+            if std::mem::take(&mut s.fail_label_add_next) {
+                return answer(500, json!({"message": "fake label failure"}));
+            }
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let Some(n) = n.parse::<u64>().ok().filter(|n| s.issues.contains_key(n)) else {
+                return answer(404, json!({"message": "Not Found"}));
+            };
+            if s.issues[&n].gone {
+                return answer(410, json!({"message": "This issue was deleted"}));
+            }
+            let mut added = Vec::new();
+            if !s.drop_labels {
+                for l in str_list(&v["labels"]) {
+                    if !s.issues[&n].labels.contains(&l) {
+                        added.push(l);
+                    }
+                }
+            }
+            for l in added {
+                s.labels.insert(l.clone());
+                let e = s.tick();
+                let i = s.issues.get_mut(&n).unwrap();
+                i.labels.push(l);
+                i.events.push((e, "labeled".into()));
+            }
+            let names: Vec<Value> = s.issues[&n]
+                .labels
+                .iter()
+                .map(|l| json!({"name": l}))
+                .collect();
+            answer(200, Value::Array(names))
+        }
         ("POST", ["repos", o, r, "issues", n, "comments"]) if s.is_bound(o, r) => {
             if std::mem::take(&mut s.fail_comment_next) {
                 return answer(500, json!({"message": "fake comment failure"}));
@@ -1351,6 +1410,11 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 return answer(404, json!({"message": "Not Found"}));
             };
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            // A create's late `labeled` events land now, inside this write's
+            // window (`creation_labels_late`).
+            let i = s.issues.get_mut(&n).unwrap();
+            let held = std::mem::take(&mut i.held_events);
+            i.events.extend(held);
             // A write by someone else that lands inside fl's window.
             if std::mem::take(&mut s.foreign_label_on_next_patch) {
                 let e = s.tick();

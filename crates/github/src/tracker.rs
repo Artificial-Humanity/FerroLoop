@@ -215,17 +215,17 @@ fn read_repo(client: &Client, name: &str) -> Result<Option<(Repo, bool)>, StoreE
 }
 
 /// ⚠ The response is the postcondition (spec §3.3): GitHub silently drops
-/// labels a caller may not set, so "no error" is not "written".
+/// labels a caller may not set, so "no error" is not "written". `labels`
+/// is `None` for a create, which sends none: they are added, and checked,
+/// by their own call (`label_created`).
 fn check_written(
     back: &IssueView,
     title: &str,
-    labels: &[String],
+    labels: Option<&[String]>,
     body: &str,
     state: &str,
     reason: Option<&str>,
 ) -> Result<(), StoreError> {
-    let want: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
-    let got: BTreeSet<&str> = back.labels.iter().map(String::as_str).collect();
     let mut problems = Vec::new();
     if back.title != title {
         problems.push("the title came back different".to_string());
@@ -236,8 +236,12 @@ fn check_written(
             back.state_reason
         ));
     }
-    if want != got {
-        problems.push(format!("the labels came back as {got:?}, not {want:?}"));
+    if let Some(labels) = labels {
+        let want: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+        let got: BTreeSet<&str> = back.labels.iter().map(String::as_str).collect();
+        if want != got {
+            problems.push(format!("the labels came back as {got:?}, not {want:?}"));
+        }
     }
     if back.body.replace("\r\n", "\n") != body {
         problems.push("the body came back different".to_string());
@@ -739,7 +743,13 @@ impl GithubTracker {
         self.ensure_labels()?;
         let labels = vec![meta::kind_label(kind), meta::state_label(kind, &meta.state)];
         let body = meta::render_body(prose, meta);
-        let sent = json!({"title": title, "body": body, "labels": labels});
+        // ⚠ No labels in the create: they are added by a second call
+        // (`label_created`). Measured live on 2026-10-05: labels set in the
+        // create showed their `labeled` events 28-88 s late (once more than
+        // 180 s), past `await_create_events`, so they landed in the next
+        // update's window as a spurious conflict; labels added by their own
+        // call showed in 1-2 s (3 of 3), with nothing more after 180 s.
+        let sent = json!({"title": title, "body": body});
         let path = self.path("/issues");
         // Before the first send: the create-key search reads back to here.
         let started = now_millis();
@@ -776,11 +786,78 @@ impl GithubTracker {
             }
             Err(e) => return Err(e),
         };
-        check_written(&issue, title, &labels, &body, "open", None)?;
+        check_written(&issue, title, None, &body, "open", None)?;
+        let issue = self.label_created(issue, &labels)?;
         self.await_create_events(issue.number, labels.len());
         self.kinds.borrow_mut().insert(issue.number, kind);
         self.remember(issue.number, meta, prose, title);
         Ok(issue)
+    }
+
+    /// Add fl's `labels` to an issue fl just created without them, and check
+    /// GitHub's answer. An issue that already carries exactly them (found
+    /// by its create key, labelled before) is left as it is.
+    /// ⚠ Every error names the issue: it exists by now, perhaps without
+    /// fl's labels, and fl's lists — which filter by label — do not show it. A retry of
+    /// the create would mint a new create key and make a DUPLICATE; `fl
+    /// github repair` restores the labels from the block instead (spec
+    /// §0.1b, 14).
+    fn label_created(&self, issue: IssueView, labels: &[String]) -> Result<IssueView, StoreError> {
+        let fl_labels = |all: &[String]| -> BTreeSet<String> {
+            all.iter()
+                .filter(|l| l.starts_with("fl:"))
+                .cloned()
+                .collect()
+        };
+        let want: BTreeSet<String> = labels.iter().cloned().collect();
+        if fl_labels(&issue.labels) == want {
+            return Ok(issue);
+        }
+        let unlabelled = |why: String| {
+            backend(format!(
+                "{} was created, but {why}. It may exist without fl's labels, which fl's lists \
+                 filter by, so they do not show it. Do not create it again: `fl github repair \
+                 {} --by <name>` restores its labels from its block",
+                issue.url, issue.number
+            ))
+        };
+        let r = self
+            .client
+            .send(
+                Method::Post,
+                &self.path(&format!("/issues/{}/labels", issue.number)),
+                Some(&json!({ "labels": labels })),
+            )
+            .map_err(|e| unlabelled(format!("adding its labels failed ({e})")))?;
+        if r.status != 200 {
+            return Err(unlabelled(format!(
+                "GitHub answered {} when fl added its labels",
+                r.status
+            )));
+        }
+        let got: Vec<String> = r
+            .body
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .ok_or_else(|| {
+                unlabelled("GitHub's answer to adding its labels could not be read".into())
+            })?;
+        let applied = fl_labels(&got);
+        if applied != want {
+            return Err(unlabelled(format!(
+                "GitHub accepted its labels but did not apply them: they came back as \
+                 {applied:?}, not {want:?}. The credential may lack permission to set labels \
+                 (Issues: read and write)"
+            )));
+        }
+        Ok(IssueView {
+            labels: got,
+            ..issue
+        })
     }
 
     /// Search for a create by its key, `settle` apart, up to three times.
@@ -1019,7 +1096,7 @@ impl GithubTracker {
             )));
         }
         let back = IssueView::from_json(&r.body)?;
-        check_written(&back, &title, &labels, &body, state, reason)?;
+        check_written(&back, &title, Some(&labels), &body, state, reason)?;
         // ⚠ Measured live: the timeline and the edit history lag a write, so
         // `after` is read until it shows fl's own write (`window_after`).
         let after = self.window_after(&id, n, &before, &issue, &back)?;
@@ -1232,11 +1309,12 @@ impl GithubTracker {
         }
     }
 
-    /// After a create: wait until the timeline shows its `labeled` events,
-    /// so they do not land in the next write's window. ⚠ Measured live:
-    /// they appeared 1.5-3.5 s after GitHub answered the create. A create
-    /// whose events never show still succeeds — the create landed, and the
-    /// next write refuses as a conflict, which is the safe side.
+    /// After a create: wait until the timeline shows the `labeled` events
+    /// of the labels `label_created` added, so they do not land in the
+    /// next write's window. ⚠ Measured live on 2026-10-05: they showed
+    /// 1-2 s after the call that added them (3 of 3). A create whose events
+    /// never show still succeeds — the create landed, and the next write
+    /// refuses as a conflict, which is the safe side.
     /// ⚠ Never an error: the issue exists by now, and `add_record` mints a
     /// new create key on every call, so an error here would invite a retry
     /// that makes a DUPLICATE. A failed read ends the wait like a timeout.
@@ -1355,7 +1433,7 @@ impl GithubTracker {
             check_written(
                 &back,
                 &issue.title,
-                &labels,
+                Some(&labels),
                 &issue.body.replace("\r\n", "\n"),
                 state,
                 reason,
@@ -2432,6 +2510,76 @@ mod tests {
         t.set_record_state(&r, State::Doing).unwrap();
     }
 
+    /// Measured live on 2026-10-05: labels set IN a create show their
+    /// `labeled` events 28-88 s late, past fl's wait, so they land in the
+    /// next update's window and read as someone else's. fl creates the
+    /// issue without labels and then adds them, whose events show in 1-2 s.
+    #[test]
+    fn a_create_followed_at_once_by_an_update_is_not_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).with_visibility(Duration::from_millis(50), Duration::from_millis(5));
+        fake.state().creation_labels_late = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        t.set_record_state(&r, State::Doing).unwrap();
+        let requests = fake.state().requests.clone();
+        let created = requests
+            .iter()
+            .position(|q| q == "POST /repos/acme/widgets/issues");
+        let labelled = requests
+            .iter()
+            .position(|q| q == "POST /repos/acme/widgets/issues/1/labels");
+        assert!(
+            matches!((created, labelled), (Some(c), Some(l)) if c < l),
+            "{requests:?}"
+        );
+    }
+
+    /// A create whose answer was lost landed without labels — a create sends
+    /// none. The search finds it by its key though it carries no fl label
+    /// and the REST list lags, adds fl's labels, and never sends the create
+    /// again.
+    #[test]
+    fn a_lost_create_that_landed_without_labels_is_found_labelled_and_not_sent_again() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().rest_list_lags = true;
+        fake.state().hang_up_after_create = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
+        assert_eq!(issue_posts(&fake), 1, "sent once, never again");
+        assert_eq!(fake.issue_count(), 1);
+        assert_eq!(fake.issue(1).labels, vec!["fl:record", "fl:record/todo"]);
+        assert_eq!(t.list_records(&p()).unwrap().len(), 1);
+    }
+
+    /// The issue exists once the create is answered. When adding its labels
+    /// then fails, the error names it and the remedy — `fl github repair`,
+    /// which restores the labels from the block (spec §0.1b, 14) — and
+    /// nothing is sent again.
+    #[test]
+    fn a_create_whose_labels_fail_names_the_issue_and_repair_restores_them() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().fail_label_add_next = true;
+        let e = t.add_record(&p(), "t").unwrap_err().to_string();
+        assert!(
+            e.contains("https://github.com/acme/widgets/issues/1")
+                && e.contains("without fl's labels")
+                && e.contains("fl github repair 1"),
+            "{e}"
+        );
+        assert_eq!(fake.issue_count(), 1);
+        assert_eq!(issue_posts(&fake), 1, "never created again");
+        assert!(fake.issue(1).labels.is_empty());
+        let url = t.issue_url(1);
+        assert!(t.repair(&url, "owner").unwrap().changed);
+        assert_eq!(fake.issue(1).labels, vec!["fl:record", "fl:record/todo"]);
+        assert_eq!(
+            t.get_record(&RecordId(url)).unwrap().unwrap().state,
+            State::Todo
+        );
+    }
+
     /// An update's own events can lag too: unless it waits for them, they
     /// land in the next write's window and read as someone else's.
     #[test]
@@ -2618,13 +2766,11 @@ mod tests {
         let r = t.add_record(&p(), "t").unwrap();
         assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
         assert_eq!(fake.issue_count(), 1, "exactly one issue");
-        let posts = fake
-            .state()
-            .requests
-            .iter()
-            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
-            .count();
-        assert_eq!(posts, 2, "the first attempt and the resend, never a third");
+        assert_eq!(
+            issue_posts(&fake),
+            2,
+            "the first attempt and the resend, never a third"
+        );
     }
 
     /// The RULE — once GitHub has answered
@@ -2657,13 +2803,7 @@ mod tests {
             1,
             "the resend's own create landed even though it could not be confirmed"
         );
-        let posts = fake
-            .state()
-            .requests
-            .iter()
-            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
-            .count();
-        assert_eq!(posts, 2, "no third send");
+        assert_eq!(issue_posts(&fake), 2, "no third send");
     }
 
     /// Once a 201 proves the
@@ -2689,11 +2829,13 @@ mod tests {
         );
     }
 
+    /// Creates sent: `POST /issues` itself, not a post to one issue's
+    /// labels or comments.
     fn issue_posts(fake: &FakeGithub) -> usize {
         fake.state()
             .requests
             .iter()
-            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
+            .filter(|r| *r == "POST /repos/acme/widgets/issues")
             .count()
     }
 
