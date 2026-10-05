@@ -219,6 +219,10 @@ pub struct State {
     /// fl's window opened and before fl reads the issue inside it.
     /// One-shot.
     pub foreign_label_after_next_timeline: bool,
+    /// (label, reads): every event a request makes naming this label stays
+    /// out of the timeline for this many timeline reads — one label's event
+    /// lagging another's from the same call. A setting.
+    pub label_lag_reads: Option<(String, u32)>,
     /// Inside the next PATCH, someone else makes these label changes —
     /// (`labeled` or `unlabeled`, label) — each with its event. One-shot.
     pub foreign_label_changes_on_next_patch: Vec<(String, String)>,
@@ -1096,6 +1100,18 @@ impl State {
     /// Records an event a request made on issue `n`. A `labeled` one gets
     /// its copy under `labeled_copies`.
     fn record(&mut self, n: u64, kind: &str, label: Option<&str>) {
+        let first = self.next_event;
+        self.record_events(n, kind, label);
+        if let Some((lagged, reads)) = self.label_lag_reads.clone()
+            && label == Some(lagged.as_str())
+        {
+            for e in first..self.next_event {
+                self.lag_left.insert(e, reads);
+            }
+        }
+    }
+
+    fn record_events(&mut self, n: u64, kind: &str, label: Option<&str>) {
         let copies = if kind == "labeled" {
             self.labeled_copies
         } else {

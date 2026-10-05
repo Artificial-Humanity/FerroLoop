@@ -2964,6 +2964,22 @@ mod tests {
         t.set_record_state(&r, State::Doing).unwrap();
     }
 
+    /// The wait after a create is for its labels, not for a number of
+    /// `labeled` events: here the kind label's event shows, with a copy of
+    /// it, while the state label's lags. Ended on two events, the wait would
+    /// let the state label's event land in the next update's window.
+    #[test]
+    fn a_create_waits_for_each_of_its_labels_not_for_two_label_events() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().labeled_copies = Some(Copies::After);
+        fake.state().label_lag_reads = Some(("fl:record/todo".into(), 2));
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().labeled_copies = None;
+        fake.state().label_lag_reads = None;
+        t.set_record_state(&r, State::Doing).unwrap();
+    }
+
     /// A copy of an earlier `labeled` event must not stand in for fl's own,
     /// lagging one: if the wait ended on the copy, fl's own events would
     /// land in the next write's window as someone else's.
