@@ -305,8 +305,8 @@ fl writes it; fl never reads state from it.
   *(Release scope — measured in the live test, §8.3, before any claim about it is made.)*
 * **The timeline and the edit history lag a write.** Measured live on 2026-09-29: an update's
   events showed on the first read after it (about 0.5 s) and its edit-history entries about
-  0.5 s later. Measured live on 2026-10-05: the `labeled` event of a create's label call
-  showed 1–2 s after it. So after a create fl reads the timeline until those `labeled` events
+  0.5 s later. Measured live on 2026-10-05: the `labeled` event of a create's label call,
+  adding one label, showed 1–2 s after it (3 of 3). So after a create fl reads the timeline until those `labeled` events
   show, and after an update or a repair it reads the window until its own events and edits
   show — each for at most 10 s. A create whose events never show
   still succeeds, and the next write refuses as a conflict. An update whose write never shows

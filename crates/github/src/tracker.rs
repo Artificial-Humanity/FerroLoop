@@ -88,8 +88,8 @@ const LIST_PAGE: u64 = 100;
 
 /// Issues per page of the create-key search, which reads every issue —
 /// fl's or not — with its whole body. Small, so a page of large bodies
-/// stays under the client's limit on an answer's size (ureq reads at most
-/// 10 MB; GitHub allows a body of 65,536 characters, which JSON escaping
+/// stays under the client's limit on an answer's size (ureq's documented
+/// default reads at most 10 MB — not measured against GitHub; GitHub allows a body of 65,536 characters, which JSON escaping
 /// can make several times longer). The search usually stops within its
 /// first page.
 const SEARCH_PAGE: u64 = 25;
@@ -192,7 +192,9 @@ fn look_before_retrying(title: &str) -> String {
     format!(
         "Before retrying, look among the repository's newest issues, labelled or not, for one \
          titled {title:?}; if it is there, run `fl github repair <number> --by <name>` on it \
-         instead of creating it again, so the retry makes no duplicate"
+         instead of creating it again, so the retry makes no duplicate. GitHub's issue list can \
+         take minutes to show a new issue: if it is not there, wait a few minutes and look again \
+         before retrying"
     )
 }
 

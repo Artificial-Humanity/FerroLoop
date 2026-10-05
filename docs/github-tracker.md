@@ -310,8 +310,18 @@ consistent if it already has them. An issue fl created may have no labels yet, s
 `fl record list`, `fl finding list` and GitHub's list filtered by an `fl:` label do not show
 it. A plain retry could make a duplicate.
 
+GitHub's issue list can take minutes to show a new issue. On 2026-10-05 its REST list left a
+new issue out for 31–93 s, once for more than 180 s; that its web list lags the same way is
+inferred, not measured. If the issue is not there, wait a few minutes and look again before
+retrying.
+
 ## Limits and costs
 
+- **An update right after a repair can refuse as a conflict.** A repair writes all of an
+  issue's labels in one request. When it adds two labels at once, GitHub can record each
+  `labeled` event twice, about a second apart (measured 2026-10-05: 4 of 10 such requests), and
+  a copy that shows after the repair returns looks like someone else's change. The refusal
+  loses nothing: read the item again and retry.
 - **Rate limits are reported, not waited out.** When GitHub's limit is spent, the command
   fails, naming when it resets if GitHub said.
 - **Each update and each repair is several requests.** It reads the issue twice, and the
