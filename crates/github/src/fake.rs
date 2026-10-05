@@ -144,6 +144,16 @@ pub struct State {
     /// The next GraphQL `issues` request answers 200 with a `repository`
     /// that holds no `issues` connection. One-shot.
     pub issues_query_without_connection_next: bool,
+    /// Every GraphQL `issues` page says another follows, under the cursor
+    /// `stuck`, whatever cursor it was asked for. After 20 such pages the
+    /// fake answers 502, so a reader that never stops still ends. A
+    /// setting.
+    pub issues_cursor_stuck: bool,
+    /// GraphQL `issues` pages served under `issues_cursor_stuck`.
+    pub(crate) stuck_pages: u32,
+    /// The next GraphQL `issues` page is empty and says another follows.
+    /// One-shot.
+    pub issues_empty_page_with_more_next: bool,
     /// GitHub's clock runs this many milliseconds behind this machine's:
     /// an issue created now is stamped that much earlier. A setting.
     pub clock_behind_ms: u64,
@@ -895,6 +905,21 @@ fn issues_page(s: &mut State, vars: &Value) -> Answer {
     if std::mem::take(&mut s.issues_query_without_connection_next) {
         return answer(200, json!({"data": {"repository": {}}}));
     }
+    if std::mem::take(&mut s.issues_empty_page_with_more_next) {
+        return answer(
+            200,
+            json!({"data": {"repository": {"issues": {
+                "pageInfo": {"hasNextPage": true, "endCursor": "0:0"},
+                "nodes": [],
+            }}}}),
+        );
+    }
+    if s.issues_cursor_stuck {
+        s.stuck_pages += 1;
+        if s.stuck_pages > 20 {
+            return answer(502, json!({"message": "fake: a reader that never stops"}));
+        }
+    }
     let known = match (vars["owner"].as_str(), vars["name"].as_str()) {
         (Some(o), Some(n)) => s.is_bound(o, n),
         _ => false,
@@ -959,10 +984,15 @@ fn issues_page(s: &mut State, vars: &Value) -> Answer {
             })
         })
         .collect();
+    let (more, end) = if s.issues_cursor_stuck {
+        (true, Some("stuck".to_string()))
+    } else {
+        (items.len() > size, end)
+    };
     answer(
         200,
         json!({"data": {"repository": {"issues": {
-            "pageInfo": {"hasNextPage": items.len() > size, "endCursor": end},
+            "pageInfo": {"hasNextPage": more, "endCursor": end},
             "nodes": nodes,
         }}}}),
     )

@@ -494,6 +494,16 @@ impl GithubTracker {
             if !more {
                 return Ok(());
             }
+            // ⚠ Progress, checked: a page that says another follows but
+            // holds no issue, or hands back the cursor it was asked for,
+            // would be read again forever.
+            if nodes.is_empty() {
+                return Err(backend(format!(
+                    "GitHub answered an empty page of {what} issue list of {} and said another \
+                     follows; retry",
+                    self.repo.full_name
+                )));
+            }
             let cursor = issues
                 .and_then(|i| i.pointer("/pageInfo/endCursor"))
                 .and_then(Value::as_str)
@@ -504,6 +514,13 @@ impl GithubTracker {
                         self.repo.full_name
                     ))
                 })?;
+            if after.as_deref() == Some(cursor) {
+                return Err(backend(format!(
+                    "GitHub said {what} issue list of {} has another page but gave the same \
+                     cursor again; retry",
+                    self.repo.full_name
+                )));
+            }
             after = Some(cursor.to_string());
         }
     }
@@ -2396,6 +2413,31 @@ mod tests {
             t.add_alias(other.iri(), alias),
             Err(StoreError::AlreadyExists(_))
         ));
+    }
+
+    /// A page that says another follows must move the cursor and hold
+    /// issues; one that does neither would be read forever, and is an
+    /// error.
+    #[test]
+    fn a_list_whose_cursor_does_not_move_is_an_error_not_an_endless_read() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record(&p(), "a").unwrap();
+        fake.state().issues_cursor_stuck = true;
+        let before = fake.state().list_issue_requests;
+        let e = t.list_records(&p()).unwrap_err().to_string();
+        assert!(e.contains("cursor") && e.contains("retry"), "{e}");
+        assert_eq!(fake.state().list_issue_requests - before, 2);
+    }
+
+    #[test]
+    fn an_empty_list_page_that_says_more_follow_is_an_error() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record(&p(), "a").unwrap();
+        fake.state().issues_empty_page_with_more_next = true;
+        let e = t.list_records(&p()).unwrap_err().to_string();
+        assert!(e.contains("empty page") && e.contains("retry"), "{e}");
     }
 
     /// GitHub's cursor names the last issue served, not an offset, so a
