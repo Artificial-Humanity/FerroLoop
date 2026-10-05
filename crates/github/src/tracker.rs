@@ -628,9 +628,9 @@ impl GithubTracker {
         // served, not an offset, so an issue leaving the filtered set
         // mid-read (a label removed) cannot shift a live item across a page
         // boundary, and the REST list's second read and comparison are not
-        // needed. A reading of GitHub's docs; unmeasured; no live test
-        // checks it yet. Oldest first, so an issue created mid-read lands
-        // on the last page.
+        // needed. A reading of the cursor model GitHub's GraphQL follows,
+        // not of GitHub's own docs; unmeasured; no live test checks it yet.
+        // Oldest first, so an issue created mid-read lands on the last page.
         let mut raw = Vec::new();
         self.each_issue(Some(&label), Order::OldestFirst, |node| {
             raw.push(IssueView::from_graphql(node)?);
