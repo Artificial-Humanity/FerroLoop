@@ -226,11 +226,11 @@ impl IssueView {
             url,
             node_id: text("id")?,
             title: text("title")?,
-            body: v
-                .get("body")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            // ⚠ Required, unlike REST's `null` for an empty body: GraphQL's
+            // `body` is never null, and a body read as empty would make an
+            // issue's create key "not found" — and a create-key search send
+            // the create again.
+            body: text("body")?,
             labels,
             state,
             state_reason: v
@@ -791,6 +791,19 @@ mod tests {
         no_labels["labels"] = Value::Null;
         let e = IssueView::from_graphql(&no_labels).unwrap_err().to_string();
         assert!(e.contains("`labels`"), "{e}");
+        // ⚠ Not an empty body: read as one, an issue's create key would
+        // be "not found", and a create-key search would send it again.
+        for body in [Value::Null, Value::from(7)] {
+            let mut no_body = node.clone();
+            no_body["labels"] = serde_json::json!({"totalCount": 0, "nodes": []});
+            no_body["body"] = body;
+            let e = IssueView::from_graphql(&no_body).unwrap_err().to_string();
+            assert!(e.contains("`body`"), "{e}");
+        }
+        let mut no_body = node.clone();
+        no_body["labels"] = serde_json::json!({"totalCount": 0, "nodes": []});
+        no_body.as_object_mut().unwrap().remove("body");
+        assert!(IssueView::from_graphql(&no_body).is_err());
         let mut odd = node.clone();
         odd["labels"] = serde_json::json!({"totalCount": 0, "nodes": []});
         odd["state"] = serde_json::json!("MERGED");
