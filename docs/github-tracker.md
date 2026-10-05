@@ -208,8 +208,10 @@ The detection rests on a model of what GitHub records. The live tests measured m
 - **Lag.** Measured: the timeline and the edit history lag a write. An update's events showed
   on the first read after it (about 0.5 s), and its edit-history entries about 0.5 s later
   (2026-09-29). Labels set in the create itself showed their events 28–88 s late, once more
-  than 180 s; labels added by their own call just after the create showed them in 1–2 s
-  (2026-10-05). So fl creates an issue without labels and then adds them (see
+  than 180 s; labels added by their own call just after the create showed them in 1–2 s; and
+  two labels added in one call recorded each event twice, about 0–1 s apart, in 4 of 10 calls,
+  against 0 of 14 calls that added one label (2026-10-05). So fl creates an issue without
+  labels and then adds them one per call (see
   [Creates](#creates)), and waits for its own write to show — after a create, until the label
   events are in the timeline; after an update or a repair, until its own events and edits are
   in the window — for at most 10 s each. Without that, fl's own late events would land in its next write's
@@ -274,15 +276,17 @@ is not used, because its index lags and promises no complete result.
 
 ## Creates
 
-A create is two calls: the first makes the issue with its title and body, and no labels; the
-second adds the kind label and the state label. GitHub shows the events of labels added this
-way in the timeline within a couple of seconds, but the events of labels set in the create
-itself up to minutes late, where fl's next write would report them as someone else's change.
+A create is three calls: the first makes the issue with its title and body, and no labels; the
+second adds the kind label; the third adds the state label. GitHub shows the events of labels
+added this way in the timeline within a couple of seconds, but the events of labels set in the
+create itself up to minutes late, and sometimes records each event twice when one call adds
+two labels. fl's next write would report either as someone else's change.
 
-If the second call fails, the issue exists without fl's labels. fl's lists, which filter by
-label, do not show it, and the error names it: run `fl github repair <number> --by <name>`,
-which restores its labels from its block. Do not retry the command that created it; that would
-make a second issue.
+If a label call fails, the issue exists without some or all of fl's labels: none, or the kind
+label without a state label. fl's lists leave the first out and report the second as diverged,
+and the error names the issue: run `fl github repair <number> --by <name>`, which restores its
+labels from its block. Do not retry the command that created it; that would make a second
+issue.
 
 Each create carries a key fl mints, stored in the block. If GitHub's answer to a create is
 lost — a server error, or the connection dropping before an answer — the issue may exist
@@ -314,9 +318,9 @@ it. A plain retry could make a duplicate.
   timeline and the edit history twice each — once before the write and once after — besides
   the write itself; a repair also posts its comment. A create has no such window: once per
   command fl reads the repository's labels, creating any that are missing, then sends the
-  create and adds its labels, and reads the timeline until their events show; a finding's
-  create first reads the record it names. These costs are input to a
-  later rate-limit design.
+  create and adds its two labels, one call each, and reads the timeline until their events
+  show; a finding's create first reads the record it names. These costs are input to a later
+  rate-limit design.
 - **Lists read GitHub's GraphQL API, every page**, oldest issue first, a hundred to a page,
   each page found from the last by a cursor. A page that fails fails the list, never
   shortening it. Measured on 2026-10-05: GitHub's REST issue list left a new issue out for
@@ -332,7 +336,7 @@ it. A plain retry could make a duplicate.
 - **An installation token is not narrowed further** than the App's installation. Install the
   App on the bound repository only.
 - **An issue whose body holds fl's block is fl's**, even with its labels removed, or without
-  them after a create that stopped between its two calls; such an issue drops out of fl's
+  them after a create that stopped before its label calls; such an issue drops out of fl's
   lists, which filter by label, and reads as not an fl item until `fl github repair` restores
   its labels. fl never adopts an issue that has no block. To find one a stopped create left,
   filter the repository's GitHub issue list by `no:label`, open the newest issues there, and

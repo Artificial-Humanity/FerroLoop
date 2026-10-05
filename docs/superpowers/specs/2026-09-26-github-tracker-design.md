@@ -273,19 +273,27 @@ fl writes it; fl never reads state from it.
 * **The response is the postcondition.** GitHub silently drops labels that a caller may not
   set. After every create and update, fl checks that the returned labels, block and status are
   the ones it sent. A mismatch is an ERROR, never success. *(Invariant.)*
-* **A create is two calls.** `POST /issues` sends the title and the body, with no labels; then
-  `POST /issues/{n}/labels` adds the kind label and the state label. fl checks the create's
-  answer (title, block, open) and then the label call's answer (the fl labels). Labels are not
+* **A create is three calls.** `POST /issues` sends the title and the body, with no labels; then
+  `POST /issues/{n}/labels` adds the kind label, and a second `POST /issues/{n}/labels` adds
+  the state label — one label per call. fl checks the create's answer (title, block, open) and
+  then the label calls' answers (the fl labels). Labels are not
   sent in the create because, measured live on 2026-10-05, labels set there produced their
   `labeled` timeline events 28–88 s late (once more than 180 s), in the REST and GraphQL
   timelines alike, and those late events carry the labels the issue has when GitHub processes
   them. fl's wait after a create (below) ended first, so the events fell in the next update's
   window as a spurious conflict. Labels added by their own call showed their events in 1–2 s
   (3 of 3), with no later events after 180 s.
-* **A stop between the two calls leaves an issue without fl's labels.** If the label call
-  fails, the error names the issue and says that `fl github repair` restores its labels from
-  its block (§3.4, §0.1b, 14); it never says to retry the create, which would make a
-  duplicate. Until it is repaired, the issue is not in fl's lists, which filter by label.
+* **One label per call.** Measured live on 2026-10-05: adding two labels in one call — one
+  `POST /issues/{n}/labels` with both, or one `PATCH` with `labels: [a, b]` — recorded each
+  `labeled` event twice, about 0–1 s apart, in 4 of 10 calls; adding one label per call never
+  did (0 of 14). fl's wait after a create counts the events it expects, so a late second pair
+  would fall in the next update's window as a spurious conflict.
+* **A stop between the calls leaves an issue without some or all of fl's labels.** A stop
+  before the first label call leaves no fl label; a stop between the label calls leaves the
+  kind label without a state label. Either way the error names the issue and says that
+  `fl github repair` restores its labels from its block (§3.4, §0.1b, 14); it never says to
+  retry the create, which would make a duplicate. Until it is repaired, the issue is left out
+  of fl's lists (no label) or makes them fail as diverged (kind label only).
 * **Labels are created explicitly.** fl creates its missing `fl:*` labels through the labels
   API at first use, and treats a failure there as an ERROR. It never relies on a label being
   created as a side effect.
@@ -297,7 +305,7 @@ fl writes it; fl never reads state from it.
   *(Release scope — measured in the live test, §8.3, before any claim about it is made.)*
 * **The timeline and the edit history lag a write.** Measured live on 2026-09-29: an update's
   events showed on the first read after it (about 0.5 s) and its edit-history entries about
-  0.5 s later. Measured live on 2026-10-05: the `labeled` events of a create's label call
+  0.5 s later. Measured live on 2026-10-05: the `labeled` event of a create's label call
   showed 1–2 s after it. So after a create fl reads the timeline until those `labeled` events
   show, and after an update or a repair it reads the window until its own events and edits
   show — each for at most 10 s. A create whose events never show
@@ -309,10 +317,10 @@ fl writes it; fl never reads state from it.
   or a connection failure, fl reads the repository's issues through the GraphQL list (§3.7),
   not search, and looks for that key before it sends the create again. *(Invariant.)* It reads
   every issue, not only those with fl's labels, because an issue the attempt made carries no
-  labels until the label call. It reads newest first and stops at the first issue whose
+  labels until the label calls. It reads newest first and stops at the first issue whose
   `createdAt` (GitHub's clock) is more than 10 minutes before the attempt began (this machine's
   clock); the margin covers skew between the two clocks. An issue found by its key that lacks
-  fl's labels is given them by the label call, and the create is not sent again.
+  fl's labels is given them by the label calls, and the create is not sent again.
 
 ### 3.4 Reads and divergence
 
