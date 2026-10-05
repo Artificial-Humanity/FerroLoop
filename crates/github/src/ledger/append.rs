@@ -45,6 +45,21 @@ enum Landed {
     Unknown(String),
 }
 
+/// Whether `message` says the branch "is at" one commit "but expected"
+/// another, each named by its full id — the moved-head refusal observed
+/// live. Words that merely resemble it, with no ids, are not one.
+fn names_two_heads(message: &str) -> bool {
+    let is_oid = |w: &str| (40..=64).contains(&w.len()) && w.bytes().all(|b| b.is_ascii_hexdigit());
+    message.match_indices("is at ").any(|(i, _)| {
+        let mut words = message[i + "is at ".len()..].split_whitespace();
+        matches!(
+            (words.next(), words.next(), words.next(), words.next()),
+            (Some(at), Some("but"), Some("expected"), Some(exp))
+                if is_oid(at) && is_oid(exp.trim_end_matches('.'))
+        )
+    })
+}
+
 /// What one answer to the commit means.
 ///
 /// ⚠ Modelled: a stale `expectedHeadOid` is refused with an error of type
@@ -65,21 +80,6 @@ enum Landed {
 /// error of type `FORBIDDEN` rather than as a 403 naming it — refused, and
 /// named (spec §6.3). Confirmed by live test
 /// `create_commit_on_branch_without_contents_write_is_refused`.
-/// Whether `message` says the branch "is at" one commit "but expected"
-/// another, each named by its full id — the moved-head refusal observed
-/// live. Words that merely resemble it, with no ids, are not one.
-fn names_two_heads(message: &str) -> bool {
-    let is_oid = |w: &str| (40..=64).contains(&w.len()) && w.bytes().all(|b| b.is_ascii_hexdigit());
-    message.match_indices("is at ").any(|(i, _)| {
-        let mut words = message[i + "is at ".len()..].split_whitespace();
-        matches!(
-            (words.next(), words.next(), words.next(), words.next()),
-            (Some(at), Some("but"), Some("expected"), Some(exp))
-                if is_oid(at) && is_oid(exp.trim_end_matches('.'))
-        )
-    })
-}
-
 fn judge(answer: GraphqlAnswer) -> Result<Landed, StoreError> {
     match answer.status {
         200..=299 => {}
