@@ -205,9 +205,6 @@ pub struct State {
     /// The next `POST /issues/{n}/labels` answers 500 and adds nothing.
     /// One-shot.
     pub fail_label_add_next: bool,
-    /// The label add that follows this many more answers 500 and adds
-    /// nothing; `Some(0)` is the next one. One-shot.
-    pub fail_label_add_after: Option<u32>,
     /// GitHub records a `labeled` event a second time. Measured live on
     /// 2026-10-05: two labels added in one call doubled each event, about
     /// 0-1 s apart, in 4 of 10 calls; one label per call did so in 0 of 22
@@ -1494,14 +1491,6 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         ("POST", ["repos", o, r, "issues", n, "labels"]) if s.is_bound(o, r) => {
             if std::mem::take(&mut s.fail_label_add_next) {
                 return answer(500, json!({"message": "fake label failure"}));
-            }
-            match s.fail_label_add_after {
-                Some(0) => {
-                    s.fail_label_add_after = None;
-                    return answer(500, json!({"message": "fake label failure"}));
-                }
-                Some(k) => s.fail_label_add_after = Some(k - 1),
-                None => {}
             }
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let Some(n) = n.parse::<u64>().ok().filter(|n| s.issues.contains_key(n)) else {

@@ -353,9 +353,9 @@ fn written_problems(
 }
 
 /// An error about an issue fl has just created: it exists without fl's
-/// labels (`certain`), or perhaps without some or all of them — a stop
-/// between the label calls leaves the kind label without a state label —
-/// so fl's lists leave it out, or report it as diverged. ⚠ Never "retry":
+/// labels (`certain`), or perhaps without some or all of them — GitHub
+/// can apply one label and drop the other — so fl's lists leave it out, or
+/// report it as diverged. ⚠ Never "retry":
 /// a retry mints a new create key and makes a DUPLICATE. `fl github
 /// repair` restores the labels from the block instead (spec §0.1b, 14).
 fn unlabelled_issue(issue: &IssueView, why: &str, certain: bool) -> StoreError {
@@ -872,8 +872,8 @@ impl GithubTracker {
         self.ensure_labels()?;
         let labels = vec![meta::kind_label(kind), meta::state_label(kind, &meta.state)];
         let body = meta::render_body(prose, meta);
-        // ⚠ No labels in the create: they are added afterward, one per call
-        // (`label_created`). Measured live on 2026-10-05: labels set in the
+        // ⚠ No labels in the create: they are added afterward, by their own
+        // call (`label_created`). Measured live on 2026-10-05: labels set in the
         // create showed their `labeled` events 28-88 s late (once more than
         // 180 s), past `await_create_events`, so they landed in the next
         // update's window as a spurious conflict; labels added by their own
@@ -951,46 +951,34 @@ impl GithubTracker {
             return Ok(issue);
         }
         let unlabelled = |why: String| unlabelled_issue(&issue, &why, false);
-        // ⚠ One label per call, the kind label first. Measured live on
-        // 2026-10-05: two labels added in one call (`POST …/labels`, or a
-        // `PATCH` with `labels`) recorded each `labeled` event TWICE, about
-        // 0-1 s apart, in 4 of 10 calls; one label per call never did (0 of
-        // 14). `await_create_events` stops at the first pair, so a late
-        // second pair would land in the next update's window as a spurious
-        // conflict.
-        let mut got = issue.labels.clone();
-        for label in labels {
-            if got.contains(label) {
-                continue;
-            }
-            let r = self
-                .client
-                .send(
-                    Method::Post,
-                    &self.path(&format!("/issues/{}/labels", issue.number)),
-                    Some(&json!({ "labels": [label] })),
-                )
-                .map_err(|e| unlabelled(format!("adding its label `{label}` failed ({e})")))?;
-            if r.status != 200 {
-                return Err(unlabelled(format!(
-                    "GitHub answered {} when fl added its label `{label}`",
-                    r.status
-                )));
-            }
-            got = r
-                .body
-                .as_array()
-                .and_then(|a| {
-                    a.iter()
-                        .map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
-                        .collect()
-                })
-                .ok_or_else(|| {
-                    unlabelled(format!(
-                        "GitHub's answer to adding its label `{label}` could not be read"
-                    ))
-                })?;
+        // Both labels in one call. (Measured live on 2026-10-05: GitHub
+        // sometimes records a `labeled` event twice, one label per call or
+        // two; `changes` drops the copy wherever it lands.)
+        let r = self
+            .client
+            .send(
+                Method::Post,
+                &self.path(&format!("/issues/{}/labels", issue.number)),
+                Some(&json!({ "labels": labels })),
+            )
+            .map_err(|e| unlabelled(format!("adding its labels failed ({e})")))?;
+        if r.status != 200 {
+            return Err(unlabelled(format!(
+                "GitHub answered {} when fl added its labels",
+                r.status
+            )));
         }
+        let got: Vec<String> = r
+            .body
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .ok_or_else(|| {
+                unlabelled("GitHub's answer to adding its labels could not be read".into())
+            })?;
         let applied = fl_labels(&got);
         let missing: Vec<&String> = want.difference(&applied).collect();
         if !missing.is_empty() {
@@ -1134,8 +1122,8 @@ impl GithubTracker {
     /// created since `CREATE_SEARCH_MARGIN` before `started`.
     /// ⚠ Every issue, not only fl's labelled ones: a create sends no labels
     /// and adds them afterward (`label_created`), so an issue this attempt
-    /// made may carry none, or only its kind label — after a stop between
-    /// the calls, or a create whose answer was lost. Newest first, and it
+    /// made may carry none — after a stop between the two calls, or a
+    /// create whose answer was lost. Newest first, and it
     /// stops at the first issue older than the margin, so its cost does not
     /// grow with the repository's history.
     fn find_by_create_key(&self, key: &str, started: u64) -> Result<Option<IssueView>, StoreError> {
@@ -2728,8 +2716,8 @@ mod tests {
         assert_eq!(t.resolve_handle(Kind::Record, 99).unwrap(), None);
     }
 
-    /// Measured live on 2026-10-05: the `labeled` events of the labels a
-    /// create adds, one per call, reach the timeline 1-2 s after it.
+    /// Measured live on 2026-10-05: the `labeled` event of a label a create
+    /// adds by its own call reaches the timeline 1-2 s after it.
     /// Unless the create waits for them, they land in the NEXT write's
     /// window and read as someone else's.
     #[test]
@@ -2874,28 +2862,22 @@ mod tests {
         );
     }
 
-    /// A stop between the two label calls leaves the kind label without a
-    /// state label: the error names the issue and the repair, and the
-    /// repair completes it.
+    /// A create is two calls: the issue, then its two labels in ONE label
+    /// call. (Adding them one per call did not stop GitHub recording a
+    /// `labeled` event twice; the conflict window drops such copies.)
     #[test]
-    fn a_create_stopped_between_its_label_calls_names_the_issue_and_repair_completes_it() {
+    fn a_create_adds_its_two_labels_in_one_call() {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake);
-        fake.state().fail_label_add_after = Some(1);
-        let e = t.add_record(&p(), "t").unwrap_err().to_string();
-        assert!(
-            e.contains("https://github.com/acme/widgets/issues/1")
-                && e.contains("without some or all of fl's labels")
-                && e.contains("Do not create it again")
-                && e.contains("fl github repair 1 --by <name>"),
-            "{e}"
-        );
-        assert_eq!(issue_posts(&fake), 1, "never created again");
-        assert_eq!(fake.issue(1).labels, vec!["fl:record"]);
-        let url = t.issue_url(1);
-        assert!(t.repair(&url, "owner").unwrap().changed);
+        t.add_record(&p(), "t").unwrap();
+        let label_calls = fake
+            .state()
+            .requests
+            .iter()
+            .filter(|q| *q == "POST /repos/acme/widgets/issues/1/labels")
+            .count();
+        assert_eq!(label_calls, 1);
         assert_eq!(fake.issue(1).labels, vec!["fl:record", "fl:record/todo"]);
-        assert_eq!(t.list_records(&p()).unwrap().len(), 1);
     }
 
     /// Measured live on 2026-10-05: GitHub sometimes records a `labeled`
