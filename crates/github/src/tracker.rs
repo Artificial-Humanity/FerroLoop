@@ -155,20 +155,34 @@ fn backend(msg: String) -> StoreError {
 
 /// ⚠ Every error inside `after_ambiguous_create` — a failed search for the
 /// create key, and ANY failure of the resend (a transport failure, a rate
-/// limit, a refused credential, a rejected request) — gets the "list before
-/// retrying" advice. The FIRST attempt failed
+/// limit, a refused credential, a rejected request) — gets the "look before
+/// retrying" advice (`look_before_retrying`). The FIRST attempt failed
 /// ambiguously (a 5xx, or the connection dropping), so by then fl cannot
 /// know whether the issue exists, whatever the later error is about: a plain
 /// "retry" would make a duplicate whenever the first attempt had landed.
 /// (Earlier rounds wrapped only a transport failure here, reading the other
 /// errors as unrelated to that ambiguity; they are not, because the
 /// ambiguity comes from the first attempt, not from the error.)
-fn after_ambiguous_failure(step: &str, e: StoreError) -> StoreError {
+fn after_ambiguous_failure(title: &str, step: &str, e: StoreError) -> StoreError {
     backend(format!(
         "an issue create failed in a way that may still have created the issue, and then \
-         {step} ({e}). List the repository's fl issues before retrying, so the retry makes no \
-         duplicate"
+         {step} ({e}). {}",
+        look_before_retrying(title)
     ))
+}
+
+/// The advice once a create may have landed: where to look for the issue,
+/// and what to do with it. ⚠ Not "list the repository's fl issues": a
+/// create sends no labels (`label_created` adds them), so an issue it made
+/// may carry none, and then it is in neither `fl record list`, `fl finding
+/// list`, nor a GitHub list filtered by fl's labels. Following that advice
+/// made the duplicate it was meant to prevent.
+fn look_before_retrying(title: &str) -> String {
+    format!(
+        "Before retrying, look among the repository's newest issues, labelled or not, for one \
+         titled {title:?}; if it is there, run `fl github repair <number> --by <name>` on it \
+         instead of creating it again, so the retry makes no duplicate"
+    )
 }
 
 fn text(v: &Value, k: &str) -> Result<String, StoreError> {
@@ -770,13 +784,15 @@ impl GithubTracker {
             // the duplicate this whole mechanism exists to avoid.
             Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
                 Ok(issue) => issue,
-                Err(_) => self.after_unreadable_create(meta, started, r.status)?,
+                Err(_) => self.after_unreadable_create(title, meta, started, r.status)?,
             },
             // ⚠ An ambiguous failure may already have created the issue.
             // Look for the create key before sending again (spec §3.3).
-            Ok(r) if r.status >= 500 => self.after_ambiguous_create(meta, started, &path, &sent)?,
+            Ok(r) if r.status >= 500 => {
+                self.after_ambiguous_create(title, meta, started, &path, &sent)?
+            }
             Err(StoreError::Unreachable { .. }) => {
-                self.after_ambiguous_create(meta, started, &path, &sent)?
+                self.after_ambiguous_create(title, meta, started, &path, &sent)?
             }
             Ok(r) => {
                 return Err(backend(format!(
@@ -889,6 +905,7 @@ impl GithubTracker {
     /// the case where it certainly did.
     fn after_ambiguous_create(
         &self,
+        title: &str,
         meta: &Meta,
         started: u64,
         path: &str,
@@ -896,7 +913,9 @@ impl GithubTracker {
     ) -> Result<IssueView, StoreError> {
         let searched = self
             .search_by_create_key(&meta.create_key, started)
-            .map_err(|e| after_ambiguous_failure("searching for it by its create key failed", e))?;
+            .map_err(|e| {
+                after_ambiguous_failure(title, "searching for it by its create key failed", e)
+            })?;
         if let Some(found) = searched {
             return Ok(found);
         }
@@ -912,19 +931,20 @@ impl GithubTracker {
         {
             Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
                 Ok(issue) => Ok(issue),
-                Err(_) => self.after_unreadable_create(meta, started, r.status),
+                Err(_) => self.after_unreadable_create(title, meta, started, r.status),
             },
             Ok(r) => Err(backend(format!(
-                "GitHub failed an issue create twice (the second answer was {}). List the \
-                 repository's fl issues before retrying, so the retry makes no duplicate",
-                r.status
+                "GitHub failed an issue create twice (the second answer was {}). {}",
+                r.status,
+                look_before_retrying(title)
             ))),
             // ⚠ Every failure of the resend gets the SAME advice as a bad
             // status: the first attempt's fate is
             // unknown, so whatever stopped this one — a dropped connection,
             // a rate limit, a refused credential — fl cannot say whether the
-            // issue exists. Only a fresh list can settle that.
+            // issue exists. Only a fresh look can settle that.
             Err(e) => Err(after_ambiguous_failure(
+                title,
                 "sending it a second time failed",
                 e,
             )),
@@ -935,9 +955,10 @@ impl GithubTracker {
     /// answer or a dropped connection, there is no "may not have happened"
     /// here. A miss on every search is never followed by a resend — that
     /// would risk making exactly the duplicate this whole path exists to
-    /// avoid. The caller is told to list the repository's fl issues itself.
+    /// avoid. The caller is told where to look for the issue itself.
     fn after_unreadable_create(
         &self,
+        title: &str,
         meta: &Meta,
         started: u64,
         status: u16,
@@ -953,16 +974,16 @@ impl GithubTracker {
                 backend(format!(
                     "GitHub answered {status} to an issue create, but its own body could not \
                      be read, and searching for it afterward by its create key failed too ({e}). \
-                     List the repository's fl issues before retrying, so the retry makes no \
-                     duplicate"
+                     {}",
+                    look_before_retrying(title)
                 ))
             })?;
         found.ok_or_else(|| {
             backend(format!(
                 "GitHub answered {status} to an issue create, but its own body could not be \
                  read, and the issue could not be found afterward by its create key \
-                 either. List the repository's fl issues before retrying, so the retry \
-                 makes no duplicate"
+                 either. {}",
+                look_before_retrying(title)
             ))
         })
     }
@@ -2005,8 +2026,8 @@ mod tests {
 
     /// A transport failure on the SECOND create
     /// attempt (after the create-key search already came up empty) must
-    /// carry the same "list the repository's fl issues before retrying"
-    /// remedy as a bad status there — losing that advice on this one path
+    /// carry the same "look before retrying" advice as a bad status
+    /// there — losing that advice on this one path
     /// would leave a caller no wiser about the risk of a duplicate.
     #[test]
     fn a_transport_failure_on_the_ambiguous_resend_still_names_the_remedy() {
@@ -2015,11 +2036,7 @@ mod tests {
         fake.state().fail_before_create = true;
         fake.state().hang_up_after_create = true;
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(
             fake.issue_count(),
             1,
@@ -2039,11 +2056,7 @@ mod tests {
         fake.state().unreadable_create_body_next = true;
         fake.state().omit_from_list = Some(1);
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(
             fake.issue_count(),
             1,
@@ -2093,6 +2106,16 @@ mod tests {
         assert_eq!(fake.issue_count(), 1, "exactly one issue");
     }
 
+    /// ⚠ Where a create that may have landed is to be looked for: among the
+    /// newest issues, labelled or not, by its title — a create sends no
+    /// labels, so the issue is in no list filtered by fl's labels.
+    fn says_where_to_look(msg: &str, title: &str) -> bool {
+        msg.contains("newest issues, labelled or not")
+            && msg.contains(&format!("titled {title:?}"))
+            && msg.contains("fl github repair <number> --by <name>")
+            && !msg.contains("List the repository's fl issues")
+    }
+
     /// Unit-level — once the first attempt was
     /// ambiguous, EVERY later error carries the advice, whatever its kind:
     /// a credential error too, since the first attempt's fate is unknown
@@ -2111,10 +2134,10 @@ mod tests {
             StoreError::Backend("GitHub answered 422".into()),
         ] {
             let shown = e.to_string();
-            let msg = after_ambiguous_failure("sending it a second time failed", e).to_string();
+            let msg = after_ambiguous_failure("a title", "sending it a second time failed", e)
+                .to_string();
             assert!(
-                msg.contains("List the repository's fl issues before retrying")
-                    && msg.contains(&shown),
+                says_where_to_look(&msg, "a title") && msg.contains(&shown),
                 "{msg}"
             );
         }
@@ -2132,7 +2155,7 @@ mod tests {
         let err = t.add_record(&p(), "t").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("List the repository's fl issues before retrying")
+            says_where_to_look(&msg, "t")
                 && msg.contains("searching for it by its create key failed"),
             "{msg}"
         );
@@ -2151,8 +2174,7 @@ mod tests {
         let err = t.add_record(&p(), "t").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("List the repository's fl issues before retrying")
-                && msg.contains("rate limit"),
+            says_where_to_look(&msg, "t") && msg.contains("rate limit"),
             "{msg}"
         );
         assert_eq!(fake.issue_count(), 0);
@@ -2796,11 +2818,7 @@ mod tests {
         fake.state().unreadable_create_body_next = true;
         fake.state().omit_from_list = Some(1);
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(
             fake.issue_count(),
             1,
@@ -2820,11 +2838,7 @@ mod tests {
         fake.state().unreadable_create_body_next = true;
         fake.state().fail_issues_query_after = Some(0);
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(
             fake.issue_count(),
             1,
@@ -2853,11 +2867,7 @@ mod tests {
         fake.state().broken_create_body_next = true;
         fake.state().omit_from_list = Some(1);
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(fake.issue_count(), 1, "a resend would duplicate it");
         assert_eq!(issue_posts(&fake), 1, "exactly one send");
     }

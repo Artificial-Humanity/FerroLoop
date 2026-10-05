@@ -290,17 +290,21 @@ anyway, so fl searches the repository's issues for that key, up to three times a
 seconds apart, before it sends the create once more. The search reads every issue, with fl's
 labels or without, newest first, and stops at issues created more than 10 minutes before the
 attempt began; the margin covers a difference between this machine's clock and GitHub's. An
-issue it finds without fl's labels is given them, and the create is not sent again. From the first lost answer on, fl cannot
-know whether the issue exists, so every later error carries the advice to list the
-repository's fl issues before retrying: a failed search, and any failure of the second
-attempt — a server error, a dropped connection, a rate limit, a refused credential or a
-rejected request. A plain retry could otherwise make a duplicate.
+issue it finds without fl's labels is given them, and the create is not sent again.
 
+From the first lost answer on, fl cannot know whether the issue exists, so every later error
+says where to look before retrying: a failed search, and any failure of the second attempt — a
+server error, a dropped connection, a rate limit, a refused credential or a rejected request.
 Once GitHub has answered a create with success, fl never sends it again, even if the answer's
 body could not be read: the issue exists. If fl then cannot find it by its key either, it
-refuses, and says to list the repository's fl issues before retrying, so the retry makes no
-duplicate. `fl record list` and `fl finding list`, or GitHub's issue list filtered by the
-`fl:record` or `fl:finding` label, show what is there.
+refuses with the same advice.
+
+The advice names the title. Look among the repository's newest issues, with labels or without,
+for an issue with that title. If it is there, run `fl github repair <number> --by <name>` on it
+instead of creating it again: the repair gives it fl's labels from its block, or reports it
+consistent if it already has them. An issue fl created may have no labels yet, so
+`fl record list`, `fl finding list` and GitHub's list filtered by an `fl:` label do not show
+it. A plain retry could make a duplicate.
 
 ## Limits and costs
 
