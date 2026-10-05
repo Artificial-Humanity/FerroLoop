@@ -208,8 +208,9 @@ The detection rests on a model of what GitHub records. The live tests measured m
 - **Lag.** Measured: the timeline and the edit history lag a write. An update's events showed
   on the first read after it (about 0.5 s), and its edit-history entries about 0.5 s later
   (2026-09-29). Labels set in the create itself showed their events 28–88 s late, once more
-  than 180 s; labels added by their own call just after the create showed them in 1–2 s
-  (2026-10-05). So fl creates an issue without labels and then adds them (see
+  than 180 s; a label added by its own call just after the create showed its event in 1–2 s
+  (2026-10-05, measured adding one label per call; fl's call adds two, and its timing is not
+  measured separately). So fl creates an issue without labels and then adds them (see
   [Creates](#creates)), and waits for its own write to show — after a create, until its labels
   are in the timeline; after an update or a repair, until its own events and edits are in the
   window — for at most 10 s each. Without that, fl's own late events would land in its next
@@ -224,7 +225,9 @@ The detection rests on a model of what GitHub records. The live tests measured m
   know which labels are on at each event, and does not count such an event — as a change by
   someone else, or as a sign that its own write shows. It always counts a label removed.
   Measured on 2026-10-05 (one sample): deleting a label from the repository records a
-  label-removed event on each issue that carried it, so that does not upset the replay. Not
+  label-removed event on each issue that carried it, the timeline still names the deleted label
+  in its events, and adding it again after re-creating it records a new label-added event, so
+  none of that upsets the replay. Not
   measured: that the timeline records every other label change, and that an event that shows
   means every earlier one shows too. A label change with no event would make fl skip a later
   `labeled` event for that label.

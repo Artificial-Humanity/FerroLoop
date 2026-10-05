@@ -161,6 +161,8 @@ fn parse_events(n: u64, items: &[Value]) -> Result<Vec<Event>, StoreError> {
             ))
         })?;
         // ⚠ A label event without its label cannot be told from noise.
+        // Measured live on 2026-10-05 (one sample): a label event keeps its
+        // `label.name` after the label is deleted from the repository.
         let label = match kind {
             "labeled" | "unlabeled" => Some(
                 e.pointer("/label/name")
@@ -938,7 +940,9 @@ impl GithubTracker {
         // create showed their `labeled` events 28-88 s late (once more than
         // 180 s), past `await_create_events`, so they landed in the next
         // update's window as a spurious conflict; labels added by their own
-        // call showed in 1-2 s (3 of 3), with nothing more after 180 s.
+        // call showed in 1-2 s (3 of 3), with nothing more after 180 s —
+        // measured adding one label per call; fl's call adds two, whose
+        // timing is not separately measured.
         let sent = json!({"title": title, "body": body});
         let path = self.path("/issues");
         // Before the first send: the create-key search reads back to here.
@@ -1503,7 +1507,8 @@ impl GithubTracker {
     /// After a create: wait until the timeline shows the `labeled` events
     /// of the labels `label_created` added, so they do not land in the
     /// next write's window. ⚠ Measured live on 2026-10-05: they showed
-    /// 1-2 s after the call that added them (3 of 3). A create whose events
+    /// 1-2 s after the call that added them (3 of 3, one label per call;
+    /// fl's call adds two, not separately measured). A create whose events
     /// never show still succeeds — the create landed, and the next write
     /// refuses as a conflict, which is the safe side.
     /// ⚠ Never an error: the issue exists by now, and `add_record` mints a
@@ -2737,8 +2742,9 @@ mod tests {
         assert_eq!(t.resolve_handle(Kind::Record, 99).unwrap(), None);
     }
 
-    /// Measured live on 2026-10-05: the `labeled` event of a label a create
-    /// adds by its own call reaches the timeline 1-2 s after it.
+    /// Measured live on 2026-10-05: the `labeled` event of a label added by
+    /// its own call (one label per call) reaches the timeline 1-2 s after
+    /// it.
     /// Unless the create waits for them, they land in the NEXT write's
     /// window and read as someone else's.
     #[test]

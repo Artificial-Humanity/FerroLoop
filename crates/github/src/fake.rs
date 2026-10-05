@@ -199,7 +199,7 @@ pub struct State {
     /// the create, once more than 180 s, in the REST and GraphQL timelines
     /// alike — past fl's wait, so they landed in the next update's window.
     /// Labels added by their own call after the create showed in 1-2 s
-    /// (3 of 3). Modelled here as: held back until that issue's next PATCH,
+    /// (3 of 3, one label per call). Modelled here as: held back until that issue's next PATCH,
     /// whose window they then land in. A setting, not one-shot.
     pub creation_labels_late: bool,
     /// The next `POST /issues/{n}/labels` answers 500 and adds nothing.

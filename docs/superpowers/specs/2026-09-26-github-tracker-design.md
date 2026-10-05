@@ -281,7 +281,8 @@ fl writes it; fl never reads state from it.
   timelines alike, and those late events carry the labels the issue has when GitHub processes
   them. fl's wait after a create (below) ended first, so the events fell in the next update's
   window as a spurious conflict. Labels added by their own call showed their events in 1–2 s
-  (3 of 3), with no later events after 180 s.
+  (3 of 3, measured adding one label per call), with no later events after 180 s. fl's label
+  call adds two labels; its timing is not separately measured.
 * **A stop between the two calls leaves an issue without fl's labels.** If the label call fails,
   or GitHub applies only some of the labels, the error names the issue and says that
   `fl github repair` restores its labels from its block (§3.4, §0.1b, 14); it never says to
@@ -308,17 +309,19 @@ fl writes it; fl never reads state from it.
   `unlabeled` event or any other kind. Which labels are on comes from the timeline, never from
   an issue fl read, which can already hold a label someone added inside the window.
   Measured live on 2026-10-05 (one sample): deleting a label from the repository records an
-  `unlabeled` event for it on each issue that carried it, and adding it again after it is
-  re-created records a new `labeled`. *(Modelled, not measured: the timeline records every
+  `unlabeled` event for it on each issue that carried it; while the label is deleted, the
+  timeline still names it in its `labeled` and `unlabeled` events; and adding it again after it
+  is re-created records a new `labeled`. A label event that names no label is an ERROR. *(Modelled, not measured: the timeline records every
   label change, and an event that shows means every earlier one shows too. A label change
   with no event would leave the replay wrong, and a later `labeled` event for that label could
   then be dropped.)*
 * **The timeline and the edit history lag a write.** Measured live on 2026-09-29: an update's
   events showed on the first read after it (about 0.5 s) and its edit-history entries about
-  0.5 s later. Measured live on 2026-10-05: the `labeled` event of a create's label call,
-  adding one label, showed 1–2 s after it (3 of 3). So after a create fl reads the timeline until those `labeled` events
-  show, and after an update or a repair it reads the window until its own events and edits
-  show — each for at most 10 s. A create whose events never show
+  0.5 s later. Measured live on 2026-10-05: the `labeled` event of a label call that adds ONE
+  label showed 1–2 s after it (3 of 3); fl's label call adds two labels, and its timing is not
+  separately measured. So after a create fl reads the timeline until its labels are on, and
+  after an update or a repair it reads the window until its own events and edits show — each
+  for at most 10 s. A create whose events never show
   still succeeds, and the next write refuses as a conflict. An update whose write never shows
   is an ERROR that says to read the item again. Without the wait, fl's own late events land
   in the next write's window and read as someone else's. *(Release scope. Modelled, not
