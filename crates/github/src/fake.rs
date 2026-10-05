@@ -189,6 +189,10 @@ pub struct State {
     /// body. GitHub documents 201; this models a 2xx it has not been seen to
     /// send (unmeasured; no live test checks it yet). One-shot.
     pub create_answers_200_next: bool,
+    /// The next create lands with this text appended to its body, and
+    /// answers it so — a body GitHub kept differently from what was sent.
+    /// One-shot.
+    pub create_body_appended_next: Option<String>,
     /// Node ids a `node(id: …)` lookup answers as living in ANOTHER
     /// repository — simulating a transferred issue (spec's `Moved` case).
     /// Modelled: this is the fake's guess at the shape of GitHub's real
@@ -1178,7 +1182,11 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 number: n,
                 node_id: format!("I_{n}"),
                 title: v["title"].as_str().unwrap_or("").into(),
-                body: v["body"].as_str().unwrap_or("").into(),
+                body: format!(
+                    "{}{}",
+                    v["body"].as_str().unwrap_or(""),
+                    s.create_body_appended_next.take().unwrap_or_default()
+                ),
                 labels,
                 state: "open".into(),
                 events,

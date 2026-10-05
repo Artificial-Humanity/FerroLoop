@@ -229,17 +229,39 @@ fn read_repo(client: &Client, name: &str) -> Result<Option<(Repo, bool)>, StoreE
 }
 
 /// ⚠ The response is the postcondition (spec §3.3): GitHub silently drops
-/// labels a caller may not set, so "no error" is not "written". `labels`
-/// is `None` for a create, which sends none: they are added, and checked,
-/// by their own call (`label_created`).
+/// labels a caller may not set, so "no error" is not "written".
 fn check_written(
+    back: &IssueView,
+    title: &str,
+    labels: &[String],
+    body: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> Result<(), StoreError> {
+    let problems = written_problems(back, title, Some(labels), body, state, reason);
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(backend(format!(
+            "GitHub accepted the write to {} but did not apply it: {}. The credential may \
+             lack permission to set labels (Issues: read and write)",
+            back.url,
+            problems.join("; ")
+        )))
+    }
+}
+
+/// How GitHub's answer differs from what fl sent; empty when it does not.
+/// `labels` is `None` for a create, which sends none: they are added, and
+/// checked, by their own call (`label_created`).
+fn written_problems(
     back: &IssueView,
     title: &str,
     labels: Option<&[String]>,
     body: &str,
     state: &str,
     reason: Option<&str>,
-) -> Result<(), StoreError> {
+) -> Vec<String> {
     let mut problems = Vec::new();
     if back.title != title {
         problems.push("the title came back different".to_string());
@@ -266,16 +288,22 @@ fn check_written(
             back.state
         ));
     }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(backend(format!(
-            "GitHub accepted the write to {} but did not apply it: {}. The credential may \
-             lack permission to set labels (Issues: read and write)",
-            back.url,
-            problems.join("; ")
-        )))
-    }
+    problems
+}
+
+/// An error about an issue fl has just created: it exists, perhaps (or,
+/// with `certain`, surely) without fl's labels, so fl's lists — which
+/// filter by label — do not show it. ⚠ Never "retry": a retry mints a new
+/// create key and makes a DUPLICATE. `fl github repair` restores the
+/// labels from the block instead (spec §0.1b, 14).
+fn unlabelled_issue(issue: &IssueView, why: &str, certain: bool) -> StoreError {
+    let exists = if certain { "exists" } else { "may exist" };
+    backend(format!(
+        "{} was created, but {why}. It {exists} without fl's labels, which fl's lists filter \
+         by, so they do not show it. Do not create it again: `fl github repair {} --by \
+         <name>` restores its labels from its block",
+        issue.url, issue.number
+    ))
 }
 
 impl GithubTracker {
@@ -802,7 +830,16 @@ impl GithubTracker {
             }
             Err(e) => return Err(e),
         };
-        check_written(&issue, title, None, &body, "open", None)?;
+        // ⚠ Not `check_written`: no labels were sent, so a mismatch here is
+        // not a label permission, and the issue exists without labels.
+        let problems = written_problems(&issue, title, None, &body, "open", None);
+        if !problems.is_empty() {
+            return Err(unlabelled_issue(
+                &issue,
+                &format!("GitHub did not create it as sent: {}", problems.join("; ")),
+                true,
+            ));
+        }
         let issue = self.label_created(issue, &labels)?;
         self.await_create_events(issue.number, labels.len());
         self.kinds.borrow_mut().insert(issue.number, kind);
@@ -813,11 +850,8 @@ impl GithubTracker {
     /// Add fl's `labels` to an issue fl just created without them, and check
     /// GitHub's answer. An issue that already carries exactly them (found
     /// by its create key, labelled before) is left as it is.
-    /// ⚠ Every error names the issue: it exists by now, perhaps without
-    /// fl's labels, and fl's lists — which filter by label — do not show it. A retry of
-    /// the create would mint a new create key and make a DUPLICATE; `fl
-    /// github repair` restores the labels from the block instead (spec
-    /// §0.1b, 14).
+    /// ⚠ Every error is `unlabelled_issue`: it names the issue, which
+    /// exists by now, and the repair — never a retry.
     fn label_created(&self, issue: IssueView, labels: &[String]) -> Result<IssueView, StoreError> {
         let fl_labels = |all: &[String]| -> BTreeSet<String> {
             all.iter()
@@ -829,14 +863,7 @@ impl GithubTracker {
         if fl_labels(&issue.labels) == want {
             return Ok(issue);
         }
-        let unlabelled = |why: String| {
-            backend(format!(
-                "{} was created, but {why}. It may exist without fl's labels, which fl's lists \
-                 filter by, so they do not show it. Do not create it again: `fl github repair \
-                 {} --by <name>` restores its labels from its block",
-                issue.url, issue.number
-            ))
-        };
+        let unlabelled = |why: String| unlabelled_issue(&issue, &why, false);
         let r = self
             .client
             .send(
@@ -1119,7 +1146,7 @@ impl GithubTracker {
             )));
         }
         let back = IssueView::from_json(&r.body)?;
-        check_written(&back, &title, Some(&labels), &body, state, reason)?;
+        check_written(&back, &title, &labels, &body, state, reason)?;
         // ⚠ Measured live: the timeline and the edit history lag a write, so
         // `after` is read until it shows fl's own write (`window_after`).
         let after = self.window_after(&id, n, &before, &issue, &back)?;
@@ -1456,7 +1483,7 @@ impl GithubTracker {
             check_written(
                 &back,
                 &issue.title,
-                Some(&labels),
+                &labels,
                 &issue.body.replace("\r\n", "\n"),
                 state,
                 reason,
@@ -2557,6 +2584,29 @@ mod tests {
             matches!((created, labelled), (Some(c), Some(l)) if c < l),
             "{requests:?}"
         );
+    }
+
+    /// A create answered with a body other than the one sent is not
+    /// written as sent, but it exists, without fl's labels (none were
+    /// sent): the error says so, names the remedy, and does not blame label
+    /// permission.
+    #[test]
+    fn a_create_answered_with_another_body_names_the_issue_and_the_repair() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().create_body_appended_next = Some("\nadded by someone".into());
+        let e = t.add_record(&p(), "t").unwrap_err().to_string();
+        assert!(
+            e.contains("https://github.com/acme/widgets/issues/1")
+                && e.contains("the body came back different")
+                && e.contains("It exists without fl's labels")
+                && e.contains("Do not create it again")
+                && e.contains("fl github repair 1 --by <name>")
+                && !e.contains("permission"),
+            "{e}"
+        );
+        assert_eq!(issue_posts(&fake), 1);
+        assert!(fake.issue(1).labels.is_empty());
     }
 
     /// A create whose answer was lost landed without labels — a create sends
