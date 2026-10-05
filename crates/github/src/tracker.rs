@@ -689,9 +689,11 @@ impl GithubTracker {
         state: Option<&str>,
         remember: bool,
     ) -> Result<Vec<(IssueView, Meta, String)>, StoreError> {
-        // ⚠ One label, never two: whether GraphQL's `labels` filter means
-        // AND or OR is unmeasured, and for one label both agree. A state
-        // label names its kind; the kind label is checked from the read.
+        // ⚠ One label, never two. Measured live on 2026-10-05: GraphQL's
+        // `labels` filter is OR, the union (`fl:record` 73 issues,
+        // `fl:finding` 70, both 143), so two labels would widen the list,
+        // never narrow it. A state label names its kind; the kind label is
+        // checked from the read.
         let label = match state {
             Some(s) => meta::state_label(kind, s),
             None => meta::kind_label(kind),

@@ -882,10 +882,11 @@ fn sort_key(i: &Issue) -> (u64, u64) {
 /// ⚠ Modelled: the connection lists issues only, never a pull request
 /// (GitHub's schema keeps those in `pullRequests`); its cursor names the
 /// last issue served, so an issue leaving the filtered set cannot shift
-/// another across a page boundary; and its `labels` filter matches an issue
-/// carrying ANY of the labels given (a reading of reports, not of GitHub's
-/// docs, which do not say). fl filters by one label, so OR and AND agree.
-/// Unmeasured; no live test checks the cursor or the filter yet.
+/// another across a page boundary. Unmeasured; no live test checks the
+/// cursor yet.
+/// Its `labels` filter matches an issue carrying ANY of the labels given:
+/// measured live on 2026-10-05, OR, the union (`fl:record` 73 issues,
+/// `fl:finding` 70, both 143). fl filters by one label.
 fn issues_page(s: &mut State, vars: &Value) -> Answer {
     s.list_issue_requests += 1;
     let first = vars["first"].as_u64();

@@ -365,8 +365,9 @@ read once. *(Modelled, not measured.)* The connection lists issues only, never p
 
 `list_records` and `list_findings` filter by the kind label and then by the block's project.
 `withdrawals_by` filters by the withdrawn state label and counts the findings whose block names
-the actor. A list filters by one label only, because it is not measured whether GraphQL reads
-two labels as "all of" or "any of".
+the actor. A list filters by one label only: measured live on 2026-10-05, GraphQL reads two
+labels as "any of" (the union; `fl:record` matched 73 issues, `fl:finding` 70, and both
+together 143), so a second label would widen the list, never narrow it.
 
 ---
 

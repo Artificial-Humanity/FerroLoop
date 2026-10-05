@@ -332,8 +332,17 @@ it. A plain retry could make a duplicate.
 - **An installation token is not narrowed further** than the App's installation. Install the
   App on the bound repository only.
 - **An issue whose body holds fl's block is fl's**, even with its labels removed, or without
-  them after a create that stopped between its two calls; such an issue drops out of fl's lists, which filter by label, and reads as not an fl item until
-  `fl github repair` restores its labels. fl never adopts an issue that has no block.
+  them after a create that stopped between its two calls; such an issue drops out of fl's
+  lists, which filter by label, and reads as not an fl item until `fl github repair` restores
+  its labels. fl never adopts an issue that has no block. To find one a stopped create left,
+  filter the repository's GitHub issue list by `no:label`, open the newest issues there, and
+  run `fl github repair <number> --by <name>` on the one whose body ends with fl's block. If
+  something else labelled it in the meantime, `no:label` does not show it; look among the
+  newest issues instead.
+- **A state label without its kind label** reads differently in two places. An issue that
+  carries `fl:finding/withdrawn` but not `fl:finding` is left out of `fl finding list`, which
+  filters by `fl:finding`, but makes the count of a raiser's withdrawals, which filters by
+  `fl:finding/withdrawn`, fail as diverged. `fl github repair` fixes it.
 - **A block and a label edited to agree** on the web read as consistent: fl does not check who
   last edited the block.
 - **A repository deliberately recreated at the bound name** is refused like any reused name,
