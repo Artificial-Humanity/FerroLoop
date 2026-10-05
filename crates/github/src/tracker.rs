@@ -6,6 +6,7 @@
 
 use crate::client::{Client, Method};
 use crate::meta::{self, IssueView, ItemKind, Meta, Read, RecordRef, TITLE_MAX};
+use fl_core::at::At;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
@@ -70,6 +71,40 @@ const STATE_EVENTS: [&str; 5] = ["labeled", "unlabeled", "closed", "reopened", "
 #[derive(Debug, Clone, Copy)]
 enum Order {
     OldestFirst,
+    NewestFirst,
+}
+
+/// How far before an attempt began the create-key search keeps reading.
+/// The search reads issues newest first and stops at the first one GitHub
+/// stamped (`createdAt`, by GitHub's clock) more than this before the
+/// attempt began (by this machine's clock): the margin covers the skew
+/// between the two clocks. Ten minutes is far more than the skew of a
+/// machine whose clock is set by the network; an issue the attempt made
+/// cannot be older than the attempt by more than the skew.
+const CREATE_SEARCH_MARGIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// This machine's clock, in milliseconds after the Unix epoch.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// A listed issue's `createdAt`. GitHub spells it to the second
+/// (`2026-10-05T12:34:56Z`); it is read as an `At`, whose order is time
+/// order. ⚠ One fl cannot read is an error: the search cannot tell
+/// whether to stop at it.
+fn created_at(node: &Value) -> Result<At, StoreError> {
+    let raw = node.get("createdAt").and_then(Value::as_str).unwrap_or("");
+    let spelled = match raw.len() {
+        20 if raw.ends_with('Z') => format!("{}.000Z", &raw[..19]),
+        _ => raw.to_string(),
+    };
+    At::parse(&spelled).map_err(|_| {
+        backend(format!(
+            "GitHub listed an issue created at {raw:?}, a time fl cannot read; retry"
+        ))
+    })
 }
 
 /// What GitHub has recorded about an issue's changes at one moment.
@@ -379,6 +414,7 @@ impl GithubTracker {
         );
         let direction = match order {
             Order::OldestFirst => "ASC",
+            Order::NewestFirst => "DESC",
         };
         let what = label.map_or_else(|| "the full".to_string(), |l| format!("the `{l}`"));
         let mut after: Option<String> = None;
@@ -705,6 +741,8 @@ impl GithubTracker {
         let body = meta::render_body(prose, meta);
         let sent = json!({"title": title, "body": body, "labels": labels});
         let path = self.path("/issues");
+        // Before the first send: the create-key search reads back to here.
+        let started = now_millis();
         // ⚠ `send_unchecked_json`, not `send`: a 201 whose own body cannot be
         // read is exactly as ambiguous as a 5xx or a dropped connection
         // (spec §3.3) — the write may have landed regardless of whether fl
@@ -722,13 +760,13 @@ impl GithubTracker {
             // the duplicate this whole mechanism exists to avoid.
             Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
                 Ok(issue) => issue,
-                Err(_) => self.after_unreadable_create(kind, meta, r.status)?,
+                Err(_) => self.after_unreadable_create(meta, started, r.status)?,
             },
             // ⚠ An ambiguous failure may already have created the issue.
             // Look for the create key before sending again (spec §3.3).
-            Ok(r) if r.status >= 500 => self.after_ambiguous_create(kind, meta, &path, &sent)?,
+            Ok(r) if r.status >= 500 => self.after_ambiguous_create(meta, started, &path, &sent)?,
             Err(StoreError::Unreachable { .. }) => {
-                self.after_ambiguous_create(kind, meta, &path, &sent)?
+                self.after_ambiguous_create(meta, started, &path, &sent)?
             }
             Ok(r) => {
                 return Err(backend(format!(
@@ -746,17 +784,18 @@ impl GithubTracker {
     }
 
     /// Search for a create by its key, `settle` apart, up to three times.
-    /// `Ok(None)` when none of the three searches found it.
+    /// `Ok(None)` when none of the three searches found it. `started`: when
+    /// the attempt began, by this machine's clock, in milliseconds.
     fn search_by_create_key(
         &self,
-        kind: ItemKind,
         key: &str,
+        started: u64,
     ) -> Result<Option<IssueView>, StoreError> {
         for attempt in 0..3 {
             if attempt > 0 {
                 std::thread::sleep(self.settle);
             }
-            if let Some(found) = self.find_by_create_key(kind, key)? {
+            if let Some(found) = self.find_by_create_key(key, started)? {
                 return Ok(Some(found));
             }
         }
@@ -771,13 +810,13 @@ impl GithubTracker {
     /// the case where it certainly did.
     fn after_ambiguous_create(
         &self,
-        kind: ItemKind,
         meta: &Meta,
+        started: u64,
         path: &str,
         sent: &Value,
     ) -> Result<IssueView, StoreError> {
         let searched = self
-            .search_by_create_key(kind, &meta.create_key)
+            .search_by_create_key(&meta.create_key, started)
             .map_err(|e| after_ambiguous_failure("searching for it by its create key failed", e))?;
         if let Some(found) = searched {
             return Ok(found);
@@ -794,7 +833,7 @@ impl GithubTracker {
         {
             Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
                 Ok(issue) => Ok(issue),
-                Err(_) => self.after_unreadable_create(kind, meta, r.status),
+                Err(_) => self.after_unreadable_create(meta, started, r.status),
             },
             Ok(r) => Err(backend(format!(
                 "GitHub failed an issue create twice (the second answer was {}). List the \
@@ -820,8 +859,8 @@ impl GithubTracker {
     /// avoid. The caller is told to list the repository's fl issues itself.
     fn after_unreadable_create(
         &self,
-        kind: ItemKind,
         meta: &Meta,
+        started: u64,
         status: u16,
     ) -> Result<IssueView, StoreError> {
         // ⚠ The create is certain here — GitHub already answered 2xx — so
@@ -830,7 +869,7 @@ impl GithubTracker {
         // retry" on a failed page read would otherwise reach the caller
         // with no hint that a resend is exactly what must NOT happen.
         let found = self
-            .search_by_create_key(kind, &meta.create_key)
+            .search_by_create_key(&meta.create_key, started)
             .map_err(|e| {
                 backend(format!(
                     "GitHub answered {status} to an issue create, but its own body could not \
@@ -849,14 +888,22 @@ impl GithubTracker {
         })
     }
 
-    fn find_by_create_key(
-        &self,
-        kind: ItemKind,
-        key: &str,
-    ) -> Result<Option<IssueView>, StoreError> {
+    /// The issue whose block carries create key `key`, among the issues
+    /// created since `CREATE_SEARCH_MARGIN` before `started`.
+    /// ⚠ Every issue, not only fl's labelled ones: a create sends no labels
+    /// and adds them by a second call (`label_created`), so an issue this
+    /// attempt made may carry none — after a stop between the two calls,
+    /// or a create whose answer was lost. Newest first, and it stops at the
+    /// first issue older than the margin, so its cost does not grow with
+    /// the repository's history.
+    fn find_by_create_key(&self, key: &str, started: u64) -> Result<Option<IssueView>, StoreError> {
+        let since =
+            At::from_unix_millis(started.saturating_sub(CREATE_SEARCH_MARGIN.as_millis() as u64));
         let mut found = None;
-        let label = meta::kind_label(kind);
-        self.each_issue(Some(&label), Order::OldestFirst, |node| {
+        self.each_issue(None, Order::NewestFirst, |node| {
+            if created_at(node)? < since {
+                return Ok(false);
+            }
             let issue = IssueView::from_graphql(node)?;
             if let Ok((_, m)) = meta::parse_body(&issue.body)
                 && m.create_key == key
@@ -1923,6 +1970,47 @@ mod tests {
             "the create landed even though it could not be found again — a resend would \
              duplicate it"
         );
+    }
+
+    /// The create-key search reads newest first and stops at the first
+    /// issue created more than `CREATE_SEARCH_MARGIN` before the attempt
+    /// began: one page per search here, however long the repository's
+    /// history.
+    #[test]
+    fn a_create_key_search_stops_at_issues_older_than_the_attempt() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        for i in 0..3 {
+            t.add_record(&p(), &format!("old {i}")).unwrap();
+        }
+        let eleven_minutes = 11 * 60 * 1000;
+        for i in fake.state().issues.values_mut() {
+            i.created_ms -= eleven_minutes;
+        }
+        fake.state().max_per_page = 1;
+        fake.state().unreadable_create_body_next = true;
+        fake.state().omit_from_list = Some(4);
+        let before = fake.state().list_issue_requests;
+        t.add_record(&p(), "t").unwrap_err();
+        assert_eq!(
+            fake.state().list_issue_requests - before,
+            3,
+            "three searches of one page each"
+        );
+    }
+
+    /// GitHub's clock may run behind this machine's, so an issue the
+    /// attempt made can carry a `createdAt` before the attempt began. The
+    /// margin covers it: the search still finds it, and nothing is sent
+    /// again.
+    #[test]
+    fn a_create_key_search_finds_a_create_stamped_by_a_clock_running_behind() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().clock_behind_ms = 5 * 60 * 1000;
+        fake.state().hang_up_after_create = true;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
     }
 
     /// Unit-level — once the first attempt was

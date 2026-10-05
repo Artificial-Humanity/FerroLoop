@@ -140,6 +140,9 @@ pub struct State {
     /// The next GraphQL `issues` request answers 200 with a `repository`
     /// that holds no `issues` connection. One-shot.
     pub issues_query_without_connection_next: bool,
+    /// GitHub's clock runs this many milliseconds behind this machine's:
+    /// an issue created now is stamped that much earlier. A setting.
+    pub clock_behind_ms: u64,
     /// GitHub's timeline lags a write: an event made by a request stays
     /// out of that issue's timeline for this many timeline reads after it.
     /// Measured live: a create's `labeled` events appeared 1.5-3.5 s after
@@ -1157,7 +1160,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 labels,
                 state: "open".into(),
                 events,
-                created_ms: now_ms(),
+                created_ms: now_ms().saturating_sub(s.clock_behind_ms),
                 rest_list_hidden: s.rest_list_lags,
                 ..Issue::default()
             };
