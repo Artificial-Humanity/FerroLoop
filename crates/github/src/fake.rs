@@ -193,6 +193,10 @@ pub struct State {
     /// answers it so — a body GitHub kept differently from what was sent.
     /// One-shot.
     pub create_body_appended_next: Option<String>,
+    /// Labels every new issue gets as it is created, whatever the create
+    /// sent — an automation labelling issues on open. The create's answer
+    /// carries them. A setting.
+    pub labels_on_open: Vec<String>,
     /// Node ids a `node(id: …)` lookup answers as living in ANOTHER
     /// repository — simulating a transferred issue (spec's `Moved` case).
     /// Modelled: this is the fake's guess at the shape of GitHub's real
@@ -1168,6 +1172,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             if s.drop_labels {
                 labels.clear();
             }
+            labels.extend(s.labels_on_open.iter().cloned());
             let mut events = Vec::new();
             for l in &labels {
                 s.labels.insert(l.clone());

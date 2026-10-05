@@ -890,11 +890,24 @@ impl GithubTracker {
                 unlabelled("GitHub's answer to adding its labels could not be read".into())
             })?;
         let applied = fl_labels(&got);
-        if applied != want {
+        let missing: Vec<&String> = want.difference(&applied).collect();
+        if !missing.is_empty() {
             return Err(unlabelled(format!(
-                "GitHub accepted its labels but did not apply them: they came back as \
-                 {applied:?}, not {want:?}. The credential may lack permission to set labels \
-                 (Issues: read and write)"
+                "GitHub accepted its labels but did not apply {missing:?}. The credential may \
+                 lack permission to set labels (Issues: read and write)"
+            )));
+        }
+        // ⚠ Every label fl sent was applied, so not a permission: adding
+        // labels never removes one, and the issue already carried another
+        // fl label (an automation, or a person, labelled it first).
+        let extra: Vec<&String> = applied.difference(&want).collect();
+        if !extra.is_empty() {
+            return Err(backend(format!(
+                "{} was created and given fl's labels, but it also carries {extra:?}, which fl \
+                 did not set and adding labels does not remove, so it reads as diverged. Do not \
+                 create it again: `fl github repair {} --by <name>` rewrites its fl labels from \
+                 its block",
+                issue.url, issue.number
             )));
         }
         Ok(IssueView {
@@ -2583,6 +2596,44 @@ mod tests {
         assert!(
             matches!((created, labelled), (Some(c), Some(l)) if c < l),
             "{requests:?}"
+        );
+    }
+
+    /// Adding labels never removes one. An issue that already carries
+    /// another fl label (an automation labelled it on open) keeps it, and
+    /// the error says what it found and names the repair — not a missing
+    /// permission, since every label fl sent was applied.
+    #[test]
+    fn a_created_issue_carrying_another_fl_label_is_named_without_blaming_permission() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().labels_on_open = vec!["fl:record/done".into()];
+        let e = t.add_record(&p(), "t").unwrap_err().to_string();
+        assert!(
+            e.contains("\"fl:record/done\"")
+                && e.contains("fl github repair 1 --by <name>")
+                && !e.contains("permission"),
+            "{e}"
+        );
+        assert_eq!(issue_posts(&fake), 1);
+    }
+
+    /// An issue that already carries exactly fl's labels is not labelled
+    /// again.
+    #[test]
+    fn a_created_issue_already_carrying_fls_labels_gets_no_label_call() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().labels_on_open = vec!["fl:record".into(), "fl:record/todo".into()];
+        let r = t.add_record(&p(), "t").unwrap();
+        assert_eq!(t.get_record(&r).unwrap().unwrap().state, State::Todo);
+        assert!(
+            !fake
+                .state()
+                .requests
+                .iter()
+                .any(|q| q == "POST /repos/acme/widgets/issues/1/labels"),
+            "no label call"
         );
     }
 
