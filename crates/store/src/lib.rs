@@ -5,7 +5,7 @@ use fl_core::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
-use fl_core::routing::{Routes, RoutingMap};
+use fl_core::routing::{ForeignRecord, Routes, RoutingMap, check_foreign_for_local};
 use fl_core::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use fl_core::store::{Bindings, Catalog, Handles, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -1126,6 +1126,23 @@ impl Tracker for RedbStore {
             let mut finding = finding;
             finding.id = FindingId(id);
             finding.record = RecordId(record_primary);
+            finding
+        })?;
+        Ok(FindingId(id))
+    }
+
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        self.check_kind(finding.project.iri(), Kind::Project)?;
+        check_foreign_for_local(&record, self.owns(record.id().iri())?)?;
+        let raise = finding.area.as_ref().map(|_| FORMAT_WITH_ROUTING);
+        let id = self.insert_new(Kind::Finding, FINDINGS, raise, |id| {
+            let mut finding = finding;
+            finding.id = FindingId(id);
+            finding.record = record.id().clone();
             finding
         })?;
         Ok(FindingId(id))
@@ -2952,6 +2969,53 @@ mod tests {
         assert!(matches!(err, StoreError::Imported { .. }), "{err:?}");
         assert!(
             err.to_string().contains("change the routing map of"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_local_store_keeps_a_checked_reference_to_a_github_record() {
+        use fl_core::routing::{ForeignRecord, Tier};
+        let (s, _d) = fresh();
+        let p = s.add_project("/p").unwrap();
+        let url = RecordId(Iri::parse("https://github.com/acme/widgets/issues/7").unwrap());
+        let err = s
+            .add_finding(Finding::raise(p.clone(), url.clone(), "rev", "claim"))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotOwned { .. }),
+            "unchecked stays refused: {err:?}"
+        );
+        // Raised against the placeholder: the stored reference must come
+        // from the proof.
+        let f = Finding::raise(
+            p.clone(),
+            RecordId(fl_core::ids::seq_iri(0)),
+            "rev",
+            "claim",
+        );
+        let id = s
+            .add_finding_checked(
+                f.clone(),
+                ForeignRecord::for_tests(url.clone(), "t", Tier::Github),
+            )
+            .unwrap();
+        assert_eq!(s.get_finding(&id).unwrap().unwrap().record, url);
+        let err = s
+            .add_finding_checked(f.clone(), ForeignRecord::for_tests(url, "t", Tier::Local))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is a record in the local tier, so a finding about it"),
+            "{err}"
+        );
+        let held = s.add_record(&p, "t").unwrap();
+        let err = s
+            .add_finding_checked(f, ForeignRecord::for_tests(held, "t", Tier::Github))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is held by this store, so a finding about it"),
             "{err}"
         );
     }

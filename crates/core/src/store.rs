@@ -5,6 +5,7 @@ use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
+use crate::routing::ForeignRecord;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -343,6 +344,15 @@ pub trait Tracker {
     fn set_record_state(&self, id: &RecordId, state: State) -> Result<(), StoreError>;
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError>;
+    /// Raise `finding` about a record in the OTHER tier (routing spec
+    /// §2.5). The tracker does not look for the record — it does not hold
+    /// it — and takes `record`, the router's proof of its check, instead.
+    /// ⚠ `add_finding` still refuses a record the tracker does not hold.
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError>;
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError>;
     /// Replace a stored finding with `finding`, keyed by its primary id even
     /// when `finding.id` is an alias.
@@ -481,6 +491,16 @@ impl Tracker for CatalogChecked<'_> {
         self.record(&finding.record)?;
         self.tracker.add_finding(finding)
     }
+    /// The project only: the record is in the other tier, which the router
+    /// checked (routing spec §2.5).
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        self.project(&finding.project)?;
+        self.tracker.add_finding_checked(finding, record)
+    }
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
         self.tracker.get_finding(id)
     }
@@ -610,6 +630,13 @@ mod tests {
         fn add_finding(&self, _: Finding) -> Result<FindingId, StoreError> {
             unreachable!("the binding must refuse before the tracker is asked")
         }
+        fn add_finding_checked(
+            &self,
+            _: Finding,
+            _: ForeignRecord,
+        ) -> Result<FindingId, StoreError> {
+            unreachable!("the binding must refuse before the tracker is asked")
+        }
         fn get_finding(&self, _: &FindingId) -> Result<Option<Finding>, StoreError> {
             unreachable!("not used")
         }
@@ -690,6 +717,39 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    // A split binding checks the project of a checked reference — and no
+    // record: the reference is to the other tier.
+    #[test]
+    fn a_split_binding_checks_only_the_project_of_a_checked_reference() {
+        use crate::routing::{ForeignRecord, Tier};
+        let catalog = MemStore::default();
+        let url = RecordId(Iri::parse("https://github.com/acme/widgets/issues/7").unwrap());
+        let refuses = CatalogChecked {
+            catalog: &catalog,
+            tracker: &NeverAsked,
+        };
+        let stranger = ProjectId(seq_iri(99));
+        let err = refuses
+            .add_finding_checked(
+                Finding::raise(stranger, url.clone(), "a", "c"),
+                ForeignRecord::for_tests(url.clone(), "t", Tier::Github),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+        let p = catalog.add_project("/p").unwrap();
+        let passes = CatalogChecked {
+            catalog: &catalog,
+            tracker: &catalog,
+        };
+        let id = passes
+            .add_finding_checked(
+                Finding::raise(p, url.clone(), "a", "c"),
+                ForeignRecord::for_tests(url.clone(), "t", Tier::Github),
+            )
+            .unwrap();
+        assert_eq!(catalog.get_finding(&id).unwrap().unwrap().record, url);
     }
 
     #[test]

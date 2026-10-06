@@ -127,6 +127,13 @@ The block is fl's record of the protocol, and the state in it is the item's stat
 names are `snake_case`. A block with a field this fl does not know, with text after it, or of
 another `fl_format` is refused, never half-read.
 
+A finding whose record lives in the project's local store — possible when the project routes
+its items between the two — names the record in its block as `{"id": "urn:uuid:…", "title":
+"…"}`, with no `node_id`, since no issue holds it, and the issue shows a line `Record: <title> —
+<id>, held in the local tier, not on GitHub.` A reader on GitHub sees the title and the id; fl
+resolves the id in the local store. On a repository that is not private, raising such a finding
+publishes the record's title, and fl warns before it does.
+
 Open or closed is a projection that fl writes and never reads state from. A record in `done`
 and a finding in `fixed` are closed as completed; a finding in `withdrawn` is closed as not
 planned; every other state is open. Closing or reopening an issue by hand does not change its

@@ -3,7 +3,7 @@ use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
-use crate::routing::{Routes, RoutingMap};
+use crate::routing::{ForeignRecord, Routes, RoutingMap, check_foreign_for_local};
 use crate::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use std::cell::RefCell;
@@ -324,6 +324,22 @@ impl Tracker for MemStore {
         let mut finding = finding;
         finding.id = id.clone();
         finding.record = RecordId(record_primary);
+        s.findings.insert(id.0.clone(), finding);
+        Ok(id)
+    }
+
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(&finding.project.0, Kind::Project)?;
+        check_foreign_for_local(&record, s.check(record.id().iri()).is_ok())?;
+        let id = FindingId(s.mint(Kind::Finding));
+        let mut finding = finding;
+        finding.id = id.clone();
+        finding.record = record.id().clone();
         s.findings.insert(id.0.clone(), finding);
         Ok(id)
     }
@@ -734,6 +750,43 @@ mod tests {
         );
         assert_eq!(s.cutover("R_1").unwrap(), Some(entry_iri(3)));
         assert_eq!(s.cutover("R_2").unwrap(), None);
+    }
+
+    // Routing spec §2.5: a local store keeps a GitHub record's reference
+    // only through the router's proof, and never for a record it holds.
+    #[test]
+    fn a_memory_store_keeps_a_checked_reference_to_a_github_record() {
+        use crate::routing::{ForeignRecord, Tier};
+        let s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let url = RecordId(Iri::parse("https://github.com/acme/widgets/issues/7").unwrap());
+        // Raised against the placeholder: the stored reference must come
+        // from the proof.
+        let f = Finding::raise(p.clone(), RecordId(seq_iri(0)), "rev", "claim");
+        let id = s
+            .add_finding_checked(
+                f.clone(),
+                ForeignRecord::for_tests(url.clone(), "t", Tier::Github),
+            )
+            .unwrap();
+        assert_eq!(s.get_finding(&id).unwrap().unwrap().record, url);
+        let err = s
+            .add_finding_checked(f.clone(), ForeignRecord::for_tests(url, "t", Tier::Local))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is a record in the local tier, so a finding about it"),
+            "{err}"
+        );
+        let held = s.add_record(&p, "t").unwrap();
+        let err = s
+            .add_finding_checked(f, ForeignRecord::for_tests(held, "t", Tier::Github))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is held by this store, so a finding about it"),
+            "{err}"
+        );
     }
 
     #[test]

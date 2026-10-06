@@ -11,6 +11,7 @@ use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::model::{Record, State};
+use fl_core::routing::{ForeignRecord, Tier};
 use fl_core::store::{Bindings, Handles, StoreError, Tracker};
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -1846,6 +1847,23 @@ impl GithubTracker {
     }
 }
 
+/// The block of a new finding about `record` (spec §3.1).
+fn finding_meta(finding: &Finding, record: RecordRef) -> Meta {
+    let mut meta = Meta::new(
+        ItemKind::Finding,
+        finding.state.as_wire(),
+        finding.project.clone(),
+    );
+    meta.record = Some(record);
+    meta.area = finding.area.clone();
+    meta.reproduction = finding.reproduction.clone();
+    meta.raised_by = Some(finding.raised_by.clone());
+    meta.assigned_to = finding.assigned_to.clone();
+    meta.withdrawn_reason = finding.withdrawn_reason.clone();
+    meta.security = finding.security;
+    meta
+}
+
 impl Tracker for GithubTracker {
     fn add_record_with_area(
         &self,
@@ -1908,22 +1926,47 @@ impl Tracker for GithubTracker {
         if finding.security {
             self.require_private()?;
         }
-        let mut meta = Meta::new(
-            ItemKind::Finding,
-            finding.state.as_wire(),
-            finding.project.clone(),
+        let meta = finding_meta(
+            &finding,
+            RecordRef {
+                id: record.url.clone(),
+                node_id: Some(record.node_id.clone()),
+                title: None,
+            },
         );
-        meta.record = Some(RecordRef {
-            id: record.url.clone(),
-            node_id: Some(record.node_id.clone()),
-            title: None,
-        });
-        meta.reproduction = finding.reproduction.clone();
-        meta.raised_by = Some(finding.raised_by.clone());
-        meta.assigned_to = finding.assigned_to.clone();
-        meta.withdrawn_reason = finding.withdrawn_reason.clone();
-        meta.security = finding.security;
-        meta.area = finding.area.clone();
+        let title = meta::title_of(&finding.claim);
+        Ok(FindingId(
+            self.create(ItemKind::Finding, &title, &finding.claim, &meta)?
+                .url,
+        ))
+    }
+
+    /// A finding about a record in the project's local tier (routing spec
+    /// §2.5): its block carries `{id, title}` and no node id (decision 14),
+    /// and the issue shows the record as text.
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        if record.tier() != Tier::Local {
+            return Err(backend(format!(
+                "{} is a record on GitHub, so a finding about it is raised with `add_finding`, \
+                 which checks it here",
+                record.id()
+            )));
+        }
+        if finding.security {
+            self.require_private()?;
+        }
+        let meta = finding_meta(
+            &finding,
+            RecordRef {
+                id: record.id().iri().clone(),
+                node_id: None,
+                title: Some(record.title().to_string()),
+            },
+        );
         let title = meta::title_of(&finding.claim);
         Ok(FindingId(
             self.create(ItemKind::Finding, &title, &finding.claim, &meta)?
@@ -2344,6 +2387,91 @@ mod tests {
             listed,
             "a label this process knows is not listed again"
         );
+    }
+
+    // Routing spec §2.5, decision 14: a GitHub finding about a local record
+    // names it as text and carries `{id, title}`; it reads back as the
+    // claim, and keeps all of it through an update.
+    #[test]
+    fn a_finding_about_a_local_record_reads_back_and_survives_an_update() {
+        use fl_core::routing::{ForeignRecord, Tier};
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let local = RecordId(Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000042").unwrap());
+        let mut f = Finding::raise(p(), local.clone(), "rev", "the claim");
+        f.area = Some("design".into());
+        let id = t
+            .add_finding_checked(
+                f,
+                ForeignRecord::for_tests(local.clone(), "@alice fix", Tier::Local),
+            )
+            .unwrap();
+        let body = fake.issue(1).body;
+        let text = &body[..body.rfind(meta::META_OPEN).unwrap()];
+        assert!(
+            text.contains("held in the local tier, not on GitHub"),
+            "{text}"
+        );
+        assert!(!text.contains("@alice"), "{text}");
+        assert!(body.contains("\"fl_format\":2"), "{body}");
+        assert!(
+            body.contains(
+                "\"record\":{\"id\":\"urn:uuid:00000000-0000-7000-8000-000000000042\",\
+                 \"title\":\"@alice fix\"}"
+            ),
+            "{body}"
+        );
+        let back = t.get_finding(&id).unwrap().unwrap();
+        assert_eq!(
+            (back.record.clone(), back.claim.as_str()),
+            (local.clone(), "the claim")
+        );
+        let mut back = back;
+        back.attach_reproduction(fl_core::ids::GateId(seq_iri(5)))
+            .unwrap();
+        t.update_finding(&back).unwrap();
+        let again = open(&fake).get_finding(&id).unwrap().unwrap();
+        assert_eq!(
+            (again.record, again.claim.as_str()),
+            (local.clone(), "the claim")
+        );
+        assert!(
+            fake.issue(1)
+                .body
+                .contains("held in the local tier, not on GitHub")
+        );
+        // A security finding still goes only to a private repository (spec §6).
+        fake.state().repos[0].visibility = "public".into();
+        let mut secret = Finding::raise(p(), local.clone(), "rev", "secret");
+        secret.security = true;
+        let err = t
+            .add_finding_checked(secret, ForeignRecord::for_tests(local, "t", Tier::Local))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::SecurityNotPrivate { .. }),
+            "{err:?}"
+        );
+        assert_eq!(fake.issue_count(), 1, "nothing created");
+    }
+
+    #[test]
+    fn a_checked_reference_to_a_github_record_is_refused() {
+        use fl_core::routing::{ForeignRecord, Tier};
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let err = t
+            .add_finding_checked(
+                Finding::raise(p(), r.clone(), "rev", "c"),
+                ForeignRecord::for_tests(r, "t", Tier::Github),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is a record on GitHub, so a finding about it"),
+            "{err}"
+        );
+        assert_eq!(fake.issue_count(), 1, "nothing created");
     }
 
     #[test]

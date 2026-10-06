@@ -32,7 +32,7 @@ pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
-pub use routing::{AreaRoute, Routes, RoutingMap, Tier};
+pub use routing::{AreaRoute, ForeignRecord, Routes, RoutingMap, Tier};
 pub use split::{
     Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,
     RemoteLedger, SplitLedger,

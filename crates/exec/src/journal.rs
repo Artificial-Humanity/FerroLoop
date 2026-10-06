@@ -9,6 +9,7 @@ use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{Record, State};
+use fl_core::routing::ForeignRecord;
 use fl_core::store::{Ledger, Roles, StoreError, Tracker};
 use std::cell::RefCell;
 
@@ -115,6 +116,13 @@ impl Tracker for Journal<'_> {
     }
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         self.store.add_finding(finding)
+    }
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        self.store.add_finding_checked(finding, record)
     }
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
         self.store.get_finding(id)

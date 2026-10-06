@@ -1,7 +1,7 @@
 //! Two-tier routing (routing spec §1): a project's areas, the tier each one
 //! routes a new item to, and whether it is sensitive.
 
-use crate::ids::ProjectId;
+use crate::ids::{ProjectId, RecordId};
 use crate::store::StoreError;
 use serde::{Deserialize, Serialize};
 
@@ -165,6 +165,66 @@ pub fn after_set(
 /// project has no map.
 pub trait Routes {
     fn routes(&self, project: &ProjectId) -> Result<Option<RoutingMap>, StoreError>;
+}
+
+/// A record in the OTHER tier, which the router read there before it built
+/// this (routing spec §2.5). A tracker stores a finding about a record it
+/// does not hold only with one of these — never on an id alone, which no
+/// one has checked. Only the router builds one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignRecord {
+    id: RecordId,
+    title: String,
+    tier: Tier,
+}
+
+impl ForeignRecord {
+    /// For the trackers' own tests. Not in the binary: the `conformance`
+    /// feature is a dev-dependency only.
+    #[cfg(any(test, feature = "conformance"))]
+    #[doc(hidden)]
+    pub fn for_tests(id: RecordId, title: &str, tier: Tier) -> Self {
+        Self {
+            id,
+            title: title.to_string(),
+            tier,
+        }
+    }
+
+    /// The record's primary id, as the tier that holds it answers it.
+    pub fn id(&self) -> &RecordId {
+        &self.id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// The tier that holds the record.
+    pub fn tier(&self) -> Tier {
+        self.tier
+    }
+}
+
+/// A local store's check of the proof for a finding about a record it does
+/// not hold: the record is on GitHub, and this store does not hold it (it
+/// would check one it holds itself, with `add_finding`).
+pub fn check_foreign_for_local(record: &ForeignRecord, held_here: bool) -> Result<(), StoreError> {
+    if record.tier() == Tier::Local {
+        return Err(StoreError::Backend(format!(
+            "{} is a record in the local tier, so a finding about it is raised with \
+             `add_finding`, which checks it there",
+            record.id()
+        )));
+    }
+    if held_here {
+        return Err(StoreError::Backend(format!(
+            "{} is held by this store, so a finding about it is raised with `add_finding`, \
+             which checks it here",
+            record.id()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

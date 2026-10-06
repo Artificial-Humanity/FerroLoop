@@ -762,6 +762,13 @@ mod tests {
         fn add_finding(&self, _: Finding) -> Result<FindingId, StoreError> {
             Err(broken())
         }
+        fn add_finding_checked(
+            &self,
+            _: Finding,
+            _: fl_core::routing::ForeignRecord,
+        ) -> Result<FindingId, StoreError> {
+            Err(broken())
+        }
         fn get_finding(&self, _: &FindingId) -> Result<Option<Finding>, StoreError> {
             Err(broken())
         }
