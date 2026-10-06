@@ -1812,10 +1812,10 @@ impl GithubTracker {
         }
     }
 
-    /// Spec §6: only a `private` repository may hold a security finding.
-    /// Read live, every time — visibility can change — and a failed read is
-    /// an ERROR: an unknown visibility is not a pass.
-    fn require_private(&self) -> Result<(), StoreError> {
+    /// The repository's visibility — `private`, `internal` or `public` —
+    /// read live, every time: visibility can change. ⚠ An answer that
+    /// cannot be read is an error: an unknown visibility is not private.
+    pub fn visibility(&self) -> Result<String, StoreError> {
         let r = self.client.send(
             Method::Get,
             &format!("/repos/{}", self.repo.full_name),
@@ -1823,26 +1823,71 @@ impl GithubTracker {
         )?;
         let refuse = |why: String| {
             backend(format!(
-                "fl could not read the visibility of {} ({why}), so it will not write a \
-                 security finding there. Retry, or use a local tracker",
+                "fl could not read the visibility of {} ({why}), and an unknown visibility is \
+                 not private. Retry",
                 self.repo.full_name
             ))
         };
         if r.status != 200 {
             return Err(refuse(format!("GitHub answered {}", r.status)));
         }
-        let visibility = r
-            .body
+        r.body
             .get("visibility")
             .and_then(Value::as_str)
-            .ok_or_else(|| refuse("the answer names no visibility".into()))?;
+            .map(str::to_string)
+            .ok_or_else(|| refuse("the answer names no visibility".into()))
+    }
+
+    /// Spec §6: only a `private` repository may hold a security finding.
+    pub fn require_private(&self) -> Result<(), StoreError> {
+        let visibility = self.visibility()?;
         if visibility == "private" {
             Ok(())
         } else {
             Err(StoreError::SecurityNotPrivate {
                 repo: self.repo.full_name.clone(),
-                visibility: visibility.to_string(),
+                visibility,
             })
+        }
+    }
+
+    /// Every fl item of `project` whose block names `area` (routing spec
+    /// §1.2), found by reading every issue's block — labelled or not — so an
+    /// item that lost its labels is not missed. An issue without an fl
+    /// label whose block cannot be read is not fl's, and is passed over.
+    /// ⚠ One WITH an fl label whose block cannot be read is an error: it
+    /// may name the area.
+    pub fn items_in_area(
+        &self,
+        project: &ProjectId,
+        area: &str,
+    ) -> Result<Vec<(Kind, Iri)>, StoreError> {
+        let mut out = Vec::new();
+        let mut unreadable = None;
+        self.each_issue(None, Order::OldestFirst, LIST_PAGE, |node| {
+            let issue = IssueView::from_graphql(node)?;
+            match meta::parse_body(&issue.body) {
+                Ok((_, m)) => {
+                    if m.project == *project && m.area.as_deref() == Some(area) {
+                        out.push((m.kind.as_kind(), issue.url.clone()));
+                    }
+                }
+                Err(e) if issue.labels.iter().any(|l| l.starts_with("fl:")) => {
+                    unreadable = Some(backend(format!(
+                        "{} carries an fl label, but its body {e}, so fl cannot tell whether it \
+                         names the area `{area}`. Restore its block from the issue's edit \
+                         history, or remove its fl labels",
+                        issue.url
+                    )));
+                    return Ok(false);
+                }
+                Err(_) => {}
+            }
+            Ok(true)
+        })?;
+        match unreadable {
+            Some(e) => Err(e),
+            None => Ok(out),
         }
     }
 }
@@ -4436,5 +4481,67 @@ mod tests {
         fn the_github_tracker_meets_the_all_roles_contract() {
             conformance::all_roles(split);
         }
+    }
+
+    // Routing spec §1.2: GitHub items are found by their blocks, so an item
+    // that lost its labels is not missed, and an issue that is not fl's is
+    // passed over.
+    #[test]
+    fn items_in_an_area_are_found_by_their_block_labelled_or_not() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record_with_area(&p(), "a", Some("code")).unwrap();
+        t.add_record_with_area(&p(), "b", Some("design")).unwrap();
+        let mut f = Finding::raise(p(), r, "rev", "c");
+        f.area = Some("code".into());
+        t.add_finding(f).unwrap();
+        t.add_record_with_area(&ProjectId(seq_iri(2)), "other", Some("code"))
+            .unwrap();
+        let plain = fake.plain_issue(&[], false);
+        fake.web_edit(plain, |i| i.body = "quoting <!-- fl:meta\n{broken".into());
+        fake.web_edit(1, |i| i.labels.clear());
+        let found = t.items_in_area(&p(), "code").unwrap();
+        assert_eq!(
+            found,
+            vec![
+                (Kind::Record, t.issue_url(1)),
+                (Kind::Finding, t.issue_url(3))
+            ]
+        );
+        assert!(t.items_in_area(&p(), "ops").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_fl_labelled_issue_whose_block_cannot_be_read_refuses_the_area_scan() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record_with_area(&p(), "a", Some("code")).unwrap();
+        fake.web_edit(1, |i| i.body = "<!-- fl:meta\n{broken".into());
+        let err = t.items_in_area(&p(), "design").unwrap_err().to_string();
+        assert!(err.contains("carries an fl label, but its body"), "{err}");
+    }
+
+    #[test]
+    fn the_visibility_is_read_live_and_only_private_holds_a_security_item() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        assert_eq!(t.visibility().unwrap(), "private");
+        t.require_private().unwrap();
+        for v in ["internal", "public"] {
+            fake.state().repos[0].visibility = v.into();
+            assert_eq!(t.visibility().unwrap(), v);
+            assert!(
+                matches!(
+                    t.require_private(),
+                    Err(StoreError::SecurityNotPrivate { .. })
+                ),
+                "{v}"
+            );
+        }
+        fake.state().omit_visibility = true;
+        assert!(
+            t.visibility().is_err(),
+            "an unknown visibility is not private"
+        );
     }
 }

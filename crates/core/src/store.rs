@@ -5,7 +5,7 @@ use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
-use crate::routing::ForeignRecord;
+use crate::routing::{ForeignRecord, RoutingFault};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -187,6 +187,9 @@ pub enum StoreError {
     /// ledger spec §3.5, §7).
     #[error("{0}")]
     Ledger(#[from] LedgerFault),
+    /// ⚠ The routing tracker refused (routing spec §4).
+    #[error("{0}")]
+    Routing(#[from] RoutingFault),
     /// ⚠ A decision may rest only on entries it publishes or that are
     /// already published (ruling 8).
     #[error(

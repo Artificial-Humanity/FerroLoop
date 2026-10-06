@@ -1,8 +1,9 @@
 //! Two-tier routing (routing spec §1): a project's areas, the tier each one
 //! routes a new item to, and whether it is sensitive.
 
-use crate::ids::{ProjectId, RecordId};
-use crate::store::StoreError;
+use crate::ids::{Kind, ProjectId, RecordId};
+use crate::iri::Iri;
+use crate::store::{StoreError, Tracker};
 use serde::{Deserialize, Serialize};
 
 /// One of a routed project's two trackers (routing spec decision 8): the
@@ -227,6 +228,105 @@ pub fn check_foreign_for_local(record: &ForeignRecord, held_here: bool) -> Resul
     Ok(())
 }
 
+/// Why the router refused (routing spec §4): each names its cause and what
+/// to do.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RoutingFault {
+    #[error(
+        "project {project} declares no areas, so fl cannot route its items. Run `fl routing set \
+         --project <project> <area> <tier>` to declare one"
+    )]
+    Unrouted { project: ProjectId },
+    #[error(
+        "a routed project needs an area for every new item: name one with `--area`. The \
+         declared areas: {}",
+        list(declared)
+    )]
+    NoArea { declared: Vec<String> },
+    #[error(
+        "the finding's record {record} has no area to inherit, so name the finding's area with \
+         `--area`. The declared areas: {}",
+        list(declared)
+    )]
+    NothingToInherit {
+        record: RecordId,
+        declared: Vec<String>,
+    },
+    #[error(
+        "`{area}` is not an area this project declares. The declared areas: {}; `fl routing \
+         set` declares a new one",
+        list(declared)
+    )]
+    Undeclared { area: String, declared: Vec<String> },
+    #[error(
+        "the `{}` tier is not available on this machine: {why}. fl never puts an item in the \
+         other tier by itself",
+        tier.as_wire()
+    )]
+    TierUnavailable { tier: Tier, why: String },
+    #[error(
+        "the `{}` tier could not be read ({cause}), so fl refuses the whole list rather than \
+         show part of it. Read one tier with `--tier local`",
+        tier.as_wire()
+    )]
+    TierUnreadable { tier: Tier, cause: String },
+    #[error(
+        "{id} is not held by any tier this machine can read (searched: {}). A local item lives \
+         in one store on one machine: it is held in another machine's local tier, or it does \
+         not exist",
+        list(searched)
+    )]
+    Elsewhere { id: Iri, searched: Vec<String> },
+    #[error(
+        "refused: {what} is security-sensitive, and the routing map sends it to {repo}, whose \
+         visibility is `{visibility}`. Raise it with `--tier local`, or bind a private \
+         repository; fl never moves it to the local tier by itself"
+    )]
+    SensitiveToPublic {
+        what: String,
+        repo: String,
+        visibility: String,
+    },
+}
+
+/// Names for a refusal, or `none`.
+fn list(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
+/// The GitHub tier as the router sees it (routing spec §2.6): the CLI
+/// opens the tracker on the first call that needs it, so work on local
+/// items needs no network and no credential.
+pub trait GithubTier {
+    /// Whether this machine binds a GitHub repository for the project
+    /// (routing spec §1.3). No request.
+    fn available(&self) -> bool;
+    /// Whether `id` names an issue of the bound repository, by its form
+    /// alone. No request.
+    fn claims(&self, id: &Iri) -> bool;
+    /// Whether `id` has the form of a GitHub issue URL, of any repository.
+    /// No request. With no binding, such an id is refused as the missing
+    /// tier, never as held elsewhere (routing spec §1.3).
+    fn issue_form(&self, id: &Iri) -> bool;
+    /// The tracker, opened on the first call. ⚠ An error — with no
+    /// binding, `TierUnavailable` — never a tracker that answers nothing.
+    fn tracker(&self) -> Result<&dyn Tracker, StoreError>;
+    /// `Ok` only when the repository is private (GitHub tracker spec §6);
+    /// otherwise `SecurityNotPrivate`.
+    fn require_private(&self) -> Result<(), StoreError>;
+    /// Every item of `project` whose block names `area`, labelled or not
+    /// (routing spec §1.2).
+    fn items_in_area(
+        &self,
+        project: &ProjectId,
+        area: &str,
+    ) -> Result<Vec<(Kind, Iri)>, StoreError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +444,78 @@ mod tests {
         assert!(
             json.starts_with("[{\"area\":\"code\",\"tier\":\"local\",\"sensitive\":false}"),
             "{json}"
+        );
+    }
+
+    // Routing spec §4: every refusal names its cause and what to do.
+    #[test]
+    fn every_routing_refusal_names_its_remedy() {
+        use crate::ids::seq_iri;
+        let declared = vec!["code".to_string(), "design".to_string()];
+        for (fault, phrase) in [
+            (
+                RoutingFault::Unrouted {
+                    project: ProjectId(seq_iri(1)),
+                },
+                "fl routing set",
+            ),
+            (
+                RoutingFault::NoArea {
+                    declared: declared.clone(),
+                },
+                "code, design",
+            ),
+            (
+                RoutingFault::NothingToInherit {
+                    record: RecordId(seq_iri(2)),
+                    declared: declared.clone(),
+                },
+                "`--area`",
+            ),
+            (
+                RoutingFault::Undeclared {
+                    area: "ops".into(),
+                    declared: declared.clone(),
+                },
+                "code, design",
+            ),
+            (
+                RoutingFault::TierUnavailable {
+                    tier: Tier::Github,
+                    why: "w".into(),
+                },
+                "never puts an item in the other tier",
+            ),
+            (
+                RoutingFault::TierUnreadable {
+                    tier: Tier::Github,
+                    cause: "c".into(),
+                },
+                "--tier local",
+            ),
+            (
+                RoutingFault::Elsewhere {
+                    id: seq_iri(3),
+                    searched: vec!["s".into()],
+                },
+                "another machine's local tier",
+            ),
+            (
+                RoutingFault::SensitiveToPublic {
+                    what: "this finding".into(),
+                    repo: "acme/widgets".into(),
+                    visibility: "public".into(),
+                },
+                "--tier local",
+            ),
+        ] {
+            let msg = StoreError::from(fault).to_string();
+            assert!(msg.contains(phrase), "{msg}");
+        }
+        assert!(
+            RoutingFault::NoArea { declared: vec![] }
+                .to_string()
+                .contains("none")
         );
     }
 }

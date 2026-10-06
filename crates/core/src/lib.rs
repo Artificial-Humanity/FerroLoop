@@ -13,6 +13,9 @@ pub mod ids;
 pub mod iri;
 pub mod log;
 pub mod mem;
+#[cfg(any(test, feature = "conformance"))]
+#[doc(hidden)]
+pub mod mem_issues;
 pub mod model;
 pub mod routing;
 pub mod split;
@@ -32,7 +35,7 @@ pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
-pub use routing::{AreaRoute, ForeignRecord, Routes, RoutingMap, Tier};
+pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use split::{
     Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,
     RemoteLedger, SplitLedger,
