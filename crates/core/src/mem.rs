@@ -233,7 +233,12 @@ impl Catalog for MemStore {
 }
 
 impl Tracker for MemStore {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
         let mut s = self.inner.borrow_mut();
         s.check_kind(&project.0, Kind::Project)?;
         let id = RecordId(s.mint(Kind::Record));
@@ -245,6 +250,7 @@ impl Tracker for MemStore {
                 title: title.to_string(),
                 state: State::Todo,
                 also_known_as: vec![],
+                area: area.map(str::to_string),
             },
         );
         Ok(id)
@@ -318,11 +324,17 @@ impl Tracker for MemStore {
             return Err(StoreError::NoSuchFinding(finding.id.clone()));
         }
         // The stored `also_known_as` is kept and the caller's ignored (see
-        // the trait): only `add_alias` adds a name.
-        let also_known_as = s.findings[&target].also_known_as.clone();
+        // the trait): only `add_alias` adds a name. The record, the raiser,
+        // the security mark and the area are fixed when the finding is
+        // raised (routing spec §1.1; GitHub tracker spec §6).
+        let kept = s.findings[&target].clone();
         let mut stored = finding.clone();
         stored.id = FindingId(target.clone());
-        stored.also_known_as = also_known_as;
+        stored.also_known_as = kept.also_known_as;
+        stored.record = kept.record;
+        stored.raised_by = kept.raised_by;
+        stored.security = kept.security;
+        stored.area = kept.area;
         s.findings.insert(target, stored);
         Ok(())
     }

@@ -95,8 +95,13 @@ impl Ledger for Journal<'_> {
 }
 
 impl Tracker for Journal<'_> {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
-        self.store.add_record(project, title)
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
+        self.store.add_record_with_area(project, title, area)
     }
     fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
         self.store.get_record(id)

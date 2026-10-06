@@ -323,7 +323,21 @@ pub trait Catalog {
 
 /// Mutable state that people discuss: records and findings.
 pub trait Tracker {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError>;
+    /// A record with no area: [`Tracker::add_record_with_area`] with
+    /// `None`. A routed project refuses it (routing spec §2.1).
+    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
+        self.add_record_with_area(project, title, None)
+    }
+    /// A record in `area` (routing spec §1.1), stored with it for good.
+    ///
+    /// ⚠ The one method an implementation writes: `add_record` reaches it,
+    /// so no wrapper can drop the area.
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError>;
     fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError>;
     fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError>;
     fn set_record_state(&self, id: &RecordId, state: State) -> Result<(), StoreError>;
@@ -443,9 +457,14 @@ impl CatalogChecked<'_> {
 }
 
 impl Tracker for CatalogChecked<'_> {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
         self.project(project)?;
-        self.tracker.add_record(project, title)
+        self.tracker.add_record_with_area(project, title, area)
     }
     fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
         self.tracker.get_record(id)
@@ -571,7 +590,12 @@ mod tests {
     /// from the binding's own check, before the tracker is reached.
     struct NeverAsked;
     impl Tracker for NeverAsked {
-        fn add_record(&self, _: &ProjectId, _: &str) -> Result<RecordId, StoreError> {
+        fn add_record_with_area(
+            &self,
+            _: &ProjectId,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<RecordId, StoreError> {
             unreachable!("the binding must refuse before the tracker is asked")
         }
         fn get_record(&self, _: &RecordId) -> Result<Option<Record>, StoreError> {

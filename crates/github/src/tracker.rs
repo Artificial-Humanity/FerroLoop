@@ -533,9 +533,10 @@ impl GithubTracker {
     }
 
     fn remember(&self, n: u64, meta: &Meta, prose: &str, title: &str) {
-        self.seen
-            .borrow_mut()
-            .insert(n, (meta.clone(), prose.to_string(), title.to_string()));
+        self.seen.borrow_mut().insert(
+            n,
+            (meta.clone().sealed(), prose.to_string(), title.to_string()),
+        );
     }
 
     pub fn issue_url(&self, number: u64) -> Iri {
@@ -947,8 +948,8 @@ impl GithubTracker {
                 meta.state
             )));
         }
-        self.ensure_labels(None)?;
-        let labels = vec![meta::kind_label(kind), meta::state_label(kind, &meta.state)];
+        self.ensure_labels(meta.area.as_deref())?;
+        let labels = meta::labels_after(&[], kind, &meta.state, meta.area.as_deref());
         let body = meta::render_body(prose, meta);
         // ⚠ No labels in the create: they are added afterward, by their own
         // call (`label_created`). Measured live on 2026-10-05: labels set in the
@@ -1709,6 +1710,7 @@ impl GithubTracker {
             title: issue.title.clone(),
             state,
             also_known_as: meta.also_known_as.clone(),
+            area: meta.area.clone(),
         })
     }
 
@@ -1744,6 +1746,7 @@ impl GithubTracker {
             withdrawn_reason: meta.withdrawn_reason.clone(),
             also_known_as: meta.also_known_as.clone(),
             security: meta.security,
+            area: meta.area.clone(),
         })
     }
 
@@ -1844,8 +1847,14 @@ impl GithubTracker {
 }
 
 impl Tracker for GithubTracker {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
-        let meta = Meta::new(ItemKind::Record, State::Todo.as_wire(), project.clone());
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
+        let mut meta = Meta::new(ItemKind::Record, State::Todo.as_wire(), project.clone());
+        meta.area = area.map(str::to_string);
         Ok(RecordId(
             self.create(ItemKind::Record, title, "", &meta)?.url,
         ))
@@ -1914,6 +1923,7 @@ impl Tracker for GithubTracker {
         meta.assigned_to = finding.assigned_to.clone();
         meta.withdrawn_reason = finding.withdrawn_reason.clone();
         meta.security = finding.security;
+        meta.area = finding.area.clone();
         let title = meta::title_of(&finding.claim);
         Ok(FindingId(
             self.create(ItemKind::Finding, &title, &finding.claim, &meta)?
@@ -2262,6 +2272,78 @@ mod tests {
         assert_eq!(back.record.iri(), &local);
         assert_eq!(back.claim, "claim");
         assert_eq!(graphql(&fake), before, "no node lookup for a local record");
+    }
+
+    // Routing spec §1.1: the area is a field of the block and an fl label,
+    // created the first time an item with that area is made here.
+    #[test]
+    fn an_item_made_with_an_area_carries_it_in_its_block_and_as_a_label() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t
+            .add_record_with_area(&p(), "fix it", Some("code"))
+            .unwrap();
+        let issue = fake.issue(1);
+        assert_eq!(
+            issue.labels,
+            vec!["fl:record", "fl:record/todo", "fl:area/code"]
+        );
+        assert!(
+            issue.body.contains("\"fl_format\":2") && issue.body.contains("\"area\":\"code\""),
+            "{}",
+            issue.body
+        );
+        // ⚠ Counted, not looked up: the fake also records a label an issue
+        // write applies, so only the create request proves fl made it first.
+        assert_eq!(
+            label_creates(&fake),
+            meta::all_labels().len() + 1,
+            "every kind and state label, and the area's"
+        );
+        // ⚠ Written before any read of the item: a read replaces what fl
+        // remembers of its create, which is what this write must not
+        // conflict with. What fl remembers of the create is sealed as the
+        // block is, so the write is not a conflict.
+        t.set_record_state(&r, State::Doing).unwrap();
+        assert!(fake.issue(1).labels.contains(&"fl:area/code".to_string()));
+        assert_eq!(
+            t.get_record(&r).unwrap().unwrap().area.as_deref(),
+            Some("code")
+        );
+        let mut f = Finding::raise(p(), r, "rev", "claim");
+        f.area = Some("design".into());
+        let fid = t.add_finding(f.clone()).unwrap();
+        assert!(fake.issue(2).labels.contains(&"fl:area/design".to_string()));
+        // The same holds for a finding: written before it is read.
+        f.id = fid.clone();
+        f.withdraw("no").unwrap();
+        t.update_finding(&f).unwrap();
+        let back = t.get_finding(&fid).unwrap().unwrap();
+        assert_eq!(back.area.as_deref(), Some("design"));
+        assert_eq!(back.state, FindingState::Withdrawn);
+    }
+
+    #[test]
+    fn an_area_label_is_created_once_per_process() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record_with_area(&p(), "a", Some("code")).unwrap();
+        let created = label_creates(&fake);
+        let lists = |f: &FakeGithub| {
+            f.state()
+                .requests
+                .iter()
+                .filter(|r| r.starts_with("GET /repos/acme/widgets/labels"))
+                .count()
+        };
+        let listed = lists(&fake);
+        t.add_record_with_area(&p(), "b", Some("code")).unwrap();
+        assert_eq!(label_creates(&fake), created, "not created twice");
+        assert_eq!(
+            lists(&fake),
+            listed,
+            "a label this process knows is not listed again"
+        );
     }
 
     #[test]

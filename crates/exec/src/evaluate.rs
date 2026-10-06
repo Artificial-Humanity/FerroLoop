@@ -742,7 +742,12 @@ mod tests {
     }
 
     impl Tracker for BrokenStore {
-        fn add_record(&self, _: &ProjectId, _: &str) -> Result<RecordId, StoreError> {
+        fn add_record_with_area(
+            &self,
+            _: &ProjectId,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<RecordId, StoreError> {
             Err(broken())
         }
         fn get_record(&self, _: &RecordId) -> Result<Option<Record>, StoreError> {

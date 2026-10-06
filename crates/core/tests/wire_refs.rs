@@ -122,6 +122,7 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
         title: "t".into(),
         state: State::Todo,
         also_known_as: vec![iri(5)],
+        area: None,
     };
     let mut finding = Finding::raise(p.clone(), r.clone(), "a", "c");
     finding.id = f.clone();

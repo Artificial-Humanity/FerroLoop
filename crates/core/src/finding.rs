@@ -84,6 +84,11 @@ pub struct Finding {
     /// not security.
     #[serde(default)]
     pub security: bool,
+    /// The finding's area (routing spec §1.1), fixed for its whole life.
+    /// `None` for a finding made before areas, or outside a routed project.
+    /// Skipped when absent, so such a finding is stored exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
 }
 
 impl Finding {
@@ -102,6 +107,7 @@ impl Finding {
             withdrawn_reason: None,
             also_known_as: vec![],
             security: false,
+            area: None,
         }
     }
 
@@ -158,6 +164,18 @@ mod tests {
             "reviewer",
             "off-by-one on an empty slice",
         )
+    }
+
+    // Routing spec §1.1: an item written before areas reads as having none,
+    // and an item without one is stored as before.
+    #[test]
+    fn a_finding_without_an_area_is_stored_as_before_and_reads_as_none() {
+        let f = Finding::raise(ProjectId(seq_iri(1)), RecordId(seq_iri(2)), "a", "c");
+        assert_eq!(f.area, None, "raise sets no area");
+        let v = serde_json::to_value(&f).unwrap();
+        assert!(v.get("area").is_none(), "skipped when absent: {v}");
+        let back: Finding = serde_json::from_value(v).unwrap();
+        assert_eq!(back.area, None);
     }
 
     #[test]

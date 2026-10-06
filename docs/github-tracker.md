@@ -108,6 +108,12 @@ fl creates the labels it needs — one kind label and one label per state, for r
 findings — the first time a command writes, with the description "managed by fl". It never
 relies on GitHub creating a label as a side effect of a write.
 
+An item of a project that routes its items between its local store and GitHub carries a third
+fl label, `fl:area/<name>`, naming its area. fl creates an area's label the first time it makes
+an item with that area, keeps it through every write and repair, and never deletes it. The area
+is also a field of the block below; a block that carries one is written as `fl_format` 2, which
+an older fl refuses as a newer format rather than reading half of it.
+
 The fields a label cannot hold are kept in a metadata block at the very end of the body, an
 HTML comment GitHub does not render. For a finding it looks like this, the JSON on one line:
 

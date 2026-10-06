@@ -168,6 +168,7 @@ mod tests {
             title: "t".into(),
             state: State::Review,
             also_known_as: vec![],
+            area: None,
         };
         let transitions = vec![
             TransitionReport {

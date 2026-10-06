@@ -79,6 +79,13 @@ pub const FORMAT_WITH_IMPORTS: u64 = 3;
 /// and 4. A format is only ever raised (`raise_format`).
 pub const FORMAT_WITH_LEDGER_ROOT: u64 = 4;
 
+/// ⚠ The format of a store that holds a routing map or an item with an
+/// area (routing spec §1.4). An older fl would read such an item and drop
+/// its area — or route nothing — so the first such write raises the store
+/// to 5 in the same transaction, and an older fl refuses it. This build
+/// opens 2 to 5. A store that never routes stays where it was.
+pub const FORMAT_WITH_ROUTING: u64 = 5;
+
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
 const LEDGER_ROOTS: TableDefinition<&str, &str> = TableDefinition::new("ledger_roots");
@@ -313,12 +320,13 @@ impl RedbStore {
             Some(Some(v))
                 if v == FORMAT_VERSION
                     || v == FORMAT_WITH_IMPORTS
-                    || v == FORMAT_WITH_LEDGER_ROOT => {}
+                    || v == FORMAT_WITH_LEDGER_ROOT
+                    || v == FORMAT_WITH_ROUTING => {}
             Some(v) => {
                 return Err(StoreError::FormatVersion {
                     found: v,
                     oldest: FORMAT_VERSION,
-                    newest: FORMAT_WITH_LEDGER_ROOT,
+                    newest: FORMAT_WITH_ROUTING,
                 });
             }
         }
@@ -355,10 +363,11 @@ impl RedbStore {
         &self,
         kind: Kind,
         table: TableDefinition<&str, &str>,
+        raise: Option<u64>,
         build: impl FnOnce(Iri) -> T,
     ) -> Result<Iri, StoreError> {
         let id = Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).map_err(backend)?;
-        self.insert_new_with_id(id, kind, table, build)
+        self.insert_new_with_id(id, kind, table, raise, build)
     }
 
     /// Mint, index, hand out a handle, and write the row — in ONE write
@@ -379,6 +388,7 @@ impl RedbStore {
         id: Iri,
         kind: Kind,
         table: TableDefinition<&str, &str>,
+        raise: Option<u64>,
         build: impl FnOnce(Iri) -> T,
     ) -> Result<Iri, StoreError> {
         let json = serde_json::to_string(&build(id.clone())).map_err(backend)?;
@@ -388,6 +398,9 @@ impl RedbStore {
             .map_err(backend)?
             .insert(id.as_str(), json.as_str())
             .map_err(backend)?;
+        if let Some(to) = raise {
+            raise_format(&tx, to)?;
+        }
         tx.commit().map_err(backend)?;
         Ok(id)
     }
@@ -808,7 +821,7 @@ impl RedbStore {
 
 impl Catalog for RedbStore {
     fn add_project(&self, root: &str) -> Result<ProjectId, StoreError> {
-        let id = self.insert_new(Kind::Project, PROJECTS, |id| Project {
+        let id = self.insert_new(Kind::Project, PROJECTS, None, |id| Project {
             id: ProjectId(id),
             root: root.to_string(),
         })?;
@@ -836,7 +849,7 @@ impl Catalog for RedbStore {
     ) -> Result<GateId, StoreError> {
         self.check_kind(project.iri(), Kind::Project)?;
         self.refuse_if_imported(project, "add a gate to")?;
-        let id = self.insert_new(Kind::Gate, GATES, |id| GateDef {
+        let id = self.insert_new(Kind::Gate, GATES, None, |id| GateDef {
             id: GateId(id),
             project: project.clone(),
             name: name.to_string(),
@@ -936,14 +949,21 @@ impl Catalog for RedbStore {
 }
 
 impl Tracker for RedbStore {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
         self.check_kind(project.iri(), Kind::Project)?;
-        let id = self.insert_new(Kind::Record, RECORDS, |id| Record {
+        let raise = area.map(|_| FORMAT_WITH_ROUTING);
+        let id = self.insert_new(Kind::Record, RECORDS, raise, |id| Record {
             id: RecordId(id),
             project: project.clone(),
             title: title.to_string(),
             state: State::Todo,
             also_known_as: vec![],
+            area: area.map(str::to_string),
         })?;
         Ok(RecordId(id))
     }
@@ -983,7 +1003,8 @@ impl Tracker for RedbStore {
                 found: record_kind,
             });
         }
-        let id = self.insert_new(Kind::Finding, FINDINGS, |id| {
+        let raise = finding.area.as_ref().map(|_| FORMAT_WITH_ROUTING);
+        let id = self.insert_new(Kind::Finding, FINDINGS, raise, |id| {
             let mut finding = finding;
             finding.id = FindingId(id);
             finding.record = RecordId(record_primary);
@@ -1010,10 +1031,15 @@ impl Tracker for RedbStore {
         // The stored `also_known_as` is kept and the caller's ignored (see
         // the trait): only `add_alias` adds a name.
         let primary = stored.id.clone();
-        let also_known_as = std::mem::take(&mut stored.also_known_as);
-        stored = finding.clone();
+        let kept = std::mem::replace(&mut stored, finding.clone());
         stored.id = primary.clone();
-        stored.also_known_as = also_known_as;
+        stored.also_known_as = kept.also_known_as;
+        // Fixed when the finding is raised (routing spec §1.1; GitHub
+        // tracker spec §6): the caller's copy never changes them.
+        stored.record = kept.record;
+        stored.raised_by = kept.raised_by;
+        stored.security = kept.security;
+        stored.area = kept.area;
         self.put_json(FINDINGS, primary.iri(), &stored)
     }
 
@@ -1464,13 +1490,13 @@ mod tests {
     fn a_minted_id_that_already_exists_is_refused_and_nothing_is_overwritten() {
         let (s, _d) = fresh();
         let id = Iri::parse("urn:uuid:0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b").unwrap();
-        s.insert_new_with_id(id.clone(), Kind::Project, PROJECTS, |i| Project {
+        s.insert_new_with_id(id.clone(), Kind::Project, PROJECTS, None, |i| Project {
             id: ProjectId(i),
             root: "/first".into(),
         })
         .unwrap();
         let err = s
-            .insert_new_with_id(id.clone(), Kind::Project, PROJECTS, |i| Project {
+            .insert_new_with_id(id.clone(), Kind::Project, PROJECTS, None, |i| Project {
                 id: ProjectId(i),
                 root: "/second".into(),
             })
@@ -1505,7 +1531,7 @@ mod tests {
                 StoreError::FormatVersion {
                     found: Some(1),
                     oldest: 2,
-                    newest: 4
+                    newest: FORMAT_WITH_ROUTING
                 }
             ),
             "{err:?}"
@@ -2468,13 +2494,62 @@ mod tests {
             let tx = db.begin_write().unwrap();
             tx.open_table(META)
                 .unwrap()
-                .insert(FORMAT_KEY, FORMAT_WITH_LEDGER_ROOT + 1)
+                .insert(FORMAT_KEY, FORMAT_WITH_ROUTING + 1)
                 .unwrap();
             tx.commit().unwrap();
         }
         let msg = RedbStore::open(&path).err().unwrap().to_string();
         assert!(msg.contains("Upgrade fl"), "{msg}");
         assert!(!msg.contains("start a new store"), "{msg}");
+    }
+
+    /// The format a store at `path` records.
+    fn format_at(path: &std::path::Path) -> Option<u64> {
+        let db = redb::Database::open(path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        meta.get(FORMAT_KEY).unwrap().map(|v| v.value())
+    }
+
+    // Routing spec §1.4: an older fl would read an item and drop its area,
+    // so the first item with one raises the store to 5 — in the same write.
+    // A store that never routes stays where it was.
+    #[test]
+    fn an_item_with_an_area_raises_the_store_to_format_5_and_one_without_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.redb");
+        let r = {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let plain = s.add_record(&p, "t").unwrap();
+            s.add_finding(Finding::raise(p.clone(), plain, "a", "c"))
+                .unwrap();
+            drop(s);
+            assert_eq!(format_at(&path), Some(FORMAT_VERSION));
+            let s = RedbStore::open(&path).unwrap();
+            s.add_record_with_area(&p, "u", Some("code")).unwrap()
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(
+            s.get_record(&r).unwrap().unwrap().area.as_deref(),
+            Some("code")
+        );
+
+        let path = dir.path().join("b.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let rec = s.add_record(&p, "t").unwrap();
+            let mut f = Finding::raise(p, rec, "a", "c");
+            f.area = Some("design".into());
+            s.add_finding(f).unwrap();
+        }
+        assert_eq!(
+            format_at(&path),
+            Some(FORMAT_WITH_ROUTING),
+            "a finding raises it too"
+        );
     }
 
     // ⚠ An older fl would open a store at format 2 or 3 and export its
