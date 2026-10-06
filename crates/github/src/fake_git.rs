@@ -807,6 +807,18 @@ fn append(s: &mut State, vars: &Value) -> Answer {
     let head = s.git.head(&branch).expect("checked above");
     let expected = input["expectedHeadOid"].as_str().unwrap_or("");
     if expected != head {
+        if std::mem::take(&mut s.lose_next_race_as_forbidden) {
+            return answer(
+                200,
+                json!({
+                    "data": {"createCommitOnBranch": null},
+                    "errors": [{
+                        "type": "FORBIDDEN", "path": ["createCommitOnBranch"],
+                        "message": format!("is at {head} but expected {expected}"),
+                    }],
+                }),
+            );
+        }
         return answer(
             200,
             json!({
@@ -1643,6 +1655,32 @@ mod tests {
             Some(root),
             "a refused commit leaves the branch head unchanged"
         );
+    }
+
+    // The shape a lost race took live: FORBIDDEN, naming where the branch
+    // is and where the commit expected it, and nothing of ours lands.
+    #[test]
+    fn a_lost_race_can_be_answered_as_forbidden_naming_both_heads() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        {
+            let mut s = fake.state();
+            s.foreign_appends
+                .push(("runs/k/1.jsonl".into(), "theirs".into()));
+            s.lose_next_race_as_forbidden = true;
+        }
+        let a = client(&fake)
+            .graphql_answer(APPEND, append_input(&root, "runs/k/1.jsonl", "a\n"))
+            .unwrap();
+        let theirs = fake.ledger_head().unwrap();
+        assert_ne!(theirs, root, "the other machine landed first");
+        assert_eq!(a.status, 200);
+        assert_eq!(a.errors[0]["type"], "FORBIDDEN");
+        assert_eq!(
+            a.errors[0]["message"],
+            format!("is at {theirs} but expected {root}")
+        );
+        assert_eq!(fake.ledger_commits(), 2, "the start and theirs, not ours");
     }
 
     #[test]
