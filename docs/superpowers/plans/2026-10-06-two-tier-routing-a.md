@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024 (`rust-version = "1.98"`), redb 4.3, serde/serde_json, thiserror 2, clap 4, ureq 3, assert_cmd/predicates for black-box tests. No new crates.
 
-**Spec:** `docs/superpowers/specs/2026-10-06-two-tier-routing-design.md` (rev 2.1: rev 2 at `06786fe`, amended with this plan by the owner's decisions 20–21 and the seven defects below) — all of §0.1, §1, §2, §4, §5 and §8's "Plan A". The GitHub tracker spec (`2026-09-26-github-tracker-design.md`) §2.3, §3.1–§3.4 and §6, and the identity spec §3.3–§3.4 and §6.1, are the ground this plan changes.
+**Spec:** `docs/superpowers/specs/2026-10-06-two-tier-routing-design.md` (rev 2.2: rev 2 at `06786fe`, amended with this plan by the owner's decisions 20–22 and the seven defects below) — all of §0.1, §1, §2, §4, §5 and §8's "Plan A". The GitHub tracker spec (`2026-09-26-github-tracker-design.md`) §2.3, §3.1–§3.4 and §6, and the identity spec §3.3–§3.4 and §6.1, are the ground this plan changes.
 
 **Branch:** `ferris/routing-a`, off `ferris/routing-plan-a` (main at `06786fe` + this plan), or off `main` once this plan is merged.
 
@@ -48,7 +48,7 @@ Plan B (escalation) is written after plan A merges. Plan A builds none of: `fl r
 2. **The same number typed as `41` and as `#41` in a routed project** — the case the migration notice is about. They must name two different items (local 41, issue 41), print back exactly as they can be typed, and a bare number no local item holds must ask "did you mean `#41`?" rather than reach GitHub. Task 11 (`a_bare_number_and_a_hash_number_name_different_items_and_print_back_as_typed`, `a_bare_number_no_local_item_holds_asks_did_you_mean_the_issue`).
 3. **An id that neither tier holds** — another machine's local item, or a typo. The answer names "another machine's local tier", never `NotOwned` or "no such record"; and when GitHub cannot be read during the fallback, the answer is that error, never "not existing". Task 8 (`an_id_neither_tier_holds_is_held_elsewhere_never_not_owned`, `a_fallback_to_an_unreachable_github_is_an_error_not_not_found`).
 4. **A finding whose record is in the other tier, in both directions, after it is written.** On GitHub the block holds `{id, title}`, is `fl_format` 2, shows the record as escaped plain text, reads back as the claim alone, and keeps all of it through an update; locally the store keeps a GitHub record's URL; the reproduction's run names the record's IRI. Task 1 (`a_local_record_reference_shows_as_plain_text_and_reads_back_as_the_claim`), Task 5 (`a_finding_about_a_local_record_reads_back_and_survives_an_update`), Task 7 (`a_finding_crosses_tiers_only_through_a_checked_foreign_record`), Task 8 (`crates/exec/tests/tiered_evidence.rs`).
-5. **A sensitive area, a `--security` finding, or a finding about a local record in a sensitive area, on its way to a public repository.** Refused before anything is written — no issue, no label — naming `--tier local` when the map chose the tier; with `--tier github` given explicitly, it is the tracker's own refusal (spec decision 21). Task 7 (`a_sensitive_area_routed_to_a_public_repository_is_refused_before_anything_is_written`, `a_finding_about_a_record_in_a_sensitive_area_never_reaches_a_public_repository`), Task 12 (`a_sensitive_area_routed_to_a_public_repository_creates_nothing_and_names_tier_local`, `a_finding_about_a_sensitive_local_record_is_refused_on_a_public_repository`).
+5. **A sensitive area, a `--security` finding, or a finding about a local record in a sensitive area, on its way to a public repository.** Refused before anything is written — no issue, no label — naming `--tier local` when the map chose the tier; with `--tier github` given explicitly, it is the tracker's own refusal (spec decision 21). Task 7 (`a_sensitive_area_routed_to_a_public_repository_is_refused_before_anything_is_written`, `a_finding_about_a_record_in_a_sensitive_area_never_reaches_a_public_repository`, `a_record_whose_area_the_map_no_longer_declares_counts_as_sensitive`), Task 9 (`a_tier_change_keeps_the_areas_sensitivity`), Task 14 (`a_record_whose_area_was_removed_elsewhere_stays_protected`), Task 12 (`a_sensitive_area_routed_to_a_public_repository_creates_nothing_and_names_tier_local`, `a_finding_about_a_sensitive_local_record_is_refused_on_a_public_repository`).
 
 ## Rulings this plan makes
 
@@ -74,7 +74,7 @@ The spec leaves these open or ambiguous. Each says why, and what it costs if wro
 18. **Plan ruling: `--area` and `--tier` in an unrouted store are refused, naming `fl routing set`.** *If wrong:* none.
 19. **Plan ruling: `fl finding list --record <id>` works in every project**; exactly one of `--project` and `--record` is given. *If wrong:* none.
 20. **Plan ruling: a lazily opened GitHub tier that fails with an error that is not a `StoreError`** (a credential missing, `$FL_GITHUB_API_URL` refused) becomes `StoreError::Backend` carrying the whole message chain. *If wrong:* the message loses its anyhow context markers.
-21. **Plan ruling, under spec decision 21 (owner, 2026-10-06): a GitHub finding about a local record in a sensitive area is refused on a repository that is not private, like any security item — naming `--tier local` when the map chose the tier; about a local record in any other area, the disclosure of §2.5 is a `warning:` line on stderr, after placement and before the write.** A visibility that cannot be read refuses the create. The record's sensitivity is read from the map as it is now. *If wrong:* wording; a record whose area was removed from the map counts as not sensitive.
+21. **Plan ruling, under spec decision 21 (owner, 2026-10-06): a GitHub finding about a local record in a sensitive area is refused on a repository that is not private, like any security item — naming `--tier local` when the map chose the tier; about a local record in any other area, the disclosure of §2.5 is a `warning:` line on stderr, after placement and before the write.** A visibility that cannot be read refuses the create. A record whose area the map no longer declares counts as sensitive (spec decision 22, failing closed), and every finding the rule covers carries `security: true`, wherever it is placed. *If wrong:* wording.
 22. **Plan ruling: in plan A, "the resolved IRI" a finding's evidence is tagged with is the record's primary IRI as the tier holding it answers.** Plan B adds the tombstone hop in `route`. *If wrong:* none until plan B.
 23. **Plan ruling: store format 5 is shared with plan B only if no release ships between them**; otherwise plan B raises to 6 (the owner was told, 2026-10-06; spec §1.4 says so). *If wrong:* an fl from plan A ignores plan B's marks.
 24. **Plan ruling: an inherited area is reported as `note: area: <name>, from its record` on stderr**, so stdout keeps its columns. *If wrong:* wording.
@@ -84,6 +84,7 @@ The spec leaves these open or ambiguous. Each says why, and what it costs if wro
 28. **Plan ruling: an IRI no local store holds reaches the router in a routed store** — `choose_store` falls back to the bound store when it is routed, and a routed store strips issue URLs from the search even with no binding — so the router can say "held on another machine's local tier", find an item another machine moved to GitHub, or name the missing config entry. Whether the bound store is routed is read only when the command names an IRI. *If wrong:* one extra open of the bound store for such a command.
 29. **Plan ruling: a local store's `update_finding` keeps the stored area, record, raiser and security mark,** as the GitHub tracker always has; the conformance suite pins it. An item keeps its area for life (§1.1). *If wrong:* none — no caller changes them.
 30. **Plan ruling: `fl manifest import` of a routed manifest is refused where the binding names `ledger = "github"`** (decision 12), before anything is imported. *If wrong:* none.
+31. **Owner decision 22 (2026-10-06), as this plan carries it: decision 21 fails closed.** `fl routing set` keeps an area's sensitivity unless told: `--sensitive` sets it, `--not-sensitive` clears it, neither keeps it (`after_set`'s `Option<bool>`, Task 3; the flags, Tasks 9 and 14). Clearing it is refused while any item in either tier names the area, by the same check and with the same list as `fl routing remove` (one function, `refuse_while_named`, Task 14). A record whose area the map no longer declares counts as sensitive (Task 7). A finding the rule covers carries `security: true` (Task 7). `[agent]`: a record with no area at all — made before the project was routed — is not sensitive; it never had an area to protect. *If wrong:* such a record's finding is published like any other's.
 
 ## Spec defects this plan found
 
@@ -130,7 +131,7 @@ All seven are amended in the spec's rev 2.1 (same file, 2026-10-06), each marked
 | `docs/github-tracker.md`, `docs/sharing-gates.md`, `docs/README.md` | modify | the area label and block, local references, formats, links |
 | `docs/superpowers/specs/2026-09-26-github-tracker-design.md` | modify | §2.3's invariant amended for local records |
 | `docs/getting-started.md` | modify | the `fl --help` block lists `routing` |
-| `docs/superpowers/specs/2026-10-06-two-tier-routing-design.md` | modified with this plan (rev 2.1) | decisions 20–21 and the seven defects; no task edits it |
+| `docs/superpowers/specs/2026-10-06-two-tier-routing-design.md` | modified with this plan (rev 2.2) | decisions 20–22 and the seven defects; no task edits it |
 
 ---
 
@@ -1242,7 +1243,7 @@ The map — area → `{tier, sensitive}` — and its rules (routing spec §1.2):
 
 **Interfaces:**
 - Consumes: `crate::wire::wire_names!`, `wire_parse!`; `RedbStore::refuse_if_imported`, `raise_format`, `FORMAT_WITH_ROUTING` (Task 2).
-- Produces (in `fl_core::routing`, re-exported at the crate root): `enum Tier { Local, Github }` (wire `local`, `github`; `Tier::ALL`, `as_wire`, `from_wire`, `wire_values`); `pub fn area_name(name: &str) -> Result<(), String>`; `struct AreaRoute { pub area: String, pub tier: Tier, pub sensitive: bool }`; `struct RoutingMap { pub areas: Vec<AreaRoute> }` (`#[serde(transparent)]`) with `starting() -> RoutingMap`, `route(&self, &str) -> Option<&AreaRoute>`, `declared(&self) -> Vec<String>`, `with(&self, &str, Tier, bool) -> RoutingMap`, `without(&self, &str) -> RoutingMap`, `check(&self) -> Result<(), String>`; `pub fn after_set(current: Option<&RoutingMap>, area: &str, tier: Tier, sensitive: bool) -> (RoutingMap, bool)`; `trait Routes { fn routes(&self, project: &ProjectId) -> Result<Option<RoutingMap>, StoreError>; }`. `MemStore::set_routes(&self, &ProjectId, &RoutingMap) -> Result<(), StoreError>`; `RedbStore::set_routes(&self, &ProjectId, &RoutingMap) -> Result<(), StoreError>`; `RedbStore::holds_routing(&self) -> Result<bool, StoreError>`; crate-private `RedbStore::refuse_a_second_project(&self, &ProjectId) -> Result<(), StoreError>` and `fn routed_store_is_taken() -> StoreError` (Task 4's import uses both). Unique phrases: `is not an area name`, `change the routing map of`, `needs a store of its own`.
+- Produces (in `fl_core::routing`, re-exported at the crate root): `enum Tier { Local, Github }` (wire `local`, `github`; `Tier::ALL`, `as_wire`, `from_wire`, `wire_values`); `pub fn area_name(name: &str) -> Result<(), String>`; `struct AreaRoute { pub area: String, pub tier: Tier, pub sensitive: bool }`; `struct RoutingMap { pub areas: Vec<AreaRoute> }` (`#[serde(transparent)]`) with `starting() -> RoutingMap`, `route(&self, &str) -> Option<&AreaRoute>`, `declared(&self) -> Vec<String>`, `with(&self, &str, Tier, bool) -> RoutingMap`, `without(&self, &str) -> RoutingMap`, `check(&self) -> Result<(), String>`; `pub fn after_set(current: Option<&RoutingMap>, area: &str, tier: Tier, sensitive: Option<bool>) -> (RoutingMap, bool)` (`None` keeps the area's sensitivity, decision 22); `trait Routes { fn routes(&self, project: &ProjectId) -> Result<Option<RoutingMap>, StoreError>; }`. `MemStore::set_routes(&self, &ProjectId, &RoutingMap) -> Result<(), StoreError>`; `RedbStore::set_routes(&self, &ProjectId, &RoutingMap) -> Result<(), StoreError>`; `RedbStore::holds_routing(&self) -> Result<bool, StoreError>`; crate-private `RedbStore::refuse_a_second_project(&self, &ProjectId) -> Result<(), StoreError>` and `fn routed_store_is_taken() -> StoreError` (Task 4's import uses both). Unique phrases: `is not an area name`, `change the routing map of`, `needs a store of its own`.
 
 - [ ] **Step 1: Write the module with its failing tests**
 
@@ -1383,16 +1384,24 @@ impl RoutingMap {
 /// The map after `fl routing set <area> <tier>` (routing spec §1.2), and
 /// whether this was the project's first set — which writes the starting
 /// set first.
+///
+/// `sensitive`: `Some` sets the area's sensitivity; `None` keeps what the
+/// map — on the first set, the starting set — says, and `false` for a new
+/// area. ⚠ A set that only changes a tier never clears a sensitivity
+/// (decision 22).
 pub fn after_set(
     current: Option<&RoutingMap>,
     area: &str,
     tier: Tier,
-    sensitive: bool,
+    sensitive: Option<bool>,
 ) -> (RoutingMap, bool) {
-    match current {
-        Some(map) => (map.with(area, tier, sensitive), false),
-        None => (RoutingMap::starting().with(area, tier, sensitive), true),
-    }
+    let (base, first) = match current {
+        Some(map) => (map.clone(), false),
+        None => (RoutingMap::starting(), true),
+    };
+    let sensitive =
+        sensitive.unwrap_or_else(|| base.route(area).is_some_and(|r| r.sensitive));
+    (base.with(area, tier, sensitive), first)
 }
 
 /// Where the router reads a project's routing map: the local store, which
@@ -1440,19 +1449,35 @@ mod tests {
 
     #[test]
     fn the_first_set_writes_the_starting_set_first_and_a_later_one_changes_one_area() {
-        let (first, was_first) = after_set(None, "ops", Tier::Github, false);
+        let (first, was_first) = after_set(None, "ops", Tier::Github, None);
         assert!(was_first);
         assert_eq!(first.declared().len(), 6);
         assert_eq!(first.route("ops").unwrap().tier, Tier::Github);
         assert_eq!(first.route("code").unwrap().tier, Tier::Local);
         assert_eq!(first.check(), Ok(()), "kept in order");
-        let (next, was_first) = after_set(Some(&first), "code", Tier::Github, true);
+        let (next, was_first) = after_set(Some(&first), "code", Tier::Github, Some(true));
         assert!(!was_first);
         let code = next.route("code").unwrap();
         assert_eq!((code.tier, code.sensitive), (Tier::Github, true));
         assert_eq!(next.declared(), first.declared(), "one area changed, none added");
-        let (named, _) = after_set(None, "code", Tier::Github, false);
+        let (named, _) = after_set(None, "code", Tier::Github, None);
         assert_eq!(named.route("code").unwrap().tier, Tier::Github, "the set wins");
+    }
+
+    // Routing spec decision 22: a set that names no sensitivity keeps the
+    // area's — a tier change never clears it — and only `Some(false)` does.
+    #[test]
+    fn a_set_that_names_no_sensitivity_keeps_the_areas() {
+        let starting = RoutingMap::starting();
+        let (moved, _) = after_set(Some(&starting), "security", Tier::Local, None);
+        let security = moved.route("security").unwrap();
+        assert_eq!((security.tier, security.sensitive), (Tier::Local, true));
+        let (first, _) = after_set(None, "security", Tier::Local, None);
+        assert!(first.route("security").unwrap().sensitive, "the starting set's, kept");
+        let (new, _) = after_set(Some(&starting), "ops", Tier::Local, None);
+        assert!(!new.route("ops").unwrap().sensitive, "a new area is not sensitive");
+        let (cleared, _) = after_set(Some(&starting), "security", Tier::Github, Some(false));
+        assert!(!cleared.route("security").unwrap().sensitive);
     }
 
     #[test]
@@ -1753,7 +1778,8 @@ Each `fl-core` run with `cargo test -p fl-core --lib routing::tests::`:
 4. Each allowed class: drop `b.is_ascii_digit()`, then `b == b'-'` → the same test red (`x-1`, `2fa`).
 5. `with` keeps order: delete the `sort_by` → `the_first_set_writes_the_starting_set_first_and_a_later_one_changes_one_area` red (`check` fails on `ops`).
 6. `with` replaces an area: drop the `filter` → the same test red (two `code` entries).
-7. `after_set`'s first branch writes the starting set: make `None` return `RoutingMap::default().with(…)` → the same test red.
+7. `after_set`'s first branch writes the starting set: make `None` start from `RoutingMap::default()` → the same test red.
+7a. `after_set` keeps a sensitivity it is not told to change (decision 22): replace the `unwrap_or_else(…)` with `unwrap_or(false)` → `a_set_that_names_no_sensitivity_keeps_the_areas` red. Read the kept value from `current` only, not `base` → the same test red (the first set's `security`).
 8. `check`'s order test: change `>=` to `>` → `a_map_out_of_order_with_an_area_twice_or_a_bad_name_is_refused` red (an area twice).
 9. `check`'s name test: delete the `for a in &self.areas` loop → the same test red.
 10. `MemStore::set_routes` checks the map: delete the `map.check()` → `cargo test -p fl-core --lib mem::tests::` stays green — not observable there; `RedbStore`'s twin is pinned below. Not a guard in `MemStore`, which tests build by hand.
@@ -3380,7 +3406,7 @@ git status --porcelain
 
 ### Task 7: The routing tracker places and creates
 
-`TieredTracker` (routing spec §2) decides where a new item goes — from `--tier` when given, else from its area through the map; a finding's area is the one given, else its record's (§1.1) — and makes every check before anything is written: an area, declared; a map for the project; the GitHub tier available; a sensitive area, a security finding, or a finding about a record in a sensitive area never sent to a non-private repository (§2.1, decisions 13 and 21). Placement is the spec's `create_in(tier, …)` (plan ruling 2). A finding's record is read in the tier that holds it, and a finding in the other tier is written through a `ForeignRecord` only the router builds (§2.5). Lookups go through one function, `route`, which Task 8 builds the `Tracker` role on and plan B extends.
+`TieredTracker` (routing spec §2) decides where a new item goes — from `--tier` when given, else from its area through the map; a finding's area is the one given, else its record's (§1.1) — and makes every check before anything is written: an area, declared; a map for the project; the GitHub tier available; a sensitive area, a security finding, or a finding about a record in a sensitive area — or in an area the map no longer declares, failing closed — never sent to a non-private repository (§2.1, decisions 13, 21 and 22). Such a finding carries the security mark wherever it goes. Placement is the spec's `create_in(tier, …)` (plan ruling 2). A finding's record is read in the tier that holds it, and a finding in the other tier is written through a `ForeignRecord` only the router builds (§2.5). Lookups go through one function, `route`, which Task 8 builds the `Tracker` role on and plan B extends.
 
 **Blast radius:** new module. `ForeignRecord` gains its crate-private constructor; `for_tests` now uses it.
 
@@ -3679,8 +3705,40 @@ mod tests {
         let mut g = Finding::raise(w.p.clone(), plain, "rev", "c");
         g.area = Some("design".into());
         assert_eq!(t.place_finding(&g, None).unwrap().at().tier(), Tier::Github);
+        // Kept local, it is a security finding (decision 22).
+        let at = t.place_finding(&f, Some(Tier::Local)).unwrap();
+        let local = t.add_finding_at(f.clone(), &at).unwrap();
+        assert!(w.local.get_finding(&local).unwrap().unwrap().security);
         w.issues.set_public(false);
-        assert_eq!(t.place_finding(&f, None).unwrap().at().tier(), Tier::Github);
+        let at = t.place_finding(&f, None).unwrap();
+        assert_eq!(at.at().tier(), Tier::Github);
+        let on_github = t.add_finding_at(f, &at).unwrap();
+        assert!(w.issues.get_finding(&on_github).unwrap().unwrap().security);
+    }
+
+    // Routing spec decision 22: an area the map no longer declares — removed
+    // on the authoring machine while this machine's records still name it —
+    // counts as sensitive: fail closed.
+    #[test]
+    fn a_record_whose_area_the_map_no_longer_declares_counts_as_sensitive() {
+        let w = world();
+        w.issues.set_public(true);
+        let t = w.router();
+        let old = w
+            .local
+            .add_record_with_area(&w.p, "made under an older map", Some("ops"))
+            .unwrap();
+        let mut f = Finding::raise(w.p.clone(), old, "rev", "c");
+        f.area = Some("design".into());
+        let err = t.place_finding(&f, None).unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::SensitiveToPublic { .. })),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("--tier local"), "{err}");
+        let at = t.place_finding(&f, Some(Tier::Local)).unwrap();
+        let id = t.add_finding_at(f, &at).unwrap();
+        assert!(w.local.get_finding(&id).unwrap().unwrap().security);
     }
 
     // Routing spec §2.5: a record in a tier that cannot be reached is an
@@ -3822,6 +3880,9 @@ pub struct FindingPlacement {
     at: Placement,
     inherited: bool,
     record: RecordSeen,
+    /// The record's area is sensitive, or one the map no longer declares
+    /// (decisions 21, 22): the finding is a security item, wherever it goes.
+    about_sensitive: bool,
 }
 
 impl FindingPlacement {
@@ -4007,11 +4068,12 @@ impl<'a> TieredTracker<'a> {
         };
         // Routing spec decision 21: a finding about a record in a sensitive
         // area publishes that record's title, so it is a security item too.
-        let record_sensitive = record
-            .area
-            .as_deref()
-            .and_then(|a| map.route(a))
-            .is_some_and(|r| r.sensitive);
+        // ⚠ Decision 22, failing closed: an area the map no longer declares
+        // may have been sensitive, so it counts as sensitive.
+        let record_sensitive = match record.area.as_deref() {
+            Some(a) => map.route(a).is_none_or(|r| r.sensitive),
+            None => false,
+        };
         let what = if record_sensitive && !finding.security {
             "this finding, about a record in a sensitive area,"
         } else {
@@ -4026,6 +4088,7 @@ impl<'a> TieredTracker<'a> {
                 title: record.title,
                 tier: record_tier,
             },
+            about_sensitive: record_sensitive,
         })
     }
 
@@ -4043,7 +4106,8 @@ impl<'a> TieredTracker<'a> {
     }
 
     /// Write the finding where `at` says: with its area, as a security
-    /// finding when the area is sensitive, naming its record's primary IRI —
+    /// finding when its area or its record's is sensitive (decisions 13,
+    /// 21, 22), naming its record's primary IRI —
     /// through a `ForeignRecord` when the record is in the other tier.
     pub fn add_finding_at(
         &self,
@@ -4051,7 +4115,7 @@ impl<'a> TieredTracker<'a> {
         at: &FindingPlacement,
     ) -> Result<FindingId, StoreError> {
         finding.area = Some(at.at.area.clone());
-        finding.security |= at.at.sensitive;
+        finding.security |= at.at.sensitive || at.about_sensitive;
         finding.record = at.record.id.clone();
         if at.at.tier == Tier::Github {
             self.check_project(&finding.project)?;
@@ -4103,6 +4167,8 @@ Each run with `cargo test -p fl-core --lib tiered::tests::`:
 19. `route`'s unbound issue form: delete the `if self.github.issue_form(id)` block → Task 8's `a_lookup_asks_the_tier_whose_form_the_id_has` red (`Elsewhere`, not `TierUnavailable`) — again not observable in this task.
 20. Decision 21, the record's sensitivity: replace `finding.security || record_sensitive` with `finding.security` → `a_finding_about_a_record_in_a_sensitive_area_never_reaches_a_public_repository` red. Make `record_sensitive` `true` → the same test red (the ordinary record's finding is refused).
 21. Its wording: always pass `"this finding"` → the same test red.
+22. Decision 22, failing closed: make the `Some(a)` arm `map.route(a).is_some_and(|r| r.sensitive)` → `a_record_whose_area_the_map_no_longer_declares_counts_as_sensitive` red. The `None` arm (a record made before the project was routed, which never had an area to be sensitive) is not exercised by a public-repository test here; not a guard this task's tests tell apart.
+23. The security mark: write `finding.security |= at.at.sensitive;` (dropping `|| at.about_sensitive`) → `a_finding_about_a_record_in_a_sensitive_area_never_reaches_a_public_repository` red and `a_record_whose_area_the_map_no_longer_declares_counts_as_sensitive` red.
 
 - [ ] **Step 6: Run the trio and commit**
 
@@ -4963,6 +5029,18 @@ fn an_area_or_a_tier_that_is_not_one_is_refused_and_nothing_is_written() {
         .stderr(contains("has no routing map"));
 }
 
+// Routing spec decision 22: a set that only changes a tier keeps the area's
+// sensitivity.
+#[test]
+fn a_tier_change_keeps_the_areas_sensitivity() {
+    let g = world("");
+    g.routed();
+    assert_eq!(
+        g.ok(&["routing", "set", "--project", "1", "security", "local"]),
+        "security\tlocal\tsensitive\n"
+    );
+}
+
 // Routing spec decision 20: handles are numbered per store, so a routed
 // store holds one project; the refusal names the remedy and writes nothing.
 #[test]
@@ -5076,7 +5154,8 @@ pub enum Cmd {
         #[arg(value_parser = parse_tier)]
         tier: Tier,
         /// Items made in this area are security items, which the map never
-        /// sends to a repository that is not private.
+        /// sends to a repository that is not private. Without it, an area
+        /// keeps its sensitivity (decision 22).
         #[arg(long)]
         sensitive: bool,
     },
@@ -5124,7 +5203,10 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, bound: Option<&TrackerBinding>) -> Result<i3
         } => {
             let p = project_of(ctx, &project)?;
             routing::area_name(&area).map_err(|why| anyhow::anyhow!("{why}"))?;
-            let (map, first) = routing::after_set(store.routes(&p)?.as_ref(), &area, tier, sensitive);
+            // Routing spec decision 22: without `--sensitive`, an area keeps
+            // its sensitivity; a tier change never clears it.
+            let asked = if sensitive { Some(true) } else { None };
+            let (map, first) = routing::after_set(store.routes(&p)?.as_ref(), &area, tier, asked);
             store.set_routes(&p, &map)?;
             if first {
                 eprintln!(
@@ -5256,8 +5338,8 @@ writes the starting set first, then the area it names:
 
 `--sensitive` marks an area whose items are security items: a finding made there is a security
 finding, and the map never sends such an item to a repository that is not private. Setting an
-area that exists changes its tier or its sensitivity for new items only; items already made stay
-where they are. `fl routing show --project <project>` prints the map, one area per line: its
+area that exists changes its tier for new items only; items already made stay where they are. A
+`set` without `--sensitive` keeps the area's sensitivity: changing an area's tier never clears it. `fl routing show --project <project>` prints the map, one area per line: its
 name, its tier, and `sensitive` or `-`.
 
 The map is authored in the store that authors the project, like its gates, and reaches other
@@ -5303,6 +5385,7 @@ Expected: PASS.
 4. `print_route`'s sensitivity: always print `-` → `a_later_set_changes_one_area_and_says_nothing_of_handles` red.
 5. `parse_tier`: accept anything as `Tier::Local` → `cargo test -p fl-cli --bin fl -- cmd::routing::tests::a_tier_is_parsed_by_its_wire_name_only` red.
 6. `needs_tracker` is false for both: make it `true` → `a_github_bound_project_hears_that_a_bare_number_now_names_a_local_item` red (GitHub is opened).
+6a. `set` without `--sensitive` keeps the area's: pass `Some(sensitive)` instead of `asked` → `a_tier_change_keeps_the_areas_sensitivity` red.
 7. The starting set is rendered from `RoutingMap::starting()`: drop `, sensitive` from `starting_set`'s format → `the_first_set_writes_the_starting_set_and_says_how_handles_change` red.
 8. The import's notice, its guard: make it `if report.areas.is_some()` (dropping `!was_routed &&`) → `an_import_that_first_routes_a_store_says_how_handles_change` red (the second import says it again); delete the block → the same test red.
 9. Decision 20 reaches the CLI: the refusal is the store's (`set_routes`, Task 3, mutation 16 there); `routing_a_project_that_shares_its_store_is_refused_naming_its_own_store` is red under that mutation too.
@@ -5674,8 +5757,8 @@ fn a_routed_manifest_is_not_imported_where_the_binding_names_the_github_ledger()
         .stdout("");
 }
 
-// Routing spec §2.3, plan ruling 27: after a repository rename a GitHub
-// item still prints as `#n` — its URL names the repository's name now.
+// Routing spec §2.3, §2.2: after a repository rename a GitHub item still
+// prints as `#n` — its URL names the repository's name now.
 #[test]
 fn after_a_rename_a_github_item_still_prints_as_hash() {
     let g = world(BOUND);
@@ -6147,18 +6230,17 @@ Expected: PASS — the new tests, and every existing CLI test unchanged.
 7. Its no-binding refusal: replace it with a call to `(self.open)` on a default binding → `tiers::tests::with_no_binding_the_tier_is_unavailable_naming_the_config_entry` red.
 8. Its downcast: map every error to `Backend` → `an_open_that_fails_with_a_store_error…` red.
 9. `claims`'s name comparison: return `true` for every issue URL when bound → `tiers::tests::nothing_is_opened_until_a_github_item_is_needed` red (`acme/other`).
-10. `claims`'s unbound arm: return `false` → `with_no_binding…` red.
-11. `show_item`'s GitHub arm: print the bare number → `cargo test -p fl-cli --test routing -- a_github_tier_record_is_an_issue_with_its_area_label_printed_as_hash` red.
-12. `record add`'s unrouted `--area` refusal: make that arm add the record → `area_in_a_project_with_no_routing_map_is_refused_naming_routing_set` red.
-13. The routing currency call in `record add`: delete it → `a_routed_create_on_the_authoring_machine_needs_the_map_exported` red and `a_routed_create_on_an_importing_machine_needs_the_import_current` red.
-14. `ensure_routing_current`'s import branch compares hashes: make it `return Ok(())` → the importing test red.
-15. Its no-manifest pass: delete the `try_exists` early return → `a_routed_create_on_the_authoring_machine_needs_the_map_exported` red (the first create fails reading a missing manifest).
-16. Its comparison: replace `m.body.routing != store.routes(project)?` with `false` → the authoring test red. Its `m.body.project == *project` conjunct is not observable: a test world has one project per root. Not a guard a test reaches.
-17. `on_github` in `reproduce`: replace it with `ctx.github.is_some()` → `reproducing_a_github_tier_finding_checks_the_committed_manifest` red (the gate runs).
-18a. `claims` takes the opened repository's name: drop the `|| self.opened.get()…` disjunct → `cargo test -p fl-cli --test routing -- after_a_rename_a_github_item_still_prints_as_hash` red (the issue prints as its URL).
-18b. `claims` with no binding claims nothing: make the `let … else` return `true` for any issue URL when unbound → `cargo test -p fl-cli --bin fl -- tiers::tests::with_no_binding_the_tier_is_unavailable_naming_the_config_entry` red.
-18c. `Import`'s decision-12 refusal: delete it → `a_routed_manifest_is_not_imported_where_the_binding_names_the_github_ledger` red; drop its `m.body.routing.is_some() &&` conjunct → `cargo test -p fl-cli --test ledger -- a_machine_with_no_cut_over_is_refused_naming_init` red (an unrouted manifest under the GitHub ledger is refused; checked against a build of this plan).
-18. `fl github` opens GitHub in a routed store: make `routed_github` always `None` → `cargo test -p fl-cli --test routing -- a_bare_number_given_to_fl_github_is_an_issue` (Task 11) red. Not observable in this task: no test here runs `fl github` in a routed store.
+10. `show_item`'s GitHub arm: print the bare number → `cargo test -p fl-cli --test routing -- a_github_tier_record_is_an_issue_with_its_area_label_printed_as_hash` red.
+11. `record add`'s unrouted `--area` refusal: make that arm add the record → `area_in_a_project_with_no_routing_map_is_refused_naming_routing_set` red.
+12. The routing currency call in `record add`: delete it → `a_routed_create_on_the_authoring_machine_needs_the_map_exported` red and `a_routed_create_on_an_importing_machine_needs_the_import_current` red.
+13. `ensure_routing_current`'s import branch compares hashes: make it `return Ok(())` → the importing test red.
+14. Its no-manifest pass: delete the `try_exists` early return → `a_routed_create_on_the_authoring_machine_needs_the_map_exported` red (the first create fails reading a missing manifest).
+15. Its comparison: replace `m.body.routing != store.routes(project)?` with `false` → the authoring test red. Its `m.body.project == *project` conjunct is not observable: a test world has one project per root. Not a guard a test reaches.
+16. `on_github` in `reproduce`: replace it with `ctx.github.is_some()` → `reproducing_a_github_tier_finding_checks_the_committed_manifest` red (the gate runs).
+17. `fl github` opens GitHub in a routed store: make `routed_github` always `None` → `cargo test -p fl-cli --test routing -- a_bare_number_given_to_fl_github_is_an_issue` (Task 11) red. Not observable in this task: no test here runs `fl github` in a routed store.
+18. `claims` takes the opened repository's name: drop the `|| self.opened.get()…` disjunct → `cargo test -p fl-cli --test routing -- after_a_rename_a_github_item_still_prints_as_hash` red (the issue prints as its URL).
+19. `claims` with no binding claims nothing: make the `let … else` return `true` for any issue URL when unbound → `cargo test -p fl-cli --bin fl -- tiers::tests::with_no_binding_the_tier_is_unavailable_naming_the_config_entry` red.
+20. `Import`'s decision-12 refusal: delete it → `a_routed_manifest_is_not_imported_where_the_binding_names_the_github_ledger` red; drop its `m.body.routing.is_some() &&` conjunct → `cargo test -p fl-cli --test ledger -- a_machine_with_no_cut_over_is_refused_naming_init` red (an unrouted manifest under the GitHub ledger is refused; checked against a build of this plan).
 
 - [ ] **Step 6: Run the trio and commit**
 
@@ -6232,7 +6314,14 @@ In `crates/cli/src/refs.rs`, inside `mod tests`, replace `a_hash_handle_is_a_han
     }
 ```
 
-In `crates/cli/tests/routing.rs`, add:
+In `crates/cli/tests/routing.rs`, extend Task 10's `after_a_rename_a_github_item_still_prints_as_hash`: after its `assert_eq!`, add
+
+```rust
+    let moved = g.ok(&["record", "move", "#1", "--to", "doing"]);
+    assert!(moved.starts_with("#1\tdoing\t"), "{moved}");
+```
+
+— `#1` now resolves through GitHub, whose answer names the repository's name now. Then add:
 
 ```rust
 // Routing spec §2.3: in a routed project the two spellings name two items,
@@ -6529,10 +6618,10 @@ Expected: PASS — including `crates/cli/tests/github.rs`'s `a_handle_may_carry_
 6. Routed, a bare `n` stays local: resolve `Ref::Handle(n)` through GitHub → the same test red, and `a_bare_number_no_local_item_holds_asks_did_you_mean_the_issue` red (a request).
 7. The hint's guard: replace `if t.github.available()` with `if true` → `on_an_unbound_machine_a_bare_number_gets_no_hint` red; with `if false` → `a_bare_number_no_local_item_holds_asks_did_you_mean_the_issue` red.
 8. The issue refusal names the repository: write "the bound repository" always → `a_hash_number_that_is_no_record_is_refused_naming_the_repository` red.
-9a. The store choice falls back to a routed bound store: delete the `Err(e) if bound_routed && is_not_owned(&e)` arm → `an_id_no_local_store_holds_is_looked_for_on_github_then_said_to_be_elsewhere` red ("no store holds"). Make `bound_routed` always `false` → the same test red, and `an_issue_url_on_an_unbound_machine_names_the_missing_config_entry` red.
-9b. The unbound strip: drop `|| bound_routed` from the `retain` guard → not observable once the fallback exists: the URL reaches `choose_store`, which answers `NotOwned`, and the fallback hands it to the router anyway. The strip saves a search of every configured store; not a guard a test tells apart.
-9c. Only `NotOwned` falls back: drop `&& is_not_owned(&e)` → not observable with one configured store (every other refusal of `choose_store` needs two stores holding the id). Not a guard a test in this world tells apart.
 9. `fl github repair` reads a bare number as an issue: in a routed store this is `Ref::Handle(n) => gh.issue_url(*n)`, unchanged — and `routed_github` (Task 10) opens it; make `routed_github` `None` → `a_bare_number_given_to_fl_github_is_an_issue` red.
+10. The store choice falls back to a routed bound store: delete the `Err(e) if bound_routed && is_not_owned(&e)` arm → `an_id_no_local_store_holds_is_looked_for_on_github_then_said_to_be_elsewhere` red ("no store holds"). Make `bound_routed` always `false` → the same test red, and `an_issue_url_on_an_unbound_machine_names_the_missing_config_entry` red.
+11. The unbound strip: drop `|| bound_routed` from the `retain` guard → not observable once the fallback exists: the URL reaches `choose_store`, which answers `NotOwned`, and the fallback hands it to the router anyway. The strip saves a search of every configured store; not a guard a test tells apart.
+12. Only `NotOwned` falls back: drop `&& is_not_owned(&e)` → not observable with one configured store (every other refusal of `choose_store` needs two stores holding the id). Not a guard a test in this world tells apart.
 
 - [ ] **Step 6: Run the trio and commit**
 
@@ -7306,20 +7395,20 @@ git status --porcelain
 
 ---
 
-### Task 14: `fl routing remove`, refused while any item names the area
+### Task 14: `fl routing remove`, and clearing a sensitivity, refused while any item names the area
 
-Decision 11 and §1.2: removing an area is refused while any item in either tier names it; the refusal gives the count and lists up to ten of the items; GitHub items are found by their blocks, not their labels, so an item that lost its label is not missed (Task 6); a tier that cannot be read refuses the removal too (plan ruling 13). fl can check only this machine's local tier, and says so (decision 15). The doc gains its "Removing an area" and "Limits" sections.
+Decision 11 and §1.2: removing an area is refused while any item in either tier names it; the refusal gives the count and lists up to ten of the items; GitHub items are found by their blocks, not their labels, so an item that lost its label is not missed (Task 6); a tier that cannot be read refuses the removal too (plan ruling 13). fl can check only this machine's local tier, and says so (decision 15). Decision 22: `fl routing set … --not-sensitive` clears an area's sensitivity, and is refused by the same check — one function, `refuse_while_named`, serves both. The doc gains its "Removing an area" and "Limits" sections. An end-to-end test runs the re-review's scenario: an area removed where the project is authored, while another machine's record still names it, keeps that record protected (decision 22, Task 7).
 
-**Blast radius:** `fl routing` gains a subcommand that needs the tracker (both tiers). Nothing else changes.
+**Blast radius:** `fl routing` gains a subcommand that needs the tracker (both tiers), and `set --not-sensitive` needs it too — so in a store not routed yet, `set --not-sensitive` with a binding opens GitHub at the start, as every tracker command of an unrouted GitHub project does. Nothing else changes.
 
 **Files:**
-- Modify: `crates/cli/src/cmd/routing.rs` (`Cmd::Remove`, `needs_tracker`, `run`, `named`)
+- Modify: `crates/cli/src/cmd/routing.rs` (`Cmd::Remove`, `Cmd::Set`'s `--not-sensitive`, `needs_tracker`, `run`, `refuse_while_named`, `named`)
 - Modify: `crates/cli/tests/routing.rs`
 - Modify: `docs/routing.md`
 
 **Interfaces:**
 - Consumes: `TieredTracker::items_naming_area` (Task 8); `RoutingMap::without` (Task 3); `RedbStore::set_routes`; `Ctx.tiers`.
-- Produces: `fl routing remove --project <p> <area>`, printing `removed\t<area>`. Unique phrases: `is still named by`, `keep it as history`.
+- Produces: `fl routing remove --project <p> <area>`, printing `removed\t<area>`; `fl routing set … --not-sensitive`; `fn refuse_while_named(ctx: &Ctx<'_>, p: &ProjectId, area: &str, refused: &str) -> Result<()>`. Unique phrases: `is still named by`, `keep it as history`, `Its sensitivity is not cleared`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -7408,16 +7497,106 @@ fn removing_an_area_the_map_does_not_declare_is_refused() {
         .failure()
         .stderr(contains("`ops` is not an area project 1 declares"));
 }
+
+// Routing spec decision 22: clearing a sensitivity is refused while any
+// item in either tier names the area — the same check as a removal — and
+// writes nothing.
+#[test]
+fn clearing_a_sensitivity_items_still_name_is_refused_and_writes_nothing() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record", "add", "--project", "1", "--title", "the key leaks", "--area", "security",
+        "--tier", "local",
+    ]);
+    g.fl()
+        .args(["routing", "set", "--project", "1", "security", "local", "--not-sensitive"])
+        .assert()
+        .failure()
+        .stderr(
+            contains("is still named by 1 item(s)")
+                .and(contains("Its sensitivity is not cleared")),
+        );
+    assert!(
+        g.ok(&["routing", "show", "--project", "1"]).contains("security\tgithub\tsensitive"),
+        "nothing written"
+    );
+    // Only an area that is sensitive asks: clearing `code`, which is not,
+    // while an item names it, changes nothing and is not refused.
+    g.ok(&["record", "add", "--project", "1", "--title", "t", "--area", "code"]);
+    assert_eq!(
+        g.ok(&["routing", "set", "--project", "1", "code", "local", "--not-sensitive"]),
+        "code\tlocal\t-\n"
+    );
+}
+
+#[test]
+fn clearing_a_sensitivity_no_item_names_works() {
+    let g = world(BOUND);
+    g.routed();
+    assert_eq!(
+        g.ok(&["routing", "set", "--project", "1", "security", "github", "--not-sensitive"]),
+        "security\tgithub\t-\n"
+    );
+    g.fl()
+        .args([
+            "routing", "set", "--project", "1", "security", "github", "--sensitive",
+            "--not-sensitive",
+        ])
+        .assert()
+        .failure();
+}
+
+// Routing spec decision 22, the re-review's scenario: the authoring machine
+// removes a sensitive area that only another machine's records name; after
+// the re-import those records still count as sensitive — fail closed.
+#[test]
+fn a_record_whose_area_was_removed_elsewhere_stays_protected() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(other.path(), BOUND);
+    let on_other = |args: &[&str]| g.fl_at(other.path()).args(args).assert();
+    on_other(&["manifest", "import"]).success();
+    on_other(&[
+        "record", "add", "--project", "1", "--title", "the key leaks", "--area", "security",
+        "--tier", "local",
+    ])
+    .success();
+    g.ok(&["routing", "remove", "--project", "1", "security"]);
+    g.ok(&["manifest", "export", "--project", "1"]);
+    on_other(&["manifest", "import"]).success();
+    g.fake.state().repos[0].visibility = "public".into();
+    on_other(&["finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "design"])
+        .failure()
+        .stderr(contains("--tier local"));
+    assert_eq!(g.fake.issue_count(), 0, "nothing published");
+}
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p fl-cli --test routing`
-Expected: FAIL — `fl routing remove` is not a command.
+Expected: FAIL — `fl routing remove` is not a command, and `--not-sensitive` not an argument of `set`.
 
 - [ ] **Step 3: Implement**
 
-In `crates/cli/src/cmd/routing.rs`, add to `Cmd`, after `Set`:
+In `crates/cli/src/cmd/routing.rs`, `Set`'s `sensitive` field becomes, with a new field after it:
+
+```rust
+        /// Items made in this area are security items, which the map never
+        /// sends to a repository that is not private. Without this flag or
+        /// `--not-sensitive`, an area keeps its sensitivity.
+        #[arg(long, conflicts_with = "not_sensitive")]
+        sensitive: bool,
+        /// Clear the area's sensitivity. Refused while any item in either
+        /// tier names the area.
+        #[arg(long)]
+        not_sensitive: bool,
+```
+
+Add to `Cmd`, after `Set`:
 
 ```rust
     /// Remove an area. Refused while any item in either tier names it.
@@ -7432,13 +7611,45 @@ In `crates/cli/src/cmd/routing.rs`, add to `Cmd`, after `Set`:
 
 ```rust
         match self {
-            Cmd::Set { .. } | Cmd::Show { .. } => false,
-            // Every item that names the area, in both tiers (routing spec §1.2).
+            // Every item that names the area, in both tiers (routing spec
+            // §1.2, decision 22).
+            Cmd::Set { not_sensitive, .. } => *not_sensitive,
+            Cmd::Show { .. } => false,
             Cmd::Remove { .. } => true,
         }
 ```
 
-In `run`, add the arm:
+In `run`, the `Set` arm binds `not_sensitive` too, and replaces Task 9's `let asked = …; let (map, first) = routing::after_set(…);` with:
+
+```rust
+            let current = store.routes(&p)?;
+            // Routing spec decision 22: neither flag keeps the area's
+            // sensitivity; clearing it is refused while any item names it.
+            let asked = match (sensitive, not_sensitive) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            let clears = asked == Some(false)
+                && current
+                    .as_ref()
+                    .and_then(|m| m.route(&area))
+                    .is_some_and(|r| r.sensitive);
+            if clears {
+                refuse_while_named(
+                    ctx,
+                    &p,
+                    &area,
+                    "Its sensitivity is not cleared: an item made in a sensitive area stays \
+                     protected",
+                )?;
+            }
+            let (map, first) = routing::after_set(current.as_ref(), &area, tier, asked);
+```
+
+(On a project's first `set` there is no map yet, so no item can name an area, and nothing is checked.)
+
+Add the arm:
 
 ```rust
         Cmd::Remove { project, area } => {
@@ -7453,28 +7664,13 @@ In `run`, add the arm:
                     map.declared().join(", ")
                 );
             }
-            let t = ctx
-                .tiers
-                .expect("a store that holds a routing map is routed, so it has tiers");
-            // ⚠ Both tiers, GitHub by its blocks; a tier that cannot be read
-            // is an error, never "no item names it".
-            let items = t.router.items_naming_area(&p, &area)?;
-            if !items.is_empty() {
-                let some: Vec<String> = items
-                    .iter()
-                    .take(10)
-                    .map(|(tier, kind, id)| named(ctx, *tier, *kind, id))
-                    .collect::<Result<_>>()?;
-                let more = if items.len() > 10 { ", …" } else { "" };
-                bail!(
-                    "`{area}` is still named by {} item(s) of project {shown}, so it is not \
-                     removed: {}{more}. An item keeps its area for life; remove the area once \
-                     none names it. fl reads only this machine's local tier: another machine's \
-                     local items may name it too",
-                    items.len(),
-                    some.join(", ")
-                );
-            }
+            refuse_while_named(
+                ctx,
+                &p,
+                &area,
+                "It is not removed: an item keeps its area for life; remove the area once none \
+                 names it",
+            )?;
             store.set_routes(&p, &map.without(&area))?;
             println!("removed\t{area}");
             eprintln!(
@@ -7482,6 +7678,37 @@ In `run`, add the arm:
                  new items are refused it"
             );
         }
+```
+
+and after `project_of`:
+
+```rust
+/// Routing spec decision 11, and decision 22's clearing of a sensitivity:
+/// refused while any item in either tier names `area`, with the count and up
+/// to ten of the items. ⚠ Both tiers, GitHub by its blocks; a tier that
+/// cannot be read is an error, never "no item names it".
+fn refuse_while_named(ctx: &Ctx<'_>, p: &ProjectId, area: &str, refused: &str) -> Result<()> {
+    let shown = refs::show(ctx.store, Kind::Project, p.iri())?;
+    let t = ctx
+        .tiers
+        .expect("a store that holds a routing map is routed, so it has tiers");
+    let items = t.router.items_naming_area(p, area)?;
+    if items.is_empty() {
+        return Ok(());
+    }
+    let some: Vec<String> = items
+        .iter()
+        .take(10)
+        .map(|(tier, kind, id)| named(ctx, *tier, *kind, id))
+        .collect::<Result<_>>()?;
+    let more = if items.len() > 10 { ", …" } else { "" };
+    bail!(
+        "`{area}` is still named by {} item(s) of project {shown}: {}{more}. {refused}. fl reads \
+         only this machine's local tier: another machine's local items may name it too",
+        items.len(),
+        some.join(", ")
+    )
+}
 ```
 
 and after `print_route`:
@@ -7510,8 +7737,14 @@ any item in either tier names the area; the refusal gives the count and lists up
 items. fl finds GitHub items by the block in each issue, not by the area label, so an item that
 lost its label is still found. A tier that cannot be read refuses the removal. fl can read only
 this machine's local tier: an item in another machine's local store keeps the area as history,
-and only new items are refused it. fl never deletes an area's label from GitHub. There is no
-rename: add the new area and remove the old one.
+and only new items are refused it. Such an item counts as sensitive from then on: fl cannot know
+what the removed area was, so a finding about it never reaches a repository that is not private.
+fl never deletes an area's label from GitHub. There is no rename: add the new area and remove the
+old one.
+
+`fl routing set --project <project> <area> <tier> --not-sensitive` clears an area's sensitivity.
+It is refused, by the same check and with the same list, while any item in either tier names the
+area.
 
 ## Limits
 
@@ -7533,14 +7766,18 @@ Expected: PASS.
 
 Each run with `cargo test -p fl-cli --test routing -- <name>`:
 
-1. The refusal: make `if !items.is_empty()` `if false` → `removing_an_area_items_still_name_is_refused_with_the_count_and_the_items` red.
+1. The refusal: replace `if items.is_empty()` with `if true` → `removing_an_area_items_still_name_is_refused_with_the_count_and_the_items` red.
 2. The count names every item, not the ten shown: print `some.len()` → not distinguishable with fewer than ten items; not a guard a test of this size tells apart.
 3. The cap of ten: `take(10)` → `take(1)` → `removing_an_area_items_still_name…` red (`1, #1`).
 4. `named`'s GitHub arm reads the number from the URL: call `ctx.show_item` instead → `an_item_that_lost_its_labels_still_blocks_the_removal` red (the lookup of an unlabelled issue fails).
-5. The scan's error propagates: replace `items_naming_area(&p, &area)?` with `.unwrap_or_default()` → `a_removal_is_refused_when_a_tier_cannot_be_read` red.
+5. The scan's error propagates: replace `items_naming_area(p, area)?` with `.unwrap_or_default()` → `a_removal_is_refused_when_a_tier_cannot_be_read` red.
 6. The undeclared refusal: delete it → `removing_an_area_the_map_does_not_declare_is_refused` red (it would print `removed`).
 7. `needs_tracker` for `Remove`: make it `false` → `removing_an_area_items_still_name_is_refused_with_the_count_and_the_items` red (the binding is not read, so GitHub cannot be read and the refusal is the tier's, not the count).
-8. The map is written without the area: write `map` unchanged → `removing_an_area_no_item_names_drops_it_for_new_items` red.
+8. `set --not-sensitive` asks the same check: delete the `if clears { refuse_while_named(…)?; }` → `clearing_a_sensitivity_items_still_name_is_refused_and_writes_nothing` red.
+9. Only a sensitive area asks: drop the "was sensitive" conjunct of `clears` → the same test red (clearing `code` is refused).
+10. `needs_tracker` for `set --not-sensitive`: make it `false` → the same test red (the binding is not read, so GitHub cannot be read and the refusal is the tier's, not the count).
+11. The flags: make `asked` `Some(true)` for `--not-sensitive` → `clearing_a_sensitivity_no_item_names_works` red.
+12. The map is written without the area: write `map` unchanged → `removing_an_area_no_item_names_drops_it_for_new_items` red.
 
 - [ ] **Step 6: Run the trio and commit**
 
@@ -7551,8 +7788,10 @@ git commit -m "feat(cli): fl routing remove, refused while any item names the ar
 
 The refusal counts the items in both tiers and lists up to ten; GitHub
 items are found by their blocks, so one that lost its label still counts;
-a tier that cannot be read refuses the removal. docs/routing.md gains
-removal and its limits. Guards mutation-tested.
+a tier that cannot be read refuses the removal. set --not-sensitive
+clears an area's sensitivity, refused by the same check. A record whose
+area was removed elsewhere stays protected end to end. docs/routing.md
+gains removal and its limits. Guards mutation-tested.
 
 Co-authored-by: Ferris <Ferris@artificialhumanity.io>"
 git status --porcelain
@@ -7568,7 +7807,7 @@ git status --porcelain
 - [ ] No test reaches the network: `grep -rln 'api.github.com\|DEFAULT_API' crates --include='*.rs'` lists the same files as on `main` (`git diff origin/main...HEAD --stat` adds none of them).
 - [ ] No plan label crept into code: `git diff origin/main...HEAD -U0 -- '*.rs' | grep '^+' | grep -iE 'task [0-9]|plan (a|b)\b|plan ruling|review focus'` prints nothing.
 - [ ] No machine name in what this branch adds: `git diff origin/main...HEAD -U0 | grep '^+' | grep -nF "$HOME"; git diff origin/main...HEAD -U0 | grep '^+' | grep -nwF "$(hostname)"` print nothing.
-- [ ] Follow `WORKFLOW.md`: `superpowers:requesting-code-review` on the whole branch, then a pull request against `main`. The pull request names the plan rulings and spec defects of this plan, says the spec is at rev 2.1 (owner decisions 20–21 and the seven defects amended, 2026-10-06), says that plan B (escalation) is written after this merges, and repeats "Plan B — what this plan leaves".
+- [ ] Follow `WORKFLOW.md`: `superpowers:requesting-code-review` on the whole branch, then a pull request against `main`. The pull request names the plan rulings and spec defects of this plan, says the spec is at rev 2.2 (owner decisions 20–22 and the seven defects amended, 2026-10-06), says that plan B (escalation) is written after this merges, and repeats "Plan B — what this plan leaves".
 
 ## Spec coverage (plan A's share)
 
@@ -7590,6 +7829,7 @@ git status --porcelain
 | decision 19 (GitHub opens lazily) | Task 10 |
 | decision 20 (a routed store holds exactly one project) | Tasks 3, 4, 9 |
 | decision 21 (nothing about a sensitive item reaches a non-private repository; refuse, not warn) | Tasks 7, 12 |
+| decision 22 (decision 21 fails closed: sensitivity kept unless changed, clearing refused while items name the area, an undeclared area counts as sensitive, such findings carry `security`) | Tasks 3, 7, 9, 14 |
 | §1.1 the area: model, store, block, label, inheritance, name rules | Tasks 1, 2, 3, 7, 12 |
 | §1.2 the map, manifest formats 1–3, the starting set, `set`/`remove`/`show`, import currency | Tasks 3, 4, 9, 10, 12, 14 |
 | §1.3 routed projects, availability, no fallback, older fl | Tasks 7, 10, 14 (the doc's limits) |
