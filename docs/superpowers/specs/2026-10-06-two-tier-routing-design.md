@@ -55,6 +55,10 @@ tracker receives a new item, and how an item moves between the tiers.
    of them, are the roadmap (§7).
 9. **The routing lives in a routing tracker** that implements the `Tracker` trait over the
    two tiers, not in each CLI command or in the gate engine.
+10. **An item's area is also a GitHub label** (`fl:area/<name>`), so GitHub's own filters show
+    it (owner, 2026-10-06).
+11. **`fl routing remove` is refused while any item in either tier names the area**
+    (owner, 2026-10-06).
 
 ### 0.2 Out of scope
 
@@ -75,6 +79,12 @@ tracker receives a new item, and how an item moves between the tiers.
 * In the local store the field is serialized with the item. In GitHub it is a field of the
   issue's fl block (`Meta.area`, skipped when absent), so an fl that predates it still reads
   the block.
+* **On GitHub the area is also a label, `fl:area/<name>`** (decision 10). It is one of fl's
+  labels: the create's label call adds it with the kind and state labels, fl creates the label
+  in the repository the first time an area is used there, and `fl github repair` restores it
+  from the block. The block stays the source of truth: an issue whose area label is missing or
+  differs from its block reads as diverged, as a wrong state label does today. The area never
+  changes after creation, so the label adds nothing to an update's conflict window.
 * An area is a name the manifest declares (§1.2). An item keeps its area for its whole life;
   escalation does not change it. *(Release scope.)*
 
@@ -91,8 +101,12 @@ tracker receives a new item, and how an item moves between the tiers.
 * Commands:
   * `fl routing set <area> <tier>` — the project's first `set` writes the starting set first:
     `code` and `tests` → `local`; `design`, `product` and `security` → `github`.
-  * `fl routing remove <area>` — items that name the area keep it as history; the removed
-    area is refused only for new items. (See §6 for the alternative.)
+  * `fl routing set <area> <tier>` on an area that exists changes its tier for new items
+    only; items already made stay where they are.
+  * `fl routing remove <area>` — **refused while any item in either tier names the area**
+    (decision 11). The refusal gives the count and lists up to ten of the items. Finding them
+    reads both tiers, so a tier that cannot be read refuses the removal too: fl never removes
+    an area it could not check.
   * `fl routing show`.
 
 ### 1.3 When a project has two tiers
@@ -241,12 +255,15 @@ Every refusal names its cause and what to do:
 | a bare handle that is only a GitHub issue | did you mean `#41`? |
 | a handle or IRI that resolves in both tiers | every candidate |
 | an escalation of an item already escalated | where it went |
+| `fl routing remove` on an area items still name | the count, and up to ten of the items |
+| an issue whose `fl:area/…` label differs from its block | diverged; `fl github repair` |
 
 ---
 
 ## 5. Testing
 
-* **Unit tests** in the module they test: the routing map and its starting set, manifest
+* **Unit tests** in the module they test: the routing map and its starting set, the refusal
+  to remove an area in use (in each tier, and when a tier cannot be read), manifest
   format 3 (and format 2 still exported without routing), handle parsing in each mode, the
   escalation steps, the store's format raise to 5.
 * **`TieredTracker` over two in-memory trackers:** create routing by area and by `--tier`,
@@ -258,19 +275,17 @@ Every refusal names its cause and what to do:
   record local, in `needs_human`, marked "escalating", and the ledger entry written.
 * **CLI black-box tests** in `tests/`: `--area`, `--tier`, `fl routing …`, the escalate
   commands, the list output with its tier column.
+* **The area label:** a GitHub item carries `fl:area/<name>`; a missing or wrong area label
+  reads as diverged and `fl github repair` restores it.
 * **One live test** on the private throwaway repository: escalate a local record; the issue
-  exists, carries the old IRI, and the local item is a tombstone.
+  exists, carries the old IRI and its area label, and the local item is a tombstone.
 
 ---
 
 ## 6. Open
 
-* **Area names on GitHub.** Whether an item's area also becomes a GitHub label (for example
-  `fl:area/design`), so that GitHub's own filters show it. Not needed for routing; it costs a
-  label per area. *(Open.)*
-* **`fl routing remove` on an area in use.** §1.2 keeps items' areas as history and refuses
-  the removed area only for new items. Whether removal should instead be refused while items
-  name the area. *(Open.)*
+None. The two questions left open when this spec was written — the area as a GitHub label,
+and removing an area in use — were decided by the owner on 2026-10-06 (decisions 10 and 11).
 
 ---
 
