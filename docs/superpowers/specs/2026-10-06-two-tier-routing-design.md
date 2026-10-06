@@ -1,8 +1,11 @@
 # Two-tier routing and escalation — design
 
-**Date:** 2026-10-06 (rev 2, same day)
+**Date:** 2026-10-06 (rev 2.1, same day)
 **Status:** Approved by the owner 2026-10-06. Rev 1 (in git at 96e1a41) was approved and then
 reviewed against the code; rev 2 folds in that review and the owner's decisions 12–19 on it.
+Rev 2.1 folds in the owner's decisions 20–21 and seven corrections found while planning plan A
+against the code (`docs/superpowers/plans/2026-10-06-two-tier-routing-a.md`, "Spec defects");
+each is marked here as an owner decision or `[agent]`.
 Sub-project 4 of 4. Delivered as two plans (§8).
 **Scope:** A project with two trackers — the local store for developer-level items, a GitHub
 repository for human-level items — the rule that routes each new item to one of them, and
@@ -68,11 +71,14 @@ how an item moves between the tiers.
     (Review: `SplitLedger::flush` refuses any decision whose record the repository does not
     own, `core/src/split.rs:378`, so every gated move of a local record would fail.)
 13. **A map entry can be marked sensitive, and a sensitive area sets the security flag.** The
-    starting set marks `security` sensitive.
+    starting set marks `security` sensitive. *(Rev 2.1, `[agent]`: only a finding carries the
+    flag; a record has none. A record in a sensitive area is refused on a non-private
+    repository when it is made, and decision 21 covers what is said about it later — §1.2.)*
 14. **An issue whose block carries an area or a local record reference is written with
     `fl_format` 2**, so an older fl says "upgrade fl" rather than "damaged". The GitHub tracker
     spec's §2.3 invariant ("a finding's record carries the `node_id`") is amended for local
-    records (§2.5).
+    records (§2.5). *(Rev 2.1, `[agent]`: the reference's field is `id`, as in every reference
+    the block holds; a local one is `{ id, title }`.)*
 15. **An area removed from the map while other machines' local items still name it** stays on
     those items as history; only new items are refused. *(Release scope.)*
 16. **When a move to `needs_human` lands but its escalation fails**, the command exits with the
@@ -83,6 +89,18 @@ how an item moves between the tiers.
     repository.
 19. **GitHub is opened only when a GitHub-tier item is needed**, so work on local items does
     not need the network or a credential.
+20. **A routed store holds exactly one project** (owner, 2026-10-06). Routing is decided per
+    store, because handles are numbered per store, so "routed project" and "routed store" are
+    one thing (§1.3). `fl routing set` is refused while the store holds any project other than
+    the one named; the refusal says to give the project its own store — a config entry with
+    its own `store`. `[agent]`: so the rule cannot be walked around, a routed store also
+    refuses `fl project add` and an import of another project, and a routed manifest is not
+    imported into a store that holds another project.
+21. **Refuse, not warn** (owner, 2026-10-06): nothing about an item in a sensitive area, and no
+    security finding, reaches a non-private repository — including a GitHub finding, in any
+    area, whose record is a local record in a sensitive area (its title would be published).
+    That finding is refused, naming `--tier local`; §2.5's warning stays for a local record in
+    any other area.
 
 ### 0.2 Out of scope
 
@@ -141,13 +159,21 @@ how an item moves between the tiers.
 * A machine that imports the manifest imports the map with it, so every machine and every
   agent routes the same way. *(Invariant — one routing rule per project, not per machine.)*
   For that to hold, a routed create and an escalation require the manifest import to be
-  current on an importing machine, and the stale check on the authoring machine, as gated
-  moves already do (`cli/src/cmd/manifest.rs:100`). `[agent]`
-* **Sensitive areas** (decision 13): an item made with a sensitive area carries the security
+  current on an importing machine. `[agent]` *(Rev 2.1, `[agent]`: on the authoring machine
+  — where gated moves check nothing today, `ensure_import_current` passing there — a routed
+  create compares the working tree's manifest, when there is one, with the store's map, and
+  is refused naming `fl manifest export` when they differ. With no manifest, no other machine
+  can import the project, so there is no other rule to disagree with.)*
+* **Sensitive areas** (decision 13): a finding made with a sensitive area carries the security
   flag, with every consequence the flag has today (a GitHub tracker refuses it on a
-  non-private repository). `--security` without a sensitive area still sets the flag.
-* Commands:
-  * `fl routing set <area> <tier> [--sensitive]` — the project's first `set` writes the
+  non-private repository). `--security` without a sensitive area still sets the flag. A record
+  carries no flag *(rev 2.1, `[agent]`)*: a record made in a sensitive area is refused on a
+  non-private repository when it is made, and a finding about a local record in a sensitive
+  area is treated as a security item (decision 21).
+* Commands *(rev 2.1, `[agent]`: each takes `--project <project>`, as every project-scoped
+  command does)*:
+  * `fl routing set <area> <tier> [--sensitive]` — refused while the store holds another
+    project (decision 20). The project's first `set` writes the
     starting set first: `code` and `tests` → `local`; `design` and `product` → `github`;
     `security` → `github`, sensitive. The first `set` also prints the handle change of §2.3.
   * `fl routing set` on an area that exists changes its tier or its sensitivity for new items
@@ -165,12 +191,17 @@ how an item moves between the tiers.
   routing map. Whether it is routed never depends on the map's current contents. `[agent]`
   (Review: deriving it from "the map names both tiers" lets one `fl routing set` change every
   handle's meaning.)
+* **A routed project is a routed store** (decision 20): fl chooses a command's tracker and
+  reads its handles per store, before it knows the command's project, and handles are
+  numbered per store, so a routed store holds exactly one project.
 * The **`github` tier is available** when the machine's config binds a GitHub repository for
   the project (the `tracker` binding of `$XDG_CONFIG_HOME/fl/config.toml`, unchanged). The
   local store is the `local` tier.
 * A routed project with no binding works on its local items. A `github`-tier create is refused
-  and names the missing config entry. fl never falls back to `local`. *(Invariant — routing
-  never changes tier silently.)*
+  and names the missing config entry; so is an issue URL the local tier does not hold. fl
+  never falls back to `local`. *(Invariant — routing never changes tier silently.)* *(Rev 2.1,
+  `[agent]`: a list of both tiers needs both, §2.4, so such a machine lists with `--tier
+  local`.)*
 * A routed project whose binding sets `ledger = "github"` is refused when the command starts,
   naming decision 12. *(Release scope.)*
 * A project with a binding and no routing map is mode A or B as today: one tracker, GitHub.
@@ -184,7 +215,9 @@ how an item moves between the tiers.
 The routing map, the area field, the "escalating" marks and the tombstones of §3 are new
 tables or fields. As with the ledger root (format 4), the store raises its format to **5** the
 first time one of them is written; an older fl refuses a format-5 store. A store that never
-routes stays at its current format. *(Release scope.)*
+routes stays at its current format. *(Release scope.)* Plans A and B share format 5 only if no
+release ships between them; otherwise plan B raises the store to 6, because an fl built from
+plan A would open a store holding marks and ignore them. (Owner informed, 2026-10-06.)
 
 ---
 
@@ -212,7 +245,11 @@ engine does not change. It follows the composable wrappers the code already has.
 ### 2.2 Lookup
 
 * By IRI, the router asks the tier that owns it:
-  * an issue URL of the bound repository → GitHub;
+  * an issue URL of the bound repository → GitHub. *(Rev 2.1, `[agent]`: "the bound
+    repository" is its configured name, or, once GitHub is open, its name now; an old name of
+    a renamed repository cannot be told from another repository without a request, so any
+    other issue URL is asked of the local tier first, then of GitHub, whose own check resolves
+    an old name.)*
   * a `urn:uuid:` IRI → the local store. If the local store holds a tombstone for it, the
     tombstone's target. If the local store does not hold it, the GitHub alias scan, because
     it may be an item escalated on another machine. `[agent]`
@@ -239,6 +276,8 @@ items:
   * In a project that was local-only, `#3` meant local item 3 and now means issue 3.
   * In a project that was GitHub-only, a bare `41` meant issue 41 and now means local item 41;
     local records made before the binding appear again in lists.
+  * *(Rev 2.1, `[agent]`)* The import that first brings a routing map to another machine prints
+    the same handle change there.
 
 In a project without a routing map, handles are unchanged: in a GitHub project a bare `41`
 still means issue 41.
@@ -250,7 +289,8 @@ still means issue 41.
   read today's output are unaffected elsewhere. `[agent]` `--tier local|github` reads one.
 * If either tier cannot be read, the merged list is an **error, never a partial list**; when
   GitHub is the tier that failed, the error suggests `--tier local`. *(Invariant — a list that
-  cannot see its whole population fails.)*
+  cannot see its whole population fails.)* A machine with no binding cannot read the GitHub
+  tier, so it lists with `--tier local` *(rev 2.1, `[agent]`)*.
 * `fl finding list --record <id>` is new: it lists one record's findings, from both tiers.
 * An item marked "escalating" is listed with that mark. Tombstones are not listed.
 * The withdrawal counts that `fl finding list` prints sum both tiers.
@@ -267,13 +307,16 @@ still means issue 41.
   (`store/src/lib.rs:973`, `github/src/tracker.rs:1864`), and `CatalogChecked` refuses any
   record the catalog's store holds (`core/src/store.rs:431`), which in a routed project is the
   local tier. So the router wraps the GitHub tier with a check of the project only.
-* **The GitHub block's record reference** for a local record is `{ iri }` with no `node_id`
-  (decision 14); the block is then `fl_format` 2. The issue shows the record's title and IRI
+* **The GitHub block's record reference** for a local record is `{ id, title }` with no
+  `node_id` (decision 14; rev 2.1 — the field is `id`, as in every reference, and `title` lets
+  the issue's text be rendered from the block on every rewrite); the block is then
+  `fl_format` 2. The issue shows the record's title and IRI
   as plain text, since a reader on GitHub cannot open a local item. `fl` resolves the IRI.
 * A local finding may name a GitHub record the same way.
 * **Disclosure.** A GitHub finding about a local record publishes that record's title. On a
   non-private repository fl warns before it writes. `[agent]` (As the ledger's decision 16
-  does for its own text.)
+  does for its own text.) About a local record in a sensitive area, fl refuses instead,
+  naming `--tier local` (decision 21).
 * **Evidence.** Runs and decisions about a finding are tagged with its record's IRI. The router
   resolves that IRI through any tombstone first, so new evidence names the record where it now
   lives. `[agent]`
@@ -310,7 +353,8 @@ is never marked and then stranded. `[agent]` The command refuses:
 * a closed state — a record `done`, a finding `fixed` or `withdrawn` (the GitHub tracker
   creates open issues only);
 * a title the GitHub tracker refuses (over 256 characters, or with whitespace at either end);
-* a security finding, or a sensitive area, when the repository is not private;
+* a security finding, a sensitive area, or a finding about a local record in a sensitive area
+  (decision 21), when the repository is not private;
 * a finding whose reproduction gate is not in the committed manifest (GitHub tracker spec
   §4.3);
 * an alias that another issue already uses, or a local alias that is an issue URL of the bound
@@ -375,8 +419,9 @@ that with no new mechanism.
 
 * A marked item reads as itself with its mark; a write to it is refused with a new
   `StoreError::Escalating { id, to_finish }`.
-* A tombstoned id reads as a new `StoreError::Moved { from, to }`, which the router follows and
-  the CLI never shows when it can follow it.
+* A tombstoned id reads as a new `StoreError::Escalated { from, to }`, which the router follows
+  and the CLI never shows when it can follow it. *(Rev 2.1, `[agent]`: rev 2 named it `Moved`,
+  which `StoreError::Moved { id, to }` already is — a transferred issue, `core/src/store.rs:155`.)*
 
 ---
 
@@ -392,6 +437,8 @@ Every refusal names its cause and what to do:
 | the `github` tier, no binding on this machine | the missing config entry; never a fallback |
 | a routing map with `ledger = "github"` | decision 12: use the local ledger |
 | a security finding or sensitive area routed to a non-private repository | use `--tier local` |
+| a GitHub finding about a local record in a sensitive area, on a non-private repository | use `--tier local` (decision 21) |
+| `fl routing set` while the store holds another project | give the project its own store (decision 20) |
 | a tier that cannot be reached | an error in lists, lookups and reference checks — never "no such item", never a partial list |
 | an id no tier holds | held on another machine's local tier, or not existing |
 | a write to an item marked "escalating" | `fl … escalate <id>` to finish, or `--abandon` |
@@ -443,7 +490,8 @@ Every refusal names its cause and what to do:
 ## 6. Open
 
 None. The review of rev 1 raised eight owner decisions (12–19) and the owner decided them on
-2026-10-06; the rest are `[agent]` rulings, marked where they are made.
+2026-10-06; planning plan A raised two more (20–21), decided the same day; the rest are
+`[agent]` rulings, marked where they are made.
 
 ---
 
@@ -470,8 +518,8 @@ Two plans, as for sub-projects 2 and 3:
 
 * **Plan A — routing.** The area (model, store, block, label), the routing map and its
   commands, manifest format 3, store format 5, `TieredTracker` (create, lookup, handles,
-  lists, references across tiers, `ForeignRecord`), lazy GitHub, decisions 12–14, the
-  migration notice.
+  lists, references across tiers, `ForeignRecord`), lazy GitHub, decisions 12–14 and 20–21,
+  the migration notice.
 * **Plan B — escalation.** The pre-checks, the mark, the find-or-create step with its own
   search, the tombstone, `--abandon`, the findings list in the issue, the `needs_human`
   trigger, the live test. Plan B is written after plan A merges.
