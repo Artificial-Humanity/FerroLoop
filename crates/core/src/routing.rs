@@ -180,16 +180,17 @@ pub struct ForeignRecord {
 }
 
 impl ForeignRecord {
+    /// The router's proof that it read `id` in `tier` (routing spec §2.5).
+    pub(crate) fn checked(id: RecordId, title: String, tier: Tier) -> Self {
+        Self { id, title, tier }
+    }
+
     /// For the trackers' own tests. Not in the binary: the `conformance`
     /// feature is a dev-dependency only.
     #[cfg(any(test, feature = "conformance"))]
     #[doc(hidden)]
     pub fn for_tests(id: RecordId, title: &str, tier: Tier) -> Self {
-        Self {
-            id,
-            title: title.to_string(),
-            tier,
-        }
+        Self::checked(id, title.to_string(), tier)
     }
 
     /// The record's primary id, as the tier that holds it answers it.
