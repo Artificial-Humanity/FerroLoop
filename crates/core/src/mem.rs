@@ -3,6 +3,7 @@ use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
+use crate::routing::{Routes, RoutingMap};
 use crate::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use std::cell::RefCell;
@@ -36,6 +37,9 @@ struct Inner {
     runs: Vec<GateRun>,
     attempts: Vec<Attempt>,
     findings: BTreeMap<Iri, Finding>,
+    /// project → its routing map (routing spec §1.2).
+    routing: BTreeMap<Iri, RoutingMap>,
+
     /// alias → primary. `"alias"` is not a `Kind`: it is an index marker, so
     /// an alias never enters `owned`. `check` follows it before deciding.
     aliases: BTreeMap<Iri, Iri>,
@@ -229,6 +233,27 @@ impl Catalog for MemStore {
 
     fn kind_of(&self, id: &Iri) -> Result<Kind, StoreError> {
         self.inner.borrow().check(id)
+    }
+}
+
+impl MemStore {
+    /// Write `project`'s routing map. A map that is not one fl writes is
+    /// refused (`RoutingMap::check`).
+    pub fn set_routes(&self, project: &ProjectId, map: &RoutingMap) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(&project.0, Kind::Project)?;
+        map.check()
+            .map_err(|why| StoreError::Backend(format!("the routing map is not valid: {why}")))?;
+        s.routing.insert(project.0.clone(), map.clone());
+        Ok(())
+    }
+}
+
+impl Routes for MemStore {
+    fn routes(&self, project: &ProjectId) -> Result<Option<RoutingMap>, StoreError> {
+        let s = self.inner.borrow();
+        s.check_kind(&project.0, Kind::Project)?;
+        Ok(s.routing.get(&project.0).cloned())
     }
 }
 
@@ -709,5 +734,19 @@ mod tests {
         );
         assert_eq!(s.cutover("R_1").unwrap(), Some(entry_iri(3)));
         assert_eq!(s.cutover("R_2").unwrap(), None);
+    }
+
+    #[test]
+    fn a_memory_store_keeps_one_routing_map_per_project() {
+        use crate::routing::{Routes, RoutingMap};
+        let s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let q = s.add_project("/q").unwrap();
+        assert_eq!(s.routes(&p).unwrap(), None);
+        s.set_routes(&p, &RoutingMap::starting()).unwrap();
+        assert_eq!(s.routes(&p).unwrap(), Some(RoutingMap::starting()));
+        assert_eq!(s.routes(&q).unwrap(), None, "per project");
+        let err = s.routes(&ProjectId(seq_iri(99))).unwrap_err();
+        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
     }
 }

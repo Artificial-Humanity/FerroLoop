@@ -14,6 +14,7 @@ pub mod iri;
 pub mod log;
 pub mod mem;
 pub mod model;
+pub mod routing;
 pub mod split;
 pub mod stale;
 pub mod store;
@@ -31,6 +32,7 @@ pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
+pub use routing::{AreaRoute, Routes, RoutingMap, Tier};
 pub use split::{
     Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,
     RemoteLedger, SplitLedger,
