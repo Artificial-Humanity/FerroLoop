@@ -13,7 +13,7 @@ use fl_core::iri::Iri;
 use fl_core::model::{Record, State};
 use fl_core::store::{Bindings, Handles, StoreError, Tracker};
 use serde_json::{Value, json};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +46,10 @@ type Seen = (Meta, String, String);
 pub struct GithubTracker {
     client: Client,
     repo: Repo,
-    labels_ready: Cell<bool>,
+    /// Every fl label this process knows exists in the repository — the
+    /// kind and state labels, and each area's (spec §3.3; routing spec
+    /// §1.1) — so each is listed and created at most once per process.
+    labels_ready: RefCell<BTreeSet<String>>,
     /// Kinds seen this process, by issue number, so a handle lookup does not
     /// read the issue again.
     kinds: RefCell<BTreeMap<u64, ItemKind>>,
@@ -480,7 +483,7 @@ impl GithubTracker {
         let tracker = Self {
             client,
             repo,
-            labels_ready: Cell::new(false),
+            labels_ready: RefCell::new(BTreeSet::new()),
             kinds: RefCell::new(BTreeMap::new()),
             seen: RefCell::new(BTreeMap::new()),
             settle: std::time::Duration::from_secs(2),
@@ -872,10 +875,19 @@ impl GithubTracker {
         Ok(out)
     }
 
-    /// Create every fl label that is missing, explicitly — never as a side
-    /// effect of an issue write (spec §3.3). Once per process.
-    fn ensure_labels(&self) -> Result<(), StoreError> {
-        if self.labels_ready.get() {
+    /// Create every fl label that is missing — the kind and state labels,
+    /// and `area`'s when given — explicitly, never as a side effect of an
+    /// issue write (spec §3.3). A label this process already knows exists is
+    /// not looked for again.
+    fn ensure_labels(&self, area: Option<&str>) -> Result<(), StoreError> {
+        let mut wanted = meta::all_labels();
+        if let Some(a) = area {
+            wanted.push(meta::area_label(a));
+        }
+        if wanted
+            .iter()
+            .all(|l| self.labels_ready.borrow().contains(l))
+        {
             return Ok(());
         }
         let have: BTreeSet<String> = self
@@ -884,8 +896,8 @@ impl GithubTracker {
             .iter()
             .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
             .collect();
-        for name in meta::all_labels() {
-            if have.contains(&name) {
+        for name in &wanted {
+            if have.contains(name) {
                 continue;
             }
             let body = json!({"name": name, "color": "5319e7", "description": "managed by fl"});
@@ -899,7 +911,7 @@ impl GithubTracker {
                 )));
             }
         }
-        self.labels_ready.set(true);
+        self.labels_ready.borrow_mut().extend(wanted);
         Ok(())
     }
 
@@ -935,7 +947,7 @@ impl GithubTracker {
                 meta.state
             )));
         }
-        self.ensure_labels()?;
+        self.ensure_labels(None)?;
         let labels = vec![meta::kind_label(kind), meta::state_label(kind, &meta.state)];
         let body = meta::render_body(prose, meta);
         // ⚠ No labels in the create: they are added afterward, by their own
@@ -1224,7 +1236,7 @@ impl GithubTracker {
         missing: impl Fn() -> StoreError,
         change: impl FnOnce(&mut Meta, &mut String, &mut String) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        self.ensure_labels()?;
+        self.ensure_labels(None)?;
         let id = self.issue_url(n);
         // Classify first, so a missing, deleted or moved issue keeps its
         // outcome — its timeline would answer 404, 410 or 301 instead.
@@ -1289,7 +1301,8 @@ impl GithubTracker {
         }
         let mut title = issue.title.clone();
         change(&mut meta, &mut prose, &mut title)?;
-        let labels = meta::labels_after(&issue.labels, kind, &meta.state);
+        self.ensure_labels(meta.area.as_deref())?;
+        let labels = meta::labels_after(&issue.labels, kind, &meta.state, meta.area.as_deref());
         let (state, reason) = meta::projection(kind, &meta.state);
         let body = meta::render_body(&prose, &meta);
         let same_labels =
@@ -1552,7 +1565,7 @@ impl GithubTracker {
         // ⚠ Explicitly, as every write does: a deleted fl label is a common
         // reason to repair, and the PATCH must not recreate it as a side
         // effect (spec §3.3).
-        self.ensure_labels()?;
+        self.ensure_labels(None)?;
         let n = self.locate(id)?;
         let classify = |fetched: Fetched| match fetched {
             // Before the window: GitHub's edit history does not answer for
@@ -1591,6 +1604,7 @@ impl GithubTracker {
                 meta.state
             )));
         }
+        self.ensure_labels(meta.area.as_deref())?;
         if matches!(meta::read_item(&issue), Ok(Read::Item { .. })) {
             return Ok(Repaired {
                 number: n,
@@ -1598,7 +1612,8 @@ impl GithubTracker {
                 changed: false,
             });
         }
-        let labels = meta::labels_after(&issue.labels, meta.kind, &meta.state);
+        let labels =
+            meta::labels_after(&issue.labels, meta.kind, &meta.state, meta.area.as_deref());
         let (state, reason) = meta::projection(meta.kind, &meta.state);
         let mut sent = json!({"labels": labels, "state": state});
         if let Some(r) = reason {
@@ -1738,6 +1753,11 @@ impl GithubTracker {
     /// id — never by the URL, because an old name may now reach another
     /// repository.
     fn current_ref(&self, r: &RecordRef) -> Result<Iri, StoreError> {
+        // Routing spec §2.5: a record in the local tier is resolved there,
+        // by its IRI; GitHub holds no node for it.
+        let Some(node_id) = &r.node_id else {
+            return Ok(r.id.clone());
+        };
         if let Some((name, _)) = meta::parse_issue_url(&r.id)
             && name.eq_ignore_ascii_case(&self.repo.full_name)
         {
@@ -1745,7 +1765,7 @@ impl GithubTracker {
         }
         let data = self.client.graphql(
             "query($id: ID!) { node(id: $id) { ... on Issue { url repository { id } } } }",
-            json!({ "id": r.node_id }),
+            json!({ "id": node_id }),
         )?;
         let node = data
             .get("node")
@@ -1886,7 +1906,8 @@ impl Tracker for GithubTracker {
         );
         meta.record = Some(RecordRef {
             id: record.url.clone(),
-            node_id: record.node_id.clone(),
+            node_id: Some(record.node_id.clone()),
+            title: None,
         });
         meta.reproduction = finding.reproduction.clone();
         meta.raised_by = Some(finding.raised_by.clone());
@@ -2126,6 +2147,121 @@ mod tests {
                 "label {l} was not created"
             );
         }
+    }
+
+    /// Gives issue `n` the area `area` in its block, with its label or
+    /// without — what a newer fl, or a hand, left there.
+    fn give_area(fake: &FakeGithub, n: u64, area: &str, labelled: bool) {
+        fake.web_edit(n, |i| {
+            let (prose, mut m) = meta::parse_body(&i.body).unwrap();
+            m.area = Some(area.into());
+            i.body = meta::render_body(&prose, &m);
+            if labelled {
+                i.labels.push(meta::area_label(area));
+            }
+        });
+    }
+
+    /// How many labels fl has created in the repository.
+    fn label_creates(fake: &FakeGithub) -> usize {
+        fake.state()
+            .requests
+            .iter()
+            .filter(|r| *r == "POST /repos/acme/widgets/labels")
+            .count()
+    }
+
+    // Routing spec §1.1: a missing area label reads as diverged, and repair
+    // restores it from the block — creating the label first, never as a side
+    // effect of the write (GitHub tracker spec §3.3).
+    #[test]
+    fn a_repair_restores_a_missing_area_label_creating_it_first() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        give_area(&fake, 1, "code", false);
+        let fresh = open(&fake);
+        let err = fresh.get_record(&r).unwrap_err().to_string();
+        assert!(err.contains("which its block's area needs"), "{err}");
+        let before = label_creates(&fake);
+        assert!(fresh.repair(r.iri(), "owner").unwrap().changed);
+        let labels = fake.issue(1).labels;
+        assert!(labels.contains(&"fl:area/code".to_string()), "{labels:?}");
+        assert_eq!(label_creates(&fake), before + 1, "created explicitly");
+        assert!(open(&fake).get_record(&r).unwrap().is_some());
+    }
+
+    // Routing spec §1.1: an area label that differs from the block reads
+    // as diverged, and repair rewrites it from the block.
+    #[test]
+    fn a_repair_replaces_a_wrong_area_label_with_the_blocks() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        give_area(&fake, 1, "code", false);
+        fake.web_edit(1, |i| i.labels.push(meta::area_label("design")));
+        let fresh = open(&fake);
+        let err = fresh.get_record(&r).unwrap_err().to_string();
+        assert!(err.contains("do not match its block's area"), "{err}");
+        assert!(fresh.repair(r.iri(), "owner").unwrap().changed);
+        let labels = fake.issue(1).labels;
+        assert!(
+            labels.contains(&"fl:area/code".to_string())
+                && !labels.contains(&"fl:area/design".to_string()),
+            "{labels:?}"
+        );
+        assert!(open(&fake).get_record(&r).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_update_keeps_the_area_label_and_creates_it_first() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        give_area(&fake, 1, "code", true);
+        let before = label_creates(&fake);
+        open(&fake).set_record_state(&r, State::Doing).unwrap();
+        let labels = fake.issue(1).labels;
+        assert!(
+            labels.contains(&"fl:area/code".to_string())
+                && labels.contains(&"fl:record/doing".to_string()),
+            "{labels:?}"
+        );
+        assert_eq!(label_creates(&fake), before + 1, "created explicitly");
+    }
+
+    // Routing spec §2.5: a reference to a local record is resolved in the
+    // local tier, never through GitHub.
+    #[test]
+    fn a_findings_reference_to_a_local_record_reads_back_without_a_lookup() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let f = t
+            .add_finding(Finding::raise(p(), r, "rev", "claim"))
+            .unwrap();
+        let local = Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000042").unwrap();
+        fake.web_edit(2, |i| {
+            let (prose, mut m) = meta::parse_body(&i.body).unwrap();
+            m.record = Some(RecordRef {
+                id: local.clone(),
+                node_id: None,
+                title: Some("t".into()),
+            });
+            i.body = meta::render_body(&prose, &m);
+        });
+        let graphql = |fk: &FakeGithub| {
+            fk.state()
+                .requests
+                .iter()
+                .filter(|r| r.starts_with("POST /graphql"))
+                .count()
+        };
+        let before = graphql(&fake);
+        let back = open(&fake).get_finding(&f).unwrap().unwrap();
+        assert_eq!(back.record.iri(), &local);
+        assert_eq!(back.claim, "claim");
+        assert_eq!(graphql(&fake), before, "no node lookup for a local record");
     }
 
     #[test]

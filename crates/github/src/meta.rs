@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const FL_FORMAT: u64 = 1;
+/// The format of a block that carries an area or a reference to a local
+/// record (routing spec decision 14). An older fl reads format 1 only, so
+/// it refuses such an issue as a newer format instead of reading half of it.
+pub const FL_FORMAT_ROUTED: u64 = 2;
+/// The start of an area's label, `fl:area/<name>` (routing spec §1.1).
+pub const AREA_LABEL_PREFIX: &str = "fl:area/";
 pub const META_OPEN: &str = "<!-- fl:meta";
 pub const META_CLOSE: &str = "-->";
 /// GitHub limits an issue title to 256 characters.
@@ -64,7 +70,22 @@ impl ItemKind {
 #[serde(deny_unknown_fields)]
 pub struct RecordRef {
     pub id: Iri,
-    pub node_id: String,
+    /// The record's issue node id (spec §2.3). `None` for a record in the
+    /// project's local tier (routing spec §2.5), which no issue holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// A local record's title, which the issue shows beside its IRI: a
+    /// reader on GitHub cannot open a local item. `None` for a record on
+    /// GitHub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl RecordRef {
+    /// Whether this names a record in the local tier.
+    pub fn is_local(&self) -> bool {
+        self.node_id.is_none()
+    }
 }
 
 /// The fields a label cannot hold (spec §3.1). ⚠ `deny_unknown_fields`: a
@@ -76,6 +97,11 @@ pub struct Meta {
     pub kind: ItemKind,
     pub state: String,
     pub project: ProjectId,
+    /// The item's area (routing spec §1.1), fixed for its life; its
+    /// `fl:area/<name>` label is rewritten from this. Skipped when absent,
+    /// so a block without one is written byte for byte as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record: Option<RecordRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +128,7 @@ impl Meta {
             kind,
             state: state.to_string(),
             project,
+            area: None,
             record: None,
             reproduction: None,
             raised_by: None,
@@ -111,6 +138,27 @@ impl Meta {
             also_known_as: vec![],
             create_key: format!("urn:uuid:{}", uuid::Uuid::now_v7()),
         }
+    }
+
+    /// The format this block is written in: [`FL_FORMAT_ROUTED`] when it
+    /// carries an area or a reference to a local record, else
+    /// [`FL_FORMAT`], which every older fl reads.
+    pub fn required_format(&self) -> u64 {
+        let local_record = self.record.as_ref().is_some_and(RecordRef::is_local);
+        if self.area.is_some() || local_record {
+            FL_FORMAT_ROUTED
+        } else {
+            FL_FORMAT
+        }
+    }
+
+    /// This block with `fl_format` set from its fields. ⚠ Never set the
+    /// field by hand: a block whose format disagrees with its fields reads
+    /// as damaged, and a remembered copy that disagrees with the issue reads
+    /// as a conflict.
+    pub fn sealed(mut self) -> Self {
+        self.fl_format = self.required_format();
+        self
     }
 }
 
@@ -250,6 +298,11 @@ pub fn state_label(kind: ItemKind, state: &str) -> String {
     format!("fl:{}/{state}", kind.as_wire())
 }
 
+/// An area's label (routing spec §1.1).
+pub fn area_label(area: &str) -> String {
+    format!("{AREA_LABEL_PREFIX}{area}")
+}
+
 /// Every label fl may set, enumerated from the kinds and their states.
 pub fn all_labels() -> Vec<String> {
     let mut out = Vec::new();
@@ -263,8 +316,14 @@ pub fn all_labels() -> Vec<String> {
 }
 
 /// An issue's labels after fl writes it: every label that is not fl's, then
-/// this kind's two (spec §3.3 — fl replaces only its own).
-pub fn labels_after(current: &[String], kind: ItemKind, state: &str) -> Vec<String> {
+/// this kind's two, then the area's — all from the block (spec §3.3; routing
+/// spec §1.1: fl replaces only its own labels, and the area label is one).
+pub fn labels_after(
+    current: &[String],
+    kind: ItemKind,
+    state: &str,
+    area: Option<&str>,
+) -> Vec<String> {
     let mut out: Vec<String> = current
         .iter()
         .filter(|l| !l.starts_with("fl:"))
@@ -272,6 +331,9 @@ pub fn labels_after(current: &[String], kind: ItemKind, state: &str) -> Vec<Stri
         .collect();
     out.push(kind_label(kind));
     out.push(state_label(kind, state));
+    if let Some(a) = area {
+        out.push(area_label(a));
+    }
     out
 }
 
@@ -290,19 +352,39 @@ pub fn projection(kind: ItemKind, state: &str) -> (&'static str, Option<&'static
     ("open", None)
 }
 
-/// The prose, then the block. ⚠ `<` and `>` are escaped inside the JSON so
-/// no field value can end the HTML comment or open a second block. They
-/// occur only inside JSON strings, where `<`/`>` are the same text.
+/// The line an issue shows for a finding whose record is in the local tier
+/// (routing spec §2.5): the record's title and IRI as text, escaped as a
+/// ledger comment escapes a name, so neither mentions anyone, links an issue
+/// or opens a tag. `None` when the block names no local record.
+pub fn record_line(meta: &Meta) -> Option<String> {
+    let r = meta.record.as_ref().filter(|r| r.is_local())?;
+    Some(format!(
+        "Record: {} — {}, held in the local tier, not on GitHub.",
+        crate::ledger::render::escape(r.title.as_deref().unwrap_or("")),
+        crate::ledger::render::escape(r.id.as_str())
+    ))
+}
+
+/// The prose, the line naming a local record when there is one, then the
+/// block, sealed. ⚠ `<` and `>` are escaped inside the JSON so no field
+/// value can end the HTML comment or open a second block. They occur only
+/// inside JSON strings, where `<`/`>` are the same text.
 pub fn render_body(prose: &str, meta: &Meta) -> String {
-    let json = serde_json::to_string(meta)
+    let meta = meta.clone().sealed();
+    let json = serde_json::to_string(&meta)
         .expect("a Meta always serializes")
         .replace('<', "\\u003c")
         .replace('>', "\\u003e");
     let block = format!("{META_OPEN}\n{json}\n{META_CLOSE}");
-    if prose.is_empty() {
+    let shown = match record_line(&meta) {
+        Some(line) if prose.is_empty() => line,
+        Some(line) => format!("{prose}\n\n{line}"),
+        None => prose.to_string(),
+    };
+    if shown.is_empty() {
         format!("{block}\n")
     } else {
-        format!("{prose}\n\n{block}\n")
+        format!("{shown}\n\n{block}\n")
     }
 }
 
@@ -320,7 +402,8 @@ impl std::fmt::Display for BodyError {
             BodyError::Damaged(why) => write!(f, "has a damaged fl block ({why})"),
             BodyError::UnknownFormat(n) => write!(
                 f,
-                "has an fl block of format {n}, and this fl reads format {FL_FORMAT}"
+                "has an fl block of format {n}, and this fl reads formats {FL_FORMAT} to \
+                 {FL_FORMAT_ROUTED}: upgrade fl to read it"
             ),
         }
     }
@@ -342,16 +425,31 @@ pub fn parse_body(body: &str) -> Result<(String, Meta), BodyError> {
     let loose: Value =
         serde_json::from_str(rest[..end].trim()).map_err(|e| BodyError::Damaged(e.to_string()))?;
     match loose.get("fl_format").and_then(Value::as_u64) {
-        Some(FL_FORMAT) => {}
+        Some(FL_FORMAT | FL_FORMAT_ROUTED) => {}
         Some(n) => return Err(BodyError::UnknownFormat(n)),
         None => return Err(BodyError::Damaged("it has no `fl_format`".into())),
     }
     let meta: Meta =
         serde_json::from_value(loose).map_err(|e| BodyError::Damaged(e.to_string()))?;
+    if meta.fl_format != meta.required_format() {
+        return Err(BodyError::Damaged(format!(
+            "its `fl_format` is {}, but its fields are format {}",
+            meta.fl_format,
+            meta.required_format()
+        )));
+    }
     if !rest[end + META_CLOSE.len()..].trim().is_empty() {
         return Err(BodyError::Damaged("text follows the block".into()));
     }
-    Ok((body[..at].trim_end().to_string(), meta))
+    let prose = body[..at].trim_end();
+    // The line fl writes for a local record is not part of the prose.
+    let prose = match record_line(&meta) {
+        Some(line) => prose
+            .strip_suffix(line.as_str())
+            .map_or(prose, str::trim_end),
+        None => prose,
+    };
+    Ok((prose.to_string(), meta))
 }
 
 /// What an issue is to fl.
@@ -442,10 +540,31 @@ pub fn read_item(issue: &IssueView) -> Result<Read, StoreError> {
     let own = kind_label(kind);
     let stray: Vec<&&str> = fl
         .iter()
-        .filter(|l| **l != own && !l.starts_with(prefix.as_str()))
+        .filter(|l| {
+            **l != own && !l.starts_with(prefix.as_str()) && !l.starts_with(AREA_LABEL_PREFIX)
+        })
         .collect();
     if !stray.is_empty() {
         problems.push(format!("it also carries {stray:?}"));
+    }
+    // Routing spec §1.1: the block is the truth; an area label that is
+    // missing, extra or another area's is diverged.
+    let areas: Vec<&str> = fl
+        .iter()
+        .copied()
+        .filter(|l| l.starts_with(AREA_LABEL_PREFIX))
+        .collect();
+    let want = meta.area.as_deref().map(area_label);
+    match (want.as_deref(), areas.as_slice()) {
+        (None, []) => {}
+        (Some(w), [one]) if *one == w => {}
+        (Some(w), []) => problems.push(format!(
+            "it has no `{w}` label, which its block's area needs"
+        )),
+        (w, found) => problems.push(format!(
+            "its area labels {found:?} do not match its block's area ({})",
+            w.unwrap_or("none")
+        )),
     }
     if problems.is_empty() {
         Ok(Read::Item { kind, meta, prose })
@@ -551,8 +670,15 @@ mod tests {
             Err(BodyError::Damaged(_))
         ));
         assert_eq!(
-            parse_body(&good.replace("\"fl_format\":1", "\"fl_format\":2")),
-            Err(BodyError::UnknownFormat(2))
+            parse_body(&good.replace("\"fl_format\":1", "\"fl_format\":3")),
+            Err(BodyError::UnknownFormat(3))
+        );
+        assert!(
+            BodyError::UnknownFormat(3)
+                .to_string()
+                .contains("formats 1 to 2"),
+            "{}",
+            BodyError::UnknownFormat(3)
         );
     }
 
@@ -651,6 +777,7 @@ mod tests {
             &["bug".into(), "fl:record/todo".into()],
             ItemKind::Record,
             "doing",
+            None,
         );
         assert_eq!(after, vec!["bug", "fl:record", "fl:record/doing"]);
     }
@@ -720,12 +847,175 @@ mod tests {
         let mut m = meta(ItemKind::Finding, "raised");
         m.record = Some(RecordRef {
             id: Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000099").unwrap(),
-            node_id: "I_9".into(),
+            node_id: Some("I_9".into()),
+            title: None,
         });
         let body = render_body("", &m);
         assert!(body.contains("\"record\":{"), "{body}");
         let bad = body.replacen("\"record\":{", "\"record\":{\"extra\":1,", 1);
         assert!(matches!(parse_body(&bad), Err(BodyError::Damaged(_))));
+    }
+
+    fn local_ref(title: &str) -> RecordRef {
+        RecordRef {
+            id: Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000042").unwrap(),
+            node_id: None,
+            title: Some(title.into()),
+        }
+    }
+
+    /// Everything before the block: what GitHub renders.
+    fn shown(body: &str) -> &str {
+        &body[..body.rfind(META_OPEN).unwrap()]
+    }
+
+    // Routing spec decision 14: format 2 exactly when the block carries an
+    // area or a reference to a local record — computed, whatever the field
+    // held.
+    #[test]
+    fn the_block_is_format_2_exactly_when_it_carries_an_area_or_a_local_record() {
+        let format = |m: &Meta| parse_body(&render_body("p", m)).unwrap().1.fl_format;
+        let mut plain = meta(ItemKind::Finding, "raised");
+        plain.fl_format = 7;
+        assert_eq!(format(&plain), 1, "computed, never taken from the field");
+        let mut with_area = meta(ItemKind::Record, "todo");
+        with_area.area = Some("code".into());
+        assert_eq!(format(&with_area), 2);
+        let mut on_github = meta(ItemKind::Finding, "raised");
+        on_github.record = Some(RecordRef {
+            id: Iri::parse("https://github.com/acme/widgets/issues/3").unwrap(),
+            node_id: Some("I_3".into()),
+            title: None,
+        });
+        assert_eq!(format(&on_github), 1);
+        assert!(!shown(&render_body("p", &on_github)).contains("Record: "));
+        let mut on_local = meta(ItemKind::Finding, "raised");
+        on_local.record = Some(local_ref("t"));
+        assert_eq!(format(&on_local), 2);
+        assert!(render_body("p", &plain).contains("\"fl_format\":1"));
+        assert!(render_body("p", &with_area).contains("\"fl_format\":2"));
+        assert!(
+            !render_body("p", &plain).contains("\"area\""),
+            "skipped when absent"
+        );
+    }
+
+    #[test]
+    fn a_block_whose_format_disagrees_with_its_fields_is_damaged() {
+        let plain = render_body("p", &meta(ItemKind::Record, "todo"));
+        let lying = plain.replace("\"fl_format\":1", "\"fl_format\":2");
+        assert_ne!(lying, plain, "the edit must have landed");
+        match parse_body(&lying) {
+            Err(BodyError::Damaged(why)) => {
+                assert!(why.contains("but its fields are format 1"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut m = meta(ItemKind::Record, "todo");
+        m.area = Some("code".into());
+        let lying = render_body("p", &m).replace("\"fl_format\":2", "\"fl_format\":1");
+        assert!(matches!(parse_body(&lying), Err(BodyError::Damaged(_))));
+    }
+
+    // Routing spec §2.5: a reader on GitHub cannot open a local record, so
+    // the issue names it as text — text that mentions nobody and links
+    // nothing — and the claim reads back without it.
+    #[test]
+    fn a_local_record_reference_shows_as_plain_text_and_reads_back_as_the_claim() {
+        let mut m = meta(ItemKind::Finding, "raised");
+        m.record = Some(local_ref("@alice: fix #3 <b>"));
+        let body = render_body("the claim", &m);
+        let text = shown(&body);
+        assert!(text.contains("Record: "), "{text}");
+        assert!(
+            text.contains("held in the local tier, not on GitHub"),
+            "{text}"
+        );
+        assert!(
+            text.contains("00000000-0000-7000-8000-000000000042"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("@alice"),
+            "a title must not mention anyone: {text}"
+        );
+        assert!(
+            !text.contains("#3"),
+            "a title must not link an issue: {text}"
+        );
+        assert!(!text.contains("<b>"), "{text}");
+        let (prose, back) = parse_body(&body).unwrap();
+        assert_eq!(prose, "the claim");
+        assert_eq!(back, m.clone().sealed());
+        let empty = render_body("", &m);
+        assert!(
+            empty.starts_with("Record: "),
+            "an empty claim leaves no blank lines before the line: {empty:?}"
+        );
+        let (prose, _) = parse_body(&empty).unwrap();
+        assert_eq!(prose, "", "an empty claim reads back empty");
+    }
+
+    // Routing spec §1.1: the area label is one of fl's, rewritten from the
+    // block like the other two.
+    #[test]
+    fn every_rewrite_keeps_the_area_label_from_the_block() {
+        let after = labels_after(
+            &["bug".into(), "fl:record/todo".into(), "fl:area/old".into()],
+            ItemKind::Record,
+            "doing",
+            Some("code"),
+        );
+        assert_eq!(
+            after,
+            vec!["bug", "fl:record", "fl:record/doing", "fl:area/code"]
+        );
+        let none = labels_after(&["fl:area/code".into()], ItemKind::Record, "todo", None);
+        assert_eq!(none, vec!["fl:record", "fl:record/todo"]);
+    }
+
+    // Routing spec §1.1: "an issue whose area label is missing or differs
+    // from its block reads as diverged, as a wrong state label does today".
+    #[test]
+    fn an_area_label_that_is_missing_or_differs_from_the_block_is_diverged() {
+        let mut m = meta(ItemKind::Record, "todo");
+        m.area = Some("code".into());
+        let body = render_body("", &m);
+        let read = |labels: &[&str]| read_item(&issue(labels, "open", &body));
+        assert!(matches!(
+            read(&["fl:record", "fl:record/todo", "fl:area/code"]).unwrap(),
+            Read::Item { .. }
+        ));
+        let err = read(&["fl:record", "fl:record/todo"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("which its block's area needs") && err.contains("fl:area/code"),
+            "{err}"
+        );
+        let err = read(&["fl:record", "fl:record/todo", "fl:area/design"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("do not match its block's area") && err.contains("fl:area/design"),
+            "{err}"
+        );
+        let err = read(&["fl:record", "fl:record/todo", "fl:area/code", "fl:area/x"])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do not match its block's area"), "{err}");
+        let plain = render_body("", &meta(ItemKind::Record, "todo"));
+        let err = read_item(&issue(
+            &["fl:record", "fl:record/todo", "fl:area/code"],
+            "open",
+            &plain,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("do not match its block's area (none)"),
+            "{err}"
+        );
     }
 
     #[test]
