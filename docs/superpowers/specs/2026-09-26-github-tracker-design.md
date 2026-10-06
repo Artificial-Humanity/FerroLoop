@@ -97,8 +97,9 @@ GitHub mode is a permanently supported configuration. The local tracker stays th
 Depends on `fl-core` only.
 
 * **`GithubTracker`** implements `Tracker` and `Handles` for one repository.
-* **`Client`** is a blocking HTTP client over the REST API, plus the one GraphQL query that
-  looks an item up by `node_id` (§2.3). The traits and the CLI are synchronous, so the crate
+* **`Client`** is a blocking HTTP client over the REST API and GraphQL. GraphQL serves the
+  issue lists (§3.7), the body edit history (§3.3) and the lookup of an item by `node_id`
+  (§2.3). The traits and the CLI are synchronous, so the crate
   has no async code.
 * **`Credentials`** is an interface with two implementations, `AppCredentials` and
   `EnvToken` (§5).
@@ -224,9 +225,9 @@ repository and `#41` there is a different issue. A URL alone is not a safe refer
 ### 2.5 Aliases
 
 An issue's aliases live in its metadata block. A lookup by an alias that is not a URL of the
-bound repository is a **full scan** of the fl issues — every page, compared against every
-block. It is correct and it is expensive: one full list per lookup. The search API is not used,
-because its index lags and it does not promise a complete result. *(Release scope — revisit
+bound repository is a **full scan** of the fl issues — every page of the GraphQL list (§3.7),
+compared against every block. It is correct and it is expensive: one full list per lookup. The
+search API is not used, because its index lags and it does not promise a complete result. *(Release scope — revisit
 with the rate-limit design of sub-project 3.)*
 
 ---
@@ -272,6 +273,21 @@ fl writes it; fl never reads state from it.
 * **The response is the postcondition.** GitHub silently drops labels that a caller may not
   set. After every create and update, fl checks that the returned labels, block and status are
   the ones it sent. A mismatch is an ERROR, never success. *(Invariant.)*
+* **A create is two calls.** `POST /issues` sends the title and the body, with no labels; then
+  one `POST /issues/{n}/labels` adds the kind label and the state label. fl checks the create's
+  answer (title, block, open) and then the label call's answer (the fl labels). Labels are not
+  sent in the create because, measured live on 2026-10-05, labels set there produced their
+  `labeled` timeline events 28–88 s late (once more than 180 s), in the REST and GraphQL
+  timelines alike, and those late events carry the labels the issue has when GitHub processes
+  them. fl's wait after a create (below) ended first, so the events fell in the next update's
+  window as a spurious conflict. Labels added by their own call showed their events in 1–2 s
+  (3 of 3, measured adding one label per call), with no later events after 180 s. fl's label
+  call adds two labels; its timing is not separately measured.
+* **A stop between the two calls leaves an issue without fl's labels.** If the label call fails,
+  or GitHub applies only some of the labels, the error names the issue and says that
+  `fl github repair` restores its labels from its block (§3.4, §0.1b, 14); it never says to
+  retry the create, which would make a duplicate. Until it is repaired, the issue is left out
+  of fl's lists (no fl label) or makes them fail as diverged (some of them).
 * **Labels are created explicitly.** fl creates its missing `fl:*` labels through the labels
   API at first use, and treats a failure there as an ERROR. It never relies on a label being
   created as a side effect.
@@ -281,19 +297,43 @@ fl writes it; fl never reads state from it.
   in that window is a **conflict ERROR**, never success. This is detection, not prevention: the
   other write has already landed, and the next read reports any inconsistency as diverged.
   *(Release scope — measured in the live test, §8.3, before any claim about it is made.)*
-* **The timeline and the edit history lag a write.** Measured live on 2026-09-29: a create's
-  `labeled` events appeared 1.5–3.5 s after GitHub answered it; an update's events showed on
-  the first read after it (about 0.5 s) and its edit-history entries about 0.5 s later. So after a create fl reads the timeline until the
-  create's `labeled` events show, and after an update or a repair it reads the window until
-  its own events and edits show — each for at most 10 s. A create whose events never show
+* **A `labeled` event for a label already on the issue is not a change.** Measured live on
+  2026-10-05: GitHub sometimes records a `labeled` event a second time, about 0–1 s after the
+  first. Two labels added in one call doubled their events in 4 of 10 calls; one label per call
+  doubled in 0 of 22 plain `gh api` probes, but in 2 of 33 issues fl created in a live run, so
+  the call pattern does not control it. Re-adding a label the issue already carries records no
+  event at all, so such an event cannot be anyone's write. fl replays the issue's timeline,
+  oldest first and from no labels — `labeled X` adds X, `unlabeled X` removes it — and drops
+  a `labeled X` while X is already on. It does so wherever window events are counted: the
+  conflict check, the wait for fl's own write, and the wait after a create. It never drops an
+  `unlabeled` event or any other kind. Which labels are on comes from the timeline, never from
+  an issue fl read, which can already hold a label someone added inside the window.
+  Measured live on 2026-10-05 (one sample): deleting a label from the repository records an
+  `unlabeled` event for it on each issue that carried it; while the label is deleted, the
+  timeline still names it in its `labeled` and `unlabeled` events; and adding it again after it
+  is re-created records a new `labeled`. A label event that names no label is an ERROR. *(Modelled, not measured: the timeline records every
+  label change, and an event that shows means every earlier one shows too. A label change
+  with no event would leave the replay wrong, and a later `labeled` event for that label could
+  then be dropped.)*
+* **The timeline and the edit history lag a write.** Measured live on 2026-09-29: an update's
+  events showed on the first read after it (about 0.5 s) and its edit-history entries about
+  0.5 s later. Measured live on 2026-10-05: the `labeled` event of a label call that adds ONE
+  label showed 1–2 s after it (3 of 3); fl's label call adds two labels, and its timing is not
+  separately measured. So after a create fl reads the timeline until its labels are on, and
+  after an update or a repair it reads the window until its own events and edits show — each
+  for at most 10 s. A create whose events never show
   still succeeds, and the next write refuses as a conflict. An update whose write never shows
   is an ERROR that says to read the item again. Without the wait, fl's own late events land
   in the next write's window and read as someone else's. *(Release scope. Modelled, not
   measured: once fl's own events show, every event written before them shows too.)*
 * **A create cannot duplicate.** A create carries a `create_key` that fl mints. After a timeout
-  or a connection failure, fl lists the fl issues created since the attempt — the list
-  endpoint, not search — and looks for that key before it sends the create again.
-  *(Invariant.)*
+  or a connection failure, fl reads the repository's issues through the GraphQL list (§3.7),
+  not search, and looks for that key before it sends the create again. *(Invariant.)* It reads
+  every issue, not only those with fl's labels, because an issue the attempt made carries no
+  labels until the label call. It reads newest first and stops at the first issue whose
+  `createdAt` (GitHub's clock) is more than 10 minutes before the attempt began (this machine's
+  clock); the margin covers skew between the two clocks. An issue found by its key that lacks
+  fl's labels is given them by the label call, and the create is not sent again.
 
 ### 3.4 Reads and divergence
 
@@ -328,10 +368,27 @@ an issue that still carries an intact fl block is restored from it, labels inclu
 
 ### 3.7 Lists
 
-A list follows every page. A failure on any page is an ERROR, never a short list.
-*(Invariant.)* `list_records` and `list_findings` filter by label and then by the block's
-project. `withdrawals_by` lists withdrawn findings and counts those whose block names the
-actor.
+A list follows every page. A failure on any page, or a page without a readable `issues`
+connection, is an ERROR, never a short list. *(Invariant.)*
+
+Every list reads GraphQL's `repository.issues` connection, not the REST issue list: one label
+filter, both states, a hundred to a page, oldest first by `createdAt`, following `pageInfo` to
+the end. Measured live on 2026-10-05 against a private repository: the REST list
+(`GET /repos/o/r/issues?labels=…`) left a new issue out for 31–93 s, once for more than 180 s,
+and showed a label change 30–100 s late; the GraphQL connection showed a new issue within 1 s
+(5 of 5) and a label change within 2–3 s (5 of 5). A list read through REST could be silently
+short, an alias scan could miss an owner, and a create-key search could miss a create that had
+landed and send it again.
+
+The GraphQL cursor names the last issue served, not an offset, so an issue that leaves the
+filtered set during a read does not move another issue across a page boundary, and a list is
+read once. *(Modelled, not measured.)* The connection lists issues only, never pull requests.
+
+`list_records` and `list_findings` filter by the kind label and then by the block's project.
+`withdrawals_by` filters by the withdrawn state label and counts the findings whose block names
+the actor. A list filters by one label only: measured live on 2026-10-05, GraphQL reads two
+labels as "any of" (the union; `fl:record` matched 73 issues, `fl:finding` 70, and both
+together 143), so a second label would widen the list, never narrow it.
 
 ---
 

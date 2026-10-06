@@ -27,6 +27,36 @@ pub struct Repo {
     pub has_issues: bool,
 }
 
+/// One timeline event: its id, its kind and, for a label event, the label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub id: u64,
+    pub kind: String,
+    pub label: Option<String>,
+}
+
+impl Event {
+    fn new(id: u64, kind: &str, label: Option<&str>) -> Self {
+        Self {
+            id,
+            kind: kind.to_string(),
+            label: label.map(str::to_string),
+        }
+    }
+}
+
+/// Where `labeled_copies` puts the second copy of a `labeled` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Copies {
+    /// Right after the event, in the timeline at once.
+    After,
+    /// Right before the event, in the timeline at once.
+    Before,
+    /// Right after the event, but out of the timeline until the issue's
+    /// next PATCH — inside that write's window.
+    Held,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Issue {
     pub number: u64,
@@ -39,14 +69,28 @@ pub struct Issue {
     pub pull_request: bool,
     pub gone: bool,
     pub moved_to: Option<String>,
-    /// (id, kind) of every timeline event, oldest first.
-    pub events: Vec<(u64, String)>,
+    /// Every timeline event, oldest first.
+    pub events: Vec<Event>,
     /// Ids of the body's edit history, oldest first.
     pub edits: Vec<String>,
     pub comments: Vec<String>,
     /// Who wrote each comment, by index. A comment this does not list was
     /// written by [`USER_LOGIN`].
     pub comment_authors: Vec<String>,
+    /// When the issue was created, in milliseconds after the Unix epoch:
+    /// the fake's clock at the create. GraphQL answers it as `createdAt`,
+    /// to the second, as GitHub spells it.
+    pub created_ms: u64,
+    /// Created while `rest_list_lags` was set: the REST issue list leaves
+    /// it out.
+    pub rest_list_hidden: bool,
+    /// `labeled` events of labels set in the create while
+    /// `creation_labels_late` was set: they join `events` at the issue's
+    /// next PATCH.
+    pub held_events: Vec<Event>,
+    /// Copies held back by `labeled_copies: Some(Copies::Held)`: they join
+    /// `events`, in id order, at the issue's next PATCH.
+    pub held_copies: Vec<Event>,
 }
 
 /// Everything the fake holds, and the knobs a test turns. Every knob is
@@ -95,6 +139,8 @@ pub struct State {
     /// The next create that `fail_before_create` does not fail answers 403
     /// with GitHub's rate-limit headers, and nothing lands. One-shot.
     pub rate_limited_next_create: bool,
+    /// Inside the next PATCH, someone else adds the label `foreign`, with
+    /// its event. One-shot.
     pub foreign_label_on_next_patch: bool,
     pub foreign_edit_on_next_patch: bool,
     /// The next request answers 502 with an HTML body — what a load
@@ -110,19 +156,83 @@ pub struct State {
     /// The next issue PATCH answers 200 with a body that cannot be read as
     /// an issue. The PATCH is still applied. One-shot.
     pub unreadable_patch_body_next: bool,
-    /// How many requests the issues-LIST endpoint (not a single-issue GET)
-    /// has answered so far, this fake's lifetime.
+    /// How many requests for a list of issues — the REST list endpoint or
+    /// GraphQL's `issues` connection, not a single-issue GET — the fake has
+    /// answered so far, this fake's lifetime.
     pub list_issue_requests: u32,
     /// (request number, issue number): right before answering that request
-    /// to the issues list, mark that issue `gone` — simulating the filtered
-    /// set changing while a multi-page read is under way (spec §3.7). Counts
-    /// every list request across every `list()` call, both passes. One-shot.
+    /// for a list of issues, mark that issue `gone` — simulating the
+    /// filtered set changing while a multi-page read is under way (spec
+    /// §3.7). Counts every list request, REST and GraphQL. One-shot.
     pub vanish_after_list_request: Option<(u32, u64)>,
+    /// GitHub's REST issue list lags a create. Measured live on 2026-10-05
+    /// against a private repository: `GET /repos/o/r/issues?labels=…`
+    /// left a new issue out for 31–93 s, once for more than 180 s, while
+    /// GraphQL's `issues` connection showed it within 1 s (5 of 5). While
+    /// this is set, every issue created is left out of the REST list for
+    /// good; GraphQL is not affected. A setting, not one-shot.
+    pub rest_list_lags: bool,
+    /// The GraphQL `issues` request that follows this many more answers
+    /// 502; `Some(0)` is the next one. Lets a test fail a later page of one
+    /// list. One-shot.
+    pub fail_issues_query_after: Option<u32>,
+    /// The next GraphQL `issues` request answers 200 with a `repository`
+    /// that holds no `issues` connection. One-shot.
+    pub issues_query_without_connection_next: bool,
+    /// Every GraphQL `issues` page says another follows, under the cursor
+    /// `stuck`, whatever cursor it was asked for. After 20 such pages the
+    /// fake answers 502, so a reader that never stops still ends. A
+    /// setting.
+    pub issues_cursor_stuck: bool,
+    /// The `first` each GraphQL `issues` request asked for, in order.
+    pub issues_firsts: Vec<Option<u64>>,
+    /// GraphQL `issues` pages served under `issues_cursor_stuck`.
+    pub(crate) stuck_pages: u32,
+    /// The next GraphQL `issues` page is empty and says another follows.
+    /// One-shot.
+    pub issues_empty_page_with_more_next: bool,
+    /// GitHub's clock runs this many milliseconds behind this machine's:
+    /// an issue created now is stamped that much earlier. A setting.
+    pub clock_behind_ms: u64,
+    /// Labels set IN a create (`POST /issues` with `labels`) show their
+    /// `labeled` events late. Measured live on 2026-10-05: 28-88 s after
+    /// the create, once more than 180 s, in the REST and GraphQL timelines
+    /// alike — past fl's wait, so they landed in the next update's window.
+    /// Labels added by their own call after the create showed in 1-2 s
+    /// (3 of 3, one label per call). Modelled here as: held back until that issue's next PATCH,
+    /// whose window they then land in. A setting, not one-shot.
+    pub creation_labels_late: bool,
+    /// The next `POST /issues/{n}/labels` answers 500 and adds nothing.
+    /// One-shot.
+    pub fail_label_add_next: bool,
+    /// GitHub records a `labeled` event a second time. Measured live on
+    /// 2026-10-05: two labels added in one call doubled each event, about
+    /// 0-1 s apart, in 4 of 10 calls; one label per call did so in 0 of 22
+    /// plain `gh api` probes but in 2 of 33 issues fl created in a live
+    /// run, so the call pattern does not control it. Re-adding a label the
+    /// issue already carries makes no event at all. While set, every
+    /// `labeled` event a label add or a PATCH makes gets a copy, placed as
+    /// `Copies` says. A setting.
+    pub labeled_copies: Option<Copies>,
+    /// Right after the next timeline read is answered, someone adds the
+    /// label `bug` to that issue, with its event — a write landing after
+    /// fl's window opened and before fl reads the issue inside it.
+    /// One-shot.
+    pub foreign_label_after_next_timeline: bool,
+    /// (label, reads): every event a request makes naming this label stays
+    /// out of the timeline for this many timeline reads — one label's event
+    /// lagging another's from the same call. A setting.
+    pub label_lag_reads: Option<(String, u32)>,
+    /// Inside the next PATCH, someone else makes these label changes —
+    /// (`labeled` or `unlabeled`, label) — each with its event. One-shot.
+    pub foreign_label_changes_on_next_patch: Vec<(String, String)>,
     /// GitHub's timeline lags a write: an event made by a request stays
     /// out of that issue's timeline for this many timeline reads after it.
-    /// Measured live: a create's `labeled` events appeared 1.5-3.5 s after
-    /// the create was answered. Events made during a timeline read, and by
-    /// `web_edit`, are not lagged. A setting, not one-shot.
+    /// Measured live on 2026-10-05: the `labeled` events of labels added
+    /// to a new issue by their own call appeared 1-2 s after it (labels set
+    /// in the create itself: see `creation_labels_late`). Events made
+    /// during a timeline read, and by `web_edit`, are not lagged. A
+    /// setting, not one-shot.
     pub timeline_lag_reads: u32,
     /// Event id → timeline reads left before it shows.
     pub(crate) lag_left: BTreeMap<u64, u32>,
@@ -135,10 +245,9 @@ pub struct State {
     /// Edit id → edit-history reads left before it shows.
     pub(crate) edit_lag_left: BTreeMap<String, u32>,
     /// This issue exists (and a direct `GET` of it succeeds), but every
-    /// issues-LIST answer omits it — simulating GitHub's list index lagging
-    /// a create indefinitely, so a create-key search can never find it. Not
-    /// one-shot: the point is that every one of the search's attempts
-    /// misses, not just the first.
+    /// list of issues — REST and GraphQL — omits it, so a create-key search
+    /// can never find it. Not one-shot: the point is that every one of the
+    /// search's attempts misses, not just the first.
     pub omit_from_list: Option<u64>,
     /// The create lands and its answer's status line and headers arrive
     /// (201), but its body breaks off partway, so it cannot be read in
@@ -148,6 +257,14 @@ pub struct State {
     /// body. GitHub documents 201; this models a 2xx it has not been seen to
     /// send (unmeasured; no live test checks it yet). One-shot.
     pub create_answers_200_next: bool,
+    /// The next create lands with this text appended to its body, and
+    /// answers it so — a body GitHub kept differently from what was sent.
+    /// One-shot.
+    pub create_body_appended_next: Option<String>,
+    /// Labels every new issue gets as it is created, whatever the create
+    /// sent — an automation labelling issues on open. The create's answer
+    /// carries them. A setting.
+    pub labels_on_open: Vec<String>,
     /// Node ids a `node(id: …)` lookup answers as living in ANOTHER
     /// repository — simulating a transferred issue (spec's `Moved` case).
     /// Modelled: this is the fake's guess at the shape of GitHub's real
@@ -446,13 +563,23 @@ impl FakeGithub {
         self.state().issues.len()
     }
 
-    /// A person changing an issue in the web interface, outside fl.
+    /// A person changing an issue in the web interface, outside fl. Its
+    /// timeline gets the events the change makes: one per label added or
+    /// removed, a close or a reopen, a retitle.
     pub fn web_edit(&self, n: u64, f: impl FnOnce(&mut Issue)) {
         let mut s = self.state();
-        let e = s.tick();
-        let issue = s.issues.get_mut(&n).expect("an issue to edit");
+        let old = s.issues.get(&n).expect("an issue to edit").clone();
+        let issue = s.issues.get_mut(&n).unwrap();
         f(issue);
-        issue.events.push((e, "labeled".into()));
+        let new = issue.clone();
+        for (kind, label) in changes(&old, &new) {
+            let e = s.tick();
+            s.issues
+                .get_mut(&n)
+                .unwrap()
+                .events
+                .push(Event::new(e, kind, label.as_deref()));
+        }
     }
 
     /// Transfers issue `n` to another repository, as GitHub does: the old
@@ -481,6 +608,7 @@ impl FakeGithub {
             labels: labels.iter().map(|l| l.to_string()).collect(),
             state: "open".into(),
             pull_request,
+            created_ms: now_ms(),
             ..Issue::default()
         };
         s.issues.insert(n, issue);
@@ -798,6 +926,238 @@ fn add_comment(i: &mut Issue, body: &str, by: String) -> Answer {
     answer(201, json!({"id": i.comments.len()}))
 }
 
+/// The fake's clock: milliseconds after the Unix epoch.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// `createdAt` as GitHub's GraphQL spells it: RFC 3339, UTC, to the second.
+fn created_at(ms: u64) -> String {
+    let at = fl_core::At::from_unix_millis(ms);
+    format!("{}Z", &at.as_str()[..19])
+}
+
+/// Where an issue sorts by creation, and what a cursor names: the fake's
+/// cursor is `{created_ms}:{number}`, a position, never an offset.
+fn sort_key(i: &Issue) -> (u64, u64) {
+    (i.created_ms, i.number)
+}
+
+/// One page of GraphQL's `repository.issues` connection (spec §3.7): label
+/// filter, `orderBy: {field: CREATED_AT, direction: $direction}`, and
+/// `after: $cursor` with a real `pageInfo`. The page size is `first`, at
+/// most `max_per_page` (0 = 100).
+///
+/// ⚠ Modelled: the connection lists issues only, never a pull request
+/// (GitHub's schema keeps those in `pullRequests`); its cursor names the
+/// last issue served, so an issue leaving the filtered set cannot shift
+/// another across a page boundary. Unmeasured; no live test checks the
+/// cursor yet.
+/// Its `labels` filter matches an issue carrying ANY of the labels given:
+/// measured live on 2026-10-05, OR, the union (`fl:record` 73 issues,
+/// `fl:finding` 70, both 143). fl filters by one label.
+fn issues_page(s: &mut State, vars: &Value) -> Answer {
+    s.list_issue_requests += 1;
+    let first = vars["first"].as_u64();
+    s.issues_firsts.push(first);
+    if let Some((request, issue)) = s.vanish_after_list_request
+        && s.list_issue_requests == request
+    {
+        s.vanish_after_list_request = None;
+        if let Some(i) = s.issues.get_mut(&issue) {
+            i.gone = true;
+        }
+    }
+    match s.fail_issues_query_after {
+        Some(0) => {
+            s.fail_issues_query_after = None;
+            return answer(502, json!({"message": "fake issues page failure"}));
+        }
+        Some(n) => s.fail_issues_query_after = Some(n - 1),
+        None => {}
+    }
+    if std::mem::take(&mut s.issues_query_without_connection_next) {
+        return answer(200, json!({"data": {"repository": {}}}));
+    }
+    if std::mem::take(&mut s.issues_empty_page_with_more_next) {
+        return answer(
+            200,
+            json!({"data": {"repository": {"issues": {
+                "pageInfo": {"hasNextPage": true, "endCursor": "0:0"},
+                "nodes": [],
+            }}}}),
+        );
+    }
+    if s.issues_cursor_stuck {
+        s.stuck_pages += 1;
+        if s.stuck_pages > 20 {
+            return answer(502, json!({"message": "fake: a reader that never stops"}));
+        }
+    }
+    let known = match (vars["owner"].as_str(), vars["name"].as_str()) {
+        (Some(o), Some(n)) => s.is_bound(o, n),
+        _ => false,
+    };
+    if !known {
+        return answer(
+            200,
+            json!({"data": {"repository": null}, "errors": [{"type": "NOT_FOUND"}]}),
+        );
+    }
+    let want = str_list(&vars["labels"]);
+    let newest_first = vars["direction"].as_str() == Some("DESC");
+    let after = vars["after"].as_str().map(|c| {
+        let (ms, n) = c.split_once(':').unwrap_or(("0", "0"));
+        (ms.parse().unwrap_or(0), n.parse().unwrap_or(0))
+    });
+    let mut items: Vec<&Issue> = s
+        .issues
+        .values()
+        .filter(|i| !i.gone && i.moved_to.is_none() && !i.pull_request)
+        .filter(|i| s.omit_from_list != Some(i.number))
+        .filter(|i| want.is_empty() || want.iter().any(|w| i.labels.contains(w)))
+        .collect();
+    items.sort_by_key(|i| sort_key(i));
+    if newest_first {
+        items.reverse();
+    }
+    if let Some(cursor) = after {
+        items.retain(|i| {
+            if newest_first {
+                sort_key(i) < cursor
+            } else {
+                sort_key(i) > cursor
+            }
+        });
+    }
+    let cap = if s.max_per_page == 0 {
+        100
+    } else {
+        s.max_per_page
+    };
+    let size = first.map_or(cap, |f| (f as usize).min(cap)).max(1);
+    let page: Vec<&Issue> = items.iter().take(size).copied().collect();
+    let end = page
+        .last()
+        .map(|i| format!("{}:{}", i.created_ms, i.number));
+    let nodes: Vec<Value> = page
+        .iter()
+        .map(|i| {
+            json!({
+                "number": i.number,
+                "id": i.node_id,
+                "url": format!("https://github.com/{}/issues/{}", s.bound().full_name, i.number),
+                "title": i.title,
+                "body": i.body,
+                "state": i.state.to_ascii_uppercase(),
+                "stateReason": i.state_reason.as_deref().map(str::to_ascii_uppercase),
+                "createdAt": created_at(i.created_ms),
+                "labels": {
+                    "totalCount": i.labels.len(),
+                    "nodes": i.labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
+                },
+            })
+        })
+        .collect();
+    let (more, end) = if s.issues_cursor_stuck {
+        (true, Some("stuck".to_string()))
+    } else {
+        (items.len() > size, end)
+    };
+    answer(
+        200,
+        json!({"data": {"repository": {"issues": {
+            "pageInfo": {"hasNextPage": more, "endCursor": end},
+            "nodes": nodes,
+        }}}}),
+    )
+}
+
+/// The timeline events a change from `old` to `new` makes, in order: each
+/// label added, each removed, a close or reopen, a retitle.
+fn changes(old: &Issue, new: &Issue) -> Vec<(&'static str, Option<String>)> {
+    let mut out: Vec<(&'static str, Option<String>)> = Vec::new();
+    for l in new.labels.iter().filter(|l| !old.labels.contains(l)) {
+        out.push(("labeled", Some(l.clone())));
+    }
+    for l in old.labels.iter().filter(|l| !new.labels.contains(l)) {
+        out.push(("unlabeled", Some(l.clone())));
+    }
+    if old.state != new.state {
+        out.push((
+            if new.state == "closed" {
+                "closed"
+            } else {
+                "reopened"
+            },
+            None,
+        ));
+    }
+    if old.title != new.title {
+        out.push(("renamed", None));
+    }
+    out
+}
+
+impl State {
+    /// Records an event a request made on issue `n`. A `labeled` one gets
+    /// its copy under `labeled_copies`.
+    fn record(&mut self, n: u64, kind: &str, label: Option<&str>) {
+        let first = self.next_event;
+        self.record_events(n, kind, label);
+        if let Some((lagged, reads)) = self.label_lag_reads.clone()
+            && label == Some(lagged.as_str())
+        {
+            for e in first..self.next_event {
+                self.lag_left.insert(e, reads);
+            }
+        }
+    }
+
+    fn record_events(&mut self, n: u64, kind: &str, label: Option<&str>) {
+        let copies = if kind == "labeled" {
+            self.labeled_copies
+        } else {
+            None
+        };
+        if copies == Some(Copies::Before) {
+            let c = self.tick();
+            self.issues
+                .get_mut(&n)
+                .unwrap()
+                .events
+                .push(Event::new(c, kind, label));
+        }
+        let e = self.tick();
+        self.issues
+            .get_mut(&n)
+            .unwrap()
+            .events
+            .push(Event::new(e, kind, label));
+        match copies {
+            Some(Copies::After) => {
+                let c = self.tick();
+                self.issues
+                    .get_mut(&n)
+                    .unwrap()
+                    .events
+                    .push(Event::new(c, kind, label));
+            }
+            Some(Copies::Held) => {
+                let c = self.tick();
+                self.issues
+                    .get_mut(&n)
+                    .unwrap()
+                    .held_copies
+                    .push(Event::new(c, kind, label));
+            }
+            Some(Copies::Before) | None => {}
+        }
+    }
+}
+
 /// Every route the fake serves. Later tasks add arms above the final `_`.
 pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &str) -> Answer {
     s.requests.push(format!("{method} {url}"));
@@ -1002,19 +1362,32 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
             if s.drop_labels {
                 labels.clear();
             }
+            labels.extend(s.labels_on_open.iter().cloned());
             let mut events = Vec::new();
             for l in &labels {
                 s.labels.insert(l.clone());
-                events.push((s.tick(), "labeled".to_string()));
+                events.push(Event::new(s.tick(), "labeled", Some(l)));
             }
+            let held_events = if s.creation_labels_late {
+                std::mem::take(&mut events)
+            } else {
+                Vec::new()
+            };
             let issue = Issue {
                 number: n,
                 node_id: format!("I_{n}"),
                 title: v["title"].as_str().unwrap_or("").into(),
-                body: v["body"].as_str().unwrap_or("").into(),
+                body: format!(
+                    "{}{}",
+                    v["body"].as_str().unwrap_or(""),
+                    s.create_body_appended_next.take().unwrap_or_default()
+                ),
                 labels,
                 state: "open".into(),
                 events,
+                created_ms: now_ms().saturating_sub(s.clock_behind_ms),
+                rest_list_hidden: s.rest_list_lags,
+                held_events,
                 ..Issue::default()
             };
             s.issues.insert(n, issue);
@@ -1063,6 +1436,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 .values()
                 .filter(|i| !i.gone && i.moved_to.is_none())
                 .filter(|i| s.omit_from_list != Some(i.number))
+                .filter(|i| !i.rest_list_hidden)
                 .filter(|i| want.iter().all(|w| i.labels.contains(w)))
                 .map(|i| s.issue_json(i))
                 .collect();
@@ -1101,22 +1475,70 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                         s.labels.insert("bug".into());
                         let i = s.issues.get_mut(&n).unwrap();
                         i.labels.push("bug".into());
-                        i.events.push((e, "labeled".into()));
+                        i.events.push(Event::new(e, "labeled", Some("bug")));
                     }
                     let (issues, lag_left) = (&s.issues, &mut s.lag_left);
                     let mut items: Vec<Value> = Vec::new();
-                    for (id, kind) in &issues[&n].events {
-                        match lag_left.get_mut(id) {
+                    for ev in &issues[&n].events {
+                        match lag_left.get_mut(&ev.id) {
                             Some(left) if *left > 0 => *left -= 1,
-                            _ => items.push(json!({"id": id, "event": kind})),
+                            _ => {
+                                let mut item = json!({"id": ev.id, "event": ev.kind});
+                                if let Some(l) = &ev.label {
+                                    item["label"] = json!({"name": l});
+                                }
+                                items.push(item);
+                            }
                         }
                     }
                     if let Some(odd) = s.odd_timeline_item_next.take() {
                         items.push(odd);
                     }
-                    s.page(&path, &q, items)
+                    let page = s.page(&path, &q, items);
+                    if std::mem::take(&mut s.foreign_label_after_next_timeline) {
+                        let e = s.tick();
+                        s.labels.insert("bug".into());
+                        let i = s.issues.get_mut(&n).unwrap();
+                        i.labels.push("bug".into());
+                        i.events.push(Event::new(e, "labeled", Some("bug")));
+                    }
+                    page
                 }
             }
+        }
+        // Adds labels to an issue and answers every label it now carries.
+        // `drop_labels` makes GitHub keep the old ones silently, as for a
+        // PATCH (a reading of the docs for this call; unmeasured).
+        ("POST", ["repos", o, r, "issues", n, "labels"]) if s.is_bound(o, r) => {
+            if std::mem::take(&mut s.fail_label_add_next) {
+                return answer(500, json!({"message": "fake label failure"}));
+            }
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let Some(n) = n.parse::<u64>().ok().filter(|n| s.issues.contains_key(n)) else {
+                return answer(404, json!({"message": "Not Found"}));
+            };
+            if s.issues[&n].gone {
+                return answer(410, json!({"message": "This issue was deleted"}));
+            }
+            let mut added = Vec::new();
+            if !s.drop_labels {
+                for l in str_list(&v["labels"]) {
+                    if !s.issues[&n].labels.contains(&l) {
+                        added.push(l);
+                    }
+                }
+            }
+            for l in added {
+                s.labels.insert(l.clone());
+                s.issues.get_mut(&n).unwrap().labels.push(l.clone());
+                s.record(n, "labeled", Some(&l));
+            }
+            let names: Vec<Value> = s.issues[&n]
+                .labels
+                .iter()
+                .map(|l| json!({"name": l}))
+                .collect();
+            answer(200, Value::Array(names))
         }
         ("POST", ["repos", o, r, "issues", n, "comments"]) if s.is_bound(o, r) => {
             if std::mem::take(&mut s.fail_comment_next) {
@@ -1203,14 +1625,41 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 return answer(404, json!({"message": "Not Found"}));
             };
             let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
-            // A write by someone else that lands inside fl's window.
+            // A create's late `labeled` events, and held copies, land now,
+            // inside this write's window (`creation_labels_late`,
+            // `labeled_copies`), in id order.
+            let i = s.issues.get_mut(&n).unwrap();
+            let held = std::mem::take(&mut i.held_events);
+            i.events.extend(held);
+            let copies = std::mem::take(&mut i.held_copies);
+            i.events.extend(copies);
+            i.events.sort_by_key(|e| e.id);
+            // A write by someone else that lands inside fl's window: the
+            // label `foreign` added.
             if std::mem::take(&mut s.foreign_label_on_next_patch) {
+                s.foreign_label_changes_on_next_patch
+                    .push(("labeled".into(), "foreign".into()));
+            }
+            for (kind, label) in std::mem::take(&mut s.foreign_label_changes_on_next_patch) {
+                s.labels.insert(label.clone());
+                let i = s.issues.get_mut(&n).unwrap();
+                let carried = i.labels.contains(&label);
+                // As GitHub: adding a label the issue carries, or removing
+                // one it does not, changes nothing and records no event.
+                if (kind == "labeled") == carried {
+                    continue;
+                }
+                if kind == "labeled" {
+                    i.labels.push(label.clone());
+                } else {
+                    i.labels.retain(|l| *l != label);
+                }
                 let e = s.tick();
                 s.issues
                     .get_mut(&n)
                     .unwrap()
                     .events
-                    .push((e, "labeled".into()));
+                    .push(Event::new(e, &kind, Some(&label)));
             }
             if std::mem::take(&mut s.foreign_edit_on_next_patch) {
                 // The fake's own rule: a FIRST edit also records the original.
@@ -1245,33 +1694,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 .get("state_reason")
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let mut kinds: Vec<&str> = Vec::new();
-            kinds.extend(
-                new.labels
-                    .iter()
-                    .filter(|l| !old.labels.contains(l))
-                    .map(|_| "labeled"),
-            );
-            kinds.extend(
-                old.labels
-                    .iter()
-                    .filter(|l| !new.labels.contains(l))
-                    .map(|_| "unlabeled"),
-            );
-            if old.state != new.state {
-                kinds.push(if new.state == "closed" {
-                    "closed"
-                } else {
-                    "reopened"
-                });
-            }
-            if old.title != new.title {
-                kinds.push("renamed");
-            }
-            for k in kinds {
-                let e = s.tick();
-                new.events.push((e, k.into()));
-            }
+            let made = changes(&old, &new);
             if old.body != new.body {
                 // ⚠ Modelled: GitHub is taken to record the original body
                 // as an entry at the FIRST edit, so a first edit adds two
@@ -1288,6 +1711,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 s.labels.insert(l.clone());
             }
             s.issues.insert(n, new);
+            for (kind, label) in made {
+                s.record(n, kind, label.as_deref());
+            }
             if std::mem::take(&mut s.unreadable_patch_body_next) {
                 // The PATCH landed, but the answer a caller reads back is
                 // garbage — a garbled proxy body, not GitHub's own.
@@ -1347,6 +1773,9 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                     200,
                     json!({"data": {"repository": {"issue": {"userContentEdits": {"totalCount": total, "nodes": nodes}}}}}),
                 );
+            }
+            if query.contains("issues(") {
+                return issues_page(s, &v["variables"]);
             }
             let id = v
                 .pointer("/variables/id")

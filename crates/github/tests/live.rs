@@ -60,6 +60,7 @@ use fl_github::ledger::layout::{self, Area, BRANCH, Line, SEGMENT_LIMIT};
 use fl_github::ledger::render::{self, DecisionView, RunRow};
 use fl_github::ledger::{InitOutcome, Mode};
 use fl_github::ledger::{Visibility, ruleset_command};
+use fl_github::tracker;
 use fl_github::{
     AppCredentials, Client, Credentials, DEFAULT_API, EnvToken, GithubTracker, Method,
 };
@@ -551,20 +552,33 @@ fn concurrent_writers_are_detected_never_silently_lost() {
 }
 
 /// What GitHub has recorded about one issue's changes: the size of its body
-/// edit history, and how many of each state-changing timeline event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// edit history, and how many of each state-changing timeline event fl
+/// counts — replayed as fl replays them (`tracker::counted_events`), so a
+/// `labeled` event GitHub records a second time, for a label already on, is
+/// not counted here either. `raw` is printed, never asserted.
+#[derive(Debug, Clone)]
 struct Seen {
     edits: u64,
     events: BTreeMap<String, u64>,
+    /// The `labeled` and `unlabeled` events as GitHub lists them, copies
+    /// included — printed so a live run shows how often GitHub records a
+    /// label event twice.
+    raw: BTreeMap<String, u64>,
 }
 
 impl Seen {
     fn events(&self, kind: &str) -> u64 {
         self.events.get(kind).copied().unwrap_or(0)
     }
+
+    /// What the model check compares: the edits and the counted changes,
+    /// never the raw label events.
+    fn counted(&self) -> (u64, &BTreeMap<String, u64>) {
+        (self.edits, &self.events)
+    }
 }
 
-/// The timeline events `check_window` counts.
+/// The timeline event kinds `check_window` counts.
 const STATE_EVENTS: [&str; 5] = ["labeled", "unlabeled", "closed", "reopened", "renamed"];
 
 /// Reads what GitHub has recorded about issue `n`, and checks on every read
@@ -589,18 +603,26 @@ fn seen(raw: &Client, repo: &str, n: u64) -> Seen {
         "`totalCount` does not count the entries `last: 100` lists: the model `check_window` \
          counts edits by is wrong"
     );
-    let mut events = BTreeMap::new();
-    for e in raw
+    let items = raw
         .get_all(&format!("/repos/{repo}/issues/{n}/timeline?per_page=100"))
-        .unwrap()
-    {
-        if let Some(k) = e["event"].as_str().filter(|k| STATE_EVENTS.contains(k)) {
-            *events.entry(k.to_string()).or_default() += 1;
+        .unwrap();
+    let mut events = BTreeMap::new();
+    for e in tracker::counted_events(n, &items).unwrap() {
+        *events.entry(e.kind).or_default() += 1;
+    }
+    let mut raw_labels = BTreeMap::new();
+    for e in &items {
+        if let Some(k) = e["event"]
+            .as_str()
+            .filter(|k| ["labeled", "unlabeled"].contains(k))
+        {
+            *raw_labels.entry(k.to_string()).or_default() += 1;
         }
     }
     Seen {
         edits: total,
         events,
+        raw: raw_labels,
     }
 }
 
@@ -621,9 +643,17 @@ fn after_fl_write(raw: &Client, repo: &str, n: u64, what: &str) -> Seen {
     let immediate = seen(raw, repo, n);
     std::thread::sleep(Duration::from_secs(2));
     let settled = seen(raw, repo, n);
-    println!("{what}: immediately {immediate:?}; after 2 s {settled:?}");
+    println!(
+        "{what}: immediately {:?} (raw label events {:?}); after 2 s {:?} (raw label events \
+         {:?})",
+        immediate.counted(),
+        immediate.raw,
+        settled.counted(),
+        settled.raw
+    );
     assert_eq!(
-        immediate, settled,
+        immediate.counted(),
+        settled.counted(),
         "{what}: GitHub showed more two seconds after fl's write returned than at once. fl \
          waits only until its OWN write shows, so something that lands later — its own or \
          someone else's — falls in the next write's window, or is missed"
@@ -659,6 +689,12 @@ fn number(id: &Iri) -> u64 {
 ///   one `closed`, a reopen one `reopened` and a retitle one `renamed`;
 /// - a rewrite that changes only line endings (CRLF): whether GitHub records
 ///   an entry is printed, and an fl write after it must not be a conflict.
+///
+/// Events are counted as fl counts them (`Seen`): a `labeled` event GitHub
+/// records a second time for a label already on is not a change, in fl or
+/// here, so the "nothing more in two seconds" check is over those changes
+/// too. Counted raw, such a copy (measured 2026-10-05) would fail this test
+/// while fl handles it.
 ///
 /// Not checked here: the ORDER `last: 100` lists entries in past a hundred
 /// entries, and an entry deleted and another added in the same window. If

@@ -169,6 +169,77 @@ impl IssueView {
             is_pull_request: v.get("pull_request").is_some_and(|p| !p.is_null()),
         })
     }
+
+    /// The same view from a node of GitHub's GraphQL `issues` connection,
+    /// which every list reads (spec §3.7). Its node holds `number id url
+    /// title body state stateReason labels(first: 100) { totalCount nodes {
+    /// name } }`. GraphQL spells the state and its reason in capitals; they
+    /// are lowered to REST's spelling. ⚠ Never a pull request: the
+    /// connection lists issues only.
+    pub fn from_graphql(v: &Value) -> Result<Self, StoreError> {
+        let text = |k: &str| {
+            v.get(k)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| StoreError::Backend(format!("GitHub listed an issue without `{k}`")))
+        };
+        let number = v
+            .get("number")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| StoreError::Backend("GitHub listed an issue without `number`".into()))?;
+        let url = Iri::parse(&text("url")?).map_err(|e| {
+            StoreError::Backend(format!("GitHub listed an issue URL fl cannot use: {e}"))
+        })?;
+        let state = match text("state")?.as_str() {
+            "OPEN" => "open".to_string(),
+            "CLOSED" => "closed".to_string(),
+            other => {
+                return Err(StoreError::Backend(format!(
+                    "GitHub listed issue {number} in the state `{other}`, which fl does not know"
+                )));
+            }
+        };
+        // ⚠ A label left out would make the issue read as another item, or
+        // as diverged: the labels are read in full or not at all.
+        let (Some(total), Some(nodes)) = (
+            v.pointer("/labels/totalCount").and_then(Value::as_u64),
+            v.pointer("/labels/nodes").and_then(Value::as_array),
+        ) else {
+            return Err(StoreError::Backend(format!(
+                "GitHub listed issue {number} without its `labels`; retry"
+            )));
+        };
+        let labels = nodes
+            .iter()
+            .map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+            .filter(|l| l.len() as u64 == total)
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "GitHub listed {} of its {total} labels of issue {number}, so fl cannot \
+                     tell what it is; retry",
+                    nodes.len()
+                ))
+            })?;
+        Ok(Self {
+            number,
+            url,
+            node_id: text("id")?,
+            title: text("title")?,
+            // ⚠ Required, unlike REST's `null` for an empty body: GraphQL's
+            // `body` is never null, and a body read as empty would make an
+            // issue's create key "not found" — and a create-key search send
+            // the create again.
+            body: text("body")?,
+            labels,
+            state,
+            state_reason: v
+                .get("stateReason")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase),
+            is_pull_request: false,
+        })
+    }
 }
 
 pub fn kind_label(kind: ItemKind) -> String {
@@ -669,5 +740,74 @@ mod tests {
         ] {
             assert_eq!(parse_issue_url(&Iri::parse(bad).unwrap()), None, "{bad}");
         }
+    }
+
+    /// GitHub's GraphQL `Issue` node (the lists, spec §3.7) and its REST
+    /// issue read as the same view: the lists and a single read must agree
+    /// on what an item is.
+    #[test]
+    fn a_graphql_issue_node_reads_as_the_same_view_as_its_rest_issue() {
+        let rest = serde_json::json!({
+            "number": 7, "node_id": "I_7",
+            "html_url": "https://github.com/acme/widgets/issues/7",
+            "title": "t", "body": "b",
+            "labels": [{"name": "fl:finding"}, {"name": "fl:finding/withdrawn"}],
+            "state": "closed", "state_reason": "not_planned",
+        });
+        let node = serde_json::json!({
+            "number": 7, "id": "I_7",
+            "url": "https://github.com/acme/widgets/issues/7",
+            "title": "t", "body": "b",
+            "labels": {"totalCount": 2,
+                       "nodes": [{"name": "fl:finding"}, {"name": "fl:finding/withdrawn"}]},
+            "state": "CLOSED", "stateReason": "NOT_PLANNED",
+            "createdAt": "2026-10-05T12:00:00Z",
+        });
+        assert_eq!(
+            IssueView::from_graphql(&node).unwrap(),
+            IssueView::from_json(&rest).unwrap()
+        );
+        let mut open = node.clone();
+        open["state"] = serde_json::json!("OPEN");
+        open["stateReason"] = Value::Null;
+        let v = IssueView::from_graphql(&open).unwrap();
+        assert_eq!((v.state.as_str(), v.state_reason), ("open", None));
+    }
+
+    /// A node fl cannot read in full is an error, never a view with a
+    /// field guessed: a label left out would read as a different item.
+    #[test]
+    fn a_graphql_issue_node_with_labels_left_out_or_an_unknown_state_is_an_error() {
+        let node = serde_json::json!({
+            "number": 7, "id": "I_7",
+            "url": "https://github.com/acme/widgets/issues/7",
+            "title": "t", "body": "b",
+            "labels": {"totalCount": 3, "nodes": [{"name": "fl:record"}]},
+            "state": "OPEN", "stateReason": null,
+        });
+        let e = IssueView::from_graphql(&node).unwrap_err().to_string();
+        assert!(e.contains("1 of its 3 labels"), "{e}");
+        let mut no_labels = node.clone();
+        no_labels["labels"] = Value::Null;
+        let e = IssueView::from_graphql(&no_labels).unwrap_err().to_string();
+        assert!(e.contains("`labels`"), "{e}");
+        // ⚠ Not an empty body: read as one, an issue's create key would
+        // be "not found", and a create-key search would send it again.
+        for body in [Value::Null, Value::from(7)] {
+            let mut no_body = node.clone();
+            no_body["labels"] = serde_json::json!({"totalCount": 0, "nodes": []});
+            no_body["body"] = body;
+            let e = IssueView::from_graphql(&no_body).unwrap_err().to_string();
+            assert!(e.contains("`body`"), "{e}");
+        }
+        let mut no_body = node.clone();
+        no_body["labels"] = serde_json::json!({"totalCount": 0, "nodes": []});
+        no_body.as_object_mut().unwrap().remove("body");
+        assert!(IssueView::from_graphql(&no_body).is_err());
+        let mut odd = node.clone();
+        odd["labels"] = serde_json::json!({"totalCount": 0, "nodes": []});
+        odd["state"] = serde_json::json!("MERGED");
+        let e = IssueView::from_graphql(&odd).unwrap_err().to_string();
+        assert!(e.contains("MERGED"), "{e}");
     }
 }

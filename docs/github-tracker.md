@@ -132,8 +132,8 @@ is an error, never a success.
 
 An issue with no `fl:` label is not an fl item, and neither is a pull request, even one that
 carries fl labels: named directly, either is refused as not an fl item, never read as "not
-found". A list that meets a pull request carrying fl labels stops with an error naming it;
-remove its fl labels (`fl github repair` refuses a pull request).
+found". fl's lists read GitHub's list of issues, which holds no pull requests, so a pull
+request carrying fl labels is not in them.
 
 ## Divergence and repair
 
@@ -205,15 +205,32 @@ The detection rests on a model of what GitHub records. The live tests measured m
   counts by the total, which does not depend on the order GitHub lists them in, and uses the
   entries only as a second count. An entry deleted and another added in the same window
   cancel out and are not seen. Not measured.
-- **Lag.** Measured: the timeline and the edit history lag a write. A create's label events
-  appeared 1.5–3.5 s after GitHub answered it; an update's events showed on the first read
-  after it (about 0.5 s), and its edit-history entries about 0.5 s later. So fl
-  waits for its own write to show — after a create, until the create's label events are in
-  the timeline; after an update or a repair, until its own events and edits are in the window
-  — for at most 10 s each. Without that, fl's own late events would land in its next write's
-  window and be reported as a spurious conflict. A create whose events never show still
+- **Lag.** Measured: the timeline and the edit history lag a write. An update's events showed
+  on the first read after it (about 0.5 s), and its edit-history entries about 0.5 s later
+  (2026-09-29). Labels set in the create itself showed their events 28–88 s late, once more
+  than 180 s; a label added by its own call just after the create showed its event in 1–2 s
+  (2026-10-05, measured adding one label per call; fl's call adds two, and its timing is not
+  measured separately). So fl creates an issue without labels and then adds them (see
+  [Creates](#creates)), and waits for its own write to show — after a create, until its labels
+  are in the timeline; after an update or a repair, until its own events and edits are in the
+  window — for at most 10 s each. Without that, fl's own late events would land in its next
+  write's window and be reported as a spurious conflict. A create whose events never show still
   succeeds; an update whose write never shows is an error that says to read the item again.
   Not measured: that once fl's own events show, every event written before them shows too.
+- **A label event recorded twice.** GitHub sometimes records a `labeled` event a second time,
+  about 0–1 s after the first (2026-10-05): when one call added two labels, in 4 of 10 calls;
+  when each call added one label, in none of 22 probes but in 2 of 33 issues fl created in a
+  live run. Adding a label an issue already carries records no event, so a `labeled` event for
+  a label already on the issue cannot be anyone's write. fl replays the issue's timeline to
+  know which labels are on at each event, and does not count such an event — as a change by
+  someone else, or as a sign that its own write shows. It always counts a label removed.
+  Measured on 2026-10-05 (one sample): deleting a label from the repository records a
+  label-removed event on each issue that carried it, the timeline still names the deleted label
+  in its events, and adding it again after re-creating it records a new label-added event, so
+  none of that upsets the replay. Not
+  measured: that the timeline records every other label change, and that an event that shows
+  means every earlier one shows too. A label change with no event would make fl skip a later
+  `labeled` event for that label.
 - **Line endings.** fl takes a body rewrite that only changes line endings to count as an
   edit. If GitHub records none for it, someone else's edit in the same window can be missed.
   Measured: GitHub recorded one entry for such a rewrite, as modelled.
@@ -265,27 +282,49 @@ repository's past names, so it cannot say whether that name was once this reposi
 one as moved, naming where it went; neither is "not found".
 
 **Aliases.** An item's other ids are kept in its block. Finding an item by an alias is a full
-scan: fl lists every fl record and every fl finding in the repository — two lists, each read
-twice when it is longer than one page — and compares every block. It is correct, and costly;
+scan: fl lists every fl record and every fl finding in the repository — two lists — and
+compares every block. It is correct, and costly;
 adding an alias makes the same scan to check the alias is not already in use. GitHub's search
 is not used, because its index lags and promises no complete result.
 
 ## Creates
 
+A create is two calls: the first makes the issue with its title and body, and no labels; the
+second adds the kind label and the state label. GitHub shows the events of labels added this
+way in the timeline within a couple of seconds, but the events of labels set in the create
+itself up to minutes late, where fl's next write would report them as someone else's change.
+
+If the second call fails, the issue exists without some or all of fl's labels. fl's lists leave
+it out, or report it as diverged if it has some of them, and the error names the issue: run
+`fl github repair <number> --by <name>`, which restores its labels from its block. Do not retry
+the command that created it; that would make a second issue.
+
 Each create carries a key fl mints, stored in the block. If GitHub's answer to a create is
 lost — a server error, or the connection dropping before an answer — the issue may exist
-anyway, so fl searches the repository's fl issues for that key, up to three times a couple of
-seconds apart, before it sends the create once more. From the first lost answer on, fl cannot
-know whether the issue exists, so every later error carries the advice to list the
-repository's fl issues before retrying: a failed search, and any failure of the second
-attempt — a server error, a dropped connection, a rate limit, a refused credential or a
-rejected request. A plain retry could otherwise make a duplicate.
+anyway, so fl searches the repository's issues for that key, up to three times a couple of
+seconds apart, before it sends the create once more. The search reads every issue, with fl's
+labels or without, newest first, and stops at issues created more than 10 minutes before the
+attempt began; the margin covers a difference between this machine's clock and GitHub's. An
+issue it finds without fl's labels is given them, and the create is not sent again.
 
+From the first lost answer on, fl cannot know whether the issue exists, so every later error
+says where to look before retrying: a failed search, and any failure of the second attempt — a
+server error, a dropped connection, a rate limit, a refused credential or a rejected request.
 Once GitHub has answered a create with success, fl never sends it again, even if the answer's
 body could not be read: the issue exists. If fl then cannot find it by its key either, it
-refuses, and says to list the repository's fl issues before retrying, so the retry makes no
-duplicate. `fl record list` and `fl finding list`, or GitHub's issue list filtered by the
-`fl:record` or `fl:finding` label, show what is there.
+refuses with the same advice.
+
+The advice names the title. Look among the repository's newest issues, with labels or without,
+for an issue with that title. If it is there, run `fl github repair <number> --by <name>` on it
+instead of creating it again: the repair gives it fl's labels from its block, or reports it
+consistent if it already has them. An issue fl created may have no labels yet, so
+`fl record list`, `fl finding list` and GitHub's list filtered by an `fl:` label do not show
+it. A plain retry could make a duplicate.
+
+GitHub's issue list can take minutes to show a new issue. On 2026-10-05 its REST list left a
+new issue out for 31–93 s, once for more than 180 s; that its web list lags the same way is
+inferred, not measured. If the issue is not there, wait a few minutes and look again before
+retrying.
 
 ## Limits and costs
 
@@ -294,13 +333,17 @@ duplicate. `fl record list` and `fl finding list`, or GitHub's issue list filter
 - **Each update and each repair is several requests.** It reads the issue twice, and the
   timeline and the edit history twice each — once before the write and once after — besides
   the write itself; a repair also posts its comment. A create has no such window: once per
-  command fl reads the repository's labels, creating any that are missing, and then sends the
-  create; a finding's create first reads the record it names. These costs are input to a
-  later rate-limit design.
-- **Lists read every page**, oldest issue first, a hundred to a page. A page that fails fails
-  the list, never shortening it. A list longer than one page is read twice, and the two reads
-  must agree: GitHub pages by offset, so an issue leaving the list mid-read could otherwise
-  drop another one silently. If they differ, the command fails and says to retry.
+  command fl reads the repository's labels, creating any that are missing, then sends the
+  create and adds its labels, and reads the timeline until they show; a finding's create
+  first reads the record it names. These costs are input to a later
+  rate-limit design.
+- **Lists read GitHub's GraphQL API, every page**, oldest issue first, a hundred to a page,
+  each page found from the last by a cursor. A page that fails fails the list, never
+  shortening it. Measured on 2026-10-05: GitHub's REST issue list left a new issue out for
+  31–93 s, once for more than 180 s, and showed a label change 30–100 s late; the GraphQL list
+  showed a new issue within 1 s and a label change within 2–3 s. The cursor names the last
+  issue read rather than a position count, so an issue leaving the list mid-read is taken not
+  to move another one off it, and a list is read once (not measured).
 - **A repository with Issues turned off** is refused when fl opens it: there is nowhere to keep
   records and findings.
 - **A finding whose record reference predates a rename** costs one lookup each time it is
@@ -308,9 +351,18 @@ duplicate. `fl record list` and `fl finding list`, or GitHub's issue list filter
   state is never written again, so it keeps costing that lookup.
 - **An installation token is not narrowed further** than the App's installation. Install the
   App on the bound repository only.
-- **An issue whose body holds fl's block is fl's**, even with its labels removed; such an issue
-  drops out of fl's lists, which filter by label, and reads as not an fl item until
-  `fl github repair` restores its labels. fl never adopts an issue that has no block.
+- **An issue whose body holds fl's block is fl's**, even with its labels removed, or without
+  them after a create that stopped between its two calls; such an issue drops out of fl's
+  lists, which filter by label, and reads as not an fl item until `fl github repair` restores
+  its labels. fl never adopts an issue that has no block. To find one a stopped create left,
+  filter the repository's GitHub issue list by `no:label`, open the newest issues there, and
+  run `fl github repair <number> --by <name>` on the one whose body ends with fl's block. If
+  something else labelled it in the meantime, `no:label` does not show it; look among the
+  newest issues instead.
+- **A state label without its kind label** reads differently in two places. An issue that
+  carries `fl:finding/withdrawn` but not `fl:finding` is left out of `fl finding list`, which
+  filters by `fl:finding`, but makes the count of a raiser's withdrawals, which filters by
+  `fl:finding/withdrawn`, fail as diverged. `fl github repair` fixes it.
 - **A block and a label edited to agree** on the web read as consistent: fl does not check who
   last edited the block.
 - **A repository deliberately recreated at the bound name** is refused like any reused name,

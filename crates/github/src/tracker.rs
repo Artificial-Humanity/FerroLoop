@@ -6,6 +6,7 @@
 
 use crate::client::{Client, Method};
 use crate::meta::{self, IssueView, ItemKind, Meta, Read, RecordRef, TITLE_MAX};
+use fl_core::at::At;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
@@ -66,9 +67,174 @@ pub struct GithubTracker {
 /// mention does not, and is not a conflict.
 const STATE_EVENTS: [&str; 5] = ["labeled", "unlabeled", "closed", "reopened", "renamed"];
 
+/// The order a list of issues is read in, by creation.
+#[derive(Debug, Clone, Copy)]
+enum Order {
+    OldestFirst,
+    NewestFirst,
+}
+
+/// How far before an attempt began the create-key search keeps reading.
+/// The search reads issues newest first and stops at the first one GitHub
+/// stamped (`createdAt`, by GitHub's clock) more than this before the
+/// attempt began (by this machine's clock): the margin covers the skew
+/// between the two clocks. Ten minutes is far more than the skew of a
+/// machine whose clock is set by the network; an issue the attempt made
+/// cannot be older than the attempt by more than the skew.
+const CREATE_SEARCH_MARGIN: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Issues per page of a list filtered by an fl label: GitHub's largest.
+const LIST_PAGE: u64 = 100;
+
+/// Issues per page of the create-key search, which reads every issue —
+/// fl's or not — with its whole body. Small, so a page of large bodies
+/// stays under the client's limit on an answer's size (ureq's documented
+/// default reads at most 10 MB — not measured against GitHub; GitHub allows a body of 65,536 characters, which JSON escaping
+/// can make several times longer). The search usually stops within its
+/// first page.
+const SEARCH_PAGE: u64 = 25;
+
+/// This machine's clock, in milliseconds after the Unix epoch.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// A listed issue's `createdAt`. GitHub spells it to the second
+/// (`2026-10-05T12:34:56Z`); it is read as an `At`, whose order is time
+/// order. ⚠ One fl cannot read is an error: the search cannot tell
+/// whether to stop at it.
+fn created_at(node: &Value) -> Result<At, StoreError> {
+    let raw = node.get("createdAt").and_then(Value::as_str).unwrap_or("");
+    let spelled = match raw.len() {
+        20 if raw.ends_with('Z') => format!("{}.000Z", &raw[..19]),
+        _ => raw.to_string(),
+    };
+    At::parse(&spelled).map_err(|_| {
+        backend(format!(
+            "GitHub listed an issue created at {raw:?}, a time fl cannot read; retry"
+        ))
+    })
+}
+
+/// One state-changing timeline event: its kind and, for a label event,
+/// the label. Public, with `counted_events`, for one reader: the live
+/// tests (`tests/live.rs`); hidden from the documentation.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub id: u64,
+    pub kind: String,
+    pub label: Option<String>,
+}
+
+/// The state-changing events of issue `n`'s raw timeline items (oldest
+/// first) that fl counts as changes: parsed as fl parses them, then
+/// replayed by `changes`, which drops a `labeled` event for a label already
+/// on. Public for one reader: the live tests (`tests/live.rs`) must count
+/// GitHub's timeline exactly as fl does, or a `labeled` event GitHub
+/// records twice fails their model check while fl itself handles it.
+#[doc(hidden)]
+pub fn counted_events(n: u64, items: &[Value]) -> Result<Vec<Event>, StoreError> {
+    let events = parse_events(n, items)?;
+    Ok(changes(&events).into_iter().cloned().collect())
+}
+
+/// Issue `n`'s raw timeline items, oldest first, as its state-changing
+/// events. ⚠ An item fl cannot classify is an error, never skipped.
+fn parse_events(n: u64, items: &[Value]) -> Result<Vec<Event>, StoreError> {
+    let mut events = Vec::new();
+    for e in items {
+        // ⚠ No `event` field is not "not a state event": fl cannot tell
+        // what it was, so it cannot rule it out.
+        let kind = e.get("event").and_then(Value::as_str).ok_or_else(|| {
+            backend(format!(
+                "GitHub sent a timeline item on issue {n} without an `event` kind, so fl \
+                 cannot tell whether someone else changed the issue; retry"
+            ))
+        })?;
+        if !STATE_EVENTS.contains(&kind) {
+            continue;
+        }
+        let id = e.get("id").and_then(Value::as_u64).ok_or_else(|| {
+            backend(format!(
+                "a `{kind}` event on issue {n} has no id, so fl cannot tell it from its own \
+                 write; retry"
+            ))
+        })?;
+        // ⚠ A label event without its label cannot be told from noise.
+        // Measured live on 2026-10-05 (one sample): a label event keeps its
+        // `label.name` after the label is deleted from the repository.
+        let label = match kind {
+            "labeled" | "unlabeled" => Some(
+                e.pointer("/label/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        backend(format!(
+                            "a `{kind}` event on issue {n} names no label, so fl cannot tell \
+                             whether it changed the issue; retry"
+                        ))
+                    })?,
+            ),
+            _ => None,
+        };
+        events.push(Event {
+            id,
+            kind: kind.to_string(),
+            label,
+        });
+    }
+    Ok(events)
+}
+
+/// The events of a whole timeline (oldest first) that can record a change.
+/// ⚠ A `labeled` event for a label already on the issue is dropped as noise.
+/// Measured live on 2026-10-05: GitHub sometimes records a `labeled` event a
+/// second time, about 0-1 s after the first (4 of 10 calls that added two
+/// labels; 2 of 33 issues fl created adding one label per call), and
+/// re-adding a label the issue already carries records no event at all. So
+/// such an event cannot be anyone's write. Which labels are on the issue is
+/// replayed from the timeline itself, from none: never from an issue fl
+/// read, which can already hold a label someone added inside the window.
+/// An `unlabeled` event, and every other kind, is always kept.
+/// Measured live on 2026-10-05 (one sample): deleting a label from the
+/// repository records an `unlabeled` event on each issue that carried it,
+/// and adding it again after it is re-created records a new `labeled`, so
+/// that path keeps the replay right.
+/// ⚠ Modelled: the timeline records every label change of the issue, in
+/// order, and an event that shows means every earlier one shows too. A
+/// label change with no event would leave the replay wrong; a later
+/// `labeled` event for that label could then be taken for noise.
+fn changes(events: &[Event]) -> Vec<&Event> {
+    let mut on = BTreeSet::new();
+    events
+        .iter()
+        .filter(|e| match (e.kind.as_str(), &e.label) {
+            ("labeled", Some(l)) => on.insert(l.clone()),
+            ("unlabeled", Some(l)) => {
+                on.remove(l);
+                true
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// The changes `after` shows that `before` did not, in timeline order.
+fn new_changes<'a>(before: &Window, after: &'a Window) -> Vec<&'a Event> {
+    let old: BTreeSet<u64> = before.events.iter().map(|e| e.id).collect();
+    changes(&after.events)
+        .into_iter()
+        .filter(|e| !old.contains(&e.id))
+        .collect()
+}
+
 /// What GitHub has recorded about an issue's changes at one moment.
 struct Window {
-    events: BTreeMap<u64, String>,
+    /// The state-changing events, in timeline order.
+    events: Vec<Event>,
     edits: BTreeSet<String>,
     /// The edit history's `totalCount`, which does not depend on the order
     /// GitHub lists the entries in.
@@ -114,20 +280,36 @@ fn backend(msg: String) -> StoreError {
 
 /// ⚠ Every error inside `after_ambiguous_create` — a failed search for the
 /// create key, and ANY failure of the resend (a transport failure, a rate
-/// limit, a refused credential, a rejected request) — gets the "list before
-/// retrying" advice. The FIRST attempt failed
+/// limit, a refused credential, a rejected request) — gets the "look before
+/// retrying" advice (`look_before_retrying`). The FIRST attempt failed
 /// ambiguously (a 5xx, or the connection dropping), so by then fl cannot
 /// know whether the issue exists, whatever the later error is about: a plain
 /// "retry" would make a duplicate whenever the first attempt had landed.
 /// (Earlier rounds wrapped only a transport failure here, reading the other
 /// errors as unrelated to that ambiguity; they are not, because the
 /// ambiguity comes from the first attempt, not from the error.)
-fn after_ambiguous_failure(step: &str, e: StoreError) -> StoreError {
+fn after_ambiguous_failure(title: &str, step: &str, e: StoreError) -> StoreError {
     backend(format!(
         "an issue create failed in a way that may still have created the issue, and then \
-         {step} ({e}). List the repository's fl issues before retrying, so the retry makes no \
-         duplicate"
+         {step} ({e}). {}",
+        look_before_retrying(title)
     ))
+}
+
+/// The advice once a create may have landed: where to look for the issue,
+/// and what to do with it. ⚠ Not "list the repository's fl issues": a
+/// create sends no labels (`label_created` adds them), so an issue it made
+/// may carry none, and then it is in neither `fl record list`, `fl finding
+/// list`, nor a GitHub list filtered by fl's labels. Following that advice
+/// made the duplicate it was meant to prevent.
+fn look_before_retrying(title: &str) -> String {
+    format!(
+        "Before retrying, look among the repository's newest issues, labelled or not, for one \
+         titled {title:?}; if it is there, run `fl github repair <number> --by <name>` on it \
+         instead of creating it again, so the retry makes no duplicate. GitHub's issue list can \
+         take minutes to show a new issue: if it is not there, wait a few minutes and look again \
+         before retrying"
+    )
 }
 
 fn text(v: &Value, k: &str) -> Result<String, StoreError> {
@@ -183,30 +365,7 @@ fn check_written(
     state: &str,
     reason: Option<&str>,
 ) -> Result<(), StoreError> {
-    let want: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
-    let got: BTreeSet<&str> = back.labels.iter().map(String::as_str).collect();
-    let mut problems = Vec::new();
-    if back.title != title {
-        problems.push("the title came back different".to_string());
-    }
-    if reason.is_some() && back.state_reason.as_deref() != reason {
-        problems.push(format!(
-            "the issue came back closed as `{:?}`, not `{reason:?}`",
-            back.state_reason
-        ));
-    }
-    if want != got {
-        problems.push(format!("the labels came back as {got:?}, not {want:?}"));
-    }
-    if back.body.replace("\r\n", "\n") != body {
-        problems.push("the body came back different".to_string());
-    }
-    if back.state != state {
-        problems.push(format!(
-            "the issue came back `{}`, not `{state}`",
-            back.state
-        ));
-    }
+    let problems = written_problems(back, title, Some(labels), body, state, reason);
     if problems.is_empty() {
         Ok(())
     } else {
@@ -217,6 +376,66 @@ fn check_written(
             problems.join("; ")
         )))
     }
+}
+
+/// How GitHub's answer differs from what fl sent; empty when it does not.
+/// `labels` is `None` for a create, which sends none: they are added, and
+/// checked, by their own calls (`label_created`).
+fn written_problems(
+    back: &IssueView,
+    title: &str,
+    labels: Option<&[String]>,
+    body: &str,
+    state: &str,
+    reason: Option<&str>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    if back.title != title {
+        problems.push("the title came back different".to_string());
+    }
+    if reason.is_some() && back.state_reason.as_deref() != reason {
+        problems.push(format!(
+            "the issue came back closed as `{:?}`, not `{reason:?}`",
+            back.state_reason
+        ));
+    }
+    if let Some(labels) = labels {
+        let want: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+        let got: BTreeSet<&str> = back.labels.iter().map(String::as_str).collect();
+        if want != got {
+            problems.push(format!("the labels came back as {got:?}, not {want:?}"));
+        }
+    }
+    if back.body.replace("\r\n", "\n") != body {
+        problems.push("the body came back different".to_string());
+    }
+    if back.state != state {
+        problems.push(format!(
+            "the issue came back `{}`, not `{state}`",
+            back.state
+        ));
+    }
+    problems
+}
+
+/// An error about an issue fl has just created: it exists without fl's
+/// labels (`certain`), or perhaps without some or all of them — GitHub
+/// can apply one label and drop the other — so fl's lists leave it out, or
+/// report it as diverged. ⚠ Never "retry":
+/// a retry mints a new create key and makes a DUPLICATE. `fl github
+/// repair` restores the labels from the block instead (spec §0.1b, 14).
+fn unlabelled_issue(issue: &IssueView, why: &str, certain: bool) -> StoreError {
+    let state = if certain {
+        "It exists without fl's labels, so fl's lists leave it out"
+    } else {
+        "It may exist without some or all of fl's labels, so fl's lists leave it out or report \
+         it as diverged"
+    };
+    backend(format!(
+        "{} was created, but {why}. {state}. Do not create it again: `fl github repair {} \
+         --by <name>` restores its labels from its block",
+        issue.url, issue.number
+    ))
 }
 
 impl GithubTracker {
@@ -332,20 +551,112 @@ impl GithubTracker {
         format!("/repos/{}{rest}", self.repo.full_name)
     }
 
-    /// Oldest first: an issue created while a list is read lands on its last
-    /// page, so it cannot shift an earlier page's issues onto the next one.
-    /// ⚠ The opposite hazard remains, because GitHub's paging is by offset,
-    /// not a cursor: an issue LEAVING the filtered set mid-read (a label
-    /// removed, closed out from under a state filter) shifts every later
-    /// issue one position earlier, which can drop a live item from a page
-    /// already served — silently, with no error (spec §3.7). `list` catches
-    /// this itself, by re-reading and comparing issue numbers whenever more
-    /// than one page was needed.
-    fn list_path(&self, labels: &[String]) -> String {
-        self.path(&format!(
-            "/issues?state=all&sort=created&direction=asc&per_page=100&labels={}",
-            labels.join(",")
-        ))
+    /// Every issue carrying `label` (every issue, for `None`), read from
+    /// GraphQL's `issues` connection a page at a time in `order`, each node
+    /// handed to `each` until it answers `false` (spec §3.7), `page` issues
+    /// to a page. Each node is one `IssueView::from_graphql` reads, plus
+    /// `createdAt`.
+    ///
+    /// ⚠ GraphQL, never the REST issue list. Measured live on 2026-10-05:
+    /// the REST list left a new issue out for 31-93 s (once more than
+    /// 180 s), and showed a label change 30-100 s late; this connection
+    /// showed a new issue within 1 s (5 of 5) and a label change within
+    /// 2-3 s (5 of 5). Read through REST, a list was silently short, an
+    /// alias scan could miss an owner, and a create-key search could miss
+    /// a create that landed and send it again.
+    /// ⚠ A failed page, or a page with no readable `issues` connection, is
+    /// an ERROR, never a short list.
+    fn each_issue(
+        &self,
+        label: Option<&str>,
+        order: Order,
+        page: u64,
+        mut each: impl FnMut(&Value) -> Result<bool, StoreError>,
+    ) -> Result<(), StoreError> {
+        let (owner, name) = self
+            .repo
+            .full_name
+            .split_once('/')
+            .expect("a full name is owner/name");
+        // Two spellings rather than `labels: null` for "no filter": what
+        // GitHub makes of an explicit null filter is unmeasured.
+        let (declared, filter) = match label {
+            Some(_) => (", $labels: [String!]!", "labels: $labels, "),
+            None => ("", ""),
+        };
+        let query = format!(
+            "query($owner: String!, $name: String!, $first: Int!, $after: String, $direction: \
+             OrderDirection!{declared}) {{ repository(owner: $owner, name: $name) {{ \
+             issues({filter}states: [OPEN, CLOSED], first: $first, after: $after, orderBy: \
+             {{field: CREATED_AT, direction: $direction}}) {{ pageInfo {{ hasNextPage \
+             endCursor }} nodes {{ number id url title body state stateReason createdAt \
+             labels(first: 100) {{ totalCount nodes {{ name }} }} }} }} }} }}"
+        );
+        let direction = match order {
+            Order::OldestFirst => "ASC",
+            Order::NewestFirst => "DESC",
+        };
+        let what = label.map_or_else(|| "the full".to_string(), |l| format!("the `{l}`"));
+        let mut after: Option<String> = None;
+        loop {
+            let mut vars = json!({"owner": owner, "name": name, "first": page,
+                                  "after": after, "direction": direction});
+            if let Some(l) = label {
+                vars["labels"] = json!([l]);
+            }
+            let data = self.client.graphql(&query, vars)?;
+            let issues = data.pointer("/repository/issues");
+            let (Some(nodes), Some(more)) = (
+                issues
+                    .and_then(|i| i.get("nodes"))
+                    .and_then(Value::as_array),
+                issues
+                    .and_then(|i| i.pointer("/pageInfo/hasNextPage"))
+                    .and_then(Value::as_bool),
+            ) else {
+                return Err(backend(format!(
+                    "GitHub answered a page of {what} issue list of {} without its `issues` \
+                     connection. A list with a missing page is not a list; retry",
+                    self.repo.full_name
+                )));
+            };
+            for node in nodes {
+                if !each(node)? {
+                    return Ok(());
+                }
+            }
+            if !more {
+                return Ok(());
+            }
+            // ⚠ Progress, checked: a page that says another follows but
+            // holds no issue, or hands back the cursor it was asked for,
+            // would be read again forever.
+            if nodes.is_empty() {
+                return Err(backend(format!(
+                    "GitHub answered an empty page of {what} issue list of {} and said another \
+                     follows; retry",
+                    self.repo.full_name
+                )));
+            }
+            let cursor = issues
+                .and_then(|i| i.pointer("/pageInfo/endCursor"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    backend(format!(
+                        "GitHub said {what} issue list of {} has another page but gave no \
+                         cursor to it; retry",
+                        self.repo.full_name
+                    ))
+                })?;
+            if after.as_deref() == Some(cursor) {
+                return Err(backend(format!(
+                    "GitHub said {what} issue list of {} has another page but gave the same \
+                     cursor again; retry",
+                    self.repo.full_name
+                )));
+            }
+            after = Some(cursor.to_string());
+        }
     }
 
     /// Whether `id` is an issue of THIS repository (spec §2.2, §2.4). A URL
@@ -499,42 +810,31 @@ impl GithubTracker {
         state: Option<&str>,
         remember: bool,
     ) -> Result<Vec<(IssueView, Meta, String)>, StoreError> {
-        let mut labels = vec![meta::kind_label(kind)];
-        if let Some(s) = state {
-            labels.push(meta::state_label(kind, s));
-        }
-        let path = self.list_path(&labels);
-        let (raw, pages) = self.client.get_all_paged(&path)?;
-        if pages > 1 {
-            // ⚠ GitHub pages by offset, not a cursor (spec §3.7): an issue
-            // leaving the filtered set mid-read shifts every later issue
-            // back by one, which can drop a live item with no error. A
-            // second, independent read is compared by issue number; any
-            // difference means the set changed while fl was reading it, and
-            // the whole list is refused rather than returned short. A single
-            // page cannot have shifted anything onto or off of itself, so it
-            // costs nothing here.
-            let (again, _) = self.client.get_all_paged(&path)?;
-            let first: BTreeSet<u64> = raw
-                .iter()
-                .filter_map(|v| v.get("number").and_then(Value::as_u64))
-                .collect();
-            let second: BTreeSet<u64> = again
-                .iter()
-                .filter_map(|v| v.get("number").and_then(Value::as_u64))
-                .collect();
-            if first != second {
-                return Err(backend(format!(
-                    "the list of {} issues changed while fl read it; retry",
-                    kind.as_wire()
-                )));
-            }
-        }
+        // ⚠ One label, never two. Measured live on 2026-10-05: GraphQL's
+        // `labels` filter is OR, the union (`fl:record` 73 issues,
+        // `fl:finding` 70, both 143), so two labels would widen the list,
+        // never narrow it. A state label names its kind; the kind label is
+        // checked from the read.
+        let label = match state {
+            Some(s) => meta::state_label(kind, s),
+            None => meta::kind_label(kind),
+        };
+        // Read once. ⚠ Modelled: GitHub's cursor names the last issue
+        // served, not an offset, so an issue leaving the filtered set
+        // mid-read (a label removed) cannot shift a live item across a page
+        // boundary, and the REST list's second read and comparison are not
+        // needed. A reading of the cursor model GitHub's GraphQL follows,
+        // not of GitHub's own docs; unmeasured; no live test checks it yet.
+        // Oldest first, so an issue created mid-read lands on the last page.
+        let mut raw = Vec::new();
+        self.each_issue(Some(&label), Order::OldestFirst, LIST_PAGE, |node| {
+            raw.push(IssueView::from_graphql(node)?);
+            Ok(true)
+        })?;
         let mut out = Vec::new();
         let mut numbers = BTreeSet::new();
-        for v in raw {
-            let issue = IssueView::from_json(&v)?;
-            // Pages are read one by one; an issue seen twice is counted once.
+        for issue in raw {
+            // An issue served twice is counted once.
             if !numbers.insert(issue.number) {
                 continue;
             }
@@ -544,8 +844,8 @@ impl GithubTracker {
                     meta,
                     prose,
                 } if k == kind => {
-                    // The label filter is taken to mean AND; the block is
-                    // checked too, so a looser filter cannot widen the list.
+                    // The block is checked too, so a looser filter cannot
+                    // widen the list.
                     if state.is_some_and(|st| meta.state != st) {
                         continue;
                     }
@@ -560,19 +860,6 @@ impl GithubTracker {
                         id: issue.url.clone(),
                         detail: "its kind label and its block disagree".into(),
                     });
-                }
-                // ⚠ Not `Diverged`: its remedy is `fl github repair`, which
-                // refuses a pull request. The remedy
-                // that works is named instead.
-                Read::NotFl(_) if issue.is_pull_request => {
-                    return Err(backend(format!(
-                        "{} is a pull request carrying fl labels, so fl cannot list the {}s \
-                         of {}: fl keeps items only in issues, and `fl github repair` does not \
-                         rewrite a pull request. Remove its fl labels",
-                        issue.url,
-                        kind.as_wire(),
-                        self.repo.full_name
-                    )));
                 }
                 Read::NotFl(what) => {
                     return Err(StoreError::Diverged {
@@ -651,8 +938,18 @@ impl GithubTracker {
         self.ensure_labels()?;
         let labels = vec![meta::kind_label(kind), meta::state_label(kind, &meta.state)];
         let body = meta::render_body(prose, meta);
-        let sent = json!({"title": title, "body": body, "labels": labels});
+        // ⚠ No labels in the create: they are added afterward, by their own
+        // call (`label_created`). Measured live on 2026-10-05: labels set in the
+        // create showed their `labeled` events 28-88 s late (once more than
+        // 180 s), past `await_create_events`, so they landed in the next
+        // update's window as a spurious conflict; labels added by their own
+        // call showed in 1-2 s (3 of 3), with nothing more after 180 s —
+        // measured adding one label per call; fl's call adds two, whose
+        // timing is not separately measured.
+        let sent = json!({"title": title, "body": body});
         let path = self.path("/issues");
+        // Before the first send: the create-key search reads back to here.
+        let started = now_millis();
         // ⚠ `send_unchecked_json`, not `send`: a 201 whose own body cannot be
         // read is exactly as ambiguous as a 5xx or a dropped connection
         // (spec §3.3) — the write may have landed regardless of whether fl
@@ -670,13 +967,15 @@ impl GithubTracker {
             // the duplicate this whole mechanism exists to avoid.
             Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
                 Ok(issue) => issue,
-                Err(_) => self.after_unreadable_create(kind, meta, r.status)?,
+                Err(_) => self.after_unreadable_create(title, meta, started, r.status)?,
             },
             // ⚠ An ambiguous failure may already have created the issue.
             // Look for the create key before sending again (spec §3.3).
-            Ok(r) if r.status >= 500 => self.after_ambiguous_create(kind, meta, &path, &sent)?,
+            Ok(r) if r.status >= 500 => {
+                self.after_ambiguous_create(title, meta, started, &path, &sent)?
+            }
             Err(StoreError::Unreachable { .. }) => {
-                self.after_ambiguous_create(kind, meta, &path, &sent)?
+                self.after_ambiguous_create(title, meta, started, &path, &sent)?
             }
             Ok(r) => {
                 return Err(backend(format!(
@@ -686,47 +985,135 @@ impl GithubTracker {
             }
             Err(e) => return Err(e),
         };
-        check_written(&issue, title, &labels, &body, "open", None)?;
-        self.await_create_events(issue.number, labels.len());
+        // ⚠ Not `check_written`: no labels were sent, so a mismatch here is
+        // not a label permission, and the issue exists without labels.
+        let problems = written_problems(&issue, title, None, &body, "open", None);
+        if !problems.is_empty() {
+            return Err(unlabelled_issue(
+                &issue,
+                &format!("GitHub did not create it as sent: {}", problems.join("; ")),
+                true,
+            ));
+        }
+        let issue = self.label_created(issue, &labels)?;
+        self.await_create_events(issue.number, &labels);
         self.kinds.borrow_mut().insert(issue.number, kind);
         self.remember(issue.number, meta, prose, title);
         Ok(issue)
     }
 
+    /// Add fl's `labels` to an issue fl just created without them, and check
+    /// GitHub's answer. An issue that already carries exactly them (found
+    /// by its create key, labelled before) is left as it is.
+    /// ⚠ Every error is `unlabelled_issue`: it names the issue, which
+    /// exists by now, and the repair — never a retry.
+    fn label_created(&self, issue: IssueView, labels: &[String]) -> Result<IssueView, StoreError> {
+        let fl_labels = |all: &[String]| -> BTreeSet<String> {
+            all.iter()
+                .filter(|l| l.starts_with("fl:"))
+                .cloned()
+                .collect()
+        };
+        let want: BTreeSet<String> = labels.iter().cloned().collect();
+        if fl_labels(&issue.labels) == want {
+            return Ok(issue);
+        }
+        let unlabelled = |why: String| unlabelled_issue(&issue, &why, false);
+        // Both labels in one call. (Measured live on 2026-10-05: GitHub
+        // sometimes records a `labeled` event twice, one label per call or
+        // two; `changes` drops the copy wherever it lands.)
+        let r = self
+            .client
+            .send(
+                Method::Post,
+                &self.path(&format!("/issues/{}/labels", issue.number)),
+                Some(&json!({ "labels": labels })),
+            )
+            .map_err(|e| unlabelled(format!("adding its labels failed ({e})")))?;
+        if r.status != 200 {
+            return Err(unlabelled(format!(
+                "GitHub answered {} when fl added its labels",
+                r.status
+            )));
+        }
+        let got: Vec<String> = r
+            .body
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
+                    .collect()
+            })
+            .ok_or_else(|| {
+                unlabelled("GitHub's answer to adding its labels could not be read".into())
+            })?;
+        let applied = fl_labels(&got);
+        let missing: Vec<&String> = want.difference(&applied).collect();
+        if !missing.is_empty() {
+            return Err(unlabelled(format!(
+                "GitHub accepted its labels but did not apply {missing:?}. The credential may \
+                 lack permission to set labels (Issues: read and write)"
+            )));
+        }
+        // ⚠ Every label fl sent was applied, so not a permission: adding
+        // labels never removes one, and the issue already carried another
+        // fl label (an automation, or a person, labelled it first).
+        let extra: Vec<&String> = applied.difference(&want).collect();
+        if !extra.is_empty() {
+            return Err(backend(format!(
+                "{} was created and given fl's labels, but it also carries {extra:?}, which fl \
+                 did not set and adding labels does not remove, so it reads as diverged. Do not \
+                 create it again: `fl github repair {} --by <name>` rewrites its fl labels from \
+                 its block",
+                issue.url, issue.number
+            )));
+        }
+        Ok(IssueView {
+            labels: got,
+            ..issue
+        })
+    }
+
     /// Search for a create by its key, `settle` apart, up to three times.
-    /// `Ok(None)` when none of the three searches found it.
+    /// `Ok(None)` when none of the three searches found it. `started`: when
+    /// the attempt began, by this machine's clock, in milliseconds.
     fn search_by_create_key(
         &self,
-        kind: ItemKind,
         key: &str,
+        started: u64,
     ) -> Result<Option<IssueView>, StoreError> {
         for attempt in 0..3 {
             if attempt > 0 {
                 std::thread::sleep(self.settle);
             }
-            if let Some(found) = self.find_by_create_key(kind, key)? {
+            if let Some(found) = self.find_by_create_key(key, started)? {
                 return Ok(Some(found));
             }
         }
         Ok(None)
     }
 
-    /// ⚠ The list GitHub serves may lag a create that just landed, so the
-    /// key is searched for first; only when EVERY search misses is the
-    /// create sent again. Only for a FIRST-attempt failure where the create
+    /// ⚠ The list GitHub serves may lag a create that just landed (GraphQL's
+    /// showed one within 1 s, 5 of 5, measured live on 2026-10-05; the REST
+    /// list, which fl does not use, took 31-93 s), so the key is searched
+    /// for `settle` apart; only when EVERY search misses is the create sent
+    /// again. Only for a FIRST-attempt failure where the create
     /// may not have happened at all — a 5xx answer, or the connection
     /// dropping before an answer arrived. See `after_unreadable_create` for
     /// the case where it certainly did.
     fn after_ambiguous_create(
         &self,
-        kind: ItemKind,
+        title: &str,
         meta: &Meta,
+        started: u64,
         path: &str,
         sent: &Value,
     ) -> Result<IssueView, StoreError> {
         let searched = self
-            .search_by_create_key(kind, &meta.create_key)
-            .map_err(|e| after_ambiguous_failure("searching for it by its create key failed", e))?;
+            .search_by_create_key(&meta.create_key, started)
+            .map_err(|e| {
+                after_ambiguous_failure(title, "searching for it by its create key failed", e)
+            })?;
         if let Some(found) = searched {
             return Ok(found);
         }
@@ -742,19 +1129,20 @@ impl GithubTracker {
         {
             Ok(r) if (200..300).contains(&r.status) => match IssueView::from_json(&r.body) {
                 Ok(issue) => Ok(issue),
-                Err(_) => self.after_unreadable_create(kind, meta, r.status),
+                Err(_) => self.after_unreadable_create(title, meta, started, r.status),
             },
             Ok(r) => Err(backend(format!(
-                "GitHub failed an issue create twice (the second answer was {}). List the \
-                 repository's fl issues before retrying, so the retry makes no duplicate",
-                r.status
+                "GitHub failed an issue create twice (the second answer was {}). {}",
+                r.status,
+                look_before_retrying(title)
             ))),
             // ⚠ Every failure of the resend gets the SAME advice as a bad
             // status: the first attempt's fate is
             // unknown, so whatever stopped this one — a dropped connection,
             // a rate limit, a refused credential — fl cannot say whether the
-            // issue exists. Only a fresh list can settle that.
+            // issue exists. Only a fresh look can settle that.
             Err(e) => Err(after_ambiguous_failure(
+                title,
                 "sending it a second time failed",
                 e,
             )),
@@ -765,11 +1153,12 @@ impl GithubTracker {
     /// answer or a dropped connection, there is no "may not have happened"
     /// here. A miss on every search is never followed by a resend — that
     /// would risk making exactly the duplicate this whole path exists to
-    /// avoid. The caller is told to list the repository's fl issues itself.
+    /// avoid. The caller is told where to look for the issue itself.
     fn after_unreadable_create(
         &self,
-        kind: ItemKind,
+        title: &str,
         meta: &Meta,
+        started: u64,
         status: u16,
     ) -> Result<IssueView, StoreError> {
         // ⚠ The create is certain here — GitHub already answered 2xx — so
@@ -778,42 +1167,51 @@ impl GithubTracker {
         // retry" on a failed page read would otherwise reach the caller
         // with no hint that a resend is exactly what must NOT happen.
         let found = self
-            .search_by_create_key(kind, &meta.create_key)
+            .search_by_create_key(&meta.create_key, started)
             .map_err(|e| {
                 backend(format!(
                     "GitHub answered {status} to an issue create, but its own body could not \
                      be read, and searching for it afterward by its create key failed too ({e}). \
-                     List the repository's fl issues before retrying, so the retry makes no \
-                     duplicate"
+                     {}",
+                    look_before_retrying(title)
                 ))
             })?;
         found.ok_or_else(|| {
             backend(format!(
                 "GitHub answered {status} to an issue create, but its own body could not be \
                  read, and the issue could not be found afterward by its create key \
-                 either. List the repository's fl issues before retrying, so the retry \
-                 makes no duplicate"
+                 either. {}",
+                look_before_retrying(title)
             ))
         })
     }
 
-    fn find_by_create_key(
-        &self,
-        kind: ItemKind,
-        key: &str,
-    ) -> Result<Option<IssueView>, StoreError> {
-        for v in self
-            .client
-            .get_all(&self.list_path(&[meta::kind_label(kind)]))?
-        {
-            let issue = IssueView::from_json(&v)?;
+    /// The issue whose block carries create key `key`, among the issues
+    /// created since `CREATE_SEARCH_MARGIN` before `started`.
+    /// ⚠ Every issue, not only fl's labelled ones: a create sends no labels
+    /// and adds them afterward (`label_created`), so an issue this attempt
+    /// made may carry none — after a stop between the two calls, or a
+    /// create whose answer was lost. Newest first, and it
+    /// stops at the first issue older than the margin, so its cost does not
+    /// grow with the repository's history.
+    fn find_by_create_key(&self, key: &str, started: u64) -> Result<Option<IssueView>, StoreError> {
+        let since =
+            At::from_unix_millis(started.saturating_sub(CREATE_SEARCH_MARGIN.as_millis() as u64));
+        let mut found = None;
+        self.each_issue(None, Order::NewestFirst, SEARCH_PAGE, |node| {
+            if created_at(node)? < since {
+                return Ok(false);
+            }
+            let issue = IssueView::from_graphql(node)?;
             if let Ok((_, m)) = meta::parse_body(&issue.body)
                 && m.create_key == key
             {
-                return Ok(Some(issue));
+                found = Some(issue);
+                return Ok(false);
             }
-        }
-        Ok(None)
+            Ok(true)
+        })?;
+        Ok(found)
     }
 
     /// Read, change, write, and check the answer. `missing` is the error for
@@ -944,32 +1342,11 @@ impl GithubTracker {
 
     /// The issue's state-changing timeline events, by id. ⚠ Never
     /// `remember`s: it reads no item.
-    fn state_events(&self, n: u64) -> Result<BTreeMap<u64, String>, StoreError> {
-        let mut events = BTreeMap::new();
-        for e in self
+    fn state_events(&self, n: u64) -> Result<Vec<Event>, StoreError> {
+        let items = self
             .client
-            .get_all(&self.path(&format!("/issues/{n}/timeline?per_page=100")))?
-        {
-            // ⚠ No `event` field is not "not a state event": fl cannot tell
-            // what it was, so it cannot rule it out.
-            let kind = e.get("event").and_then(Value::as_str).ok_or_else(|| {
-                backend(format!(
-                    "GitHub sent a timeline item on issue {n} without an `event` kind, so fl \
-                     cannot tell whether someone else changed the issue; retry"
-                ))
-            })?;
-            if !STATE_EVENTS.contains(&kind) {
-                continue;
-            }
-            let id = e.get("id").and_then(Value::as_u64).ok_or_else(|| {
-                backend(format!(
-                    "a `{kind}` event on issue {n} has no id, so fl cannot tell it from its own \
-                     write; retry"
-                ))
-            })?;
-            events.insert(id, kind.to_string());
-        }
-        Ok(events)
+            .get_all(&self.path(&format!("/issues/{n}/timeline?per_page=100")))?;
+        parse_events(n, &items)
     }
 
     /// The body's edit history: its entries' ids and its `totalCount`.
@@ -1066,10 +1443,8 @@ impl GithubTracker {
             edits: own_edits,
         } = own_write(before, old, new);
         let mut foreign = Vec::new();
-        for (eid, kind) in &after.events {
-            if before.events.contains_key(eid) {
-                continue;
-            }
+        for e in new_changes(before, after) {
+            let kind = &e.kind;
             match expected.get_mut(kind.as_str()) {
                 Some(left) if *left > 0 => *left -= 1,
                 _ => foreign.push(format!("a `{kind}` event")),
@@ -1132,25 +1507,36 @@ impl GithubTracker {
         }
     }
 
-    /// After a create: wait until the timeline shows its `labeled` events,
-    /// so they do not land in the next write's window. ⚠ Measured live:
-    /// they appeared 1.5-3.5 s after GitHub answered the create. A create
-    /// whose events never show still succeeds — the create landed, and the
-    /// next write refuses as a conflict, which is the safe side.
+    /// After a create: wait until the timeline shows the `labeled` events
+    /// of the labels `label_created` added, so they do not land in the
+    /// next write's window. ⚠ Measured live on 2026-10-05: they showed
+    /// 1-2 s after the call that added them (3 of 3, one label per call;
+    /// fl's call adds two, not separately measured). A create whose events
+    /// never show still succeeds — the create landed, and the next write
+    /// refuses as a conflict, which is the safe side.
     /// ⚠ Never an error: the issue exists by now, and `add_record` mints a
     /// new create key on every call, so an error here would invite a retry
     /// that makes a DUPLICATE. A failed read ends the wait like a timeout.
-    /// ⚠ Counts every `labeled` event, not the create's own labels: one added
-    /// by someone else can stand in for a lagging one of fl's, which then
-    /// lands in the next write's window — a conflict, the safe side.
-    fn await_create_events(&self, n: u64, labels: usize) {
+    /// ⚠ Waits for the labels themselves, as the timeline's changes add
+    /// them (`changes`): a `labeled` event that is noise never ends the wait.
+    fn await_create_events(&self, n: u64, labels: &[String]) {
         let start = std::time::Instant::now();
         loop {
             let Ok(events) = self.state_events(n) else {
                 return;
             };
-            let shown = events.values().filter(|k| *k == "labeled").count();
-            if shown >= labels || start.elapsed() >= self.visible_within {
+            let mut on = BTreeSet::new();
+            for e in changes(&events) {
+                if let Some(l) = &e.label {
+                    if e.kind == "labeled" {
+                        on.insert(l.as_str());
+                    } else {
+                        on.remove(l.as_str());
+                    }
+                }
+            }
+            let shown = labels.iter().all(|l| on.contains(l.as_str()));
+            if shown || start.elapsed() >= self.visible_within {
                 return;
             }
             std::thread::sleep(self.poll);
@@ -1687,10 +2073,8 @@ fn new_edits(before: &Window, after: &Window) -> Option<usize> {
 /// shrunken history counts as shown, so `check_window` reports it.
 fn shows(before: &Window, after: &Window, own: &Own) -> bool {
     let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-    for (eid, kind) in &after.events {
-        if !before.events.contains_key(eid) {
-            *seen.entry(kind.as_str()).or_default() += 1;
-        }
+    for e in new_changes(before, after) {
+        *seen.entry(e.kind.as_str()).or_default() += 1;
     }
     own.events
         .iter()
@@ -1702,7 +2086,7 @@ fn shows(before: &Window, after: &Window, own: &Own) -> bool {
 mod tests {
     use super::*;
     use crate::creds::EnvToken;
-    use crate::fake::FakeGithub;
+    use crate::fake::{Copies, FakeGithub};
     use fl_core::MemStore;
     use fl_core::ids::seq_iri;
     use std::time::Duration;
@@ -1825,8 +2209,8 @@ mod tests {
 
     /// A transport failure on the SECOND create
     /// attempt (after the create-key search already came up empty) must
-    /// carry the same "list the repository's fl issues before retrying"
-    /// remedy as a bad status there — losing that advice on this one path
+    /// carry the same "look before retrying" advice as a bad status
+    /// there — losing that advice on this one path
     /// would leave a caller no wiser about the risk of a duplicate.
     #[test]
     fn a_transport_failure_on_the_ambiguous_resend_still_names_the_remedy() {
@@ -1835,11 +2219,7 @@ mod tests {
         fake.state().fail_before_create = true;
         fake.state().hang_up_after_create = true;
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(
             fake.issue_count(),
             1,
@@ -1859,17 +2239,80 @@ mod tests {
         fake.state().unreadable_create_body_next = true;
         fake.state().omit_from_list = Some(1);
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(
             fake.issue_count(),
             1,
             "the create landed even though it could not be found again — a resend would \
              duplicate it"
         );
+    }
+
+    /// The create-key search reads newest first and stops at the first
+    /// issue created more than `CREATE_SEARCH_MARGIN` before the attempt
+    /// began: one page per search here, however long the repository's
+    /// history.
+    #[test]
+    fn a_create_key_search_stops_at_issues_older_than_the_attempt() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        for i in 0..3 {
+            t.add_record(&p(), &format!("old {i}")).unwrap();
+        }
+        let eleven_minutes = 11 * 60 * 1000;
+        for i in fake.state().issues.values_mut() {
+            i.created_ms -= eleven_minutes;
+        }
+        fake.state().max_per_page = 1;
+        fake.state().unreadable_create_body_next = true;
+        fake.state().omit_from_list = Some(4);
+        let before = fake.state().list_issue_requests;
+        t.add_record(&p(), "t").unwrap_err();
+        assert_eq!(
+            fake.state().list_issue_requests - before,
+            3,
+            "three searches of one page each"
+        );
+    }
+
+    /// The create-key search reads every issue, fl's or not, with whole
+    /// bodies: small pages, so a page of large bodies stays under the
+    /// client's answer-size limit (it usually needs one page). A list,
+    /// filtered to fl's issues, reads a hundred to a page.
+    #[test]
+    fn the_create_key_search_reads_small_pages_and_a_list_full_ones() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().hang_up_after_create = true;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.state().issues_firsts, vec![Some(25)]);
+        fake.state().issues_firsts.clear();
+        t.list_records(&p()).unwrap();
+        assert_eq!(fake.state().issues_firsts, vec![Some(100)]);
+    }
+
+    /// GitHub's clock may run behind this machine's, so an issue the
+    /// attempt made can carry a `createdAt` before the attempt began. The
+    /// margin covers it: the search still finds it, and nothing is sent
+    /// again.
+    #[test]
+    fn a_create_key_search_finds_a_create_stamped_by_a_clock_running_behind() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().clock_behind_ms = 5 * 60 * 1000;
+        fake.state().hang_up_after_create = true;
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+    }
+
+    /// ⚠ Where a create that may have landed is to be looked for: among the
+    /// newest issues, labelled or not, by its title — a create sends no
+    /// labels, so the issue is in no list filtered by fl's labels.
+    fn says_where_to_look(msg: &str, title: &str) -> bool {
+        msg.contains("newest issues, labelled or not")
+            && msg.contains(&format!("titled {title:?}"))
+            && msg.contains("fl github repair <number> --by <name>")
+            && !msg.contains("List the repository's fl issues")
     }
 
     /// Unit-level — once the first attempt was
@@ -1890,10 +2333,10 @@ mod tests {
             StoreError::Backend("GitHub answered 422".into()),
         ] {
             let shown = e.to_string();
-            let msg = after_ambiguous_failure("sending it a second time failed", e).to_string();
+            let msg = after_ambiguous_failure("a title", "sending it a second time failed", e)
+                .to_string();
             assert!(
-                msg.contains("List the repository's fl issues before retrying")
-                    && msg.contains(&shown),
+                says_where_to_look(&msg, "a title") && msg.contains(&shown),
                 "{msg}"
             );
         }
@@ -1907,11 +2350,11 @@ mod tests {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake).without_settle();
         fake.state().hang_up_after_create = true;
-        fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 1));
+        fake.state().fail_issues_query_after = Some(0);
         let err = t.add_record(&p(), "t").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("List the repository's fl issues before retrying")
+            says_where_to_look(&msg, "t")
                 && msg.contains("searching for it by its create key failed"),
             "{msg}"
         );
@@ -1930,8 +2373,7 @@ mod tests {
         let err = t.add_record(&p(), "t").unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("List the repository's fl issues before retrying")
-                && msg.contains("rate limit"),
+            says_where_to_look(&msg, "t") && msg.contains("rate limit"),
             "{msg}"
         );
         assert_eq!(fake.issue_count(), 0);
@@ -2060,76 +2502,128 @@ mod tests {
         fake.state().max_per_page = 2;
         assert_eq!(t.list_records(&p()).unwrap().len(), 5);
         assert!(t.list_records(&ProjectId(seq_iri(2))).unwrap().is_empty());
-        fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 2));
+        fake.state().fail_issues_query_after = Some(1);
         assert!(t.list_records(&p()).is_err(), "never a short list");
     }
 
-    /// The flip side of the test below — a list that
-    /// fits on a single page must not pay for the second-pass stability
-    /// check at all. Nothing can have shifted a page onto or off of itself.
+    /// A page that answers with no `issues` connection is not an empty
+    /// page: the list fails (spec §3.7).
     #[test]
-    fn a_single_page_list_is_read_once() {
+    fn a_list_page_without_an_issues_connection_is_an_error_not_an_empty_list() {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake);
         t.add_record(&p(), "a").unwrap();
-        t.add_record(&p(), "b").unwrap();
-        let before = fake.state().requests.len();
-        assert_eq!(t.list_records(&p()).unwrap().len(), 2);
-        let issue_list_requests = fake.state().requests[before..]
-            .iter()
-            .filter(|r| r.starts_with("GET /repos/acme/widgets/issues?"))
-            .count();
-        assert_eq!(
-            issue_list_requests, 1,
-            "a single page must not be read twice"
-        );
-    }
-
-    /// A list that needed more than one page is read a
-    /// SECOND time to check the set of issue numbers is stable — a stable
-    /// list still succeeds, just at the cost of the extra read.
-    #[test]
-    fn a_stable_multi_page_list_is_read_twice_and_still_succeeds() {
-        let fake = FakeGithub::start("acme/widgets");
-        let t = open(&fake);
-        for i in 0..5 {
-            t.add_record(&p(), &format!("r{i}")).unwrap();
-        }
-        fake.state().max_per_page = 2;
-        let before = fake.state().requests.len();
-        assert_eq!(t.list_records(&p()).unwrap().len(), 5);
-        let issue_list_requests = fake.state().requests[before..]
-            .iter()
-            .filter(|r| r.starts_with("GET /repos/acme/widgets/issues?"))
-            .count();
-        assert_eq!(
-            issue_list_requests, 6,
-            "3 pages needed for 5 records at 2 per page, read twice"
-        );
-    }
-
-    /// GitHub pages by offset. An issue leaving the
-    /// filtered set between two page reads of the SAME pass shifts every
-    /// later issue back by one — which can drop a live item with no error
-    /// (spec §3.7). The second, independent read this fake's fix adds must
-    /// catch the mismatch rather than returning what looks like a complete
-    /// but short list.
-    #[test]
-    fn a_list_that_changes_shape_between_the_two_passes_is_an_error_not_a_short_list() {
-        let fake = FakeGithub::start("acme/widgets");
-        let t = open(&fake);
-        for i in 0..5 {
-            t.add_record(&p(), &format!("r{i}")).unwrap();
-        }
-        fake.state().max_per_page = 2;
-        // Issue 1 vanishes right as the first pass's second page is served
-        // (its first page already went out with issue 1 still in it).
-        fake.state().vanish_after_list_request = Some((2, 1));
-        let err = t.list_records(&p()).unwrap_err();
+        fake.state().issues_query_without_connection_next = true;
+        let e = t.list_records(&p()).unwrap_err().to_string();
         assert!(
-            matches!(err, StoreError::Backend(ref m) if m.contains("changed while fl read it")),
-            "{err:?}"
+            e.contains("without its `issues`") && e.contains("retry"),
+            "{e}"
         );
+    }
+
+    /// Measured live on 2026-10-05: GitHub's REST issue list left a new
+    /// issue out for 31-93 s, once for more than 180 s; GraphQL's `issues`
+    /// connection showed it within 1 s. Every list fl makes — records,
+    /// findings, a withdrawal count, an alias scan — reads GraphQL, so none
+    /// is short while the REST list lags.
+    #[test]
+    fn every_list_sees_a_just_created_issue_the_rest_list_leaves_out() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().rest_list_lags = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        let f = t
+            .add_finding(Finding::raise(p(), r.clone(), "hasty", "c"))
+            .unwrap();
+        let alias = Iri::parse("https://github.com/elsewhere/old/issues/3").unwrap();
+        t.add_alias(f.iri(), alias.clone()).unwrap();
+        let mut fin = t.get_finding(&f).unwrap().unwrap();
+        fin.withdraw("w").unwrap();
+        t.update_finding(&fin).unwrap();
+        assert_eq!(t.list_records(&p()).unwrap().len(), 1);
+        assert_eq!(t.list_findings(&p()).unwrap().len(), 1);
+        assert_eq!(t.withdrawals_by("hasty").unwrap(), 1);
+        assert_eq!(
+            t.get_finding(&FindingId(alias.clone()))
+                .unwrap()
+                .unwrap()
+                .id,
+            f
+        );
+        let other = t.add_record(&p(), "u").unwrap();
+        assert!(matches!(
+            t.add_alias(other.iri(), alias),
+            Err(StoreError::AlreadyExists(_))
+        ));
+    }
+
+    /// A page that says another follows must move the cursor and hold
+    /// issues; one that does neither would be read forever, and is an
+    /// error.
+    #[test]
+    fn a_list_whose_cursor_does_not_move_is_an_error_not_an_endless_read() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record(&p(), "a").unwrap();
+        fake.state().issues_cursor_stuck = true;
+        let before = fake.state().list_issue_requests;
+        let e = t.list_records(&p()).unwrap_err().to_string();
+        assert!(e.contains("cursor") && e.contains("retry"), "{e}");
+        assert_eq!(fake.state().list_issue_requests - before, 2);
+    }
+
+    #[test]
+    fn an_empty_list_page_that_says_more_follow_is_an_error() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record(&p(), "a").unwrap();
+        fake.state().issues_empty_page_with_more_next = true;
+        let e = t.list_records(&p()).unwrap_err().to_string();
+        assert!(e.contains("empty page") && e.contains("retry"), "{e}");
+    }
+
+    /// GitHub's cursor names the last issue served, not an offset, so a
+    /// list is read once, a page at a time.
+    #[test]
+    fn a_multi_page_list_is_read_once_by_cursor() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        for i in 0..5 {
+            t.add_record(&p(), &format!("r{i}")).unwrap();
+        }
+        fake.state().max_per_page = 2;
+        let before = fake.state().list_issue_requests;
+        assert_eq!(t.list_records(&p()).unwrap().len(), 5);
+        assert_eq!(
+            fake.state().list_issue_requests - before,
+            3,
+            "3 pages for 5 records at 2 per page, read once"
+        );
+    }
+
+    /// An issue leaving the filtered set between two pages of one read
+    /// moves no other issue across a page boundary: the cursor names a
+    /// position, not an offset (spec §3.7). Under offset paging this drops
+    /// a live record with no error.
+    #[test]
+    fn an_issue_leaving_the_list_mid_read_drops_no_other() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        for i in 0..5 {
+            t.add_record(&p(), &format!("r{i}")).unwrap();
+        }
+        fake.state().max_per_page = 2;
+        // Issue 1 vanishes right as the second page is served; the first
+        // page already went out with it.
+        let next = fake.state().list_issue_requests + 2;
+        fake.state().vanish_after_list_request = Some((next, 1));
+        let titles: Vec<String> = t
+            .list_records(&p())
+            .unwrap()
+            .into_iter()
+            .map(|r| r.title)
+            .collect();
+        assert_eq!(titles, ["r0", "r1", "r2", "r3", "r4"]);
     }
 
     /// The row of spec §8.2 that makes the others meaningful: a store that
@@ -2166,24 +2660,16 @@ mod tests {
         }
     }
 
-    /// A pull request carrying fl labels stops a list
-    /// with the remedy that works — removing its fl labels — never
-    /// `fl github repair`, which refuses pull requests.
+    /// GraphQL's `issues` connection lists issues only, so a pull request
+    /// carrying fl labels is not in a list; named directly, it is refused
+    /// as not an fl item (`deleted_moved_absent_and_foreign_issues_are_told_apart`).
     #[test]
-    fn a_pull_request_with_fl_labels_in_a_list_names_removing_the_labels() {
+    fn a_pull_request_with_fl_labels_is_not_in_a_list() {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake);
         t.add_record(&p(), "t").unwrap();
         fake.plain_issue(&["fl:record", "fl:record/todo"], true);
-        let msg = t.list_records(&p()).unwrap_err().to_string();
-        assert!(
-            msg.contains("is a pull request") && msg.contains("Remove its fl labels"),
-            "{msg}"
-        );
-        assert!(
-            !msg.contains("Run `fl github repair"),
-            "the remedy must not be the command that refuses a pull request: {msg}"
-        );
+        assert_eq!(t.list_records(&p()).unwrap().len(), 1);
     }
 
     #[test]
@@ -2259,9 +2745,11 @@ mod tests {
         assert_eq!(t.resolve_handle(Kind::Record, 99).unwrap(), None);
     }
 
-    /// Measured live: a create's `labeled` events reach the timeline 1.5-3.5 s
-    /// after GitHub answers. Unless the create waits for them, they land in
-    /// the NEXT write's window and read as someone else's.
+    /// Measured live on 2026-10-05: the `labeled` event of a label added by
+    /// its own call (one label per call) reaches the timeline 1-2 s after
+    /// it.
+    /// Unless the create waits for them, they land in the NEXT write's
+    /// window and read as someone else's.
     #[test]
     fn a_create_waits_until_its_labels_show_in_the_timeline() {
         let fake = FakeGithub::start("acme/widgets");
@@ -2270,6 +2758,297 @@ mod tests {
         let r = t.add_record(&p(), "t").unwrap();
         fake.state().timeline_lag_reads = 0;
         t.set_record_state(&r, State::Doing).unwrap();
+    }
+
+    /// Measured live on 2026-10-05: labels set IN a create show their
+    /// `labeled` events 28-88 s late, past fl's wait, so they land in the
+    /// next update's window and read as someone else's. fl creates the
+    /// issue without labels and then adds them, whose events show in 1-2 s.
+    #[test]
+    fn a_create_followed_at_once_by_an_update_is_not_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).with_visibility(Duration::from_millis(50), Duration::from_millis(5));
+        fake.state().creation_labels_late = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        t.set_record_state(&r, State::Doing).unwrap();
+        let requests = fake.state().requests.clone();
+        let created = requests
+            .iter()
+            .position(|q| q == "POST /repos/acme/widgets/issues");
+        let labelled = requests
+            .iter()
+            .position(|q| q == "POST /repos/acme/widgets/issues/1/labels");
+        assert!(
+            matches!((created, labelled), (Some(c), Some(l)) if c < l),
+            "{requests:?}"
+        );
+    }
+
+    /// Adding labels never removes one. An issue that already carries
+    /// another fl label (an automation labelled it on open) keeps it, and
+    /// the error says what it found and names the repair — not a missing
+    /// permission, since every label fl sent was applied.
+    #[test]
+    fn a_created_issue_carrying_another_fl_label_is_named_without_blaming_permission() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().labels_on_open = vec!["fl:record/done".into()];
+        let e = t.add_record(&p(), "t").unwrap_err().to_string();
+        assert!(
+            e.contains("\"fl:record/done\"")
+                && e.contains("fl github repair 1 --by <name>")
+                && !e.contains("permission"),
+            "{e}"
+        );
+        assert_eq!(issue_posts(&fake), 1);
+    }
+
+    /// An issue that already carries exactly fl's labels is not labelled
+    /// again.
+    #[test]
+    fn a_created_issue_already_carrying_fls_labels_gets_no_label_call() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().labels_on_open = vec!["fl:record".into(), "fl:record/todo".into()];
+        let r = t.add_record(&p(), "t").unwrap();
+        assert_eq!(t.get_record(&r).unwrap().unwrap().state, State::Todo);
+        assert!(
+            !fake
+                .state()
+                .requests
+                .iter()
+                .any(|q| q == "POST /repos/acme/widgets/issues/1/labels"),
+            "no label call"
+        );
+    }
+
+    /// A create answered with a body other than the one sent is not
+    /// written as sent, but it exists, without fl's labels (none were
+    /// sent): the error says so, names the remedy, and does not blame label
+    /// permission.
+    #[test]
+    fn a_create_answered_with_another_body_names_the_issue_and_the_repair() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().create_body_appended_next = Some("\nadded by someone".into());
+        let e = t.add_record(&p(), "t").unwrap_err().to_string();
+        assert!(
+            e.contains("https://github.com/acme/widgets/issues/1")
+                && e.contains("the body came back different")
+                && e.contains("It exists without fl's labels")
+                && e.contains("Do not create it again")
+                && e.contains("fl github repair 1 --by <name>")
+                && !e.contains("permission"),
+            "{e}"
+        );
+        assert_eq!(issue_posts(&fake), 1);
+        assert!(fake.issue(1).labels.is_empty());
+    }
+
+    /// A create whose answer was lost landed without labels — a create sends
+    /// none. The search finds it by its key though it carries no fl label
+    /// and the REST list lags, adds fl's labels, and never sends the create
+    /// again.
+    #[test]
+    fn a_lost_create_that_landed_without_labels_is_found_labelled_and_not_sent_again() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().rest_list_lags = true;
+        fake.state().hang_up_after_create = true;
+        let r = t.add_record(&p(), "t").unwrap();
+        assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
+        assert_eq!(issue_posts(&fake), 1, "sent once, never again");
+        assert_eq!(fake.issue_count(), 1);
+        assert_eq!(fake.issue(1).labels, vec!["fl:record", "fl:record/todo"]);
+        assert_eq!(t.list_records(&p()).unwrap().len(), 1);
+    }
+
+    /// The issue exists once the create is answered. When adding its labels
+    /// then fails, the error names it and the remedy — `fl github repair`,
+    /// which restores the labels from the block (spec §0.1b, 14) — and
+    /// nothing is sent again.
+    #[test]
+    fn a_create_whose_labels_fail_names_the_issue_and_repair_restores_them() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().fail_label_add_next = true;
+        let e = t.add_record(&p(), "t").unwrap_err().to_string();
+        assert!(
+            e.contains("https://github.com/acme/widgets/issues/1")
+                && e.contains("without some or all of fl's labels")
+                && e.contains("Do not create it again")
+                && e.contains("fl github repair 1 --by <name>"),
+            "{e}"
+        );
+        assert_eq!(fake.issue_count(), 1);
+        assert_eq!(issue_posts(&fake), 1, "never created again");
+        assert!(fake.issue(1).labels.is_empty());
+        let url = t.issue_url(1);
+        assert!(t.repair(&url, "owner").unwrap().changed);
+        assert_eq!(fake.issue(1).labels, vec!["fl:record", "fl:record/todo"]);
+        assert_eq!(
+            t.get_record(&RecordId(url)).unwrap().unwrap().state,
+            State::Todo
+        );
+    }
+
+    /// A create is two calls: the issue, then its two labels in ONE label
+    /// call. (Adding them one per call did not stop GitHub recording a
+    /// `labeled` event twice; the conflict window drops such copies.)
+    #[test]
+    fn a_create_adds_its_two_labels_in_one_call() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record(&p(), "t").unwrap();
+        let label_calls = fake
+            .state()
+            .requests
+            .iter()
+            .filter(|q| *q == "POST /repos/acme/widgets/issues/1/labels")
+            .count();
+        assert_eq!(label_calls, 1);
+        assert_eq!(fake.issue(1).labels, vec!["fl:record", "fl:record/todo"]);
+    }
+
+    /// Measured live on 2026-10-05: GitHub sometimes records a `labeled`
+    /// event twice, about 0-1 s apart (4 of 10 two-label calls; 2 of 33
+    /// issues fl created, one label per call). Re-adding a label the issue
+    /// already carries makes no event, so a `labeled` event for a label
+    /// already on the issue cannot be anyone's write: it is not counted.
+    /// Here the copies of a create's two events land in the next update's
+    /// window.
+    #[test]
+    fn a_create_whose_label_events_github_records_twice_is_not_followed_by_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).with_visibility(Duration::from_millis(50), Duration::from_millis(5));
+        fake.state().labeled_copies = Some(Copies::Held);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().labeled_copies = None;
+        t.set_record_state(&r, State::Doing).unwrap();
+        t.set_record_state(&r, State::Review).unwrap();
+    }
+
+    /// The same for an update's own `labeled` event, recorded again in the
+    /// next update's window.
+    #[test]
+    fn an_updates_label_event_recorded_twice_is_not_a_conflict_in_the_next_window() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().labeled_copies = Some(Copies::Held);
+        t.set_record_state(&r, State::Doing).unwrap();
+        fake.state().labeled_copies = None;
+        t.set_record_state(&r, State::Review).unwrap();
+    }
+
+    /// A copy of fl's own `labeled` event in the same window, before or
+    /// after it, is one change, not two.
+    #[test]
+    fn a_copy_of_fls_own_label_event_in_its_window_is_not_a_conflict() {
+        for copies in [Copies::Before, Copies::After] {
+            let fake = FakeGithub::start("acme/widgets");
+            let t = open(&fake);
+            let r = t.add_record(&p(), "t").unwrap();
+            fake.state().labeled_copies = Some(copies);
+            t.set_record_state(&r, State::Doing)
+                .unwrap_or_else(|e| panic!("{copies:?}: {e}"));
+            fake.state().labeled_copies = None;
+            t.set_record_state(&r, State::Review)
+                .unwrap_or_else(|e| panic!("{copies:?}: {e}"));
+        }
+    }
+
+    /// A repair that adds two labels at once, whose events GitHub records
+    /// twice, followed at once by an update: the copies land in the
+    /// update's window and are not counted.
+    #[test]
+    fn an_update_right_after_a_two_label_repair_is_not_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels = vec!["bug".into()]);
+        fake.state().labeled_copies = Some(Copies::Held);
+        assert!(t.repair(r.iri(), "owner").unwrap().changed);
+        fake.state().labeled_copies = None;
+        t.set_record_state(&r, State::Doing).unwrap();
+    }
+
+    /// The wait after a create is for its labels, not for a number of
+    /// `labeled` events: here the kind label's event shows, with a copy of
+    /// it, while the state label's lags. Ended on two events, the wait would
+    /// let the state label's event land in the next update's window.
+    #[test]
+    fn a_create_waits_for_each_of_its_labels_not_for_two_label_events() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().labeled_copies = Some(Copies::After);
+        fake.state().label_lag_reads = Some(("fl:record/todo".into(), 2));
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().labeled_copies = None;
+        fake.state().label_lag_reads = None;
+        t.set_record_state(&r, State::Doing).unwrap();
+    }
+
+    /// A copy of an earlier `labeled` event must not stand in for fl's own,
+    /// lagging one: if the wait ended on the copy, fl's own events would
+    /// land in the next write's window as someone else's.
+    #[test]
+    fn a_copy_of_an_earlier_label_event_does_not_end_the_wait_for_fls_own() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        fake.state().labeled_copies = Some(Copies::Held);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().labeled_copies = None;
+        fake.web_edit(1, |i| i.labels = vec![]);
+        // The repair's own two `labeled` events lag two timeline reads; the
+        // create's held copies show at once.
+        fake.state().timeline_lag_reads = 2;
+        assert!(t.repair(r.iri(), "owner").unwrap().changed);
+        fake.state().timeline_lag_reads = 0;
+        t.set_record_state(&r, State::Doing).unwrap();
+    }
+
+    /// Removing a label is never noise: someone else's removal inside fl's
+    /// window is a conflict.
+    #[test]
+    fn a_foreign_label_removal_inside_fls_write_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels.push("bug".into()));
+        fake.state().foreign_label_changes_on_next_patch = vec![("unlabeled".into(), "bug".into())];
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// A label removed and added back inside fl's window leaves the labels
+    /// as they were, but the removal is someone else's write.
+    #[test]
+    fn a_foreign_label_removed_and_added_back_inside_fls_write_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels.push("bug".into()));
+        fake.state().foreign_label_changes_on_next_patch = vec![
+            ("unlabeled".into(), "bug".into()),
+            ("labeled".into(), "bug".into()),
+        ];
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
+    }
+
+    /// A label someone adds after fl's window opens, before fl reads the
+    /// issue inside it, is in the issue fl writes from. Its event is still
+    /// a change: whether a `labeled` event is noise is read from the
+    /// timeline, never from the issue fl read.
+    #[test]
+    fn a_label_added_just_after_fls_window_opens_is_a_conflict() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.state().foreign_label_after_next_timeline = true;
+        let err = t.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Conflict { .. }), "{err:?}");
     }
 
     /// An update's own events can lag too: unless it waits for them, they
@@ -2458,13 +3237,11 @@ mod tests {
         let r = t.add_record(&p(), "t").unwrap();
         assert_eq!(r.iri().as_str(), "https://github.com/acme/widgets/issues/1");
         assert_eq!(fake.issue_count(), 1, "exactly one issue");
-        let posts = fake
-            .state()
-            .requests
-            .iter()
-            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
-            .count();
-        assert_eq!(posts, 2, "the first attempt and the resend, never a third");
+        assert_eq!(
+            issue_posts(&fake),
+            2,
+            "the first attempt and the resend, never a third"
+        );
     }
 
     /// The RULE — once GitHub has answered
@@ -2487,23 +3264,13 @@ mod tests {
         fake.state().unreadable_create_body_next = true;
         fake.state().omit_from_list = Some(1);
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(
             fake.issue_count(),
             1,
             "the resend's own create landed even though it could not be confirmed"
         );
-        let posts = fake
-            .state()
-            .requests
-            .iter()
-            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
-            .count();
-        assert_eq!(posts, 2, "no third send");
+        assert_eq!(issue_posts(&fake), 2, "no third send");
     }
 
     /// Once a 201 proves the
@@ -2515,13 +3282,9 @@ mod tests {
         let fake = FakeGithub::start("acme/widgets");
         let t = open(&fake).without_settle();
         fake.state().unreadable_create_body_next = true;
-        fake.state().fail_page = Some(("/repos/acme/widgets/issues".into(), 1));
+        fake.state().fail_issues_query_after = Some(0);
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(
             fake.issue_count(),
             1,
@@ -2529,11 +3292,13 @@ mod tests {
         );
     }
 
+    /// Creates sent: `POST /issues` itself, not a post to one issue's
+    /// labels or comments.
     fn issue_posts(fake: &FakeGithub) -> usize {
         fake.state()
             .requests
             .iter()
-            .filter(|r| r.starts_with("POST /repos/acme/widgets/issues"))
+            .filter(|r| *r == "POST /repos/acme/widgets/issues")
             .count()
     }
 
@@ -2548,11 +3313,7 @@ mod tests {
         fake.state().broken_create_body_next = true;
         fake.state().omit_from_list = Some(1);
         let err = t.add_record(&p(), "t").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("List the repository's fl issues before retrying"),
-            "{err}"
-        );
+        assert!(says_where_to_look(&err.to_string(), "t"), "{err}");
         assert_eq!(fake.issue_count(), 1, "a resend would duplicate it");
         assert_eq!(issue_posts(&fake), 1, "exactly one send");
     }
@@ -3165,6 +3926,64 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("has no id") && msg.contains("retry"), "{msg}");
+        // A label event that names no label cannot be told from noise.
+        fake.state().odd_timeline_item_next = Some(json!({"id": 98, "event": "unlabeled"}));
+        let msg = t
+            .set_record_state(&r, State::Doing)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("names no label") && msg.contains("retry"),
+            "{msg}"
+        );
+    }
+
+    /// What the live tests count: raw timeline items, parsed and replayed
+    /// as fl parses and replays them.
+    #[test]
+    fn counted_events_parses_raw_timeline_items_and_drops_noise() {
+        let items = vec![
+            json!({"id": 1, "event": "labeled", "label": {"name": "a"}}),
+            json!({"id": 2, "event": "commented"}),
+            json!({"id": 3, "event": "labeled", "label": {"name": "a"}}),
+            json!({"id": 4, "event": "renamed"}),
+        ];
+        let kinds: Vec<(u64, String)> = counted_events(7, &items)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.id, e.kind))
+            .collect();
+        assert_eq!(
+            kinds,
+            [(1, "labeled".to_string()), (4, "renamed".to_string())]
+        );
+        let bad = vec![json!({"id": 5, "event": "labeled"})];
+        let e = counted_events(7, &bad).unwrap_err().to_string();
+        assert!(e.contains("names no label"), "{e}");
+    }
+
+    /// The replay behind the conflict window: a `labeled` event for a
+    /// label already on the issue is dropped, by the labels the timeline
+    /// itself has added and removed; every other event is kept.
+    #[test]
+    fn a_labeled_event_for_a_label_already_on_is_dropped_and_nothing_else_is() {
+        let ev = |id: u64, kind: &str, label: Option<&str>| Event {
+            id,
+            kind: kind.into(),
+            label: label.map(str::to_string),
+        };
+        let events = vec![
+            ev(1, "labeled", Some("a")),
+            ev(2, "labeled", Some("a")),
+            ev(3, "labeled", Some("b")),
+            ev(4, "unlabeled", Some("a")),
+            ev(5, "unlabeled", Some("a")),
+            ev(6, "labeled", Some("a")),
+            ev(7, "closed", None),
+            ev(8, "labeled", Some("b")),
+        ];
+        let kept: Vec<u64> = changes(&events).iter().map(|e| e.id).collect();
+        assert_eq!(kept, [1, 3, 4, 5, 6, 7]);
     }
 
     fn raise_security(t: &GithubTracker) -> Result<FindingId, StoreError> {
