@@ -125,6 +125,8 @@ pub struct ImportReport {
     /// `(old, new)` when a re-import came from another checkout. The
     /// project's gates now run over the new root, and the CLI says so.
     pub root_moved: Option<(String, String)>,
+    /// How many areas the imported routing map declares, when it has one.
+    pub areas: Option<usize>,
 }
 
 fn backend(e: impl std::fmt::Display) -> StoreError {
@@ -643,7 +645,14 @@ impl RedbStore {
                 commit,
             }),
         };
-        manifest::export(self, project, commit, exported_at_unix, ledger_root)
+        manifest::export(
+            self,
+            project,
+            commit,
+            exported_at_unix,
+            ledger_root,
+            self.routes(project)?,
+        )
     }
 
     /// Whether this store records any ledger root. An export that cannot
@@ -741,6 +750,19 @@ impl RedbStore {
         if held_project && self.imported_hash(project)?.is_none() {
             return Err(ManifestError::AuthoringStore(project.clone()));
         }
+        // ⚠ An older checked-out manifest would un-route this machine alone
+        // (routing spec §1.2: one routing rule per project, not per machine).
+        if held_project && body.routing.is_none() && self.routes(project)?.is_some() {
+            return Err(ManifestError::WouldDropRouting(project.clone()));
+        }
+        // Routing spec decision 20: a routed store holds one project — a
+        // routed manifest goes only into a store holding no other, and no
+        // other project goes into a routed store.
+        if body.routing.is_some() {
+            self.refuse_a_second_project(project)?;
+        } else if !held_project && self.holds_routing()? {
+            return Err(routed_store_is_taken().into());
+        }
         // Another project on the same root would give one checkout two
         // sets of gates and two handles, with nothing said.
         for other in self.list_projects()? {
@@ -794,6 +816,7 @@ impl RedbStore {
             transitions: body.transitions.len(),
             transitions_removed: stale_transitions.clone(),
             root_moved,
+            areas: body.routing.as_ref().map(|m| m.areas.len()),
         };
         // (definition to write, whether it is new to this store)
         let mut writes: Vec<(&GateDef, bool)> = Vec::new();
@@ -874,6 +897,14 @@ impl RedbStore {
             .map_err(backend)?
             .insert(project.iri().as_str(), m.content_sha256.as_str())
             .map_err(backend)?;
+        if let Some(map) = &body.routing {
+            let json = serde_json::to_string(map).map_err(backend)?;
+            tx.open_table(ROUTING)
+                .map_err(backend)?
+                .insert(project.iri().as_str(), json.as_str())
+                .map_err(backend)?;
+            raise_format(&tx, FORMAT_WITH_ROUTING)?;
+        }
         if let Some(root) = &body.ledger_root {
             record_ledger_root(&tx, &root.repository_node_id, &root.commit)?;
         }
@@ -2460,6 +2491,79 @@ mod tests {
         let report = b.import_manifest(&without, "/x").unwrap();
         assert!(b.list_transitions(&p).unwrap().is_empty());
         assert_eq!(report.transitions_removed, vec!["ship".to_string()]);
+    }
+
+    // Routing spec §1.2: the importing machine routes as the authoring one.
+    #[test]
+    fn an_export_carries_the_map_and_an_import_writes_it_raising_the_store_to_5() {
+        use fl_core::routing::{Routes, RoutingMap};
+        let (a, _ga, p, _, _) = authoring();
+        a.set_routes(&p, &RoutingMap::starting()).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
+        assert_eq!(m.body.format_version, 3);
+        assert_eq!(m.body.routing, Some(RoutingMap::starting()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.redb");
+        {
+            let b = RedbStore::open(&path).unwrap();
+            let report = b.import_manifest(&m, "/x").unwrap();
+            assert_eq!(report.areas, Some(5));
+            assert_eq!(b.routes(&p).unwrap(), Some(RoutingMap::starting()));
+            assert!(b.holds_routing().unwrap());
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
+    }
+
+    // Routing spec §1.2: an older checked-out manifest must not un-route one
+    // machine.
+    #[test]
+    fn an_import_that_would_drop_the_routing_map_is_refused() {
+        use fl_core::routing::{Routes, RoutingMap};
+        let (a, _ga, p, _, _) = authoring();
+        let unrouted = a.export_manifest(&p, "c1", 7, None).unwrap();
+        a.set_routes(&p, &RoutingMap::starting()).unwrap();
+        let routed = a.export_manifest(&p, "c2", 8, None).unwrap();
+        let (b, _gb) = fresh();
+        b.import_manifest(&routed, "/x").unwrap();
+        let err = b.import_manifest(&unrouted, "/x").unwrap_err();
+        assert!(matches!(err, ManifestError::WouldDropRouting(_)), "{err}");
+        assert!(
+            err.to_string().contains("would un-route the project"),
+            "{err}"
+        );
+        assert_eq!(
+            b.routes(&p).unwrap(),
+            Some(RoutingMap::starting()),
+            "nothing written"
+        );
+        // A map that changed is imported: areas come and go (decision 15).
+        a.set_routes(&p, &RoutingMap::starting().without("design"))
+            .unwrap();
+        b.import_manifest(&a.export_manifest(&p, "c3", 9, None).unwrap(), "/x")
+            .unwrap();
+        assert_eq!(b.routes(&p).unwrap().unwrap().declared().len(), 4);
+    }
+
+    // Routing spec decision 20: an import keeps a routed store to one
+    // project, both ways round.
+    #[test]
+    fn an_import_never_puts_a_routed_project_beside_another() {
+        use fl_core::routing::RoutingMap;
+        let (a, _ga, p, _, _) = authoring();
+        a.set_routes(&p, &RoutingMap::starting()).unwrap();
+        let routed = a.export_manifest(&p, "c1", 7, None).unwrap();
+        let (b, _gb) = fresh();
+        b.add_project("/elsewhere").unwrap();
+        let err = b.import_manifest(&routed, "/x").unwrap_err().to_string();
+        assert!(err.contains("needs a store of its own"), "{err}");
+        assert!(!b.holds_routing().unwrap(), "nothing written");
+        let (c, _gc) = fresh();
+        c.import_manifest(&routed, "/x").unwrap();
+        let (o, _go, op, _, _) = authoring();
+        let unrouted = o.export_manifest(&op, "c1", 7, None).unwrap();
+        let err = c.import_manifest(&unrouted, "/y").unwrap_err().to_string();
+        assert!(err.contains("needs a store of its own"), "{err}");
+        assert_eq!(c.list_projects().unwrap().len(), 1);
     }
 
     #[test]

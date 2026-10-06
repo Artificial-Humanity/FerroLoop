@@ -58,6 +58,14 @@ otherwise export the manifest without the root every other machine checks the le
 remedy is to upgrade `fl`: nothing is wrong with the store, and starting a new one would lose its
 history. From this release on, `fl` itself says so when it meets a store newer than it reads.
 
+A project that routes its items between its local store and GitHub exports its routing map
+too: the manifest is then format 3 (with its ledger root, if it has one), and the map is
+covered by the hash like everything else in it. Importing such a manifest writes the map and
+raises the store to format 5, which an older `fl` refuses — it would route nothing. A
+re-import of a manifest that has no routing map, into a store that imported one, is refused:
+the checked-out manifest is older than the one this store imported. A project without
+routing still exports format 1 or 2, exactly as before.
+
 ## Check
 
 `fl manifest check --project <project>` is a *superset* of the check a gate-running command

@@ -265,6 +265,9 @@ fn print_import(store: &RedbStore, m: &Manifest, report: &fl_store::ImportReport
         report.gates_unchanged,
         report.transitions
     );
+    if let Some(n) = report.areas {
+        println!("routing\t{n} areas");
+    }
     // ⚠ This store numbers handles on its own: they can differ from the
     // authoring machine's, so the person needs to see them here.
     for g in &m.body.gates {
