@@ -52,6 +52,9 @@ enum Command {
     /// GitHub tracker: who fl writes as, and repair of a diverged issue.
     #[command(subcommand)]
     Github(cmd::github::Cmd),
+    /// Route a project's new items between its local store and GitHub.
+    #[command(subcommand)]
+    Routing(cmd::routing::Cmd),
 }
 
 impl Command {
@@ -69,6 +72,7 @@ impl Command {
             Command::Stats(c) => c.iris(),
             Command::Manifest(c) => c.iris(),
             Command::Github(c) => c.iris(),
+            Command::Routing(c) => c.iris(),
         }
     }
 
@@ -98,6 +102,7 @@ impl Command {
             Command::Stats(c) => c.has_handle(),
             Command::Manifest(c) => c.has_handle(),
             Command::Github(c) => c.has_handle(),
+            Command::Routing(c) => c.has_handle(),
         }
     }
 
@@ -107,6 +112,7 @@ impl Command {
         match self {
             Command::Record(_) | Command::Finding(_) | Command::Attempt(_) => true,
             Command::Github(_) => true,
+            Command::Routing(c) => c.needs_tracker(),
             // `check` is the CI gate: it touches the tracker only to resolve
             // `--record`, and must not need GitHub otherwise.
             Command::Check(c) => c.record.is_some(),
@@ -720,6 +726,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Stats(c) => cmd::stats::run(&store, c, stats_source),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
+        Command::Routing(c) => cmd::routing::run(&ctx, c, here_binding.as_ref()),
     };
     // What the GitHub ledger's reads noted without refusing — a quarantined
     // line skipped (spec §3.3, §3.6) — once each, whatever became of the

@@ -425,8 +425,16 @@ pub fn run(store: &RedbStore, cmd: Cmd, binding: &Binding) -> Result<i32> {
                 anyhow::anyhow!("`{}` is not a git working tree: {e}", root.display())
             })?;
             let m = read(&root)?;
+            let was_routed = store.holds_routing()?;
             let report = store.import_manifest(&m, &root.display().to_string())?;
             print_import(store, &m, &report)?;
+            // Routing spec §2.3: the import that first routes this store
+            // changes what a handle means here, as the first `fl routing set`
+            // does where the project is authored.
+            if !was_routed && report.areas.is_some() {
+                let was_github = matches!(binding, Binding::Github(_));
+                eprintln!("{}", crate::cmd::routing::handle_change(was_github));
+            }
         }
         Cmd::Check { project } => {
             let p = ProjectId(refs::resolve(
