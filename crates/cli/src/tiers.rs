@@ -129,6 +129,19 @@ pub struct Tiers<'a> {
     pub github: &'a LazyGithub<'a>,
 }
 
+impl Tiers<'_> {
+    /// A listed item's tier column (routing spec §2.4): the tier it was
+    /// listed from, or `escalating` for a local item marked escalating —
+    /// between the tiers. Only a local row reads a mark: a GitHub row is
+    /// where an escalation ends, and asks nothing.
+    pub fn column(&self, in_tier: Tier, id: &Iri) -> Result<&'static str, StoreError> {
+        if in_tier == Tier::Local && self.router.escalating(id)?.is_some() {
+            return Ok("escalating");
+        }
+        Ok(in_tier.as_wire())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

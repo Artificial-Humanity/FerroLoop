@@ -97,13 +97,15 @@ says to use `--tier local`: it never moves an item to the local tier by itself.
 
 ## Lists
 
-In a routed project `fl record list` and `fl finding list` read both tiers and show each item's
-tier in a second column (`1\tlocal\ttodo\t…`, `#1\tgithub\ttodo\t…`); `--tier local` or `--tier
-github` reads one. When a tier cannot be read — GitHub is down, or this machine binds no
-repository — the list is refused rather than shown in part, and the refusal suggests `--tier
-local`. `fl finding list --record <id>` lists one record's findings, from both tiers; it works in
-any project. The withdrawal counts under a finding list sum both tiers; with `--tier`, they count
-that tier, and say so.
+In a routed project `fl record list` and `fl finding list` read both tiers and show each item's tier
+in a second column (`1\tlocal\ttodo\t…`, `#1\tgithub\ttodo\t…`); `--tier local` or `--tier github`
+reads one. A local item marked "escalating" — an escalation that has not finished — shows
+`escalating` in that column (`1\tescalating\ttodo\t…`); once its issue exists, a list of both tiers
+shows the issue alone, and `--tier local` still shows the marked item. An escalated item is listed
+as its issue. When a tier cannot be read — GitHub is down, or this machine binds no repository — the
+list is refused rather than shown in part, and the refusal suggests `--tier local`. `fl finding list
+--record <id>` lists one record's findings, from both tiers; it works in any project. The withdrawal
+counts under a finding list sum both tiers; with `--tier`, they count that tier, and say so.
 
 ## Removing an area
 
@@ -163,10 +165,13 @@ the issue the stopped run may have made, by the old IRI, and never makes a secon
 issue exists: once the issue exists it is refused, naming the issue, and only finishing is left.
 `--abandon` takes neither `--by` nor `--reason`, and prints `1\tabandoned`.
 
-Last, the local item is replaced by a tombstone: the old IRI, the issue, who, when and why. The
-old handle and the old IRI then name the issue — a lookup, a move, `fl finding list --record` —
-and the local row is left out of lists. A local record moved to `needs_human` is escalated the
-same way once the move lands, by `fl`; if that escalation fails, the move stands and a
+Last, the local item is replaced by a tombstone: the old IRI, the issue, who, when and why. The old
+handle and the old IRI then name the issue — a lookup, a move, a finding raised about it, an
+attempt, `fl finding list --record` — and the local row is left out of lists. The record's local
+findings stay local, and the evidence recorded about them from then on names the issue. A GitHub
+finding about a record that was escalated later still shows the record's old local reference in its
+issue text; fl resolves it through the tombstone. A local record moved to `needs_human` is escalated
+the same way once the move lands, by `fl`; if that escalation fails, the move stands and a
 `warning:` names the command that finishes it.
 
 ## Limits

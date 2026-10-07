@@ -145,7 +145,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                         println!(
                             "{}\t{}\t{}\t{}",
                             ctx.show_item(Kind::Record, r.id.iri())?,
-                            in_tier.as_wire(),
+                            t.column(in_tier, r.id.iri())?,
                             r.state.as_wire(),
                             r.title
                         );

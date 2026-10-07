@@ -192,11 +192,16 @@ impl R {
         ]);
     }
 
+    /// The local store, opened between commands.
+    fn store(&self) -> fl_store::RedbStore {
+        fl_store::RedbStore::open(&self.home.path().join("fl.redb")).unwrap()
+    }
+
     /// How many gate runs the store holds, over every gate: a routed
     /// store's ledger is local (routing spec §3.5).
     fn runs(&self) -> usize {
         use fl_core::store::{Catalog, Ledger};
-        let store = fl_store::RedbStore::open(&self.home.path().join("fl.redb")).unwrap();
+        let store = self.store();
         store
             .list_projects()
             .unwrap()
@@ -940,7 +945,7 @@ fn a_landed_move_whose_escalation_fails_warns_and_keeps_the_moves_code() {
     assert_eq!(g.fake.issue_count(), 0);
     assert_eq!(
         g.ok(&["record", "list", "--project", "1"]),
-        "1\tlocal\tneeds_human\tfix the parser\n"
+        "1\tescalating\tneeds_human\tfix the parser\n"
     );
     // Marked: a further move is refused, naming the command.
     let refused = g.refused(&["record", "move", "1", "--to", "doing"]);
@@ -1138,4 +1143,177 @@ fn an_unrouted_stores_move_to_needs_human_is_unchanged() {
     assert_eq!(out, UNGATED);
     assert!(err.is_empty(), "{err}");
     assert!(g.fake.state().requests.is_empty());
+}
+
+/// The fake's issue `n`, as an IRI's text.
+fn issue_iri(n: u64) -> String {
+    format!("https://github.com/acme/widgets/issues/{n}")
+}
+
+// Routing spec §2.4: an item marked escalating is listed with that mark — in
+// the tier column, where a GitHub row never shows it — and once the
+// escalation finishes, its issue is listed as GitHub's and the local row is
+// gone.
+#[test]
+fn a_marked_record_and_finding_list_as_escalating_until_finished() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    g.local_record("tidy the lexer", "code");
+    for (record, claim) in [("1", "it drops a token"), ("2", "it is slow")] {
+        g.ok(&[
+            "finding", "raise", "--record", record, "--claim", claim, "--by", "rev",
+        ]);
+    }
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "look",
+        "--area",
+        "design",
+    ]);
+    g.fake.state().rate_limited_next_create = true;
+    g.refused(&["record", "escalate", "1", "--by", "alice", "--reason", "r"]);
+    g.fake.state().rate_limited_next_create = true;
+    g.refused(&["finding", "escalate", "1", "--by", "alice", "--reason", "r"]);
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1"]),
+        "1\tescalating\ttodo\tfix the parser\n2\tlocal\ttodo\ttidy the lexer\n\
+         #1\tgithub\ttodo\tlook\n"
+    );
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1", "--tier", "local"]),
+        "1\tescalating\ttodo\tfix the parser\n2\tlocal\ttodo\ttidy the lexer\n"
+    );
+    assert_eq!(
+        g.ok(&["finding", "list", "--project", "1"]),
+        "1\tescalating\traised\trev\tit drops a token\n2\tlocal\traised\trev\tit is slow\n"
+    );
+
+    assert_eq!(
+        g.ok(&["record", "escalate", "1", "--by", "alice", "--reason", "r"]),
+        "1\tescalated\t#2\n"
+    );
+    assert_eq!(
+        g.ok(&["finding", "escalate", "1", "--by", "alice", "--reason", "r"]),
+        "1\tescalated\t#3\n"
+    );
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1"]),
+        "2\tlocal\ttodo\ttidy the lexer\n#1\tgithub\ttodo\tlook\n\
+         #2\tgithub\ttodo\tfix the parser\n"
+    );
+    assert_eq!(
+        g.ok(&["finding", "list", "--project", "1"]),
+        "2\tlocal\traised\trev\tit is slow\n#3\tgithub\traised\trev\tit drops a token\n"
+    );
+}
+
+// Routing spec §2.3, §2.5: an escalated record's old handle and its old IRI
+// both reach its issue — a move moves the issue, a finding raised about it
+// is about the issue, and an attempt is recorded against the issue. (The
+// bare handle's move is pinned by
+// `a_record_escalates_to_an_issue_with_its_state_area_findings_and_provenance`.)
+#[test]
+fn an_escalated_records_old_handle_moves_its_issue() {
+    use fl_core::store::{Catalog, Ledger, Tracker};
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    g.ok(&["record", "escalate", "1", "--by", "alice", "--reason", "r"]);
+    let old = g.block(1).escalated.unwrap().from.to_string();
+
+    let moved = g.ok(&["record", "move", &old, "--to", "doing"]);
+    assert!(moved.starts_with("#1\tdoing\t"), "{moved}");
+    assert!(
+        g.fake
+            .issue(1)
+            .labels
+            .contains(&"fl:record/doing".to_string())
+    );
+
+    for (by, record) in [("by handle", "1"), ("by iri", old.as_str())] {
+        g.ok(&[
+            "finding", "raise", "--record", record, "--claim", by, "--by", "rev",
+        ]);
+    }
+    let store = g.store();
+    let p = store.list_projects().unwrap()[0].id.clone();
+    let about: Vec<(String, String)> = store
+        .list_findings(&p)
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.claim, f.record.iri().to_string()))
+        .collect();
+    assert_eq!(
+        about,
+        vec![
+            ("by handle".to_string(), issue_iri(1)),
+            ("by iri".to_string(), issue_iri(1)),
+        ]
+    );
+    drop(store);
+
+    // A zero budget is refused before anything is spawned, and the attempt
+    // is still recorded — against the issue.
+    for record in ["1", old.as_str()] {
+        g.fl()
+            .args(["attempt", record, "--budget-usd-micros", "0"])
+            .assert()
+            .code(1);
+    }
+    let attempts: Vec<String> = g
+        .store()
+        .attempts(&p)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.record.iri().to_string())
+        .collect();
+    assert_eq!(attempts, vec![issue_iri(1), issue_iri(1)]);
+}
+
+// Routing spec §2.4, §3.5: after a record's escalation its findings stay
+// where they are, and `finding list --record` by its old handle, its old
+// IRI or its issue lists them from both tiers — the local ones, whose stored
+// record is the old IRI, and one raised on GitHub about the issue.
+#[test]
+fn finding_list_by_an_escalated_records_old_handle_lists_both_tiers() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    g.ok(&[
+        "finding",
+        "raise",
+        "--record",
+        "1",
+        "--claim",
+        "it drops a token",
+        "--by",
+        "rev",
+    ]);
+    g.ok(&["record", "escalate", "1", "--by", "alice", "--reason", "r"]);
+    g.ok(&[
+        "finding",
+        "raise",
+        "--record",
+        "#1",
+        "--claim",
+        "it is slow",
+        "--by",
+        "rev",
+        "--area",
+        "design",
+    ]);
+    let old = g.block(1).escalated.unwrap().from.to_string();
+    let both = "1\tlocal\traised\trev\tit drops a token\n#2\tgithub\traised\trev\tit is slow\n";
+    for record in ["1", old.as_str(), "#1"] {
+        assert_eq!(
+            g.ok(&["finding", "list", "--record", record]),
+            both,
+            "--record {record}"
+        );
+    }
 }

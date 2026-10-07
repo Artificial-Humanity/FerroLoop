@@ -7,6 +7,7 @@ use fl_core::FindingPlacement;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::routing::Tier;
+use fl_core::store::StoreError;
 use fl_core::{Iri, Kind};
 use fl_exec::finding::{FindingExecError, attach_reproduction, verify_finding};
 use std::collections::BTreeSet;
@@ -410,8 +411,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 return Err(crate::cmd::routing::not_routed("--tier"));
             }
             // ⚠ The whole list or an error: `findings` refuses when a tier
-            // it must read cannot be read (routing spec §2.4).
-            let listed: Vec<(Option<Tier>, Finding)> = match ctx.tiers {
+            // it must read cannot be read (routing spec §2.4). Each routed
+            // row carries its tier column.
+            let listed: Vec<(Option<&str>, Finding)> = match ctx.tiers {
                 None => ctx
                     .tracker
                     .list_findings(&p)?
@@ -422,23 +424,22 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     .router
                     .findings(&p, tier)?
                     .into_iter()
-                    .map(|(in_tier, f)| (Some(in_tier), f))
-                    .collect(),
+                    .map(|(in_tier, f)| Ok((Some(t.column(in_tier, f.id.iri())?), f)))
+                    .collect::<Result<_, StoreError>>()?,
             };
             let named = |f: &Finding| {
                 of.as_ref()
                     .is_none_or(|r| f.record == r.id || r.also_known_as.contains(f.record.iri()))
             };
             let mut raisers: BTreeSet<String> = Default::default();
-            for (in_tier, f) in listed
+            for (column, f) in listed
                 .iter()
                 .filter(|(_, f)| want.is_none_or(|w| f.state == w) && named(f))
             {
                 let shown = ctx.show_item(Kind::Finding, f.id.iri())?;
-                match in_tier {
-                    Some(t) => println!(
-                        "{shown}\t{}\t{}\t{}\t{}",
-                        t.as_wire(),
+                match column {
+                    Some(column) => println!(
+                        "{shown}\t{column}\t{}\t{}\t{}",
                         f.state.as_wire(),
                         f.raised_by,
                         f.claim
