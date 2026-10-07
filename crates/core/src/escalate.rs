@@ -71,7 +71,10 @@ impl Prepared {
         self.resumes.as_ref()
     }
 
-    /// The issue an earlier run made: `escalate` finishes it — its labels,
+    /// The issue an earlier run made — found by its create key, from the
+    /// mark an earlier run left, or because it holds the item's own IRI as
+    /// an alias although the item is not marked (an `--abandon` whose
+    /// search could not see it yet): `escalate` finishes it — its labels,
     /// if a stop left them off, then the tombstone.
     pub fn found(&self) -> Option<&Iri> {
         self.found.as_ref()
@@ -233,10 +236,21 @@ impl TieredTracker<'_> {
     }
 
     /// The one-namespace rule (routing spec §3.2): no name of the item may
-    /// already name something on GitHub.
-    fn names_free(&self, id: &Iri, aliases: &[Iri]) -> Result<(), StoreError> {
+    /// already name something on GitHub — except the item's own issue.
+    /// Answers that issue, when there is one.
+    ///
+    /// ⚠ An `--abandon` whose search could not see the issue yet removes
+    /// the mark although the issue exists, and holds the item's primary IRI
+    /// as an alias. The search by its create key, with no time bound, tells
+    /// it from another issue's alias; only that case pays for it. The
+    /// issue it finds passed every check when it was made, and carries
+    /// every alias of the item, so the rest are not asked.
+    fn names_free(&self, id: &Iri, aliases: &[Iri]) -> Result<Option<Iri>, StoreError> {
         for alias in std::iter::once(id).chain(aliases) {
             if let Some(issue) = self.github.alias_taken(alias)? {
+                if alias == id && self.github.find_escalated(id, 0)?.as_ref() == Some(&issue) {
+                    return Ok(Some(issue));
+                }
                 return Err(EscalationFault::AliasTaken {
                     alias: alias.clone(),
                     issue,
@@ -244,7 +258,7 @@ impl TieredTracker<'_> {
                 .into());
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// The record's open findings in both tiers, about it by its IRI or any
@@ -283,7 +297,7 @@ impl TieredTracker<'_> {
         let map = self.map_of(project)?;
         self.github.tracker()?;
         let resumes = self.escalations.mark_of(&primary)?;
-        let found = match &resumes {
+        let mut found = match &resumes {
             Some(mark) => self.github.find_escalated(&primary, mark.at_ms)?,
             None => None,
         };
@@ -304,7 +318,7 @@ impl TieredTracker<'_> {
                     if sensitive(&map, record.area.as_deref()) {
                         self.private_or_refuse(false, "this record")?;
                     }
-                    self.names_free(&primary, &record.also_known_as)?;
+                    found = self.names_free(&primary, &record.also_known_as)?;
                 }
                 let findings = self.open_findings(&record, &map)?;
                 Outgoing::Record { record, findings }
@@ -326,7 +340,7 @@ impl TieredTracker<'_> {
                             },
                         )?;
                     }
-                    self.names_free(&primary, &finding.also_known_as)?;
+                    found = self.names_free(&primary, &finding.also_known_as)?;
                 }
                 let record = RecordSeen {
                     id: record.id,
@@ -387,9 +401,13 @@ impl TieredTracker<'_> {
             by: mark.by,
             reason: mark.reason,
         };
+        // A found issue is found again by the create's search, however old:
+        // the search stops at it. One an `--abandon` left behind is older
+        // than this run's mark, so the search reaches back without bound.
+        let since_ms = if at.found.is_some() { 0 } else { mark.at_ms };
         let issue = self
             .github
-            .create_escalated(&at.outgoing, &from, mark.at_ms)?;
+            .create_escalated(&at.outgoing, &from, since_ms)?;
         self.escalations.tombstone(&at.id, &issue)?;
         Ok(issue)
     }
@@ -427,12 +445,18 @@ mod tests {
     use crate::store::{Catalog, Tracker};
     use std::cell::{Cell, RefCell};
 
-    /// The in-memory GitHub tier, and every `create_escalated` it was asked:
-    /// the provenance, and the time its search reached back to.
+    /// The in-memory GitHub tier, every `create_escalated` it was asked —
+    /// the provenance, and the time its search reached back to — and how
+    /// many `find_escalated` searches it was asked. With
+    /// `alias_held_by` set, every alias reads as that issue's — an alias a
+    /// person wrote into another issue by hand, which the in-memory tier's
+    /// one namespace would refuse.
     #[derive(Default)]
     struct Watched {
         issues: MemIssues,
         creates_asked: RefCell<Vec<(Provenance, u64)>>,
+        alias_held_by: RefCell<Option<Iri>>,
+        searches: Cell<u32>,
     }
 
     impl std::ops::Deref for Watched {
@@ -473,10 +497,14 @@ mod tests {
         }
 
         fn find_escalated(&self, key: &Iri, since_ms: u64) -> Result<Option<Iri>, StoreError> {
+            self.searches.set(self.searches.get() + 1);
             self.issues.find_escalated(key, since_ms)
         }
 
         fn alias_taken(&self, alias: &Iri) -> Result<Option<Iri>, StoreError> {
+            if let Some(issue) = self.alias_held_by.borrow().clone() {
+                return Ok(Some(issue));
+            }
             self.issues.alias_taken(alias)
         }
 
@@ -1376,6 +1404,87 @@ mod tests {
         assert_eq!(too_long(&err).0, "the list of its aliases", "{err}");
         assert_eq!(w.local.mark_of(s.iri()).unwrap(), None);
         assert_eq!(w.issues.creates(), 3, "no issue made");
+    }
+
+    // Routing spec §3.3: an `--abandon` whose search could not see the
+    // issue yet removes the mark while the issue exists. The rerun finds
+    // the issue — it holds the item's IRI as an alias, made from the item's
+    // create key — and finishes it, never refusing the alias as taken.
+    #[test]
+    fn a_rerun_after_an_abandon_that_missed_the_issue_finishes_it() {
+        let w = world();
+        let t = w.router();
+        let r = w.record(Some("code"), "t");
+        w.issues.set_lose_next_create_answer(true);
+        w.run(r.iri(), Kind::Record).unwrap_err();
+        let landed = MemIssues::issue(1);
+        w.local.unmark(r.iri()).unwrap();
+
+        let at = t.prepare_escalation(r.iri(), Kind::Record).unwrap();
+        assert_eq!((at.resumes(), at.found()), (None, Some(&landed)));
+        assert_eq!(t.escalate(&at, BY, WHY, NOW + 5).unwrap(), landed);
+        assert_eq!(w.issues.creates(), 1);
+        assert_eq!(
+            w.issues
+                .creates_asked
+                .borrow()
+                .last()
+                .map(|(_, since)| *since),
+            Some(0),
+            "the create's search reaches back past this run's mark"
+        );
+        assert_finished(&w, &t, &r, &landed);
+
+        // So for a finding.
+        let f = w.finding(&w.record(Some("code"), "f"), "code", false);
+        w.issues.set_lose_next_create_answer(true);
+        w.run(f.iri(), Kind::Finding).unwrap_err();
+        let landed = MemIssues::issue(2);
+        w.local.unmark(f.iri()).unwrap();
+        let at = t.prepare_escalation(f.iri(), Kind::Finding).unwrap();
+        assert_eq!(at.found(), Some(&landed));
+        assert_eq!(t.escalate(&at, BY, WHY, NOW).unwrap(), landed);
+        assert_eq!(w.issues.creates(), 2);
+        assert_eq!(w.local.tombstone_of(f.iri()).unwrap().unwrap().to, landed);
+
+        // The item's IRI held by another issue, though its own exists: that
+        // is still taken.
+        let s = w.record(Some("code"), "s");
+        w.issues.set_lose_next_create_answer(true);
+        w.run(s.iri(), Kind::Record).unwrap_err();
+        w.local.unmark(s.iri()).unwrap();
+        let other = MemIssues::issue(9);
+        *w.issues.alias_held_by.borrow_mut() = Some(other.clone());
+        let err = w.run(s.iri(), Kind::Record).unwrap_err();
+        assert!(
+            matches!(
+                escalation(&err),
+                Some(EscalationFault::AliasTaken { alias, issue })
+                    if alias == s.iri() && *issue == other
+            ),
+            "{err:?}"
+        );
+        assert_eq!(w.local.mark_of(s.iri()).unwrap(), None);
+
+        // Another of its names taken: refused, and the search by its create
+        // key — which only the item's own IRI can need — is not asked.
+        *w.issues.alias_held_by.borrow_mut() = None;
+        let u = w.record(Some("code"), "u");
+        let alias = Iri::parse("urn:x-acme:widget-7").unwrap();
+        w.local.add_alias(u.iri(), alias.clone()).unwrap();
+        w.issues
+            .add_alias(&MemIssues::issue(1), alias.clone())
+            .unwrap();
+        let searches = w.issues.searches.get();
+        let err = w.run(u.iri(), Kind::Record).unwrap_err();
+        assert!(
+            matches!(
+                escalation(&err),
+                Some(EscalationFault::AliasTaken { alias: a, .. }) if *a == alias
+            ),
+            "{err:?}"
+        );
+        assert_eq!(w.issues.searches.get(), searches, "a search was asked");
     }
 
     // Routing spec §3.3: `--abandon` removes the mark only after the search
