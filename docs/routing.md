@@ -165,7 +165,9 @@ issue exists: once the issue exists it is refused, naming the issue, and only fi
 
 Last, the local item is replaced by a tombstone: the old IRI, the issue, who, when and why. The
 old handle and the old IRI then name the issue — a lookup, a move, `fl finding list --record` —
-and the local row is left out of lists.
+and the local row is left out of lists. A local record moved to `needs_human` is escalated the
+same way once the move lands, by `fl`; if that escalation fails, the move stands and a
+`warning:` names the command that finishes it.
 
 ## Limits
 

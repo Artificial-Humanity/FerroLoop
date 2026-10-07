@@ -7,9 +7,11 @@ use crate::ctx::Ctx;
 use crate::refs::Ref;
 use crate::tiers::Tiers;
 use anyhow::{Context, Result};
-use fl_core::escalation::Outgoing;
+use fl_core::escalation::{Outgoing, escalate_command};
 use fl_core::ids::Kind;
+use fl_core::model::{Record, State};
 use fl_core::routing::Tier;
+use fl_core::store::StoreError;
 use fl_core::{Iri, Prepared};
 
 /// The refusal in a store with no routing map: it has no tiers, so nothing
@@ -46,11 +48,8 @@ pub fn run(
     let (Some(by), Some(reason)) = (by, reason) else {
         unreachable!("clap requires --by and --reason unless --abandon is given")
     };
-    match escalate(ctx, t, kind, &iri, &shown, by, reason) {
-        Ok(issue) => {
-            println!("{shown}\tescalated\t{}", ctx.show_item(kind, &issue)?);
-            Ok(0)
-        }
+    match escalate_and_say(ctx, t, kind, &iri, &shown, by, reason) {
+        Ok(()) => Ok(0),
         // ⚠ Marked: the item refuses every write until the escalation is
         // finished or abandoned (routing spec §3.3). A read of the mark that
         // fails leaves the error as it is.
@@ -65,6 +64,63 @@ pub fn run(
         }
         Err(e) => Err(e),
     }
+}
+
+/// ⚠ Routing spec §3.3 step 1: a marked item refuses every write. A
+/// command whose gates run before its write — `fl record move`, `fl finding
+/// reproduce`, `fl finding verify` — calls this first, before the import
+/// check and the gates, and is refused as the store would refuse it: nothing
+/// runs and no evidence is written for a write that cannot land. `id` is
+/// the item's primary IRI, as the router read it.
+pub fn refuse_marked(ctx: &Ctx<'_>, kind: Kind, id: &Iri) -> Result<()> {
+    if let Some(t) = ctx.tiers
+        && t.router.escalating(id)?.is_some()
+    {
+        return Err(StoreError::Escalating {
+            id: id.clone(),
+            to_finish: escalate_command(kind, id),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+/// Routing spec §3.4: a local record whose move to `needs_human` landed is
+/// escalated, by `fl`, as `fl record escalate` would. The move stands
+/// whatever happens here: a failure is a warning naming the command that
+/// finishes the escalation, never an error, so the move's exit code is the
+/// command's.
+pub fn after_landed_move(ctx: &Ctx<'_>, record: &Record, shown: &str) {
+    let Some(t) = ctx.tiers else {
+        return;
+    };
+    let iri = record.id.iri();
+    if t.router.tier_of(iri) != Tier::Local {
+        return;
+    }
+    let reason = format!("the record was moved to {}", State::NeedsHuman.as_wire());
+    if let Err(e) = escalate_and_say(ctx, t, Kind::Record, iri, shown, "fl", &reason) {
+        eprintln!(
+            "warning: the move stands, but the escalation of record {shown} to GitHub stopped \
+             (run `fl record escalate {shown} --by <name> --reason <text>` to finish it): {e:#}"
+        );
+    }
+}
+
+/// The escalation of `iri`, run, and its line for a person:
+/// `<shown>\tescalated\t<issue>`.
+fn escalate_and_say(
+    ctx: &Ctx<'_>,
+    t: &Tiers<'_>,
+    kind: Kind,
+    iri: &Iri,
+    shown: &str,
+    by: &str,
+    reason: &str,
+) -> Result<()> {
+    let issue = escalate(ctx, t, kind, iri, shown, by, reason)?;
+    println!("{shown}\tescalated\t{}", ctx.show_item(kind, &issue)?);
+    Ok(())
 }
 
 /// The escalation of `iri`, checked, warned about and run: the issue.

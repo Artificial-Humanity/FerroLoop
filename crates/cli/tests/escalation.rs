@@ -34,6 +34,18 @@ const STOPPED: &str = "stopped after its mark was written";
 /// The note a rerun given another who or why prints.
 const KEPT: &str = "the mark's who and why are kept";
 
+/// What the warning after a landed move to `needs_human` tells a person to
+/// run (routing spec §3.4).
+const TO_FINISH: &str = "`fl record escalate 1 --by <name> --reason <text>`";
+
+/// The escalation line of a record the move to `needs_human` escalated, as
+/// the issue's Markdown escapes it.
+const BY_FL: &str = "Escalated from the local tier by fl: the record was moved to needs\\_human.";
+
+/// The ungated move of record 1 from `todo` to `needs_human`, as printed.
+const UNGATED: &str =
+    "1\tneeds_human\tungated: project 1 declares no transition from `todo` to `needs_human`\n";
+
 struct R {
     home: tempfile::TempDir,
     repo: tempfile::TempDir,
@@ -57,19 +69,29 @@ fn world(tracker: &str) -> R {
         repo,
         fake: FakeGithub::start("acme/widgets"),
     };
-    let cfg = format!(
-        "[[project]]\nroot = \"{}\"\nstore = \"{}\"\n{tracker}",
-        r.repo.path().canonicalize().unwrap().display(),
-        r.home.path().join("fl.redb").display()
-    );
-    fs::create_dir_all(r.home.path().join("config/fl")).unwrap();
-    fs::write(r.home.path().join("config/fl/config.toml"), cfg).unwrap();
+    r.configure(r.home.path(), tracker);
     r
 }
 
 impl R {
+    /// The config entry of the machine whose home is `home`: the working
+    /// tree's project, a store of its own, and `tracker`.
+    fn configure(&self, home: &Path, tracker: &str) {
+        let cfg = format!(
+            "[[project]]\nroot = \"{}\"\nstore = \"{}\"\n{tracker}",
+            self.repo.path().canonicalize().unwrap().display(),
+            home.join("fl.redb").display()
+        );
+        fs::create_dir_all(home.join("config/fl")).unwrap();
+        fs::write(home.join("config/fl/config.toml"), cfg).unwrap();
+    }
+
     fn fl(&self) -> Command {
-        let home = self.home.path();
+        self.fl_at(self.home.path())
+    }
+
+    /// `fl` on the machine whose home is `home`.
+    fn fl_at(&self, home: &Path) -> Command {
         let mut c = Command::cargo_bin("fl").unwrap();
         c.env("XDG_CONFIG_HOME", home.join("config"))
             .env("XDG_DATA_HOME", home.join("data"))
@@ -135,6 +157,53 @@ impl R {
         fl_github::meta::parse_body(&self.fake.issue(n).body)
             .unwrap()
             .1
+    }
+
+    /// A gate running `program` over `src/**/*.rs`, and the transition from
+    /// `from` to `to` it gates.
+    fn gated(&self, from: &str, to: &str, program: &str) {
+        self.ok(&[
+            "gate",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "g",
+            "--glob",
+            "src/**/*.rs",
+            "--program",
+            program,
+        ]);
+        self.ok(&[
+            "transition",
+            "add",
+            "--project",
+            "1",
+            "--name",
+            "t",
+            "--from",
+            from,
+            "--to",
+            to,
+            "--regret",
+            "low",
+            "--gate",
+            "1",
+        ]);
+    }
+
+    /// How many gate runs the store holds, over every gate: a routed
+    /// store's ledger is local (routing spec §3.5).
+    fn runs(&self) -> usize {
+        use fl_core::store::{Catalog, Ledger};
+        let store = fl_store::RedbStore::open(&self.home.path().join("fl.redb")).unwrap();
+        store
+            .list_projects()
+            .unwrap()
+            .iter()
+            .flat_map(|p| store.list_gates(&p.id).unwrap())
+            .map(|g| store.gate_runs(&g.id).unwrap().len())
+            .sum()
     }
 }
 
@@ -761,4 +830,312 @@ fn an_escalation_takes_by_and_reason_or_abandon() {
         g.fl().args(&args).assert().code(2).stderr(contains(said));
     }
     assert_eq!(g.fake.issue_count(), 0);
+}
+
+/// The one `warning:` line in `err`, which must hold exactly one.
+fn only_warning(err: &str) -> &str {
+    let warned: Vec<&str> = err.lines().filter(|l| l.starts_with("warning: ")).collect();
+    assert_eq!(warned.len(), 1, "{err}");
+    warned[0]
+}
+
+// Routing spec §3.4: a local record whose move to `needs_human` lands is
+// escalated, by `fl`, for the move — after the move's own line.
+#[test]
+fn an_ungated_move_of_a_local_record_to_needs_human_escalates_it() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    let (out, err) = g.ok_said(&["record", "move", "1", "--to", "needs_human"]);
+    assert_eq!(out, format!("{UNGATED}1\tescalated\t#1\n"));
+    assert!(!err.contains("warning:"), "{err}");
+    let issue = g.fake.issue(1);
+    assert_eq!(
+        issue.labels,
+        vec!["fl:record", "fl:record/needs_human", "fl:area/code"]
+    );
+    assert!(issue.body.contains(BY_FL), "{}", issue.body);
+    let from = g.block(1).escalated.unwrap();
+    assert_eq!(
+        (from.by.as_str(), from.reason.as_str()),
+        ("fl", "the record was moved to needs_human")
+    );
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1"]),
+        "#1\tgithub\tneeds_human\tfix the parser\n"
+    );
+}
+
+// Routing spec §3.4, §3.5: a gated move that lands keeps its evidence — its
+// gate run, in the local ledger — and then escalates the record.
+#[test]
+fn a_gated_move_to_needs_human_that_lands_escalates_it_and_keeps_its_gate_run() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    g.gated("todo", "needs_human", "true");
+    let out = g.ok(&["record", "move", "1", "--to", "needs_human"]);
+    assert!(
+        out.starts_with("PASS\tt\tg\t") && out.ends_with("\n1\tneeds_human\n1\tescalated\t#1\n"),
+        "{out}"
+    );
+    assert_eq!(g.runs(), 1);
+    assert_eq!(g.fake.issue_count(), 1);
+    assert!(g.fake.issue(1).body.contains(BY_FL));
+    assert!(
+        g.fake
+            .issue(1)
+            .labels
+            .contains(&"fl:record/needs_human".to_string())
+    );
+}
+
+// Routing spec §3.4: only a move that lands escalates. A refused move exits
+// with its gate's code, keeps its evidence, and leaves the record local,
+// unmarked and unescalated.
+#[test]
+fn a_refused_move_to_needs_human_escalates_nothing() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    g.gated("todo", "needs_human", "false");
+    let out = g
+        .fl()
+        .args(["record", "move", "1", "--to", "needs_human"])
+        .output()
+        .unwrap();
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{said}");
+    assert!(
+        said.contains("REFUSED\t1\tstays `todo`") && !said.contains("escalated"),
+        "{said}"
+    );
+    assert_eq!(g.runs(), 1);
+    assert_eq!(g.fake.issue_count(), 0);
+    // Not marked: the record still moves.
+    g.ok(&["record", "move", "1", "--to", "doing"]);
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1"]),
+        "1\tlocal\tdoing\tfix the parser\n"
+    );
+}
+
+// Routing spec §3.4: an escalation that stops after its mark
+// leaves the move standing — exit 0, the record local in `needs_human` and
+// marked — and a warning names the command that finishes it, which then
+// resumes with the mark's who and why.
+#[test]
+fn a_landed_move_whose_escalation_fails_warns_and_keeps_the_moves_code() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    g.fake.state().rate_limited_next_create = true;
+    let (out, err) = g.ok_said(&["record", "move", "1", "--to", "needs_human"]);
+    assert_eq!(out, UNGATED);
+    let warned = only_warning(&err);
+    assert!(
+        warned.contains(TO_FINISH) && warned.contains("rate limit") && !err.contains(STOPPED),
+        "{err}"
+    );
+    assert_eq!(g.fake.issue_count(), 0);
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1"]),
+        "1\tlocal\tneeds_human\tfix the parser\n"
+    );
+    // Marked: a further move is refused, naming the command.
+    let refused = g.refused(&["record", "move", "1", "--to", "doing"]);
+    assert!(
+        refused.contains("so this store refuses to change it")
+            && refused.contains("fl record escalate"),
+        "{refused}"
+    );
+    let (out, err) = g.ok_said(&["record", "escalate", "1", "--by", "alice", "--reason", "r"]);
+    assert_eq!(out, "1\tescalated\t#1\n");
+    assert!(err.contains(KEPT), "{err}");
+    assert!(g.fake.issue(1).body.contains(BY_FL));
+}
+
+// Routing spec §3.2, §3.4: an escalation refused before its mark — a
+// sensitive record bound for a public repository — leaves the move standing
+// and the record unmarked, and the warning names why.
+#[test]
+fn a_landed_move_whose_escalation_is_refused_before_the_mark_leaves_it_unmarked() {
+    let g = world(BOUND);
+    g.routed();
+    g.fake.state().repos[0].visibility = "public".into();
+    g.local_record("rotate the keys", "security");
+    let (out, err) = g.ok_said(&["record", "move", "1", "--to", "needs_human"]);
+    assert_eq!(out, UNGATED);
+    let warned = only_warning(&err);
+    assert!(
+        warned.contains("this record is security-sensitive") && warned.contains(TO_FINISH),
+        "{err}"
+    );
+    assert_eq!(g.fake.issue_count(), 0);
+    g.ok(&["record", "move", "1", "--to", "doing"]);
+}
+
+// Routing spec §3.3 step 1: a marked record's move is refused before any
+// gate runs, so no evidence is written for a move that cannot land.
+#[test]
+fn a_move_of_a_marked_record_is_refused_before_its_gates_run() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    g.gated("todo", "doing", "true");
+    g.fake.state().rate_limited_next_create = true;
+    g.refused(&["record", "escalate", "1", "--by", "alice", "--reason", "r"]);
+    let out = g
+        .fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("so this store refuses to change it") && err.contains("fl record escalate"),
+        "{err}"
+    );
+    assert!(out.stdout.is_empty(), "no gate line");
+    assert_eq!(g.runs(), 0, "no gate ran");
+}
+
+// Routing spec §3.3 step 1: a marked finding's reproduction and its
+// verification are refused before their gate runs, as a marked record's
+// move is: no evidence is written for a write that cannot land.
+#[test]
+fn a_reproduction_or_verification_of_a_marked_finding_is_refused_before_its_gate_runs() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    for claim in ["it drops a token", "it is slow"] {
+        g.ok(&[
+            "finding", "raise", "--record", "1", "--claim", claim, "--by", "rev",
+        ]);
+    }
+    g.ok(&[
+        "gate",
+        "add",
+        "--project",
+        "1",
+        "--name",
+        "g",
+        "--glob",
+        "src/**/*.rs",
+        "--program",
+        "false",
+    ]);
+    // Finding 2 is reproduced and assigned, so it can be verified; its
+    // escalation needs its gate in the committed manifest.
+    g.ok(&["finding", "reproduce", "2", "--gate", "1"]);
+    g.ok(&["finding", "assign", "2", "--to", "bob"]);
+    g.ok(&["manifest", "export", "--project", "1"]);
+    git(g.repo.path(), &["add", "-A"]);
+    git(g.repo.path(), &["commit", "-qm", "manifest"]);
+    for n in ["1", "2"] {
+        g.fake.state().rate_limited_next_create = true;
+        let err = g.refused(&["finding", "escalate", n, "--by", "alice", "--reason", "r"]);
+        assert!(err.contains(STOPPED), "{err}");
+    }
+    let runs = g.runs();
+    for args in [
+        &["finding", "reproduce", "1", "--gate", "1"][..],
+        &["finding", "verify", "2"][..],
+    ] {
+        let out = g.fl().args(args).output().unwrap();
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(g.runs(), runs, "{args:?}: a gate ran: {err}");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        assert!(
+            err.contains("so this store refuses to change it")
+                && err.contains("fl finding escalate"),
+            "{args:?}: {err}"
+        );
+    }
+}
+
+// Routing spec §3.3 step 1: on a machine that imported the manifest, a
+// marked record's gated move is refused for the mark, before the import is
+// checked — the import is not what stops it.
+#[test]
+fn a_marked_records_move_is_refused_before_the_import_check() {
+    let g = world(BOUND);
+    g.routed();
+    g.gated("todo", "doing", "true");
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(other.path(), BOUND);
+    let at = |args: &[&str]| g.fl_at(other.path()).args(args).output().unwrap();
+    assert!(at(&["manifest", "import"]).status.success());
+    assert!(
+        at(&[
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--area",
+            "code",
+        ])
+        .status
+        .success()
+    );
+    g.fake.state().rate_limited_next_create = true;
+    assert_eq!(
+        at(&["record", "escalate", "1", "--by", "alice", "--reason", "r"])
+            .status
+            .code(),
+        Some(2)
+    );
+    // The import goes stale.
+    g.ok(&["routing", "set", "--project", "1", "product", "local"]);
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let out = at(&["record", "move", "1", "--to", "doing"]);
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("so this store refuses to change it")
+            && !err.contains("changed since this store imported it"),
+        "{err}"
+    );
+}
+
+// Routing spec §3.4: only a local record escalates. A GitHub record moved to
+// `needs_human` is moved, and no second issue is made.
+#[test]
+fn a_github_record_moved_to_needs_human_is_not_escalated() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "look",
+        "--area",
+        "design",
+    ]);
+    let (out, err) = g.ok_said(&["record", "move", "#1", "--to", "needs_human"]);
+    assert!(
+        out.starts_with("#1\tneeds_human\t") && !out.contains("escalated"),
+        "{out}"
+    );
+    assert!(!err.contains("warning:"), "{err}");
+    assert_eq!(g.fake.issue_count(), 1);
+}
+
+// Routing spec §3.1: a store with no routing map has no local tier, so its
+// move to `needs_human` is as it was — no escalation, nothing asked of
+// GitHub.
+#[test]
+fn an_unrouted_stores_move_to_needs_human_is_unchanged() {
+    let g = world("");
+    g.ok(&["project", "add", "."]);
+    g.ok(&["record", "add", "--project", "1", "--title", "t"]);
+    let (out, err) = g.ok_said(&["record", "move", "1", "--to", "needs_human"]);
+    assert_eq!(out, UNGATED);
+    assert!(err.is_empty(), "{err}");
+    assert!(g.fake.state().requests.is_empty());
 }

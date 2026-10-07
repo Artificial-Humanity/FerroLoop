@@ -3,7 +3,7 @@ use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{ProjectId, RecordId};
-use fl_core::model::State;
+use fl_core::model::{Record, State};
 use fl_core::routing::Tier;
 use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
@@ -169,6 +169,10 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 );
             };
 
+            // Routing spec §3.3 step 1: a marked record's move is refused
+            // before the import check and the gates.
+            crate::cmd::escalate::refuse_marked(ctx, Kind::Record, record.id.iri())?;
+
             let gated = store
                 .list_transitions(&record.project)?
                 .iter()
@@ -200,6 +204,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     record.state.as_wire(),
                     state.as_wire()
                 );
+                after_landed(ctx, &record, state, &shown);
                 return Ok(0);
             }
 
@@ -238,6 +243,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 }
                 MoveOutcome::Moved => {
                     println!("{shown}\t{}", state.as_wire());
+                    after_landed(ctx, &record, state, &shown);
                 }
                 MoveOutcome::Ungated => {
                     unreachable!("an ungated move returns above, before any transition is printed")
@@ -261,4 +267,12 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         }
     }
     Ok(0)
+}
+
+/// Routing spec §3.4: a move that landed in `needs_human` escalates a local
+/// record. It returns nothing: the move's own code is the command's.
+fn after_landed(ctx: &Ctx<'_>, record: &Record, to: State, shown: &str) {
+    if to == State::NeedsHuman {
+        crate::cmd::escalate::after_landed_move(ctx, record, shown);
+    }
 }

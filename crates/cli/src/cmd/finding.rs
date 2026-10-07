@@ -227,6 +227,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Reproduce { finding, gate } => {
             let f = self::finding(ctx, &finding)?;
+            // Routing spec §3.3 step 1: a marked finding's reproduction is
+            // refused before the import check and the gate.
+            crate::cmd::escalate::refuse_marked(ctx, Kind::Finding, f.id.iri())?;
             crate::cmd::manifest::ensure_import_current(store, &f.project)?;
             let fid = f.id;
             let gid = GateId(refs::resolve(
@@ -266,6 +269,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Verify { finding } => {
             let f = self::finding(ctx, &finding)?;
+            // Routing spec §3.3 step 1: a marked finding's verification is
+            // refused before the import check and the gate.
+            crate::cmd::escalate::refuse_marked(ctx, Kind::Finding, f.id.iri())?;
             crate::cmd::manifest::ensure_import_current(store, &f.project)?;
             crate::preflight::check(ctx, &f.project)?;
             let id = f.id;
