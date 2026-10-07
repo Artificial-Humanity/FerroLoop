@@ -1,11 +1,13 @@
 # Two-tier routing and escalation — design
 
-**Date:** 2026-10-06 (rev 2.1, same day)
+**Date:** 2026-10-06 (rev 2.3, 2026-10-07)
 **Status:** Approved by the owner 2026-10-06. Rev 1 (in git at 96e1a41) was approved and then
 reviewed against the code; rev 2 folds in that review and the owner's decisions 12–19 on it.
 Rev 2.1 folds in the owner's decisions 20–21 and seven corrections found while planning plan A
 against the code (`docs/superpowers/plans/2026-10-06-two-tier-routing-a.md`, "Spec defects");
-each is marked here as an owner decision or `[agent]`.
+rev 2.2 folds in the owner's decision 22, after a re-review found two ways around decision 21;
+rev 2.3 folds in the owner's decision 23, after the final review found a way around decision 22.
+Each change is marked here as an owner decision or `[agent]`.
 Sub-project 4 of 4. Delivered as two plans (§8).
 **Scope:** A project with two trackers — the local store for developer-level items, a GitHub
 repository for human-level items — the rule that routes each new item to one of them, and
@@ -101,6 +103,27 @@ how an item moves between the tiers.
     area, whose record is a local record in a sensitive area (its title would be published).
     That finding is refused, naming `--tier local`; §2.5's warning stays for a local record in
     any other area.
+22. **Decision 21 fails closed** (owner, 2026-10-06, after a re-review showed two ways around
+    it). `fl routing set` keeps an area's sensitivity unless told otherwise: `--sensitive` sets
+    it, `--not-sensitive` clears it, and neither keeps it — a set that only changes a tier
+    never clears it. Clearing it is refused while any item in either tier names the area, by
+    the same check, with the same count and up to ten items, as `fl routing remove`
+    (decision 11). A record whose area the map no longer declares — removed where the project
+    is authored while another machine's records still name it — counts as sensitive. A
+    finding that decision 21 refuses on GitHub, or that is kept local for it, carries the
+    security flag. `[agent]`: a record with no area at all (made before the project was
+    routed) is not sensitive.
+23. (owner, 2026-10-07) "A later `fl routing set` that adds an area the map does not declare
+    must say `--sensitive` or `--not-sensitive`. With `--not-sensitive` fl does the same check
+    and prints the same 'this machine only' note as clearing a sensitivity. The first `set`
+    keeps its default." `[agent]`: the way around decision 22 it closes — the authoring machine
+    removes a sensitive area that only another machine's local records name, sets it again
+    with no flag, and exports; the area came back not sensitive, and once imported a finding
+    about such a record reached a public repository with only a warning. The refusal comes
+    before anything is written and names both flags. The "this machine only" note: a refused
+    clearing or re-add says fl reads only this machine's local tier, and one that succeeds —
+    adding an area, or clearing a sensitive one — prints a `note:` saying fl checked only this
+    machine's local tier; a `--not-sensitive` that changes nothing prints none.
 
 ### 0.2 Out of scope
 
@@ -169,15 +192,23 @@ how an item moves between the tiers.
   non-private repository). `--security` without a sensitive area still sets the flag. A record
   carries no flag *(rev 2.1, `[agent]`)*: a record made in a sensitive area is refused on a
   non-private repository when it is made, and a finding about a local record in a sensitive
-  area is treated as a security item (decision 21).
+  area — or in an area the map no longer declares — is a security item: it carries the flag,
+  and is never sent to a non-private repository (decisions 21, 22).
 * Commands *(rev 2.1, `[agent]`: each takes `--project <project>`, as every project-scoped
   command does)*:
-  * `fl routing set <area> <tier> [--sensitive]` — refused while the store holds another
-    project (decision 20). The project's first `set` writes the
+  * `fl routing set <area> <tier> [--sensitive | --not-sensitive]` — refused while the store
+    holds another project (decision 20). The project's first `set` writes the
     starting set first: `code` and `tests` → `local`; `design` and `product` → `github`;
     `security` → `github`, sensitive. The first `set` also prints the handle change of §2.3.
-  * `fl routing set` on an area that exists changes its tier or its sensitivity for new items
-    only; items already made stay where they are.
+  * `fl routing set` on an area that exists changes its tier for new items only; items already
+    made stay where they are. Without `--sensitive` or `--not-sensitive` the area keeps its
+    sensitivity (decision 22). `--not-sensitive` on a sensitive area is **refused while any
+    item in either tier names the area**, by the same check as `fl routing remove` below.
+  * A later `fl routing set` that adds an area the map does not declare: decision 23.
+    `[agent]`: without `--sensitive` or `--not-sensitive` it is refused before anything is
+    written; with `--not-sensitive` it is refused while any item in either tier names the
+    area, since such an item counts as sensitive (decision 22). The project's first `set` is
+    unchanged.
   * `fl routing remove <area>` — **refused while any item in either tier names the area**
     (decision 11). The refusal gives the count and lists up to ten of the items. It finds
     GitHub items by reading their blocks, not by the area label, so an item that lost its
@@ -315,8 +346,9 @@ still means issue 41.
 * A local finding may name a GitHub record the same way.
 * **Disclosure.** A GitHub finding about a local record publishes that record's title. On a
   non-private repository fl warns before it writes. `[agent]` (As the ledger's decision 16
-  does for its own text.) About a local record in a sensitive area, fl refuses instead,
-  naming `--tier local` (decision 21).
+  does for its own text.) About a local record in a sensitive area — or in an area the map no
+  longer declares, which counts as sensitive (decision 22) — fl refuses instead, naming `--tier
+  local` (decision 21), and the finding carries the security flag wherever it is placed.
 * **Evidence.** Runs and decisions about a finding are tagged with its record's IRI. The router
   resolves that IRI through any tombstone first, so new evidence names the record where it now
   lives. `[agent]`
@@ -439,6 +471,8 @@ Every refusal names its cause and what to do:
 | a security finding or sensitive area routed to a non-private repository | use `--tier local` |
 | a GitHub finding about a local record in a sensitive area, on a non-private repository | use `--tier local` (decision 21) |
 | `fl routing set` while the store holds another project | give the project its own store (decision 20) |
+| `fl routing set --not-sensitive` on an area items still name | the count, and up to ten of the items (decision 22) |
+| a later `fl routing set` that adds an area with neither `--sensitive` nor `--not-sensitive` | both flags, and that a removed area may have been sensitive (decision 23) `[agent]` |
 | a tier that cannot be reached | an error in lists, lookups and reference checks — never "no such item", never a partial list |
 | an id no tier holds | held on another machine's local tier, or not existing |
 | a write to an item marked "escalating" | `fl … escalate <id>` to finish, or `--abandon` |
@@ -457,12 +491,18 @@ Every refusal names its cause and what to do:
 * **Unit tests** in the module they test: the routing map, its starting set and sensitivity;
   the refusal to remove an area in use (in each tier, by block not label, and when a tier
   cannot be read); manifest formats 1–3 chosen as in §1.2; area-name validation; handle
-  parsing in each mode; the store's format raise to 5; `Escalating` and `Moved`.
+  parsing in each mode; the store's format raise to 5; `Escalating` and `Escalated`; a `set`
+  that names no sensitivity keeps the area's (decision 22); a routed store refuses a map while
+  it holds another project, and another project once routed, by `add` or by import
+  (decision 20).
 * **`TieredTracker` over two in-memory trackers**, and the `Tracker` conformance suite over
   it: create routing by area, by inherited area and by `--tier`; the refusals of §4; merged
   lists and the tier column; a failed tier as an error; references across tiers through
   `ForeignRecord` only; tombstone resolution; the alias-scan fallback for an id the local
-  store does not hold; evidence tagged with the resolved IRI.
+  store does not hold; evidence tagged with the resolved IRI; a finding about a local record in
+  a sensitive area, or in an area the map no longer declares, refused on a non-private
+  repository naming `--tier local` and marked as a security finding wherever it is placed
+  (decisions 21, 22).
 * **Lazy GitHub:** a local-tier command with the fake GitHub down succeeds; a merged list with
   it down is an error that suggests `--tier local`.
 * **Escalation over the local store and the fake GitHub:**
@@ -480,7 +520,17 @@ Every refusal names its cause and what to do:
   as diverged and `fl github repair` restores it.
 * **CLI black-box tests** in `tests/`: `--area`, `--tier`, `--sensitive`, `fl routing …` and
   its migration notice, the escalate commands, `fl finding list --record`, and list output
-  with and without the tier column.
+  with and without the tier column. Decision 20: `fl routing set` with a second project in
+  the store is refused, names the remedy and writes nothing. Decision 21: a GitHub finding
+  about a sensitive local record on a public repository is refused and nothing is created;
+  one about an ordinary local record is warned about. Decision 22: a tier change keeps the
+  sensitivity; `--not-sensitive` with items naming the area is refused and writes nothing,
+  and with none it clears; the re-review's scenario end to end — an area removed where the
+  project is authored, then re-imported, leaves another machine's record protected.
+  `[agent]` Decision 23: a later set that adds an area with no flag is refused and writes
+  nothing; with `--sensitive` it works; with `--not-sensitive` it is refused while an item
+  names the area and works when none does; the first set needs no flag; the final review's
+  scenario end to end — remove, set again with no flag — is refused at the set.
 * **One live test** on the private throwaway repository: escalate a local record; the issue
   exists, carries the old IRI, its area label and its findings list, and the local item is a
   tombstone.
@@ -490,8 +540,9 @@ Every refusal names its cause and what to do:
 ## 6. Open
 
 None. The review of rev 1 raised eight owner decisions (12–19) and the owner decided them on
-2026-10-06; planning plan A raised two more (20–21), decided the same day; the rest are
-`[agent]` rulings, marked where they are made.
+2026-10-06; planning plan A raised three more (20–22), decided the same day; the rest are
+`[agent]` rulings, marked where they are made. `[agent]`: the final review of plan A raised one
+more (23), decided 2026-10-07.
 
 ---
 
@@ -518,8 +569,8 @@ Two plans, as for sub-projects 2 and 3:
 
 * **Plan A — routing.** The area (model, store, block, label), the routing map and its
   commands, manifest format 3, store format 5, `TieredTracker` (create, lookup, handles,
-  lists, references across tiers, `ForeignRecord`), lazy GitHub, decisions 12–14 and 20–21,
-  the migration notice.
+  lists, references across tiers, `ForeignRecord`), lazy GitHub, decisions 12–14 and 20–23
+  (`[agent]`: 23 added in rev 2.3), the migration notice.
 * **Plan B — escalation.** The pre-checks, the mark, the find-or-create step with its own
   search, the tombstone, `--abandon`, the findings list in the issue, the `needs_human`
   trigger, the live test. Plan B is written after plan A merges.

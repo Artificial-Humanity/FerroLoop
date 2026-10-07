@@ -66,7 +66,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, root: Option<&Path>) -> Result<i32> {
         }
         Cmd::Repair { id, by } => {
             let iri = match &id {
-                Ref::Handle(n) => gh.issue_url(*n),
+                Ref::Handle(n) | Ref::Issue(n) => gh.issue_url(*n),
                 Ref::Iri(i) => i.clone(),
             };
             let done = gh.repair(&iri, &by)?;

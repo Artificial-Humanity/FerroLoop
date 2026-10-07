@@ -1,9 +1,12 @@
 use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
+use crate::tiers::Tiers;
 use anyhow::{Result, bail};
 use clap::Subcommand;
+use fl_core::FindingPlacement;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
+use fl_core::routing::Tier;
 use fl_core::{Iri, Kind};
 use fl_exec::finding::{FindingExecError, attach_reproduction, verify_finding};
 use std::collections::BTreeSet;
@@ -21,6 +24,13 @@ pub enum Cmd {
         /// one only to a private repository (GitHub tracker spec §6).
         #[arg(long)]
         security: bool,
+        /// The finding's area (routing spec §1.1). Without it, the
+        /// record's.
+        #[arg(long)]
+        area: Option<String>,
+        /// The tier, over the one the area routes to (routing spec §2.1).
+        #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
+        tier: Option<Tier>,
     },
     /// Attach a reproduction. REFUSED unless the gate currently fails.
     Reproduce {
@@ -40,11 +50,18 @@ pub enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// A project's findings, or one record's (routing spec §2.4).
     List {
+        #[arg(long, required_unless_present = "record", conflicts_with = "record")]
+        project: Option<Ref>,
+        /// One record's findings, from both tiers in a routed project.
         #[arg(long)]
-        project: Ref,
+        record: Option<Ref>,
         #[arg(long)]
         state: Option<String>,
+        /// One tier only, in a routed project.
+        #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
+        tier: Option<Tier>,
     },
 }
 
@@ -60,7 +77,9 @@ impl Cmd {
             Cmd::Assign { finding, .. } => vec![finding],
             Cmd::Verify { finding } => vec![finding],
             Cmd::Withdraw { finding, .. } => vec![finding],
-            Cmd::List { project, .. } => vec![project],
+            Cmd::List {
+                project, record, ..
+            } => project.iter().chain(record.iter()).collect(),
         }
     }
 
@@ -79,12 +98,7 @@ impl Cmd {
 /// alias typed. An id that names no finding is returned as given: the
 /// caller's own lookup refuses it, echoing what was typed.
 fn finding_id(ctx: &Ctx<'_>, r: &Ref) -> Result<FindingId> {
-    let id = FindingId(refs::resolve(
-        ctx.handles,
-        &ctx.tracker_label,
-        Kind::Finding,
-        r,
-    )?);
+    let id = FindingId(ctx.resolve_item(Kind::Finding, r)?);
     Ok(match ctx.tracker.get_finding(&id)? {
         Some(f) => f.id,
         None => id,
@@ -124,6 +138,28 @@ fn explain(e: FindingExecError, finding: &Ref, gate: Option<&Ref>) -> anyhow::Er
     }
 }
 
+/// Routing spec §2.5: a GitHub finding about a local record publishes the
+/// record's title and IRI. On a repository that is not private, say so
+/// before it is written. (About a record in a sensitive area, the router
+/// has already refused.) A visibility that cannot be read refuses: an
+/// unknown visibility is not private.
+fn warn_disclosure(t: &Tiers<'_>, at: &FindingPlacement) -> Result<()> {
+    if at.at().tier() != Tier::Github || at.record().tier != Tier::Local {
+        return Ok(());
+    }
+    let gh = t.github.open()?;
+    let visibility = gh.visibility()?;
+    if visibility != "private" {
+        eprintln!(
+            "warning: {} is {visibility}: this finding's issue names its local record, {:?}, \
+             and the record's IRI, and anyone who can read the repository will see them",
+            gh.repo().full_name,
+            at.record().title
+        );
+    }
+    Ok(())
+}
+
 pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     let store = ctx.store;
     match cmd {
@@ -132,13 +168,10 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             claim,
             by,
             security,
+            area,
+            tier,
         } => {
-            let r = RecordId(refs::resolve(
-                ctx.handles,
-                &ctx.tracker_label,
-                Kind::Record,
-                &record,
-            )?);
+            let r = RecordId(ctx.resolve_item(Kind::Record, &record)?);
             let Some(rec) = ctx.tracker.get_record(&r)? else {
                 bail!(
                     "`{record}` is not a record in the store at {}. Use \
@@ -146,12 +179,33 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     ctx.tracker_label
                 );
             };
+            let project = rec.project.clone();
             let mut f = Finding::raise(rec.project, r, &by, &claim);
             f.security = security;
-            let id = ctx.tracker.add_finding(f)?;
+            f.area = area;
+            let id = match ctx.tiers {
+                None => {
+                    if f.area.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--area"));
+                    }
+                    if tier.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--tier"));
+                    }
+                    ctx.tracker.add_finding(f)?
+                }
+                Some(t) => {
+                    crate::cmd::manifest::ensure_routing_current(store, &project)?;
+                    let at = t.router.place_finding(&f, tier)?;
+                    if at.inherited() {
+                        eprintln!("note: area: {}, from its record", at.at().area());
+                    }
+                    warn_disclosure(t, &at)?;
+                    t.router.add_finding_at(f, &at)?
+                }
+            };
             println!(
                 "{}\traised\t{claim}",
-                refs::show(ctx.handles, Kind::Finding, id.iri())?
+                ctx.show_item(Kind::Finding, id.iri())?
             );
         }
         Cmd::Reproduce { finding, gate } => {
@@ -166,7 +220,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             )?);
             // A gate IRI about to be written where another machine reads it
             // must be in the committed manifest (spec §4.3–§4.5).
-            if ctx.github.is_some() {
+            if ctx.on_github(fid.iri()) {
                 crate::cmd::manifest::ensure_publishable(store, &f.project, Some(&gid))?;
             }
             crate::preflight::check(ctx, &f.project)?;
@@ -179,7 +233,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             crate::ctx::report_flush(&flushed);
             println!(
                 "{}\treproduced\tgate {} failed over {} items",
-                refs::show(ctx.handles, Kind::Finding, fid.iri())?,
+                ctx.show_item(Kind::Finding, fid.iri())?,
                 refs::show(ctx.handles, Kind::Gate, gid.iri())?,
                 report.verdict.population().unwrap_or(0)
             );
@@ -190,7 +244,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             ctx.tracker.update_finding(&f)?;
             println!(
                 "{}\tassigned\t{to}",
-                refs::show(ctx.handles, Kind::Finding, f.id.iri())?
+                ctx.show_item(Kind::Finding, f.id.iri())?
             );
         }
         Cmd::Verify { finding } => {
@@ -271,7 +325,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 }
             }
 
-            let shown = refs::show(ctx.handles, Kind::Finding, id.iri())?;
+            let shown = ctx.show_item(Kind::Finding, id.iri())?;
             if report.closed {
                 println!("CLOSED\t{shown}");
             } else {
@@ -288,10 +342,15 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             ctx.tracker.update_finding(&f)?;
             println!(
                 "{}\twithdrawn\t{reason}",
-                refs::show(ctx.handles, Kind::Finding, f.id.iri())?
+                ctx.show_item(Kind::Finding, f.id.iri())?
             );
         }
-        Cmd::List { project, state } => {
+        Cmd::List {
+            project,
+            record,
+            state,
+            tier,
+        } => {
             let want = match state.as_deref() {
                 None => None,
                 Some(s) => Some(FindingState::from_wire(s).ok_or_else(|| {
@@ -301,30 +360,88 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     )
                 })?),
             };
-            let p = ProjectId(refs::resolve(
-                ctx.handles,
-                store.label(),
-                Kind::Project,
-                &project,
-            )?);
-            let all = ctx.tracker.list_findings(&p)?;
+            let (p, of) = match (&project, &record) {
+                (Some(pr), None) => (
+                    ProjectId(refs::resolve(
+                        ctx.handles,
+                        store.label(),
+                        Kind::Project,
+                        pr,
+                    )?),
+                    None,
+                ),
+                (None, Some(r)) => {
+                    let id = RecordId(ctx.resolve_item(Kind::Record, r)?);
+                    let Some(rec) = ctx.tracker.get_record(&id)? else {
+                        bail!(
+                            "`{r}` is not a record in the store at {}. Use `fl record list \
+                             --project <project>` to see records that exist.",
+                            ctx.tracker_label
+                        );
+                    };
+                    (rec.project.clone(), Some(rec))
+                }
+                _ => unreachable!("clap requires exactly one of --project and --record"),
+            };
+            if ctx.tiers.is_none() && tier.is_some() {
+                return Err(crate::cmd::routing::not_routed("--tier"));
+            }
+            // ⚠ The whole list or an error: `findings` refuses when a tier
+            // it must read cannot be read (routing spec §2.4).
+            let listed: Vec<(Option<Tier>, Finding)> = match ctx.tiers {
+                None => ctx
+                    .tracker
+                    .list_findings(&p)?
+                    .into_iter()
+                    .map(|f| (None, f))
+                    .collect(),
+                Some(t) => t
+                    .router
+                    .findings(&p, tier)?
+                    .into_iter()
+                    .map(|(in_tier, f)| (Some(in_tier), f))
+                    .collect(),
+            };
+            let named = |f: &Finding| {
+                of.as_ref()
+                    .is_none_or(|r| f.record == r.id || r.also_known_as.contains(f.record.iri()))
+            };
             let mut raisers: BTreeSet<String> = Default::default();
-            for f in all.iter().filter(|f| want.is_none_or(|w| f.state == w)) {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    refs::show(ctx.handles, Kind::Finding, f.id.iri())?,
-                    f.state.as_wire(),
-                    f.raised_by,
-                    f.claim
-                );
+            for (in_tier, f) in listed
+                .iter()
+                .filter(|(_, f)| want.is_none_or(|w| f.state == w) && named(f))
+            {
+                let shown = ctx.show_item(Kind::Finding, f.id.iri())?;
+                match in_tier {
+                    Some(t) => println!(
+                        "{shown}\t{}\t{}\t{}\t{}",
+                        t.as_wire(),
+                        f.state.as_wire(),
+                        f.raised_by,
+                        f.claim
+                    ),
+                    None => println!(
+                        "{shown}\t{}\t{}\t{}",
+                        f.state.as_wire(),
+                        f.raised_by,
+                        f.claim
+                    ),
+                }
                 raisers.insert(f.raised_by.clone());
             }
-            // ⚠ Decision 27's cost, printed where it can be seen. A cost
-            // nobody reads is not a cost.
+            // ⚠ The cost of a withdrawal, printed where it can be seen —
+            // over both tiers, or the one `--tier` names, and then it says
+            // which.
             for actor in raisers {
-                let n = ctx.tracker.withdrawals_by(&actor)?;
+                let n = match ctx.tiers {
+                    Some(t) => t.router.withdrawals_in(&actor, tier)?,
+                    None => ctx.tracker.withdrawals_by(&actor)?,
+                };
                 if n > 0 {
-                    println!("{actor}\twithdrawn: {n}");
+                    match tier {
+                        Some(t) => println!("{actor}\twithdrawn: {n} ({} tier)", t.as_wire()),
+                        None => println!("{actor}\twithdrawn: {n}"),
+                    }
                 }
             }
         }

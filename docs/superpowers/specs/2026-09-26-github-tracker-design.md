@@ -200,6 +200,13 @@ trusted without a lookup, because the repository itself is bound by `node_id` at
 every other URL is resolved by `node_id`. This avoids one lookup per reference in the common case
 and never trusts an old name.
 
+*Amended by the two-tier routing spec (decision 14, 2026-10-06):* a finding whose record lives
+in the project's **local tier** carries a reference with no `node_id` — `{"id": "<local IRI>",
+"title": "<the record's title>"}` — because no issue holds that record. fl resolves it in the
+local tier, by its IRI, never through GitHub, and the issue shows the title and IRI as text. A
+block that carries one is written as `fl_format` 2, so an older fl refuses it as a newer format
+rather than reading it as damaged.
+
 ### 2.4 Renamed and transferred repositories
 
 After a rename, or a transfer to another owner, GitHub redirects the old URLs — **until someone

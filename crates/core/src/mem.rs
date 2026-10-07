@@ -3,6 +3,7 @@ use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
+use crate::routing::{ForeignRecord, Routes, RoutingMap, check_foreign_for_local};
 use crate::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
 use std::cell::RefCell;
@@ -36,6 +37,9 @@ struct Inner {
     runs: Vec<GateRun>,
     attempts: Vec<Attempt>,
     findings: BTreeMap<Iri, Finding>,
+    /// project → its routing map (routing spec §1.2).
+    routing: BTreeMap<Iri, RoutingMap>,
+
     /// alias → primary. `"alias"` is not a `Kind`: it is an index marker, so
     /// an alias never enters `owned`. `check` follows it before deciding.
     aliases: BTreeMap<Iri, Iri>,
@@ -232,8 +236,34 @@ impl Catalog for MemStore {
     }
 }
 
+impl MemStore {
+    /// Write `project`'s routing map. A map that is not one fl writes is
+    /// refused (`RoutingMap::check`).
+    pub fn set_routes(&self, project: &ProjectId, map: &RoutingMap) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(&project.0, Kind::Project)?;
+        map.check()
+            .map_err(|why| StoreError::Backend(format!("the routing map is not valid: {why}")))?;
+        s.routing.insert(project.0.clone(), map.clone());
+        Ok(())
+    }
+}
+
+impl Routes for MemStore {
+    fn routes(&self, project: &ProjectId) -> Result<Option<RoutingMap>, StoreError> {
+        let s = self.inner.borrow();
+        s.check_kind(&project.0, Kind::Project)?;
+        Ok(s.routing.get(&project.0).cloned())
+    }
+}
+
 impl Tracker for MemStore {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
         let mut s = self.inner.borrow_mut();
         s.check_kind(&project.0, Kind::Project)?;
         let id = RecordId(s.mint(Kind::Record));
@@ -245,6 +275,7 @@ impl Tracker for MemStore {
                 title: title.to_string(),
                 state: State::Todo,
                 also_known_as: vec![],
+                area: area.map(str::to_string),
             },
         );
         Ok(id)
@@ -297,6 +328,22 @@ impl Tracker for MemStore {
         Ok(id)
     }
 
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(&finding.project.0, Kind::Project)?;
+        check_foreign_for_local(&record, s.check(record.id().iri()).is_ok())?;
+        let id = FindingId(s.mint(Kind::Finding));
+        let mut finding = finding;
+        finding.id = id.clone();
+        finding.record = record.id().clone();
+        s.findings.insert(id.0.clone(), finding);
+        Ok(id)
+    }
+
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
         let s = self.inner.borrow();
         s.check(&id.0)?;
@@ -318,11 +365,17 @@ impl Tracker for MemStore {
             return Err(StoreError::NoSuchFinding(finding.id.clone()));
         }
         // The stored `also_known_as` is kept and the caller's ignored (see
-        // the trait): only `add_alias` adds a name.
-        let also_known_as = s.findings[&target].also_known_as.clone();
+        // the trait): only `add_alias` adds a name. The record, the raiser,
+        // the security mark and the area are fixed when the finding is
+        // raised (routing spec §1.1; GitHub tracker spec §6).
+        let kept = s.findings[&target].clone();
         let mut stored = finding.clone();
         stored.id = FindingId(target.clone());
-        stored.also_known_as = also_known_as;
+        stored.also_known_as = kept.also_known_as;
+        stored.record = kept.record;
+        stored.raised_by = kept.raised_by;
+        stored.security = kept.security;
+        stored.area = kept.area;
         s.findings.insert(target, stored);
         Ok(())
     }
@@ -697,5 +750,56 @@ mod tests {
         );
         assert_eq!(s.cutover("R_1").unwrap(), Some(entry_iri(3)));
         assert_eq!(s.cutover("R_2").unwrap(), None);
+    }
+
+    // Routing spec §2.5: a local store keeps a GitHub record's reference
+    // only through the router's proof, and never for a record it holds.
+    #[test]
+    fn a_memory_store_keeps_a_checked_reference_to_a_github_record() {
+        use crate::routing::{ForeignRecord, Tier};
+        let s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let url = RecordId(Iri::parse("https://github.com/acme/widgets/issues/7").unwrap());
+        // Raised against the placeholder: the stored reference must come
+        // from the proof.
+        let f = Finding::raise(p.clone(), RecordId(seq_iri(0)), "rev", "claim");
+        let id = s
+            .add_finding_checked(
+                f.clone(),
+                ForeignRecord::for_tests(url.clone(), "t", Tier::Github),
+            )
+            .unwrap();
+        assert_eq!(s.get_finding(&id).unwrap().unwrap().record, url);
+        let err = s
+            .add_finding_checked(f.clone(), ForeignRecord::for_tests(url, "t", Tier::Local))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is a record in the local tier, so a finding about it"),
+            "{err}"
+        );
+        let held = s.add_record(&p, "t").unwrap();
+        let err = s
+            .add_finding_checked(f, ForeignRecord::for_tests(held, "t", Tier::Github))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is held by this store, so a finding about it"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_memory_store_keeps_one_routing_map_per_project() {
+        use crate::routing::{Routes, RoutingMap};
+        let s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let q = s.add_project("/q").unwrap();
+        assert_eq!(s.routes(&p).unwrap(), None);
+        s.set_routes(&p, &RoutingMap::starting()).unwrap();
+        assert_eq!(s.routes(&p).unwrap(), Some(RoutingMap::starting()));
+        assert_eq!(s.routes(&q).unwrap(), None, "per project");
+        let err = s.routes(&ProjectId(seq_iri(99))).unwrap_err();
+        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
     }
 }

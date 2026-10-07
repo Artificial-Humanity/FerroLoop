@@ -7,5 +7,6 @@ pub mod ledger;
 pub mod manifest;
 pub mod project;
 pub mod record;
+pub mod routing;
 pub mod stats;
 pub mod transition;

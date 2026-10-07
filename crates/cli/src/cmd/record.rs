@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{ProjectId, RecordId};
 use fl_core::model::State;
+use fl_core::routing::Tier;
 use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
 use fl_exec::record::{MoveOutcome, move_record};
@@ -15,10 +16,19 @@ pub enum Cmd {
         project: Ref,
         #[arg(long)]
         title: String,
+        /// The record's area (routing spec §1.1), which routes it to a tier.
+        #[arg(long)]
+        area: Option<String>,
+        /// The tier, over the one the area routes to (routing spec §2.1).
+        #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
+        tier: Option<Tier>,
     },
     List {
         #[arg(long)]
         project: Ref,
+        /// One tier only, in a routed project (routing spec §2.4).
+        #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
+        tier: Option<Tier>,
     },
     Move {
         id: Ref,
@@ -35,7 +45,7 @@ impl Cmd {
     fn refs(&self) -> Vec<&Ref> {
         match self {
             Cmd::Add { project, .. } => vec![project],
-            Cmd::List { project } => vec![project],
+            Cmd::List { project, .. } => vec![project],
             Cmd::Move { id, .. } => vec![id],
         }
     }
@@ -53,7 +63,12 @@ impl Cmd {
 pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     let store = ctx.store;
     match cmd {
-        Cmd::Add { project, title } => {
+        Cmd::Add {
+            project,
+            title,
+            area,
+            tier,
+        } => {
             let p = ProjectId(refs::resolve(
                 ctx.handles,
                 store.label(),
@@ -67,26 +82,58 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     store.label()
                 );
             }
-            let id = ctx.tracker.add_record(&p, &title)?;
-            println!(
-                "{}\t{title}",
-                refs::show(ctx.handles, Kind::Record, id.iri())?
-            );
+            let id = match ctx.tiers {
+                None => {
+                    if area.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--area"));
+                    }
+                    if tier.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--tier"));
+                    }
+                    ctx.tracker.add_record(&p, &title)?
+                }
+                Some(t) => {
+                    crate::cmd::manifest::ensure_routing_current(store, &p)?;
+                    let at = t.router.place_record(&p, area.as_deref(), tier)?;
+                    t.router.add_record_at(&p, &title, &at)?
+                }
+            };
+            println!("{}\t{title}", ctx.show_item(Kind::Record, id.iri())?);
         }
-        Cmd::List { project } => {
+        Cmd::List { project, tier } => {
             let p = ProjectId(refs::resolve(
                 ctx.handles,
                 store.label(),
                 Kind::Project,
                 &project,
             )?);
-            for r in ctx.tracker.list_records(&p)? {
-                println!(
-                    "{}\t{}\t{}",
-                    refs::show(ctx.handles, Kind::Record, r.id.iri())?,
-                    r.state.as_wire(),
-                    r.title
-                );
+            match ctx.tiers {
+                None => {
+                    if tier.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--tier"));
+                    }
+                    for r in ctx.tracker.list_records(&p)? {
+                        println!(
+                            "{}\t{}\t{}",
+                            ctx.show_item(Kind::Record, r.id.iri())?,
+                            r.state.as_wire(),
+                            r.title
+                        );
+                    }
+                }
+                // ⚠ The whole list or an error: `records` refuses when a
+                // tier it must read cannot be read (routing spec §2.4).
+                Some(t) => {
+                    for (in_tier, r) in t.router.records(&p, tier)? {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            ctx.show_item(Kind::Record, r.id.iri())?,
+                            in_tier.as_wire(),
+                            r.state.as_wire(),
+                            r.title
+                        );
+                    }
+                }
             }
         }
         Cmd::Move { id, to } => {
@@ -96,12 +143,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     State::wire_values()
                 );
             };
-            let r = RecordId(refs::resolve(
-                ctx.handles,
-                &ctx.tracker_label,
-                Kind::Record,
-                &id,
-            )?);
+            let r = RecordId(ctx.resolve_item(Kind::Record, &id)?);
             let Some(record) = ctx.tracker.get_record(&r)? else {
                 bail!(
                     "`{id}` is not a record in the store at {}. Use \
@@ -131,7 +173,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             crate::ctx::report_flush(&report.flushed);
             // What the person reads back: the record's handle (or its
             // primary IRI), never the alias or IRI they typed.
-            let shown = refs::show(ctx.handles, Kind::Record, record.id.iri())?;
+            let shown = ctx.show_item(Kind::Record, record.id.iri())?;
 
             if let MoveOutcome::Ungated = report.outcome {
                 println!(

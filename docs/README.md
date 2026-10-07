@@ -18,6 +18,8 @@ File naming in this directory follows
 * [github-ledger.md](github-ledger.md) — publish each decision's evidence to the tracker's
   repository and comment it on its issue: setup, modes, disclosure, comments and their
   recovery, cost, errors and limits.
+* [routing.md](routing.md) — keep developer-level items in the local store and human-level
+  items in GitHub: areas, the routing map, handles, lists and their limits.
 
 No anchor document exists yet.
 

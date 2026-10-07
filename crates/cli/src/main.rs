@@ -6,6 +6,7 @@ mod preflight;
 mod refs;
 #[cfg(test)]
 mod testing;
+mod tiers;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -52,6 +53,9 @@ enum Command {
     /// GitHub tracker: who fl writes as, and repair of a diverged issue.
     #[command(subcommand)]
     Github(cmd::github::Cmd),
+    /// Route a project's new items between its local store and GitHub.
+    #[command(subcommand)]
+    Routing(cmd::routing::Cmd),
 }
 
 impl Command {
@@ -69,6 +73,7 @@ impl Command {
             Command::Stats(c) => c.iris(),
             Command::Manifest(c) => c.iris(),
             Command::Github(c) => c.iris(),
+            Command::Routing(c) => c.iris(),
         }
     }
 
@@ -98,7 +103,14 @@ impl Command {
             Command::Stats(c) => c.has_handle(),
             Command::Manifest(c) => c.has_handle(),
             Command::Github(c) => c.has_handle(),
+            Command::Routing(c) => c.has_handle(),
         }
+    }
+
+    /// Whether the command writes a routing map: decision 12's refusal
+    /// reads the binding for it, routed or not yet.
+    fn sets_routing(&self) -> bool {
+        matches!(self, Command::Routing(c) if c.sets_routing())
     }
 
     /// Whether the command reads or writes records or findings. Only these
@@ -107,6 +119,7 @@ impl Command {
         match self {
             Command::Record(_) | Command::Finding(_) | Command::Attempt(_) => true,
             Command::Github(_) => true,
+            Command::Routing(c) => c.needs_tracker(),
             // `check` is the CI gate: it touches the tracker only to resolve
             // `--record`, and must not need GitHub otherwise.
             Command::Check(c) => c.record.is_some(),
@@ -297,6 +310,51 @@ fn choose_store(
     choose_among(&[bound.to_path_buf()], iris)
 }
 
+/// Whether the store at `bound` exists and holds a routing map. ⚠ Never
+/// creates a store: only a file that exists is opened.
+fn bound_is_routed(bound: &Path) -> Result<bool> {
+    if !bound.exists() {
+        return Ok(false);
+    }
+    let store = RedbStore::open(bound)
+        .with_context(|| format!("could not open the store at {}", bound.display()))?;
+    Ok(store.holds_routing()?)
+}
+
+/// Whether a configured store other than `bound` holds any of `iris`. ⚠
+/// Never creates a store: only a file that exists is opened. A confined
+/// command searches no other store, so none holds them.
+fn held_elsewhere(
+    bound: &Path,
+    entries: &[config::Entry],
+    iris: &[Iri],
+    confined: bool,
+) -> Result<bool> {
+    if confined {
+        return Ok(false);
+    }
+    for e in entries {
+        if same_store(&e.store, bound) || !e.store.exists() {
+            continue;
+        }
+        let s = RedbStore::open(&e.store)
+            .with_context(|| format!("could not open the store at {}", e.store.display()))?;
+        for id in iris {
+            if s.owns(id)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn is_not_owned(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<StoreError>(),
+        Some(StoreError::NotOwned { .. })
+    )
+}
+
 /// The common search loop, over whatever candidate list the caller already
 /// decided on (confined: `[bound]`, unconfined: `bound` plus every
 /// configured store that exists).
@@ -422,6 +480,17 @@ fn local_only_reason(explicit: bool, elsewhere: bool) -> String {
          records a GitHub ledger"
             .into()
     }
+}
+
+/// Routing spec decision 12, when a command starts.
+fn refuse_routed_github_ledger(
+    routed: bool,
+    binding: Option<&config::TrackerBinding>,
+) -> Result<()> {
+    if let Some(b) = binding.filter(|b| routed && b.github_ledger()) {
+        return Err(cmd::routing::github_ledger_refusal(&b.github));
+    }
+    Ok(())
 }
 
 /// The tracker for a command that reads or writes records or findings, and
@@ -554,12 +623,30 @@ fn run(cli: Cli) -> Result<i32> {
     let explicit_given = explicit.is_some();
     let (bound, confined) = db_path(explicit, configured)?;
     let mut iris = cli.command.iris();
+    // Whether the bound store is routed (routing spec §1.3), read only when
+    // the command names an IRI: in a routed store an issue URL is the github
+    // tier's, and an id no store holds is the router's to look for.
+    let bound_routed = !iris.is_empty() && bound_is_routed(&bound)?;
     // A GitHub issue URL is the tracker's to resolve: no local store holds
     // one, and searching them would refuse it as NotOwned (spec §2.2).
-    if here_binding.is_some() {
+    if here_binding.is_some() || bound_routed {
         iris.retain(|i| !fl_github::meta::is_issue_url(i));
     }
-    let path = choose_store(&bound, entries, &iris, confined)?;
+    let path = match choose_store(&bound, entries, &iris, confined) {
+        // Routing spec §2.2: an id no local store holds may be an item
+        // another machine moved to GitHub, or one on another machine's local
+        // tier. The router says which; refusing here would say neither.
+        // ⚠ Only when no id of the command is held by another store: the
+        // command is then about that store's project, not the routed one's.
+        Err(e)
+            if bound_routed
+                && is_not_owned(&e)
+                && !held_elsewhere(&bound, entries, &iris, confined)? =>
+        {
+            bound.clone()
+        }
+        other => other?,
+    };
     // ⚠ The tracker comes from the store the command
     // ends up in, never from the current directory alone — an IRI can send
     // `choose_store` to another project's store, and pairing that store with
@@ -598,9 +685,27 @@ fn run(cli: Cli) -> Result<i32> {
     }
     let store = RedbStore::open(&path)
         .with_context(|| format!("could not open the store at {}", path.display()))?;
+    // A store in which any project routes its items between two tiers
+    // (routing spec §1.3), whatever its maps hold.
+    let routed = store.holds_routing()?;
+    // The current directory's binding, when it was read and the command
+    // runs on that entry's store — the same rule as `manifest_binding`
+    // below. `None` when it says nothing of this store: one an IRI or
+    // `--db` chose is never judged on this directory's binding.
+    let here_for_store = (entry_read && path == bound).then_some(here_binding.as_ref());
+    refuse_routed_github_ledger(
+        routed || cli.command.sets_routing(),
+        binding.as_ref().or(here_for_store.flatten()),
+    )?;
     // Why `fl stats` could not read GitHub, when it could not reach it.
     let mut unread: Option<String> = None;
     let github = match &binding {
+        // A routed store opens GitHub on the first call that needs it (routing spec §2.6),
+        // through `lazy`.
+        Some(_) if routed => None,
+        // A routing command reads items only through a routed store's
+        // router: in a store with no routing map it has none to read.
+        Some(_) if matches!(cli.command, Command::Routing(_)) => None,
         Some(b) if needs_tracker => Some(open_github(b, cfg.github.as_ref(), &store)?),
         // ⚠ A report falls back to the local store, and says so, when
         // GitHub cannot be reached (§2.5); any other failure is an error.
@@ -642,14 +747,55 @@ fn run(cli: Cli) -> Result<i32> {
         Some(w) => w,
         None => &store,
     };
-    let (checked, routed);
-    let ctx = match &github {
-        Some(gh) => {
+    let config_path = config::path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "the config".into());
+    let lazy = routed.then(|| {
+        tiers::LazyGithub::new(
+            binding.clone(),
+            config_path,
+            Box::new(|b: &config::TrackerBinding| open_github(b, cfg.github.as_ref(), &store)),
+        )
+    });
+    let tiered = lazy.as_ref().map(|l| fl_core::TieredTracker {
+        catalog: &store,
+        local: &store,
+        routes: &store,
+        github: l,
+    });
+    let tiers = match (&tiered, &lazy) {
+        (Some(router), Some(github)) => Some(tiers::Tiers { router, github }),
+        _ => None,
+    };
+    // `fl github …` names GitHub items only, so it opens GitHub now, routed
+    // or not.
+    let routed_github = match (&lazy, &cli.command) {
+        (Some(l), Command::Github(_)) => Some(l.open()?),
+        _ => None,
+    };
+
+    let (checked, numbered);
+    let ctx = match (&tiers, &github) {
+        (Some(t), _) => Ctx {
+            store: &store,
+            tracker: t.router,
+            ledger,
+            handles: &store,
+            github: routed_github,
+            github_ledger: None,
+            witness: None,
+            tracker_label: match &binding {
+                Some(b) => format!("{} or GitHub `{}`", store.label(), b.github),
+                None => store.label().to_string(),
+            },
+            tiers: Some(t),
+        },
+        (None, Some(gh)) => {
             checked = CatalogChecked {
                 catalog: &store,
                 tracker: gh,
             };
-            routed = KindRouted {
+            numbered = KindRouted {
                 catalog: &store,
                 tracker: gh,
             };
@@ -657,14 +803,15 @@ fn run(cli: Cli) -> Result<i32> {
                 store: &store,
                 tracker: &checked,
                 ledger,
-                handles: &routed,
+                handles: &numbered,
                 github: Some(gh),
                 github_ledger: github_ledger.as_ref(),
                 witness: witness.as_ref(),
                 tracker_label: format!("github:{}", gh.repo().full_name),
+                tiers: None,
             }
         }
-        None => Ctx {
+        (None, None) => Ctx {
             store: &store,
             tracker: &store,
             ledger,
@@ -673,6 +820,7 @@ fn run(cli: Cli) -> Result<i32> {
             github_ledger: None,
             witness: None,
             tracker_label: store.label().to_string(),
+            tiers: None,
         },
     };
     // `manifest export` writes the ledger root of the repository the
@@ -694,7 +842,10 @@ fn run(cli: Cli) -> Result<i32> {
             store_tracker(&path, entries)?;
         }
         match &here_binding {
-            Some(t) => cmd::manifest::Binding::Github(t.github.clone()),
+            Some(t) => cmd::manifest::Binding::Github {
+                repo: t.github.clone(),
+                github_ledger: t.github_ledger(),
+            },
             None => cmd::manifest::Binding::Local,
         }
     };
@@ -720,6 +871,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Stats(c) => cmd::stats::run(&store, c, stats_source),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
+        Command::Routing(c) => cmd::routing::run(&ctx, c, here_for_store.map(|b| b.is_some())),
     };
     // What the GitHub ledger's reads noted without refusing — a quarantined
     // line skipped (spec §3.3, §3.6) — once each, whatever became of the
@@ -843,5 +995,31 @@ mod tests {
         ] {
             assert_eq!(api_override_host(url).unwrap(), host, "{url}");
         }
+    }
+
+    // Routing spec decision 12: a routed project uses the local ledger.
+    #[test]
+    fn a_routed_store_whose_binding_names_the_github_ledger_is_refused() {
+        let mut b = entry("/a", "/s.redb", Some("acme/widgets"))
+            .tracker
+            .unwrap();
+        assert!(
+            refuse_routed_github_ledger(true, Some(&b)).is_ok(),
+            "the local ledger is fine"
+        );
+        b.ledger = Some(config::LedgerChoice::Github);
+        let msg = format!(
+            "{:#}",
+            refuse_routed_github_ledger(true, Some(&b)).unwrap_err()
+        );
+        assert!(
+            msg.contains("a routed project keeps its runs and decisions in the local ledger"),
+            "{msg}"
+        );
+        assert!(
+            refuse_routed_github_ledger(false, Some(&b)).is_ok(),
+            "unrouted: as before"
+        );
+        assert!(refuse_routed_github_ledger(true, None).is_ok());
     }
 }

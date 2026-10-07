@@ -9,6 +9,7 @@ use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{Record, State};
+use fl_core::routing::ForeignRecord;
 use fl_core::store::{Ledger, Roles, StoreError, Tracker};
 use std::cell::RefCell;
 
@@ -95,8 +96,13 @@ impl Ledger for Journal<'_> {
 }
 
 impl Tracker for Journal<'_> {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
-        self.store.add_record(project, title)
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
+        self.store.add_record_with_area(project, title, area)
     }
     fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
         self.store.get_record(id)
@@ -110,6 +116,13 @@ impl Tracker for Journal<'_> {
     }
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         self.store.add_finding(finding)
+    }
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        self.store.add_finding_checked(finding, record)
     }
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
         self.store.get_finding(id)

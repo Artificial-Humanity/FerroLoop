@@ -108,6 +108,13 @@ fl creates the labels it needs — one kind label and one label per state, for r
 findings — the first time a command writes, with the description "managed by fl". It never
 relies on GitHub creating a label as a side effect of a write.
 
+An item of a project that routes its items between its local store and GitHub
+([routing.md](routing.md)) carries a third fl
+label, `fl:area/<name>`, naming its area. fl creates an area's label the first time it makes
+an item with that area, keeps it through every write and repair, and never deletes it. The area
+is also a field of the block below; a block that carries one is written as `fl_format` 2, which
+an older fl refuses as a newer format rather than reading half of it.
+
 The fields a label cannot hold are kept in a metadata block at the very end of the body, an
 HTML comment GitHub does not render. For a finding it looks like this, the JSON on one line:
 
@@ -120,6 +127,13 @@ HTML comment GitHub does not render. For a finding it looks like this, the JSON 
 The block is fl's record of the protocol, and the state in it is the item's state. Its field
 names are `snake_case`. A block with a field this fl does not know, with text after it, or of
 another `fl_format` is refused, never half-read.
+
+A finding whose record lives in the project's local store — possible when the project routes
+its items between the two — names the record in its block as `{"id": "urn:uuid:…", "title":
+"…"}`, with no `node_id`, since no issue holds it, and the issue shows a line `Record: <title> —
+<id>, held in the local tier, not on GitHub.` A reader on GitHub sees the title and the id; fl
+resolves the id in the local store. On a repository that is not private, raising such a finding
+publishes the record's title, and fl warns before it does.
 
 Open or closed is a projection that fl writes and never reads state from. A record in `done`
 and a finding in `fixed` are closed as completed; a finding in `withdrawn` is closed as not
@@ -260,7 +274,9 @@ a security finding that nobody marked.
 
 An item's id is its issue's URL, `https://github.com/acme/widgets/issues/41`. Its handle is
 the issue number, which may be typed `41` or `#41`; records and findings share issue numbers,
-so `fl record` refuses the number of a finding. `owner/repo#41` names issue 41 of that
+so `fl record` refuses the number of a finding. In a project that routes its items between its
+local store and GitHub ([routing.md](routing.md)), only `#41` names the issue; a bare `41` names a
+local item. `owner/repo#41` names issue 41 of that
 repository, and is refused as not held by this tracker unless it names the bound one — by its
 current name, or by an old name that still reaches it after a rename. Projects
 and gates keep their local handles.

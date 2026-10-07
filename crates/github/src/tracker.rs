@@ -11,9 +11,10 @@ use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::model::{Record, State};
+use fl_core::routing::{ForeignRecord, Tier};
 use fl_core::store::{Bindings, Handles, StoreError, Tracker};
 use serde_json::{Value, json};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,7 +47,10 @@ type Seen = (Meta, String, String);
 pub struct GithubTracker {
     client: Client,
     repo: Repo,
-    labels_ready: Cell<bool>,
+    /// Every fl label this process knows exists in the repository — the
+    /// kind and state labels, and each area's (spec §3.3; routing spec
+    /// §1.1) — so each is listed and created at most once per process.
+    labels_ready: RefCell<BTreeSet<String>>,
     /// Kinds seen this process, by issue number, so a handle lookup does not
     /// read the issue again.
     kinds: RefCell<BTreeMap<u64, ItemKind>>,
@@ -480,7 +484,7 @@ impl GithubTracker {
         let tracker = Self {
             client,
             repo,
-            labels_ready: Cell::new(false),
+            labels_ready: RefCell::new(BTreeSet::new()),
             kinds: RefCell::new(BTreeMap::new()),
             seen: RefCell::new(BTreeMap::new()),
             settle: std::time::Duration::from_secs(2),
@@ -530,9 +534,10 @@ impl GithubTracker {
     }
 
     fn remember(&self, n: u64, meta: &Meta, prose: &str, title: &str) {
-        self.seen
-            .borrow_mut()
-            .insert(n, (meta.clone(), prose.to_string(), title.to_string()));
+        self.seen.borrow_mut().insert(
+            n,
+            (meta.clone().sealed(), prose.to_string(), title.to_string()),
+        );
     }
 
     pub fn issue_url(&self, number: u64) -> Iri {
@@ -872,10 +877,19 @@ impl GithubTracker {
         Ok(out)
     }
 
-    /// Create every fl label that is missing, explicitly — never as a side
-    /// effect of an issue write (spec §3.3). Once per process.
-    fn ensure_labels(&self) -> Result<(), StoreError> {
-        if self.labels_ready.get() {
+    /// Create every fl label that is missing — the kind and state labels,
+    /// and `area`'s when given — explicitly, never as a side effect of an
+    /// issue write (spec §3.3). A label this process already knows exists is
+    /// not looked for again.
+    fn ensure_labels(&self, area: Option<&str>) -> Result<(), StoreError> {
+        let mut wanted = meta::all_labels();
+        if let Some(a) = area {
+            wanted.push(meta::area_label(a));
+        }
+        if wanted
+            .iter()
+            .all(|l| self.labels_ready.borrow().contains(l))
+        {
             return Ok(());
         }
         let have: BTreeSet<String> = self
@@ -884,8 +898,8 @@ impl GithubTracker {
             .iter()
             .filter_map(|l| l.get("name").and_then(Value::as_str).map(str::to_string))
             .collect();
-        for name in meta::all_labels() {
-            if have.contains(&name) {
+        for name in &wanted {
+            if have.contains(name) {
                 continue;
             }
             let body = json!({"name": name, "color": "5319e7", "description": "managed by fl"});
@@ -899,7 +913,7 @@ impl GithubTracker {
                 )));
             }
         }
-        self.labels_ready.set(true);
+        self.labels_ready.borrow_mut().extend(wanted);
         Ok(())
     }
 
@@ -935,8 +949,8 @@ impl GithubTracker {
                 meta.state
             )));
         }
-        self.ensure_labels()?;
-        let labels = vec![meta::kind_label(kind), meta::state_label(kind, &meta.state)];
+        self.ensure_labels(meta.area.as_deref())?;
+        let labels = meta::labels_after(&[], kind, &meta.state, meta.area.as_deref());
         let body = meta::render_body(prose, meta);
         // ⚠ No labels in the create: they are added afterward, by their own
         // call (`label_created`). Measured live on 2026-10-05: labels set in the
@@ -1224,7 +1238,7 @@ impl GithubTracker {
         missing: impl Fn() -> StoreError,
         change: impl FnOnce(&mut Meta, &mut String, &mut String) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        self.ensure_labels()?;
+        self.ensure_labels(None)?;
         let id = self.issue_url(n);
         // Classify first, so a missing, deleted or moved issue keeps its
         // outcome — its timeline would answer 404, 410 or 301 instead.
@@ -1289,7 +1303,8 @@ impl GithubTracker {
         }
         let mut title = issue.title.clone();
         change(&mut meta, &mut prose, &mut title)?;
-        let labels = meta::labels_after(&issue.labels, kind, &meta.state);
+        self.ensure_labels(meta.area.as_deref())?;
+        let labels = meta::labels_after(&issue.labels, kind, &meta.state, meta.area.as_deref());
         let (state, reason) = meta::projection(kind, &meta.state);
         let body = meta::render_body(&prose, &meta);
         let same_labels =
@@ -1552,7 +1567,7 @@ impl GithubTracker {
         // ⚠ Explicitly, as every write does: a deleted fl label is a common
         // reason to repair, and the PATCH must not recreate it as a side
         // effect (spec §3.3).
-        self.ensure_labels()?;
+        self.ensure_labels(None)?;
         let n = self.locate(id)?;
         let classify = |fetched: Fetched| match fetched {
             // Before the window: GitHub's edit history does not answer for
@@ -1591,6 +1606,7 @@ impl GithubTracker {
                 meta.state
             )));
         }
+        self.ensure_labels(meta.area.as_deref())?;
         if matches!(meta::read_item(&issue), Ok(Read::Item { .. })) {
             return Ok(Repaired {
                 number: n,
@@ -1598,7 +1614,8 @@ impl GithubTracker {
                 changed: false,
             });
         }
-        let labels = meta::labels_after(&issue.labels, meta.kind, &meta.state);
+        let labels =
+            meta::labels_after(&issue.labels, meta.kind, &meta.state, meta.area.as_deref());
         let (state, reason) = meta::projection(meta.kind, &meta.state);
         let mut sent = json!({"labels": labels, "state": state});
         if let Some(r) = reason {
@@ -1694,6 +1711,7 @@ impl GithubTracker {
             title: issue.title.clone(),
             state,
             also_known_as: meta.also_known_as.clone(),
+            area: meta.area.clone(),
         })
     }
 
@@ -1729,6 +1747,7 @@ impl GithubTracker {
             withdrawn_reason: meta.withdrawn_reason.clone(),
             also_known_as: meta.also_known_as.clone(),
             security: meta.security,
+            area: meta.area.clone(),
         })
     }
 
@@ -1738,6 +1757,11 @@ impl GithubTracker {
     /// id — never by the URL, because an old name may now reach another
     /// repository.
     fn current_ref(&self, r: &RecordRef) -> Result<Iri, StoreError> {
+        // Routing spec §2.5: a record in the local tier is resolved there,
+        // by its IRI; GitHub holds no node for it.
+        let Some(node_id) = &r.node_id else {
+            return Ok(r.id.clone());
+        };
         if let Some((name, _)) = meta::parse_issue_url(&r.id)
             && name.eq_ignore_ascii_case(&self.repo.full_name)
         {
@@ -1745,7 +1769,7 @@ impl GithubTracker {
         }
         let data = self.client.graphql(
             "query($id: ID!) { node(id: $id) { ... on Issue { url repository { id } } } }",
-            json!({ "id": r.node_id }),
+            json!({ "id": node_id }),
         )?;
         let node = data
             .get("node")
@@ -1788,10 +1812,10 @@ impl GithubTracker {
         }
     }
 
-    /// Spec §6: only a `private` repository may hold a security finding.
-    /// Read live, every time — visibility can change — and a failed read is
-    /// an ERROR: an unknown visibility is not a pass.
-    fn require_private(&self) -> Result<(), StoreError> {
+    /// The repository's visibility — `private`, `internal` or `public` —
+    /// read live, every time: visibility can change. ⚠ An answer that
+    /// cannot be read is an error: an unknown visibility is not private.
+    pub fn visibility(&self) -> Result<String, StoreError> {
         let r = self.client.send(
             Method::Get,
             &format!("/repos/{}", self.repo.full_name),
@@ -1799,33 +1823,101 @@ impl GithubTracker {
         )?;
         let refuse = |why: String| {
             backend(format!(
-                "fl could not read the visibility of {} ({why}), so it will not write a \
-                 security finding there. Retry, or use a local tracker",
+                "fl could not read the visibility of {} ({why}), and an unknown visibility is \
+                 not private. Retry",
                 self.repo.full_name
             ))
         };
         if r.status != 200 {
             return Err(refuse(format!("GitHub answered {}", r.status)));
         }
-        let visibility = r
-            .body
+        r.body
             .get("visibility")
             .and_then(Value::as_str)
-            .ok_or_else(|| refuse("the answer names no visibility".into()))?;
+            .map(str::to_string)
+            .ok_or_else(|| refuse("the answer names no visibility".into()))
+    }
+
+    /// Spec §6: only a `private` repository may hold a security finding.
+    pub fn require_private(&self) -> Result<(), StoreError> {
+        let visibility = self.visibility()?;
         if visibility == "private" {
             Ok(())
         } else {
             Err(StoreError::SecurityNotPrivate {
                 repo: self.repo.full_name.clone(),
-                visibility: visibility.to_string(),
+                visibility,
             })
+        }
+    }
+
+    /// Every fl item of `project` whose block names `area` (routing spec
+    /// §1.2), found by reading every issue's block — labelled or not — so an
+    /// item that lost its labels is not missed. An issue without an fl
+    /// label whose block cannot be read is not fl's, and is passed over.
+    /// ⚠ One WITH an fl label whose block cannot be read is an error: it
+    /// may name the area.
+    pub fn items_in_area(
+        &self,
+        project: &ProjectId,
+        area: &str,
+    ) -> Result<Vec<(Kind, Iri)>, StoreError> {
+        let mut out = Vec::new();
+        let mut unreadable = None;
+        self.each_issue(None, Order::OldestFirst, LIST_PAGE, |node| {
+            let issue = IssueView::from_graphql(node)?;
+            match meta::parse_body(&issue.body) {
+                Ok((_, m)) => {
+                    if m.project == *project && m.area.as_deref() == Some(area) {
+                        out.push((m.kind.as_kind(), issue.url.clone()));
+                    }
+                }
+                Err(e) if issue.labels.iter().any(|l| l.starts_with("fl:")) => {
+                    unreadable = Some(backend(format!(
+                        "{} carries an fl label, but its body {e}, so fl cannot tell whether it \
+                         names the area `{area}`. Restore its block from the issue's edit \
+                         history, or remove its fl labels",
+                        issue.url
+                    )));
+                    return Ok(false);
+                }
+                Err(_) => {}
+            }
+            Ok(true)
+        })?;
+        match unreadable {
+            Some(e) => Err(e),
+            None => Ok(out),
         }
     }
 }
 
+/// The block of a new finding about `record` (spec §3.1).
+fn finding_meta(finding: &Finding, record: RecordRef) -> Meta {
+    let mut meta = Meta::new(
+        ItemKind::Finding,
+        finding.state.as_wire(),
+        finding.project.clone(),
+    );
+    meta.record = Some(record);
+    meta.area = finding.area.clone();
+    meta.reproduction = finding.reproduction.clone();
+    meta.raised_by = Some(finding.raised_by.clone());
+    meta.assigned_to = finding.assigned_to.clone();
+    meta.withdrawn_reason = finding.withdrawn_reason.clone();
+    meta.security = finding.security;
+    meta
+}
+
 impl Tracker for GithubTracker {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
-        let meta = Meta::new(ItemKind::Record, State::Todo.as_wire(), project.clone());
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
+        let mut meta = Meta::new(ItemKind::Record, State::Todo.as_wire(), project.clone());
+        meta.area = area.map(str::to_string);
         Ok(RecordId(
             self.create(ItemKind::Record, title, "", &meta)?.url,
         ))
@@ -1879,20 +1971,47 @@ impl Tracker for GithubTracker {
         if finding.security {
             self.require_private()?;
         }
-        let mut meta = Meta::new(
-            ItemKind::Finding,
-            finding.state.as_wire(),
-            finding.project.clone(),
+        let meta = finding_meta(
+            &finding,
+            RecordRef {
+                id: record.url.clone(),
+                node_id: Some(record.node_id.clone()),
+                title: None,
+            },
         );
-        meta.record = Some(RecordRef {
-            id: record.url.clone(),
-            node_id: record.node_id.clone(),
-        });
-        meta.reproduction = finding.reproduction.clone();
-        meta.raised_by = Some(finding.raised_by.clone());
-        meta.assigned_to = finding.assigned_to.clone();
-        meta.withdrawn_reason = finding.withdrawn_reason.clone();
-        meta.security = finding.security;
+        let title = meta::title_of(&finding.claim);
+        Ok(FindingId(
+            self.create(ItemKind::Finding, &title, &finding.claim, &meta)?
+                .url,
+        ))
+    }
+
+    /// A finding about a record in the project's local tier (routing spec
+    /// §2.5): its block carries `{id, title}` and no node id (decision 14),
+    /// and the issue shows the record as text.
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        if record.tier() != Tier::Local {
+            return Err(backend(format!(
+                "{} is a record on GitHub, so a finding about it is raised with `add_finding`, \
+                 which checks it here",
+                record.id()
+            )));
+        }
+        if finding.security {
+            self.require_private()?;
+        }
+        let meta = finding_meta(
+            &finding,
+            RecordRef {
+                id: record.id().iri().clone(),
+                node_id: None,
+                title: Some(record.title().to_string()),
+            },
+        );
         let title = meta::title_of(&finding.claim);
         Ok(FindingId(
             self.create(ItemKind::Finding, &title, &finding.claim, &meta)?
@@ -2126,6 +2245,278 @@ mod tests {
                 "label {l} was not created"
             );
         }
+    }
+
+    /// Gives issue `n` the area `area` in its block, with its label or
+    /// without — what a newer fl, or a hand, left there.
+    fn give_area(fake: &FakeGithub, n: u64, area: &str, labelled: bool) {
+        fake.web_edit(n, |i| {
+            let (prose, mut m) = meta::parse_body(&i.body).unwrap();
+            m.area = Some(area.into());
+            i.body = meta::render_body(&prose, &m);
+            if labelled {
+                i.labels.push(meta::area_label(area));
+            }
+        });
+    }
+
+    /// How many labels fl has created in the repository.
+    fn label_creates(fake: &FakeGithub) -> usize {
+        fake.state()
+            .requests
+            .iter()
+            .filter(|r| *r == "POST /repos/acme/widgets/labels")
+            .count()
+    }
+
+    // Routing spec §1.1: a missing area label reads as diverged, and repair
+    // restores it from the block — creating the label first, never as a side
+    // effect of the write (GitHub tracker spec §3.3).
+    #[test]
+    fn a_repair_restores_a_missing_area_label_creating_it_first() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        give_area(&fake, 1, "code", false);
+        let fresh = open(&fake);
+        let err = fresh.get_record(&r).unwrap_err().to_string();
+        assert!(err.contains("which its block's area needs"), "{err}");
+        let before = label_creates(&fake);
+        assert!(fresh.repair(r.iri(), "owner").unwrap().changed);
+        let labels = fake.issue(1).labels;
+        assert!(labels.contains(&"fl:area/code".to_string()), "{labels:?}");
+        assert_eq!(label_creates(&fake), before + 1, "created explicitly");
+        assert!(open(&fake).get_record(&r).unwrap().is_some());
+    }
+
+    // Routing spec §1.1: an area label that differs from the block reads
+    // as diverged, and repair rewrites it from the block.
+    #[test]
+    fn a_repair_replaces_a_wrong_area_label_with_the_blocks() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        give_area(&fake, 1, "code", false);
+        fake.web_edit(1, |i| i.labels.push(meta::area_label("design")));
+        let fresh = open(&fake);
+        let err = fresh.get_record(&r).unwrap_err().to_string();
+        assert!(err.contains("do not match its block's area"), "{err}");
+        assert!(fresh.repair(r.iri(), "owner").unwrap().changed);
+        let labels = fake.issue(1).labels;
+        assert!(
+            labels.contains(&"fl:area/code".to_string())
+                && !labels.contains(&"fl:area/design".to_string()),
+            "{labels:?}"
+        );
+        assert!(open(&fake).get_record(&r).unwrap().is_some());
+    }
+
+    #[test]
+    fn an_update_keeps_the_area_label_and_creates_it_first() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        give_area(&fake, 1, "code", true);
+        let before = label_creates(&fake);
+        open(&fake).set_record_state(&r, State::Doing).unwrap();
+        let labels = fake.issue(1).labels;
+        assert!(
+            labels.contains(&"fl:area/code".to_string())
+                && labels.contains(&"fl:record/doing".to_string()),
+            "{labels:?}"
+        );
+        assert_eq!(label_creates(&fake), before + 1, "created explicitly");
+    }
+
+    // Routing spec §2.5: a reference to a local record is resolved in the
+    // local tier, never through GitHub.
+    #[test]
+    fn a_findings_reference_to_a_local_record_reads_back_without_a_lookup() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let f = t
+            .add_finding(Finding::raise(p(), r, "rev", "claim"))
+            .unwrap();
+        let local = Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000042").unwrap();
+        fake.web_edit(2, |i| {
+            let (prose, mut m) = meta::parse_body(&i.body).unwrap();
+            m.record = Some(RecordRef {
+                id: local.clone(),
+                node_id: None,
+                title: Some("t".into()),
+            });
+            i.body = meta::render_body(&prose, &m);
+        });
+        let graphql = |fk: &FakeGithub| {
+            fk.state()
+                .requests
+                .iter()
+                .filter(|r| r.starts_with("POST /graphql"))
+                .count()
+        };
+        let before = graphql(&fake);
+        let back = open(&fake).get_finding(&f).unwrap().unwrap();
+        assert_eq!(back.record.iri(), &local);
+        assert_eq!(back.claim, "claim");
+        assert_eq!(graphql(&fake), before, "no node lookup for a local record");
+    }
+
+    // Routing spec §1.1: the area is a field of the block and an fl label,
+    // created the first time an item with that area is made here.
+    #[test]
+    fn an_item_made_with_an_area_carries_it_in_its_block_and_as_a_label() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t
+            .add_record_with_area(&p(), "fix it", Some("code"))
+            .unwrap();
+        let issue = fake.issue(1);
+        assert_eq!(
+            issue.labels,
+            vec!["fl:record", "fl:record/todo", "fl:area/code"]
+        );
+        assert!(
+            issue.body.contains("\"fl_format\":2") && issue.body.contains("\"area\":\"code\""),
+            "{}",
+            issue.body
+        );
+        // ⚠ Counted, not looked up: the fake also records a label an issue
+        // write applies, so only the create request proves fl made it first.
+        assert_eq!(
+            label_creates(&fake),
+            meta::all_labels().len() + 1,
+            "every kind and state label, and the area's"
+        );
+        // ⚠ Written before any read of the item: a read replaces what fl
+        // remembers of its create, which is what this write must not
+        // conflict with. What fl remembers of the create is sealed as the
+        // block is, so the write is not a conflict.
+        t.set_record_state(&r, State::Doing).unwrap();
+        assert!(fake.issue(1).labels.contains(&"fl:area/code".to_string()));
+        assert_eq!(
+            t.get_record(&r).unwrap().unwrap().area.as_deref(),
+            Some("code")
+        );
+        let mut f = Finding::raise(p(), r, "rev", "claim");
+        f.area = Some("design".into());
+        let fid = t.add_finding(f.clone()).unwrap();
+        assert!(fake.issue(2).labels.contains(&"fl:area/design".to_string()));
+        // The same holds for a finding: written before it is read.
+        f.id = fid.clone();
+        f.withdraw("no").unwrap();
+        t.update_finding(&f).unwrap();
+        let back = t.get_finding(&fid).unwrap().unwrap();
+        assert_eq!(back.area.as_deref(), Some("design"));
+        assert_eq!(back.state, FindingState::Withdrawn);
+    }
+
+    #[test]
+    fn an_area_label_is_created_once_per_process() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record_with_area(&p(), "a", Some("code")).unwrap();
+        let created = label_creates(&fake);
+        let lists = |f: &FakeGithub| {
+            f.state()
+                .requests
+                .iter()
+                .filter(|r| r.starts_with("GET /repos/acme/widgets/labels"))
+                .count()
+        };
+        let listed = lists(&fake);
+        t.add_record_with_area(&p(), "b", Some("code")).unwrap();
+        assert_eq!(label_creates(&fake), created, "not created twice");
+        assert_eq!(
+            lists(&fake),
+            listed,
+            "a label this process knows is not listed again"
+        );
+    }
+
+    // Routing spec §2.5, decision 14: a GitHub finding about a local record
+    // names it as text and carries `{id, title}`; it reads back as the
+    // claim, and keeps all of it through an update.
+    #[test]
+    fn a_finding_about_a_local_record_reads_back_and_survives_an_update() {
+        use fl_core::routing::{ForeignRecord, Tier};
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let local = RecordId(Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000042").unwrap());
+        let mut f = Finding::raise(p(), local.clone(), "rev", "the claim");
+        f.area = Some("design".into());
+        let id = t
+            .add_finding_checked(
+                f,
+                ForeignRecord::for_tests(local.clone(), "@alice fix", Tier::Local),
+            )
+            .unwrap();
+        let body = fake.issue(1).body;
+        let text = &body[..body.rfind(meta::META_OPEN).unwrap()];
+        assert!(
+            text.contains("held in the local tier, not on GitHub"),
+            "{text}"
+        );
+        assert!(!text.contains("@alice"), "{text}");
+        assert!(body.contains("\"fl_format\":2"), "{body}");
+        assert!(
+            body.contains(
+                "\"record\":{\"id\":\"urn:uuid:00000000-0000-7000-8000-000000000042\",\
+                 \"title\":\"@alice fix\"}"
+            ),
+            "{body}"
+        );
+        let back = t.get_finding(&id).unwrap().unwrap();
+        assert_eq!(
+            (back.record.clone(), back.claim.as_str()),
+            (local.clone(), "the claim")
+        );
+        let mut back = back;
+        back.attach_reproduction(fl_core::ids::GateId(seq_iri(5)))
+            .unwrap();
+        t.update_finding(&back).unwrap();
+        let again = open(&fake).get_finding(&id).unwrap().unwrap();
+        assert_eq!(
+            (again.record, again.claim.as_str()),
+            (local.clone(), "the claim")
+        );
+        assert!(
+            fake.issue(1)
+                .body
+                .contains("held in the local tier, not on GitHub")
+        );
+        // A security finding still goes only to a private repository (spec §6).
+        fake.state().repos[0].visibility = "public".into();
+        let mut secret = Finding::raise(p(), local.clone(), "rev", "secret");
+        secret.security = true;
+        let err = t
+            .add_finding_checked(secret, ForeignRecord::for_tests(local, "t", Tier::Local))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::SecurityNotPrivate { .. }),
+            "{err:?}"
+        );
+        assert_eq!(fake.issue_count(), 1, "nothing created");
+    }
+
+    #[test]
+    fn a_checked_reference_to_a_github_record_is_refused() {
+        use fl_core::routing::{ForeignRecord, Tier};
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        let err = t
+            .add_finding_checked(
+                Finding::raise(p(), r.clone(), "rev", "c"),
+                ForeignRecord::for_tests(r, "t", Tier::Github),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is a record on GitHub, so a finding about it"),
+            "{err}"
+        );
+        assert_eq!(fake.issue_count(), 1, "nothing created");
     }
 
     #[test]
@@ -4090,5 +4481,67 @@ mod tests {
         fn the_github_tracker_meets_the_all_roles_contract() {
             conformance::all_roles(split);
         }
+    }
+
+    // Routing spec §1.2: GitHub items are found by their blocks, so an item
+    // that lost its labels is not missed, and an issue that is not fl's is
+    // passed over.
+    #[test]
+    fn items_in_an_area_are_found_by_their_block_labelled_or_not() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record_with_area(&p(), "a", Some("code")).unwrap();
+        t.add_record_with_area(&p(), "b", Some("design")).unwrap();
+        let mut f = Finding::raise(p(), r, "rev", "c");
+        f.area = Some("code".into());
+        t.add_finding(f).unwrap();
+        t.add_record_with_area(&ProjectId(seq_iri(2)), "other", Some("code"))
+            .unwrap();
+        let plain = fake.plain_issue(&[], false);
+        fake.web_edit(plain, |i| i.body = "quoting <!-- fl:meta\n{broken".into());
+        fake.web_edit(1, |i| i.labels.clear());
+        let found = t.items_in_area(&p(), "code").unwrap();
+        assert_eq!(
+            found,
+            vec![
+                (Kind::Record, t.issue_url(1)),
+                (Kind::Finding, t.issue_url(3))
+            ]
+        );
+        assert!(t.items_in_area(&p(), "ops").unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_fl_labelled_issue_whose_block_cannot_be_read_refuses_the_area_scan() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        t.add_record_with_area(&p(), "a", Some("code")).unwrap();
+        fake.web_edit(1, |i| i.body = "<!-- fl:meta\n{broken".into());
+        let err = t.items_in_area(&p(), "design").unwrap_err().to_string();
+        assert!(err.contains("carries an fl label, but its body"), "{err}");
+    }
+
+    #[test]
+    fn the_visibility_is_read_live_and_only_private_holds_a_security_item() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        assert_eq!(t.visibility().unwrap(), "private");
+        t.require_private().unwrap();
+        for v in ["internal", "public"] {
+            fake.state().repos[0].visibility = v.into();
+            assert_eq!(t.visibility().unwrap(), v);
+            assert!(
+                matches!(
+                    t.require_private(),
+                    Err(StoreError::SecurityNotPrivate { .. })
+                ),
+                "{v}"
+            );
+        }
+        fake.state().omit_visibility = true;
+        assert!(
+            t.visibility().is_err(),
+            "an unknown visibility is not private"
+        );
     }
 }

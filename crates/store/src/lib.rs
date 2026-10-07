@@ -5,6 +5,7 @@ use fl_core::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
 use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
+use fl_core::routing::{ForeignRecord, Routes, RoutingMap, check_foreign_for_local};
 use fl_core::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use fl_core::store::{Bindings, Catalog, Handles, Ledger, StoreError, Tracker};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -17,6 +18,8 @@ use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 /// Format 2: ids are IRIs, with an ownership index and per-kind handles.
 /// Format 1 keyed every table by a `u64` id from one shared counter.
 pub const FORMAT_VERSION: u64 = 2;
+/// What a store that imported a project cannot do to its routing map.
+pub const CHANGE_ROUTING: &str = "change the routing map of";
 const FORMAT_KEY: &str = "format_version";
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -79,6 +82,13 @@ pub const FORMAT_WITH_IMPORTS: u64 = 3;
 /// and 4. A format is only ever raised (`raise_format`).
 pub const FORMAT_WITH_LEDGER_ROOT: u64 = 4;
 
+/// ⚠ The format of a store that holds a routing map or an item with an
+/// area (routing spec §1.4). An older fl would read such an item and drop
+/// its area — or route nothing — so the first such write raises the store
+/// to 5 in the same transaction, and an older fl refuses it. This build
+/// opens 2 to 5. A store that never routes stays where it was.
+pub const FORMAT_WITH_ROUTING: u64 = 5;
+
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
 const LEDGER_ROOTS: TableDefinition<&str, &str> = TableDefinition::new("ledger_roots");
@@ -89,6 +99,11 @@ const LEDGER_HEADS: TableDefinition<&str, &str> = TableDefinition::new("ledger_h
 /// JSON (`CachedSegment`). Additive.
 const LEDGER_SEGMENTS: TableDefinition<(&str, &str), &str> =
     TableDefinition::new("ledger_segments");
+
+/// project → its routing map, as JSON (routing spec §1.2). Created by the
+/// first map written; writing one raises the store to
+/// [`FORMAT_WITH_ROUTING`] in the same transaction.
+const ROUTING: TableDefinition<&str, &str> = TableDefinition::new("routing");
 
 const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
@@ -112,6 +127,8 @@ pub struct ImportReport {
     /// `(old, new)` when a re-import came from another checkout. The
     /// project's gates now run over the new root, and the CLI says so.
     pub root_moved: Option<(String, String)>,
+    /// How many areas the imported routing map declares, when it has one.
+    pub areas: Option<usize>,
 }
 
 fn backend(e: impl std::fmt::Display) -> StoreError {
@@ -289,6 +306,16 @@ fn drop_candidates(tx: &redb::WriteTransaction, ids: &[Iri]) -> Result<(), Store
     Ok(())
 }
 
+/// Routing spec decision 20: a store whose project is routed takes no
+/// other project.
+fn routed_store_is_taken() -> StoreError {
+    backend(
+        "this store holds a routed project, which needs a store of its own: handles are \
+         numbered per store. Give the new project its own store — a config entry with its own \
+         `store`",
+    )
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let label = path.display().to_string();
@@ -313,12 +340,13 @@ impl RedbStore {
             Some(Some(v))
                 if v == FORMAT_VERSION
                     || v == FORMAT_WITH_IMPORTS
-                    || v == FORMAT_WITH_LEDGER_ROOT => {}
+                    || v == FORMAT_WITH_LEDGER_ROOT
+                    || v == FORMAT_WITH_ROUTING => {}
             Some(v) => {
                 return Err(StoreError::FormatVersion {
                     found: v,
                     oldest: FORMAT_VERSION,
-                    newest: FORMAT_WITH_LEDGER_ROOT,
+                    newest: FORMAT_WITH_ROUTING,
                 });
             }
         }
@@ -355,10 +383,11 @@ impl RedbStore {
         &self,
         kind: Kind,
         table: TableDefinition<&str, &str>,
+        raise: Option<u64>,
         build: impl FnOnce(Iri) -> T,
     ) -> Result<Iri, StoreError> {
         let id = Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).map_err(backend)?;
-        self.insert_new_with_id(id, kind, table, build)
+        self.insert_new_with_id(id, kind, table, raise, build)
     }
 
     /// Mint, index, hand out a handle, and write the row — in ONE write
@@ -379,6 +408,7 @@ impl RedbStore {
         id: Iri,
         kind: Kind,
         table: TableDefinition<&str, &str>,
+        raise: Option<u64>,
         build: impl FnOnce(Iri) -> T,
     ) -> Result<Iri, StoreError> {
         let json = serde_json::to_string(&build(id.clone())).map_err(backend)?;
@@ -388,6 +418,9 @@ impl RedbStore {
             .map_err(backend)?
             .insert(id.as_str(), json.as_str())
             .map_err(backend)?;
+        if let Some(to) = raise {
+            raise_format(&tx, to)?;
+        }
         tx.commit().map_err(backend)?;
         Ok(id)
     }
@@ -578,7 +611,9 @@ impl RedbStore {
         Ok(hash)
     }
 
-    fn refuse_if_imported(
+    /// `Imported`, naming `action`, when this store imported `project`
+    /// from a manifest: its definitions are authored elsewhere.
+    pub fn refuse_if_imported(
         &self,
         project: &ProjectId,
         action: &'static str,
@@ -614,7 +649,14 @@ impl RedbStore {
                 commit,
             }),
         };
-        manifest::export(self, project, commit, exported_at_unix, ledger_root)
+        manifest::export(
+            self,
+            project,
+            commit,
+            exported_at_unix,
+            ledger_root,
+            self.routes(project)?,
+        )
     }
 
     /// Whether this store records any ledger root. An export that cannot
@@ -623,6 +665,54 @@ impl RedbStore {
     pub fn holds_a_ledger_root(&self) -> Result<bool, StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let table = match tx.open_table(LEDGER_ROOTS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
+            Err(e) => return Err(backend(e)),
+        };
+        let any = table.iter().map_err(backend)?.next().is_some();
+        Ok(any)
+    }
+
+    /// Write `project`'s routing map (routing spec §1.2) — which this store
+    /// must author, and which must be its only project (decision 20) — and
+    /// raise the store to format 5, in one transaction.
+    pub fn set_routes(&self, project: &ProjectId, map: &RoutingMap) -> Result<(), StoreError> {
+        self.check_kind(project.iri(), Kind::Project)?;
+        self.refuse_if_imported(project, CHANGE_ROUTING)?;
+        self.refuse_a_second_project(project)?;
+        map.check()
+            .map_err(|why| backend(format!("the routing map is not valid: {why}")))?;
+        let json = serde_json::to_string(map).map_err(backend)?;
+        let tx = self.db.begin_write().map_err(backend)?;
+        tx.open_table(ROUTING)
+            .map_err(backend)?
+            .insert(project.iri().as_str(), json.as_str())
+            .map_err(backend)?;
+        raise_format(&tx, FORMAT_WITH_ROUTING)?;
+        tx.commit().map_err(backend)
+    }
+
+    /// Routing spec decision 20: a routed store holds exactly one project,
+    /// because handles are numbered per store. `Err` names the other
+    /// project and the remedy.
+    pub(crate) fn refuse_a_second_project(&self, project: &ProjectId) -> Result<(), StoreError> {
+        match self.list_projects()?.into_iter().find(|p| p.id != *project) {
+            Some(other) => Err(backend(format!(
+                "this store also holds project {} (root {}), and a routed project needs a store \
+                 of its own: handles are numbered per store, so one number would name items of \
+                 both. Give the project its own store — a config entry with its own `store` — \
+                 and route it there",
+                other.id, other.root
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether any project in this store has a routing map: the store is
+    /// then routed (routing spec §1.3), whatever the map holds.
+    pub fn holds_routing(&self) -> Result<bool, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(ROUTING) {
             Ok(t) => t,
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(false),
             Err(e) => return Err(backend(e)),
@@ -663,6 +753,19 @@ impl RedbStore {
         };
         if held_project && self.imported_hash(project)?.is_none() {
             return Err(ManifestError::AuthoringStore(project.clone()));
+        }
+        // ⚠ An older checked-out manifest would un-route this machine alone
+        // (routing spec §1.2: one routing rule per project, not per machine).
+        if held_project && body.routing.is_none() && self.routes(project)?.is_some() {
+            return Err(ManifestError::WouldDropRouting(project.clone()));
+        }
+        // Routing spec decision 20: a routed store holds one project — a
+        // routed manifest goes only into a store holding no other, and no
+        // other project goes into a routed store.
+        if body.routing.is_some() {
+            self.refuse_a_second_project(project)?;
+        } else if !held_project && self.holds_routing()? {
+            return Err(routed_store_is_taken().into());
         }
         // Another project on the same root would give one checkout two
         // sets of gates and two handles, with nothing said.
@@ -717,6 +820,7 @@ impl RedbStore {
             transitions: body.transitions.len(),
             transitions_removed: stale_transitions.clone(),
             root_moved,
+            areas: body.routing.as_ref().map(|m| m.areas.len()),
         };
         // (definition to write, whether it is new to this store)
         let mut writes: Vec<(&GateDef, bool)> = Vec::new();
@@ -797,6 +901,14 @@ impl RedbStore {
             .map_err(backend)?
             .insert(project.iri().as_str(), m.content_sha256.as_str())
             .map_err(backend)?;
+        if let Some(map) = &body.routing {
+            let json = serde_json::to_string(map).map_err(backend)?;
+            tx.open_table(ROUTING)
+                .map_err(backend)?
+                .insert(project.iri().as_str(), json.as_str())
+                .map_err(backend)?;
+            raise_format(&tx, FORMAT_WITH_ROUTING)?;
+        }
         if let Some(root) = &body.ledger_root {
             record_ledger_root(&tx, &root.repository_node_id, &root.commit)?;
         }
@@ -808,7 +920,11 @@ impl RedbStore {
 
 impl Catalog for RedbStore {
     fn add_project(&self, root: &str) -> Result<ProjectId, StoreError> {
-        let id = self.insert_new(Kind::Project, PROJECTS, |id| Project {
+        // Routing spec decision 20: a routed store holds one project.
+        if self.holds_routing()? {
+            return Err(routed_store_is_taken());
+        }
+        let id = self.insert_new(Kind::Project, PROJECTS, None, |id| Project {
             id: ProjectId(id),
             root: root.to_string(),
         })?;
@@ -836,7 +952,7 @@ impl Catalog for RedbStore {
     ) -> Result<GateId, StoreError> {
         self.check_kind(project.iri(), Kind::Project)?;
         self.refuse_if_imported(project, "add a gate to")?;
-        let id = self.insert_new(Kind::Gate, GATES, |id| GateDef {
+        let id = self.insert_new(Kind::Gate, GATES, None, |id| GateDef {
             id: GateId(id),
             project: project.clone(),
             name: name.to_string(),
@@ -935,15 +1051,41 @@ impl Catalog for RedbStore {
     }
 }
 
-impl Tracker for RedbStore {
-    fn add_record(&self, project: &ProjectId, title: &str) -> Result<RecordId, StoreError> {
+impl Routes for RedbStore {
+    fn routes(&self, project: &ProjectId) -> Result<Option<RoutingMap>, StoreError> {
         self.check_kind(project.iri(), Kind::Project)?;
-        let id = self.insert_new(Kind::Record, RECORDS, |id| Record {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(ROUTING) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let Some(v) = table.get(project.iri().as_str()).map_err(backend)? else {
+            return Ok(None);
+        };
+        let map: RoutingMap = serde_json::from_str(v.value()).map_err(decode)?;
+        // ⚠ A stored map routes nothing until it is one fl writes.
+        map.check().map_err(decode)?;
+        Ok(Some(map))
+    }
+}
+
+impl Tracker for RedbStore {
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
+        self.check_kind(project.iri(), Kind::Project)?;
+        let raise = area.map(|_| FORMAT_WITH_ROUTING);
+        let id = self.insert_new(Kind::Record, RECORDS, raise, |id| Record {
             id: RecordId(id),
             project: project.clone(),
             title: title.to_string(),
             state: State::Todo,
             also_known_as: vec![],
+            area: area.map(str::to_string),
         })?;
         Ok(RecordId(id))
     }
@@ -983,10 +1125,28 @@ impl Tracker for RedbStore {
                 found: record_kind,
             });
         }
-        let id = self.insert_new(Kind::Finding, FINDINGS, |id| {
+        let raise = finding.area.as_ref().map(|_| FORMAT_WITH_ROUTING);
+        let id = self.insert_new(Kind::Finding, FINDINGS, raise, |id| {
             let mut finding = finding;
             finding.id = FindingId(id);
             finding.record = RecordId(record_primary);
+            finding
+        })?;
+        Ok(FindingId(id))
+    }
+
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        self.check_kind(finding.project.iri(), Kind::Project)?;
+        check_foreign_for_local(&record, self.owns(record.id().iri())?)?;
+        let raise = finding.area.as_ref().map(|_| FORMAT_WITH_ROUTING);
+        let id = self.insert_new(Kind::Finding, FINDINGS, raise, |id| {
+            let mut finding = finding;
+            finding.id = FindingId(id);
+            finding.record = record.id().clone();
             finding
         })?;
         Ok(FindingId(id))
@@ -1010,10 +1170,15 @@ impl Tracker for RedbStore {
         // The stored `also_known_as` is kept and the caller's ignored (see
         // the trait): only `add_alias` adds a name.
         let primary = stored.id.clone();
-        let also_known_as = std::mem::take(&mut stored.also_known_as);
-        stored = finding.clone();
+        let kept = std::mem::replace(&mut stored, finding.clone());
         stored.id = primary.clone();
-        stored.also_known_as = also_known_as;
+        stored.also_known_as = kept.also_known_as;
+        // Fixed when the finding is raised (routing spec §1.1; GitHub
+        // tracker spec §6): the caller's copy never changes them.
+        stored.record = kept.record;
+        stored.raised_by = kept.raised_by;
+        stored.security = kept.security;
+        stored.area = kept.area;
         self.put_json(FINDINGS, primary.iri(), &stored)
     }
 
@@ -1464,13 +1629,13 @@ mod tests {
     fn a_minted_id_that_already_exists_is_refused_and_nothing_is_overwritten() {
         let (s, _d) = fresh();
         let id = Iri::parse("urn:uuid:0190a1b2-c3d4-7e5f-8a6b-7c8d9e0f1a2b").unwrap();
-        s.insert_new_with_id(id.clone(), Kind::Project, PROJECTS, |i| Project {
+        s.insert_new_with_id(id.clone(), Kind::Project, PROJECTS, None, |i| Project {
             id: ProjectId(i),
             root: "/first".into(),
         })
         .unwrap();
         let err = s
-            .insert_new_with_id(id.clone(), Kind::Project, PROJECTS, |i| Project {
+            .insert_new_with_id(id.clone(), Kind::Project, PROJECTS, None, |i| Project {
                 id: ProjectId(i),
                 root: "/second".into(),
             })
@@ -1505,7 +1670,7 @@ mod tests {
                 StoreError::FormatVersion {
                     found: Some(1),
                     oldest: 2,
-                    newest: 4
+                    newest: FORMAT_WITH_ROUTING
                 }
             ),
             "{err:?}"
@@ -2349,6 +2514,79 @@ mod tests {
         assert_eq!(report.transitions_removed, vec!["ship".to_string()]);
     }
 
+    // Routing spec §1.2: the importing machine routes as the authoring one.
+    #[test]
+    fn an_export_carries_the_map_and_an_import_writes_it_raising_the_store_to_5() {
+        use fl_core::routing::{Routes, RoutingMap};
+        let (a, _ga, p, _, _) = authoring();
+        a.set_routes(&p, &RoutingMap::starting()).unwrap();
+        let m = a.export_manifest(&p, "c1", 7, None).unwrap();
+        assert_eq!(m.body.format_version, 3);
+        assert_eq!(m.body.routing, Some(RoutingMap::starting()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.redb");
+        {
+            let b = RedbStore::open(&path).unwrap();
+            let report = b.import_manifest(&m, "/x").unwrap();
+            assert_eq!(report.areas, Some(5));
+            assert_eq!(b.routes(&p).unwrap(), Some(RoutingMap::starting()));
+            assert!(b.holds_routing().unwrap());
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
+    }
+
+    // Routing spec §1.2: an older checked-out manifest must not un-route one
+    // machine.
+    #[test]
+    fn an_import_that_would_drop_the_routing_map_is_refused() {
+        use fl_core::routing::{Routes, RoutingMap};
+        let (a, _ga, p, _, _) = authoring();
+        let unrouted = a.export_manifest(&p, "c1", 7, None).unwrap();
+        a.set_routes(&p, &RoutingMap::starting()).unwrap();
+        let routed = a.export_manifest(&p, "c2", 8, None).unwrap();
+        let (b, _gb) = fresh();
+        b.import_manifest(&routed, "/x").unwrap();
+        let err = b.import_manifest(&unrouted, "/x").unwrap_err();
+        assert!(matches!(err, ManifestError::WouldDropRouting(_)), "{err}");
+        assert!(
+            err.to_string().contains("would un-route the project"),
+            "{err}"
+        );
+        assert_eq!(
+            b.routes(&p).unwrap(),
+            Some(RoutingMap::starting()),
+            "nothing written"
+        );
+        // A map that changed is imported: areas come and go (decision 15).
+        a.set_routes(&p, &RoutingMap::starting().without("design"))
+            .unwrap();
+        b.import_manifest(&a.export_manifest(&p, "c3", 9, None).unwrap(), "/x")
+            .unwrap();
+        assert_eq!(b.routes(&p).unwrap().unwrap().declared().len(), 4);
+    }
+
+    // Routing spec decision 20: an import keeps a routed store to one
+    // project, both ways round.
+    #[test]
+    fn an_import_never_puts_a_routed_project_beside_another() {
+        use fl_core::routing::RoutingMap;
+        let (a, _ga, p, _, _) = authoring();
+        a.set_routes(&p, &RoutingMap::starting()).unwrap();
+        let routed = a.export_manifest(&p, "c1", 7, None).unwrap();
+        let (b, _gb) = fresh();
+        b.add_project("/elsewhere").unwrap();
+        let err = b.import_manifest(&routed, "/x").unwrap_err().to_string();
+        assert!(err.contains("needs a store of its own"), "{err}");
+        assert!(!b.holds_routing().unwrap(), "nothing written");
+        let (c, _gc) = fresh();
+        c.import_manifest(&routed, "/x").unwrap();
+        let (o, _go, op, _, _) = authoring();
+        let unrouted = o.export_manifest(&op, "c1", 7, None).unwrap();
+        let err = c.import_manifest(&unrouted, "/y").unwrap_err().to_string();
+        assert!(err.contains("needs a store of its own"), "{err}");
+        assert_eq!(c.list_projects().unwrap().len(), 1);
+    }
+
     #[test]
     fn imported_hash_of_a_project_this_store_never_held_is_not_owned() {
         let (s, _g) = fresh();
@@ -2468,13 +2706,62 @@ mod tests {
             let tx = db.begin_write().unwrap();
             tx.open_table(META)
                 .unwrap()
-                .insert(FORMAT_KEY, FORMAT_WITH_LEDGER_ROOT + 1)
+                .insert(FORMAT_KEY, FORMAT_WITH_ROUTING + 1)
                 .unwrap();
             tx.commit().unwrap();
         }
         let msg = RedbStore::open(&path).err().unwrap().to_string();
         assert!(msg.contains("Upgrade fl"), "{msg}");
         assert!(!msg.contains("start a new store"), "{msg}");
+    }
+
+    /// The format a store at `path` records.
+    fn format_at(path: &std::path::Path) -> Option<u64> {
+        let db = redb::Database::open(path).unwrap();
+        let tx = db.begin_read().unwrap();
+        let meta = tx.open_table(META).unwrap();
+        meta.get(FORMAT_KEY).unwrap().map(|v| v.value())
+    }
+
+    // Routing spec §1.4: an older fl would read an item and drop its area,
+    // so the first item with one raises the store to 5 — in the same write.
+    // A store that never routes stays where it was.
+    #[test]
+    fn an_item_with_an_area_raises_the_store_to_format_5_and_one_without_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.redb");
+        let r = {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let plain = s.add_record(&p, "t").unwrap();
+            s.add_finding(Finding::raise(p.clone(), plain, "a", "c"))
+                .unwrap();
+            drop(s);
+            assert_eq!(format_at(&path), Some(FORMAT_VERSION));
+            let s = RedbStore::open(&path).unwrap();
+            s.add_record_with_area(&p, "u", Some("code")).unwrap()
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(
+            s.get_record(&r).unwrap().unwrap().area.as_deref(),
+            Some("code")
+        );
+
+        let path = dir.path().join("b.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let rec = s.add_record(&p, "t").unwrap();
+            let mut f = Finding::raise(p, rec, "a", "c");
+            f.area = Some("design".into());
+            s.add_finding(f).unwrap();
+        }
+        assert_eq!(
+            format_at(&path),
+            Some(FORMAT_WITH_ROUTING),
+            "a finding raises it too"
+        );
     }
 
     // ⚠ An older fl would open a store at format 2 or 3 and export its
@@ -2597,5 +2884,143 @@ mod tests {
         );
         assert!(!b.owns(p.iri()).unwrap(), "nothing was written");
         assert_eq!(b.ledger_root("R_1").unwrap().as_deref(), Some("other"));
+    }
+
+    // Routing spec §1.2, §1.4: the map is kept, raising the store to 5 in
+    // the same write; a store holds routing once its project has a map.
+    #[test]
+    fn a_routing_map_is_kept_and_raises_the_store_to_format_5() {
+        use fl_core::routing::{Routes, RoutingMap};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.redb");
+        let p = {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            assert!(!s.holds_routing().unwrap());
+            assert_eq!(s.routes(&p).unwrap(), None, "no table yet: no map");
+            s.set_routes(&p, &RoutingMap::starting()).unwrap();
+            assert!(s.holds_routing().unwrap());
+            p
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(s.routes(&p).unwrap(), Some(RoutingMap::starting()));
+        let err = s.routes(&ProjectId(fl_core::ids::seq_iri(99))).unwrap_err();
+        assert!(matches!(err, StoreError::NotOwned { .. }), "{err:?}");
+    }
+
+    // Routing spec decision 20: handles are numbered per store, so a routed
+    // store holds exactly one project — no map while another project is
+    // there, and no other project once there is one.
+    #[test]
+    fn a_routed_store_holds_exactly_one_project() {
+        use fl_core::routing::{Routes, RoutingMap};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("two.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let q = s.add_project("/q").unwrap();
+            let err = s
+                .set_routes(&p, &RoutingMap::starting())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("needs a store of its own")
+                    && err.contains(q.iri().as_str())
+                    && err.contains("its own `store`"),
+                "{err}"
+            );
+            assert_eq!(s.routes(&p).unwrap(), None, "nothing written");
+            assert!(!s.holds_routing().unwrap());
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_VERSION));
+        let (s, _d) = fresh();
+        let p = s.add_project("/p").unwrap();
+        s.set_routes(&p, &RoutingMap::starting()).unwrap();
+        let err = s.add_project("/q").unwrap_err().to_string();
+        assert!(err.contains("needs a store of its own"), "{err}");
+        assert_eq!(s.list_projects().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_map_that_is_not_valid_is_refused_before_anything_is_written() {
+        use fl_core::routing::{Routes, RoutingMap};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.redb");
+        {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let mut bad = RoutingMap::starting();
+            bad.areas[0].area = "Code".into();
+            let err = s.set_routes(&p, &bad).unwrap_err().to_string();
+            assert!(err.contains("is not an area name"), "{err}");
+            assert_eq!(s.routes(&p).unwrap(), None);
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_VERSION));
+    }
+
+    // The map is authored where the project is (routing spec §1.2): an
+    // importing store's copy comes from the manifest only.
+    #[test]
+    fn an_imported_projects_routing_map_cannot_be_changed_here() {
+        use fl_core::routing::RoutingMap;
+        let (a, _ga, p, _, _) = authoring();
+        let (b, _gb) = fresh();
+        b.import_manifest(&a.export_manifest(&p, "c1", 7, None).unwrap(), "/x")
+            .unwrap();
+        let err = b.set_routes(&p, &RoutingMap::starting()).unwrap_err();
+        assert!(matches!(err, StoreError::Imported { .. }), "{err:?}");
+        assert!(
+            err.to_string().contains("change the routing map of"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_local_store_keeps_a_checked_reference_to_a_github_record() {
+        use fl_core::routing::{ForeignRecord, Tier};
+        let (s, _d) = fresh();
+        let p = s.add_project("/p").unwrap();
+        let url = RecordId(Iri::parse("https://github.com/acme/widgets/issues/7").unwrap());
+        let err = s
+            .add_finding(Finding::raise(p.clone(), url.clone(), "rev", "claim"))
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::NotOwned { .. }),
+            "unchecked stays refused: {err:?}"
+        );
+        // Raised against the placeholder: the stored reference must come
+        // from the proof.
+        let f = Finding::raise(
+            p.clone(),
+            RecordId(fl_core::ids::seq_iri(0)),
+            "rev",
+            "claim",
+        );
+        let id = s
+            .add_finding_checked(
+                f.clone(),
+                ForeignRecord::for_tests(url.clone(), "t", Tier::Github),
+            )
+            .unwrap();
+        assert_eq!(s.get_finding(&id).unwrap().unwrap().record, url);
+        let err = s
+            .add_finding_checked(f.clone(), ForeignRecord::for_tests(url, "t", Tier::Local))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is a record in the local tier, so a finding about it"),
+            "{err}"
+        );
+        let held = s.add_record(&p, "t").unwrap();
+        let err = s
+            .add_finding_checked(f, ForeignRecord::for_tests(held, "t", Tier::Github))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("is held by this store, so a finding about it"),
+            "{err}"
+        );
     }
 }

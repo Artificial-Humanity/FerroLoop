@@ -7,7 +7,7 @@ use clap::Subcommand;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{GateKind, Selector};
 use fl_core::store::{Bindings, Catalog};
-use fl_core::{Iri, Kind};
+use fl_core::{Iri, Kind, Routes};
 use fl_exec::git::Git;
 use fl_store::RedbStore;
 use fl_store::manifest::{Currency, MANIFEST_PATH, Manifest};
@@ -109,6 +109,43 @@ pub fn ensure_import_current(store: &RedbStore, project: &ProjectId) -> Result<(
              now {}). Run `fl manifest import` before running its gates.",
             root.join(MANIFEST_PATH).display(),
             m.content_sha256
+        );
+    }
+    Ok(())
+}
+
+/// Routing spec §1.2: one routing rule per project, not per machine. On an
+/// importing machine the import must be current. On the authoring machine a
+/// manifest in the working tree must carry the store's map; with no
+/// manifest, no other machine can import the project, so there is no other
+/// rule to disagree with.
+pub fn ensure_routing_current(store: &RedbStore, project: &ProjectId) -> Result<()> {
+    let root = root_of(store, project)?;
+    let path = root.join(MANIFEST_PATH);
+    if let Some(recorded) = store.imported_hash(project)? {
+        let m = manifest_of(&root, project, false)?;
+        if m.content_sha256 != recorded {
+            bail!(
+                "the manifest at {} changed since this store imported it, and it may route items \
+                 differently. Run `fl manifest import` before making an item",
+                path.display()
+            );
+        }
+        return Ok(());
+    }
+    if !path
+        .try_exists()
+        .with_context(|| format!("could not look for {}", path.display()))?
+    {
+        return Ok(());
+    }
+    let m = read(&root)?;
+    if m.body.project == *project && m.body.routing != store.routes(project)? {
+        bail!(
+            "the routing map of project {project} changed since the manifest at {} was \
+             exported, so another machine would route differently. Run `fl manifest export \
+             --project {project}`, then commit",
+            path.display()
         );
     }
     Ok(())
@@ -265,6 +302,9 @@ fn print_import(store: &RedbStore, m: &Manifest, report: &fl_store::ImportReport
         report.gates_unchanged,
         report.transitions
     );
+    if let Some(n) = report.areas {
+        println!("routing\t{n} areas");
+    }
     // ⚠ This store numbers handles on its own: they can differ from the
     // authoring machine's, so the person needs to see them here.
     for g in &m.body.gates {
@@ -322,8 +362,21 @@ pub enum Binding {
     Unread,
     /// The project's tracker is the local store: no GitHub ledger.
     Local,
-    /// The project is bound to this `owner/repo`.
-    Github(String),
+    /// The project is bound to this `owner/repo`, with the GitHub ledger
+    /// or not.
+    Github { repo: String, github_ledger: bool },
+}
+
+impl Binding {
+    /// Whether the project was bound to GitHub, when fl read its entry for
+    /// this store: `None` when it did not, and does not know.
+    pub fn was_github(&self) -> Option<bool> {
+        match self {
+            Binding::Unread => None,
+            Binding::Local => Some(false),
+            Binding::Github { .. } => Some(true),
+        }
+    }
 }
 
 /// The `node_id` whose ledger root an export writes.
@@ -335,7 +388,7 @@ pub enum Binding {
 /// than written without one.
 fn ledger_node(store: &RedbStore, binding: &Binding) -> Result<Option<String>> {
     match binding {
-        Binding::Github(repo) => match store.bound_node_id(repo)? {
+        Binding::Github { repo, .. } => match store.bound_node_id(repo)? {
             Some(node) => Ok(Some(node)),
             None if store.holds_a_ledger_root()? => bail!(
                 "this store records a GitHub ledger root, but no repository node for `{repo}`, \
@@ -422,8 +475,30 @@ pub fn run(store: &RedbStore, cmd: Cmd, binding: &Binding) -> Result<i32> {
                 anyhow::anyhow!("`{}` is not a git working tree: {e}", root.display())
             })?;
             let m = read(&root)?;
+            // Routing spec decision 12: a routed project keeps its ledger
+            // local, so a binding that names the GitHub ledger takes none.
+            if m.body.routing.is_some()
+                && let Binding::Github {
+                    repo,
+                    github_ledger: true,
+                } = binding
+            {
+                return Err(crate::cmd::routing::github_ledger_refusal(repo));
+            }
+            let was_routed = store.holds_routing()?;
             let report = store.import_manifest(&m, &root.display().to_string())?;
             print_import(store, &m, &report)?;
+            // Routing spec §2.3: the import that first routes this store
+            // changes what a handle means here, as the first `fl routing set`
+            // does where the project is authored.
+            // Where the entry was not read, the mode before is unknown, and
+            // nothing is said rather than a guess.
+            if !was_routed
+                && report.areas.is_some()
+                && let Some(was_github) = binding.was_github()
+            {
+                eprintln!("{}", crate::cmd::routing::handle_change(was_github));
+            }
         }
         Cmd::Check { project } => {
             let p = ProjectId(refs::resolve(

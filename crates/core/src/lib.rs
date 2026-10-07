@@ -13,10 +13,15 @@ pub mod ids;
 pub mod iri;
 pub mod log;
 pub mod mem;
+#[cfg(any(test, feature = "conformance"))]
+#[doc(hidden)]
+pub mod mem_issues;
 pub mod model;
+pub mod routing;
 pub mod split;
 pub mod stale;
 pub mod store;
+pub mod tiered;
 pub mod verdict;
 
 pub use at::{At, AtError};
@@ -31,6 +36,7 @@ pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
 };
+pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use split::{
     Batch, CachedSegment, Coverage, LedgerCache, LedgerMemory, LocalLedger, Outbox, Pending,
     RemoteLedger, SplitLedger,
@@ -40,6 +46,7 @@ pub use store::{
     Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,
     as_clause, follow, ledger_root_shape, node_id_shape,
 };
+pub use tiered::{FindingPlacement, Placement, RecordSeen, TieredTracker};
 pub use verdict::{FailReason, Population, Verdict};
 
 /// Where a project's committed manifest lives, relative to the project root

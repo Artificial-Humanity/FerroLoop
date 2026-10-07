@@ -742,7 +742,12 @@ mod tests {
     }
 
     impl Tracker for BrokenStore {
-        fn add_record(&self, _: &ProjectId, _: &str) -> Result<RecordId, StoreError> {
+        fn add_record_with_area(
+            &self,
+            _: &ProjectId,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<RecordId, StoreError> {
             Err(broken())
         }
         fn get_record(&self, _: &RecordId) -> Result<Option<Record>, StoreError> {
@@ -755,6 +760,13 @@ mod tests {
             Err(broken())
         }
         fn add_finding(&self, _: Finding) -> Result<FindingId, StoreError> {
+            Err(broken())
+        }
+        fn add_finding_checked(
+            &self,
+            _: Finding,
+            _: fl_core::routing::ForeignRecord,
+        ) -> Result<FindingId, StoreError> {
             Err(broken())
         }
         fn get_finding(&self, _: &FindingId) -> Result<Option<Finding>, StoreError> {

@@ -57,12 +57,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             cmd.adapter
         );
     }
-    let id = RecordId(refs::resolve(
-        ctx.handles,
-        &ctx.tracker_label,
-        Kind::Record,
-        &cmd.record,
-    )?);
+    let id = RecordId(ctx.resolve_item(Kind::Record, &cmd.record)?);
     let Some(record) = ctx.tracker.get_record(&id)? else {
         bail!(
             "`{}` is not a record in the store at {}. Run `fl record list --project <project>` \

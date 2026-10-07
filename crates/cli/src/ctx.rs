@@ -2,9 +2,13 @@
 //! §2.6): the local store for the catalog, whichever tracker the project is
 //! bound to, and whichever ledger it is bound to.
 
+use crate::refs::Ref;
+use anyhow::bail;
 use fl_core::decision::{Decision, Flushed, LeftLocal};
-use fl_core::ids::{GateId, ProjectId};
+use fl_core::ids::{GateId, Kind, ProjectId};
+use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
+use fl_core::routing::{GithubTier, Tier};
 use fl_core::store::{Handles, Ledger, Roles, StoreError, Tracker};
 use fl_store::RedbStore;
 use std::cell::RefCell;
@@ -30,6 +34,10 @@ pub struct Ctx<'a> {
     pub witness: Option<&'a Witness<'a>>,
     /// Where records and findings live, for messages.
     pub tracker_label: String,
+    /// A routed store's tiers (routing spec §1.3): the router — which is
+    /// also `tracker` — and the GitHub tier it opens lazily. `None` in an
+    /// unrouted store.
+    pub tiers: Option<&'a crate::tiers::Tiers<'a>>,
 }
 
 impl Ctx<'_> {
@@ -38,6 +46,65 @@ impl Ctx<'_> {
             catalog: self.store,
             tracker: self.tracker,
             ledger: self.ledger,
+        }
+    }
+
+    /// How a person reads a record's or finding's id (routing spec §2.3):
+    /// in a routed store a GitHub item is `#41` and a local one `41`, so
+    /// every printed handle can be typed back. Elsewhere, as before.
+    pub fn show_item(&self, kind: Kind, id: &Iri) -> anyhow::Result<String> {
+        let Some(t) = self.tiers else {
+            return crate::refs::show(self.handles, kind, id);
+        };
+        match t.router.tier_of(id) {
+            Tier::Local => crate::refs::show(self.store, kind, id),
+            Tier::Github => Ok(match t.github.open()?.handle_of(kind, id)? {
+                Some(n) => format!("#{n}"),
+                None => id.to_string(),
+            }),
+        }
+    }
+
+    /// The id a typed record or finding names (routing spec §2.3). In a
+    /// routed store `#41` is GitHub issue 41 and a bare `41` local item 41;
+    /// a bare number no local item holds asks whether `#41` was meant, when
+    /// this machine has the GitHub tier. Elsewhere, as before.
+    pub fn resolve_item(&self, kind: Kind, r: &Ref) -> anyhow::Result<Iri> {
+        let Some(t) = self.tiers else {
+            return crate::refs::resolve(self.handles, &self.tracker_label, kind, r);
+        };
+        let what = kind.as_wire();
+        match r {
+            Ref::Iri(i) => Ok(i.clone()),
+            Ref::Issue(n) => match t.github.open()?.resolve_handle(kind, *n)? {
+                Some(i) => Ok(i),
+                None => bail!(
+                    "there is no {what} #{n} in {}. List them to see the ones that exist.",
+                    t.github.repo_name().unwrap_or("the bound repository")
+                ),
+            },
+            Ref::Handle(n) => match self.store.resolve_handle(kind, *n)? {
+                Some(i) => Ok(i),
+                None if t.github.available() => bail!(
+                    "there is no {what} {n} in this machine's local tier. Did you mean `#{n}`? In \
+                     a routed project a bare number names a local item, and `#{n}` names GitHub \
+                     issue {n}."
+                ),
+                None => bail!(
+                    "there is no {what} {n} in this machine's local tier. List them to see the \
+                     ones that exist."
+                ),
+            },
+        }
+    }
+
+    /// Whether `id` is written where another machine reads it — on GitHub
+    /// — so a gate it names must be in the committed manifest (GitHub
+    /// tracker spec §4.3).
+    pub fn on_github(&self, id: &Iri) -> bool {
+        match self.tiers {
+            Some(t) => t.router.tier_of(id) == Tier::Github,
+            None => self.github.is_some(),
         }
     }
 }
@@ -150,6 +217,7 @@ mod tests {
             github_ledger: None,
             witness: None,
             tracker_label: String::new(),
+            tiers: None,
         };
         assert!(
             std::ptr::addr_eq(ctx.roles().ledger, &flushes as &dyn Ledger),

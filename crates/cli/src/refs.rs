@@ -7,7 +7,12 @@ use fl_core::{Handles, Iri, Kind};
 
 #[derive(Debug, Clone)]
 pub enum Ref {
+    /// A bare number: a local item in a routed store (routing spec §2.3),
+    /// the tracker's own handle elsewhere.
     Handle(u64),
+    /// `#41`: a GitHub issue in a routed store; elsewhere the same as a
+    /// bare number, as GitHub writes one.
+    Issue(u64),
     Iri(Iri),
 }
 
@@ -35,10 +40,17 @@ impl std::str::FromStr for Ref {
                 .map(Ref::Iri)
                 .map_err(|e| format!("`{s}` names an issue fl cannot address: {e}"));
         }
-        // A handle may be written `#41`, as GitHub writes an issue number.
-        let digits = s.strip_prefix('#').unwrap_or(s);
-        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+        if let Some(digits) = s.strip_prefix('#')
+            && !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+        {
             return digits
+                .parse::<u64>()
+                .map(Ref::Issue)
+                .map_err(|_| format!("`{s}` is too large to be an issue number"));
+        }
+        if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+            return s
                 .parse::<u64>()
                 .map(Ref::Handle)
                 .map_err(|_| format!("`{s}` is too large to be a handle"));
@@ -57,6 +69,7 @@ impl std::fmt::Display for Ref {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Ref::Handle(n) => write!(f, "{n}"),
+            Ref::Issue(n) => write!(f, "#{n}"),
             Ref::Iri(i) => write!(f, "{i}"),
         }
     }
@@ -67,7 +80,7 @@ impl std::fmt::Display for Ref {
 pub fn resolve(store: &dyn Handles, label: &str, kind: Kind, r: &Ref) -> Result<Iri> {
     match r {
         Ref::Iri(i) => Ok(i.clone()),
-        Ref::Handle(n) => match store.resolve_handle(kind, *n)? {
+        Ref::Handle(n) | Ref::Issue(n) => match store.resolve_handle(kind, *n)? {
             Some(i) => Ok(i),
             None => bail!(
                 "there is no {} {n} in the store at {label}. List them to see the ones that exist.",
@@ -92,7 +105,7 @@ pub fn iris(refs: &[&Ref]) -> Vec<Iri> {
     refs.iter()
         .filter_map(|r| match r {
             Ref::Iri(i) => Some(i.clone()),
-            Ref::Handle(_) => None,
+            Ref::Handle(_) | Ref::Issue(_) => None,
         })
         .collect()
 }
@@ -102,7 +115,8 @@ pub fn iris(refs: &[&Ref]) -> Vec<Iri> {
 /// the search to a different store, a handle alongside it must not be
 /// silently resolved against that other store's numbering.
 pub fn has_handle(refs: &[&Ref]) -> bool {
-    refs.iter().any(|r| matches!(r, Ref::Handle(_)))
+    refs.iter()
+        .any(|r| matches!(r, Ref::Handle(_) | Ref::Issue(_)))
 }
 
 #[cfg(test)]
@@ -121,10 +135,30 @@ mod tests {
         }
     }
 
+    // Routing spec §2.3: `#41` is GitHub's spelling, kept apart from a bare
+    // number, and each prints back as it was typed.
     #[test]
-    fn a_hash_handle_is_a_handle() {
-        assert!(matches!(parse("#41"), Ok(Ref::Handle(41))));
+    fn a_hash_number_is_an_issue_and_a_bare_one_a_handle() {
+        assert!(matches!(parse("#41"), Ok(Ref::Issue(41))));
         assert!(matches!(parse("41"), Ok(Ref::Handle(41))));
+        assert_eq!(parse("#41").unwrap().to_string(), "#41");
+        assert_eq!(parse("41").unwrap().to_string(), "41");
+        let (issue, handle) = (parse("#41").unwrap(), parse("41").unwrap());
+        assert!(has_handle(&[&issue]) && has_handle(&[&handle]));
+        assert!(iris(&[&issue, &handle]).is_empty());
+        assert!(parse("#").is_err() && parse("#4a").is_err());
+    }
+
+    // Outside a routed store, nothing changes: `#1` and `1` name one item.
+    #[test]
+    fn outside_a_routed_store_a_hash_number_and_a_bare_one_resolve_alike() {
+        use fl_core::store::{Catalog, Tracker};
+        let s = fl_core::MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        for typed in [Ref::Handle(1), Ref::Issue(1)] {
+            assert_eq!(resolve(&s, "memory", Kind::Record, &typed).unwrap(), r.0);
+        }
     }
 
     #[test]

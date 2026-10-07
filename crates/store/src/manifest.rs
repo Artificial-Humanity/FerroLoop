@@ -8,17 +8,22 @@
 
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::model::{GateDef, Transition};
+use fl_core::routing::RoutingMap;
 use fl_core::store::{Catalog, StoreError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 /// Format 1: gates and transitions. Format 2 adds `ledger_root` (GitHub
-/// ledger spec §6.1 step 4). An export writes 2 exactly when it carries a
-/// root, so a project with no GitHub ledger still exports a manifest every
-/// older fl reads.
-pub const MANIFEST_FORMAT: u64 = 2;
+/// ledger spec §6.1 step 4). Format 3 adds `routing` (routing spec §1.2),
+/// with a ledger root or without. An export writes the oldest format that
+/// holds what it carries ([`format_for`]), so a project with neither
+/// still exports a manifest every older fl reads.
 pub const MANIFEST_FORMAT_WITHOUT_LEDGER: u64 = 1;
+pub const MANIFEST_FORMAT_WITH_LEDGER: u64 = 2;
+pub const MANIFEST_FORMAT_WITH_ROUTING: u64 = 3;
+/// The newest format this fl reads.
+pub const MANIFEST_FORMAT: u64 = MANIFEST_FORMAT_WITH_ROUTING;
 pub use fl_core::MANIFEST_PATH;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,6 +61,10 @@ pub struct Body {
     /// and hashes — byte for byte as it did before format 2 existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger_root: Option<LedgerRoot>,
+    /// Format 3 only (routing spec §1.2). ⚠ Skipped when absent, so a body
+    /// of format 1 or 2 serializes — and hashes — byte for byte as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingMap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +113,13 @@ pub enum ManifestError {
     )]
     WouldRemoveGate { id: GateId, name: String },
     #[error(
+        "the manifest has no routing map, and this store imported one for project {0}. \
+         Importing it would un-route the project on this machine alone, so it is refused. The \
+         checked-out manifest may be older than the one this store imported: check out a \
+         commit whose manifest has the routing map"
+    )]
+    WouldDropRouting(ProjectId),
+    #[error(
         "project {other} in this store already uses the root {root}. Import into a separate \
          store with `fl --db <path> manifest import` — but doing that on the machine that \
          authors this project makes its IRIs ambiguous between the two stores — or use the \
@@ -133,14 +149,26 @@ pub fn content_sha256(body: &Body) -> Result<String, ManifestError> {
         .collect())
 }
 
-/// Every gate and transition of `project`, with pass marks cleared, and the
-/// ledger root when the project's repository has one.
+/// The format of a body carrying a ledger root and a routing map, or not:
+/// the oldest that holds both (routing spec §1.2).
+pub fn format_for(ledger_root: bool, routing: bool) -> u64 {
+    match (ledger_root, routing) {
+        (_, true) => MANIFEST_FORMAT_WITH_ROUTING,
+        (true, false) => MANIFEST_FORMAT_WITH_LEDGER,
+        (false, false) => MANIFEST_FORMAT_WITHOUT_LEDGER,
+    }
+}
+
+/// Every gate and transition of `project`, with pass marks cleared, the
+/// ledger root when the project's repository has one, and the routing map
+/// when the project has one.
 pub fn export(
     catalog: &dyn Catalog,
     project: &ProjectId,
     commit: &str,
     exported_at_unix: u64,
     ledger_root: Option<LedgerRoot>,
+    routing: Option<RoutingMap>,
 ) -> Result<Manifest, ManifestError> {
     if catalog.get_project(project)?.is_none() {
         return Err(ManifestError::Inconsistent(format!(
@@ -155,11 +183,7 @@ pub fn export(
     let mut transitions = catalog.list_transitions(project)?;
     transitions.sort_by(|a, b| a.name.cmp(&b.name));
     let body = Body {
-        format_version: if ledger_root.is_some() {
-            MANIFEST_FORMAT
-        } else {
-            MANIFEST_FORMAT_WITHOUT_LEDGER
-        },
+        format_version: format_for(ledger_root.is_some(), routing.is_some()),
         provenance: Provenance {
             commit: commit.to_string(),
             exported_at_unix,
@@ -168,6 +192,7 @@ pub fn export(
         gates,
         transitions,
         ledger_root,
+        routing,
     };
     let content_sha256 = content_sha256(&body)?;
     let m = Manifest {
@@ -229,28 +254,27 @@ impl Manifest {
 
     fn check_consistent(&self) -> Result<(), ManifestError> {
         let f = self.body.format_version;
-        match (&self.body.ledger_root, f) {
-            (None, MANIFEST_FORMAT_WITHOUT_LEDGER) => {}
-            (Some(root), MANIFEST_FORMAT) => {
-                fl_core::ledger_root_shape(&root.repository_node_id, &root.commit).map_err(
-                    |why| {
-                        ManifestError::Inconsistent(format!("its ledger root cannot be one: {why}"))
-                    },
-                )?;
-            }
-            (None, _) => {
-                return Err(ManifestError::Inconsistent(format!(
-                    "it is format {f} and carries no ledger root; only format \
-                     {MANIFEST_FORMAT} carries one, and every format {MANIFEST_FORMAT} manifest \
-                     does"
-                )));
-            }
-            (Some(_), _) => {
-                return Err(ManifestError::Inconsistent(format!(
-                    "it carries a ledger root but is format {f}; a manifest with a ledger root \
-                     is format {MANIFEST_FORMAT}"
-                )));
-            }
+        let want = format_for(self.body.ledger_root.is_some(), self.body.routing.is_some());
+        if f != want {
+            let carried = match (&self.body.ledger_root, &self.body.routing) {
+                (Some(_), Some(_)) => "a ledger root and a routing map",
+                (Some(_), None) => "a ledger root",
+                (None, Some(_)) => "a routing map",
+                (None, None) => "neither a ledger root nor a routing map",
+            };
+            return Err(ManifestError::Inconsistent(format!(
+                "it is format {f}, but what it carries — {carried} — is format {want}"
+            )));
+        }
+        if let Some(root) = &self.body.ledger_root {
+            fl_core::ledger_root_shape(&root.repository_node_id, &root.commit).map_err(|why| {
+                ManifestError::Inconsistent(format!("its ledger root cannot be one: {why}"))
+            })?;
+        }
+        if let Some(map) = &self.body.routing {
+            map.check().map_err(|why| {
+                ManifestError::Inconsistent(format!("its routing map is not valid: {why}"))
+            })?;
         }
         let p = &self.body.project;
         let mut ids = BTreeSet::new();
@@ -369,14 +393,14 @@ mod tests {
     #[test]
     fn an_export_round_trips_through_its_file_form() {
         let (s, p, _, _) = store();
-        let m = export(&s, &p, "abc", 7, None).unwrap();
+        let m = export(&s, &p, "abc", 7, None, None).unwrap();
         assert_eq!(Manifest::parse(&m.to_json()).unwrap(), m);
     }
 
     #[test]
     fn an_export_carries_only_the_named_project() {
         let (s, p, g1, g2) = store();
-        let m = export(&s, &p, "abc", 7, None).unwrap();
+        let m = export(&s, &p, "abc", 7, None, None).unwrap();
         let ids: Vec<_> = m.body.gates.iter().map(|g| g.id.clone()).collect();
         assert_eq!(ids, vec![g1, g2]);
         assert_eq!(m.body.transitions.len(), 1);
@@ -388,14 +412,14 @@ mod tests {
         let mut def = s.get_gate(&g1).unwrap().unwrap();
         def.last_pass_commit = Some("abc".into());
         s.update_gate(&def).unwrap();
-        let m = export(&s, &p, "abc", 7, None).unwrap();
+        let m = export(&s, &p, "abc", 7, None, None).unwrap();
         assert!(m.body.gates.iter().all(|g| g.last_pass_commit.is_none()));
     }
 
     #[test]
     fn a_hand_edit_is_refused() {
         let (s, p, _, _) = store();
-        let text = export(&s, &p, "abc", 7, None)
+        let text = export(&s, &p, "abc", 7, None, None)
             .unwrap()
             .to_json()
             .replace("\"name\": \"fmt\"", "\"name\": \"fmt2\"");
@@ -407,7 +431,7 @@ mod tests {
     #[test]
     fn a_future_format_is_named_as_one() {
         let (s, p, _, _) = store();
-        let text = export(&s, &p, "abc", 7, None)
+        let text = export(&s, &p, "abc", 7, None, None)
             .unwrap()
             .to_json()
             .replace("\"format_version\": 1", "\"format_version\": 9");
@@ -442,7 +466,7 @@ mod tests {
     #[test]
     fn a_manifest_with_no_ledger_root_is_format_1_and_an_older_fl_reads_it() {
         let (s, p, _, _) = store();
-        let m = export(&s, &p, "abc", 7, None).unwrap();
+        let m = export(&s, &p, "abc", 7, None, None).unwrap();
         assert_eq!(m.body.format_version, 1);
         let text = m.to_json();
         assert!(!text.contains("ledger_root"), "{text}");
@@ -471,7 +495,7 @@ mod tests {
     fn a_ledger_root_that_cannot_be_one_is_refused_even_with_a_correct_hash() {
         let (s, p, _, _) = store();
         for (node, commit) in [("R_1", "abc123"), ("", COMMIT), ("1R", COMMIT)] {
-            let mut m = export(&s, &p, "abc", 7, Some(root())).unwrap();
+            let mut m = export(&s, &p, "abc", 7, Some(root()), None).unwrap();
             m.body.ledger_root = Some(LedgerRoot {
                 repository_node_id: node.into(),
                 commit: commit.into(),
@@ -490,6 +514,7 @@ mod tests {
                     repository_node_id: node.into(),
                     commit: commit.into(),
                 }),
+                None,
             )
             .unwrap_err();
             assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
@@ -499,7 +524,7 @@ mod tests {
     #[test]
     fn a_manifest_with_a_ledger_root_is_format_2_and_round_trips() {
         let (s, p, _, _) = store();
-        let m = export(&s, &p, "abc", 7, Some(root())).unwrap();
+        let m = export(&s, &p, "abc", 7, Some(root()), None).unwrap();
         assert_eq!(m.body.format_version, 2);
         let back = Manifest::parse(&m.to_json()).unwrap();
         assert_eq!(back.body.ledger_root, Some(root()));
@@ -509,21 +534,88 @@ mod tests {
     #[test]
     fn a_root_on_format_1_or_no_root_on_format_2_is_refused() {
         let (s, p, _, _) = store();
-        let mut m = export(&s, &p, "abc", 7, None).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None, None).unwrap();
         m.body.ledger_root = Some(root());
         let err = rehashed(m).verify().unwrap_err();
         assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
 
-        let mut m = export(&s, &p, "abc", 7, Some(root())).unwrap();
+        let mut m = export(&s, &p, "abc", 7, Some(root()), None).unwrap();
         m.body.ledger_root = None;
         let err = rehashed(m).verify().unwrap_err();
         assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
     }
 
+    fn routes() -> fl_core::RoutingMap {
+        fl_core::RoutingMap::starting()
+    }
+
+    // Routing spec §1.2: the oldest format that holds what the manifest
+    // carries, so a project without routing exports what every older fl
+    // reads.
+    #[test]
+    fn the_format_is_the_oldest_that_holds_what_the_manifest_carries() {
+        let (s, p, _, _) = store();
+        for (root, routing, want) in [
+            (None, None, 1),
+            (Some(root()), None, 2),
+            (None, Some(routes()), 3),
+            (Some(root()), Some(routes()), 3),
+        ] {
+            let m = export(&s, &p, "abc", 7, root, routing.clone()).unwrap();
+            assert_eq!(m.body.format_version, want);
+            let back = Manifest::parse(&m.to_json()).unwrap();
+            assert_eq!(back.body.routing, routing);
+            assert_eq!(back, m);
+        }
+        let text = export(&s, &p, "abc", 7, None, None).unwrap().to_json();
+        assert!(!text.contains("routing"), "skipped when absent: {text}");
+    }
+
+    #[test]
+    fn a_map_on_a_format_it_does_not_belong_to_or_not_valid_is_refused() {
+        let (s, p, _, _) = store();
+        let mut m = export(&s, &p, "abc", 7, None, Some(routes())).unwrap();
+        m.body.format_version = 2;
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Inconsistent(ref w) if w.contains("but what it carries")),
+            "{err}"
+        );
+        let mut m = export(&s, &p, "abc", 7, None, Some(routes())).unwrap();
+        m.body.routing = None;
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
+        let mut m = export(&s, &p, "abc", 7, None, Some(routes())).unwrap();
+        m.body.routing.as_mut().unwrap().areas[0].area = "Code".into();
+        let err = rehashed(m).verify().unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Inconsistent(ref w) if w.contains("its routing map is not valid")),
+            "{err}"
+        );
+        let mut bad = routes();
+        bad.areas.swap(0, 1);
+        assert!(
+            export(&s, &p, "abc", 7, None, Some(bad)).is_err(),
+            "never exported"
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_routing_map_is_refused() {
+        let (s, p, _, _) = store();
+        let text = export(&s, &p, "abc", 7, None, Some(routes()))
+            .unwrap()
+            .to_json();
+        let edited = text.replacen("\"tier\": \"local\"", "\"tier\": \"github\"", 1);
+        assert_ne!(edited, text, "the edit must have landed");
+        let err = Manifest::parse(&edited).unwrap_err();
+        assert!(matches!(err, ManifestError::HandEdited { .. }), "{err}");
+    }
+
     #[test]
     fn a_transition_naming_an_unlisted_gate_is_refused_even_with_a_correct_hash() {
         let (s, p, _, g2) = store();
-        let mut m = export(&s, &p, "abc", 7, None).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None, None).unwrap();
         m.body.gates.retain(|g| g.id != g2);
         m.content_sha256 = content_sha256(&m.body).unwrap();
         let err = Manifest::parse(&m.to_json()).unwrap_err();
@@ -539,7 +631,7 @@ mod tests {
     #[test]
     fn a_gate_of_another_project_is_refused() {
         let (s, p, g1, _) = store();
-        let mut m = export(&s, &p, "abc", 7, None).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None, None).unwrap();
         let g = m.body.gates.iter_mut().find(|g| g.id == g1).unwrap();
         g.project = ProjectId(fl_core::ids::seq_iri(999));
         let err = rehashed(m).verify().unwrap_err();
@@ -549,7 +641,7 @@ mod tests {
     #[test]
     fn a_pass_mark_in_the_file_is_refused() {
         let (s, p, _, _) = store();
-        let mut m = export(&s, &p, "abc", 7, None).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None, None).unwrap();
         m.body.gates[0].last_pass_commit = Some("abc".into());
         let err = rehashed(m).verify().unwrap_err();
         assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
@@ -558,13 +650,13 @@ mod tests {
     #[test]
     fn a_gate_or_transition_listed_twice_is_refused() {
         let (s, p, _, _) = store();
-        let mut m = export(&s, &p, "abc", 7, None).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None, None).unwrap();
         let dup = m.body.gates[0].clone();
         m.body.gates.push(dup);
         let err = rehashed(m).verify().unwrap_err();
         assert!(matches!(err, ManifestError::Inconsistent(_)), "{err}");
 
-        let mut m = export(&s, &p, "abc", 7, None).unwrap();
+        let mut m = export(&s, &p, "abc", 7, None, None).unwrap();
         let dup = m.body.transitions[0].clone();
         m.body.transitions.push(dup);
         let err = rehashed(m).verify().unwrap_err();
@@ -574,7 +666,7 @@ mod tests {
     #[test]
     fn currency_ignores_the_pass_mark_and_sees_every_other_change() {
         let (s, p, g1, _) = store();
-        let m = export(&s, &p, "abc", 7, None).unwrap();
+        let m = export(&s, &p, "abc", 7, None, None).unwrap();
         let mut def = s.get_gate(&g1).unwrap().unwrap();
         def.last_pass_commit = Some("zzz".into());
         assert_eq!(m.currency_of(&def), Currency::Current);

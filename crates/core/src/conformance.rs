@@ -145,7 +145,7 @@ fn run_bound<F: Fixture>(
 /// How many cases [`catalog`] runs. Update deliberately — see [`run_suite`].
 const CATALOG_CASES: usize = 3;
 /// How many cases [`tracker`] runs. Update deliberately — see [`run_suite`].
-const TRACKER_CASES: usize = 12;
+const TRACKER_CASES: usize = 14;
 /// How many cases [`ledger`] runs. Update deliberately — see [`run_suite`].
 const LEDGER_CASES: usize = 4;
 /// How many cases [`split_ledger`] runs. Update deliberately — see [`run_suite`].
@@ -180,6 +180,8 @@ pub fn tracker<F: Fixture>(make: impl Fn() -> F) {
         set_record_state_and_update_finding_through_an_alias_touch_the_primary_once,
         a_finding_raised_against_a_record_alias_stores_the_primary,
         update_finding_keeps_the_stored_aliases_whatever_the_caller_holds,
+        an_area_given_at_creation_reads_back,
+        an_update_keeps_what_a_finding_was_raised_with,
     ];
     run_bound("tracker", TRACKER_CASES, cases, make);
 }
@@ -833,6 +835,79 @@ pub fn update_finding_keeps_the_stored_aliases_whatever_the_caller_holds(roles: 
             .id,
         fid,
         "the alias still resolves"
+    );
+}
+
+/// Routing spec §1.1: an area given when an item is made is stored with it
+/// and reads back.
+fn an_area_given_at_creation_reads_back(roles: &Bound<'_>) {
+    let p = roles.catalog.add_project("/p").unwrap();
+    let r = roles
+        .tracker
+        .add_record_with_area(&p, "t", Some("code"))
+        .unwrap();
+    assert_eq!(
+        roles
+            .tracker
+            .get_record(&r)
+            .unwrap()
+            .unwrap()
+            .area
+            .as_deref(),
+        Some("code")
+    );
+    let mut f = Finding::raise(p, r, "reviewer", "claim");
+    f.area = Some("code".into());
+    let id = roles.tracker.add_finding(f).unwrap();
+    assert_eq!(
+        roles
+            .tracker
+            .get_finding(&id)
+            .unwrap()
+            .unwrap()
+            .area
+            .as_deref(),
+        Some("code")
+    );
+}
+
+/// Routing spec §1.1: an item keeps its area for its whole life — and a
+/// finding its record, its raiser and its security mark: an update never
+/// takes them from the caller.
+fn an_update_keeps_what_a_finding_was_raised_with(roles: &Bound<'_>) {
+    let p = roles.catalog.add_project("/p").unwrap();
+    let r = roles
+        .tracker
+        .add_record_with_area(&p, "t", Some("code"))
+        .unwrap();
+    let other = roles
+        .tracker
+        .add_record_with_area(&p, "u", Some("code"))
+        .unwrap();
+    let mut f = Finding::raise(p, r.clone(), "reviewer", "claim");
+    f.area = Some("code".into());
+    let id = roles.tracker.add_finding(f).unwrap();
+    let mut changed = roles.tracker.get_finding(&id).unwrap().unwrap();
+    changed.area = Some("tests".into());
+    changed.record = other;
+    changed.security = true;
+    changed.raised_by = "someone else".into();
+    changed.withdraw("no").unwrap();
+    roles.tracker.update_finding(&changed).unwrap();
+    let back = roles.tracker.get_finding(&id).unwrap().unwrap();
+    assert_eq!(
+        back.state,
+        FindingState::Withdrawn,
+        "the caller's state is written"
+    );
+    assert_eq!(
+        (
+            back.area.as_deref(),
+            back.record,
+            back.security,
+            back.raised_by.as_str()
+        ),
+        (Some("code"), r, false, "reviewer")
     );
 }
 

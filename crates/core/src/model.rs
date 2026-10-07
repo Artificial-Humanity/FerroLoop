@@ -125,6 +125,11 @@ pub struct Record {
     /// existed still reads.
     #[serde(default)]
     pub also_known_as: Vec<Iri>,
+    /// The record's area (routing spec §1.1), fixed for its whole life.
+    /// `None` for a record made before areas, or outside a routed project.
+    /// Skipped when absent, so such a record is stored exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area: Option<String>,
 }
 
 crate::wire::wire_tags!(Selector as selector_wire {
@@ -175,6 +180,22 @@ mod tests {
         assert_eq!(State::from_wire("needs_human"), Some(State::NeedsHuman));
         assert_eq!(State::NeedsHuman.as_wire(), "needs_human");
         assert_eq!(State::from_wire("nonsense"), None);
+    }
+
+    #[test]
+    fn a_record_without_an_area_is_stored_as_before_and_reads_as_none() {
+        let r = Record {
+            id: RecordId(seq_iri(1)),
+            project: ProjectId(seq_iri(2)),
+            title: "t".into(),
+            state: State::Todo,
+            also_known_as: vec![],
+            area: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v.get("area").is_none(), "skipped when absent: {v}");
+        let back: Record = serde_json::from_value(v).unwrap();
+        assert_eq!(back, r);
     }
 
     #[test]

@@ -63,6 +63,7 @@ Commands:
   stats       Report what a project's recorded attempts cost
   manifest    Share a project's gates through a committed manifest
   github      GitHub tracker: who fl writes as, and repair of a diverged issue
+  routing     Route a project's new items between its local store and GitHub
   help        Print this message or the help of the given subcommand(s)
 
 Options:
