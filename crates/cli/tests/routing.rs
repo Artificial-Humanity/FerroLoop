@@ -2311,3 +2311,49 @@ fn finding_list_takes_exactly_one_of_project_and_record() {
         .failure()
         .stderr(contains("cannot be used with"));
 }
+
+/// The note a successful `--not-sensitive` prints when it adds an area or
+/// clears a sensitive one.
+const THIS_MACHINE_ONLY: &str = "checked only this machine's local tier";
+
+impl R {
+    /// `fl args`, which must succeed; its stderr.
+    fn ok_stderr(&self, args: &[&str]) -> String {
+        let out = self.fl().args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "fl {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stderr).unwrap()
+    }
+}
+
+// Routing spec decision 23: a `--not-sensitive` that succeeds says fl
+// checked only this machine's local tier — where the risk is — once; one
+// that changes nothing, and a `--sensitive` set, say nothing of it.
+#[test]
+fn a_successful_not_sensitive_says_only_this_machines_local_tier_was_checked() {
+    let g = world(BOUND);
+    g.routed();
+    let set = |rest: &[&str]| {
+        let mut args = vec!["routing", "set", "--project", "1"];
+        args.extend(rest);
+        g.ok_stderr(&args)
+    };
+    once(
+        &set(&["ops", "local", "--not-sensitive"]),
+        THIS_MACHINE_ONLY,
+    );
+    once(
+        &set(&["security", "github", "--not-sensitive"]),
+        THIS_MACHINE_ONLY,
+    );
+    for quiet in [
+        set(&["code", "local", "--not-sensitive"]),
+        set(&["ci", "local", "--sensitive"]),
+        set(&["ci", "github", "--sensitive"]),
+    ] {
+        assert!(!quiet.contains(THIS_MACHINE_ONLY), "{quiet}");
+    }
+}

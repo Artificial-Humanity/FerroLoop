@@ -176,6 +176,15 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, was_github: Option<bool>) -> Result<i32> {
                     eprintln!("{}", handle_change(was_github));
                 }
             }
+            // Routing spec decision 23: the check passed on what this
+            // machine can see, which is where the risk is.
+            if clears {
+                eprintln!(
+                    "note: fl checked only this machine's local tier, and GitHub, for items that \
+                     name `{area}`: another machine's local items may still name it, and no \
+                     longer count as sensitive"
+                );
+            }
             print_route(map.route(&area).expect("the area was just set"));
         }
         Cmd::Remove { project, area } => {

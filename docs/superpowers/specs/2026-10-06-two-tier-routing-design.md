@@ -120,8 +120,10 @@ how an item moves between the tiers.
     removes a sensitive area that only another machine's local records name, sets it again
     with no flag, and exports; the area came back not sensitive, and once imported a finding
     about such a record reached a public repository with only a warning. The refusal comes
-    before anything is written and names both flags. The "this machine only" note is the one
-    a refused clearing gives: fl reads only this machine's local tier.
+    before anything is written and names both flags. The "this machine only" note: a refused
+    clearing or re-add says fl reads only this machine's local tier, and one that succeeds —
+    adding an area, or clearing a sensitive one — prints a `note:` saying fl checked only this
+    machine's local tier; a `--not-sensitive` that changes nothing prints none.
 
 ### 0.2 Out of scope
 

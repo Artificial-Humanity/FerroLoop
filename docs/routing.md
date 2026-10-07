@@ -122,7 +122,9 @@ It is refused, by the same check and with the same list, while any item in eithe
 area. Setting an area the map does not declare — a removed one again, or a new one — needs
 `--sensitive` or `--not-sensitive`, and `--not-sensitive` there is refused by the same check.
 That check reads only this machine's local tier: after `--not-sensitive`, another machine's
-local items that name the area no longer count as sensitive.
+local items that name the area no longer count as sensitive. A `--not-sensitive` that adds an area
+or clears a sensitive one says so in a `note:` when it succeeds; one that changes nothing says
+nothing.
 
 ## Limits
 
