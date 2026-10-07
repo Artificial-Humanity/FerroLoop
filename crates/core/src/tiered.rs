@@ -2,6 +2,7 @@
 //! two tiers — the local store for developer-level items, a GitHub
 //! repository for human-level ones — routing each new item by its area.
 
+use crate::escalation::{Escalations, Mark};
 use crate::finding::Finding;
 use crate::ids::{FindingId, Kind, ProjectId, RecordId};
 use crate::iri::Iri;
@@ -22,6 +23,8 @@ pub struct TieredTracker<'a> {
     pub routes: &'a dyn Routes,
     /// The GitHub tier, opened on the first call that needs it (§2.6).
     pub github: &'a dyn GithubTier,
+    /// The local tier's marks and tombstones (§3.6): the local store.
+    pub escalations: &'a dyn Escalations,
 }
 
 /// Where a new record goes, decided before anything is written (§2.1).
@@ -118,23 +121,35 @@ impl<'a> TieredTracker<'a> {
         })
     }
 
-    /// `act` in the tier that owns `id` (§2.2): an issue of the bound
-    /// repository in GitHub; any other id in the local tier, then — if the
-    /// local tier never held it — in GitHub, whose alias scan finds an item
-    /// another machine moved there. With no binding, an issue URL the local
-    /// tier does not hold is the missing tier's (§1.3). ⚠ An id neither tier
-    /// holds is `Elsewhere`, never `NotOwned`; a tier that cannot be reached
-    /// is its own error, never "not held".
+    /// `act` in the tier that owns `id` (§2.2), given the id to act on: an
+    /// issue of the bound repository in GitHub; any other id in the local
+    /// tier, then — if the local tier never held it — in GitHub, whose alias
+    /// scan finds an item another machine moved there. With no binding, an
+    /// issue URL the local tier does not hold is the missing tier's (§1.3).
+    /// An id the local tier holds as a tombstone is GitHub's, asked once
+    /// for the tombstone's target (§3.6): GitHub's answer for that issue is
+    /// the answer. An id the local tier holds marked escalating is its
+    /// issue once the issue exists and GitHub reads it (§2.2); otherwise,
+    /// best effort, the local item, which refuses every write.
+    /// ⚠ An id neither tier holds is `Elsewhere`, never `NotOwned`; outside
+    /// that best effort, a tier that cannot be reached is its own error,
+    /// never "not held".
     pub(crate) fn route<T>(
         &self,
         id: &Iri,
-        act: impl Fn(&dyn Tracker) -> Result<T, StoreError>,
+        act: impl Fn(&dyn Tracker, &Iri) -> Result<T, StoreError>,
     ) -> Result<(Tier, T), StoreError> {
         if self.github.claims(id) {
-            return Ok((Tier::Github, act(self.github.tracker()?)?));
+            return Ok((Tier::Github, act(self.github.tracker()?, id)?));
         }
-        let mut searched = match act(self.local) {
+        if let Some(issue) = self.issue_of_marked(id)? {
+            return Ok((Tier::Github, act(self.github.tracker()?, &issue)?));
+        }
+        let mut searched = match act(self.local, id) {
             Err(StoreError::NotOwned { searched, .. }) => searched,
+            Err(StoreError::Escalated { to, .. }) => {
+                return Ok((Tier::Github, act(self.github.tracker()?, &to)?));
+            }
             other => return Ok((Tier::Local, other?)),
         };
         if !self.github.available() {
@@ -149,7 +164,7 @@ impl<'a> TieredTracker<'a> {
             }
             .into());
         }
-        match act(self.github.tracker()?) {
+        match act(self.github.tracker()?, id) {
             Err(StoreError::NotOwned {
                 searched: theirs, ..
             }) => {
@@ -166,10 +181,79 @@ impl<'a> TieredTracker<'a> {
 
     /// The record `id` names, and the tier that holds it.
     pub(crate) fn record_of(&self, id: &RecordId) -> Result<(Tier, Record), StoreError> {
-        match self.route(id.iri(), |t| t.get_record(id))? {
+        match self.route(id.iri(), |t, id| t.get_record(&RecordId(id.clone())))? {
             (tier, Some(r)) => Ok((tier, r)),
             (_, None) => Err(StoreError::NoSuchRecord(id.clone())),
         }
+    }
+
+    /// The mark on `id` when the local tier holds it marked escalating
+    /// (§2.4, §3.3 step 1). An id GitHub claims is GitHub's, so it has none,
+    /// and GitHub is not asked.
+    pub fn escalating(&self, id: &Iri) -> Result<Option<Mark>, StoreError> {
+        if self.tier_of(id) == Tier::Github {
+            return Ok(None);
+        }
+        self.escalations.mark_of(id)
+    }
+
+    /// The issue of an item the local tier holds marked escalating, when
+    /// its escalation made one that GitHub reads as an fl item (§2.2: a
+    /// marked item and the GitHub issue whose alias is its IRI are one
+    /// item). The search is the escalation's own — by the item's primary
+    /// IRI, back to the mark's time — and only a marked item pays for it.
+    /// ⚠ Best effort: no issue found, an issue fl cannot read (a stop
+    /// between the create and its labels leaves one), and a GitHub that
+    /// cannot be opened or reached all answer `None`, so the local item
+    /// answers — as it last was, and refusing every write (§3.3 step 1). No
+    /// write lands in two places.
+    fn issue_of_marked(&self, id: &Iri) -> Result<Option<Iri>, StoreError> {
+        let Some(mark) = self.escalations.mark_of(id)? else {
+            return Ok(None);
+        };
+        let Ok(github) = self.github.tracker() else {
+            return Ok(None);
+        };
+        let kind = self.catalog.kind_of(id)?;
+        let primary = match kind {
+            Kind::Finding => self
+                .local
+                .get_finding(&FindingId(id.clone()))?
+                .map(|f| f.id.0),
+            _ => self
+                .local
+                .get_record(&RecordId(id.clone()))?
+                .map(|r| r.id.0),
+        };
+        let Some(primary) = primary else {
+            return Ok(None);
+        };
+        let Ok(Some(issue)) = self.github.find_escalated(&primary, mark.at_ms) else {
+            return Ok(None);
+        };
+        let readable = match kind {
+            Kind::Finding => github
+                .get_finding(&FindingId(issue.clone()))
+                .is_ok_and(|f| f.is_some()),
+            _ => github
+                .get_record(&RecordId(issue.clone()))
+                .is_ok_and(|r| r.is_some()),
+        };
+        Ok(readable.then_some(issue))
+    }
+
+    /// `finding` with its record as the record now is (§2.5 "Evidence",
+    /// §3.5): a local record escalated since the finding was raised is named
+    /// by its issue. The stored reference is not rewritten — stores ignore
+    /// the record on an update. An id GitHub claims is never looked up
+    /// locally.
+    fn as_now(&self, mut finding: Finding) -> Result<Finding, StoreError> {
+        if self.tier_of(finding.record.iri()) == Tier::Local
+            && let Some(t) = self.escalations.tombstone_of(finding.record.iri())?
+        {
+            finding.record = RecordId(t.to);
+        }
+        Ok(finding)
     }
 
     fn check_project(&self, project: &ProjectId) -> Result<(), StoreError> {
@@ -398,11 +482,11 @@ impl TieredTracker<'_> {
             let got = self.read(tier, only, |t| t.list_records(project))?;
             out.extend(got.into_iter().map(|r| (tier, r)));
         }
-        Ok(out)
+        self.one_copy(out, |r| (r.id.iri(), &r.also_known_as))
     }
 
     /// The project's findings in both tiers, or in `only`, each with its
-    /// tier (§2.4).
+    /// tier (§2.4) and its record as the record now is (§2.5).
     pub fn findings(
         &self,
         project: &ProjectId,
@@ -410,8 +494,36 @@ impl TieredTracker<'_> {
     ) -> Result<Vec<(Tier, Finding)>, StoreError> {
         let mut out = Vec::new();
         for tier in tiers(only) {
-            let got = self.read(tier, only, |t| t.list_findings(project))?;
-            out.extend(got.into_iter().map(|f| (tier, f)));
+            for f in self.read(tier, only, |t| t.list_findings(project))? {
+                out.push((tier, self.as_now(f)?));
+            }
+        }
+        self.one_copy(out, |f| (f.id.iri(), &f.also_known_as))
+    }
+
+    /// `items` without the local copy of a marked item whose issue is in
+    /// the same list (§2.2: they are one item, and the issue is the one
+    /// shown). The issue names the item's IRI among its aliases, so nothing
+    /// more is asked of GitHub. A list of the local tier alone keeps the
+    /// copy, listed with its mark (§2.4).
+    fn one_copy<T>(
+        &self,
+        items: Vec<(Tier, T)>,
+        names: impl Fn(&T) -> (&Iri, &Vec<Iri>),
+    ) -> Result<Vec<(Tier, T)>, StoreError> {
+        let issued: std::collections::BTreeSet<Iri> = items
+            .iter()
+            .filter(|(tier, _)| *tier == Tier::Github)
+            .flat_map(|(_, item)| names(item).1.iter().cloned())
+            .collect();
+        let mut out = Vec::with_capacity(items.len());
+        for (tier, item) in items {
+            let id = names(&item).0;
+            let its_issue_listed = tier == Tier::Local && issued.contains(id);
+            if its_issue_listed && self.escalations.mark_of(id)?.is_some() {
+                continue;
+            }
+            out.push((tier, item));
         }
         Ok(out)
     }
@@ -467,7 +579,8 @@ impl Tracker for TieredTracker<'_> {
     }
 
     fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
-        self.route(id.iri(), |t| t.get_record(id)).map(|(_, r)| r)
+        self.route(id.iri(), |t, id| t.get_record(&RecordId(id.clone())))
+            .map(|(_, r)| r)
     }
 
     fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError> {
@@ -479,8 +592,10 @@ impl Tracker for TieredTracker<'_> {
     }
 
     fn set_record_state(&self, id: &RecordId, state: State) -> Result<(), StoreError> {
-        self.route(id.iri(), |t| t.set_record_state(id, state))
-            .map(drop)
+        self.route(id.iri(), |t, id| {
+            t.set_record_state(&RecordId(id.clone()), state)
+        })
+        .map(drop)
     }
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
@@ -500,12 +615,19 @@ impl Tracker for TieredTracker<'_> {
     }
 
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
-        self.route(id.iri(), |t| t.get_finding(id)).map(|(_, f)| f)
+        match self.route(id.iri(), |t, id| t.get_finding(&FindingId(id.clone())))? {
+            (_, Some(f)) => Ok(Some(self.as_now(f)?)),
+            (_, None) => Ok(None),
+        }
     }
 
     fn update_finding(&self, finding: &Finding) -> Result<(), StoreError> {
-        self.route(finding.id.iri(), |t| t.update_finding(finding))
-            .map(drop)
+        self.route(finding.id.iri(), |t, id| {
+            let mut finding = finding.clone();
+            finding.id = FindingId(id.clone());
+            t.update_finding(&finding)
+        })
+        .map(drop)
     }
 
     fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError> {
@@ -521,7 +643,7 @@ impl Tracker for TieredTracker<'_> {
     }
 
     fn add_alias(&self, primary: &Iri, alias: Iri) -> Result<(), StoreError> {
-        self.route(primary, |t| t.add_alias(primary, alias.clone()))
+        self.route(primary, |t, id| t.add_alias(id, alias.clone()))
             .map(drop)
     }
 }
@@ -530,6 +652,7 @@ impl Tracker for TieredTracker<'_> {
 mod tests {
     use super::*;
     use crate::MemStore;
+    use crate::escalation::{Escalations, Mark, Outgoing, Provenance};
     use crate::finding::FindingState;
     use crate::mem_issues::MemIssues;
     use crate::model::{CommandSpec, GateKind, PopulationDelivery, Selector, State};
@@ -560,6 +683,7 @@ mod tests {
                 local: &self.local,
                 routes: &self.local,
                 github: &self.issues,
+                escalations: &self.local,
             }
         }
 
@@ -568,6 +692,46 @@ mod tests {
             let t = self.router();
             let at = t.place_record(&self.p, Some(area), None).unwrap();
             t.add_record_at(&self.p, title, &at).unwrap()
+        }
+
+        /// `old`, a local item, marked and then replaced by a tombstone that
+        /// points to `to` (routing spec §3.3 steps 1 and 3).
+        fn tombstone(&self, old: &Iri, to: &Iri) {
+            self.local.mark(old, &mark()).unwrap();
+            self.local.tombstone(old, to).unwrap();
+        }
+
+        /// The local record `old` escalated by hand: its issue made in the
+        /// GitHub tier, then the mark and the tombstone.
+        fn escalated(&self, old: &RecordId, title: &str) -> RecordId {
+            let issue = self
+                .issues
+                .add_record_with_area(&self.p, title, Some("code"))
+                .unwrap();
+            self.tombstone(old.iri(), issue.iri());
+            issue
+        }
+
+        /// The issue an escalation of `item` makes (routing spec §3.3 step
+        /// 2): keyed by the item's IRI, which is its first alias, and with no
+        /// tombstone yet — a stop before step 3.
+        fn issued(&self, item: Outgoing) -> Iri {
+            let from = Provenance {
+                from: item.id().clone(),
+                by: mark().by,
+                reason: mark().reason,
+            };
+            self.issues
+                .create_escalated(&item, &from, mark().at_ms)
+                .unwrap()
+        }
+    }
+
+    fn mark() -> Mark {
+        Mark {
+            by: "alice".into(),
+            reason: "a person decides".into(),
+            at_ms: 1,
         }
     }
 
@@ -922,6 +1086,7 @@ mod tests {
             local: &w.local,
             routes: &every,
             github: &w.issues,
+            escalations: &w.local,
         };
         let kind = GateKind::Command(CommandSpec {
             program: "true".into(),
@@ -1278,6 +1443,377 @@ mod tests {
         assert_eq!(w.local.get_finding(&id).unwrap().unwrap().record, r1);
     }
 
+    // Routing spec §2.2, §3.6: an escalated item's old IRI reaches its
+    // issue — a read, a write, and a finding raised about it, which is
+    // written about the issue and crosses tiers through the router's proof.
+    #[test]
+    fn a_tombstoned_id_is_followed_to_its_issue() {
+        let w = world();
+        let t = w.router();
+        let old = w.record("code", "fix");
+        let issue = w.escalated(&old, "fix");
+        assert_eq!(t.get_record(&old).unwrap().unwrap().id, issue);
+        t.set_record_state(&old, State::Doing).unwrap();
+        assert_eq!(
+            w.issues.get_record(&issue).unwrap().unwrap().state,
+            State::Doing
+        );
+        let mut stays = Finding::raise(w.p.clone(), old.clone(), "rev", "stays");
+        stays.area = Some("code".into());
+        let at = t.place_finding(&stays, None).unwrap();
+        assert_eq!(
+            (at.record().id.clone(), at.record().tier, at.at().tier()),
+            (issue.clone(), Tier::Github, Tier::Local)
+        );
+        let id = t.add_finding(stays).unwrap();
+        assert_eq!(t.tier_of(id.iri()), Tier::Local);
+        assert_eq!(w.local.get_finding(&id).unwrap().unwrap().record, issue);
+        let mut moves = Finding::raise(w.p.clone(), old.clone(), "rev", "moves");
+        moves.area = Some("design".into());
+        let id = t.add_finding(moves).unwrap();
+        assert_eq!(w.issues.get_finding(&id).unwrap().unwrap().record, issue);
+        // A finding's old IRI: read, updated — from a copy read before the
+        // escalation — and given an alias, on GitHub.
+        let mut f = Finding::raise(w.p.clone(), old.clone(), "rev", "c");
+        f.area = Some("code".into());
+        let old_f = t.add_finding(f).unwrap();
+        let mut before = t.get_finding(&old_f).unwrap().unwrap();
+        let gh_f = w
+            .issues
+            .add_finding(Finding::raise(w.p.clone(), issue.clone(), "rev", "c"))
+            .unwrap();
+        w.tombstone(old_f.iri(), gh_f.iri());
+        assert_eq!(t.get_finding(&old_f).unwrap().unwrap().id, gh_f);
+        before.withdraw("no").unwrap();
+        t.update_finding(&before).unwrap();
+        assert_eq!(
+            w.issues.get_finding(&gh_f).unwrap().unwrap().state,
+            FindingState::Withdrawn
+        );
+        let alias = crate::ids::seq_iri(88);
+        t.add_alias(old_f.iri(), alias.clone()).unwrap();
+        assert_eq!(t.get_finding(&FindingId(alias)).unwrap().unwrap().id, gh_f);
+    }
+
+    // Routing spec §2.5: GitHub that cannot be reached while a tombstone is
+    // followed is that tier's error, never "held elsewhere" or "no such
+    // record".
+    #[test]
+    fn following_a_tombstone_to_an_unbound_or_unreachable_github_is_that_tiers_error() {
+        let w = world();
+        let t = w.router();
+        let old = w.record("code", "fix");
+        w.escalated(&old, "fix");
+        w.issues.set_unbound(true);
+        let err = t.get_record(&old).unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::TierUnavailable { .. })),
+            "{err:?}"
+        );
+        let err = t.set_record_state(&old, State::Doing).unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::TierUnavailable { .. })),
+            "{err:?}"
+        );
+        w.issues.set_unbound(false);
+        w.issues.set_down(true);
+        let err = t.get_record(&old).unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+    }
+
+    // A tombstone is followed once, to GitHub: its target is GitHub's answer
+    // for that id, even when GitHub does not hold it — never "held
+    // elsewhere", and never a second hop through the local tier.
+    #[test]
+    fn a_tombstone_is_followed_once_and_its_target_is_githubs_answer() {
+        let w = world();
+        let t = w.router();
+        let old = w.record("code", "gone");
+        let gone = MemIssues::issue(42);
+        w.tombstone(old.iri(), &gone);
+        assert_eq!(t.get_record(&old).unwrap(), None, "GitHub's answer");
+        let err = t.set_record_state(&old, State::Doing).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::NoSuchRecord(r) if r.iri() == &gone),
+            "{err:?}"
+        );
+        let first = w.record("code", "first");
+        let second = w.record("code", "second");
+        w.escalated(&second, "second");
+        w.tombstone(first.iri(), second.iri());
+        let err = t.get_record(&first).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::NotOwned { id, .. } if id == second.iri()),
+            "GitHub's answer for {second}: {err:?}"
+        );
+    }
+
+    // Routing spec §2.5 ("Evidence"), §3.5: a finding's record is shown as
+    // the record now is — its issue, once escalated — in either tier, while
+    // the stored reference stays as it was raised.
+    #[test]
+    fn a_findings_record_reads_as_its_issue_once_escalated() {
+        let w = world();
+        let t = w.router();
+        let old = w.record("code", "fix");
+        let mut f = Finding::raise(w.p.clone(), old.clone(), "rev", "here");
+        f.area = Some("code".into());
+        let local_f = t.add_finding(f).unwrap();
+        let mut g = Finding::raise(w.p.clone(), old.clone(), "rev", "there");
+        g.area = Some("design".into());
+        let gh_f = t.add_finding(g).unwrap();
+        let issue = w.escalated(&old, "fix");
+        assert_eq!(t.get_finding(&local_f).unwrap().unwrap().record, issue);
+        assert_eq!(t.get_finding(&gh_f).unwrap().unwrap().record, issue);
+        let listed: Vec<RecordId> = t
+            .findings(&w.p, None)
+            .unwrap()
+            .into_iter()
+            .map(|(_, f)| f.record)
+            .collect();
+        assert_eq!(listed, vec![issue.clone(), issue.clone()]);
+        assert_eq!(t.list_findings(&w.p).unwrap()[0].record, issue);
+        let mut back = t.get_finding(&local_f).unwrap().unwrap();
+        back.withdraw("no").unwrap();
+        t.update_finding(&back).unwrap();
+        let stored = w.local.get_finding(&local_f).unwrap().unwrap();
+        assert_eq!(
+            (stored.state, stored.record),
+            (FindingState::Withdrawn, old),
+            "stores ignore the record on an update"
+        );
+    }
+
+    // Routing spec §2.2: an issue of the bound repository is GitHub's, even
+    // when the local tier holds its URL as an alias of an escalating or
+    // escalated item — no mark is read for it, and no tombstone rewrites it.
+    #[test]
+    fn an_issue_url_is_never_read_through_a_local_mark_or_tombstone() {
+        let w = world();
+        let t = w.router();
+        let gh = w.record("design", "on github");
+        let local = w.record("code", "local");
+        let unmarked = w.record("code", "unmarked");
+        w.local.add_alias(local.iri(), gh.iri().clone()).unwrap();
+        w.local.mark(local.iri(), &mark()).unwrap();
+        let asked = w.issues.asked();
+        assert_eq!(t.escalating(local.iri()).unwrap(), Some(mark()));
+        assert_eq!(t.escalating(unmarked.iri()).unwrap(), None);
+        assert_eq!(t.escalating(gh.iri()).unwrap(), None);
+        assert_eq!(w.issues.asked(), asked, "GitHub is not asked for a mark");
+        let issue = w
+            .issues
+            .add_record_with_area(&w.p, "local", Some("code"))
+            .unwrap();
+        w.local.tombstone(local.iri(), issue.iri()).unwrap();
+        let mut f = Finding::raise(w.p.clone(), gh.clone(), "rev", "c");
+        f.area = Some("design".into());
+        let id = t.add_finding(f).unwrap();
+        assert_eq!(t.get_finding(&id).unwrap().unwrap().record, gh);
+        assert_eq!(t.findings(&w.p, None).unwrap()[0].1.record, gh);
+    }
+
+    // Routing spec §2.4, §3.6: a marked item reads as itself and refuses a
+    // write through the router; a tombstoned item is not listed.
+    #[test]
+    fn a_marked_item_refuses_a_write_and_a_tombstoned_one_is_not_listed() {
+        let w = world();
+        let t = w.router();
+        let marked = w.record("code", "marked");
+        let mut f = Finding::raise(w.p.clone(), marked.clone(), "rev", "c");
+        f.area = Some("code".into());
+        let kept = t.add_finding(f.clone()).unwrap();
+        let gone_f = t.add_finding(f).unwrap();
+        w.local.mark(marked.iri(), &mark()).unwrap();
+        let err = t.set_record_state(&marked, State::Doing).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Escalating { id, .. } if id == marked.iri()),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("so this store refuses to change it"),
+            "{err}"
+        );
+        assert_eq!(t.get_record(&marked).unwrap().unwrap().id, marked);
+        let gone = w.record("code", "gone");
+        let issue = w.escalated(&gone, "gone");
+        w.tombstone(gone_f.iri(), &MemIssues::issue(50));
+        let records: Vec<(Tier, RecordId)> = t
+            .records(&w.p, None)
+            .unwrap()
+            .into_iter()
+            .map(|(tier, r)| (tier, r.id))
+            .collect();
+        assert_eq!(records, vec![(Tier::Local, marked), (Tier::Github, issue)]);
+        let findings: Vec<(Tier, FindingId)> = t
+            .findings(&w.p, None)
+            .unwrap()
+            .into_iter()
+            .map(|(tier, f)| (tier, f.id))
+            .collect();
+        assert_eq!(findings, vec![(Tier::Local, kept)]);
+    }
+
+    // Routing spec §1.2: an escalated item is named once, by the tier it
+    // lives in now.
+    #[test]
+    fn an_escalated_item_names_its_area_only_from_its_issue() {
+        let w = world();
+        let t = w.router();
+        let old = w.record("code", "fix");
+        let issue = w.escalated(&old, "fix");
+        assert_eq!(
+            t.items_naming_area(&w.p, "code").unwrap(),
+            vec![(Tier::Github, Kind::Record, issue.0)]
+        );
+    }
+
+    // Routing spec §2.2: a marked item and the issue whose alias is its IRI
+    // are one item. Until the issue exists the old IRI reads the local item;
+    // once it does, any name of the item reads, writes and places a finding
+    // about the issue. An unmarked item asks nothing of GitHub.
+    #[test]
+    fn a_marked_item_is_its_issue_once_the_issue_exists() {
+        let w = world();
+        let t = w.router();
+        let r = w.record("code", "fix");
+        let alias = crate::ids::seq_iri(77);
+        w.local.add_alias(r.iri(), alias.clone()).unwrap();
+        let mut f = Finding::raise(w.p.clone(), r.clone(), "rev", "c");
+        f.area = Some("code".into());
+        let f = t.add_finding(f).unwrap();
+        let asked = w.issues.asked();
+        assert_eq!(t.get_record(&r).unwrap().unwrap().id, r);
+        assert_eq!(w.issues.asked(), asked, "an unmarked item asks nothing");
+        w.local.mark(r.iri(), &mark()).unwrap();
+        w.local.mark(f.iri(), &mark()).unwrap();
+        assert_eq!(t.get_record(&r).unwrap().unwrap().id, r, "no issue yet");
+        assert_eq!(t.get_finding(&f).unwrap().unwrap().id, f, "no issue yet");
+        let record = w.local.get_record(&r).unwrap().unwrap();
+        let issue = RecordId(w.issued(Outgoing::Record {
+            record,
+            findings: vec![],
+        }));
+        let finding = w.local.get_finding(&f).unwrap().unwrap();
+        let seen = RecordSeen {
+            id: issue.clone(),
+            title: "fix".into(),
+            tier: Tier::Github,
+        };
+        let f_issue = FindingId(w.issued(Outgoing::Finding {
+            finding,
+            record: seen,
+        }));
+        assert_eq!(t.get_record(&r).unwrap().unwrap().id, issue);
+        assert_eq!(t.get_record(&RecordId(alias)).unwrap().unwrap().id, issue);
+        assert_eq!(t.get_finding(&f).unwrap().unwrap().id, f_issue);
+        let mut about = Finding::raise(w.p.clone(), r.clone(), "rev", "about");
+        about.area = Some("code".into());
+        let at = t.place_finding(&about, None).unwrap();
+        assert_eq!(
+            (at.record().id.clone(), at.record().tier),
+            (issue.clone(), Tier::Github)
+        );
+        t.set_record_state(&r, State::Doing).unwrap();
+        assert_eq!(
+            w.issues.get_record(&issue).unwrap().unwrap().state,
+            State::Doing
+        );
+        assert_eq!(
+            w.local.get_record(&r).unwrap().unwrap().state,
+            State::Todo,
+            "the local item is not written"
+        );
+    }
+
+    // Routing spec §2.2, §3.3 step 1: a marked item's issue takes over only
+    // when GitHub answers for it. A GitHub that cannot be opened or reached
+    // leaves the local item — even when the issue exists — which reads as
+    // itself and refuses a write.
+    #[test]
+    fn a_marked_item_with_github_unbound_or_unreachable_is_the_local_item() {
+        let w = world();
+        let t = w.router();
+        let r = w.record("code", "fix");
+        w.local.mark(r.iri(), &mark()).unwrap();
+        let record = w.local.get_record(&r).unwrap().unwrap();
+        w.issued(Outgoing::Record {
+            record,
+            findings: vec![],
+        });
+        for (unbound, down) in [(true, false), (false, true)] {
+            w.issues.set_unbound(unbound);
+            w.issues.set_down(down);
+            let read = t.get_record(&r).unwrap().unwrap();
+            assert_eq!(read.id, r, "unbound {unbound}, down {down}");
+            let err = t.set_record_state(&r, State::Doing).unwrap_err();
+            assert!(
+                matches!(&err, StoreError::Escalating { id, .. } if id == r.iri()),
+                "unbound {unbound}, down {down}: {err:?}"
+            );
+        }
+    }
+
+    // Routing spec §2.2, §2.4: a merged list shows a marked item whose issue
+    // exists once — as the issue; a list of the local tier alone still shows
+    // the local item. An unmarked local item stays listed even when an issue
+    // names it among its aliases.
+    #[test]
+    fn a_merged_list_shows_a_marked_item_with_an_issue_once() {
+        let w = world();
+        let t = w.router();
+        let r = w.record("code", "fix");
+        let other = w.record("code", "other");
+        let mut f = Finding::raise(w.p.clone(), r.clone(), "rev", "c");
+        f.area = Some("code".into());
+        let f = t.add_finding(f).unwrap();
+        w.local.mark(r.iri(), &mark()).unwrap();
+        w.local.mark(f.iri(), &mark()).unwrap();
+        let record = w.local.get_record(&r).unwrap().unwrap();
+        let issue = RecordId(w.issued(Outgoing::Record {
+            record,
+            findings: vec![],
+        }));
+        let finding = w.local.get_finding(&f).unwrap().unwrap();
+        let seen = RecordSeen {
+            id: issue.clone(),
+            title: "fix".into(),
+            tier: Tier::Github,
+        };
+        let f_issue = FindingId(w.issued(Outgoing::Finding {
+            finding,
+            record: seen,
+        }));
+        let stray = w
+            .issues
+            .add_record_with_area(&w.p, "stray", Some("code"))
+            .unwrap();
+        w.issues.add_alias(stray.iri(), other.0.clone()).unwrap();
+        let records = |only: Option<Tier>| -> Vec<(Tier, RecordId)> {
+            let got = t.records(&w.p, only).unwrap();
+            got.into_iter().map(|(tier, r)| (tier, r.id)).collect()
+        };
+        assert_eq!(
+            records(None),
+            vec![
+                (Tier::Local, other.clone()),
+                (Tier::Github, issue),
+                (Tier::Github, stray)
+            ]
+        );
+        assert_eq!(
+            records(Some(Tier::Local)),
+            vec![(Tier::Local, r), (Tier::Local, other)]
+        );
+        let findings = |only: Option<Tier>| -> Vec<(Tier, FindingId)> {
+            let got = t.findings(&w.p, only).unwrap();
+            got.into_iter().map(|(tier, f)| (tier, f.id)).collect()
+        };
+        assert_eq!(findings(None), vec![(Tier::Github, f_issue)]);
+        assert_eq!(findings(Some(Tier::Local)), vec![(Tier::Local, f)]);
+    }
+
     /// The tracker suites make items without an area, which a routed
     /// project refuses: this gives each one `code`, which every map here
     /// declares, and passes everything else through.
@@ -1341,6 +1877,7 @@ mod tests {
                 local: &self.local,
                 routes: &self.every,
                 github: &self.issues,
+                escalations: &self.local,
             };
             let tracker = WithCode(&router);
             f(&crate::conformance::Bound {

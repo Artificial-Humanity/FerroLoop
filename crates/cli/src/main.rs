@@ -762,6 +762,7 @@ fn run(cli: Cli) -> Result<i32> {
         local: &store,
         routes: &store,
         github: l,
+        escalations: &store,
     });
     let tiers = match (&tiered, &lazy) {
         (Some(router), Some(github)) => Some(tiers::Tiers { router, github }),

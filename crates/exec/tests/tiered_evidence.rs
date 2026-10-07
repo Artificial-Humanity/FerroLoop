@@ -43,6 +43,7 @@ fn a_github_finding_about_a_local_record_tags_its_evidence_with_the_local_iri() 
         local: &local,
         routes: &local,
         github: &issues,
+        escalations: &local,
     };
     let r = router
         .add_record_with_area(&p, "fix the parser", Some("code"))
