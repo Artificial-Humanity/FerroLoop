@@ -82,9 +82,11 @@ map does not declare is refused, naming the declared ones; so are `--area` and `
 project without a routing map.
 
 A finding and its record may be in different tiers. A finding on GitHub about a local record
-shows the record's title and id as text; on a repository that is not private, fl warns before it
+shows the record's title and IRI as text; on a repository that is not private, fl warns before it
 publishes them — and refuses, saying to use `--tier local`, when the record is in a sensitive
 area: nothing about an item in a sensitive area reaches a repository that is not private.
+A record whose area the map no longer declares counts as sensitive here, since it may have been
+declared sensitive once.
 
 A finding made in a sensitive area is a security finding. When the map would send a security
 finding, or any item of a sensitive area, to a repository that is not private, fl refuses and

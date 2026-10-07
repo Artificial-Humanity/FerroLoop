@@ -184,14 +184,25 @@ impl<'a> TieredTracker<'a> {
     }
 
     /// The private-repository rule (GitHub tracker spec §6). When the map
-    /// chose the tier, the refusal names `--tier local` (§2.1).
+    /// chose the tier, the refusal names `--tier local` (§2.1); when the
+    /// person named it, the refusal says what was refused and does not claim
+    /// the map sent it.
     fn private_or_refuse(&self, by_map: bool, what: &str) -> Result<(), StoreError> {
         match self.github.require_private() {
-            Err(StoreError::SecurityNotPrivate { repo, visibility }) if by_map => {
-                Err(RoutingFault::SensitiveToPublic {
-                    what: what.to_string(),
-                    repo,
-                    visibility,
+            Err(StoreError::SecurityNotPrivate { repo, visibility }) => {
+                let what = what.to_string();
+                Err(if by_map {
+                    RoutingFault::SensitiveToPublic {
+                        what,
+                        repo,
+                        visibility,
+                    }
+                } else {
+                    RoutingFault::SensitiveNamedPublic {
+                        what,
+                        repo,
+                        visibility,
+                    }
                 }
                 .into())
             }
@@ -783,8 +794,21 @@ mod tests {
         // Named by the person, the tier is theirs: the tracker's own refusal.
         let err = t.place_finding(&f, Some(Tier::Github)).unwrap_err();
         assert!(
-            matches!(err, StoreError::SecurityNotPrivate { .. }),
+            matches!(fault(&err), Some(RoutingFault::SensitiveNamedPublic { .. })),
             "{err:?}"
+        );
+        let err = t
+            .place_record(&w.p, Some("security"), Some(Tier::Github))
+            .unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::SensitiveNamedPublic { .. })),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("this record is security-sensitive")
+                && !err.to_string().contains("routing map"),
+            "{err}"
         );
         assert!(w.issues.list_records(&w.p).unwrap().is_empty());
         assert!(w.issues.list_findings(&w.p).unwrap().is_empty());
@@ -821,7 +845,7 @@ mod tests {
         );
         let err = t.place_finding(&f, Some(Tier::Github)).unwrap_err();
         assert!(
-            matches!(err, StoreError::SecurityNotPrivate { .. }),
+            matches!(fault(&err), Some(RoutingFault::SensitiveNamedPublic { .. })),
             "{err:?}"
         );
         assert!(w.issues.list_findings(&w.p).unwrap().is_empty());

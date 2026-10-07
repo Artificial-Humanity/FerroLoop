@@ -288,6 +288,17 @@ pub enum RoutingFault {
         repo: String,
         visibility: String,
     },
+    /// The same rule, for a tier the person named: the map did not choose it,
+    /// so the message does not say it did.
+    #[error(
+        "refused: {what} is security-sensitive, and {repo}, whose visibility is `{visibility}`, \
+         is not private. Use the local tier for it, or bind a private repository"
+    )]
+    SensitiveNamedPublic {
+        what: String,
+        repo: String,
+        visibility: String,
+    },
 }
 
 /// Names for a refusal, or `none`.
@@ -508,6 +519,14 @@ mod tests {
                     visibility: "public".into(),
                 },
                 "--tier local",
+            ),
+            (
+                RoutingFault::SensitiveNamedPublic {
+                    what: "this record".into(),
+                    repo: "acme/widgets".into(),
+                    visibility: "public".into(),
+                },
+                "this record is security-sensitive",
             ),
         ] {
             let msg = StoreError::from(fault).to_string();

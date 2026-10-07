@@ -1011,6 +1011,26 @@ fn a_sensitive_area_routed_to_a_public_repository_creates_nothing_and_names_tier
         .assert()
         .failure()
         .stderr(contains("security-sensitive"));
+    // Named by the person, the tier is theirs, and the refusal still speaks of
+    // the record rather than of a security finding.
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "s",
+            "--area",
+            "security",
+            "--tier",
+            "github",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("this record is security-sensitive").and(contains("a security finding").not()),
+        );
     assert_eq!(g.fake.issue_count(), 0, "nothing created on GitHub");
     g.fl()
         .args([
@@ -1168,4 +1188,33 @@ fn a_finding_on_the_authoring_machine_needs_the_map_exported() {
         .assert()
         .failure()
         .stderr(contains("changed since the manifest at"));
+}
+
+// Routing spec §2.5: the warning comes before the write, and a visibility
+// that cannot be read refuses the create — an unknown visibility is not
+// private. Nothing is written.
+#[test]
+fn a_visibility_that_cannot_be_read_refuses_a_finding_about_a_local_record_unwritten() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "fix the parser",
+        "--area",
+        "code",
+    ]);
+    // Opening GitHub reads the repository once; the warning's read is next.
+    g.fake.state().fail_repo_read_after = Some(1);
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "design",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("could not read the visibility of acme/widgets"));
+    assert_eq!(g.fake.issue_count(), 0, "nothing created on GitHub");
 }
