@@ -5,9 +5,9 @@
 use crate::finding::Finding;
 use crate::ids::{FindingId, Kind, ProjectId, RecordId};
 use crate::iri::Iri;
-use crate::model::Record;
+use crate::model::{Record, State};
 use crate::routing::{ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
-use crate::store::{Catalog, StoreError, Tracker};
+use crate::store::{Catalog, StoreError, Tracker, as_clause};
 
 /// `Tracker` over a project's two tiers (routing spec §2). The CLI builds
 /// it for a routed store; the gate engine sees one tracker, as before.
@@ -339,12 +339,182 @@ impl<'a> TieredTracker<'a> {
     }
 }
 
+/// Both tiers, local first, or the one asked for.
+fn tiers(only: Option<Tier>) -> Vec<Tier> {
+    match only {
+        Some(t) => vec![t],
+        None => Tier::ALL.to_vec(),
+    }
+}
+
+impl TieredTracker<'_> {
+    /// `act` over one tier's tracker. ⚠ In a merged read (`only` is `None`)
+    /// a GitHub tier that cannot be read refuses the whole read, naming
+    /// `--tier local` (§2.4): a list that cannot see its whole population
+    /// fails.
+    fn read<T>(
+        &self,
+        tier: Tier,
+        only: Option<Tier>,
+        act: impl Fn(&dyn Tracker) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        match self.tracker_in(tier).and_then(act) {
+            Err(e) if only.is_none() && tier == Tier::Github => Err(RoutingFault::TierUnreadable {
+                tier,
+                cause: as_clause(&e),
+            }
+            .into()),
+            other => other,
+        }
+    }
+
+    /// The project's records in both tiers, or in `only`, each with its
+    /// tier (§2.4).
+    pub fn records(
+        &self,
+        project: &ProjectId,
+        only: Option<Tier>,
+    ) -> Result<Vec<(Tier, Record)>, StoreError> {
+        let mut out = Vec::new();
+        for tier in tiers(only) {
+            let got = self.read(tier, only, |t| t.list_records(project))?;
+            out.extend(got.into_iter().map(|r| (tier, r)));
+        }
+        Ok(out)
+    }
+
+    /// The project's findings in both tiers, or in `only`, each with its
+    /// tier (§2.4).
+    pub fn findings(
+        &self,
+        project: &ProjectId,
+        only: Option<Tier>,
+    ) -> Result<Vec<(Tier, Finding)>, StoreError> {
+        let mut out = Vec::new();
+        for tier in tiers(only) {
+            let got = self.read(tier, only, |t| t.list_findings(project))?;
+            out.extend(got.into_iter().map(|f| (tier, f)));
+        }
+        Ok(out)
+    }
+
+    /// How many findings `actor` raised and withdrew, summed over both
+    /// tiers, or in `only` (§2.4).
+    pub fn withdrawals_in(&self, actor: &str, only: Option<Tier>) -> Result<u64, StoreError> {
+        let mut n = 0;
+        for tier in tiers(only) {
+            n += self.read(tier, only, |t| t.withdrawals_by(actor))?;
+        }
+        Ok(n)
+    }
+
+    /// Every item of `project` that names `area` (§1.2): this machine's
+    /// local tier, and GitHub by the items' blocks. ⚠ A tier that cannot be
+    /// read is an error: the removal this serves must see every item.
+    pub fn items_naming_area(
+        &self,
+        project: &ProjectId,
+        area: &str,
+    ) -> Result<Vec<(Tier, Kind, Iri)>, StoreError> {
+        let mut out = Vec::new();
+        for r in self.local.list_records(project)? {
+            if r.area.as_deref() == Some(area) {
+                out.push((Tier::Local, Kind::Record, r.id.0));
+            }
+        }
+        for f in self.local.list_findings(project)? {
+            if f.area.as_deref() == Some(area) {
+                out.push((Tier::Local, Kind::Finding, f.id.0));
+            }
+        }
+        // Open the tier first: with no binding it is the missing tier's
+        // error, whatever the tier would answer for an area (§2.4).
+        self.github.tracker()?;
+        for (kind, id) in self.github.items_in_area(project, area)? {
+            out.push((Tier::Github, kind, id));
+        }
+        Ok(out)
+    }
+}
+
+impl Tracker for TieredTracker<'_> {
+    fn add_record_with_area(
+        &self,
+        project: &ProjectId,
+        title: &str,
+        area: Option<&str>,
+    ) -> Result<RecordId, StoreError> {
+        let at = self.place_record(project, area, None)?;
+        self.add_record_at(project, title, &at)
+    }
+
+    fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
+        self.route(id.iri(), |t| t.get_record(id)).map(|(_, r)| r)
+    }
+
+    fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError> {
+        Ok(self
+            .records(project, None)?
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect())
+    }
+
+    fn set_record_state(&self, id: &RecordId, state: State) -> Result<(), StoreError> {
+        self.route(id.iri(), |t| t.set_record_state(id, state))
+            .map(drop)
+    }
+
+    fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
+        let at = self.place_finding(&finding, None)?;
+        self.add_finding_at(finding, &at)
+    }
+
+    /// ⚠ The router checks every reference itself and never trusts a proof
+    /// it did not build (§2.5): this places the finding as `add_finding`
+    /// does, and drops `_record`.
+    fn add_finding_checked(
+        &self,
+        finding: Finding,
+        _record: ForeignRecord,
+    ) -> Result<FindingId, StoreError> {
+        self.add_finding(finding)
+    }
+
+    fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
+        self.route(id.iri(), |t| t.get_finding(id)).map(|(_, f)| f)
+    }
+
+    fn update_finding(&self, finding: &Finding) -> Result<(), StoreError> {
+        self.route(finding.id.iri(), |t| t.update_finding(finding))
+            .map(drop)
+    }
+
+    fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError> {
+        Ok(self
+            .findings(project, None)?
+            .into_iter()
+            .map(|(_, f)| f)
+            .collect())
+    }
+
+    fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError> {
+        self.withdrawals_in(actor, None)
+    }
+
+    fn add_alias(&self, primary: &Iri, alias: Iri) -> Result<(), StoreError> {
+        self.route(primary, |t| t.add_alias(primary, alias.clone()))
+            .map(drop)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::MemStore;
+    use crate::finding::FindingState;
     use crate::mem_issues::MemIssues;
-    use crate::model::{CommandSpec, GateKind, PopulationDelivery, Selector};
+    use crate::model::{CommandSpec, GateKind, PopulationDelivery, Selector, State};
 
     /// A project with the starting map in a local `MemStore`, and an
     /// in-memory GitHub tier.
@@ -748,5 +918,356 @@ mod tests {
             "{err:?}"
         );
         assert!(w.issues.list_records(&as_project).unwrap().is_empty());
+    }
+
+    // Routing spec §2.2: by IRI, the router asks the tier that owns it.
+    #[test]
+    fn a_lookup_asks_the_tier_whose_form_the_id_has() {
+        let w = world();
+        let t = w.router();
+        let local = w.record("code", "l");
+        let gh = w.record("design", "g");
+        let asked = w.issues.asked();
+        assert_eq!(t.get_record(&local).unwrap().unwrap().title, "l");
+        assert_eq!(w.issues.asked(), asked, "a local id never opens GitHub");
+        assert_eq!(t.get_record(&gh).unwrap().unwrap().title, "g");
+        // An issue of the bound repository is GitHub's, even when the local
+        // tier holds the same IRI as an alias.
+        let taken = MemIssues::issue(9);
+        w.local.add_alias(local.iri(), taken.clone()).unwrap();
+        assert_eq!(
+            t.get_record(&RecordId(taken)).unwrap(),
+            None,
+            "GitHub's answer"
+        );
+        w.issues.set_unbound(true);
+        let err = t.get_record(&gh).unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::TierUnavailable { .. })),
+            "an issue URL is the missing tier's, never held elsewhere: {err:?}"
+        );
+    }
+
+    // Routing spec §1.3, §2.2: with no binding, an alias that is another
+    // repository's issue URL is still found in the local tier.
+    #[test]
+    fn with_no_binding_another_repositorys_issue_url_held_locally_is_found_there() {
+        let w = world();
+        let t = w.router();
+        let local = w.record("code", "l");
+        let old = Iri::parse("https://github.com/o/r/issues/41").unwrap();
+        w.local.add_alias(local.iri(), old.clone()).unwrap();
+        w.issues.set_unbound(true);
+        assert_eq!(t.get_record(&RecordId(old)).unwrap().unwrap().id, local);
+        let err = t
+            .get_record(&RecordId(
+                Iri::parse("https://github.com/o/r/issues/42").unwrap(),
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::TierUnavailable { .. })),
+            "{err:?}"
+        );
+    }
+
+    // Routing spec §2.2: never `NotOwned`, as if the id were malformed.
+    #[test]
+    fn an_id_neither_tier_holds_is_held_elsewhere_never_not_owned() {
+        let w = world();
+        let t = w.router();
+        let stranger = RecordId(crate::ids::seq_iri(99));
+        let err = t.get_record(&stranger).unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::Elsewhere { .. })),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("another machine's local tier")
+                && msg.contains("memory")
+                && msg.contains("github:acme/widgets"),
+            "{msg}"
+        );
+        w.issues.set_unbound(true);
+        let asked = w.issues.asked();
+        let err = t.set_record_state(&stranger, State::Doing).unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::Elsewhere { .. })),
+            "{err:?}"
+        );
+        assert_eq!(w.issues.asked(), asked, "an unbound machine asks no GitHub");
+    }
+
+    // Routing spec §2.2: a urn the local store does not hold may be an item
+    // another machine moved to GitHub; GitHub's alias scan finds it.
+    #[test]
+    fn a_local_id_this_store_does_not_hold_is_found_by_githubs_alias_scan() {
+        let w = world();
+        let t = w.router();
+        let gh = w.record("design", "moved here");
+        let old = crate::ids::seq_iri(77);
+        w.issues.add_alias(gh.iri(), old.clone()).unwrap();
+        assert_eq!(t.get_record(&RecordId(old)).unwrap().unwrap().id, gh);
+    }
+
+    #[test]
+    fn a_fallback_to_an_unreachable_github_is_an_error_not_not_found() {
+        let w = world();
+        let t = w.router();
+        w.issues.set_down(true);
+        let err = t
+            .get_record(&RecordId(crate::ids::seq_iri(99)))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn writes_go_to_the_tier_that_holds_the_item() {
+        let w = world();
+        let t = w.router();
+        let local = w.record("code", "l");
+        let gh = w.record("design", "g");
+        t.set_record_state(&local, State::Doing).unwrap();
+        t.set_record_state(&gh, State::Review).unwrap();
+        assert_eq!(
+            w.local.get_record(&local).unwrap().unwrap().state,
+            State::Doing
+        );
+        assert_eq!(
+            w.issues.get_record(&gh).unwrap().unwrap().state,
+            State::Review
+        );
+        let f = t
+            .add_finding(Finding::raise(w.p.clone(), gh, "rev", "c"))
+            .unwrap();
+        let mut back = t.get_finding(&f).unwrap().unwrap();
+        back.withdraw("no").unwrap();
+        t.update_finding(&back).unwrap();
+        assert_eq!(
+            w.issues.get_finding(&f).unwrap().unwrap().state,
+            FindingState::Withdrawn
+        );
+    }
+
+    // Routing spec §2.5: the router never trusts a proof it did not build.
+    #[test]
+    fn the_router_trusts_no_proof_it_did_not_build() {
+        let w = world();
+        let t = w.router();
+        let local = w.record("code", "l");
+        let mut f = Finding::raise(w.p.clone(), local.clone(), "rev", "c");
+        f.area = Some("design".into());
+        let lie = ForeignRecord::for_tests(local, "l", Tier::Github);
+        let id = t.add_finding_checked(f, lie).unwrap();
+        assert_eq!(
+            t.tier_of(id.iri()),
+            Tier::Github,
+            "placed by its area, as add_finding"
+        );
+    }
+
+    // Routing spec §2.4: both tiers merged, each item with its tier.
+    #[test]
+    fn a_merged_list_holds_both_tiers_and_names_each_items_tier() {
+        let w = world();
+        let t = w.router();
+        let local = w.record("code", "l");
+        let gh = w.record("design", "g");
+        let both: Vec<(Tier, RecordId)> = t
+            .records(&w.p, None)
+            .unwrap()
+            .into_iter()
+            .map(|(tier, r)| (tier, r.id))
+            .collect();
+        assert_eq!(
+            both,
+            vec![(Tier::Local, local.clone()), (Tier::Github, gh.clone())]
+        );
+        assert_eq!(t.list_records(&w.p).unwrap().len(), 2);
+        assert_eq!(t.records(&w.p, Some(Tier::Local)).unwrap().len(), 1);
+        assert_eq!(t.records(&w.p, Some(Tier::Github)).unwrap()[0].1.id, gh);
+        t.add_finding(Finding::raise(w.p.clone(), local, "rev", "c"))
+            .unwrap();
+        assert_eq!(t.findings(&w.p, None).unwrap()[0].0, Tier::Local);
+        assert_eq!(t.list_findings(&w.p).unwrap().len(), 1);
+    }
+
+    // Routing spec §2.4: "a list that cannot see its whole population fails".
+    #[test]
+    fn a_merged_list_refuses_when_the_github_tier_cannot_be_read() {
+        let w = world();
+        let t = w.router();
+        w.record("code", "l");
+        for (down, unbound) in [(true, false), (false, true)] {
+            w.issues.set_down(down);
+            w.issues.set_unbound(unbound);
+            for err in [
+                t.records(&w.p, None).unwrap_err(),
+                t.findings(&w.p, None).unwrap_err(),
+                t.withdrawals_in("rev", None).unwrap_err(),
+                t.list_records(&w.p).unwrap_err(),
+            ] {
+                assert!(
+                    matches!(fault(&err), Some(RoutingFault::TierUnreadable { .. })),
+                    "{err:?}"
+                );
+                assert!(err.to_string().contains("--tier local"), "{err}");
+            }
+            assert_eq!(
+                t.records(&w.p, Some(Tier::Local)).unwrap().len(),
+                1,
+                "the local tier alone still reads"
+            );
+        }
+        w.issues.set_unbound(false);
+        w.issues.set_down(true);
+        let err = t.records(&w.p, Some(Tier::Github)).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Unreachable { .. }),
+            "one tier asked for is its own error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn withdrawals_sum_both_tiers_or_count_the_one_asked() {
+        let w = world();
+        let t = w.router();
+        for area in ["code", "design"] {
+            let r = w.record(area, "t");
+            let f = t
+                .add_finding(Finding::raise(w.p.clone(), r, "hasty", "c"))
+                .unwrap();
+            let mut back = t.get_finding(&f).unwrap().unwrap();
+            back.withdraw("no").unwrap();
+            t.update_finding(&back).unwrap();
+        }
+        assert_eq!(t.withdrawals_by("hasty").unwrap(), 2);
+        assert_eq!(t.withdrawals_in("hasty", Some(Tier::Local)).unwrap(), 1);
+        assert_eq!(t.withdrawals_in("hasty", Some(Tier::Github)).unwrap(), 1);
+    }
+
+    // Routing spec §1.2: removing an area needs every item that names it,
+    // in both tiers; a tier that cannot be read refuses.
+    #[test]
+    fn items_naming_an_area_are_found_in_both_tiers_and_an_unreadable_tier_refuses() {
+        let w = world();
+        let t = w.router();
+        let l = w.record("code", "l");
+        let at = t
+            .place_record(&w.p, Some("code"), Some(Tier::Github))
+            .unwrap();
+        let g = t.add_record_at(&w.p, "g", &at).unwrap();
+        let mut f = Finding::raise(w.p.clone(), l.clone(), "rev", "c");
+        f.area = Some("code".into());
+        let lf = t.add_finding(f).unwrap();
+        w.record("design", "other");
+        let found = t.items_naming_area(&w.p, "code").unwrap();
+        assert_eq!(
+            found,
+            vec![
+                (Tier::Local, Kind::Record, l.0),
+                (Tier::Local, Kind::Finding, lf.0),
+                (Tier::Github, Kind::Record, g.0),
+            ]
+        );
+        assert!(t.items_naming_area(&w.p, "ops").unwrap().is_empty());
+        w.issues.set_down(true);
+        assert!(t.items_naming_area(&w.p, "code").is_err());
+        w.issues.set_down(false);
+        w.issues.set_unbound(true);
+        let err = t.items_naming_area(&w.p, "code").unwrap_err();
+        assert!(
+            matches!(fault(&err), Some(RoutingFault::TierUnavailable { .. })),
+            "an unbound machine cannot see GitHub's items: {err:?}"
+        );
+    }
+
+    /// The tracker suites make items without an area, which a routed
+    /// project refuses: this gives each one `code`, which every map here
+    /// declares, and passes everything else through.
+    struct WithCode<'a>(&'a dyn Tracker);
+
+    impl Tracker for WithCode<'_> {
+        fn add_record_with_area(
+            &self,
+            p: &ProjectId,
+            t: &str,
+            a: Option<&str>,
+        ) -> Result<RecordId, StoreError> {
+            self.0.add_record_with_area(p, t, a.or(Some("code")))
+        }
+        fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
+            self.0.get_record(id)
+        }
+        fn list_records(&self, p: &ProjectId) -> Result<Vec<Record>, StoreError> {
+            self.0.list_records(p)
+        }
+        fn set_record_state(&self, id: &RecordId, s: State) -> Result<(), StoreError> {
+            self.0.set_record_state(id, s)
+        }
+        fn add_finding(&self, f: Finding) -> Result<FindingId, StoreError> {
+            self.0.add_finding(f)
+        }
+        fn add_finding_checked(
+            &self,
+            f: Finding,
+            r: ForeignRecord,
+        ) -> Result<FindingId, StoreError> {
+            self.0.add_finding_checked(f, r)
+        }
+        fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
+            self.0.get_finding(id)
+        }
+        fn update_finding(&self, f: &Finding) -> Result<(), StoreError> {
+            self.0.update_finding(f)
+        }
+        fn list_findings(&self, p: &ProjectId) -> Result<Vec<Finding>, StoreError> {
+            self.0.list_findings(p)
+        }
+        fn withdrawals_by(&self, a: &str) -> Result<u64, StoreError> {
+            self.0.withdrawals_by(a)
+        }
+        fn add_alias(&self, primary: &Iri, alias: Iri) -> Result<(), StoreError> {
+            self.0.add_alias(primary, alias)
+        }
+    }
+
+    struct Over {
+        local: MemStore,
+        issues: MemIssues,
+        every: EveryProject,
+    }
+
+    impl crate::conformance::Fixture for Over {
+        fn with(&self, f: &mut dyn FnMut(&crate::conformance::Bound<'_>)) {
+            let router = TieredTracker {
+                catalog: &self.local,
+                local: &self.local,
+                routes: &self.every,
+                github: &self.issues,
+            };
+            let tracker = WithCode(&router);
+            f(&crate::conformance::Bound {
+                catalog: &self.local,
+                tracker: &tracker,
+                ledger: &self.local,
+                handles: &self.local,
+            });
+        }
+    }
+
+    fn over(code: Tier) -> Over {
+        Over {
+            local: MemStore::default(),
+            issues: MemIssues::default(),
+            every: EveryProject(RoutingMap::starting().with("code", code, false)),
+        }
+    }
+
+    // Routing spec §2: "The `Tracker` conformance suite runs over it."
+    #[test]
+    fn the_router_meets_the_tracker_contract_with_code_in_either_tier() {
+        crate::conformance::tracker(|| over(Tier::Local));
+        crate::conformance::tracker(|| over(Tier::Github));
     }
 }
