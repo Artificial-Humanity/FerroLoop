@@ -146,7 +146,8 @@ impl RoutingMap {
 /// `sensitive`: `Some` sets the area's sensitivity; `None` keeps what the
 /// map — on the first set, the starting set — says, and `false` for a new
 /// area. ⚠ A set that only changes a tier never clears a sensitivity
-/// (decision 22).
+/// (decision 22). A later set that adds an area must give `Some`: the CLI
+/// refuses one that does not (decision 23).
 pub fn after_set(
     current: Option<&RoutingMap>,
     area: &str,

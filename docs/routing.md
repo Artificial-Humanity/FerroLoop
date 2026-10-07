@@ -23,8 +23,11 @@ writes the starting set first, then the area it names:
 `--sensitive` marks an area whose items are security items: a finding made there is a security
 finding, and the map never sends such an item to a repository that is not private. Setting an
 area that exists changes its tier for new items only; items already made stay where they are. A
-`set` without `--sensitive` keeps the area's sensitivity: changing an area's tier never clears it. `fl routing show --project <project>` prints the map, one area per line:
-its name, its tier, and `sensitive` or `-`.
+`set` without `--sensitive` keeps the area's sensitivity: changing an area's tier never clears it.
+After the first `set`, a `set` that adds an area the map does not declare must say
+`--sensitive` or `--not-sensitive`: the area may have been removed, and may have been sensitive.
+`fl routing show --project <project>` prints the map, one area per line: its name, its tier, and
+`sensitive` or `-`.
 
 The map is authored in the store that authors the project, like its gates, and reaches other
 machines in the committed manifest ([sharing-gates.md](sharing-gates.md)): after changing it, run
@@ -109,14 +112,17 @@ any item in either tier names the area; the refusal gives the count and lists up
 items. fl finds GitHub items by the block in each issue, not by the area label, so an item that
 lost its label is still found. A tier that cannot be read refuses the removal. fl can read only
 this machine's local tier: an item in another machine's local store keeps the area as history,
-and only new items are refused it. Such an item counts as sensitive from then on: fl cannot know
-what the removed area was, so a finding about it never reaches a repository that is not private.
-fl never deletes an area's label from GitHub. There is no rename: add the new area and remove the
-old one.
+and only new items are refused it. Such an item counts as sensitive while the map does not
+declare its area: fl cannot know what the removed area was, so a finding about it never reaches a
+repository that is not private. fl never deletes an area's label from GitHub. There is no rename:
+add the new area and remove the old one.
 
 `fl routing set --project <project> <area> <tier> --not-sensitive` clears an area's sensitivity.
 It is refused, by the same check and with the same list, while any item in either tier names the
-area.
+area. Setting an area the map does not declare — a removed one again, or a new one — needs
+`--sensitive` or `--not-sensitive`, and `--not-sensitive` there is refused by the same check.
+That check reads only this machine's local tier: after `--not-sensitive`, another machine's
+local items that name the area no longer count as sensitive.
 
 ## Limits
 

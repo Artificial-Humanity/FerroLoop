@@ -54,11 +54,13 @@ pub enum Cmd {
         tier: Tier,
         /// Items made in this area are security items, which the map never
         /// sends to a repository that is not private. Without this flag or
-        /// `--not-sensitive`, an area keeps its sensitivity.
+        /// `--not-sensitive`, an area keeps its sensitivity; an area the
+        /// map does not declare needs one of the two, except on the
+        /// project's first set.
         #[arg(long, conflicts_with = "not_sensitive")]
         sensitive: bool,
-        /// Clear the area's sensitivity. Refused while any item in either
-        /// tier names the area.
+        /// Clear the area's sensitivity, or add an area as not sensitive.
+        /// Refused while any item in either tier names the area.
         #[arg(long)]
         not_sensitive: bool,
     },
@@ -132,11 +134,24 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, bound: Option<&TrackerBinding>) -> Result<i3
                 (_, true) => Some(false),
                 _ => None,
             };
+            // Routing spec decision 23: a later set that adds an area the
+            // map does not declare names its sensitivity. The project's
+            // first set keeps its default.
+            let added = current.as_ref().is_some_and(|m| m.route(&area).is_none());
+            if added && asked.is_none() {
+                bail!(
+                    "`{area}` is not an area project {} declares, so this set must say whether it \
+                     is sensitive: add `--sensitive` or `--not-sensitive`. An area once removed \
+                     may have been sensitive, and another machine's items may still name it",
+                    refs::show(store, Kind::Project, p.iri())?
+                );
+            }
+            // Clearing a sensitivity, or adding an area as not sensitive —
+            // which an item naming it would count as (decision 22).
             let clears = asked == Some(false)
                 && current
                     .as_ref()
-                    .and_then(|m| m.route(&area))
-                    .is_some_and(|r| r.sensitive);
+                    .is_some_and(|m| m.route(&area).is_none_or(|r| r.sensitive));
             if clears {
                 refuse_while_named(
                     ctx,

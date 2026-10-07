@@ -468,7 +468,15 @@ fn a_routed_create_on_the_authoring_machine_needs_the_map_exported() {
         "--area",
         "code",
     ]);
-    g.ok(&["routing", "set", "--project", "1", "ops", "local"]);
+    g.ok(&[
+        "routing",
+        "set",
+        "--project",
+        "1",
+        "ops",
+        "local",
+        "--sensitive",
+    ]);
     g.fl()
         .args([
             "record",
@@ -521,7 +529,15 @@ fn a_routed_create_on_an_importing_machine_needs_the_import_current() {
         "code",
     ])
     .success();
-    g.ok(&["routing", "set", "--project", "1", "ops", "local"]);
+    g.ok(&[
+        "routing",
+        "set",
+        "--project",
+        "1",
+        "ops",
+        "local",
+        "--sensitive",
+    ]);
     g.ok(&["manifest", "export", "--project", "1"]);
     on_other(&[
         "record",
@@ -1180,7 +1196,15 @@ fn a_finding_on_the_authoring_machine_needs_the_map_exported() {
         "code",
     ]);
     g.ok(&["manifest", "export", "--project", "1"]);
-    g.ok(&["routing", "set", "--project", "1", "ops", "local"]);
+    g.ok(&[
+        "routing",
+        "set",
+        "--project",
+        "1",
+        "ops",
+        "local",
+        "--sensitive",
+    ]);
     g.fl()
         .args([
             "finding", "raise", "--record", "1", "--claim", "c", "--by", "r",
@@ -1688,5 +1712,161 @@ fn a_record_whose_area_was_removed_elsewhere_stays_protected() {
     ])
     .failure()
     .stderr(contains("--tier local"));
+    assert_eq!(g.fake.issue_count(), 0, "nothing published");
+}
+
+/// Write a local record in `area` straight into the store at `home`, as one
+/// made under an older map would be: fl itself refuses a new item an area
+/// the map does not declare.
+fn local_record_named(home: &Path, area: &str) {
+    use fl_core::store::{Catalog, Tracker};
+    let s = fl_store::RedbStore::open(&home.join("fl.redb")).unwrap();
+    let p = s.list_projects().unwrap().remove(0).id;
+    s.add_record_with_area(&p, "made under an older map", Some(area))
+        .unwrap();
+}
+
+// Routing spec decision 23: a later set that adds an area the map does not
+// declare names its sensitivity — the area may have been sensitive on
+// another machine, whose items still name it. Nothing is written.
+#[test]
+fn a_later_set_that_adds_an_area_must_say_whether_it_is_sensitive() {
+    let g = world("");
+    g.routed();
+    let before = g.ok(&["routing", "show", "--project", "1"]);
+    g.fl()
+        .args(["routing", "set", "--project", "1", "ops", "local"])
+        .assert()
+        .failure()
+        .stderr(
+            contains("must say whether it is sensitive")
+                .and(contains("`--sensitive` or `--not-sensitive`")),
+        );
+    assert_eq!(
+        g.ok(&["routing", "show", "--project", "1"]),
+        before,
+        "nothing written"
+    );
+    assert_eq!(
+        g.ok(&[
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "ops",
+            "local",
+            "--sensitive"
+        ]),
+        "ops\tlocal\tsensitive\n"
+    );
+    // An area the map declares keeps its sensitivity without a flag, as
+    // before.
+    assert_eq!(
+        g.ok(&["routing", "set", "--project", "1", "ops", "github"]),
+        "ops\tgithub\tsensitive\n"
+    );
+}
+
+// Routing spec decision 23: `--not-sensitive` on an area the map does not
+// declare is the same check as clearing a sensitivity — refused while an
+// item names it, allowed when none does.
+#[test]
+fn adding_an_area_as_not_sensitive_is_refused_while_an_item_names_it() {
+    let g = world(BOUND);
+    g.routed();
+    local_record_named(g.home.path(), "ops");
+    g.fl()
+        .args([
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "ops",
+            "local",
+            "--not-sensitive",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("is still named by 1 item(s)").and(contains("Its sensitivity is not cleared")),
+        );
+    assert!(
+        !g.ok(&["routing", "show", "--project", "1"]).contains("ops"),
+        "nothing written"
+    );
+    assert_eq!(
+        g.ok(&[
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "ci",
+            "local",
+            "--not-sensitive"
+        ]),
+        "ci\tlocal\t-\n"
+    );
+}
+
+// Routing spec decision 23: the first set keeps its default — the starting
+// set's sensitivity, or none for a new area — with no flag.
+#[test]
+fn the_first_set_needs_no_sensitivity_flag() {
+    let g = world("");
+    g.ok(&["project", "add", "."]);
+    assert_eq!(
+        g.ok(&["routing", "set", "--project", "1", "ops", "local"]),
+        "ops\tlocal\t-\n"
+    );
+}
+
+// Routing spec decision 23, the final review's scenario: the authoring
+// machine removes `security`, which only another machine's record names,
+// then sets it again. Without a flag the area would come back not
+// sensitive and, once imported, let a finding about that record onto a
+// public repository; the set is refused instead.
+#[test]
+fn re_adding_a_removed_area_without_a_sensitivity_is_refused_before_it_can_publish() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(other.path(), BOUND);
+    let on_other = |args: &[&str]| g.fl_at(other.path()).args(args).assert();
+    on_other(&["manifest", "import"]).success();
+    on_other(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "the key leaks",
+        "--area",
+        "security",
+        "--tier",
+        "local",
+    ])
+    .success();
+    g.ok(&["routing", "remove", "--project", "1", "security"]);
+    g.fl()
+        .args(["routing", "set", "--project", "1", "security", "local"])
+        .assert()
+        .failure()
+        .stderr(contains("must say whether it is sensitive"));
+    assert!(
+        !g.ok(&["routing", "show", "--project", "1"])
+            .contains("security"),
+        "nothing written"
+    );
+    // The map that reaches the other machine still lacks the area, so its
+    // record stays protected.
+    g.ok(&["manifest", "export", "--project", "1"]);
+    on_other(&["manifest", "import"]).success();
+    g.fake.state().repos[0].visibility = "public".into();
+    on_other(&[
+        "finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "design",
+    ])
+    .failure()
+    .stderr(contains("about a record in a sensitive area"));
     assert_eq!(g.fake.issue_count(), 0, "nothing published");
 }

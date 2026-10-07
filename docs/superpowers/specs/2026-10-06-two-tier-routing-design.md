@@ -1,11 +1,12 @@
 # Two-tier routing and escalation — design
 
-**Date:** 2026-10-06 (rev 2.2, same day)
+**Date:** 2026-10-06 (rev 2.3, 2026-10-07)
 **Status:** Approved by the owner 2026-10-06. Rev 1 (in git at 96e1a41) was approved and then
 reviewed against the code; rev 2 folds in that review and the owner's decisions 12–19 on it.
 Rev 2.1 folds in the owner's decisions 20–21 and seven corrections found while planning plan A
 against the code (`docs/superpowers/plans/2026-10-06-two-tier-routing-a.md`, "Spec defects");
-rev 2.2 folds in the owner's decision 22, after a re-review found two ways around decision 21.
+rev 2.2 folds in the owner's decision 22, after a re-review found two ways around decision 21;
+rev 2.3 folds in the owner's decision 23, after the final review found a way around decision 22.
 Each change is marked here as an owner decision or `[agent]`.
 Sub-project 4 of 4. Delivered as two plans (§8).
 **Scope:** A project with two trackers — the local store for developer-level items, a GitHub
@@ -112,6 +113,15 @@ how an item moves between the tiers.
     finding that decision 21 refuses on GitHub, or that is kept local for it, carries the
     security flag. `[agent]`: a record with no area at all (made before the project was
     routed) is not sensitive.
+23. (owner, 2026-10-07) "A later `fl routing set` that adds an area the map does not declare
+    must say `--sensitive` or `--not-sensitive`. With `--not-sensitive` fl does the same check
+    and prints the same 'this machine only' note as clearing a sensitivity. The first `set`
+    keeps its default." `[agent]`: the way around decision 22 it closes — the authoring machine
+    removes a sensitive area that only another machine's local records name, sets it again
+    with no flag, and exports; the area came back not sensitive, and once imported a finding
+    about such a record reached a public repository with only a warning. The refusal comes
+    before anything is written and names both flags. The "this machine only" note is the one
+    a refused clearing gives: fl reads only this machine's local tier.
 
 ### 0.2 Out of scope
 
@@ -192,6 +202,11 @@ how an item moves between the tiers.
     made stay where they are. Without `--sensitive` or `--not-sensitive` the area keeps its
     sensitivity (decision 22). `--not-sensitive` on a sensitive area is **refused while any
     item in either tier names the area**, by the same check as `fl routing remove` below.
+  * A later `fl routing set` that adds an area the map does not declare: decision 23.
+    `[agent]`: without `--sensitive` or `--not-sensitive` it is refused before anything is
+    written; with `--not-sensitive` it is refused while any item in either tier names the
+    area, since such an item counts as sensitive (decision 22). The project's first `set` is
+    unchanged.
   * `fl routing remove <area>` — **refused while any item in either tier names the area**
     (decision 11). The refusal gives the count and lists up to ten of the items. It finds
     GitHub items by reading their blocks, not by the area label, so an item that lost its
@@ -455,6 +470,7 @@ Every refusal names its cause and what to do:
 | a GitHub finding about a local record in a sensitive area, on a non-private repository | use `--tier local` (decision 21) |
 | `fl routing set` while the store holds another project | give the project its own store (decision 20) |
 | `fl routing set --not-sensitive` on an area items still name | the count, and up to ten of the items (decision 22) |
+| a later `fl routing set` that adds an area with neither `--sensitive` nor `--not-sensitive` | both flags, and that a removed area may have been sensitive (decision 23) `[agent]` |
 | a tier that cannot be reached | an error in lists, lookups and reference checks — never "no such item", never a partial list |
 | an id no tier holds | held on another machine's local tier, or not existing |
 | a write to an item marked "escalating" | `fl … escalate <id>` to finish, or `--abandon` |
@@ -509,6 +525,10 @@ Every refusal names its cause and what to do:
   sensitivity; `--not-sensitive` with items naming the area is refused and writes nothing,
   and with none it clears; the re-review's scenario end to end — an area removed where the
   project is authored, then re-imported, leaves another machine's record protected.
+  `[agent]` Decision 23: a later set that adds an area with no flag is refused and writes
+  nothing; with `--sensitive` it works; with `--not-sensitive` it is refused while an item
+  names the area and works when none does; the first set needs no flag; the final review's
+  scenario end to end — remove, set again with no flag — is refused at the set.
 * **One live test** on the private throwaway repository: escalate a local record; the issue
   exists, carries the old IRI, its area label and its findings list, and the local item is a
   tombstone.
