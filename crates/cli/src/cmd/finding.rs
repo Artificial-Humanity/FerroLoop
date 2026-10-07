@@ -79,12 +79,7 @@ impl Cmd {
 /// alias typed. An id that names no finding is returned as given: the
 /// caller's own lookup refuses it, echoing what was typed.
 fn finding_id(ctx: &Ctx<'_>, r: &Ref) -> Result<FindingId> {
-    let id = FindingId(refs::resolve(
-        ctx.handles,
-        &ctx.tracker_label,
-        Kind::Finding,
-        r,
-    )?);
+    let id = FindingId(ctx.resolve_item(Kind::Finding, r)?);
     Ok(match ctx.tracker.get_finding(&id)? {
         Some(f) => f.id,
         None => id,
@@ -133,12 +128,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             by,
             security,
         } => {
-            let r = RecordId(refs::resolve(
-                ctx.handles,
-                &ctx.tracker_label,
-                Kind::Record,
-                &record,
-            )?);
+            let r = RecordId(ctx.resolve_item(Kind::Record, &record)?);
             let Some(rec) = ctx.tracker.get_record(&r)? else {
                 bail!(
                     "`{record}` is not a record in the store at {}. Use \

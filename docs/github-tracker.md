@@ -274,7 +274,9 @@ a security finding that nobody marked.
 
 An item's id is its issue's URL, `https://github.com/acme/widgets/issues/41`. Its handle is
 the issue number, which may be typed `41` or `#41`; records and findings share issue numbers,
-so `fl record` refuses the number of a finding. `owner/repo#41` names issue 41 of that
+so `fl record` refuses the number of a finding. In a project that routes its items between its
+local store and GitHub ([routing.md](routing.md)), only `#41` names the issue; a bare `41` names a
+local item. `owner/repo#41` names issue 41 of that
 repository, and is refused as not held by this tracker unless it names the bound one — by its
 current name, or by an old name that still reaches it after a rename. Projects
 and gates keep their local handles.

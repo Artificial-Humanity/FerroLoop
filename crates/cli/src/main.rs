@@ -310,6 +310,24 @@ fn choose_store(
     choose_among(&[bound.to_path_buf()], iris)
 }
 
+/// Whether the store at `bound` exists and holds a routing map. ⚠ Never
+/// creates a store: only a file that exists is opened.
+fn bound_is_routed(bound: &Path) -> Result<bool> {
+    if !bound.exists() {
+        return Ok(false);
+    }
+    let store = RedbStore::open(bound)
+        .with_context(|| format!("could not open the store at {}", bound.display()))?;
+    Ok(store.holds_routing()?)
+}
+
+fn is_not_owned(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<StoreError>(),
+        Some(StoreError::NotOwned { .. })
+    )
+}
+
 /// The common search loop, over whatever candidate list the caller already
 /// decided on (confined: `[bound]`, unconfined: `bound` plus every
 /// configured store that exists).
@@ -578,12 +596,22 @@ fn run(cli: Cli) -> Result<i32> {
     let explicit_given = explicit.is_some();
     let (bound, confined) = db_path(explicit, configured)?;
     let mut iris = cli.command.iris();
+    // Whether the bound store is routed (routing spec §1.3), read only when
+    // the command names an IRI: in a routed store an issue URL is the github
+    // tier's, and an id no store holds is the router's to look for.
+    let bound_routed = !iris.is_empty() && bound_is_routed(&bound)?;
     // A GitHub issue URL is the tracker's to resolve: no local store holds
     // one, and searching them would refuse it as NotOwned (spec §2.2).
-    if here_binding.is_some() {
+    if here_binding.is_some() || bound_routed {
         iris.retain(|i| !fl_github::meta::is_issue_url(i));
     }
-    let path = choose_store(&bound, entries, &iris, confined)?;
+    let path = match choose_store(&bound, entries, &iris, confined) {
+        // Routing spec §2.2: an id no local store holds may be an item
+        // another machine moved to GitHub, or one on another machine's local
+        // tier. The router says which; refusing here would say neither.
+        Err(e) if bound_routed && is_not_owned(&e) => bound.clone(),
+        other => other?,
+    };
     // ⚠ The tracker comes from the store the command
     // ends up in, never from the current directory alone — an IRI can send
     // `choose_store` to another project's store, and pairing that store with

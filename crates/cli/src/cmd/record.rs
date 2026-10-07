@@ -108,12 +108,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     State::wire_values()
                 );
             };
-            let r = RecordId(refs::resolve(
-                ctx.handles,
-                &ctx.tracker_label,
-                Kind::Record,
-                &id,
-            )?);
+            let r = RecordId(ctx.resolve_item(Kind::Record, &id)?);
             let Some(record) = ctx.tracker.get_record(&r)? else {
                 bail!(
                     "`{id}` is not a record in the store at {}. Use \

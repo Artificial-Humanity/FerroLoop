@@ -46,6 +46,11 @@ bare `41` names local item 41. The first `fl routing set` says what that changes
 
 The import that first brings a routing map to another machine says the same there.
 
+`fl record` and `fl finding` read a bare number as a local item: one that no local item holds
+is refused, asking whether `#41` was meant. A GitHub item prints as `#41` and a local one as
+`41`, so every handle fl prints can be typed back. `fl github …` names GitHub items only, so a
+bare number there is still an issue.
+
 ## What a routed project needs
 
 A project is routed once it has a routing map, whatever the map holds. The `github` tier is

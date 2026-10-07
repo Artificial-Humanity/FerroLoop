@@ -32,6 +32,11 @@ impl<'a> LazyGithub<'a> {
         }
     }
 
+    /// The configured `owner/repo`, when this machine binds one.
+    pub fn repo_name(&self) -> Option<&str> {
+        self.binding.as_ref().map(|b| b.github.as_str())
+    }
+
     /// The GitHub tracker, opened now if it is not yet (routing spec §2.6).
     /// An error that is not a store error keeps its whole message chain.
     pub fn open(&self) -> Result<&GithubTracker, StoreError> {
@@ -202,5 +207,6 @@ mod tests {
         lazy.tracker().unwrap();
         lazy.tracker().unwrap();
         assert_eq!(opened.get(), 1, "opened once");
+        assert_eq!(lazy.repo_name(), Some("acme/widgets"));
     }
 }

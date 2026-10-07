@@ -646,4 +646,204 @@ fn after_a_rename_a_github_item_still_prints_as_hash() {
         ]),
         "#1\tlook\n"
     );
+    let moved = g.ok(&["record", "move", "#1", "--to", "doing"]);
+    assert!(moved.starts_with("#1\tdoing\t"), "{moved}");
+}
+
+// Routing spec §2.3: in a routed project the two spellings name two items,
+// and each prints back as it can be typed.
+#[test]
+fn a_bare_number_and_a_hash_number_name_different_items_and_print_back_as_typed() {
+    let g = world(BOUND);
+    g.routed();
+    assert_eq!(
+        g.ok(&[
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "local one",
+            "--area",
+            "code"
+        ]),
+        "1\tlocal one\n"
+    );
+    assert_eq!(
+        g.ok(&[
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "issue one",
+            "--area",
+            "design"
+        ]),
+        "#1\tissue one\n"
+    );
+    // An ungated move prints `<handle>\t<state>\tungated: …`.
+    let moved = g.ok(&["record", "move", "1", "--to", "doing"]);
+    assert!(moved.starts_with("1\tdoing\t"), "{moved}");
+    let moved = g.ok(&["record", "move", "#1", "--to", "review"]);
+    assert!(moved.starts_with("#1\treview\t"), "{moved}");
+    let labels = g.fake.issue(1).labels;
+    assert!(
+        labels.contains(&"fl:record/review".to_string())
+            && !labels.contains(&"fl:record/doing".to_string()),
+        "{labels:?}"
+    );
+}
+
+#[test]
+fn a_bare_number_no_local_item_holds_asks_did_you_mean_the_issue() {
+    let g = world(BOUND);
+    g.routed();
+    g.fl()
+        .args(["record", "move", "5", "--to", "doing"])
+        .assert()
+        .failure()
+        .stderr(contains("Did you mean `#5`?"));
+    assert!(
+        g.fake.state().requests.is_empty(),
+        "a bare number never reaches GitHub"
+    );
+}
+
+#[test]
+fn on_an_unbound_machine_a_bare_number_gets_no_hint() {
+    let g = world("");
+    g.routed();
+    g.fl()
+        .args(["record", "move", "5", "--to", "doing"])
+        .assert()
+        .failure()
+        .stderr(contains("in this machine's local tier").and(contains("Did you mean").not()));
+}
+
+#[test]
+fn a_hash_number_that_is_no_record_is_refused_naming_the_repository() {
+    let g = world(BOUND);
+    g.routed();
+    g.fl()
+        .args(["record", "move", "#9", "--to", "doing"])
+        .assert()
+        .failure()
+        .stderr(contains("there is no record #9 in acme/widgets"));
+}
+
+// Routing spec §2.3: `fl github …` names GitHub items only, so a bare
+// number there is an issue.
+#[test]
+fn a_bare_number_given_to_fl_github_is_an_issue() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "t",
+        "--area",
+        "design",
+    ]);
+    g.fl()
+        .args(["github", "repair", "1", "--by", "owner"])
+        .assert()
+        .success()
+        .stdout("consistent\t1\ttodo\n");
+}
+
+// Routing spec §2.3: `owner/repo#41` names the issue in a routed store too.
+#[test]
+fn owner_repo_hash_names_the_issue_in_a_routed_store() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "l",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "g",
+        "--area",
+        "design",
+    ]);
+    let moved = g.ok(&["record", "move", "acme/widgets#1", "--to", "doing"]);
+    assert!(moved.starts_with("#1\tdoing\t"), "{moved}");
+    assert!(
+        g.fake
+            .issue(1)
+            .labels
+            .contains(&"fl:record/doing".to_string())
+    );
+}
+
+// Routing spec §2.2: an id no local store holds reaches the router —
+// GitHub's alias scan finds an item another machine moved there; otherwise
+// it is held on another machine's local tier.
+#[test]
+fn an_id_no_local_store_holds_is_looked_for_on_github_then_said_to_be_elsewhere() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "look",
+        "--area",
+        "design",
+    ]);
+    let moved_here = "urn:uuid:00000000-0000-7000-8000-0000000000aa";
+    g.fake.web_edit(1, |i| {
+        let (prose, mut m) = fl_github::meta::parse_body(&i.body).unwrap();
+        m.also_known_as
+            .push(fl_core::Iri::parse(moved_here).unwrap());
+        i.body = fl_github::meta::render_body(&prose, &m);
+    });
+    let moved = g.ok(&["record", "move", moved_here, "--to", "doing"]);
+    assert!(moved.starts_with("#1\tdoing\t"), "{moved}");
+    g.fl()
+        .args([
+            "record",
+            "move",
+            "urn:uuid:00000000-0000-7000-8000-0000000000bb",
+            "--to",
+            "doing",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("another machine's local tier"));
+}
+
+// Routing spec §1.3: on an unbound machine an issue URL is refused as the
+// missing config entry, never searched for as a local id.
+#[test]
+fn an_issue_url_on_an_unbound_machine_names_the_missing_config_entry() {
+    let g = world("");
+    g.routed();
+    g.fl()
+        .args([
+            "record",
+            "move",
+            "https://github.com/acme/widgets/issues/1",
+            "--to",
+            "doing",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("binds no GitHub repository for the project"));
 }

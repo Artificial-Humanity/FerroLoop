@@ -51,12 +51,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     )?);
     let record = match &cmd.record {
         Some(r) => {
-            let id = RecordId(refs::resolve(
-                ctx.handles,
-                &ctx.tracker_label,
-                Kind::Record,
-                r,
-            )?);
+            let id = RecordId(ctx.resolve_item(Kind::Record, r)?);
             // The record's PRIMARY id, never the alias the person typed:
             // every run tied to one record must name it the same way.
             let Some(rec) = ctx.tracker.get_record(&id)? else {

@@ -258,7 +258,7 @@ fn comment(ctx: &Ctx<'_>, gl: &GithubLedger<'_>, item: &Ref) -> Result<i32> {
         // filed under it are read: said, so a count after a rename is
         // visibly about that URL and not the one the decisions may be
         // filed under.
-        Ref::Handle(n) => {
+        Ref::Handle(n) | Ref::Issue(n) => {
             let iri = gh.issue_url(*n);
             eprintln!("read\t{iri}");
             iri

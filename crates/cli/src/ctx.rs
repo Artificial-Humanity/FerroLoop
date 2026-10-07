@@ -2,11 +2,13 @@
 //! §2.6): the local store for the catalog, whichever tracker the project is
 //! bound to, and whichever ledger it is bound to.
 
+use crate::refs::Ref;
+use anyhow::bail;
 use fl_core::decision::{Decision, Flushed, LeftLocal};
 use fl_core::ids::{GateId, Kind, ProjectId};
 use fl_core::iri::Iri;
 use fl_core::log::{Attempt, GateRun};
-use fl_core::routing::Tier;
+use fl_core::routing::{GithubTier, Tier};
 use fl_core::store::{Handles, Ledger, Roles, StoreError, Tracker};
 use fl_store::RedbStore;
 use std::cell::RefCell;
@@ -60,6 +62,39 @@ impl Ctx<'_> {
                 Some(n) => format!("#{n}"),
                 None => id.to_string(),
             }),
+        }
+    }
+
+    /// The id a typed record or finding names (routing spec §2.3). In a
+    /// routed store `#41` is GitHub issue 41 and a bare `41` local item 41;
+    /// a bare number no local item holds asks whether `#41` was meant, when
+    /// this machine has the GitHub tier. Elsewhere, as before.
+    pub fn resolve_item(&self, kind: Kind, r: &Ref) -> anyhow::Result<Iri> {
+        let Some(t) = self.tiers else {
+            return crate::refs::resolve(self.handles, &self.tracker_label, kind, r);
+        };
+        let what = kind.as_wire();
+        match r {
+            Ref::Iri(i) => Ok(i.clone()),
+            Ref::Issue(n) => match t.github.open()?.resolve_handle(kind, *n)? {
+                Some(i) => Ok(i),
+                None => bail!(
+                    "there is no {what} #{n} in {}. List them to see the ones that exist.",
+                    t.github.repo_name().unwrap_or("the bound repository")
+                ),
+            },
+            Ref::Handle(n) => match self.store.resolve_handle(kind, *n)? {
+                Some(i) => Ok(i),
+                None if t.github.available() => bail!(
+                    "there is no {what} {n} in this machine's local tier. Did you mean `#{n}`? In \
+                     a routed project a bare number names a local item, and `#{n}` names GitHub \
+                     issue {n}."
+                ),
+                None => bail!(
+                    "there is no {what} {n} in this machine's local tier. List them to see the \
+                     ones that exist."
+                ),
+            },
         }
     }
 
