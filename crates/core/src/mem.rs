@@ -1,3 +1,4 @@
+use crate::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
 use crate::finding::{Finding, FindingState};
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
 use crate::iri::Iri;
@@ -58,6 +59,11 @@ struct Inner {
     heads: BTreeMap<String, String>,
     /// (repository `node_id`, path on the branch) → that file as last read.
     segments: BTreeMap<(String, String), CachedSegment>,
+    /// primary → the mark of an escalation under way (routing spec §3.3).
+    escalating: BTreeMap<Iri, Mark>,
+    /// primary → the tombstone of an escalated item. The item's row, handle
+    /// and aliases stay: its id and handle still resolve here (§2.3).
+    tombstones: BTreeMap<Iri, Tombstone>,
 }
 
 impl Inner {
@@ -118,6 +124,34 @@ impl Inner {
     /// ownership, not which key to read.
     fn resolve(&self, id: &Iri) -> Iri {
         self.aliases.get(id).cloned().unwrap_or_else(|| id.clone())
+    }
+
+    /// `check`, then the primary `id` names and its kind — unless the item
+    /// was escalated: a tombstoned item reads as `Escalated`, under every
+    /// name it has (routing spec §3.6).
+    fn live(&self, id: &Iri) -> Result<(Iri, Kind), StoreError> {
+        let kind = self.check(id)?;
+        let primary = self.resolve(id);
+        if let Some(t) = self.tombstones.get(&primary) {
+            return Err(StoreError::Escalated {
+                from: primary,
+                to: t.to.clone(),
+            });
+        }
+        Ok((primary, kind))
+    }
+
+    /// `live`, and then refuse an item marked escalating: a write would
+    /// change the copy the escalation is moving (routing spec §3.3 step 1).
+    fn writable(&self, id: &Iri) -> Result<Iri, StoreError> {
+        let (primary, kind) = self.live(id)?;
+        if self.escalating.contains_key(&primary) {
+            return Err(StoreError::Escalating {
+                to_finish: escalate_command(kind, &primary),
+                id: primary,
+            });
+        }
+        Ok(primary)
     }
 }
 
@@ -237,6 +271,19 @@ impl Catalog for MemStore {
 }
 
 impl MemStore {
+    /// A store whose first minted id is `seq_iri(first)`, the next
+    /// `seq_iri(first + 1)`, and so on: still deterministic for a given
+    /// `first`. For a test against a real service that keeps what earlier
+    /// runs wrote, so each run's ids are its own. Handles still start at 1.
+    /// Not in the binary: the `conformance` feature is a dev-dependency only.
+    #[cfg(any(test, feature = "conformance"))]
+    #[doc(hidden)]
+    pub fn starting_at(first: u64) -> Self {
+        let store = Self::default();
+        store.inner.borrow_mut().next_id = first.saturating_sub(1);
+        store
+    }
+
     /// Write `project`'s routing map. A map that is not one fl writes is
     /// refused (`RoutingMap::check`).
     pub fn set_routes(&self, project: &ProjectId, map: &RoutingMap) -> Result<(), StoreError> {
@@ -283,8 +330,7 @@ impl Tracker for MemStore {
 
     fn get_record(&self, id: &RecordId) -> Result<Option<Record>, StoreError> {
         let s = self.inner.borrow();
-        s.check(&id.0)?;
-        let target = s.resolve(&id.0);
+        let (target, _) = s.live(&id.0)?;
         Ok(s.records.get(&target).cloned())
     }
 
@@ -293,17 +339,16 @@ impl Tracker for MemStore {
         s.check_kind(&project.0, Kind::Project)?;
         Ok(s.records
             .values()
-            .filter(|r| r.project == *project)
+            .filter(|r| r.project == *project && !s.tombstones.contains_key(r.id.iri()))
             .cloned()
             .collect())
     }
 
     fn set_record_state(&self, id: &RecordId, state: State) -> Result<(), StoreError> {
         let mut s = self.inner.borrow_mut();
-        s.check(&id.0)?;
         // `id` may be an alias: resolve to the primary key `records` is
         // actually keyed by.
-        let target = s.resolve(&id.0);
+        let target = s.writable(&id.0)?;
         let rec = s
             .records
             .get_mut(&target)
@@ -318,8 +363,9 @@ impl Tracker for MemStore {
         s.check_kind(&finding.record.0, Kind::Record)?;
         // `record` may have been given as an alias: resolve to the primary,
         // so two findings raised against the same record always agree on
-        // which IRI names it.
-        let record_primary = s.resolve(&finding.record.0);
+        // which IRI names it. A marked record takes findings (routing spec
+        // §3.3 step 1); an escalated one is `Escalated`.
+        let (record_primary, _) = s.live(&finding.record.0)?;
         let id = FindingId(s.mint(Kind::Finding));
         let mut finding = finding;
         finding.id = id.clone();
@@ -346,21 +392,19 @@ impl Tracker for MemStore {
 
     fn get_finding(&self, id: &FindingId) -> Result<Option<Finding>, StoreError> {
         let s = self.inner.borrow();
-        s.check(&id.0)?;
-        let target = s.resolve(&id.0);
+        let (target, _) = s.live(&id.0)?;
         Ok(s.findings.get(&target).cloned())
     }
 
     fn update_finding(&self, finding: &Finding) -> Result<(), StoreError> {
         let mut s = self.inner.borrow_mut();
-        s.check(&finding.id.0)?;
         // `finding.id` (what the caller passed) may be an alias: resolve to
         // the primary key `findings` is actually keyed by, and pin the
         // written row's own `id` to that primary too — even if the caller's
         // struct still carries the alias — so an update through an alias
         // lands on, and stays keyed by, the primary, never a second row
         // under the alias.
-        let target = s.resolve(&finding.id.0);
+        let target = s.writable(&finding.id.0)?;
         if !s.findings.contains_key(&target) {
             return Err(StoreError::NoSuchFinding(finding.id.clone()));
         }
@@ -385,18 +429,18 @@ impl Tracker for MemStore {
         s.check_kind(&project.0, Kind::Project)?;
         Ok(s.findings
             .values()
-            .filter(|f| f.project == *project)
+            .filter(|f| f.project == *project && !s.tombstones.contains_key(f.id.iri()))
             .cloned()
             .collect())
     }
 
+    /// An escalated finding is counted by the tier it lives in now.
     fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError> {
-        Ok(self
-            .inner
-            .borrow()
-            .findings
+        let s = self.inner.borrow();
+        Ok(s.findings
             .values()
             .filter(|f| f.raised_by == actor && f.state == FindingState::Withdrawn)
+            .filter(|f| !s.tombstones.contains_key(f.id.iri()))
             .count() as u64)
     }
 
@@ -409,7 +453,7 @@ impl Tracker for MemStore {
         }
         // `primary` may itself be an alias; resolve to the true primary so
         // `aliases` never chains and the row update below finds the row.
-        let resolved = s.resolve(primary);
+        let resolved = s.writable(primary)?;
         let kind = s.check(&resolved)?;
         match kind {
             Kind::Record => {
@@ -435,6 +479,63 @@ impl Tracker for MemStore {
         }
         s.aliases.insert(alias, resolved);
         Ok(())
+    }
+}
+
+impl Escalations for MemStore {
+    fn mark(&self, id: &Iri, mark: &Mark) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        let (primary, kind) = s.live(id)?;
+        if !matches!(kind, Kind::Record | Kind::Finding) {
+            return Err(StoreError::WrongKind {
+                id: id.clone(),
+                expected: Kind::Record,
+                found: kind,
+            });
+        }
+        if s.escalating.contains_key(&primary) {
+            return Err(EscalationFault::AlreadyMarked { id: primary, kind }.into());
+        }
+        s.escalating.insert(primary, mark.clone());
+        Ok(())
+    }
+
+    fn mark_of(&self, id: &Iri) -> Result<Option<Mark>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.escalating.get(&s.resolve(id)).cloned())
+    }
+
+    fn unmark(&self, id: &Iri) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check(id)?;
+        let primary = s.resolve(id);
+        if s.escalating.remove(&primary).is_none() {
+            return Err(EscalationFault::NotMarked { id: primary }.into());
+        }
+        Ok(())
+    }
+
+    fn tombstone(&self, id: &Iri, to: &Iri) -> Result<Tombstone, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check(id)?;
+        let primary = s.resolve(id);
+        let Some(mark) = s.escalating.remove(&primary) else {
+            return Err(EscalationFault::NotMarked { id: primary }.into());
+        };
+        let tomb = Tombstone {
+            from: primary.clone(),
+            to: to.clone(),
+            by: mark.by,
+            reason: mark.reason,
+            at_ms: mark.at_ms,
+        };
+        s.tombstones.insert(primary, tomb.clone());
+        Ok(tomb)
+    }
+
+    fn tombstone_of(&self, id: &Iri) -> Result<Option<Tombstone>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.tombstones.get(&s.resolve(id)).cloned())
     }
 }
 
@@ -645,6 +746,58 @@ mod tests {
         crate::conformance::all_roles(|| Single(MemStore::default(), ()));
         crate::conformance::local_handles(|| (MemStore::default(), ()));
         crate::conformance::ledger_cache(|| (MemStore::default(), ()));
+    }
+
+    #[test]
+    fn a_store_started_at_n_mints_n_first() {
+        let s = MemStore::starting_at(1_000);
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        assert_eq!((p.0, r.0), (seq_iri(1_000), seq_iri(1_001)));
+        assert_eq!(
+            MemStore::default().add_project("/p").unwrap().0,
+            seq_iri(1),
+            "the default store still starts at 1"
+        );
+    }
+
+    #[test]
+    fn mem_store_meets_the_escalation_contract() {
+        use crate::conformance::Single;
+        crate::conformance::escalations(|| Single(MemStore::default(), ()));
+    }
+
+    // Routing spec §3.3 step 1: the shared case, run on its own by name.
+    #[test]
+    fn a_marked_item_refuses_every_write_and_a_finding_about_it_is_allowed() {
+        use crate::conformance::{EscalationFixture, Single};
+        Single(MemStore::default(), ()).with_escalations(&mut |b| {
+            crate::conformance::a_marked_item_refuses_every_write_and_a_finding_about_it_is_allowed(
+                b,
+            )
+        });
+    }
+
+    // Routing spec §2.3: a local handle of an escalated item resolves
+    // through its tombstone, so the handle and the row stay.
+    #[test]
+    fn an_escalated_items_handle_still_resolves_to_its_id() {
+        let s = MemStore::default();
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        let mark = Mark {
+            by: "alice".into(),
+            reason: "r".into(),
+            at_ms: 1,
+        };
+        s.mark(r.iri(), &mark).unwrap();
+        let to = Iri::parse("https://github.com/acme/widgets/issues/7").unwrap();
+        s.tombstone(r.iri(), &to).unwrap();
+        assert_eq!(
+            s.resolve_handle(Kind::Record, 1).unwrap(),
+            Some(r.0.clone())
+        );
+        assert_eq!(s.handle_of(Kind::Record, r.iri()).unwrap(), Some(1));
     }
 
     #[test]

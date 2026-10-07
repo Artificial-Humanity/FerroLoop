@@ -4,6 +4,7 @@
 
 use crate::config::TrackerBinding;
 use fl_core::TieredTracker;
+use fl_core::escalation::{Outgoing, Provenance};
 use fl_core::ids::{Kind, ProjectId};
 use fl_core::iri::Iri;
 use fl_core::routing::{GithubTier, RoutingFault, Tier};
@@ -103,12 +104,42 @@ impl GithubTier for LazyGithub<'_> {
     ) -> Result<Vec<(Kind, Iri)>, StoreError> {
         self.open()?.items_in_area(project, area)
     }
+
+    fn find_escalated(&self, key: &Iri, since_ms: u64) -> Result<Option<Iri>, StoreError> {
+        self.open()?.find_escalated(key, since_ms)
+    }
+
+    fn alias_taken(&self, alias: &Iri) -> Result<Option<Iri>, StoreError> {
+        self.open()?.alias_taken(alias)
+    }
+
+    fn create_escalated(
+        &self,
+        item: &Outgoing,
+        from: &Provenance,
+        since_ms: u64,
+    ) -> Result<Iri, StoreError> {
+        self.open()?.create_escalated(item, from, since_ms)
+    }
 }
 
 /// A routed store's tiers, as a command sees them.
 pub struct Tiers<'a> {
     pub router: &'a TieredTracker<'a>,
     pub github: &'a LazyGithub<'a>,
+}
+
+impl Tiers<'_> {
+    /// A listed item's tier column (routing spec §2.4): the tier it was
+    /// listed from, or `escalating` for a local item marked escalating —
+    /// between the tiers. Only a local row reads a mark: a GitHub row is
+    /// where an escalation ends, and asks nothing.
+    pub fn column(&self, in_tier: Tier, id: &Iri) -> Result<&'static str, StoreError> {
+        if in_tier == Tier::Local && self.router.escalating(id)?.is_some() {
+            return Ok("escalating");
+        }
+        Ok(in_tier.as_wire())
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +209,50 @@ mod tests {
                 && msg.contains("/c/fl/config.toml"),
             "{msg}"
         );
+    }
+
+    // Routing spec §1.3: what an escalation asks of GitHub, with no binding,
+    // is the missing tier — never "no issue" or "not taken" — and opens
+    // nothing.
+    #[test]
+    fn with_no_binding_an_escalations_questions_are_the_missing_tier() {
+        let lazy = LazyGithub::new(
+            None,
+            "the config".into(),
+            Box::new(|_: &TrackerBinding| unreachable!("no binding, nothing to open")),
+        );
+        let old = fl_core::ids::seq_iri(7);
+        let unavailable = |e: StoreError| {
+            matches!(
+                e,
+                StoreError::Routing(RoutingFault::TierUnavailable {
+                    tier: Tier::Github,
+                    ..
+                })
+            )
+        };
+        assert!(unavailable(lazy.find_escalated(&old, 0).unwrap_err()));
+        assert!(unavailable(lazy.alias_taken(&old).unwrap_err()));
+        let record = fl_core::model::Record {
+            id: fl_core::ids::RecordId(old.clone()),
+            project: ProjectId(fl_core::ids::seq_iri(1)),
+            title: "t".into(),
+            state: fl_core::model::State::NeedsHuman,
+            also_known_as: vec![],
+            area: None,
+        };
+        let item = Outgoing::Record {
+            record,
+            findings: vec![],
+        };
+        let from = Provenance {
+            from: old,
+            by: "alice".into(),
+            reason: "r".into(),
+        };
+        assert!(unavailable(
+            lazy.create_escalated(&item, &from, 0).unwrap_err()
+        ));
     }
 
     #[test]

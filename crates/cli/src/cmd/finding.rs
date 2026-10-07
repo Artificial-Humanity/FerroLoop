@@ -7,6 +7,7 @@ use fl_core::FindingPlacement;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
 use fl_core::routing::Tier;
+use fl_core::store::StoreError;
 use fl_core::{Iri, Kind};
 use fl_exec::finding::{FindingExecError, attach_reproduction, verify_finding};
 use std::collections::BTreeSet;
@@ -63,6 +64,22 @@ pub enum Cmd {
         #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
         tier: Option<Tier>,
     },
+    /// Move a local finding to GitHub (routing spec §3): every check first,
+    /// then the mark, the issue, and the tombstone. A rerun finishes an
+    /// escalation that stopped.
+    Escalate {
+        id: Ref,
+        /// Who escalates it, named on the issue.
+        #[arg(long, required_unless_present = "abandon")]
+        by: Option<String>,
+        /// Why, named on the issue.
+        #[arg(long, required_unless_present = "abandon")]
+        reason: Option<String>,
+        /// Remove the mark of an escalation that stopped before its issue
+        /// was made.
+        #[arg(long, conflicts_with_all = ["by", "reason"])]
+        abandon: bool,
+    },
 }
 
 impl Cmd {
@@ -77,6 +94,7 @@ impl Cmd {
             Cmd::Assign { finding, .. } => vec![finding],
             Cmd::Verify { finding } => vec![finding],
             Cmd::Withdraw { finding, .. } => vec![finding],
+            Cmd::Escalate { id, .. } => vec![id],
             Cmd::List {
                 project, record, ..
             } => project.iter().chain(record.iter()).collect(),
@@ -210,6 +228,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Reproduce { finding, gate } => {
             let f = self::finding(ctx, &finding)?;
+            // Routing spec §3.3 step 1: a marked finding's reproduction is
+            // refused before the import check and the gate.
+            crate::cmd::escalate::refuse_marked(ctx, Kind::Finding, f.id.iri())?;
             crate::cmd::manifest::ensure_import_current(store, &f.project)?;
             let fid = f.id;
             let gid = GateId(refs::resolve(
@@ -249,6 +270,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
         }
         Cmd::Verify { finding } => {
             let f = self::finding(ctx, &finding)?;
+            // Routing spec §3.3 step 1: a marked finding's verification is
+            // refused before the import check and the gate.
+            crate::cmd::escalate::refuse_marked(ctx, Kind::Finding, f.id.iri())?;
             crate::cmd::manifest::ensure_import_current(store, &f.project)?;
             crate::preflight::check(ctx, &f.project)?;
             let id = f.id;
@@ -387,8 +411,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 return Err(crate::cmd::routing::not_routed("--tier"));
             }
             // ⚠ The whole list or an error: `findings` refuses when a tier
-            // it must read cannot be read (routing spec §2.4).
-            let listed: Vec<(Option<Tier>, Finding)> = match ctx.tiers {
+            // it must read cannot be read (routing spec §2.4). Each routed
+            // row carries its tier column.
+            let listed: Vec<(Option<&str>, Finding)> = match ctx.tiers {
                 None => ctx
                     .tracker
                     .list_findings(&p)?
@@ -399,23 +424,22 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     .router
                     .findings(&p, tier)?
                     .into_iter()
-                    .map(|(in_tier, f)| (Some(in_tier), f))
-                    .collect(),
+                    .map(|(in_tier, f)| Ok((Some(t.column(in_tier, f.id.iri())?), f)))
+                    .collect::<Result<_, StoreError>>()?,
             };
             let named = |f: &Finding| {
                 of.as_ref()
                     .is_none_or(|r| f.record == r.id || r.also_known_as.contains(f.record.iri()))
             };
             let mut raisers: BTreeSet<String> = Default::default();
-            for (in_tier, f) in listed
+            for (column, f) in listed
                 .iter()
                 .filter(|(_, f)| want.is_none_or(|w| f.state == w) && named(f))
             {
                 let shown = ctx.show_item(Kind::Finding, f.id.iri())?;
-                match in_tier {
-                    Some(t) => println!(
-                        "{shown}\t{}\t{}\t{}\t{}",
-                        t.as_wire(),
+                match column {
+                    Some(column) => println!(
+                        "{shown}\t{column}\t{}\t{}\t{}",
                         f.state.as_wire(),
                         f.raised_by,
                         f.claim
@@ -444,6 +468,21 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     }
                 }
             }
+        }
+        Cmd::Escalate {
+            id,
+            by,
+            reason,
+            abandon,
+        } => {
+            return crate::cmd::escalate::run(
+                ctx,
+                Kind::Finding,
+                &id,
+                by.as_deref(),
+                reason.as_deref(),
+                abandon,
+            );
         }
     }
     Ok(0)

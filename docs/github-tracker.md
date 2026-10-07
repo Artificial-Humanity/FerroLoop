@@ -135,6 +135,15 @@ its items between the two — names the record in its block as `{"id": "urn:uuid
 resolves the id in the local store. On a repository that is not private, raising such a finding
 publishes the record's title, and fl warns before it does.
 
+A record or finding escalated from the local store to GitHub ([routing.md](routing.md)) keeps
+where it came from in its block, as `"escalated": {"from": "urn:uuid:…", "by": "…", "reason":
+"…"}` — its IRI in the local store, who escalated it, and why — and the issue shows a line
+`Escalated from the local tier by <by>: <reason>. Its local IRI was <from>.` after the body and
+after any `Record:` line. Both lines are written from the block on every write, so neither
+becomes part of a finding's claim or a record's text, and the names and reasons in them mention
+nobody and link nothing. A block that carries `escalated` is written as `fl_format` 3, whatever
+else it carries; an fl that reads formats 1 and 2 refuses it as a newer format.
+
 Open or closed is a projection that fl writes and never reads state from. A record in `done`
 and a finding in `fixed` are closed as completed; a finding in `withdrawn` is closed as not
 planned; every other state is open. Closing or reopening an issue by hand does not change its
@@ -392,17 +401,22 @@ retrying.
 
 ## The live tests
 
-**Status: passed on 2026-09-29, writing with a fine-grained token.** All three passed. The
-concurrency test counted 1 clean round, 9 conflicts caught and 0 updates lost. They have not
-yet been run writing as the App.
+**Status: the first three passed on 2026-09-29, writing with a fine-grained token; the
+escalation test has not yet been run.** The concurrency test counted 1 clean round, 9 conflicts
+caught and 0 updates lost. None has yet been run writing as the App.
 
 The tests that run in CI use an in-process fake GitHub. It proves the structure, not how
-GitHub behaves, so three more tests in `crates/github/tests/live.rs` run against GitHub
+GitHub behaves, so four more tests in `crates/github/tests/live.rs` run against GitHub
 itself: a round trip of a record and a finding; ten rounds of two writers adding to the same
-finding at once, which require no update ever to be lost silently; and exact counts of the
-edit history and the timeline against the model conflict detection rests on, as
-[Conflicts](#conflicts) lists. They are ignored by default, and each fails at once, naming
-`FL_GITHUB_LIVE_REPO`, if it is not set.
+finding at once, which require no update ever to be lost silently; exact counts of the edit
+history and the timeline against the model conflict detection rests on, as
+[Conflicts](#conflicts) lists; and an escalation through the routing tracker
+([routing.md](routing.md)). The escalation test escalates a local record that has an open
+finding and a security finding, and checks that it becomes one open issue in the record's
+state with its area label; that the issue's block carries the old IRI as its create key, as an
+alias and as where it came from; that its text lists the open finding and not the security
+one; and that the local item is a tombstone the router follows. They are ignored by default,
+and each fails at once, naming `FL_GITHUB_LIVE_REPO`, if it is not set.
 
 Run them only against a **private, throwaway** repository: they create issues and never delete
 them, and they refuse a repository that is not private. Set `FL_GITHUB_TOKEN` in the

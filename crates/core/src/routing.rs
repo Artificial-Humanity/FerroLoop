@@ -1,6 +1,7 @@
 //! Two-tier routing (routing spec §1): a project's areas, the tier each one
 //! routes a new item to, and whether it is sensitive.
 
+use crate::escalation::{Outgoing, Provenance};
 use crate::ids::{Kind, ProjectId, RecordId};
 use crate::iri::Iri;
 use crate::store::{StoreError, Tracker};
@@ -338,6 +339,25 @@ pub trait GithubTier {
         project: &ProjectId,
         area: &str,
     ) -> Result<Vec<(Kind, Iri)>, StoreError>;
+    /// The issue an escalation made for the item whose old IRI is `key`
+    /// (routing spec §3.3 step 2): every issue, labelled or not, newest
+    /// first, back to `since_ms` — the mark's time — less the create-search
+    /// margin. `None` when there is none.
+    fn find_escalated(&self, key: &Iri, since_ms: u64) -> Result<Option<Iri>, StoreError>;
+    /// The issue `alias` already names on GitHub, if any (routing spec §3.2:
+    /// one id names one item across both tiers).
+    fn alias_taken(&self, alias: &Iri) -> Result<Option<Iri>, StoreError>;
+    /// Step 2 of an escalation (routing spec §3.3): searches first, as
+    /// `find_escalated`, and answers the issue an earlier run made — given
+    /// its labels if that run stopped before them — or creates the issue
+    /// with the item's own state, area and aliases, `from.from` as its
+    /// create key and first alias, and `from` as where it came from.
+    fn create_escalated(
+        &self,
+        item: &Outgoing,
+        from: &Provenance,
+        since_ms: u64,
+    ) -> Result<Iri, StoreError>;
 }
 
 #[cfg(test)]

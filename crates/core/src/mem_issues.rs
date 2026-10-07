@@ -3,6 +3,7 @@
 //! findings share one numbering, as issues do; no project is checked — the
 //! router checks it, as it does for the real tracker. Never in the binary.
 
+use crate::escalation::{Outgoing, Provenance};
 use crate::finding::{Finding, FindingState};
 use crate::ids::{FindingId, Kind, ProjectId, RecordId};
 use crate::iri::Iri;
@@ -25,6 +26,9 @@ pub struct MemIssues {
     scan_fails: Cell<bool>,
     visibility_unread: Cell<bool>,
     asked: Cell<u32>,
+    fail_next_create: Cell<bool>,
+    lose_next_create_answer: Cell<bool>,
+    creates: Cell<u32>,
 }
 
 /// What `items_in_area` answers once `set_scan_fails` is on.
@@ -38,6 +42,9 @@ struct Issues {
     records: BTreeMap<u64, Record>,
     findings: BTreeMap<u64, Finding>,
     aliases: BTreeMap<Iri, u64>,
+    /// An escalated issue's create key — the item's old IRI — and its
+    /// number.
+    keys: BTreeMap<Iri, u64>,
 }
 
 impl MemIssues {
@@ -72,16 +79,37 @@ impl MemIssues {
         self.asked.get()
     }
 
+    /// The next `create_escalated` fails as unreachable before it reads or
+    /// writes anything, so nothing lands: a stop before the create. Once.
+    pub fn set_fail_next_create(&self, fail: bool) {
+        self.fail_next_create.set(fail);
+    }
+
+    /// The next `create_escalated` that creates lands its issue, then fails
+    /// as unreachable: a create whose answer was lost. Once.
+    pub fn set_lose_next_create_answer(&self, lose: bool) {
+        self.lose_next_create_answer.set(lose);
+    }
+
+    /// How many issues `create_escalated` made — a found one is not made.
+    pub fn creates(&self) -> u32 {
+        self.creates.get()
+    }
+
+    fn unreachable() -> StoreError {
+        StoreError::Unreachable {
+            store: LABEL.into(),
+            cause: "connection refused".into(),
+        }
+    }
+
     pub fn issue(n: u64) -> Iri {
         Iri::parse(&format!("{ISSUES}{n}")).expect("an issue URL is an IRI")
     }
 
     fn up(&self) -> Result<(), StoreError> {
         if self.down.get() {
-            return Err(StoreError::Unreachable {
-                store: LABEL.into(),
-                cause: "connection refused".into(),
-            });
+            return Err(Self::unreachable());
         }
         Ok(())
     }
@@ -356,6 +384,93 @@ impl GithubTier for MemIssues {
             .map(|f| (Kind::Finding, f.id.0.clone()));
         Ok(records.chain(findings).collect())
     }
+
+    /// ⚠ This tier has no clock, so `since_ms` is not read: every issue an
+    /// escalation made is found. The GitHub tracker's own tests cover the
+    /// search's margin.
+    fn find_escalated(&self, key: &Iri, _since_ms: u64) -> Result<Option<Iri>, StoreError> {
+        self.up()?;
+        Ok(self.inner.borrow().keys.get(key).map(|n| Self::issue(*n)))
+    }
+
+    /// The one id namespace, as the GitHub tracker keeps it (routing spec
+    /// §3.2): any issue URL of this repository is taken — it names that
+    /// issue, held here or not — and so is another issue's alias.
+    fn alias_taken(&self, alias: &Iri) -> Result<Option<Iri>, StoreError> {
+        self.up()?;
+        if let Some(n) = alias
+            .as_str()
+            .strip_prefix(ISSUES)
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            return Ok(Some(Self::issue(n)));
+        }
+        Ok(self
+            .inner
+            .borrow()
+            .aliases
+            .get(alias)
+            .map(|n| Self::issue(*n)))
+    }
+
+    /// As the GitHub tracker: the search first — by the create key, which
+    /// is the old IRI — then the create, with the item's own state, area
+    /// and project, the old IRI and the item's aliases as its aliases, and
+    /// a finding's record as the router read it. ⚠ `since_ms` is not read,
+    /// as in `find_escalated`.
+    fn create_escalated(
+        &self,
+        item: &Outgoing,
+        from: &Provenance,
+        _since_ms: u64,
+    ) -> Result<Iri, StoreError> {
+        self.up()?;
+        if self.fail_next_create.replace(false) {
+            return Err(Self::unreachable());
+        }
+        if let Some(n) = self.inner.borrow().keys.get(&from.from) {
+            return Ok(Self::issue(*n));
+        }
+        if let Outgoing::Finding { finding, .. } = item
+            && finding.security
+            && self.public.get()
+        {
+            return Err(StoreError::SecurityNotPrivate {
+                repo: "acme/widgets".into(),
+                visibility: "public".into(),
+            });
+        }
+        let n = self.mint();
+        let url = Self::issue(n);
+        let mut s = self.inner.borrow_mut();
+        let mut aliases = vec![from.from.clone()];
+        match item {
+            Outgoing::Record { record, .. } => {
+                aliases.extend(record.also_known_as.iter().cloned());
+                let mut record = record.clone();
+                record.id = RecordId(url.clone());
+                record.also_known_as = aliases.clone();
+                s.records.insert(n, record);
+            }
+            Outgoing::Finding { finding, record } => {
+                aliases.extend(finding.also_known_as.iter().cloned());
+                let mut finding = finding.clone();
+                finding.id = FindingId(url.clone());
+                finding.record = record.id.clone();
+                finding.also_known_as = aliases.clone();
+                s.findings.insert(n, finding);
+            }
+        }
+        for alias in aliases {
+            s.aliases.insert(alias, n);
+        }
+        s.keys.insert(from.from.clone(), n);
+        self.creates.set(self.creates.get() + 1);
+        if self.lose_next_create_answer.replace(false) {
+            return Err(Self::unreachable());
+        }
+        Ok(url)
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +479,7 @@ mod tests {
     use crate::MemStore;
     use crate::conformance::{self, Bound, Fixture};
     use crate::ids::seq_iri;
+    use crate::tiered::RecordSeen;
 
     /// A `MemStore` catalog with this tier as the tracker, as the GitHub
     /// tracker is bound.
@@ -489,5 +605,243 @@ mod tests {
             t.items_in_area(&p, "design").unwrap(),
             vec![(Kind::Record, area.0.clone()), (Kind::Finding, mine.0)]
         );
+    }
+
+    /// An item's IRI in the local tier.
+    fn local(n: u64) -> Iri {
+        Iri::parse(&format!("urn:uuid:00000000-0000-7000-8000-{n:012}")).unwrap()
+    }
+
+    fn escalation_of(from: &Iri) -> Provenance {
+        Provenance {
+            from: from.clone(),
+            by: "alice".into(),
+            reason: "it needs a person".into(),
+        }
+    }
+
+    /// A local record in `needs_human`, area `code`, with one alias.
+    fn escalated_record(id: &Iri, alias: &Iri) -> Outgoing {
+        Outgoing::Record {
+            record: Record {
+                id: RecordId(id.clone()),
+                project: ProjectId(seq_iri(1)),
+                title: "the build is flaky".into(),
+                state: State::NeedsHuman,
+                also_known_as: vec![alias.clone()],
+                area: Some("code".into()),
+            },
+            findings: vec![],
+        }
+    }
+
+    // Routing spec §3.3 step 2: the issue carries the item's own state, area
+    // and aliases, and its old IRI is an alias of it, so the old id still
+    // names the item; the old IRI is the create key the search finds.
+    #[test]
+    fn an_escalated_record_keeps_its_state_area_and_aliases_and_its_old_iri_finds_it() {
+        let t = MemIssues::default();
+        let (old, alias) = (local(7), local(8));
+        let url = t
+            .create_escalated(&escalated_record(&old, &alias), &escalation_of(&old), 0)
+            .unwrap();
+        assert_eq!(url, MemIssues::issue(1));
+        let expected = Record {
+            id: RecordId(url.clone()),
+            project: ProjectId(seq_iri(1)),
+            title: "the build is flaky".into(),
+            state: State::NeedsHuman,
+            also_known_as: vec![old.clone(), alias.clone()],
+            area: Some("code".into()),
+        };
+        assert_eq!(
+            t.get_record(&RecordId(old.clone())).unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(t.get_record(&RecordId(alias)).unwrap(), Some(expected));
+        assert_eq!(t.find_escalated(&old, 0).unwrap(), Some(url));
+        assert_eq!(t.find_escalated(&local(9), 0).unwrap(), None);
+        assert_eq!(t.creates(), 1);
+    }
+
+    // Routing spec §3.3: a rerun searches first and finds the issue the
+    // first run made — never a second one.
+    #[test]
+    fn a_second_escalation_of_an_item_finds_its_issue_and_creates_none() {
+        let t = MemIssues::default();
+        let (old, alias) = (local(7), local(8));
+        let item = escalated_record(&old, &alias);
+        let first = t.create_escalated(&item, &escalation_of(&old), 0).unwrap();
+        let again = t.create_escalated(&item, &escalation_of(&old), 0).unwrap();
+        assert_eq!(again, first);
+        assert_eq!(t.creates(), 1);
+        assert_eq!(t.list_records(&ProjectId(seq_iri(1))).unwrap().len(), 1);
+    }
+
+    // Routing spec §3.3 step 2: a finding keeps its own state, area and
+    // security mark, and names the record as the router read it — here, a
+    // local record that was escalated before it. A security finding goes
+    // to a private repository only; a public one takes any other finding.
+    #[test]
+    fn an_escalated_finding_keeps_its_state_and_names_its_record_and_security_needs_private() {
+        let t = MemIssues::default();
+        let p = ProjectId(seq_iri(1));
+        let record = t.add_record(&p, "the record, escalated").unwrap();
+        let about = |old: &Iri, security: bool, also_known_as: Vec<Iri>| {
+            let mut finding = Finding::raise(p.clone(), RecordId(local(3)), "rev", "it fails");
+            finding.id = FindingId(old.clone());
+            finding.state = FindingState::Assigned;
+            finding.assigned_to = Some("bob".into());
+            finding.area = Some("code".into());
+            finding.security = security;
+            finding.also_known_as = also_known_as;
+            Outgoing::Finding {
+                finding,
+                record: RecordSeen {
+                    id: record.clone(),
+                    title: "t".into(),
+                    tier: Tier::Github,
+                },
+            }
+        };
+        let old = local(7);
+        let item = about(&old, true, vec![local(8)]);
+        let url = t.create_escalated(&item, &escalation_of(&old), 0).unwrap();
+        assert_eq!(url, MemIssues::issue(2));
+        let back = t.get_finding(&FindingId(old.clone())).unwrap().unwrap();
+        let Outgoing::Finding {
+            finding: mut expected,
+            ..
+        } = item
+        else {
+            unreachable!()
+        };
+        expected.id = FindingId(url);
+        expected.record = record.clone();
+        expected.also_known_as = vec![old.clone(), local(8)];
+        assert_eq!(back, expected);
+        let by_alias = t.get_finding(&FindingId(local(8))).unwrap();
+        assert_eq!(by_alias, Some(expected));
+
+        t.set_public(true);
+        // A rerun finds the issue it made before any visibility check, as
+        // the GitHub tracker does: the issue passed it when it was made.
+        let again = t.create_escalated(&about(&old, true, vec![local(8)]), &escalation_of(&old), 0);
+        assert_eq!(again.unwrap(), MemIssues::issue(2));
+        let open = local(9);
+        let url = t.create_escalated(&about(&open, false, vec![]), &escalation_of(&open), 0);
+        assert_eq!(url.unwrap(), MemIssues::issue(3));
+        let secret = local(11);
+        let err = t
+            .create_escalated(&about(&secret, true, vec![]), &escalation_of(&secret), 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::SecurityNotPrivate { .. }),
+            "{err:?}"
+        );
+        assert_eq!(t.find_escalated(&secret, 0).unwrap(), None);
+        assert_eq!(t.creates(), 2);
+    }
+
+    // Routing spec §3.2, one id namespace: an alias is taken when it is an
+    // issue URL of this repository, held here or not, or another issue's
+    // alias.
+    #[test]
+    fn an_alias_is_taken_by_any_issue_url_here_or_by_an_alias_of_one() {
+        let t = MemIssues::default();
+        let p = ProjectId(seq_iri(1));
+        let r = t.add_record(&p, "t").unwrap();
+        let elsewhere = Iri::parse("https://github.com/elsewhere/old/issues/7").unwrap();
+        t.add_alias(r.iri(), elsewhere.clone()).unwrap();
+        assert_eq!(t.alias_taken(r.iri()).unwrap(), Some(MemIssues::issue(1)));
+        assert_eq!(
+            t.alias_taken(&elsewhere).unwrap(),
+            Some(MemIssues::issue(1))
+        );
+        assert_eq!(
+            t.alias_taken(&MemIssues::issue(2)).unwrap(),
+            Some(MemIssues::issue(2)),
+            "an issue URL of this repository, though no issue 2 is held here"
+        );
+        assert_eq!(t.alias_taken(&local(8)).unwrap(), None);
+    }
+
+    // A stop at step 2, for the router's tests: a create that fails before
+    // it lands leaves nothing, and the next one runs.
+    #[test]
+    fn a_failed_create_lands_nothing_and_fails_once() {
+        let t = MemIssues::default();
+        let (old, alias) = (local(7), local(8));
+        let item = escalated_record(&old, &alias);
+        t.set_fail_next_create(true);
+        let err = t
+            .create_escalated(&item, &escalation_of(&old), 0)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+        assert_eq!(t.find_escalated(&old, 0).unwrap(), None);
+        assert_eq!(t.alias_taken(&old).unwrap(), None);
+        assert_eq!(t.creates(), 0);
+        assert_eq!(
+            t.create_escalated(&item, &escalation_of(&old), 0).unwrap(),
+            MemIssues::issue(1)
+        );
+        assert_eq!(t.creates(), 1);
+        // It fails before the search too: GitHub was not reached at all.
+        t.set_fail_next_create(true);
+        let err = t
+            .create_escalated(&item, &escalation_of(&old), 0)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+    }
+
+    // An ambiguous create (GitHub tracker spec §3.3): the issue lands and
+    // the answer is lost. A rerun finds it by its create key, once.
+    #[test]
+    fn a_create_whose_answer_was_lost_lands_and_a_rerun_finds_it() {
+        let t = MemIssues::default();
+        let (old, alias) = (local(7), local(8));
+        let item = escalated_record(&old, &alias);
+        t.set_lose_next_create_answer(true);
+        let err = t
+            .create_escalated(&item, &escalation_of(&old), 0)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Unreachable { .. }), "{err:?}");
+        assert_eq!(
+            t.find_escalated(&old, 0).unwrap(),
+            Some(MemIssues::issue(1))
+        );
+        assert_eq!(t.creates(), 1);
+        assert_eq!(
+            t.create_escalated(&item, &escalation_of(&old), 0).unwrap(),
+            MemIssues::issue(1)
+        );
+        assert_eq!(t.creates(), 1, "found, not made again");
+        let other = local(9);
+        assert_eq!(
+            t.create_escalated(
+                &escalated_record(&other, &local(10)),
+                &escalation_of(&other),
+                0
+            )
+            .unwrap(),
+            MemIssues::issue(2),
+            "the knob fires once"
+        );
+    }
+
+    #[test]
+    fn the_escalation_calls_fail_as_unreachable_when_the_tier_is_down() {
+        let t = MemIssues::default();
+        let old = local(7);
+        t.set_down(true);
+        let unreachable = |e: StoreError| matches!(e, StoreError::Unreachable { .. });
+        assert!(unreachable(t.find_escalated(&old, 0).unwrap_err()));
+        assert!(unreachable(t.alias_taken(&old).unwrap_err()));
+        let item = escalated_record(&old, &local(8));
+        assert!(unreachable(
+            t.create_escalated(&item, &escalation_of(&old), 0)
+                .unwrap_err()
+        ));
+        assert_eq!(t.creates(), 0);
     }
 }

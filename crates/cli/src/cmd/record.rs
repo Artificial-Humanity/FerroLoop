@@ -3,7 +3,7 @@ use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{ProjectId, RecordId};
-use fl_core::model::State;
+use fl_core::model::{Record, State};
 use fl_core::routing::Tier;
 use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
@@ -35,6 +35,22 @@ pub enum Cmd {
         #[arg(long = "to")]
         to: String,
     },
+    /// Move a local record to GitHub (routing spec §3): every check first,
+    /// then the mark, the issue, and the tombstone. A rerun finishes an
+    /// escalation that stopped.
+    Escalate {
+        id: Ref,
+        /// Who escalates it, named on the issue.
+        #[arg(long, required_unless_present = "abandon")]
+        by: Option<String>,
+        /// Why, named on the issue.
+        #[arg(long, required_unless_present = "abandon")]
+        reason: Option<String>,
+        /// Remove the mark of an escalation that stopped before its issue
+        /// was made.
+        #[arg(long, conflicts_with_all = ["by", "reason"])]
+        abandon: bool,
+    },
 }
 
 impl Cmd {
@@ -47,6 +63,7 @@ impl Cmd {
             Cmd::Add { project, .. } => vec![project],
             Cmd::List { project, .. } => vec![project],
             Cmd::Move { id, .. } => vec![id],
+            Cmd::Escalate { id, .. } => vec![id],
         }
     }
 
@@ -128,7 +145,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                         println!(
                             "{}\t{}\t{}\t{}",
                             ctx.show_item(Kind::Record, r.id.iri())?,
-                            in_tier.as_wire(),
+                            t.column(in_tier, r.id.iri())?,
                             r.state.as_wire(),
                             r.title
                         );
@@ -151,6 +168,10 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     ctx.tracker_label
                 );
             };
+
+            // Routing spec §3.3 step 1: a marked record's move is refused
+            // before the import check and the gates.
+            crate::cmd::escalate::refuse_marked(ctx, Kind::Record, record.id.iri())?;
 
             let gated = store
                 .list_transitions(&record.project)?
@@ -183,6 +204,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     record.state.as_wire(),
                     state.as_wire()
                 );
+                after_landed(ctx, &record, state, &shown);
                 return Ok(0);
             }
 
@@ -221,12 +243,36 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 }
                 MoveOutcome::Moved => {
                     println!("{shown}\t{}", state.as_wire());
+                    after_landed(ctx, &record, state, &shown);
                 }
                 MoveOutcome::Ungated => {
                     unreachable!("an ungated move returns above, before any transition is printed")
                 }
             }
         }
+        Cmd::Escalate {
+            id,
+            by,
+            reason,
+            abandon,
+        } => {
+            return crate::cmd::escalate::run(
+                ctx,
+                Kind::Record,
+                &id,
+                by.as_deref(),
+                reason.as_deref(),
+                abandon,
+            );
+        }
     }
     Ok(0)
+}
+
+/// Routing spec §3.4: a move that landed in `needs_human` escalates a local
+/// record. It returns nothing: the move's own code is the command's.
+fn after_landed(ctx: &Ctx<'_>, record: &Record, to: State, shown: &str) {
+    if to == State::NeedsHuman {
+        crate::cmd::escalate::after_landed_move(ctx, record, shown);
+    }
 }

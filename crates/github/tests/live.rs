@@ -1,15 +1,15 @@
 //! Against GitHub itself (GitHub tracker spec §8.3; GitHub ledger spec
-//! §8.4). Ignored by default.
+//! §8.4; routing spec §5, the escalation). Ignored by default.
 //!
-//! Run only against THROWAWAY repositories. The tracker's tests create
-//! issues and never delete them. The ledger's append to `fl/ledger`, leave
-//! a branch `fl-live/root` at its first commit, and delete nothing: a
-//! ledger under a ruleset cannot be deleted, so every test is safe to run
-//! again on what earlier runs left.
+//! Run only against THROWAWAY repositories. The tracker's tests and the
+//! escalation's create issues and never delete them. The ledger's append
+//! to `fl/ledger`, leave a branch `fl-live/root` at its first commit, and
+//! delete nothing: a ledger under a ruleset cannot be deleted, so every
+//! test is safe to run again on what earlier runs left.
 //!
-//! - `FL_GITHUB_LIVE_REPO`: a private repository (the tracker's tests, and
-//!   most of the ledger's) holding at least one commit: `init` refuses an
-//!   empty repository.
+//! - `FL_GITHUB_LIVE_REPO`: a private repository (the tracker's tests, the
+//!   escalation's, and most of the ledger's) holding at least one commit:
+//!   `init` refuses an empty repository.
 //! - `FL_GITHUB_LIVE_PUBLIC_REPO`: a public repository holding only test
 //!   data and one commit, with an active ruleset on `refs/heads/fl/ledger`
 //!   holding `non_fast_forward` and `deletion` (`fl github ledger init`
@@ -22,7 +22,7 @@
 //!   `FL_GITHUB_LIVE_REPO` only, with Contents: read and Metadata: read.
 //!
 //! A ledger test whose variable is unset skips, saying which; the tracker's
-//! tests still fail without `FL_GITHUB_LIVE_REPO`.
+//! tests and the escalation's still fail without `FL_GITHUB_LIVE_REPO`.
 //!
 //! GitHub's replicas can lag a write. fl's ledger allows for that on its own
 //! path; a test that writes around fl, or reads GitHub directly after a
@@ -54,12 +54,14 @@ use fl_core::log::GateRun;
 use fl_core::model::State;
 use fl_core::split::{Batch, LedgerCache, RemoteLedger};
 use fl_core::store::Bindings;
-use fl_core::store::{StoreError, Tracker};
+use fl_core::store::{Catalog, StoreError, Tracker};
 use fl_core::verdict::Verdict;
+use fl_core::{Escalations, Kind, RoutingMap, TieredTracker, Tombstone};
 use fl_github::ledger::layout::{self, Area, BRANCH, Line, SEGMENT_LIMIT};
 use fl_github::ledger::render::{self, DecisionView, RunRow};
 use fl_github::ledger::{InitOutcome, Mode};
 use fl_github::ledger::{Visibility, ruleset_command};
+use fl_github::meta::{self, EscalatedFrom};
 use fl_github::tracker;
 use fl_github::{
     AppCredentials, Client, Credentials, DEFAULT_API, EnvToken, GithubTracker, Method,
@@ -147,12 +149,16 @@ fn fresh() -> Iri {
     Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).unwrap()
 }
 
-fn now() -> At {
-    let ms = SystemTime::now()
+/// This machine's clock, in unix milliseconds.
+fn now_ms() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("a clock after 1970")
-        .as_millis();
-    At::from_unix_millis(ms as u64)
+        .as_millis() as u64
+}
+
+fn now() -> At {
+    At::from_unix_millis(now_ms())
 }
 
 /// `createCommitOnBranch`, as fl sends it.
@@ -819,6 +825,162 @@ fn the_edit_history_and_timeline_counts_match_fls_model() {
         (0, 0, 0, 1, 0),
         "a reopen is one `reopened` event"
     );
+}
+
+/// Routing spec §5's one live test, through the routing tracker over a
+/// local `MemStore` and the live repository: a local record in `code`, with
+/// an open finding and a security finding, escalates to one open issue in
+/// the record's state, labelled with its area, whose block names the old
+/// IRI as its create key, an alias and where it came from, and whose text
+/// lists the open finding and not the security one. The local item is a
+/// tombstone, and the router reads the old id as the issue.
+#[test]
+#[ignore = "live: needs FL_GITHUB_LIVE_REPO and a credential"]
+fn a_local_record_escalates_to_an_issue_and_leaves_a_tombstone() {
+    const BY: &str = "fl live test";
+    const WHY: &str = "the escalation live test";
+    const OPEN: &str = "fl live test: an open finding";
+    const SECRET: &str = "fl live test: a security finding";
+    let github = tracker();
+    let raw = client();
+    let repo = repo();
+    // ⚠ An escalated record's IRI stays an alias of its issue for good, so
+    // each run's ids must be its own: a run that reused an earlier run's
+    // record IRI would be refused, the IRI already naming an issue.
+    let local = MemStore::starting_at(now_ms());
+    let p = local.add_project("/live").unwrap();
+    local.set_routes(&p, &RoutingMap::starting()).unwrap();
+    let router = TieredTracker {
+        catalog: &local,
+        local: &local,
+        routes: &local,
+        github: &github,
+        escalations: &local,
+    };
+
+    // The starting map routes `code` to the local tier. A state other than
+    // `todo` shows the issue carries the record's own.
+    let old = router
+        .add_record_with_area(&p, "fl live test: an escalated record", Some("code"))
+        .unwrap();
+    router.set_record_state(&old, State::Doing).unwrap();
+    let open = router
+        .add_finding(Finding::raise(p.clone(), old.clone(), "live", OPEN))
+        .unwrap();
+    let mut secret = Finding::raise(p.clone(), old.clone(), "live", SECRET);
+    secret.security = true;
+    let secret = router.add_finding(secret).unwrap();
+    assert!(
+        local.get_record(&old).unwrap().is_some(),
+        "the record is local"
+    );
+    assert!(
+        local.get_finding(&open).unwrap().is_some(),
+        "the finding is local"
+    );
+    assert!(local.get_finding(&secret).unwrap().unwrap().security);
+
+    let at = router.prepare_escalation(old.iri(), Kind::Record).unwrap();
+    assert_eq!((at.resumes(), at.found()), (None, None), "a first run");
+    let now = now_ms();
+    let issue = router.escalate(&at, BY, WHY, now).unwrap();
+
+    // The issue: one, open, in this repository, labelled and in the record's
+    // state.
+    let (name, n) = meta::parse_issue_url(&issue).expect("an issue URL");
+    assert!(
+        name.eq_ignore_ascii_case(&repo),
+        "{issue} is not in `{repo}`"
+    );
+    let labels = |v: &Value| -> Vec<String> {
+        v["labels"]
+            .as_array()
+            .map(|ls| {
+                ls.iter()
+                    .filter_map(|l| l["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let got = eventually(
+        || {
+            raw.send(Method::Get, &format!("/repos/{repo}/issues/{n}"), None)
+                .unwrap()
+                .body
+        },
+        |v| labels(v).iter().any(|l| l == "fl:area/code"),
+    );
+    assert_eq!(got["state"].as_str(), Some("open"), "{got}");
+    let on = labels(&got);
+    for want in ["fl:record", "fl:record/doing", "fl:area/code"] {
+        assert!(on.iter().any(|l| l == want), "no `{want}` among {on:?}");
+    }
+    let listed = eventually(|| github.list_records(&p).unwrap(), |rs| !rs.is_empty());
+    let ids: Vec<&Iri> = listed.iter().map(|r| r.id.iri()).collect();
+    assert_eq!(ids, vec![&issue], "one issue for the record, never two");
+
+    // Its block: the old IRI as create key, first alias and provenance.
+    let body = got["body"].as_str().unwrap().replace("\r\n", "\n");
+    let (prose, block) = meta::parse_body(&body).expect("the issue's block");
+    assert_eq!(block.fl_format, meta::FL_FORMAT_ESCALATED);
+    assert_eq!(block.state, "doing");
+    assert_eq!(block.area.as_deref(), Some("code"));
+    assert_eq!(block.create_key, old.iri().as_str());
+    assert_eq!(block.also_known_as.first(), Some(old.iri()));
+    assert_eq!(
+        block.escalated,
+        Some(EscalatedFrom {
+            from: old.iri().clone(),
+            by: BY.into(),
+            reason: WHY.into(),
+        })
+    );
+
+    // Its text: the escalation line, and the open finding — not the
+    // security one.
+    let line = meta::escalation_line(&block).expect("an escalation line");
+    assert!(body.contains(&line), "no `{line}` in:\n{body}");
+    assert!(
+        prose.contains("Open findings when this record was escalated:"),
+        "no findings list in:\n{prose}"
+    );
+    for shown in [OPEN, open.iri().as_str()] {
+        assert!(
+            prose.contains(&render::escape(shown)),
+            "`{shown}` is not listed in:\n{prose}"
+        );
+    }
+    for hidden in [SECRET, secret.iri().as_str()] {
+        assert!(
+            !body.contains(hidden) && !body.contains(&render::escape(hidden)),
+            "the security finding's `{hidden}` is published in:\n{body}"
+        );
+    }
+
+    // The local item is a tombstone, its mark gone, and the router reads
+    // the old id as the issue.
+    assert_eq!(
+        local.tombstone_of(old.iri()).unwrap(),
+        Some(Tombstone {
+            from: old.iri().clone(),
+            to: issue.clone(),
+            by: BY.into(),
+            reason: WHY.into(),
+            at_ms: now,
+        })
+    );
+    assert_eq!(local.mark_of(old.iri()).unwrap(), None);
+    let read = local.get_record(&old);
+    assert!(
+        matches!(&read, Err(StoreError::Escalated { to, .. }) if *to == issue),
+        "the local store still answers the old id: {read:?}"
+    );
+    let seen = router
+        .get_record(&old)
+        .unwrap()
+        .expect("the router reads the old id");
+    assert_eq!(seen.id.iri(), &issue);
+    assert_eq!(seen.state, State::Doing);
 }
 
 /// ⚠ Spec §6.1: `init`'s first commit holds `format` and `README.md` and
