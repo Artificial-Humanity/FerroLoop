@@ -147,7 +147,8 @@ record in a sensitive area, a security finding, a finding in a sensitive area or
 record in one — or in an area the map no longer declares — is refused, and stays local. Anything
 else escalated to a repository that is not private is published after a `warning:` that names the
 repository, its visibility, and what goes out: the title or claim, the item's local IRI, the
-reason, who escalated it, and a record's number of open findings.
+reason, who escalated it, and — for a finding — who raised it and who it is assigned to, or — for
+a record — how many open findings go out with their claims, states and IRIs.
 
 The escalation then marks the local item "escalating", with who, why and the time. While it is
 marked, the local store refuses every write to it, naming the command that finishes it; a finding

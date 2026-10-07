@@ -320,7 +320,9 @@ fn an_escalation_to_a_public_repository_warns_what_it_publishes() {
             && err.contains(WARNED)
             && err.contains("\"fix the parser\"")
             && err.contains(&format!("its local IRI, {iri},"))
-            && err.contains("and its 1 open findings"),
+            && err.contains(
+                "who escalated it, \"alice\", and its 1 open finding, with its claim, state and IRI"
+            ),
         "{err}"
     );
     assert_eq!(g.fake.issue_count(), 1);
@@ -334,6 +336,8 @@ fn an_escalation_to_a_public_repository_warns_what_it_publishes() {
         err.contains(WARNED)
             && err.contains("this finding's claim, \"it drops a token\"")
             && err.contains(&format!("its local IRI, {iri},"))
+            && err.contains("who escalated it, \"bob\", raised by \"rev\"")
+            && !err.contains("assigned to")
             && !err.contains("its local record's title"),
         "{err}"
     );
@@ -354,6 +358,58 @@ fn an_escalation_to_a_public_repository_warns_what_it_publishes() {
         "{err}"
     );
     assert_eq!(g.fake.issue_count(), 3);
+
+    // A finding that is assigned publishes who it is assigned to.
+    g.local_record("hone the lexer", "code");
+    g.ok(&[
+        "finding",
+        "raise",
+        "--record",
+        "4",
+        "--claim",
+        "it is slow too",
+        "--by",
+        "rev",
+    ]);
+    g.ok(&[
+        "gate",
+        "add",
+        "--project",
+        "1",
+        "--name",
+        "g",
+        "--glob",
+        "src/**/*.rs",
+        "--program",
+        "false",
+    ]);
+    g.ok(&["finding", "reproduce", "3", "--gate", "1"]);
+    g.ok(&["finding", "assign", "3", "--to", "carol"]);
+    g.ok(&["manifest", "export", "--project", "1"]);
+    git(g.repo.path(), &["add", "-A"]);
+    git(g.repo.path(), &["commit", "-qm", "manifest"]);
+    let (_, err) = g.ok_said(&["finding", "escalate", "3", "--by", "bob", "--reason", "why"]);
+    assert!(
+        err.contains(
+            "who escalated it, \"bob\", raised by \"rev\", assigned to \"carol\", and its local"
+        ),
+        "{err}"
+    );
+
+    // A record with several open findings says they go out with their
+    // claims, states and IRIs.
+    g.local_record("sand the lexer", "code");
+    for claim in ["one", "two"] {
+        g.ok(&[
+            "finding", "raise", "--record", "5", "--claim", claim, "--by", "rev",
+        ]);
+    }
+    let (_, err) = g.ok_said(&["record", "escalate", "5", "--by", "bob", "--reason", "why"]);
+    assert!(
+        err.contains("and its 2 open findings, with their claims, states and IRIs"),
+        "{err}"
+    );
+    assert_eq!(g.fake.issue_count(), 5);
 }
 
 // Routing spec §3.2, decisions 18, 21 and 22: a record's issue lists its

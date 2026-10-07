@@ -136,13 +136,26 @@ fn warn_disclosure(t: &Tiers<'_>, prepared: &Prepared, by: &str, reason: &str) -
     // becomes one of the issue's aliases.
     let iri = prepared.id();
     let what = match prepared.outgoing() {
-        Outgoing::Record { record, findings } => format!(
-            "this record's title, {:?}, its local IRI, {iri}, the reason, {reason:?}, who \
-             escalated it, {by}, and its {} open findings",
-            record.title,
-            findings.len()
-        ),
+        Outgoing::Record { record, findings } => {
+            let n = findings.len();
+            // The open findings go out with their claims, states and IRIs.
+            let listed = match n {
+                0 => "and its 0 open findings".to_string(),
+                1 => "and its 1 open finding, with its claim, state and IRI".to_string(),
+                n => format!("and its {n} open findings, with their claims, states and IRIs"),
+            };
+            format!(
+                "this record's title, {:?}, its local IRI, {iri}, the reason, {reason:?}, who \
+                 escalated it, {by:?}, {listed}",
+                record.title
+            )
+        }
         Outgoing::Finding { finding, record } => {
+            // The names the issue's block carries.
+            let assigned = match &finding.assigned_to {
+                Some(to) => format!(", assigned to {to:?}"),
+                None => String::new(),
+            };
             let about = match record.tier {
                 Tier::Local => format!(
                     ", and its local record's title, {:?}, and IRI",
@@ -152,8 +165,8 @@ fn warn_disclosure(t: &Tiers<'_>, prepared: &Prepared, by: &str, reason: &str) -
             };
             format!(
                 "this finding's claim, {:?}, its local IRI, {iri}, the reason, {reason:?}, who \
-                 escalated it, {by}{about}",
-                finding.claim
+                 escalated it, {by:?}, raised by {:?}{assigned}{about}",
+                finding.claim, finding.raised_by
             )
         }
     };
