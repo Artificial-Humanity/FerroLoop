@@ -5,8 +5,9 @@
 //! is always used through `CatalogChecked`, which does (spec §1.3).
 
 use crate::client::{Client, Method};
-use crate::meta::{self, IssueView, ItemKind, Meta, Read, RecordRef, TITLE_MAX};
+use crate::meta::{self, EscalatedFrom, IssueView, ItemKind, Meta, Read, RecordRef, TITLE_MAX};
 use fl_core::at::At;
+use fl_core::escalation::{Outgoing, Provenance};
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
@@ -950,7 +951,6 @@ impl GithubTracker {
             )));
         }
         self.ensure_labels(meta.area.as_deref())?;
-        let labels = meta::labels_after(&[], kind, &meta.state, meta.area.as_deref());
         let body = meta::render_body(prose, meta);
         // ⚠ No labels in the create: they are added afterward, by their own
         // call (`label_created`). Measured live on 2026-10-05: labels set in the
@@ -1009,6 +1009,21 @@ impl GithubTracker {
                 true,
             ));
         }
+        self.finish_create(issue, kind, meta, prose, title)
+    }
+
+    /// The end of a create (spec §3.3), once the issue exists: fl's labels
+    /// added by a call of their own, a wait until they show, and the issue
+    /// remembered as just read.
+    fn finish_create(
+        &self,
+        issue: IssueView,
+        kind: ItemKind,
+        meta: &Meta,
+        prose: &str,
+        title: &str,
+    ) -> Result<IssueView, StoreError> {
+        let labels = meta::labels_after(&[], kind, &meta.state, meta.area.as_deref());
         let issue = self.label_created(issue, &labels)?;
         self.await_create_events(issue.number, &labels);
         self.kinds.borrow_mut().insert(issue.number, kind);
@@ -1100,7 +1115,7 @@ impl GithubTracker {
             if attempt > 0 {
                 std::thread::sleep(self.settle);
             }
-            if let Some(found) = self.find_by_create_key(key, started)? {
+            if let Some(found) = self.find_by_key(key, started)? {
                 return Ok(Some(found));
             }
         }
@@ -1201,16 +1216,19 @@ impl GithubTracker {
     }
 
     /// The issue whose block carries create key `key`, among the issues
-    /// created since `CREATE_SEARCH_MARGIN` before `started`.
+    /// created since `CREATE_SEARCH_MARGIN` before `since_ms` (unix
+    /// milliseconds, by this machine's clock): when a create attempt began,
+    /// or when an escalation marked its item (routing spec §3.3 step 2).
+    /// One pass; `Ok(None)` when it misses.
     /// ⚠ Every issue, not only fl's labelled ones: a create sends no labels
     /// and adds them afterward (`label_created`), so an issue this attempt
     /// made may carry none — after a stop between the two calls, or a
     /// create whose answer was lost. Newest first, and it
     /// stops at the first issue older than the margin, so its cost does not
     /// grow with the repository's history.
-    fn find_by_create_key(&self, key: &str, started: u64) -> Result<Option<IssueView>, StoreError> {
+    pub fn find_by_key(&self, key: &str, since_ms: u64) -> Result<Option<IssueView>, StoreError> {
         let since =
-            At::from_unix_millis(started.saturating_sub(CREATE_SEARCH_MARGIN.as_millis() as u64));
+            At::from_unix_millis(since_ms.saturating_sub(CREATE_SEARCH_MARGIN.as_millis() as u64));
         let mut found = None;
         self.each_issue(None, Order::NewestFirst, SEARCH_PAGE, |node| {
             if created_at(node)? < since {
@@ -1890,6 +1908,161 @@ impl GithubTracker {
             None => Ok(out),
         }
     }
+
+    /// The issue `alias` already names here, if any — the one id namespace
+    /// `add_alias` keeps (spec §2.5), read without writing: an issue URL of
+    /// this repository names that issue, and another issue's alias names
+    /// that issue.
+    /// ⚠ The alias scan reads fl's labelled issues (`alias_owner`): an issue
+    /// with no fl label is not seen.
+    pub fn alias_taken(&self, alias: &Iri) -> Result<Option<Iri>, StoreError> {
+        if let Owner::Ours(n) = self.owner(alias)? {
+            return Ok(Some(self.issue_url(n)));
+        }
+        Ok(self.alias_owner(alias)?.map(|n| self.issue_url(n)))
+    }
+
+    /// The issue an escalated item becomes (routing spec §3.3 step 2). Its
+    /// create key is the item's local IRI, so the issue an earlier run made
+    /// is found first — labelled or not, back to `since_ms` (the mark's
+    /// time) less the margin — given its labels if that run stopped before
+    /// them, and returned: never a second issue. Otherwise the issue is
+    /// made with the item's own state, area and aliases, the local IRI
+    /// first among them, and the block names where it came from.
+    pub fn create_escalated(
+        &self,
+        item: &Outgoing,
+        from: &Provenance,
+        since_ms: u64,
+    ) -> Result<Iri, StoreError> {
+        if let Some(found) = self.find_by_key(from.from.as_str(), since_ms)? {
+            return Ok(self.finish_found(found)?.url);
+        }
+        let (kind, title, prose, mut meta, aliases) = match item {
+            Outgoing::Record { record, findings } => {
+                let mut meta = Meta::new(
+                    ItemKind::Record,
+                    record.state.as_wire(),
+                    record.project.clone(),
+                );
+                meta.area = record.area.clone();
+                (
+                    ItemKind::Record,
+                    record.title.clone(),
+                    escalated_findings(findings),
+                    meta,
+                    record.also_known_as.as_slice(),
+                )
+            }
+            Outgoing::Finding { finding, record } => {
+                // GitHub tracker spec §6, as `add_finding`.
+                if finding.security {
+                    self.require_private()?;
+                }
+                let record = match record.tier {
+                    // Routing spec §2.5: as `add_finding_checked`.
+                    Tier::Local => RecordRef {
+                        id: record.id.iri().clone(),
+                        node_id: None,
+                        title: Some(record.title.clone()),
+                    },
+                    Tier::Github => {
+                        let issue = self.record_issue(&record.id)?;
+                        RecordRef {
+                            id: issue.url,
+                            node_id: Some(issue.node_id),
+                            title: None,
+                        }
+                    }
+                };
+                (
+                    ItemKind::Finding,
+                    meta::title_of(&finding.claim),
+                    finding.claim.clone(),
+                    finding_meta(finding, record),
+                    finding.also_known_as.as_slice(),
+                )
+            }
+        };
+        // The local IRI is the create key the search above looks for, and
+        // an alias, so the old id still names the item.
+        meta.create_key = from.from.to_string();
+        meta.also_known_as = vec![from.from.clone()];
+        for alias in aliases {
+            if !meta.also_known_as.contains(alias) {
+                meta.also_known_as.push(alias.clone());
+            }
+        }
+        meta.escalated = Some(EscalatedFrom {
+            from: from.from.clone(),
+            by: from.by.clone(),
+            reason: from.reason.clone(),
+        });
+        Ok(self.create(kind, &title, &prose, &meta)?.url)
+    }
+
+    /// An issue an earlier escalation made, found by its create key: given
+    /// the labels its own block names — kind, state, area — exactly as a
+    /// create gives them, when a stop between the create and the label
+    /// call left it without them. One that carries them is left as it is.
+    fn finish_found(&self, issue: IssueView) -> Result<IssueView, StoreError> {
+        let (prose, block) = meta::parse_body(&issue.body).map_err(|e| StoreError::Diverged {
+            id: issue.url.clone(),
+            detail: format!("its body {e}"),
+        })?;
+        self.ensure_labels(block.area.as_deref())?;
+        let title = issue.title.clone();
+        self.finish_create(issue, block.kind, &block, &prose, &title)
+    }
+
+    /// The issue of the fl record `id` names here (spec §3.1): another kind
+    /// is `WrongKind`, no issue is `NoSuchRecord`.
+    /// ⚠ `remember: false`: a validity check, not a read the caller
+    /// receives the record from.
+    fn record_issue(&self, id: &RecordId) -> Result<IssueView, StoreError> {
+        match self.item(id.iri(), ItemKind::Record, false)? {
+            Found::Item(issue, _, _) => Ok(issue),
+            Found::OtherKind(k) => Err(StoreError::WrongKind {
+                id: id.iri().clone(),
+                expected: Kind::Record,
+                found: k.as_kind(),
+            }),
+            Found::Absent => Err(StoreError::NoSuchRecord(id.clone())),
+        }
+    }
+}
+
+/// An escalated record's text (routing spec decision 18): its open
+/// findings, one line each — state, claim and IRI, each escaped so none
+/// mentions anyone, links anything or breaks the line — under a heading;
+/// empty when there are none. The list is as of the escalation, and is not
+/// kept current.
+fn escalated_findings(findings: &[Finding]) -> String {
+    let escape = crate::ledger::render::escape;
+    let lines: Vec<String> = findings
+        .iter()
+        // Defence in depth: the router leaves security findings out too
+        // (routing spec decision 18), and a public issue must never list one.
+        // Sensitivity is the router's to filter: it holds the routing map,
+        // and leaves out a finding in a sensitive or undeclared area
+        // (routing spec decision 21).
+        .filter(|f| !f.security)
+        .map(|f| {
+            format!(
+                "- {}: {} — {}",
+                escape(f.state.as_wire()),
+                escape(&f.claim),
+                escape(f.id.iri().as_str())
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Open findings when this record was escalated:\n\n{}",
+        lines.join("\n")
+    )
 }
 
 /// The block of a new finding about `record` (spec §3.1).
@@ -1955,19 +2128,7 @@ impl Tracker for GithubTracker {
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         // The record must be an fl record of this repository (spec §3.1).
-        // ⚠ `remember: false`: this is a validity
-        // check, not a read the caller receives the record from.
-        let record = match self.item(finding.record.iri(), ItemKind::Record, false)? {
-            Found::Item(issue, _, _) => issue,
-            Found::OtherKind(k) => {
-                return Err(StoreError::WrongKind {
-                    id: finding.record.iri().clone(),
-                    expected: Kind::Record,
-                    found: k.as_kind(),
-                });
-            }
-            Found::Absent => return Err(StoreError::NoSuchRecord(finding.record.clone())),
-        };
+        let record = self.record_issue(&finding.record)?;
         if finding.security {
             self.require_private()?;
         }
@@ -2076,10 +2237,7 @@ impl Tracker for GithubTracker {
     fn add_alias(&self, primary: &Iri, alias: Iri) -> Result<(), StoreError> {
         // One id namespace: the alias may not name an issue here, nor be
         // another item's alias.
-        if let Owner::Ours(_) = self.owner(&alias)? {
-            return Err(StoreError::AlreadyExists(alias));
-        }
-        if self.alias_owner(&alias)?.is_some() {
+        if self.alias_taken(&alias)?.is_some() {
             return Err(StoreError::AlreadyExists(alias));
         }
         let n = self.locate(primary)?;
@@ -4427,6 +4585,424 @@ mod tests {
         fake.state().repos[0].visibility = "public".into();
         let r = t.add_record(&p(), "t").unwrap();
         t.add_finding(Finding::raise(p(), r, "a", "c")).unwrap();
+    }
+
+    /// An item's IRI in the local tier.
+    fn local_iri(n: u64) -> Iri {
+        Iri::parse(&format!("urn:uuid:00000000-0000-7000-8000-{n:012}")).unwrap()
+    }
+
+    fn escalation_of(from: &Iri) -> Provenance {
+        Provenance {
+            from: from.clone(),
+            by: "alice".into(),
+            reason: "it needs a person".into(),
+        }
+    }
+
+    /// A local record in `needs_human`, area `code`.
+    fn needs_human(id: &Iri, also_known_as: Vec<Iri>) -> Record {
+        Record {
+            id: RecordId(id.clone()),
+            project: p(),
+            title: "the build is flaky".into(),
+            state: State::NeedsHuman,
+            also_known_as,
+            area: Some("code".into()),
+        }
+    }
+
+    fn escalated_record(id: &Iri) -> Outgoing {
+        Outgoing::Record {
+            record: needs_human(id, vec![]),
+            findings: vec![],
+        }
+    }
+
+    /// Issue `n`'s text as shown and its block.
+    fn shown_and_block(fake: &FakeGithub, n: u64) -> (String, Meta) {
+        let body = fake.issue(n).body;
+        let shown = body[..body.rfind(meta::META_OPEN).unwrap()].to_string();
+        (shown, meta::parse_body(&body).unwrap().1)
+    }
+
+    /// Label calls sent to issue `n`.
+    fn label_posts(fake: &FakeGithub, n: u64) -> usize {
+        let call = format!("POST /repos/acme/widgets/issues/{n}/labels");
+        fake.state().requests.iter().filter(|r| **r == call).count()
+    }
+
+    const ESCALATED_7: &str = "Escalated from the local tier by alice: it needs a person. \
+                               Its local IRI was urn:uuid:00000000-0000-7000-8000-000000000007.";
+
+    // Routing spec decision 18: an escalated record's issue lists its open
+    // findings — state, claim and IRI, escaped — and never a security one.
+    #[test]
+    fn an_escalated_records_text_lists_its_open_findings_escaped_and_never_a_security_one() {
+        let record = RecordId(local_iri(7));
+        let mut open = Finding::raise(p(), record.clone(), "rev", "it fails for @alice\nin #3");
+        open.id = FindingId(Iri::parse("urn:x-local:finding_1").unwrap());
+        open.state = FindingState::Reproduced;
+        let mut slow = Finding::raise(p(), record.clone(), "rev", "slow <b>always</b>");
+        slow.id = FindingId(local_iri(8));
+        let mut secret = Finding::raise(p(), record, "rev", "the token leaks");
+        secret.id = FindingId(local_iri(9));
+        secret.security = true;
+        assert_eq!(escalated_findings(&[]), "");
+        assert_eq!(escalated_findings(std::slice::from_ref(&secret)), "");
+        assert_eq!(
+            escalated_findings(&[open, secret, slow]),
+            "Open findings when this record was escalated:\n\n\
+             - reproduced: it fails for @&#8203;alice<br>in #&#8203;3 — urn:x-local:finding\\_1\n\
+             - raised: slow &lt;b&gt;always&lt;/b&gt; — \
+             urn:uuid:00000000-0000-7000-8000-000000000008"
+        );
+    }
+
+    // Routing spec §3.3 step 2: the issue has the record's own state, area
+    // and aliases, its local IRI as the create key and an alias, and names
+    // where it came from; the old IRI still finds it.
+    #[test]
+    fn an_escalated_record_keeps_its_state_area_and_aliases_and_lists_its_findings() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        let old = local_iri(7);
+        let alias = Iri::parse("https://github.com/elsewhere/old/issues/4").unwrap();
+        let mut open_finding = Finding::raise(p(), RecordId(old.clone()), "rev", "it is slow");
+        open_finding.id = FindingId(local_iri(8));
+        let mut secret = Finding::raise(p(), RecordId(old.clone()), "rev", "the token leaks");
+        secret.id = FindingId(local_iri(9));
+        secret.security = true;
+        let item = Outgoing::Record {
+            // An alias that repeats the local IRI is written once.
+            record: needs_human(&old, vec![alias.clone(), old.clone()]),
+            findings: vec![open_finding, secret],
+        };
+        let url = t
+            .create_escalated(&item, &escalation_of(&old), now_millis())
+            .unwrap();
+        assert_eq!(url, t.issue_url(1));
+        let issue = fake.issue(1);
+        assert_eq!(issue.state, "open");
+        assert_eq!(issue.title, "the build is flaky");
+        assert_eq!(
+            issue.labels,
+            vec!["fl:record", "fl:record/needs_human", "fl:area/code"]
+        );
+        let (shown, block) = shown_and_block(&fake, 1);
+        assert_eq!(
+            shown,
+            format!(
+                "Open findings when this record was escalated:\n\n\
+                 - raised: it is slow — urn:uuid:00000000-0000-7000-8000-000000000008\n\n\
+                 {ESCALATED_7}\n\n"
+            )
+        );
+        assert!(!shown.contains("token"), "{shown}");
+        assert_eq!(block.create_key, old.as_str());
+        assert_eq!(block.also_known_as, vec![old.clone(), alias.clone()]);
+        assert_eq!(
+            block.escalated,
+            Some(EscalatedFrom {
+                from: old.clone(),
+                by: "alice".into(),
+                reason: "it needs a person".into(),
+            })
+        );
+        assert_eq!(block.fl_format, 3);
+        assert_eq!(
+            (block.state.as_str(), block.area.as_deref()),
+            ("needs_human", Some("code"))
+        );
+        let back = open(&fake)
+            .get_record(&RecordId(old.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(back.id, RecordId(url));
+        assert_eq!(
+            (back.title.as_str(), back.state, back.also_known_as),
+            ("the build is flaky", State::NeedsHuman, vec![old, alias])
+        );
+    }
+
+    // Routing spec §2.5, §3.3 step 2: an escalated finding's issue is its
+    // claim; its record is named as text when it is local, and by URL and
+    // node id when it is on GitHub.
+    #[test]
+    fn an_escalated_finding_names_a_local_record_as_text_and_links_a_github_one() {
+        use fl_core::tiered::RecordSeen;
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        let local_record = RecordId(local_iri(42));
+        let old = local_iri(7);
+        let alias = Iri::parse("https://github.com/elsewhere/old/issues/4").unwrap();
+        let mut f = Finding::raise(p(), local_record.clone(), "rev", "the claim\nin two lines");
+        f.id = FindingId(old.clone());
+        f.area = Some("design".into());
+        f.also_known_as = vec![alias.clone()];
+        let item = Outgoing::Finding {
+            finding: f,
+            record: RecordSeen {
+                id: local_record.clone(),
+                title: "the build".into(),
+                tier: Tier::Local,
+            },
+        };
+        let url = t
+            .create_escalated(&item, &escalation_of(&old), now_millis())
+            .unwrap();
+        assert_eq!(url, t.issue_url(1));
+        let issue = fake.issue(1);
+        assert_eq!(issue.title, "the claim");
+        assert_eq!(
+            issue.labels,
+            vec!["fl:finding", "fl:finding/raised", "fl:area/design"]
+        );
+        let (shown, block) = shown_and_block(&fake, 1);
+        let record_line = meta::record_line(&block).unwrap();
+        assert!(
+            record_line.contains("held in the local tier, not on GitHub"),
+            "{record_line}"
+        );
+        assert_eq!(
+            shown,
+            format!("the claim\nin two lines\n\n{record_line}\n\n{ESCALATED_7}\n\n")
+        );
+        assert_eq!(
+            block.record,
+            Some(RecordRef {
+                id: local_record.0.clone(),
+                node_id: None,
+                title: Some("the build".into()),
+            })
+        );
+        assert_eq!(
+            (block.create_key.as_str(), block.also_known_as.clone()),
+            (old.as_str(), vec![old.clone(), alias])
+        );
+        assert_eq!(block.fl_format, 3);
+        let back = t.get_finding(&FindingId(url)).unwrap().unwrap();
+        assert_eq!(
+            (back.record, back.claim.as_str()),
+            (local_record, "the claim\nin two lines")
+        );
+
+        let on_github = t.add_record(&p(), "the build").unwrap();
+        let old = local_iri(8);
+        let mut f = Finding::raise(p(), RecordId(local_iri(42)), "rev", "another claim");
+        f.id = FindingId(old.clone());
+        f.state = FindingState::Assigned;
+        f.assigned_to = Some("bob".into());
+        let item = Outgoing::Finding {
+            finding: f,
+            record: RecordSeen {
+                id: on_github.clone(),
+                title: "the build".into(),
+                tier: Tier::Github,
+            },
+        };
+        let url = t
+            .create_escalated(&item, &escalation_of(&old), now_millis())
+            .unwrap();
+        assert_eq!(url, t.issue_url(3));
+        assert_eq!(
+            fake.issue(3).labels,
+            vec!["fl:finding", "fl:finding/assigned"]
+        );
+        let (shown, block) = shown_and_block(&fake, 3);
+        assert!(!shown.contains("Record:"), "{shown}");
+        assert_eq!(
+            block.record,
+            Some(RecordRef {
+                id: on_github.0.clone(),
+                node_id: Some("I_2".into()),
+                title: None,
+            })
+        );
+        assert_eq!(block.assigned_to.as_deref(), Some("bob"));
+        let back = t.get_finding(&FindingId(url)).unwrap().unwrap();
+        assert_eq!(back.record, on_github);
+    }
+
+    // GitHub tracker spec §6: a security finding is escalated only to a
+    // private repository; anywhere else nothing is created.
+    #[test]
+    fn an_escalated_security_finding_goes_only_to_a_private_repository() {
+        use fl_core::tiered::RecordSeen;
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        let old = local_iri(7);
+        let mut f = Finding::raise(p(), RecordId(local_iri(42)), "rev", "the token leaks");
+        f.id = FindingId(old.clone());
+        f.security = true;
+        let item = Outgoing::Finding {
+            finding: f,
+            record: RecordSeen {
+                id: RecordId(local_iri(42)),
+                title: "t".into(),
+                tier: Tier::Local,
+            },
+        };
+        fake.state().repos[0].visibility = "public".into();
+        let err = t
+            .create_escalated(&item, &escalation_of(&old), now_millis())
+            .unwrap_err();
+        let StoreError::SecurityNotPrivate { visibility, .. } = &err else {
+            panic!("{err:?}");
+        };
+        assert_eq!(visibility, "public");
+        assert_eq!((fake.issue_count(), issue_posts(&fake)), (0, 0));
+        fake.state().repos[0].visibility = "private".into();
+        t.create_escalated(&item, &escalation_of(&old), now_millis())
+            .unwrap();
+        assert!(shown_and_block(&fake, 1).1.security);
+    }
+
+    // GitHub tracker spec §3.2: an issue is created open, so a closed item
+    // is refused before anything is sent — the router checks first (routing
+    // spec §3.2), and the create's own check stays.
+    #[test]
+    fn a_closed_item_is_never_created_by_an_escalation() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        let old = local_iri(7);
+        let mut record = needs_human(&old, vec![]);
+        record.state = State::Done;
+        let item = Outgoing::Record {
+            record,
+            findings: vec![],
+        };
+        let err = t
+            .create_escalated(&item, &escalation_of(&old), now_millis())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fl creates items open"), "{err}");
+        assert_eq!((fake.issue_count(), issue_posts(&fake)), (0, 0));
+    }
+
+    // Routing spec §3.3: running the escalation again resumes — the search
+    // finds the issue the first run made, and nothing is created or
+    // labelled again.
+    #[test]
+    fn a_rerun_finds_the_escalated_issue_and_creates_no_second() {
+        let fake = FakeGithub::start("acme/widgets");
+        let since = now_millis();
+        let old = local_iri(7);
+        let first = open(&fake)
+            .without_settle()
+            .create_escalated(&escalated_record(&old), &escalation_of(&old), since)
+            .unwrap();
+        let labelled = label_posts(&fake, 1);
+        let again = open(&fake)
+            .without_settle()
+            .create_escalated(&escalated_record(&old), &escalation_of(&old), since)
+            .unwrap();
+        assert_eq!(again, first);
+        assert_eq!((fake.issue_count(), issue_posts(&fake)), (1, 1));
+        assert_eq!(label_posts(&fake, 1), labelled, "no second label call");
+    }
+
+    // Routing spec §3.3 step 2: a run stopped between the create and its
+    // label call left an issue with no fl label. A rerun more than the
+    // create-search margin later still finds it — it searches back from the
+    // mark's time, not its own — labels it as the create would have, and
+    // makes no second issue.
+    #[test]
+    fn an_escalation_stopped_before_its_labels_is_found_and_finished_after_the_margin() {
+        let fake = FakeGithub::start("acme/widgets");
+        let marked = now_millis();
+        let old = local_iri(7);
+        fake.state().fail_label_add_next = true;
+        let err = open(&fake)
+            .without_settle()
+            .create_escalated(&escalated_record(&old), &escalation_of(&old), marked)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("without some or all of fl's labels"), "{err}");
+        assert!(fake.issue(1).labels.is_empty());
+        let eleven_minutes = 11 * 60 * 1000;
+        for i in fake.state().issues.values_mut() {
+            i.created_ms -= eleven_minutes;
+        }
+        let marked = marked - eleven_minutes;
+        // The label is gone too: it is created before it is added.
+        fake.state().labels.remove("fl:area/code");
+        let t = open(&fake).without_settle();
+        assert_eq!(
+            t.find_by_key(old.as_str(), now_millis()).unwrap(),
+            None,
+            "searched from now, the issue is past the margin"
+        );
+        let created = label_creates(&fake);
+        let url = t
+            .create_escalated(&escalated_record(&old), &escalation_of(&old), marked)
+            .unwrap();
+        assert_eq!(url, t.issue_url(1));
+        assert_eq!(
+            fake.issue(1).labels,
+            vec!["fl:record", "fl:record/needs_human", "fl:area/code"]
+        );
+        assert_eq!(label_creates(&fake), created + 1, "created explicitly");
+        assert_eq!((fake.issue_count(), issue_posts(&fake)), (1, 1));
+        let records = open(&fake).list_records(&p()).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, State::NeedsHuman);
+    }
+
+    // GitHub tracker spec §3.3: a create whose answer failed after it
+    // landed is found by its create key — the local IRI — and not sent
+    // again.
+    #[test]
+    fn an_escalation_whose_create_failed_after_landing_is_found_not_duplicated() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        let old = local_iri(7);
+        fake.state().fail_after_create = true;
+        let url = t
+            .create_escalated(&escalated_record(&old), &escalation_of(&old), now_millis())
+            .unwrap();
+        assert_eq!(url, t.issue_url(1));
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+        assert_eq!(
+            fake.issue(1).labels,
+            vec!["fl:record", "fl:record/needs_human", "fl:area/code"]
+        );
+    }
+
+    // Routing spec §3.3 step 2: one pass, every issue newest first, back
+    // to the margin before the given time and no further.
+    #[test]
+    fn find_by_key_reads_back_to_the_margin_before_its_time_and_no_further() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        let since = now_millis();
+        let old = local_iri(7);
+        t.create_escalated(&escalated_record(&old), &escalation_of(&old), since)
+            .unwrap();
+        t.add_record(&p(), "newer").unwrap();
+        let found = |at: u64| t.find_by_key(old.as_str(), at).unwrap().map(|i| i.number);
+        assert_eq!(found(since), Some(1));
+        assert_eq!(t.find_by_key("urn:uuid:another", since).unwrap(), None);
+        let eleven_minutes = 11 * 60 * 1000;
+        fake.state().issues.get_mut(&1).unwrap().created_ms -= eleven_minutes;
+        assert_eq!(found(since), None, "older than the margin");
+        assert_eq!(found(since - eleven_minutes), Some(1));
+    }
+
+    // Routing spec §3.2, one id namespace: an alias is taken when it is an
+    // issue URL of this repository or another issue's alias.
+    #[test]
+    fn an_alias_is_taken_by_an_issue_here_or_by_another_issues_alias() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let a = t.add_record(&p(), "a").unwrap();
+        let elsewhere = Iri::parse("https://github.com/elsewhere/old/issues/7").unwrap();
+        t.add_alias(a.iri(), elsewhere.clone()).unwrap();
+        assert_eq!(t.alias_taken(a.iri()).unwrap(), Some(t.issue_url(1)));
+        assert_eq!(t.alias_taken(&elsewhere).unwrap(), Some(t.issue_url(1)));
+        assert_eq!(t.alias_taken(&local_iri(8)).unwrap(), None);
+        let free = Iri::parse("https://github.com/elsewhere/old/issues/8").unwrap();
+        assert_eq!(t.alias_taken(&free).unwrap(), None);
     }
 
     /// The same suites the local stores pass (spec §8.1): the GitHub
