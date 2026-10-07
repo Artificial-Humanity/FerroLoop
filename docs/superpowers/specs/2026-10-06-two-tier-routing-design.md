@@ -541,7 +541,8 @@ Every refusal names its cause and what to do:
 
 None. The review of rev 1 raised eight owner decisions (12–19) and the owner decided them on
 2026-10-06; planning plan A raised three more (20–22), decided the same day; the rest are
-`[agent]` rulings, marked where they are made.
+`[agent]` rulings, marked where they are made. `[agent]`: the final review of plan A raised one
+more (23), decided 2026-10-07.
 
 ---
 
@@ -568,8 +569,8 @@ Two plans, as for sub-projects 2 and 3:
 
 * **Plan A — routing.** The area (model, store, block, label), the routing map and its
   commands, manifest format 3, store format 5, `TieredTracker` (create, lookup, handles,
-  lists, references across tiers, `ForeignRecord`), lazy GitHub, decisions 12–14 and 20–22,
-  the migration notice.
+  lists, references across tiers, `ForeignRecord`), lazy GitHub, decisions 12–14 and 20–23
+  (`[agent]`: 23 added in rev 2.3), the migration notice.
 * **Plan B — escalation.** The pre-checks, the mark, the find-or-create step with its own
   search, the tombstone, `--abandon`, the findings list in the issue, the `needs_human`
   trigger, the live test. Plan B is written after plan A merges.

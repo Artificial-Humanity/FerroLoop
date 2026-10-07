@@ -1738,9 +1738,9 @@ fn clearing_a_sensitivity_no_item_names_works() {
         .failure();
 }
 
-// Routing spec decision 22, the re-review's scenario: the authoring machine
-// removes a sensitive area that only another machine's records name; after
-// the re-import those records still count as sensitive — fail closed.
+// Routing spec decision 22, end to end: the authoring machine removes a
+// sensitive area that only another machine's records name; after the
+// re-import those records still count as sensitive — fail closed.
 #[test]
 fn a_record_whose_area_was_removed_elsewhere_stays_protected() {
     let g = world(BOUND);
@@ -1880,8 +1880,8 @@ fn the_first_set_needs_no_sensitivity_flag() {
     );
 }
 
-// Routing spec decision 23, the final review's scenario: the authoring
-// machine removes `security`, which only another machine's record names,
+// Routing spec decision 23 and §1.2, end to end: the authoring machine
+// removes `security`, which only another machine's record names,
 // then sets it again. Without a flag the area would come back not
 // sensitive and, once imported, let a finding about that record onto a
 // public repository; the set is refused instead.
@@ -2356,4 +2356,32 @@ fn a_successful_not_sensitive_says_only_this_machines_local_tier_was_checked() {
     ] {
         assert!(!quiet.contains(THIS_MACHINE_ONLY), "{quiet}");
     }
+}
+
+// Routing spec §2.3: under `--db` fl reads no config entry, so the first
+// set does not know the project's mode before, and says nothing of handles
+// rather than guess.
+#[test]
+fn a_first_set_under_db_says_nothing_of_handles() {
+    let g = world("");
+    let db = g.home.path().join("elsewhere.redb");
+    let db = db.to_str().unwrap();
+    g.ok(&["--db", db, "project", "add", "."]);
+    g.fl()
+        .args([
+            "--db",
+            db,
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "code",
+            "local",
+        ])
+        .assert()
+        .success()
+        .stderr(
+            contains("wrote the starting set first")
+                .and(contains("handles change in this project").not()),
+        );
 }
