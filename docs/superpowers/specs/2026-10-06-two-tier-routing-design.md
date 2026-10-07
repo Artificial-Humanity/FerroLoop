@@ -1,12 +1,15 @@
 # Two-tier routing and escalation — design
 
-**Date:** 2026-10-06 (rev 2.3, 2026-10-07)
+**Date:** 2026-10-06 (rev 2.4, 2026-10-07)
 **Status:** Approved by the owner 2026-10-06. Rev 1 (in git at 96e1a41) was approved and then
 reviewed against the code; rev 2 folds in that review and the owner's decisions 12–19 on it.
 Rev 2.1 folds in the owner's decisions 20–21 and seven corrections found while planning plan A
 against the code (`docs/superpowers/plans/2026-10-06-two-tier-routing-a.md`, "Spec defects");
 rev 2.2 folds in the owner's decision 22, after a re-review found two ways around decision 21;
-rev 2.3 folds in the owner's decision 23, after the final review found a way around decision 22.
+rev 2.3 folds in the owner's decision 23, after the final review found a way around decision 22;
+rev 2.4 folds in seven `[agent]` corrections found while planning plan B against the code
+(`docs/superpowers/plans/2026-10-07-two-tier-routing-b.md`, "Spec defects"), and one `[agent]`
+ruling from its review: a marked item's lookup is best effort (§2.2).
 Each change is marked here as an owner decision or `[agent]`.
 Sub-project 4 of 4. Delivered as two plans (§8).
 **Scope:** A project with two trackers — the local store for developer-level items, a GitHub
@@ -88,7 +91,8 @@ how an item moves between the tiers.
 17. **No area rename.** Areas are added and removed only.
 18. **An escalated record's GitHub issue lists the record's open findings** — claim, state and
     IRI — leaving out security findings. fl warns before it publishes to a non-private
-    repository.
+    repository. *(Rev 2.4, `[agent]`: also leaving out findings in a sensitive area or one the
+    map no longer declares — decisions 21 and 22.)*
 19. **GitHub is opened only when a GitHub-tier item is needed**, so work on local items does
     not need the network or a credential.
 20. **A routed store holds exactly one project** (owner, 2026-10-06). Routing is decided per
@@ -288,7 +292,13 @@ engine does not change. It follows the composable wrappers the code already has.
   on another machine's local tier, or not existing** — never `NotOwned` as if the id were
   malformed. `[agent]` A local item exists in exactly one store on one machine.
 * An item marked "escalating" and the GitHub issue whose alias is its IRI are one item, not
-  two: the lookup returns the GitHub issue once it exists. `[agent]`
+  two: the lookup returns the GitHub issue once it exists. `[agent]` *(Rev 2.4, `[agent]`: best
+  effort. The lookup of a marked item asks GitHub by the escalation's own search, and only a
+  marked item pays for it; the issue takes over only when it is found and GitHub reads it as an
+  fl item. Otherwise — no issue, an issue fl cannot read yet (a stop before its labels), or
+  GitHub unbound or out of reach — the local copy answers, as it last was, and the local store
+  refuses every write to it (§3.3 step 1), so no write lands in two places. A merged list shows
+  the item once, as the issue; `--tier local` shows the marked local item.)*
 
 ### 2.3 Handles
 
@@ -323,7 +333,8 @@ still means issue 41.
   cannot see its whole population fails.)* A machine with no binding cannot read the GitHub
   tier, so it lists with `--tier local` *(rev 2.1, `[agent]`)*.
 * `fl finding list --record <id>` is new: it lists one record's findings, from both tiers.
-* An item marked "escalating" is listed with that mark. Tombstones are not listed.
+* An item marked "escalating" is listed with that mark. Tombstones are not listed. *(Rev 2.4,
+  `[agent]`: in a routed store's lists the tier column of a marked item reads `escalating`.)*
 * The withdrawal counts that `fl finding list` prints sum both tiers.
 
 ### 2.5 References across tiers
@@ -385,6 +396,8 @@ is never marked and then stranded. `[agent]` The command refuses:
 * a closed state — a record `done`, a finding `fixed` or `withdrawn` (the GitHub tracker
   creates open issues only);
 * a title the GitHub tracker refuses (over 256 characters, or with whitespace at either end);
+  *(rev 2.4, `[agent]`: a finding's issue title is its claim's first line, trimmed and cut to
+  256, so only a record's title can fail this)*
 * a security finding, a sensitive area, or a finding about a local record in a sensitive area
   (decision 21), when the repository is not private;
 * a finding whose reproduction gate is not in the committed manifest (GitHub tracker spec
@@ -404,7 +417,10 @@ Each step can be run again, and running the command again resumes from where it 
    `fl finding escalate <id>`) to finish. A finding raised against a marked record is not a
    write to it and is allowed.
 2. **Find or create the GitHub issue.**
-   * The create key is derived from the old IRI.
+   * The create key is derived from the old IRI. *(Rev 2.4, `[agent]`: the key is the old IRI
+     itself. Today's key is random and searched for only inside one create, back to that
+     attempt's start, so the escalation has a search and a create of its own: the create
+     carries the item's own state and aliases, which no create carried before.)*
    * Before any create, fl searches every issue, labelled or not, newest first, back to the
      mark's time less the create-search margin, for that key. `[agent]` (Review: today's
      search runs only inside one create after an ambiguous failure, and only back to that
@@ -413,7 +429,11 @@ Each step can be run again, and running the command again resumes from where it 
    * Only when the search finds nothing does fl create the issue: the item's title, state,
      area and fl block; aliases that include the old local IRI and the item's own aliases.
      The issue's text names who escalated it, why, and the old IRI, and for a record lists its
-     open findings (decision 18).
+     open findings (decision 18). *(Rev 2.4, `[agent]`: a finding's issue text is its claim, so
+     who, why and the old IRI are a block field, `escalated: { from, by, reason }`, and the issue
+     shows a line rendered from it and stripped on read; a block that carries it is written with
+     `fl_format` 3, so an older fl says "upgrade fl", not "damaged". A record's open findings are
+     listed in its issue's text as they stood at the escalation.)*
 3. **Replace the local item with a tombstone** — the old IRI, the new IRI, who, when, why.
 
 The item is never live in both tiers: step 1 blocks local writes before step 2 can make the
@@ -428,7 +448,8 @@ only way on is step 3.
 
 In a routed project, `fl record move <id> --to needs_human` on a local record runs the
 transition as today — gates, ledger entry, then the state change (evidence before state,
-identity spec §3.5). **If the move landed**, it then runs the escalation; a refused move
+identity spec §3.5). *(Rev 2.4, `[agent]`: a routed project's ledger is local and writes no
+decision of its own, so the move's evidence is its gate runs; an ungated move writes none.)* **If the move landed**, it then runs the escalation; a refused move
 escalates nothing. If the escalation fails, the record stays local, in `needs_human`, marked
 "escalating" if step 1 ran, and the command exits with the move's own code and a `warning:`
 naming `fl record escalate <id>` (decision 16).
@@ -511,7 +532,8 @@ Every refusal names its cause and what to do:
     copies — including a rerun more than the create-search margin after a stop between the
     create and its label call;
   * `--abandon` before and after the issue exists;
-  * a record's issue lists its open, non-security findings.
+  * a record's issue lists its open findings, none a security finding or in a sensitive or
+    undeclared area *(rev 2.4, `[agent]`)*.
 * **The `needs_human` trigger:** a refused move escalates nothing; an escalation that fails
   after a landed move leaves the record local, in `needs_human`, marked, the ledger entry
   written, the move's exit code and the warning.
@@ -533,7 +555,9 @@ Every refusal names its cause and what to do:
   scenario end to end — remove, set again with no flag — is refused at the set.
 * **One live test** on the private throwaway repository: escalate a local record; the issue
   exists, carries the old IRI, its area label and its findings list, and the local item is a
-  tombstone.
+  tombstone. *(Rev 2.4, `[agent]`: over `MemStore` and the router; the live tests drive the
+  GitHub tracker directly and fl-github has no redb store. A shared conformance suite holds
+  `MemStore` and the redb store to one escalation contract.)*
 
 ---
 
@@ -542,7 +566,8 @@ Every refusal names its cause and what to do:
 None. The review of rev 1 raised eight owner decisions (12–19) and the owner decided them on
 2026-10-06; planning plan A raised three more (20–22), decided the same day; the rest are
 `[agent]` rulings, marked where they are made. `[agent]`: the final review of plan A raised one
-more (23), decided 2026-10-07.
+more (23), decided 2026-10-07. Planning plan B raised no owner decision; its seven corrections
+and its ruling on a marked item's lookup are `[agent]` rulings (rev 2.4).
 
 ---
 
