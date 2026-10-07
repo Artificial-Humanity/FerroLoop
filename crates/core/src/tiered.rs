@@ -1206,6 +1206,62 @@ mod tests {
         );
     }
 
+    // Routing spec §1.2: the scan of GitHub's items is the removal's
+    // evidence; its failure is the refusal, never "no item names it".
+    #[test]
+    fn a_failed_scan_of_githubs_items_is_an_error_never_none() {
+        let w = world();
+        let t = w.router();
+        w.issues.set_scan_fails(true);
+        let err = t.items_naming_area(&w.p, "ops").unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Backend(m) if m == crate::mem_issues::SCAN_FAILED),
+            "{err:?}"
+        );
+    }
+
+    // GitHub tracker spec §6: an unknown visibility is not private. A record
+    // in a sensitive area, or a security finding, is refused when the
+    // visibility cannot be read — with that error, before anything is written.
+    #[test]
+    fn an_unreadable_visibility_refuses_a_sensitive_placement() {
+        let w = world();
+        let t = w.router();
+        let r = w.record("code", "t");
+        w.issues.set_visibility_unread(true);
+        let unread = |e: &StoreError| matches!(e, StoreError::Backend(m) if m == crate::mem_issues::VISIBILITY_UNREAD);
+        let err = t.place_record(&w.p, Some("security"), None).unwrap_err();
+        assert!(unread(&err), "{err:?}");
+        let mut f = Finding::raise(w.p.clone(), r, "rev", "c");
+        f.area = Some("design".into());
+        f.security = true;
+        let err = t.place_finding(&f, None).unwrap_err();
+        assert!(unread(&err), "{err:?}");
+        f.security = false;
+        f.area = Some("security".into());
+        let err = t.place_finding(&f, Some(Tier::Github)).unwrap_err();
+        assert!(unread(&err), "{err:?}");
+        assert!(w.issues.list_records(&w.p).unwrap().is_empty());
+        assert!(w.issues.list_findings(&w.p).unwrap().is_empty());
+    }
+
+    // Routing spec §2.5: a finding names the record its placement was
+    // checked against, never one the finding was raised about afterwards.
+    #[test]
+    fn a_finding_is_written_about_the_record_its_placement_checked() {
+        let w = world();
+        let t = w.router();
+        let r1 = w.record("code", "one");
+        let r2 = w.record("code", "two");
+        let mut about_r1 = Finding::raise(w.p.clone(), r1.clone(), "rev", "c");
+        about_r1.area = Some("code".into());
+        let at = t.place_finding(&about_r1, None).unwrap();
+        assert!(!at.crosses() && at.at().tier() == Tier::Local);
+        let about_r2 = Finding::raise(w.p.clone(), r2, "rev", "c");
+        let id = t.add_finding_at(about_r2, &at).unwrap();
+        assert_eq!(w.local.get_finding(&id).unwrap().unwrap().record, r1);
+    }
+
     /// The tracker suites make items without an area, which a routed
     /// project refuses: this gives each one `code`, which every map here
     /// declares, and passes everything else through.

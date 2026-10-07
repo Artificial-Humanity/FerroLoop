@@ -22,8 +22,15 @@ pub struct MemIssues {
     down: Cell<bool>,
     unbound: Cell<bool>,
     public: Cell<bool>,
+    scan_fails: Cell<bool>,
+    visibility_unread: Cell<bool>,
     asked: Cell<u32>,
 }
+
+/// What `items_in_area` answers once `set_scan_fails` is on.
+pub const SCAN_FAILED: &str = "the area scan failed";
+/// What `require_private` answers once `set_visibility_unread` is on.
+pub const VISIBILITY_UNREAD: &str = "the visibility could not be read";
 
 #[derive(Default)]
 struct Issues {
@@ -47,6 +54,17 @@ impl MemIssues {
     /// The repository is public.
     pub fn set_public(&self, public: bool) {
         self.public.set(public);
+    }
+
+    /// The scan for an area's items fails; every other call answers.
+    pub fn set_scan_fails(&self, fails: bool) {
+        self.scan_fails.set(fails);
+    }
+
+    /// The repository's visibility cannot be read; the tracker still opens
+    /// and every other call answers.
+    pub fn set_visibility_unread(&self, unread: bool) {
+        self.visibility_unread.set(unread);
     }
 
     /// How many times the router asked for this tier's tracker.
@@ -304,6 +322,9 @@ impl GithubTier for MemIssues {
 
     fn require_private(&self) -> Result<(), StoreError> {
         self.up()?;
+        if self.visibility_unread.get() {
+            return Err(StoreError::Backend(VISIBILITY_UNREAD.into()));
+        }
         if self.public.get() {
             return Err(StoreError::SecurityNotPrivate {
                 repo: "acme/widgets".into(),
@@ -319,6 +340,9 @@ impl GithubTier for MemIssues {
         area: &str,
     ) -> Result<Vec<(Kind, Iri)>, StoreError> {
         self.up()?;
+        if self.scan_fails.get() {
+            return Err(StoreError::Backend(SCAN_FAILED.into()));
+        }
         let s = self.inner.borrow();
         let records = s
             .records
@@ -396,6 +420,28 @@ mod tests {
             Some(StoreError::Routing(RoutingFault::TierUnavailable { .. }))
         ));
         assert_eq!(t.asked(), 2);
+    }
+
+    #[test]
+    fn a_failing_scan_or_visibility_fails_only_its_own_call() {
+        let t = MemIssues::default();
+        let p = ProjectId(seq_iri(1));
+        t.set_scan_fails(true);
+        t.set_visibility_unread(true);
+        assert!(t.tracker().is_ok());
+        t.add_record_with_area(&p, "t", Some("code")).unwrap();
+        assert!(matches!(
+            t.items_in_area(&p, "code"),
+            Err(StoreError::Backend(m)) if m == SCAN_FAILED
+        ));
+        assert!(matches!(
+            t.require_private(),
+            Err(StoreError::Backend(m)) if m == VISIBILITY_UNREAD
+        ));
+        t.set_scan_fails(false);
+        t.set_visibility_unread(false);
+        assert_eq!(t.items_in_area(&p, "code").unwrap().len(), 1);
+        assert!(t.require_private().is_ok());
     }
 
     #[test]

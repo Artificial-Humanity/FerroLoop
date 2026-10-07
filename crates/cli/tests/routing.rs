@@ -1870,3 +1870,43 @@ fn re_adding_a_removed_area_without_a_sensitivity_is_refused_before_it_can_publi
     .stderr(contains("about a record in a sensitive area"));
     assert_eq!(g.fake.issue_count(), 0, "nothing published");
 }
+
+// GitHub tracker spec §6, routing spec §2.1: a record in a sensitive area
+// goes to GitHub only once its visibility reads `private`. A visibility
+// that cannot be read refuses the create, and nothing is written: a record
+// has no security flag for the tracker to check when it writes.
+#[test]
+fn a_sensitive_record_is_refused_when_the_visibility_cannot_be_read() {
+    let g = world(BOUND);
+    g.routed();
+    // Opening GitHub reads the repository once; the visibility read is next.
+    g.fake.state().fail_repo_read_after = Some(1);
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "the key leaks",
+            "--area",
+            "security",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("could not read the visibility of acme/widgets"));
+    let reads: Vec<String> = g
+        .fake
+        .state()
+        .requests
+        .iter()
+        .filter(|r| r.starts_with("GET /repos/acme/widgets") && !r.contains("/repos/acme/widgets/"))
+        .cloned()
+        .collect();
+    assert_eq!(
+        reads.len(),
+        2,
+        "the open's read, then the visibility's: {reads:?}"
+    );
+    assert_eq!(g.fake.issue_count(), 0, "nothing created on GitHub");
+}
