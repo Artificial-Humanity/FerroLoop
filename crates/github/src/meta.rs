@@ -17,6 +17,10 @@ pub const FL_FORMAT: u64 = 1;
 /// record (routing spec decision 14). An older fl reads format 1 only, so
 /// it refuses such an issue as a newer format instead of reading half of it.
 pub const FL_FORMAT_ROUTED: u64 = 2;
+/// The format of a block that carries its escalation (routing spec §3.3):
+/// `Meta` refuses a field it does not know, so an fl that reads formats 1
+/// and 2 would read the field as damage; raised, it says "upgrade fl".
+pub const FL_FORMAT_ESCALATED: u64 = 3;
 /// The start of an area's label, `fl:area/<name>` (routing spec §1.1).
 pub const AREA_LABEL_PREFIX: &str = "fl:area/";
 pub const META_OPEN: &str = "<!-- fl:meta";
@@ -88,6 +92,18 @@ impl RecordRef {
     }
 }
 
+/// Where an escalated issue came from (routing spec §3.3 step 2): the
+/// item's IRI in the local tier, who escalated it, and why. The issue shows
+/// it as a line written from the block, never as prose, so a finding's claim
+/// stays its claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EscalatedFrom {
+    pub from: Iri,
+    pub by: String,
+    pub reason: String,
+}
+
 /// The fields a label cannot hold (spec §3.1). ⚠ `deny_unknown_fields`: a
 /// block with a field this fl does not know is damaged, not half-read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,6 +132,11 @@ pub struct Meta {
     pub withdrawn_reason: Option<String>,
     #[serde(default)]
     pub also_known_as: Vec<Iri>,
+    /// Set once, when the item is escalated from the local tier; skipped
+    /// when absent, so a block without one is written byte for byte as
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalated: Option<EscalatedFrom>,
     /// Minted by fl for each create, so a retry can find what an ambiguous
     /// failure may already have made (spec §3.3).
     pub create_key: String,
@@ -136,16 +157,20 @@ impl Meta {
             security: false,
             withdrawn_reason: None,
             also_known_as: vec![],
+            escalated: None,
             create_key: format!("urn:uuid:{}", uuid::Uuid::now_v7()),
         }
     }
 
-    /// The format this block is written in: [`FL_FORMAT_ROUTED`] when it
-    /// carries an area or a reference to a local record, else
-    /// [`FL_FORMAT`], which every older fl reads.
+    /// The format this block is written in: [`FL_FORMAT_ESCALATED`] when it
+    /// carries its escalation, whatever else it carries; else
+    /// [`FL_FORMAT_ROUTED`] when it carries an area or a reference to a
+    /// local record; else [`FL_FORMAT`], which every older fl reads.
     pub fn required_format(&self) -> u64 {
         let local_record = self.record.as_ref().is_some_and(RecordRef::is_local);
-        if self.area.is_some() || local_record {
+        if self.escalated.is_some() {
+            FL_FORMAT_ESCALATED
+        } else if self.area.is_some() || local_record {
             FL_FORMAT_ROUTED
         } else {
             FL_FORMAT
@@ -365,8 +390,23 @@ pub fn record_line(meta: &Meta) -> Option<String> {
     ))
 }
 
-/// The prose, the line naming a local record when there is one, then the
-/// block, sealed. ⚠ `<` and `>` are escaped inside the JSON so no field
+/// The line an escalated issue shows (routing spec §3.3 step 2): who
+/// escalated it, why, and its IRI in the local tier, each escaped as
+/// [`record_line`] escapes a title. `None` when the block carries no
+/// escalation.
+pub fn escalation_line(meta: &Meta) -> Option<String> {
+    let e = meta.escalated.as_ref()?;
+    Some(format!(
+        "Escalated from the local tier by {}: {}. Its local IRI was {}.",
+        crate::ledger::render::escape(&e.by),
+        crate::ledger::render::escape(&e.reason),
+        crate::ledger::render::escape(e.from.as_str())
+    ))
+}
+
+/// The prose, the line naming a local record when there is one, the line
+/// naming where an escalated item came from when there is one, then the
+/// block, sealed — a blank line between each. ⚠ `<` and `>` are escaped inside the JSON so no field
 /// value can end the HTML comment or open a second block. They occur only
 /// inside JSON strings, where `<`/`>` are the same text.
 pub fn render_body(prose: &str, meta: &Meta) -> String {
@@ -376,11 +416,16 @@ pub fn render_body(prose: &str, meta: &Meta) -> String {
         .replace('<', "\\u003c")
         .replace('>', "\\u003e");
     let block = format!("{META_OPEN}\n{json}\n{META_CLOSE}");
-    let shown = match record_line(&meta) {
-        Some(line) if prose.is_empty() => line,
-        Some(line) => format!("{prose}\n\n{line}"),
-        None => prose.to_string(),
-    };
+    let shown = [
+        Some(prose.to_string()),
+        record_line(&meta),
+        escalation_line(&meta),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join("\n\n");
     if shown.is_empty() {
         format!("{block}\n")
     } else {
@@ -403,7 +448,7 @@ impl std::fmt::Display for BodyError {
             BodyError::UnknownFormat(n) => write!(
                 f,
                 "has an fl block of format {n}, and this fl reads formats {FL_FORMAT} to \
-                 {FL_FORMAT_ROUTED}: upgrade fl to read it"
+                 {FL_FORMAT_ESCALATED}: upgrade fl to read it"
             ),
         }
     }
@@ -425,7 +470,7 @@ pub fn parse_body(body: &str) -> Result<(String, Meta), BodyError> {
     let loose: Value =
         serde_json::from_str(rest[..end].trim()).map_err(|e| BodyError::Damaged(e.to_string()))?;
     match loose.get("fl_format").and_then(Value::as_u64) {
-        Some(FL_FORMAT | FL_FORMAT_ROUTED) => {}
+        Some(FL_FORMAT | FL_FORMAT_ROUTED | FL_FORMAT_ESCALATED) => {}
         Some(n) => return Err(BodyError::UnknownFormat(n)),
         None => return Err(BodyError::Damaged("it has no `fl_format`".into())),
     }
@@ -441,14 +486,17 @@ pub fn parse_body(body: &str) -> Result<(String, Meta), BodyError> {
     if !rest[end + META_CLOSE.len()..].trim().is_empty() {
         return Err(BodyError::Damaged("text follows the block".into()));
     }
-    let prose = body[..at].trim_end();
-    // The line fl writes for a local record is not part of the prose.
-    let prose = match record_line(&meta) {
-        Some(line) => prose
+    // The lines fl writes from the block are not part of the prose: the
+    // escalation's line last, then the local record's before it.
+    let mut prose = body[..at].trim_end();
+    for line in [escalation_line(&meta), record_line(&meta)]
+        .into_iter()
+        .flatten()
+    {
+        prose = prose
             .strip_suffix(line.as_str())
-            .map_or(prose, str::trim_end),
-        None => prose,
-    };
+            .map_or(prose, str::trim_end);
+    }
     Ok((prose.to_string(), meta))
 }
 
@@ -670,15 +718,13 @@ mod tests {
             Err(BodyError::Damaged(_))
         ));
         assert_eq!(
-            parse_body(&good.replace("\"fl_format\":1", "\"fl_format\":3")),
-            Err(BodyError::UnknownFormat(3))
+            parse_body(&good.replace("\"fl_format\":1", "\"fl_format\":4")),
+            Err(BodyError::UnknownFormat(4))
         );
+        let said = BodyError::UnknownFormat(4).to_string();
         assert!(
-            BodyError::UnknownFormat(3)
-                .to_string()
-                .contains("formats 1 to 2"),
-            "{}",
-            BodyError::UnknownFormat(3)
+            said.contains("formats 1 to 3") && said.contains("upgrade fl"),
+            "{said}"
         );
     }
 
@@ -1016,6 +1062,210 @@ mod tests {
             err.contains("do not match its block's area (none)"),
             "{err}"
         );
+    }
+
+    fn escalated_from(by: &str, reason: &str) -> EscalatedFrom {
+        EscalatedFrom {
+            from: Iri::parse("urn:uuid:00000000-0000-7000-8000-000000000007").unwrap(),
+            by: by.into(),
+            reason: reason.into(),
+        }
+    }
+
+    const ESCALATED_LINE: &str = "Escalated from the local tier by alice: it needs a person. \
+                                  Its local IRI was urn:uuid:00000000-0000-7000-8000-000000000007.";
+
+    // Routing spec §3.3: a block that carries its escalation is format 3,
+    // whatever else it carries — an fl that reads formats 1 and 2 refuses it
+    // as newer rather than reading it as damaged.
+    #[test]
+    fn the_block_is_format_3_exactly_when_it_carries_its_escalation() {
+        let format = |m: &Meta| parse_body(&render_body("p", m)).unwrap().1.fl_format;
+        for area in [None, Some("code")] {
+            for record in [None, Some(local_ref("t"))] {
+                let mut m = meta(ItemKind::Finding, "raised");
+                m.area = area.map(str::to_string);
+                m.record = record.clone();
+                let before = if area.is_some() || record.is_some() {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(format(&m), before, "{area:?} {record:?}");
+                m.escalated = Some(escalated_from("alice", "it needs a person"));
+                m.fl_format = 2;
+                assert_eq!(format(&m), 3, "{area:?} {record:?}");
+            }
+        }
+        let mut m = meta(ItemKind::Record, "needs_human");
+        m.escalated = Some(escalated_from("alice", "it needs a person"));
+        let body = render_body("", &m);
+        assert!(
+            body.contains(
+                "\"escalated\":{\"from\":\"urn:uuid:00000000-0000-7000-8000-000000000007\",\
+                 \"by\":\"alice\",\"reason\":\"it needs a person\"}"
+            ),
+            "{body}"
+        );
+        assert!(body.contains("\"fl_format\":3"), "{body}");
+        assert!(
+            !render_body("", &meta(ItemKind::Record, "todo")).contains("escalated"),
+            "skipped when absent"
+        );
+    }
+
+    // Routing spec §3.3 step 2: an escalated record's issue names who
+    // escalated it, why, and its old IRI — after its prose, as a line fl
+    // writes from the block and reads back out of the prose.
+    #[test]
+    fn an_escalated_record_shows_its_provenance_after_its_prose_and_reads_back_unchanged() {
+        let mut m = meta(ItemKind::Record, "needs_human");
+        m.escalated = Some(escalated_from("alice", "it needs a person"));
+        assert_eq!(escalation_line(&m).as_deref(), Some(ESCALATED_LINE));
+        assert_eq!(escalation_line(&meta(ItemKind::Record, "todo")), None);
+        let body = render_body("the prose\nsecond line", &m);
+        assert_eq!(
+            shown(&body),
+            format!("the prose\nsecond line\n\n{ESCALATED_LINE}\n\n")
+        );
+        assert_eq!(
+            parse_body(&body).unwrap(),
+            ("the prose\nsecond line".into(), m.clone().sealed())
+        );
+        let empty = render_body("", &m);
+        assert_eq!(shown(&empty), format!("{ESCALATED_LINE}\n\n"));
+        assert_eq!(
+            parse_body(&empty).unwrap().0,
+            "",
+            "no prose reads back empty"
+        );
+    }
+
+    // A finding's text is its claim: the record line and the provenance
+    // line follow it, in that order, and the claim reads back unchanged.
+    #[test]
+    fn an_escalated_findings_claim_reads_back_as_the_claim() {
+        let mut m = meta(ItemKind::Finding, "reproduced");
+        m.record = Some(local_ref("t"));
+        m.escalated = Some(escalated_from("alice", "it needs a person"));
+        let record = record_line(&m).unwrap();
+        let body = render_body("the claim", &m);
+        assert_eq!(
+            shown(&body),
+            format!("the claim\n\n{record}\n\n{ESCALATED_LINE}\n\n")
+        );
+        assert_eq!(
+            parse_body(&body).unwrap(),
+            ("the claim".into(), m.clone().sealed())
+        );
+        m.record = Some(RecordRef {
+            id: Iri::parse("https://github.com/acme/widgets/issues/3").unwrap(),
+            node_id: Some("I_3".into()),
+            title: None,
+        });
+        let body = render_body("the claim", &m);
+        assert_eq!(shown(&body), format!("the claim\n\n{ESCALATED_LINE}\n\n"));
+        assert_eq!(parse_body(&body).unwrap().0, "the claim");
+    }
+
+    // The line is text on GitHub: who and why mention nobody, link nothing,
+    // open no tag and break no line — and the block keeps them as written.
+    #[test]
+    fn an_escalations_who_and_why_are_escaped_and_still_read_back() {
+        let mut m = meta(ItemKind::Finding, "raised");
+        m.escalated = Some(EscalatedFrom {
+            from: Iri::parse("urn:x-local:item_7").unwrap(),
+            by: "@someone <b>#12".into(),
+            reason: "see #12 <b>now</b>\nask @someone".into(),
+        });
+        let body = render_body("the claim", &m);
+        let line = escalation_line(&m).unwrap();
+        assert_eq!(
+            shown(&body),
+            format!("the claim\n\n{line}\n\n"),
+            "one line, after the claim"
+        );
+        assert!(
+            line.starts_with(
+                "Escalated from the local tier by @&#8203;someone &lt;b&gt;#&#8203;12: "
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains("see #&#8203;12 &lt;b&gt;now&lt;/b&gt;<br>ask @&#8203;someone. "),
+            "{line}"
+        );
+        assert!(
+            line.ends_with("Its local IRI was urn:x-local:item\\_7."),
+            "{line}"
+        );
+        for raw in ["@someone", "#12", "<b>", "item_7", "\n"] {
+            assert!(!line.contains(raw), "{raw:?} in {line}");
+        }
+        assert_eq!(
+            parse_body(&body).unwrap(),
+            ("the claim".into(), m.clone().sealed())
+        );
+    }
+
+    #[test]
+    fn a_block_whose_format_disagrees_with_its_escalation_is_damaged() {
+        let plain = render_body("p", &meta(ItemKind::Record, "todo"));
+        let lying = plain.replace("\"fl_format\":1", "\"fl_format\":3");
+        assert_ne!(lying, plain, "the edit must have landed");
+        match parse_body(&lying) {
+            Err(BodyError::Damaged(why)) => {
+                assert!(why.contains("is 3, but its fields are format 1"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let mut m = meta(ItemKind::Record, "todo");
+        m.area = Some("code".into());
+        m.escalated = Some(escalated_from("alice", "it needs a person"));
+        let good = render_body("p", &m);
+        let lying = good.replace("\"fl_format\":3", "\"fl_format\":2");
+        assert_ne!(lying, good, "the edit must have landed");
+        match parse_body(&lying) {
+            Err(BodyError::Damaged(why)) => {
+                assert!(why.contains("is 2, but its fields are format 3"), "{why}")
+            }
+            other => panic!("{other:?}"),
+        }
+        let extra = good.replacen("\"escalated\":{", "\"escalated\":{\"extra\":1,", 1);
+        assert_ne!(extra, good, "the edit must have landed");
+        assert!(matches!(parse_body(&extra), Err(BodyError::Damaged(_))));
+    }
+
+    // An issue an fl that knows no escalation wrote reads exactly as it did,
+    // and is written back byte for byte.
+    #[test]
+    fn an_older_format_block_reads_and_writes_exactly_as_before() {
+        let one = "the prose\n\n<!-- fl:meta\n{\"fl_format\":1,\"kind\":\"record\",\
+                   \"state\":\"todo\",\
+                   \"project\":\"urn:uuid:00000000-0000-7000-8000-000000000001\",\
+                   \"security\":false,\"also_known_as\":[],\"create_key\":\"urn:uuid:k\"}\n-->\n";
+        let (prose, m) = parse_body(one).unwrap();
+        let mut want = meta(ItemKind::Record, "todo");
+        want.create_key = "urn:uuid:k".into();
+        assert_eq!((prose.as_str(), &m), ("the prose", &want));
+        assert_eq!(render_body(&prose, &m), one);
+        let two = "the claim\n\nRecord: t — urn:uuid:00000000-0000-7000-8000-000000000042, \
+                   held in the local tier, not on GitHub.\n\n<!-- fl:meta\n{\"fl_format\":2,\
+                   \"kind\":\"finding\",\"state\":\"raised\",\
+                   \"project\":\"urn:uuid:00000000-0000-7000-8000-000000000001\",\
+                   \"area\":\"code\",\"record\":{\"id\":\
+                   \"urn:uuid:00000000-0000-7000-8000-000000000042\",\"title\":\"t\"},\
+                   \"raised_by\":\"rev\",\"security\":false,\"also_known_as\":[],\
+                   \"create_key\":\"urn:uuid:k\"}\n-->\n";
+        let (prose, m) = parse_body(two).unwrap();
+        let mut want = meta(ItemKind::Finding, "raised");
+        want.fl_format = 2;
+        want.area = Some("code".into());
+        want.record = Some(local_ref("t"));
+        want.raised_by = Some("rev".into());
+        want.create_key = "urn:uuid:k".into();
+        assert_eq!((prose.as_str(), &m), ("the claim", &want));
+        assert_eq!(render_body(&prose, &m), two);
     }
 
     #[test]

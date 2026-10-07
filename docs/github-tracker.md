@@ -135,6 +135,15 @@ its items between the two — names the record in its block as `{"id": "urn:uuid
 resolves the id in the local store. On a repository that is not private, raising such a finding
 publishes the record's title, and fl warns before it does.
 
+A record or finding escalated from the local store to GitHub ([routing.md](routing.md)) keeps
+where it came from in its block, as `"escalated": {"from": "urn:uuid:…", "by": "…", "reason":
+"…"}` — its IRI in the local store, who escalated it, and why — and the issue shows a line
+`Escalated from the local tier by <by>: <reason>. Its local IRI was <from>.` after the body and
+after any `Record:` line. Both lines are written from the block on every write, so neither
+becomes part of a finding's claim or a record's text, and the names and reasons in them mention
+nobody and link nothing. A block that carries `escalated` is written as `fl_format` 3, whatever
+else it carries; an fl that reads formats 1 and 2 refuses it as a newer format.
+
 Open or closed is a projection that fl writes and never reads state from. A record in `done`
 and a finding in `fixed` are closed as completed; a finding in `withdrawn` is closed as not
 planned; every other state is open. Closing or reopening an issue by hand does not change its
