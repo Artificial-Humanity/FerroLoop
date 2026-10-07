@@ -38,6 +38,16 @@ const KEPT: &str = "the mark's who and why are kept";
 /// run (routing spec §3.4).
 const TO_FINISH: &str = "`fl record escalate 1 --by <name> --reason <text>`";
 
+/// That warning, when the escalation stopped before its mark.
+const NOT_ESCALATED: &str = "was not escalated to GitHub, and nothing was written";
+
+/// That warning, when the escalation stopped after its mark.
+const MARKED: &str = "refuses writes until its escalation is finished";
+
+/// The refusal of a write to marked record 1 before its gates run, naming
+/// the command by the record's handle.
+const FINISH_BY_HANDLE: &str = "Run `fl record escalate 1` to finish the escalation";
+
 /// The escalation line of a record the move to `needs_human` escalated, as
 /// the issue's Markdown escapes it.
 const BY_FL: &str = "Escalated from the local tier by fl: the record was moved to needs\\_human.";
@@ -394,6 +404,7 @@ fn an_escalation_to_a_public_repository_warns_what_it_publishes() {
             && err.contains(WARNED)
             && err.contains("\"fix the parser\"")
             && err.contains(&format!("its local IRI, {iri},"))
+            && err.contains("the area label fl:area/code,")
             && err.contains(
                 "who escalated it, \"alice\", and its 1 open finding, with its claim, state and IRI"
             ),
@@ -579,6 +590,7 @@ fn a_stop_between_the_create_and_its_labels_is_finished_by_a_rerun_with_one_issu
     assert!(
         err.contains(STOPPED)
             && err.contains("`fl record escalate 1 --by <who> --reason <why>`")
+            && err.contains("<why>` to finish it, or, if no issue was made yet, `fl record")
             && err.contains("`fl record escalate 1 --abandon`"),
         "{err}"
     );
@@ -595,7 +607,7 @@ fn a_stop_between_the_create_and_its_labels_is_finished_by_a_rerun_with_one_issu
     // and offline.
     let err = g.refused(&["record", "move", "1", "--to", "doing"]);
     assert!(
-        err.contains("so this store refuses to change it") && err.contains("fl record escalate"),
+        err.contains("so this store refuses to change it") && err.contains(FINISH_BY_HANDLE),
         "{err}"
     );
     let raise = |claim: &'static str| {
@@ -939,7 +951,11 @@ fn a_landed_move_whose_escalation_fails_warns_and_keeps_the_moves_code() {
     assert_eq!(out, UNGATED);
     let warned = only_warning(&err);
     assert!(
-        warned.contains(TO_FINISH) && warned.contains("rate limit") && !err.contains(STOPPED),
+        warned.contains(TO_FINISH)
+            && warned.contains(MARKED)
+            && !warned.contains(NOT_ESCALATED)
+            && warned.contains("rate limit")
+            && !err.contains(STOPPED),
         "{err}"
     );
     assert_eq!(g.fake.issue_count(), 0);
@@ -951,13 +967,45 @@ fn a_landed_move_whose_escalation_fails_warns_and_keeps_the_moves_code() {
     let refused = g.refused(&["record", "move", "1", "--to", "doing"]);
     assert!(
         refused.contains("so this store refuses to change it")
-            && refused.contains("fl record escalate"),
+            && refused.contains(FINISH_BY_HANDLE),
         "{refused}"
     );
     let (out, err) = g.ok_said(&["record", "escalate", "1", "--by", "alice", "--reason", "r"]);
     assert_eq!(out, "1\tescalated\t#1\n");
     assert!(err.contains(KEPT), "{err}");
     assert!(g.fake.issue(1).body.contains(BY_FL));
+}
+
+// Routing spec §3.4, §3.5: a gated move that lands and whose escalation
+// then stops after its mark keeps the move's code and its gate run, warns
+// once that the record is marked, and leaves it marked.
+#[test]
+fn a_gated_move_that_lands_and_whose_escalation_fails_warns_once_and_leaves_it_marked() {
+    let g = world(BOUND);
+    g.routed();
+    g.local_record("fix the parser", "code");
+    g.gated("todo", "needs_human", "true");
+    g.fake.state().rate_limited_next_create = true;
+    let out = g
+        .fl()
+        .args(["record", "move", "1", "--to", "needs_human"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let said = String::from_utf8(out.stdout).unwrap();
+    assert!(said.ends_with("\n1\tneeds_human\n"), "{said}");
+    assert_eq!(g.runs(), 1);
+    let warned = only_warning(&err);
+    assert!(
+        warned.contains(MARKED) && warned.contains(TO_FINISH) && !err.contains(STOPPED),
+        "{err}"
+    );
+    assert_eq!(g.fake.issue_count(), 0);
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1"]),
+        "1\tescalating\tneeds_human\tfix the parser\n"
+    );
 }
 
 // Routing spec §3.2, §3.4: an escalation refused before its mark — a
@@ -973,7 +1021,10 @@ fn a_landed_move_whose_escalation_is_refused_before_the_mark_leaves_it_unmarked(
     assert_eq!(out, UNGATED);
     let warned = only_warning(&err);
     assert!(
-        warned.contains("this record is security-sensitive") && warned.contains(TO_FINISH),
+        warned.contains("this record is security-sensitive")
+            && warned.contains(TO_FINISH)
+            && warned.contains(NOT_ESCALATED)
+            && !warned.contains(MARKED),
         "{err}"
     );
     assert_eq!(g.fake.issue_count(), 0);
@@ -998,7 +1049,7 @@ fn a_move_of_a_marked_record_is_refused_before_its_gates_run() {
     let err = String::from_utf8(out.stderr).unwrap();
     assert_eq!(out.status.code(), Some(2), "{err}");
     assert!(
-        err.contains("so this store refuses to change it") && err.contains("fl record escalate"),
+        err.contains("so this store refuses to change it") && err.contains(FINISH_BY_HANDLE),
         "{err}"
     );
     assert!(out.stdout.is_empty(), "no gate line");
@@ -1051,9 +1102,10 @@ fn a_reproduction_or_verification_of_a_marked_finding_is_refused_before_its_gate
         let err = String::from_utf8(out.stderr).unwrap();
         assert_eq!(g.runs(), runs, "{args:?}: a gate ran: {err}");
         assert_eq!(out.status.code(), Some(2), "{args:?}: {err}");
+        let n = args[2];
+        let finish = format!("Run `fl finding escalate {n}` to finish the escalation");
         assert!(
-            err.contains("so this store refuses to change it")
-                && err.contains("fl finding escalate"),
+            err.contains("so this store refuses to change it") && err.contains(&finish),
             "{args:?}: {err}"
         );
     }
@@ -1101,6 +1153,7 @@ fn a_marked_records_move_is_refused_before_the_import_check() {
     assert_eq!(out.status.code(), Some(2), "{err}");
     assert!(
         err.contains("so this store refuses to change it")
+            && err.contains(FINISH_BY_HANDLE)
             && !err.contains("changed since this store imported it"),
         "{err}"
     );

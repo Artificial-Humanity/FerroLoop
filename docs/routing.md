@@ -152,9 +152,9 @@ repository that is not private: a record in a sensitive area, a security finding
 sensitive area or about a local record in one — or in an area the map no longer declares — is
 refused, and stays local. Anything else escalated to a repository that is not private is published
 after a `warning:` that names the repository, its visibility, and what goes out: the title or claim,
-the item's local IRI, the reason, who escalated it, and — for a finding — who raised it and who it
-is assigned to, or — for a record — how many open findings go out with their claims, states and
-IRIs.
+the item's local IRI and its other names, its area label, the reason, who escalated it, and — for a
+finding — who raised it and who it is assigned to, or — for a record — how many open findings go out
+with their claims, states and IRIs.
 
 The escalation then marks the local item "escalating", with who, why and the time. While it is
 marked, the local store refuses every write to it, naming the command that finishes it; a finding
@@ -176,7 +176,10 @@ findings stay local, and the evidence recorded about them from then on names the
 finding about a record that was escalated later still shows the record's old local reference in its
 issue text; fl resolves it through the tombstone. A local record moved to `needs_human` is escalated
 the same way once the move lands, by `fl`; if that escalation fails, the move stands and a
-`warning:` names the command that finishes it.
+`warning:` says which of two things is true, naming the command either way: the record was not
+escalated and nothing was written, so the command can be run once the cause is fixed; or the
+record is marked escalating and refuses writes until the command finishes it, or `--abandon` stops
+it if no issue was made yet.
 
 ## Limits
 

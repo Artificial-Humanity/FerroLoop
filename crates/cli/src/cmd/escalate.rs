@@ -7,12 +7,13 @@ use crate::ctx::Ctx;
 use crate::refs::Ref;
 use crate::tiers::Tiers;
 use anyhow::{Context, Result};
-use fl_core::escalation::{Outgoing, escalate_command};
+use fl_core::escalation::Outgoing;
 use fl_core::ids::Kind;
 use fl_core::model::{Record, State};
 use fl_core::routing::Tier;
 use fl_core::store::StoreError;
 use fl_core::{Iri, Prepared};
+use fl_github::meta::AREA_LABEL_PREFIX;
 
 /// The refusal in a store with no routing map: it has no tiers, so nothing
 /// in it is local in the sense an escalation moves from (routing spec §3.1).
@@ -52,14 +53,15 @@ pub fn run(
         Ok(()) => Ok(0),
         // ⚠ Marked: the item refuses every write until the escalation is
         // finished or abandoned (routing spec §3.3). A read of the mark that
-        // fails leaves the error as it is.
+        // fails leaves the error as it is. `--abandon` is refused once the
+        // issue exists, so it is offered for the case before.
         Err(e) if matches!(t.router.escalating(&iri), Ok(Some(_))) => {
             let what = kind.as_wire();
             Err(e.context(format!(
                 "the escalation of {what} {shown} stopped after its mark was written, and the \
                  local item refuses every write until it is finished. Run `fl {what} escalate \
-                 {shown} --by <who> --reason <why>` to finish it, or `fl {what} escalate \
-                 {shown} --abandon` to stop it"
+                 {shown} --by <who> --reason <why>` to finish it, or, if no issue was made yet, \
+                 `fl {what} escalate {shown} --abandon` to stop it"
             )))
         }
         Err(e) => Err(e),
@@ -71,14 +73,19 @@ pub fn run(
 /// reproduce`, `fl finding verify` — calls this first, before the import
 /// check and the gates, and is refused as the store would refuse it: nothing
 /// runs and no evidence is written for a write that cannot land. `id` is
-/// the item's primary IRI, as the router read it.
+/// the item's primary IRI, as the router read it; the command the refusal
+/// names takes the handle a person knows it by.
 pub fn refuse_marked(ctx: &Ctx<'_>, kind: Kind, id: &Iri) -> Result<()> {
     if let Some(t) = ctx.tiers
         && t.router.escalating(id)?.is_some()
     {
         return Err(StoreError::Escalating {
             id: id.clone(),
-            to_finish: escalate_command(kind, id),
+            to_finish: format!(
+                "fl {} escalate {}",
+                kind.as_wire(),
+                ctx.show_item(kind, id)?
+            ),
         }
         .into());
     }
@@ -99,11 +106,27 @@ pub fn after_landed_move(ctx: &Ctx<'_>, record: &Record, shown: &str) {
         return;
     }
     let reason = format!("the record was moved to {}", State::NeedsHuman.as_wire());
-    if let Err(e) = escalate_and_say(ctx, t, Kind::Record, iri, shown, "fl", &reason) {
-        eprintln!(
-            "warning: the move stands, but the escalation of record {shown} to GitHub stopped \
-             (run `fl record escalate {shown} --by <name> --reason <text>` to finish it): {e:#}"
-        );
+    let Err(e) = escalate_and_say(ctx, t, Kind::Record, iri, shown, "fl", &reason) else {
+        return;
+    };
+    let run = format!("fl record escalate {shown} --by <name> --reason <text>");
+    // Whether the escalation stopped before or after its mark decides what
+    // is true of the record now (routing spec §3.3).
+    match t.router.escalating(iri) {
+        Ok(None) => eprintln!(
+            "warning: the move stands; record {shown} was not escalated to GitHub, and nothing \
+             was written: {e:#}. Run `{run}` once the cause is fixed"
+        ),
+        Ok(Some(_)) => eprintln!(
+            "warning: the move stands; record {shown} is marked escalating, and refuses writes \
+             until its escalation is finished: {e:#}. Run `{run}` to finish it, or, if no issue \
+             was made yet, `fl record escalate {shown} --abandon` to stop it"
+        ),
+        Err(read) => eprintln!(
+            "warning: the move stands, but the escalation of record {shown} to GitHub stopped, \
+             and whether it left the record marked could not be read ({read}): {e:#}. Run \
+             `{run}` to finish it"
+        ),
     }
 }
 
@@ -189,8 +212,21 @@ fn warn_disclosure(t: &Tiers<'_>, prepared: &Prepared, by: &str, reason: &str) -
         None => (by, reason),
     };
     // The local IRI is published too: the issue's text names it, and it
-    // becomes one of the issue's aliases.
+    // becomes one of the issue's aliases — so do the item's other names,
+    // and its area becomes a label.
     let iri = prepared.id();
+    let (aliases, area) = match prepared.outgoing() {
+        Outgoing::Record { record, .. } => (&record.also_known_as, &record.area),
+        Outgoing::Finding { finding, .. } => (&finding.also_known_as, &finding.area),
+    };
+    let others: Vec<&str> = aliases.iter().map(Iri::as_str).collect();
+    let mut names = String::new();
+    if !others.is_empty() {
+        names.push_str(&format!(", its other names, {}", others.join(", ")));
+    }
+    if let Some(area) = area {
+        names.push_str(&format!(", the area label {AREA_LABEL_PREFIX}{area}"));
+    }
     let what = match prepared.outgoing() {
         Outgoing::Record { record, findings } => {
             let n = findings.len();
@@ -201,8 +237,8 @@ fn warn_disclosure(t: &Tiers<'_>, prepared: &Prepared, by: &str, reason: &str) -
                 n => format!("and its {n} open findings, with their claims, states and IRIs"),
             };
             format!(
-                "this record's title, {:?}, its local IRI, {iri}, the reason, {reason:?}, who \
-                 escalated it, {by:?}, {listed}",
+                "this record's title, {:?}, its local IRI, {iri}{names}, the reason, \
+                 {reason:?}, who escalated it, {by:?}, {listed}",
                 record.title
             )
         }
@@ -220,8 +256,8 @@ fn warn_disclosure(t: &Tiers<'_>, prepared: &Prepared, by: &str, reason: &str) -
                 Tier::Github => String::new(),
             };
             format!(
-                "this finding's claim, {:?}, its local IRI, {iri}, the reason, {reason:?}, who \
-                 escalated it, {by:?}, raised by {:?}{assigned}{about}",
+                "this finding's claim, {:?}, its local IRI, {iri}{names}, the reason, \
+                 {reason:?}, who escalated it, {by:?}, raised by {:?}{assigned}{about}",
                 finding.claim, finding.raised_by
             )
         }
