@@ -271,6 +271,19 @@ impl Catalog for MemStore {
 }
 
 impl MemStore {
+    /// A store whose first minted id is `seq_iri(first)`, the next
+    /// `seq_iri(first + 1)`, and so on: still deterministic for a given
+    /// `first`. For a test against a real service that keeps what earlier
+    /// runs wrote, so each run's ids are its own. Handles still start at 1.
+    /// Not in the binary: the `conformance` feature is a dev-dependency only.
+    #[cfg(any(test, feature = "conformance"))]
+    #[doc(hidden)]
+    pub fn starting_at(first: u64) -> Self {
+        let store = Self::default();
+        store.inner.borrow_mut().next_id = first.saturating_sub(1);
+        store
+    }
+
     /// Write `project`'s routing map. A map that is not one fl writes is
     /// refused (`RoutingMap::check`).
     pub fn set_routes(&self, project: &ProjectId, map: &RoutingMap) -> Result<(), StoreError> {
@@ -733,6 +746,19 @@ mod tests {
         crate::conformance::all_roles(|| Single(MemStore::default(), ()));
         crate::conformance::local_handles(|| (MemStore::default(), ()));
         crate::conformance::ledger_cache(|| (MemStore::default(), ()));
+    }
+
+    #[test]
+    fn a_store_started_at_n_mints_n_first() {
+        let s = MemStore::starting_at(1_000);
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        assert_eq!((p.0, r.0), (seq_iri(1_000), seq_iri(1_001)));
+        assert_eq!(
+            MemStore::default().add_project("/p").unwrap().0,
+            seq_iri(1),
+            "the default store still starts at 1"
+        );
     }
 
     #[test]

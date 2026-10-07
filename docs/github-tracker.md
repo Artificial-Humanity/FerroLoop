@@ -401,17 +401,22 @@ retrying.
 
 ## The live tests
 
-**Status: passed on 2026-09-29, writing with a fine-grained token.** All three passed. The
-concurrency test counted 1 clean round, 9 conflicts caught and 0 updates lost. They have not
-yet been run writing as the App.
+**Status: the first three passed on 2026-09-29, writing with a fine-grained token; the
+escalation test has not yet been run.** The concurrency test counted 1 clean round, 9 conflicts
+caught and 0 updates lost. None has yet been run writing as the App.
 
 The tests that run in CI use an in-process fake GitHub. It proves the structure, not how
-GitHub behaves, so three more tests in `crates/github/tests/live.rs` run against GitHub
+GitHub behaves, so four more tests in `crates/github/tests/live.rs` run against GitHub
 itself: a round trip of a record and a finding; ten rounds of two writers adding to the same
-finding at once, which require no update ever to be lost silently; and exact counts of the
-edit history and the timeline against the model conflict detection rests on, as
-[Conflicts](#conflicts) lists. They are ignored by default, and each fails at once, naming
-`FL_GITHUB_LIVE_REPO`, if it is not set.
+finding at once, which require no update ever to be lost silently; exact counts of the edit
+history and the timeline against the model conflict detection rests on, as
+[Conflicts](#conflicts) lists; and an escalation through the routing tracker
+([routing.md](routing.md)). The escalation test escalates a local record that has an open
+finding and a security finding, and checks that it becomes one open issue in the record's
+state with its area label; that the issue's block carries the old IRI as its create key, as an
+alias and as where it came from; that its text lists the open finding and not the security
+one; and that the local item is a tombstone the router follows. They are ignored by default,
+and each fails at once, naming `FL_GITHUB_LIVE_REPO`, if it is not set.
 
 Run them only against a **private, throwaway** repository: they create issues and never delete
 them, and they refuse a repository that is not private. Set `FL_GITHUB_TOKEN` in the
