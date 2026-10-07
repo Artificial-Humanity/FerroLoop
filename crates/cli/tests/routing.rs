@@ -1218,3 +1218,214 @@ fn a_visibility_that_cannot_be_read_refuses_a_finding_about_a_local_record_unwri
         .stderr(contains("could not read the visibility of acme/widgets"));
     assert_eq!(g.fake.issue_count(), 0, "nothing created on GitHub");
 }
+
+// Routing spec §2.4: both tiers, each item's tier in a column; `--tier`
+// reads one.
+#[test]
+fn a_merged_list_shows_each_items_tier_and_the_tier_flag_reads_one() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "l",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "g",
+        "--area",
+        "design",
+    ]);
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1"]),
+        "1\tlocal\ttodo\tl\n#1\tgithub\ttodo\tg\n"
+    );
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1", "--tier", "local"]),
+        "1\tlocal\ttodo\tl\n"
+    );
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1", "--tier", "github"]),
+        "#1\tgithub\ttodo\tg\n"
+    );
+}
+
+#[test]
+fn an_unrouted_list_has_no_tier_column_and_refuses_tier() {
+    let g = world("");
+    g.ok(&["project", "add", "."]);
+    g.ok(&["record", "add", "--project", "1", "--title", "t"]);
+    assert_eq!(g.ok(&["record", "list", "--project", "1"]), "1\ttodo\tt\n");
+    for list in ["record", "finding"] {
+        g.fl()
+            .args([list, "list", "--project", "1", "--tier", "local"])
+            .assert()
+            .failure()
+            .stderr(contains("`--tier` needs a routing map"));
+    }
+}
+
+// Routing spec §2.4: "a list that cannot see its whole population fails".
+#[test]
+fn a_merged_list_with_github_down_is_refused_naming_tier_local() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "l",
+        "--area",
+        "code",
+    ]);
+    g.fake.state().down = true;
+    for list in [
+        ["record", "list", "--project", "1"],
+        ["finding", "list", "--project", "1"],
+    ] {
+        g.fl()
+            .args(list)
+            .assert()
+            .failure()
+            .stdout("")
+            .stderr(contains("rather than show part of it").and(contains("--tier local")));
+    }
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1", "--tier", "local"]),
+        "1\tlocal\ttodo\tl\n"
+    );
+}
+
+#[test]
+fn an_unbound_machine_lists_its_local_tier_with_tier_local() {
+    let g = world("");
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "l",
+        "--area",
+        "code",
+    ]);
+    g.fl()
+        .args(["record", "list", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(
+            contains("binds no GitHub repository for the project").and(contains("--tier local")),
+        );
+    assert_eq!(
+        g.ok(&["record", "list", "--project", "1", "--tier", "local"]),
+        "1\tlocal\ttodo\tl\n"
+    );
+}
+
+// Routing spec §2.4: one record's findings, from both tiers.
+#[test]
+fn finding_list_record_lists_one_records_findings_from_both_tiers() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "a",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "b",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "finding", "raise", "--record", "1", "--claim", "here", "--by", "rev",
+    ]);
+    g.ok(&[
+        "finding", "raise", "--record", "1", "--claim", "there", "--by", "rev", "--area", "design",
+    ]);
+    g.ok(&[
+        "finding", "raise", "--record", "2", "--claim", "other", "--by", "rev",
+    ]);
+    assert_eq!(
+        g.ok(&["finding", "list", "--record", "1"]),
+        "1\tlocal\traised\trev\there\n#1\tgithub\traised\trev\tthere\n"
+    );
+    g.fl()
+        .args(["finding", "list", "--record", "1", "--project", "1"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn finding_list_record_works_in_an_unrouted_project_too() {
+    let g = world("");
+    g.ok(&["project", "add", "."]);
+    g.ok(&["record", "add", "--project", "1", "--title", "a"]);
+    g.ok(&["record", "add", "--project", "1", "--title", "b"]);
+    g.ok(&[
+        "finding", "raise", "--record", "1", "--claim", "x", "--by", "rev",
+    ]);
+    g.ok(&[
+        "finding", "raise", "--record", "2", "--claim", "y", "--by", "rev",
+    ]);
+    assert_eq!(
+        g.ok(&["finding", "list", "--record", "2"]),
+        "2\traised\trev\ty\n"
+    );
+}
+
+// Routing spec §2.4: the withdrawal counts sum both tiers.
+#[test]
+fn withdrawal_counts_sum_both_tiers_and_name_the_tier_when_narrowed() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "a",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "finding", "raise", "--record", "1", "--claim", "x", "--by", "hasty",
+    ]);
+    g.ok(&[
+        "finding", "raise", "--record", "1", "--claim", "y", "--by", "hasty", "--area", "design",
+    ]);
+    g.ok(&["finding", "withdraw", "1", "--reason", "no"]);
+    g.ok(&["finding", "withdraw", "#1", "--reason", "no"]);
+    assert!(
+        g.ok(&["finding", "list", "--project", "1"])
+            .ends_with("hasty\twithdrawn: 2\n"),
+        "summed over both tiers"
+    );
+    assert!(
+        g.ok(&["finding", "list", "--project", "1", "--tier", "local"])
+            .ends_with("hasty\twithdrawn: 1 (local tier)\n")
+    );
+}

@@ -26,6 +26,9 @@ pub enum Cmd {
     List {
         #[arg(long)]
         project: Ref,
+        /// One tier only, in a routed project (routing spec §2.4).
+        #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
+        tier: Option<Tier>,
     },
     Move {
         id: Ref,
@@ -42,7 +45,7 @@ impl Cmd {
     fn refs(&self) -> Vec<&Ref> {
         match self {
             Cmd::Add { project, .. } => vec![project],
-            Cmd::List { project } => vec![project],
+            Cmd::List { project, .. } => vec![project],
             Cmd::Move { id, .. } => vec![id],
         }
     }
@@ -97,20 +100,40 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             };
             println!("{}\t{title}", ctx.show_item(Kind::Record, id.iri())?);
         }
-        Cmd::List { project } => {
+        Cmd::List { project, tier } => {
             let p = ProjectId(refs::resolve(
                 ctx.handles,
                 store.label(),
                 Kind::Project,
                 &project,
             )?);
-            for r in ctx.tracker.list_records(&p)? {
-                println!(
-                    "{}\t{}\t{}",
-                    ctx.show_item(Kind::Record, r.id.iri())?,
-                    r.state.as_wire(),
-                    r.title
-                );
+            match ctx.tiers {
+                None => {
+                    if tier.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--tier"));
+                    }
+                    for r in ctx.tracker.list_records(&p)? {
+                        println!(
+                            "{}\t{}\t{}",
+                            ctx.show_item(Kind::Record, r.id.iri())?,
+                            r.state.as_wire(),
+                            r.title
+                        );
+                    }
+                }
+                // ⚠ The whole list or an error: `records` refuses when a
+                // tier it must read cannot be read (routing spec §2.4).
+                Some(t) => {
+                    for (in_tier, r) in t.router.records(&p, tier)? {
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            ctx.show_item(Kind::Record, r.id.iri())?,
+                            in_tier.as_wire(),
+                            r.state.as_wire(),
+                            r.title
+                        );
+                    }
+                }
             }
         }
         Cmd::Move { id, to } => {

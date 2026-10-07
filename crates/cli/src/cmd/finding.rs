@@ -50,11 +50,18 @@ pub enum Cmd {
         #[arg(long)]
         reason: String,
     },
+    /// A project's findings, or one record's (routing spec §2.4).
     List {
+        #[arg(long, required_unless_present = "record", conflicts_with = "record")]
+        project: Option<Ref>,
+        /// One record's findings, from both tiers in a routed project.
         #[arg(long)]
-        project: Ref,
+        record: Option<Ref>,
         #[arg(long)]
         state: Option<String>,
+        /// One tier only, in a routed project.
+        #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
+        tier: Option<Tier>,
     },
 }
 
@@ -70,7 +77,9 @@ impl Cmd {
             Cmd::Assign { finding, .. } => vec![finding],
             Cmd::Verify { finding } => vec![finding],
             Cmd::Withdraw { finding, .. } => vec![finding],
-            Cmd::List { project, .. } => vec![project],
+            Cmd::List {
+                project, record, ..
+            } => project.iter().chain(record.iter()).collect(),
         }
     }
 
@@ -336,7 +345,12 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 ctx.show_item(Kind::Finding, f.id.iri())?
             );
         }
-        Cmd::List { project, state } => {
+        Cmd::List {
+            project,
+            record,
+            state,
+            tier,
+        } => {
             let want = match state.as_deref() {
                 None => None,
                 Some(s) => Some(FindingState::from_wire(s).ok_or_else(|| {
@@ -346,30 +360,88 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     )
                 })?),
             };
-            let p = ProjectId(refs::resolve(
-                ctx.handles,
-                store.label(),
-                Kind::Project,
-                &project,
-            )?);
-            let all = ctx.tracker.list_findings(&p)?;
+            let (p, of) = match (&project, &record) {
+                (Some(pr), None) => (
+                    ProjectId(refs::resolve(
+                        ctx.handles,
+                        store.label(),
+                        Kind::Project,
+                        pr,
+                    )?),
+                    None,
+                ),
+                (None, Some(r)) => {
+                    let id = RecordId(ctx.resolve_item(Kind::Record, r)?);
+                    let Some(rec) = ctx.tracker.get_record(&id)? else {
+                        bail!(
+                            "`{r}` is not a record in {}. Use `fl record list --project \
+                             <project>` to see records that exist.",
+                            ctx.tracker_label
+                        );
+                    };
+                    (rec.project.clone(), Some(rec))
+                }
+                _ => unreachable!("clap requires exactly one of --project and --record"),
+            };
+            if ctx.tiers.is_none() && tier.is_some() {
+                return Err(crate::cmd::routing::not_routed("--tier"));
+            }
+            // ⚠ The whole list or an error: `findings` refuses when a tier
+            // it must read cannot be read (routing spec §2.4).
+            let listed: Vec<(Option<Tier>, Finding)> = match ctx.tiers {
+                None => ctx
+                    .tracker
+                    .list_findings(&p)?
+                    .into_iter()
+                    .map(|f| (None, f))
+                    .collect(),
+                Some(t) => t
+                    .router
+                    .findings(&p, tier)?
+                    .into_iter()
+                    .map(|(in_tier, f)| (Some(in_tier), f))
+                    .collect(),
+            };
+            let named = |f: &Finding| {
+                of.as_ref()
+                    .is_none_or(|r| f.record == r.id || r.also_known_as.contains(f.record.iri()))
+            };
             let mut raisers: BTreeSet<String> = Default::default();
-            for f in all.iter().filter(|f| want.is_none_or(|w| f.state == w)) {
-                println!(
-                    "{}\t{}\t{}\t{}",
-                    ctx.show_item(Kind::Finding, f.id.iri())?,
-                    f.state.as_wire(),
-                    f.raised_by,
-                    f.claim
-                );
+            for (in_tier, f) in listed
+                .iter()
+                .filter(|(_, f)| want.is_none_or(|w| f.state == w) && named(f))
+            {
+                let shown = ctx.show_item(Kind::Finding, f.id.iri())?;
+                match in_tier {
+                    Some(t) => println!(
+                        "{shown}\t{}\t{}\t{}\t{}",
+                        t.as_wire(),
+                        f.state.as_wire(),
+                        f.raised_by,
+                        f.claim
+                    ),
+                    None => println!(
+                        "{shown}\t{}\t{}\t{}",
+                        f.state.as_wire(),
+                        f.raised_by,
+                        f.claim
+                    ),
+                }
                 raisers.insert(f.raised_by.clone());
             }
-            // ⚠ Decision 27's cost, printed where it can be seen. A cost
-            // nobody reads is not a cost.
+            // ⚠ The cost of a withdrawal, printed where it can be seen —
+            // over both tiers, or the one `--tier` names, and then it says
+            // which.
             for actor in raisers {
-                let n = ctx.tracker.withdrawals_by(&actor)?;
+                let n = match ctx.tiers {
+                    Some(t) => t.router.withdrawals_in(&actor, tier)?,
+                    None => ctx.tracker.withdrawals_by(&actor)?,
+                };
                 if n > 0 {
-                    println!("{actor}\twithdrawn: {n}");
+                    match tier {
+                        Some(t) => println!("{actor}\twithdrawn: {n} ({} tier)", t.as_wire()),
+                        None => println!("{actor}\twithdrawn: {n}"),
+                    }
                 }
             }
         }

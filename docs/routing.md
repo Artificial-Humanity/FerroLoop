@@ -91,3 +91,13 @@ declared sensitive once.
 A finding made in a sensitive area is a security finding. When the map would send a security
 finding, or any item of a sensitive area, to a repository that is not private, fl refuses and
 says to use `--tier local`: it never moves an item to the local tier by itself.
+
+## Lists
+
+In a routed project `fl record list` and `fl finding list` read both tiers and show each item's
+tier in a second column (`1\tlocal\ttodo\t…`, `#1\tgithub\ttodo\t…`); `--tier local` or `--tier
+github` reads one. When a tier cannot be read — GitHub is down, or this machine binds no
+repository — the list is refused rather than shown in part, and the refusal suggests `--tier
+local`. `fl finding list --record <id>` lists one record's findings, from both tiers; it works in
+any project. The withdrawal counts under a finding list sum both tiers; with `--tier`, they count
+that tier, and say so.
