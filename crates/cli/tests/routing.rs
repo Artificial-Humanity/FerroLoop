@@ -25,6 +25,10 @@ fn git(dir: &Path, args: &[&str]) {
 /// The config line binding the project to the fake's repository.
 const BOUND: &str = "tracker = { github = \"acme/widgets\", credential = \"env\" }\n";
 
+/// What fl says when the fake GitHub is down: the refusal for a store that
+/// cannot be reached, never "nothing there".
+const DOWN: &str = "could not be opened";
+
 struct R {
     home: tempfile::TempDir,
     repo: tempfile::TempDir,
@@ -613,7 +617,53 @@ fn reproducing_a_github_tier_finding_checks_the_committed_manifest() {
         ])
         .assert()
         .failure()
-        .stderr(contains("there is no manifest at"));
+        // The authoring machine's own wording: export, then commit.
+        .stderr(contains("and commit the file it writes"));
+}
+
+// …and a local-tier finding is written where no other machine reads it, so
+// its reproduction needs no manifest: it fails on the gate alone.
+#[test]
+fn reproducing_a_local_tier_finding_needs_no_manifest() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "fix",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "finding",
+        "raise",
+        "--record",
+        "1",
+        "--claim",
+        "it is off",
+        "--by",
+        "rev",
+    ]);
+    g.ok(&[
+        "gate",
+        "add",
+        "--project",
+        "1",
+        "--name",
+        "g",
+        "--glob",
+        "src/**/*.rs",
+        "--program",
+        "true",
+    ]);
+    g.fl()
+        .args(["finding", "reproduce", "1", "--gate", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("currently PASSES over").and(contains("manifest").not()));
 }
 
 // Routing spec decision 12: a routed manifest is not imported where the
@@ -1558,7 +1608,8 @@ fn a_removal_is_refused_when_a_tier_cannot_be_read() {
     g.fl()
         .args(["routing", "remove", "--project", "1", "product"])
         .assert()
-        .failure();
+        .failure()
+        .stderr(contains(DOWN));
     let unbound = world("");
     unbound.routed();
     unbound
@@ -1567,6 +1618,12 @@ fn a_removal_is_refused_when_a_tier_cannot_be_read() {
         .assert()
         .failure()
         .stderr(contains("binds no GitHub repository for the project"));
+    assert!(
+        unbound
+            .ok(&["routing", "show", "--project", "1"])
+            .contains("product"),
+        "nothing written"
+    );
     g.fake.state().down = false;
     assert!(
         g.ok(&["routing", "show", "--project", "1"])
@@ -2219,4 +2276,38 @@ fn an_importing_machine_refuses_a_map_change_before_it_asks_github() {
     // One lock: the message must not take the fake's state a second time.
     let requests = g.fake.state().requests.clone();
     assert_eq!(requests.len(), asked, "{requests:?}");
+}
+
+// Routing spec §1.3: `#5` names GitHub issue 5, so on a machine with no
+// binding it is refused as the missing config entry.
+#[test]
+fn a_hash_number_on_an_unbound_machine_names_the_missing_config_entry() {
+    let g = world("");
+    g.routed();
+    g.fl()
+        .args(["record", "move", "#5", "--to", "doing"])
+        .assert()
+        .failure()
+        .stderr(
+            contains("binds no GitHub repository for the project")
+                .and(contains("tracker = { github = \"owner/repo\"")),
+        );
+}
+
+// Routing spec §2.4: `finding list` names a project or a record — one of
+// the two, never both, never neither.
+#[test]
+fn finding_list_takes_exactly_one_of_project_and_record() {
+    let g = world("");
+    g.ok(&["project", "add", "."]);
+    g.fl()
+        .args(["finding", "list"])
+        .assert()
+        .failure()
+        .stderr(contains("required arguments were not provided"));
+    g.fl()
+        .args(["finding", "list", "--record", "1", "--project", "1"])
+        .assert()
+        .failure()
+        .stderr(contains("cannot be used with"));
 }
