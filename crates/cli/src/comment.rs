@@ -308,6 +308,7 @@ mod tests {
                 github_ledger: Some(&gl),
                 witness: Some(&witness),
                 tracker_label: String::new(),
+                tiers: None,
             };
             witness
                 .flush(Decision {
@@ -359,6 +360,7 @@ mod tests {
             github_ledger: Some(&gl),
             witness: Some(&witness),
             tracker_label: String::new(),
+            tiers: None,
         };
         witness
             .flush(Decision {

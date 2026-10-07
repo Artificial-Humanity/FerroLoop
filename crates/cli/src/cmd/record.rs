@@ -15,6 +15,9 @@ pub enum Cmd {
         project: Ref,
         #[arg(long)]
         title: String,
+        /// The record's area (routing spec §1.1), which routes it to a tier.
+        #[arg(long)]
+        area: Option<String>,
     },
     List {
         #[arg(long)]
@@ -53,7 +56,11 @@ impl Cmd {
 pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     let store = ctx.store;
     match cmd {
-        Cmd::Add { project, title } => {
+        Cmd::Add {
+            project,
+            title,
+            area,
+        } => {
             let p = ProjectId(refs::resolve(
                 ctx.handles,
                 store.label(),
@@ -67,11 +74,16 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     store.label()
                 );
             }
-            let id = ctx.tracker.add_record(&p, &title)?;
-            println!(
-                "{}\t{title}",
-                refs::show(ctx.handles, Kind::Record, id.iri())?
-            );
+            let id = match (ctx.tiers, &area) {
+                (None, Some(_)) => return Err(crate::cmd::routing::not_routed("--area")),
+                (None, None) => ctx.tracker.add_record(&p, &title)?,
+                (Some(_), _) => {
+                    crate::cmd::manifest::ensure_routing_current(store, &p)?;
+                    ctx.tracker
+                        .add_record_with_area(&p, &title, area.as_deref())?
+                }
+            };
+            println!("{}\t{title}", ctx.show_item(Kind::Record, id.iri())?);
         }
         Cmd::List { project } => {
             let p = ProjectId(refs::resolve(
@@ -83,7 +95,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             for r in ctx.tracker.list_records(&p)? {
                 println!(
                     "{}\t{}\t{}",
-                    refs::show(ctx.handles, Kind::Record, r.id.iri())?,
+                    ctx.show_item(Kind::Record, r.id.iri())?,
                     r.state.as_wire(),
                     r.title
                 );
@@ -131,7 +143,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             crate::ctx::report_flush(&report.flushed);
             // What the person reads back: the record's handle (or its
             // primary IRI), never the alias or IRI they typed.
-            let shown = refs::show(ctx.handles, Kind::Record, record.id.iri())?;
+            let shown = ctx.show_item(Kind::Record, record.id.iri())?;
 
             if let MoveOutcome::Ungated = report.outcome {
                 println!(

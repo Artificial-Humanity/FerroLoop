@@ -6,6 +6,7 @@ mod preflight;
 mod refs;
 #[cfg(test)]
 mod testing;
+mod tiers;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -104,6 +105,12 @@ impl Command {
             Command::Github(c) => c.has_handle(),
             Command::Routing(c) => c.has_handle(),
         }
+    }
+
+    /// Whether the command writes a routing map: decision 12's refusal
+    /// reads the binding for it, routed or not yet.
+    fn sets_routing(&self) -> bool {
+        matches!(self, Command::Routing(c) if c.sets_routing())
     }
 
     /// Whether the command reads or writes records or findings. Only these
@@ -430,6 +437,17 @@ fn local_only_reason(explicit: bool, elsewhere: bool) -> String {
     }
 }
 
+/// Routing spec decision 12, when a command starts.
+fn refuse_routed_github_ledger(
+    routed: bool,
+    binding: Option<&config::TrackerBinding>,
+) -> Result<()> {
+    if let Some(b) = binding.filter(|b| routed && b.github_ledger()) {
+        return Err(cmd::routing::github_ledger_refusal(&b.github));
+    }
+    Ok(())
+}
+
 /// The tracker for a command that reads or writes records or findings, and
 /// works on the store at `chosen`.
 ///
@@ -604,9 +622,19 @@ fn run(cli: Cli) -> Result<i32> {
     }
     let store = RedbStore::open(&path)
         .with_context(|| format!("could not open the store at {}", path.display()))?;
+    // A store in which any project routes its items between two tiers
+    // (routing spec §1.3), whatever its maps hold.
+    let routed = store.holds_routing()?;
+    refuse_routed_github_ledger(
+        routed || cli.command.sets_routing(),
+        binding.as_ref().or(here_binding.as_ref()),
+    )?;
     // Why `fl stats` could not read GitHub, when it could not reach it.
     let mut unread: Option<String> = None;
     let github = match &binding {
+        // A routed store opens GitHub on the first call that needs it (routing spec §2.6),
+        // through `lazy`.
+        Some(_) if routed => None,
         Some(b) if needs_tracker => Some(open_github(b, cfg.github.as_ref(), &store)?),
         // ⚠ A report falls back to the local store, and says so, when
         // GitHub cannot be reached (§2.5); any other failure is an error.
@@ -648,14 +676,55 @@ fn run(cli: Cli) -> Result<i32> {
         Some(w) => w,
         None => &store,
     };
-    let (checked, routed);
-    let ctx = match &github {
-        Some(gh) => {
+    let config_path = config::path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "the config".into());
+    let lazy = routed.then(|| {
+        tiers::LazyGithub::new(
+            binding.clone(),
+            config_path,
+            Box::new(|b: &config::TrackerBinding| open_github(b, cfg.github.as_ref(), &store)),
+        )
+    });
+    let tiered = lazy.as_ref().map(|l| fl_core::TieredTracker {
+        catalog: &store,
+        local: &store,
+        routes: &store,
+        github: l,
+    });
+    let tiers = match (&tiered, &lazy) {
+        (Some(router), Some(github)) => Some(tiers::Tiers { router, github }),
+        _ => None,
+    };
+    // `fl github …` names GitHub items only, so it opens GitHub now, routed
+    // or not.
+    let routed_github = match (&lazy, &cli.command) {
+        (Some(l), Command::Github(_)) => Some(l.open()?),
+        _ => None,
+    };
+
+    let (checked, numbered);
+    let ctx = match (&tiers, &github) {
+        (Some(t), _) => Ctx {
+            store: &store,
+            tracker: t.router,
+            ledger,
+            handles: &store,
+            github: routed_github,
+            github_ledger: None,
+            witness: None,
+            tracker_label: match &binding {
+                Some(b) => format!("{} or GitHub `{}`", store.label(), b.github),
+                None => store.label().to_string(),
+            },
+            tiers: Some(t),
+        },
+        (None, Some(gh)) => {
             checked = CatalogChecked {
                 catalog: &store,
                 tracker: gh,
             };
-            routed = KindRouted {
+            numbered = KindRouted {
                 catalog: &store,
                 tracker: gh,
             };
@@ -663,14 +732,15 @@ fn run(cli: Cli) -> Result<i32> {
                 store: &store,
                 tracker: &checked,
                 ledger,
-                handles: &routed,
+                handles: &numbered,
                 github: Some(gh),
                 github_ledger: github_ledger.as_ref(),
                 witness: witness.as_ref(),
                 tracker_label: format!("github:{}", gh.repo().full_name),
+                tiers: None,
             }
         }
-        None => Ctx {
+        (None, None) => Ctx {
             store: &store,
             tracker: &store,
             ledger,
@@ -679,6 +749,7 @@ fn run(cli: Cli) -> Result<i32> {
             github_ledger: None,
             witness: None,
             tracker_label: store.label().to_string(),
+            tiers: None,
         },
     };
     // `manifest export` writes the ledger root of the repository the
@@ -700,7 +771,10 @@ fn run(cli: Cli) -> Result<i32> {
             store_tracker(&path, entries)?;
         }
         match &here_binding {
-            Some(t) => cmd::manifest::Binding::Github(t.github.clone()),
+            Some(t) => cmd::manifest::Binding::Github {
+                repo: t.github.clone(),
+                github_ledger: t.github_ledger(),
+            },
             None => cmd::manifest::Binding::Local,
         }
     };
@@ -850,5 +924,31 @@ mod tests {
         ] {
             assert_eq!(api_override_host(url).unwrap(), host, "{url}");
         }
+    }
+
+    // Routing spec decision 12: a routed project uses the local ledger.
+    #[test]
+    fn a_routed_store_whose_binding_names_the_github_ledger_is_refused() {
+        let mut b = entry("/a", "/s.redb", Some("acme/widgets"))
+            .tracker
+            .unwrap();
+        assert!(
+            refuse_routed_github_ledger(true, Some(&b)).is_ok(),
+            "the local ledger is fine"
+        );
+        b.ledger = Some(config::LedgerChoice::Github);
+        let msg = format!(
+            "{:#}",
+            refuse_routed_github_ledger(true, Some(&b)).unwrap_err()
+        );
+        assert!(
+            msg.contains("a routed project keeps its runs and decisions in the local ledger"),
+            "{msg}"
+        );
+        assert!(
+            refuse_routed_github_ledger(false, Some(&b)).is_ok(),
+            "unrouted: as before"
+        );
+        assert!(refuse_routed_github_ledger(true, None).is_ok());
     }
 }

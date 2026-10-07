@@ -151,7 +151,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             let id = ctx.tracker.add_finding(f)?;
             println!(
                 "{}\traised\t{claim}",
-                refs::show(ctx.handles, Kind::Finding, id.iri())?
+                ctx.show_item(Kind::Finding, id.iri())?
             );
         }
         Cmd::Reproduce { finding, gate } => {
@@ -166,7 +166,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             )?);
             // A gate IRI about to be written where another machine reads it
             // must be in the committed manifest (spec §4.3–§4.5).
-            if ctx.github.is_some() {
+            if ctx.on_github(fid.iri()) {
                 crate::cmd::manifest::ensure_publishable(store, &f.project, Some(&gid))?;
             }
             crate::preflight::check(ctx, &f.project)?;
@@ -179,7 +179,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             crate::ctx::report_flush(&flushed);
             println!(
                 "{}\treproduced\tgate {} failed over {} items",
-                refs::show(ctx.handles, Kind::Finding, fid.iri())?,
+                ctx.show_item(Kind::Finding, fid.iri())?,
                 refs::show(ctx.handles, Kind::Gate, gid.iri())?,
                 report.verdict.population().unwrap_or(0)
             );
@@ -190,7 +190,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             ctx.tracker.update_finding(&f)?;
             println!(
                 "{}\tassigned\t{to}",
-                refs::show(ctx.handles, Kind::Finding, f.id.iri())?
+                ctx.show_item(Kind::Finding, f.id.iri())?
             );
         }
         Cmd::Verify { finding } => {
@@ -271,7 +271,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                 }
             }
 
-            let shown = refs::show(ctx.handles, Kind::Finding, id.iri())?;
+            let shown = ctx.show_item(Kind::Finding, id.iri())?;
             if report.closed {
                 println!("CLOSED\t{shown}");
             } else {
@@ -288,7 +288,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             ctx.tracker.update_finding(&f)?;
             println!(
                 "{}\twithdrawn\t{reason}",
-                refs::show(ctx.handles, Kind::Finding, f.id.iri())?
+                ctx.show_item(Kind::Finding, f.id.iri())?
             );
         }
         Cmd::List { project, state } => {
@@ -312,7 +312,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             for f in all.iter().filter(|f| want.is_none_or(|w| f.state == w)) {
                 println!(
                     "{}\t{}\t{}\t{}",
-                    refs::show(ctx.handles, Kind::Finding, f.id.iri())?,
+                    ctx.show_item(Kind::Finding, f.id.iri())?,
                     f.state.as_wire(),
                     f.raised_by,
                     f.claim

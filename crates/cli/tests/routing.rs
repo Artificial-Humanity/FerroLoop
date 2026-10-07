@@ -258,3 +258,392 @@ fn an_import_that_first_routes_a_store_says_how_handles_change() {
         .success()
         .stderr(contains("handles change in this project").not());
 }
+
+// Routing spec §2.6: work on local items needs no network and no credential.
+#[test]
+fn a_local_item_is_made_and_moved_without_a_request_to_github() {
+    let g = world(BOUND);
+    g.routed();
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "fix it",
+            "--area",
+            "code",
+        ])
+        .assert()
+        .success()
+        .stdout("1\tfix it\n");
+    g.fl()
+        .args(["record", "move", "1", "--to", "doing"])
+        .assert()
+        .success();
+    assert!(
+        g.fake.state().requests.is_empty(),
+        "{:?}",
+        g.fake.state().requests
+    );
+}
+
+// Routing spec §1.1, §2.3: a GitHub-tier record is an issue carrying its
+// area's label, printed as `#1`.
+#[test]
+fn a_github_tier_record_is_an_issue_with_its_area_label_printed_as_hash() {
+    let g = world(BOUND);
+    g.routed();
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "look",
+            "--area",
+            "design",
+        ])
+        .assert()
+        .success()
+        .stdout("#1\tlook\n");
+    assert_eq!(
+        g.fake.issue(1).labels,
+        vec!["fl:record", "fl:record/todo", "fl:area/design"]
+    );
+}
+
+#[test]
+fn a_routed_create_with_no_area_or_an_undeclared_one_is_refused_naming_the_areas() {
+    let g = world("");
+    g.routed();
+    g.fl()
+        .args(["record", "add", "--project", "1", "--title", "t"])
+        .assert()
+        .failure()
+        .stderr(contains("needs an area for every new item").and(contains("code, design")));
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--area",
+            "ops",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("`ops` is not an area this project declares"));
+}
+
+#[test]
+fn area_in_a_project_with_no_routing_map_is_refused_naming_routing_set() {
+    let g = world("");
+    g.ok(&["project", "add", "."]);
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--area",
+            "code",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "needs a routing map, and this project declares none",
+        ));
+}
+
+// Routing spec §1.3: "routing never changes tier silently".
+#[test]
+fn a_github_tier_create_on_an_unbound_machine_names_the_config_entry() {
+    let g = world("");
+    g.routed();
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--area",
+            "design",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("binds no GitHub repository for the project")
+                .and(contains("never puts an item in the other tier")),
+        );
+    // Nothing landed locally: the next local record is the first.
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "u",
+            "--area",
+            "code",
+        ])
+        .assert()
+        .success()
+        .stdout("1\tu\n");
+}
+
+// Routing spec decision 12.
+#[test]
+fn a_routed_binding_with_the_github_ledger_is_refused_when_the_command_starts() {
+    let with_ledger =
+        "tracker = { github = \"acme/widgets\", credential = \"env\", ledger = \"github\" }\n";
+    let g = world(with_ledger);
+    g.ok(&["project", "add", "."]);
+    g.fl()
+        .args(["routing", "set", "--project", "1", "code", "local"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "a routed project keeps its runs and decisions in the local ledger",
+        ));
+    g.fl()
+        .args(["routing", "show", "--project", "1"])
+        .assert()
+        .success()
+        .stderr(contains("has no routing map"));
+    g.configure(g.home.path(), BOUND);
+    g.ok(&["routing", "set", "--project", "1", "code", "local"]);
+    g.configure(g.home.path(), with_ledger);
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--area",
+            "code",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "a routed project keeps its runs and decisions in the local ledger",
+        ));
+}
+
+// Routing spec §1.2: one routing rule per project, not per machine — on
+// the authoring machine, once a manifest exists, it must carry the map.
+#[test]
+fn a_routed_create_on_the_authoring_machine_needs_the_map_exported() {
+    let g = world("");
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "a",
+        "--area",
+        "code",
+    ]);
+    g.ok(&["manifest", "export", "--project", "1"]);
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "b",
+        "--area",
+        "code",
+    ]);
+    g.ok(&["routing", "set", "--project", "1", "ops", "local"]);
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "c",
+            "--area",
+            "code",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("changed since the manifest at"));
+    g.ok(&["manifest", "export", "--project", "1"]);
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "c",
+        "--area",
+        "code",
+    ]);
+}
+
+// …and on an importing machine, the import must be current.
+#[test]
+fn a_routed_create_on_an_importing_machine_needs_the_import_current() {
+    let g = world("");
+    g.routed();
+    g.ok(&["manifest", "export", "--project", "1"]);
+    git(g.repo.path(), &["add", "-A"]);
+    git(g.repo.path(), &["commit", "-qm", "manifest"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(other.path(), "");
+    let on_other = |args: &[&str]| g.fl_at(other.path()).args(args).assert();
+    on_other(&["manifest", "import"])
+        .success()
+        .stdout(contains("routing\t5 areas"));
+    on_other(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "t",
+        "--area",
+        "code",
+    ])
+    .success();
+    g.ok(&["routing", "set", "--project", "1", "ops", "local"]);
+    g.ok(&["manifest", "export", "--project", "1"]);
+    on_other(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "u",
+        "--area",
+        "code",
+    ])
+    .failure()
+    .stderr(contains("may route items differently"));
+    on_other(&["manifest", "import"]).success();
+    on_other(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "u",
+        "--area",
+        "code",
+    ])
+    .success();
+}
+
+// GitHub tracker spec §4.3: a gate a GitHub item names must be in the
+// committed manifest — in a routed store, for a GitHub-tier finding.
+#[test]
+fn reproducing_a_github_tier_finding_checks_the_committed_manifest() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "look",
+        "--area",
+        "design",
+    ]);
+    g.ok(&[
+        "finding",
+        "raise",
+        "--record",
+        "https://github.com/acme/widgets/issues/1",
+        "--claim",
+        "it is off",
+        "--by",
+        "rev",
+    ]);
+    g.ok(&[
+        "gate",
+        "add",
+        "--project",
+        "1",
+        "--name",
+        "g",
+        "--glob",
+        "src/**/*.rs",
+        "--program",
+        "false",
+    ]);
+    g.fl()
+        .args([
+            "finding",
+            "reproduce",
+            "https://github.com/acme/widgets/issues/2",
+            "--gate",
+            "1",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("there is no manifest at"));
+}
+
+// Routing spec decision 12: a routed manifest is not imported where the
+// binding names the GitHub ledger, and nothing is imported.
+#[test]
+fn a_routed_manifest_is_not_imported_where_the_binding_names_the_github_ledger() {
+    let g = world("");
+    g.routed();
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(
+        other.path(),
+        "tracker = { github = \"acme/widgets\", credential = \"env\", ledger = \"github\" }\n",
+    );
+    g.fl_at(other.path())
+        .args(["manifest", "import"])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "a routed project keeps its runs and decisions in the local ledger",
+        ));
+    g.fl_at(other.path())
+        .args(["project", "list"])
+        .assert()
+        .success()
+        .stdout("");
+}
+
+// Routing spec §2.3, §2.2: after a repository rename a GitHub item still
+// prints as `#n` — its URL names the repository's name now.
+#[test]
+fn after_a_rename_a_github_item_still_prints_as_hash() {
+    let g = world(BOUND);
+    g.routed();
+    g.fake.rename("acme/gadgets");
+    assert_eq!(
+        g.ok(&[
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "look",
+            "--area",
+            "design"
+        ]),
+        "#1\tlook\n"
+    );
+}

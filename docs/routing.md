@@ -45,3 +45,23 @@ bare `41` names local item 41. The first `fl routing set` says what that changes
   and local records made before the binding appear in lists again.
 
 The import that first brings a routing map to another machine says the same there.
+
+## What a routed project needs
+
+A project is routed once it has a routing map, whatever the map holds. The `github` tier is
+available on a machine whose config binds the project to a repository (the `tracker` binding of
+[github-tracker.md](github-tracker.md)). Without one, the machine works on local items: a
+`github`-tier item is refused, naming the missing config entry, and fl never puts it in the local
+tier instead.
+
+fl opens GitHub only when a command needs a GitHub item — a GitHub-tier create, a GitHub id or
+`#41` handle, a list of both tiers — so work on local items needs neither the network nor a
+credential. `fl github …` names GitHub items only, and opens GitHub at the start.
+
+A routed project keeps its runs and decisions in the local store: a binding with `ledger =
+"github"` is refused while the project is routed, and `fl routing set` refuses to route a project
+whose binding names it.
+
+Every machine routes the same way. On a machine that imported the project, a new item needs the
+import to be current (`fl manifest import`). On the machine that authors it, once the project has
+a manifest, the manifest must carry the current map (`fl manifest export`, then commit).

@@ -377,6 +377,7 @@ mod tests {
             github_ledger: Some(&gl),
             witness: None,
             tracker_label: String::new(),
+            tiers: None,
         };
         let err = run(&ctx, Cmd::Init { confirm: None }, None).unwrap_err();
         assert!(

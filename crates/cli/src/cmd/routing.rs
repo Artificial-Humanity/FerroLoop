@@ -21,6 +21,27 @@ pub fn parse_tier(s: &str) -> Result<Tier, String> {
     })
 }
 
+/// The refusal for `--area` or `--tier` in a store with no routing map.
+pub fn not_routed(flag: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`{flag}` needs a routing map, and this project declares none: an area is a name its \
+         routing map declares, and a tier one it routes to. `fl routing set --project \
+         <project> <area> <tier>` declares one"
+    )
+}
+
+/// Routing spec decision 12: a routed project keeps its runs and decisions
+/// in the local ledger in this release — `SplitLedger::flush` refuses a
+/// decision about a record the repository does not hold, so every gated
+/// move of a local record would fail.
+pub fn github_ledger_refusal(repo: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the binding of `{repo}` names `ledger = \"github\"`, and a routed project keeps its runs \
+         and decisions in the local ledger: fl does not publish a routed project's ledger to \
+         GitHub yet. Remove `ledger = \"github\"` from the binding"
+    )
+}
+
 #[derive(Subcommand)]
 pub enum Cmd {
     /// Route an area to a tier for new items. The project's first `set`
@@ -57,6 +78,11 @@ impl Cmd {
 
     pub fn has_handle(&self) -> bool {
         refs::has_handle(&self.refs())
+    }
+
+    /// Whether this command writes a routing map.
+    pub fn sets_routing(&self) -> bool {
+        matches!(self, Cmd::Set { .. })
     }
 
     /// Whether this command reads records or findings, in either tier.
