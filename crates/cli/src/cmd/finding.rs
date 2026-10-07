@@ -1,9 +1,12 @@
 use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
+use crate::tiers::Tiers;
 use anyhow::{Result, bail};
 use clap::Subcommand;
+use fl_core::FindingPlacement;
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, ProjectId, RecordId};
+use fl_core::routing::Tier;
 use fl_core::{Iri, Kind};
 use fl_exec::finding::{FindingExecError, attach_reproduction, verify_finding};
 use std::collections::BTreeSet;
@@ -21,6 +24,13 @@ pub enum Cmd {
         /// one only to a private repository (GitHub tracker spec §6).
         #[arg(long)]
         security: bool,
+        /// The finding's area (routing spec §1.1). Without it, the
+        /// record's.
+        #[arg(long)]
+        area: Option<String>,
+        /// The tier, over the one the area routes to (routing spec §2.1).
+        #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
+        tier: Option<Tier>,
     },
     /// Attach a reproduction. REFUSED unless the gate currently fails.
     Reproduce {
@@ -119,6 +129,28 @@ fn explain(e: FindingExecError, finding: &Ref, gate: Option<&Ref>) -> anyhow::Er
     }
 }
 
+/// Routing spec §2.5: a GitHub finding about a local record publishes the
+/// record's title and IRI. On a repository that is not private, say so
+/// before it is written. (About a record in a sensitive area, the router
+/// has already refused.) A visibility that cannot be read refuses: an
+/// unknown visibility is not private.
+fn warn_disclosure(t: &Tiers<'_>, at: &FindingPlacement) -> Result<()> {
+    if at.at().tier() != Tier::Github || at.record().tier != Tier::Local {
+        return Ok(());
+    }
+    let gh = t.github.open()?;
+    let visibility = gh.visibility()?;
+    if visibility != "private" {
+        eprintln!(
+            "warning: {} is {visibility}: this finding's issue names its local record, {:?}, \
+             and the record's IRI, and anyone who can read the repository will see them",
+            gh.repo().full_name,
+            at.record().title
+        );
+    }
+    Ok(())
+}
+
 pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     let store = ctx.store;
     match cmd {
@@ -127,6 +159,8 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             claim,
             by,
             security,
+            area,
+            tier,
         } => {
             let r = RecordId(ctx.resolve_item(Kind::Record, &record)?);
             let Some(rec) = ctx.tracker.get_record(&r)? else {
@@ -136,9 +170,30 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     ctx.tracker_label
                 );
             };
+            let project = rec.project.clone();
             let mut f = Finding::raise(rec.project, r, &by, &claim);
             f.security = security;
-            let id = ctx.tracker.add_finding(f)?;
+            f.area = area;
+            let id = match ctx.tiers {
+                None => {
+                    if f.area.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--area"));
+                    }
+                    if tier.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--tier"));
+                    }
+                    ctx.tracker.add_finding(f)?
+                }
+                Some(t) => {
+                    crate::cmd::manifest::ensure_routing_current(store, &project)?;
+                    let at = t.router.place_finding(&f, tier)?;
+                    if at.inherited() {
+                        eprintln!("note: area: {}, from its record", at.at().area());
+                    }
+                    warn_disclosure(t, &at)?;
+                    t.router.add_finding_at(f, &at)?
+                }
+            };
             println!(
                 "{}\traised\t{claim}",
                 ctx.show_item(Kind::Finding, id.iri())?

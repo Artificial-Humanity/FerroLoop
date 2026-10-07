@@ -847,3 +847,325 @@ fn an_issue_url_on_an_unbound_machine_names_the_missing_config_entry() {
         .failure()
         .stderr(contains("binds no GitHub repository for the project"));
 }
+
+// Routing spec §2.1: `--tier` overrides the map; the area is recorded
+// either way.
+#[test]
+fn a_tier_given_puts_a_record_there_with_its_area() {
+    let g = world(BOUND);
+    g.routed();
+    assert_eq!(
+        g.ok(&[
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--area",
+            "code",
+            "--tier",
+            "github",
+        ]),
+        "#1\tt\n"
+    );
+    assert!(g.fake.issue(1).labels.contains(&"fl:area/code".to_string()));
+}
+
+#[test]
+fn tier_or_area_in_a_project_with_no_routing_map_is_refused() {
+    let g = world("");
+    g.ok(&["project", "add", "."]);
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--tier",
+            "local",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains(
+            "`--tier` needs a routing map, and this project declares none",
+        ));
+    g.ok(&["record", "add", "--project", "1", "--title", "t"]);
+    for extra in [["--area", "code"], ["--tier", "local"]] {
+        let mut args = vec![
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r",
+        ];
+        args.extend(extra);
+        g.fl().args(&args).assert().failure().stderr(contains(
+            "needs a routing map, and this project declares none",
+        ));
+    }
+}
+
+// Routing spec §1.1: a finding takes its record's area, and says so.
+#[test]
+fn a_finding_takes_its_records_area_and_says_so() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "look",
+        "--area",
+        "design",
+    ]);
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "#1", "--claim", "off", "--by", "rev",
+        ])
+        .assert()
+        .success()
+        .stdout("#2\traised\toff\n")
+        .stderr(contains("note: area: design, from its record"));
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "#1", "--claim", "here", "--by", "rev", "--area",
+            "code",
+        ])
+        .assert()
+        .success()
+        .stdout("1\traised\there\n")
+        .stderr(contains("from its record").not());
+}
+
+#[test]
+fn a_finding_whose_record_has_no_area_needs_one() {
+    let g = world("");
+    g.ok(&["project", "add", "."]);
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "before routing",
+    ]);
+    g.ok(&["routing", "set", "--project", "1", "code", "local"]);
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("has no area to inherit"));
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "code",
+        ])
+        .assert()
+        .success();
+}
+
+// Routing spec §2.1, decision 13: never to a public repository by the map;
+// nothing is created, and the refusal names `--tier local`.
+#[test]
+fn a_sensitive_area_routed_to_a_public_repository_creates_nothing_and_names_tier_local() {
+    let g = world(BOUND);
+    g.routed();
+    g.fake.state().repos[0].visibility = "public".into();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "t",
+        "--area",
+        "code",
+    ]);
+    for extra in [
+        vec!["--area", "security"],
+        vec!["--area", "design", "--security"],
+    ] {
+        let mut args = vec![
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r",
+        ];
+        args.extend(extra);
+        g.fl()
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(contains("security-sensitive").and(contains("--tier local")));
+    }
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "s",
+            "--area",
+            "security",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("security-sensitive"));
+    assert_eq!(g.fake.issue_count(), 0, "nothing created on GitHub");
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "security",
+            "--tier", "local",
+        ])
+        .assert()
+        .success()
+        .stdout("1\traised\tc\n");
+}
+
+#[test]
+fn a_finding_in_a_sensitive_area_on_a_private_repository_is_a_security_finding() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "t",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "security",
+    ]);
+    assert!(
+        g.fake.issue(1).body.contains("\"security\":true"),
+        "{}",
+        g.fake.issue(1).body
+    );
+}
+
+// Routing spec §2.5: a GitHub finding about a local record publishes the
+// record's title; on a repository that is not private, fl says so first.
+#[test]
+fn a_github_finding_about_a_local_record_warns_on_a_public_repository() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "fix the parser",
+        "--area",
+        "code",
+    ]);
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "design",
+        ])
+        .assert()
+        .success()
+        .stderr(contains("names its local record").not());
+    g.fake.state().repos[0].visibility = "public".into();
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "d", "--by", "r", "--area", "design",
+        ])
+        .assert()
+        .success()
+        .stderr(
+            contains("warning: acme/widgets is public").and(contains("names its local record")),
+        );
+    assert!(
+        g.fake.issue(2).body.contains("Record: fix the parser"),
+        "{}",
+        g.fake.issue(2).body
+    );
+    // Only a GitHub finding about a LOCAL record publishes a local title.
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "look",
+        "--area",
+        "design",
+    ]);
+    for args in [
+        [
+            "finding", "raise", "--record", "#3", "--claim", "e", "--by", "r",
+        ],
+        [
+            "finding", "raise", "--record", "1", "--claim", "f", "--by", "r",
+        ],
+    ] {
+        g.fl()
+            .args(args)
+            .assert()
+            .success()
+            .stderr(contains("names its local record").not());
+    }
+}
+
+// Routing spec decision 21: a finding about a local record in a sensitive
+// area never reaches a public repository, whatever its own area.
+#[test]
+fn a_finding_about_a_sensitive_local_record_is_refused_on_a_public_repository() {
+    let g = world(BOUND);
+    g.routed();
+    g.fake.state().repos[0].visibility = "public".into();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "the key leaks",
+        "--area",
+        "security",
+        "--tier",
+        "local",
+    ]);
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "design",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("about a record in a sensitive area")
+                .and(contains("--tier local"))
+                .and(contains("names its local record").not()),
+        );
+    assert_eq!(g.fake.issue_count(), 0, "nothing created on GitHub");
+}
+
+// Routing spec §1.2: a finding is a routed create too.
+#[test]
+fn a_finding_on_the_authoring_machine_needs_the_map_exported() {
+    let g = world("");
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "t",
+        "--area",
+        "code",
+    ]);
+    g.ok(&["manifest", "export", "--project", "1"]);
+    g.ok(&["routing", "set", "--project", "1", "ops", "local"]);
+    g.fl()
+        .args([
+            "finding", "raise", "--record", "1", "--claim", "c", "--by", "r",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("changed since the manifest at"));
+}

@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::ids::{ProjectId, RecordId};
 use fl_core::model::State;
+use fl_core::routing::Tier;
 use fl_core::store::Catalog;
 use fl_core::{Iri, Kind};
 use fl_exec::record::{MoveOutcome, move_record};
@@ -18,6 +19,9 @@ pub enum Cmd {
         /// The record's area (routing spec §1.1), which routes it to a tier.
         #[arg(long)]
         area: Option<String>,
+        /// The tier, over the one the area routes to (routing spec §2.1).
+        #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
+        tier: Option<Tier>,
     },
     List {
         #[arg(long)]
@@ -60,6 +64,7 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
             project,
             title,
             area,
+            tier,
         } => {
             let p = ProjectId(refs::resolve(
                 ctx.handles,
@@ -74,13 +79,20 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     store.label()
                 );
             }
-            let id = match (ctx.tiers, &area) {
-                (None, Some(_)) => return Err(crate::cmd::routing::not_routed("--area")),
-                (None, None) => ctx.tracker.add_record(&p, &title)?,
-                (Some(_), _) => {
+            let id = match ctx.tiers {
+                None => {
+                    if area.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--area"));
+                    }
+                    if tier.is_some() {
+                        return Err(crate::cmd::routing::not_routed("--tier"));
+                    }
+                    ctx.tracker.add_record(&p, &title)?
+                }
+                Some(t) => {
                     crate::cmd::manifest::ensure_routing_current(store, &p)?;
-                    ctx.tracker
-                        .add_record_with_area(&p, &title, area.as_deref())?
+                    let at = t.router.place_record(&p, area.as_deref(), tier)?;
+                    t.router.add_record_at(&p, &title, &at)?
                 }
             };
             println!("{}\t{title}", ctx.show_item(Kind::Record, id.iri())?);

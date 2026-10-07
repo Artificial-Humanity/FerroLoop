@@ -70,3 +70,22 @@ whose binding names it.
 Every machine routes the same way. On a machine that imported the project, a new item needs the
 import to be current (`fl manifest import`). On the machine that authors it, once the project has
 a manifest, the manifest must carry the current map (`fl manifest export`, then commit).
+
+## Making items
+
+In a routed project every new record and finding has an area. `fl record add --area <area>`
+routes a record by its area; `--tier local` or `--tier github` puts it in that tier instead, and
+the area is recorded either way. `fl finding raise` takes the same two options. With no `--area`,
+a finding takes its record's area, and fl says so: `note: area: code, from its record`. A finding
+whose record has no area — one made before the project was routed — needs `--area`. An area the
+map does not declare is refused, naming the declared ones; so are `--area` and `--tier` in a
+project without a routing map.
+
+A finding and its record may be in different tiers. A finding on GitHub about a local record
+shows the record's title and id as text; on a repository that is not private, fl warns before it
+publishes them — and refuses, saying to use `--tier local`, when the record is in a sensitive
+area: nothing about an item in a sensitive area reaches a repository that is not private.
+
+A finding made in a sensitive area is a security finding. When the map would send a security
+finding, or any item of a sensitive area, to a repository that is not private, fl refuses and
+says to use `--tier local`: it never moves an item to the local tier by itself.
