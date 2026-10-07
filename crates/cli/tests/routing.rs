@@ -1350,7 +1350,10 @@ fn an_unbound_machine_lists_its_local_tier_with_tier_local() {
         .assert()
         .failure()
         .stderr(
-            contains("binds no GitHub repository for the project").and(contains("--tier local")),
+            contains("binds no GitHub repository for the project")
+                .and(contains("--tier local"))
+                // A create's remedy, not a list's.
+                .and(contains("never puts an item in the other tier").not()),
         );
     assert_eq!(
         g.ok(&["record", "list", "--project", "1", "--tier", "local"]),
@@ -1909,4 +1912,71 @@ fn a_sensitive_record_is_refused_when_the_visibility_cannot_be_read() {
         "the open's read, then the visibility's: {reads:?}"
     );
     assert_eq!(g.fake.issue_count(), 0, "nothing created on GitHub");
+}
+
+impl R {
+    /// `fl args`, which must fail; its stderr.
+    fn refused(&self, args: &[&str]) -> String {
+        let out = self.fl().args(args).output().unwrap();
+        assert!(!out.status.success(), "fl {args:?} succeeded");
+        assert!(out.stdout.is_empty(), "a refusal prints nothing on stdout");
+        String::from_utf8(out.stderr).unwrap()
+    }
+}
+
+/// Asserts `phrase` is said exactly once in `said`.
+fn once(said: &str, phrase: &str) {
+    assert_eq!(said.matches(phrase).count(), 1, "{phrase:?} in {said}");
+}
+
+// Routing spec §4: a refusal says its cause once — on a create, a lookup, a
+// list and a removal alike.
+#[test]
+fn a_routing_refusal_is_said_once() {
+    let g = world("");
+    g.routed();
+    once(
+        &g.refused(&[
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--area",
+            "ops",
+        ]),
+        "is not an area this project declares",
+    );
+    once(
+        &g.refused(&["record", "move", "#4", "--to", "doing"]),
+        "binds no GitHub repository for the project",
+    );
+    once(
+        &g.refused(&["record", "list", "--project", "1"]),
+        "rather than show part of it",
+    );
+    once(
+        &g.refused(&["routing", "remove", "--project", "1", "product"]),
+        "binds no GitHub repository for the project",
+    );
+}
+
+// One wording for a record the tiers do not hold, wherever it is named.
+#[test]
+fn a_record_no_tier_holds_is_refused_in_one_wording() {
+    let g = world(BOUND);
+    g.routed();
+    let absent = "https://github.com/acme/widgets/issues/9";
+    let wording = "is not a record in the store at";
+    for args in [
+        vec!["finding", "list", "--record", absent],
+        vec![
+            "finding", "raise", "--record", absent, "--claim", "c", "--by", "r",
+        ],
+    ] {
+        let said = g.refused(&args);
+        once(&said, wording);
+        assert!(said.contains("or GitHub `acme/widgets`"), "{said}");
+    }
 }

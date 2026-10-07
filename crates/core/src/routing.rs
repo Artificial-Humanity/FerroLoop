@@ -460,37 +460,39 @@ mod tests {
         );
     }
 
-    // Routing spec §4: every refusal names its cause and what to do.
+    // Routing spec §4: every refusal names its cause and what to do — each
+    // in a phrase no other refusal says, so a test that asserts one phrase
+    // can tell which refusal it got.
     #[test]
     fn every_routing_refusal_names_its_remedy() {
         use crate::ids::seq_iri;
         let declared = vec!["code".to_string(), "design".to_string()];
-        for (fault, phrase) in [
+        let faults = [
             (
                 RoutingFault::Unrouted {
                     project: ProjectId(seq_iri(1)),
                 },
-                "fl routing set",
+                "<area> <tier>` to declare one",
             ),
             (
                 RoutingFault::NoArea {
                     declared: declared.clone(),
                 },
-                "code, design",
+                "name one with `--area`",
             ),
             (
                 RoutingFault::NothingToInherit {
                     record: RecordId(seq_iri(2)),
                     declared: declared.clone(),
                 },
-                "`--area`",
+                "name the finding's area with `--area`",
             ),
             (
                 RoutingFault::Undeclared {
                     area: "ops".into(),
                     declared: declared.clone(),
                 },
-                "code, design",
+                "`fl routing set` declares a new one",
             ),
             (
                 RoutingFault::TierUnavailable {
@@ -504,22 +506,22 @@ mod tests {
                     tier: Tier::Github,
                     cause: "c".into(),
                 },
-                "--tier local",
+                "Read one tier with `--tier local`",
             ),
             (
                 RoutingFault::Elsewhere {
                     id: seq_iri(3),
                     searched: vec!["s".into()],
                 },
-                "another machine's local tier",
+                "held in another machine's local tier",
             ),
             (
                 RoutingFault::SensitiveToPublic {
-                    what: "this finding".into(),
+                    what: "this record".into(),
                     repo: "acme/widgets".into(),
                     visibility: "public".into(),
                 },
-                "--tier local",
+                "Raise it with `--tier local`",
             ),
             (
                 RoutingFault::SensitiveNamedPublic {
@@ -527,11 +529,17 @@ mod tests {
                     repo: "acme/widgets".into(),
                     visibility: "public".into(),
                 },
-                "this record is security-sensitive",
+                "Use the local tier for it",
             ),
-        ] {
-            let msg = StoreError::from(fault).to_string();
-            assert!(msg.contains(phrase), "{msg}");
+        ];
+        let said: Vec<String> = faults
+            .iter()
+            .map(|(f, _)| StoreError::from(f.clone()).to_string())
+            .collect();
+        for (i, (_, phrase)) in faults.iter().enumerate() {
+            for (j, msg) in said.iter().enumerate() {
+                assert_eq!(msg.contains(phrase), i == j, "{phrase:?} in {msg}");
+            }
         }
         assert!(
             RoutingFault::NoArea { declared: vec![] }

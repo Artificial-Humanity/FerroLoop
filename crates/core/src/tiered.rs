@@ -370,11 +370,18 @@ impl TieredTracker<'_> {
         act: impl Fn(&dyn Tracker) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         match self.tracker_in(tier).and_then(act) {
-            Err(e) if only.is_none() && tier == Tier::Github => Err(RoutingFault::TierUnreadable {
-                tier,
-                cause: as_clause(&e),
+            Err(e) if only.is_none() && tier == Tier::Github => {
+                // With no binding, the cause is the missing config entry
+                // alone: the create's remedy — that fl never puts an item
+                // in the other tier — says nothing to a list.
+                let cause = match &e {
+                    StoreError::Routing(RoutingFault::TierUnavailable { why, .. }) => {
+                        as_clause(why)
+                    }
+                    other => as_clause(other),
+                };
+                Err(RoutingFault::TierUnreadable { tier, cause }.into())
             }
-            .into()),
             other => other,
         }
     }
@@ -1136,6 +1143,15 @@ mod tests {
                     "{err:?}"
                 );
                 assert!(err.to_string().contains("--tier local"), "{err}");
+                assert_eq!(
+                    err.to_string().contains("this test binds no repository"),
+                    unbound,
+                    "{err}"
+                );
+                assert!(
+                    !err.to_string().contains("never puts an item"),
+                    "a create's remedy, not a list's: {err}"
+                );
             }
             assert_eq!(
                 t.records(&w.p, Some(Tier::Local)).unwrap().len(),

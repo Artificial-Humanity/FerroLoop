@@ -185,10 +185,10 @@ pub enum StoreError {
     SecurityNotPrivate { repo: String, visibility: String },
     /// ⚠ The shared ledger is not there, or not as fl wrote it (GitHub
     /// ledger spec §3.5, §7).
-    #[error("{0}")]
+    #[error(transparent)]
     Ledger(#[from] LedgerFault),
     /// ⚠ The routing tracker refused (routing spec §4).
-    #[error("{0}")]
+    #[error(transparent)]
     Routing(#[from] RoutingFault),
     /// ⚠ A decision may rest only on entries it publishes or that are
     /// already published (ruling 8).
@@ -608,6 +608,35 @@ mod tests {
     use crate::MemStore;
     use crate::ids::seq_iri;
     use crate::model::{CommandSpec, GateKind, PopulationDelivery};
+
+    /// Every message along `e`'s source chain, as `{:#}` prints them.
+    fn chain(e: &dyn std::error::Error) -> String {
+        let mut said = e.to_string();
+        let mut at = e.source();
+        while let Some(s) = at {
+            said.push_str(": ");
+            said.push_str(&s.to_string());
+            at = s.source();
+        }
+        said
+    }
+
+    // A wrapped ledger or routing fault is said once along the chain a
+    // person reads, not once by the wrapper and again as its source.
+    #[test]
+    fn a_wrapped_fault_is_said_once() {
+        let ledger = StoreError::from(LedgerFault::NotSetUp {
+            repo: "acme/widgets".into(),
+        });
+        let routing = StoreError::from(RoutingFault::NoArea { declared: vec![] });
+        for (e, phrase) in [
+            (ledger, "has no GitHub ledger yet"),
+            (routing, "needs an area for every new item"),
+        ] {
+            let said = chain(&e);
+            assert_eq!(said.matches(phrase).count(), 1, "{said}");
+        }
+    }
 
     /// A tracker that must never be asked: every refusal below has to come
     /// from the binding's own check, before the tracker is reached.

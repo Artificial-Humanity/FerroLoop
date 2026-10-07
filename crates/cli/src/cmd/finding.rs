@@ -374,8 +374,8 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     let id = RecordId(ctx.resolve_item(Kind::Record, r)?);
                     let Some(rec) = ctx.tracker.get_record(&id)? else {
                         bail!(
-                            "`{r}` is not a record in {}. Use `fl record list --project \
-                             <project>` to see records that exist.",
+                            "`{r}` is not a record in the store at {}. Use `fl record list \
+                             --project <project>` to see records that exist.",
                             ctx.tracker_label
                         );
                     };
