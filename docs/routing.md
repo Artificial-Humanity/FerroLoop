@@ -101,3 +101,29 @@ repository — the list is refused rather than shown in part, and the refusal su
 local`. `fl finding list --record <id>` lists one record's findings, from both tiers; it works in
 any project. The withdrawal counts under a finding list sum both tiers; with `--tier`, they count
 that tier, and say so.
+
+## Removing an area
+
+`fl routing remove --project <project> <area>` removes an area from the map. It is refused while
+any item in either tier names the area; the refusal gives the count and lists up to ten of the
+items. fl finds GitHub items by the block in each issue, not by the area label, so an item that
+lost its label is still found. A tier that cannot be read refuses the removal. fl can read only
+this machine's local tier: an item in another machine's local store keeps the area as history,
+and only new items are refused it. Such an item counts as sensitive from then on: fl cannot know
+what the removed area was, so a finding about it never reaches a repository that is not private.
+fl never deletes an area's label from GitHub. There is no rename: add the new area and remove the
+old one.
+
+`fl routing set --project <project> <area> <tier> --not-sensitive` clears an area's sensitivity.
+It is refused, by the same check and with the same list, while any item in either tier names the
+area.
+
+## Limits
+
+* A machine with no binding for the project lists with `--tier local`: a list of both tiers needs
+  both.
+* A routed project has a store to itself: a store holding another project cannot be routed.
+* An older fl refuses a routed project's manifest (format 3) and its store (format 5) as newer
+  formats. On a machine whose store is already bound to GitHub and that runs an older fl, the
+  project behaves as an ordinary GitHub-bound project, and makes GitHub items with no area.
+* A routed project keeps its ledger local: the GitHub ledger is not available to it yet.

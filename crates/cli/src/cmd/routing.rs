@@ -53,10 +53,20 @@ pub enum Cmd {
         #[arg(value_parser = parse_tier)]
         tier: Tier,
         /// Items made in this area are security items, which the map never
-        /// sends to a repository that is not private. Without it, an area
-        /// keeps its sensitivity (decision 22).
-        #[arg(long)]
+        /// sends to a repository that is not private. Without this flag or
+        /// `--not-sensitive`, an area keeps its sensitivity.
+        #[arg(long, conflicts_with = "not_sensitive")]
         sensitive: bool,
+        /// Clear the area's sensitivity. Refused while any item in either
+        /// tier names the area.
+        #[arg(long)]
+        not_sensitive: bool,
+    },
+    /// Remove an area. Refused while any item in either tier names it.
+    Remove {
+        #[arg(long)]
+        project: Ref,
+        area: String,
     },
     /// Print the project's routing map.
     Show {
@@ -68,7 +78,9 @@ pub enum Cmd {
 impl Cmd {
     fn refs(&self) -> Vec<&Ref> {
         match self {
-            Cmd::Set { project, .. } | Cmd::Show { project } => vec![project],
+            Cmd::Set { project, .. } | Cmd::Remove { project, .. } | Cmd::Show { project } => {
+                vec![project]
+            }
         }
     }
 
@@ -88,7 +100,11 @@ impl Cmd {
     /// Whether this command reads records or findings, in either tier.
     pub fn needs_tracker(&self) -> bool {
         match self {
-            Cmd::Set { .. } | Cmd::Show { .. } => false,
+            // Every item that names the area, in both tiers (routing spec
+            // §1.2, decision 22).
+            Cmd::Set { not_sensitive, .. } => *not_sensitive,
+            Cmd::Show { .. } => false,
+            Cmd::Remove { .. } => true,
         }
     }
 }
@@ -104,13 +120,33 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, bound: Option<&TrackerBinding>) -> Result<i3
             area,
             tier,
             sensitive,
+            not_sensitive,
         } => {
             let p = project_of(ctx, &project)?;
             routing::area_name(&area).map_err(|why| anyhow::anyhow!("{why}"))?;
-            // Routing spec decision 22: without `--sensitive`, an area keeps
-            // its sensitivity; a tier change never clears it.
-            let asked = if sensitive { Some(true) } else { None };
-            let (map, first) = routing::after_set(store.routes(&p)?.as_ref(), &area, tier, asked);
+            let current = store.routes(&p)?;
+            // Routing spec decision 22: neither flag keeps the area's
+            // sensitivity; clearing it is refused while any item names it.
+            let asked = match (sensitive, not_sensitive) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            };
+            let clears = asked == Some(false)
+                && current
+                    .as_ref()
+                    .and_then(|m| m.route(&area))
+                    .is_some_and(|r| r.sensitive);
+            if clears {
+                refuse_while_named(
+                    ctx,
+                    &p,
+                    &area,
+                    "Its sensitivity is not cleared: an item made in a sensitive area stays \
+                     protected",
+                )?;
+            }
+            let (map, first) = routing::after_set(current.as_ref(), &area, tier, asked);
             store.set_routes(&p, &map)?;
             if first {
                 eprintln!(
@@ -121,6 +157,32 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, bound: Option<&TrackerBinding>) -> Result<i3
                 eprintln!("{}", handle_change(bound.is_some()));
             }
             print_route(map.route(&area).expect("the area was just set"));
+        }
+        Cmd::Remove { project, area } => {
+            let p = project_of(ctx, &project)?;
+            let shown = refs::show(store, Kind::Project, p.iri())?;
+            let Some(map) = store.routes(&p)? else {
+                bail!("project {shown} has no routing map, so it declares no area to remove");
+            };
+            if map.route(&area).is_none() {
+                bail!(
+                    "`{area}` is not an area project {shown} declares. The declared areas: {}",
+                    map.declared().join(", ")
+                );
+            }
+            refuse_while_named(
+                ctx,
+                &p,
+                &area,
+                "It is not removed: an item keeps its area for life; remove the area once none \
+                 names it",
+            )?;
+            store.set_routes(&p, &map.without(&area))?;
+            println!("removed\t{area}");
+            eprintln!(
+                "note: another machine's local items that name `{area}` keep it as history; only \
+                 new items are refused it"
+            );
         }
         Cmd::Show { project } => {
             let p = project_of(ctx, &project)?;
@@ -150,9 +212,48 @@ fn project_of(ctx: &Ctx<'_>, r: &Ref) -> Result<ProjectId> {
     Ok(p)
 }
 
+/// Routing spec decision 11, and decision 22's clearing of a sensitivity:
+/// refused while any item in either tier names `area`, with the count and up
+/// to ten of the items. Both tiers, GitHub by its blocks; a tier that cannot
+/// be read is an error, never "no item names it".
+fn refuse_while_named(ctx: &Ctx<'_>, p: &ProjectId, area: &str, refused: &str) -> Result<()> {
+    let shown = refs::show(ctx.store, Kind::Project, p.iri())?;
+    let t = ctx
+        .tiers
+        .expect("a store that holds a routing map is routed, so it has tiers");
+    let items = t.router.items_naming_area(p, area)?;
+    if items.is_empty() {
+        return Ok(());
+    }
+    let some: Vec<String> = items
+        .iter()
+        .take(10)
+        .map(|(tier, kind, id)| named(ctx, *tier, *kind, id))
+        .collect::<Result<_>>()?;
+    let more = if items.len() > 10 { ", …" } else { "" };
+    bail!(
+        "`{area}` is still named by {} item(s) of project {shown}: {}{more}. {refused}. fl reads \
+         only this machine's local tier: another machine's local items may name it too",
+        items.len(),
+        some.join(", ")
+    )
+}
+
 fn print_route(a: &AreaRoute) {
     let sensitive = if a.sensitive { "sensitive" } else { "-" };
     println!("{}\t{}\t{sensitive}", a.area, a.tier.as_wire());
+}
+
+/// How a refusal names an item: a GitHub item by its issue number, read
+/// from its URL — an item that lost its labels has no handle GitHub's
+/// lookup would give — and a local one by its handle.
+fn named(ctx: &Ctx<'_>, tier: Tier, kind: Kind, id: &Iri) -> Result<String> {
+    Ok(match tier {
+        Tier::Github => fl_github::meta::parse_issue_url(id)
+            .map(|(_, n)| format!("#{n}"))
+            .unwrap_or_else(|| id.to_string()),
+        Tier::Local => refs::show(ctx.store, kind, id)?,
+    })
 }
 
 /// The starting set, as a notice says it: read from

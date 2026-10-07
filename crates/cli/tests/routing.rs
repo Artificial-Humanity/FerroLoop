@@ -1429,3 +1429,264 @@ fn withdrawal_counts_sum_both_tiers_and_name_the_tier_when_narrowed() {
             .ends_with("hasty\twithdrawn: 1 (local tier)\n")
     );
 }
+
+// Routing spec decision 11: refused while any item in either tier names the
+// area, with the count and the items.
+#[test]
+fn removing_an_area_items_still_name_is_refused_with_the_count_and_the_items() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "l",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "g",
+        "--area",
+        "code",
+        "--tier",
+        "github",
+    ]);
+    g.fl()
+        .args(["routing", "remove", "--project", "1", "code"])
+        .assert()
+        .failure()
+        .stderr(contains("is still named by 2 item(s)").and(contains("1, #1")));
+    assert!(
+        g.ok(&["routing", "show", "--project", "1"])
+            .contains("code\tlocal")
+    );
+}
+
+// Routing spec §1.2: by block, not label.
+#[test]
+fn an_item_that_lost_its_labels_still_blocks_the_removal() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "g",
+        "--area",
+        "design",
+    ]);
+    g.fake.web_edit(1, |i| i.labels.clear());
+    g.fl()
+        .args(["routing", "remove", "--project", "1", "design"])
+        .assert()
+        .failure()
+        .stderr(contains("is still named by 1 item(s)").and(contains("#1")));
+}
+
+#[test]
+fn removing_an_area_no_item_names_drops_it_for_new_items() {
+    let g = world(BOUND);
+    g.routed();
+    g.fl()
+        .args(["routing", "remove", "--project", "1", "product"])
+        .assert()
+        .success()
+        .stdout("removed\tproduct\n")
+        .stderr(contains("keep it as history"));
+    assert!(
+        !g.ok(&["routing", "show", "--project", "1"])
+            .contains("product")
+    );
+    g.fl()
+        .args([
+            "record",
+            "add",
+            "--project",
+            "1",
+            "--title",
+            "t",
+            "--area",
+            "product",
+        ])
+        .assert()
+        .failure()
+        .stderr(contains("`product` is not an area this project declares"));
+}
+
+// Routing spec §1.2: a tier that cannot be read refuses the removal.
+#[test]
+fn a_removal_is_refused_when_a_tier_cannot_be_read() {
+    let g = world(BOUND);
+    g.routed();
+    g.fake.state().down = true;
+    g.fl()
+        .args(["routing", "remove", "--project", "1", "product"])
+        .assert()
+        .failure();
+    let unbound = world("");
+    unbound.routed();
+    unbound
+        .fl()
+        .args(["routing", "remove", "--project", "1", "product"])
+        .assert()
+        .failure()
+        .stderr(contains("binds no GitHub repository for the project"));
+    g.fake.state().down = false;
+    assert!(
+        g.ok(&["routing", "show", "--project", "1"])
+            .contains("product")
+    );
+}
+
+#[test]
+fn removing_an_area_the_map_does_not_declare_is_refused() {
+    let g = world("");
+    g.routed();
+    g.fl()
+        .args(["routing", "remove", "--project", "1", "ops"])
+        .assert()
+        .failure()
+        .stderr(contains("`ops` is not an area project 1 declares"));
+}
+
+// Routing spec decision 22: clearing a sensitivity is refused while any
+// item in either tier names the area — the same check as a removal — and
+// writes nothing.
+#[test]
+fn clearing_a_sensitivity_items_still_name_is_refused_and_writes_nothing() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "the key leaks",
+        "--area",
+        "security",
+        "--tier",
+        "local",
+    ]);
+    g.fl()
+        .args([
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "security",
+            "local",
+            "--not-sensitive",
+        ])
+        .assert()
+        .failure()
+        .stderr(
+            contains("is still named by 1 item(s)").and(contains("Its sensitivity is not cleared")),
+        );
+    assert!(
+        g.ok(&["routing", "show", "--project", "1"])
+            .contains("security\tgithub\tsensitive"),
+        "nothing written"
+    );
+    // Only an area that is sensitive asks: clearing `code`, which is not,
+    // while an item names it, changes nothing and is not refused.
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "t",
+        "--area",
+        "code",
+    ]);
+    assert_eq!(
+        g.ok(&[
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "code",
+            "local",
+            "--not-sensitive"
+        ]),
+        "code\tlocal\t-\n"
+    );
+}
+
+#[test]
+fn clearing_a_sensitivity_no_item_names_works() {
+    let g = world(BOUND);
+    g.routed();
+    assert_eq!(
+        g.ok(&[
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "security",
+            "github",
+            "--not-sensitive"
+        ]),
+        "security\tgithub\t-\n"
+    );
+    g.fl()
+        .args([
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "security",
+            "github",
+            "--sensitive",
+            "--not-sensitive",
+        ])
+        .assert()
+        .failure();
+}
+
+// Routing spec decision 22, the re-review's scenario: the authoring machine
+// removes a sensitive area that only another machine's records name; after
+// the re-import those records still count as sensitive — fail closed.
+#[test]
+fn a_record_whose_area_was_removed_elsewhere_stays_protected() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(other.path(), BOUND);
+    let on_other = |args: &[&str]| g.fl_at(other.path()).args(args).assert();
+    on_other(&["manifest", "import"]).success();
+    on_other(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "the key leaks",
+        "--area",
+        "security",
+        "--tier",
+        "local",
+    ])
+    .success();
+    g.ok(&["routing", "remove", "--project", "1", "security"]);
+    g.ok(&["manifest", "export", "--project", "1"]);
+    on_other(&["manifest", "import"]).success();
+    g.fake.state().repos[0].visibility = "public".into();
+    on_other(&[
+        "finding", "raise", "--record", "1", "--claim", "c", "--by", "r", "--area", "design",
+    ])
+    .failure()
+    .stderr(contains("--tier local"));
+    assert_eq!(g.fake.issue_count(), 0, "nothing published");
+}
