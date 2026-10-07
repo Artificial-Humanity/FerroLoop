@@ -12,7 +12,7 @@ use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::model::{Record, State};
-use fl_core::routing::{ForeignRecord, Tier};
+use fl_core::routing::{ForeignRecord, GithubTier, Tier};
 use fl_core::store::{Bindings, Handles, StoreError, Tracker};
 use serde_json::{Value, json};
 use std::cell::RefCell;
@@ -2270,6 +2270,61 @@ impl Handles for GithubTracker {
             return Ok(None);
         };
         Ok((self.kind_at(handle)? == Some(want)).then(|| self.issue_url(handle)))
+    }
+}
+
+/// The router's view of this tracker (routing spec §2.6), for a caller that
+/// holds it open already — the CLI opens it lazily instead. Each question is
+/// answered by the tracker's own method of the same name, except
+/// `find_escalated`, which is `find_by_key`'s issue URL.
+impl GithubTier for GithubTracker {
+    fn available(&self) -> bool {
+        true
+    }
+
+    /// An issue URL of this repository under its name now, in any case. No
+    /// request: a URL under an old name is not claimed, so the router asks
+    /// the local tier first and then this tracker, which resolves it.
+    fn claims(&self, id: &Iri) -> bool {
+        meta::parse_issue_url(id)
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case(&self.repo.full_name))
+    }
+
+    fn issue_form(&self, id: &Iri) -> bool {
+        meta::is_issue_url(id)
+    }
+
+    fn tracker(&self) -> Result<&dyn Tracker, StoreError> {
+        Ok(self)
+    }
+
+    fn require_private(&self) -> Result<(), StoreError> {
+        GithubTracker::require_private(self)
+    }
+
+    fn items_in_area(
+        &self,
+        project: &ProjectId,
+        area: &str,
+    ) -> Result<Vec<(Kind, Iri)>, StoreError> {
+        GithubTracker::items_in_area(self, project, area)
+    }
+
+    fn find_escalated(&self, key: &Iri, since_ms: u64) -> Result<Option<Iri>, StoreError> {
+        Ok(self.find_by_key(key.as_str(), since_ms)?.map(|i| i.url))
+    }
+
+    fn alias_taken(&self, alias: &Iri) -> Result<Option<Iri>, StoreError> {
+        GithubTracker::alias_taken(self, alias)
+    }
+
+    fn create_escalated(
+        &self,
+        item: &Outgoing,
+        from: &Provenance,
+        since_ms: u64,
+    ) -> Result<Iri, StoreError> {
+        GithubTracker::create_escalated(self, item, from, since_ms)
     }
 }
 
@@ -5003,6 +5058,65 @@ mod tests {
         assert_eq!(t.alias_taken(&local_iri(8)).unwrap(), None);
         let free = Iri::parse("https://github.com/elsewhere/old/issues/8").unwrap();
         assert_eq!(t.alias_taken(&free).unwrap(), None);
+    }
+
+    // Routing spec §2.6: the router reaches the GitHub tracker through
+    // `GithubTier`. It claims an issue URL of this repository under its
+    // name now — in any case, with no request — and no other repository's;
+    // any issue URL has the form.
+    #[test]
+    fn the_tracker_as_a_tier_claims_its_own_issue_urls_under_its_name_now() {
+        let fake = FakeGithub::start("acme/widgets");
+        let memory = MemStore::default();
+        let url = |name: &str| Iri::parse(&format!("https://github.com/{name}/issues/4")).unwrap();
+        let (t, _) = GithubTracker::open(client(&fake), "acme/widgets", &memory).unwrap();
+        let tier: &dyn GithubTier = &t;
+        let asked = fake.state().requests.len();
+        assert!(tier.available());
+        assert!(tier.claims(&url("acme/widgets")) && tier.claims(&url("Acme/Widgets")));
+        assert!(!tier.claims(&url("acme/gadgets")) && tier.issue_form(&url("acme/gadgets")));
+        assert!(!tier.claims(&local_iri(4)) && !tier.issue_form(&local_iri(4)));
+        assert_eq!(fake.state().requests.len(), asked, "read by form alone");
+        fake.rename("acme/gadgets");
+        let (t, _) = GithubTracker::open(client(&fake), "acme/widgets", &memory).unwrap();
+        let tier: &dyn GithubTier = &t;
+        assert!(tier.claims(&url("acme/gadgets")));
+        assert!(
+            !tier.claims(&url("acme/widgets")),
+            "the old name is not claimed by form"
+        );
+    }
+
+    // Routing spec §3.2, §3.3 step 2, as the router asks them: through the
+    // tier, an escalation's issue is made, found by its key, and its old
+    // IRI is then a taken alias; the rest is the tracker's own.
+    #[test]
+    fn the_tracker_as_a_tier_creates_finds_and_checks_an_escalated_issue() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        let tier: &dyn GithubTier = &t;
+        let since = now_millis();
+        let old = local_iri(7);
+        assert_eq!(tier.find_escalated(&old, since).unwrap(), None);
+        assert_eq!(tier.alias_taken(&old).unwrap(), None);
+        let url = tier
+            .create_escalated(&escalated_record(&old), &escalation_of(&old), since)
+            .unwrap();
+        assert_eq!(url, t.issue_url(1));
+        assert_eq!(tier.find_escalated(&old, since).unwrap(), Some(url.clone()));
+        assert_eq!(tier.alias_taken(&old).unwrap(), Some(url.clone()));
+        assert_eq!(
+            tier.items_in_area(&p(), "code").unwrap(),
+            vec![(Kind::Record, url.clone())]
+        );
+        let back = tier.tracker().unwrap().get_record(&RecordId(old)).unwrap();
+        assert_eq!(back.map(|r| r.id.0), Some(url));
+        assert!(tier.require_private().is_ok());
+        fake.state().repos[0].visibility = "public".into();
+        assert!(matches!(
+            tier.require_private(),
+            Err(StoreError::SecurityNotPrivate { .. })
+        ));
     }
 
     /// The same suites the local stores pass (spec §8.1): the GitHub
