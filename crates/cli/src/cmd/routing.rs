@@ -1,7 +1,6 @@
 //! `fl routing` (routing spec §1.2): the areas a project declares, the tier
 //! each one routes a new item to, and whether it is sensitive.
 
-use crate::config::TrackerBinding;
 use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
@@ -111,10 +110,11 @@ impl Cmd {
     }
 }
 
-/// `bound`: the project's tracker binding in the config, when it was read:
-/// the first `set` says how handles change from the project's mode before
-/// (routing spec §2.3).
-pub fn run(ctx: &Ctx<'_>, cmd: Cmd, bound: Option<&TrackerBinding>) -> Result<i32> {
+/// `was_github`: whether the project's config entry binds it to GitHub, when
+/// fl read the entry for this store: the first `set` says how handles change
+/// from the project's mode before (routing spec §2.3). `None`: fl does not
+/// know the mode before, and says nothing rather than guess.
+pub fn run(ctx: &Ctx<'_>, cmd: Cmd, was_github: Option<bool>) -> Result<i32> {
     let store = ctx.store;
     match cmd {
         Cmd::Set {
@@ -125,6 +125,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, bound: Option<&TrackerBinding>) -> Result<i3
             not_sensitive,
         } => {
             let p = project_of(ctx, &project)?;
+            // Before either tier is read: a store that imported the project
+            // never changes its map.
+            store.refuse_if_imported(&p, fl_store::CHANGE_ROUTING)?;
             routing::area_name(&area).map_err(|why| anyhow::anyhow!("{why}"))?;
             let current = store.routes(&p)?;
             // Routing spec decision 22: neither flag keeps the area's
@@ -169,12 +172,15 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, bound: Option<&TrackerBinding>) -> Result<i3
                     refs::show(store, Kind::Project, p.iri())?,
                     starting_set()
                 );
-                eprintln!("{}", handle_change(bound.is_some()));
+                if let Some(was_github) = was_github {
+                    eprintln!("{}", handle_change(was_github));
+                }
             }
             print_route(map.route(&area).expect("the area was just set"));
         }
         Cmd::Remove { project, area } => {
             let p = project_of(ctx, &project)?;
+            store.refuse_if_imported(&p, fl_store::CHANGE_ROUTING)?;
             let shown = refs::show(store, Kind::Project, p.iri())?;
             let Some(map) = store.routes(&p)? else {
                 bail!("project {shown} has no routing map, so it declares no area to remove");

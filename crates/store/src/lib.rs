@@ -18,6 +18,8 @@ use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 /// Format 2: ids are IRIs, with an ownership index and per-kind handles.
 /// Format 1 keyed every table by a `u64` id from one shared counter.
 pub const FORMAT_VERSION: u64 = 2;
+/// What a store that imported a project cannot do to its routing map.
+pub const CHANGE_ROUTING: &str = "change the routing map of";
 const FORMAT_KEY: &str = "format_version";
 
 const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
@@ -609,7 +611,9 @@ impl RedbStore {
         Ok(hash)
     }
 
-    fn refuse_if_imported(
+    /// `Imported`, naming `action`, when this store imported `project`
+    /// from a manifest: its definitions are authored elsewhere.
+    pub fn refuse_if_imported(
         &self,
         project: &ProjectId,
         action: &'static str,
@@ -674,7 +678,7 @@ impl RedbStore {
     /// raise the store to format 5, in one transaction.
     pub fn set_routes(&self, project: &ProjectId, map: &RoutingMap) -> Result<(), StoreError> {
         self.check_kind(project.iri(), Kind::Project)?;
-        self.refuse_if_imported(project, "change the routing map of")?;
+        self.refuse_if_imported(project, CHANGE_ROUTING)?;
         self.refuse_a_second_project(project)?;
         map.check()
             .map_err(|why| backend(format!("the routing map is not valid: {why}")))?;

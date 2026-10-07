@@ -367,6 +367,18 @@ pub enum Binding {
     Github { repo: String, github_ledger: bool },
 }
 
+impl Binding {
+    /// Whether the project was bound to GitHub, when fl read its entry for
+    /// this store: `None` when it did not, and does not know.
+    pub fn was_github(&self) -> Option<bool> {
+        match self {
+            Binding::Unread => None,
+            Binding::Local => Some(false),
+            Binding::Github { .. } => Some(true),
+        }
+    }
+}
+
 /// The `node_id` whose ledger root an export writes.
 ///
 /// ⚠ Every export writes the root from the store, so it cannot be dropped
@@ -479,8 +491,12 @@ pub fn run(store: &RedbStore, cmd: Cmd, binding: &Binding) -> Result<i32> {
             // Routing spec §2.3: the import that first routes this store
             // changes what a handle means here, as the first `fl routing set`
             // does where the project is authored.
-            if !was_routed && report.areas.is_some() {
-                let was_github = matches!(binding, Binding::Github { .. });
+            // Where the entry was not read, the mode before is unknown, and
+            // nothing is said rather than a guess.
+            if !was_routed
+                && report.areas.is_some()
+                && let Some(was_github) = binding.was_github()
+            {
                 eprintln!("{}", crate::cmd::routing::handle_change(was_github));
             }
         }

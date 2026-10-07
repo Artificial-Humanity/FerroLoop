@@ -321,6 +321,33 @@ fn bound_is_routed(bound: &Path) -> Result<bool> {
     Ok(store.holds_routing()?)
 }
 
+/// Whether a configured store other than `bound` holds any of `iris`. ⚠
+/// Never creates a store: only a file that exists is opened. A confined
+/// command searches no other store, so none holds them.
+fn held_elsewhere(
+    bound: &Path,
+    entries: &[config::Entry],
+    iris: &[Iri],
+    confined: bool,
+) -> Result<bool> {
+    if confined {
+        return Ok(false);
+    }
+    for e in entries {
+        if same_store(&e.store, bound) || !e.store.exists() {
+            continue;
+        }
+        let s = RedbStore::open(&e.store)
+            .with_context(|| format!("could not open the store at {}", e.store.display()))?;
+        for id in iris {
+            if s.owns(id)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn is_not_owned(e: &anyhow::Error) -> bool {
     matches!(
         e.downcast_ref::<StoreError>(),
@@ -609,7 +636,15 @@ fn run(cli: Cli) -> Result<i32> {
         // Routing spec §2.2: an id no local store holds may be an item
         // another machine moved to GitHub, or one on another machine's local
         // tier. The router says which; refusing here would say neither.
-        Err(e) if bound_routed && is_not_owned(&e) => bound.clone(),
+        // ⚠ Only when no id of the command is held by another store: the
+        // command is then about that store's project, not the routed one's.
+        Err(e)
+            if bound_routed
+                && is_not_owned(&e)
+                && !held_elsewhere(&bound, entries, &iris, confined)? =>
+        {
+            bound.clone()
+        }
         other => other?,
     };
     // ⚠ The tracker comes from the store the command
@@ -653,9 +688,14 @@ fn run(cli: Cli) -> Result<i32> {
     // A store in which any project routes its items between two tiers
     // (routing spec §1.3), whatever its maps hold.
     let routed = store.holds_routing()?;
+    // The current directory's binding, when it was read and the command
+    // runs on that entry's store — the same rule as `manifest_binding`
+    // below. `None` when it says nothing of this store: one an IRI or
+    // `--db` chose is never judged on this directory's binding.
+    let here_for_store = (entry_read && path == bound).then_some(here_binding.as_ref());
     refuse_routed_github_ledger(
         routed || cli.command.sets_routing(),
-        binding.as_ref().or(here_binding.as_ref()),
+        binding.as_ref().or(here_for_store.flatten()),
     )?;
     // Why `fl stats` could not read GitHub, when it could not reach it.
     let mut unread: Option<String> = None;
@@ -663,6 +703,9 @@ fn run(cli: Cli) -> Result<i32> {
         // A routed store opens GitHub on the first call that needs it (routing spec §2.6),
         // through `lazy`.
         Some(_) if routed => None,
+        // A routing command reads items only through a routed store's
+        // router: in a store with no routing map it has none to read.
+        Some(_) if matches!(cli.command, Command::Routing(_)) => None,
         Some(b) if needs_tracker => Some(open_github(b, cfg.github.as_ref(), &store)?),
         // ⚠ A report falls back to the local store, and says so, when
         // GitHub cannot be reached (§2.5); any other failure is an error.
@@ -828,7 +871,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Stats(c) => cmd::stats::run(&store, c, stats_source),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
-        Command::Routing(c) => cmd::routing::run(&ctx, c, here_binding.as_ref()),
+        Command::Routing(c) => cmd::routing::run(&ctx, c, here_for_store.map(|b| b.is_some())),
     };
     // What the GitHub ledger's reads noted without refusing — a quarantined
     // line skipped (spec §3.3, §3.6) — once each, whatever became of the

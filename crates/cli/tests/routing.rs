@@ -1980,3 +1980,243 @@ fn a_record_no_tier_holds_is_refused_in_one_wording() {
         assert!(said.contains("or GitHub `acme/widgets`"), "{said}");
     }
 }
+
+// Routing spec §2.3: on a machine with no binding, the import that first
+// routes the store says a `#3` now names an issue.
+#[test]
+fn an_import_on_an_unbound_machine_says_a_hash_number_now_names_an_issue() {
+    let g = world("");
+    g.routed();
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(other.path(), "");
+    g.fl_at(other.path())
+        .args(["manifest", "import"])
+        .assert()
+        .success()
+        .stderr(contains("`#3` named local item 3"));
+}
+
+// …and where the config entry is not read (`--db`), fl does not know the
+// mode before, so it says nothing of handles rather than guess.
+#[test]
+fn an_import_that_did_not_read_the_config_entry_says_nothing_of_handles() {
+    let g = world("");
+    g.routed();
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(other.path(), BOUND);
+    let db = other.path().join("elsewhere.redb");
+    g.fl_at(other.path())
+        .args(["--db", db.to_str().unwrap(), "manifest", "import"])
+        .assert()
+        .success()
+        .stdout(contains("routing\t5 areas"))
+        .stderr(contains("handles change in this project").not());
+}
+
+/// A second project, at its own root with its own store under `g`'s home,
+/// configured beside `g`'s — whose entry carries `tracker` — with its
+/// project added. Its root, and the id of its project.
+fn second_project(g: &R, tracker: &str) -> (tempfile::TempDir, String) {
+    let b = tempfile::tempdir().unwrap();
+    git(b.path(), &["init", "-q"]);
+    git(
+        b.path(),
+        &[
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "first",
+        ],
+    );
+    let home = g.home.path();
+    let cfg = format!(
+        "[[project]]\nroot = \"{}\"\nstore = \"{}\"\n{tracker}\
+         [[project]]\nroot = \"{}\"\nstore = \"{}\"\n",
+        g.repo.path().canonicalize().unwrap().display(),
+        home.join("fl.redb").display(),
+        b.path().canonicalize().unwrap().display(),
+        home.join("b.redb").display()
+    );
+    fs::write(home.join("config/fl/config.toml"), cfg).unwrap();
+    g.fl()
+        .current_dir(b.path())
+        .args(["project", "add", "."])
+        .assert()
+        .success();
+    let id = {
+        use fl_core::store::Catalog;
+        let s = fl_store::RedbStore::open(&home.join("b.redb")).unwrap();
+        s.list_projects().unwrap().remove(0).id.iri().to_string()
+    };
+    (b, id)
+}
+
+// Routing spec decision 12 and §2.3: a store chosen by an IRI is not judged
+// on this directory's binding — neither refused for its GitHub ledger nor
+// told its handles change as this directory's would.
+#[test]
+fn a_store_chosen_by_iri_is_not_judged_on_this_directorys_binding() {
+    let with_ledger =
+        "tracker = { github = \"acme/widgets\", credential = \"env\", ledger = \"github\" }\n";
+    for here in [with_ledger, BOUND] {
+        let g = world("");
+        let (_b, other) = second_project(&g, here);
+        g.fl()
+            .args(["routing", "set", "--project", &other, "code", "local"])
+            .assert()
+            .success()
+            .stdout("code\tlocal\t-\n")
+            .stderr(contains("handles change in this project").not());
+    }
+}
+
+// Routing spec §2.2: an id no store holds is the router's to look for only
+// when the command is about the routed store's own items — not when
+// another of its ids is held by another project's store.
+#[test]
+fn an_id_held_by_another_store_beside_one_no_store_holds_is_not_the_routers() {
+    let g = world("");
+    g.routed();
+    let (b, _) = second_project(&g, "");
+    let on_b = |args: &[&str]| g.fl().current_dir(b.path()).args(args).assert().success();
+    on_b(&["record", "add", "--project", "1", "--title", "t"]);
+    on_b(&[
+        "finding", "raise", "--record", "1", "--claim", "c", "--by", "r",
+    ]);
+    let finding = {
+        use fl_core::store::{Catalog, Tracker};
+        let s = fl_store::RedbStore::open(&g.home.path().join("b.redb")).unwrap();
+        let p = s.list_projects().unwrap().remove(0).id;
+        s.list_findings(&p).unwrap().remove(0).id.iri().to_string()
+    };
+    let gate = "urn:uuid:00000000-0000-7000-8000-0000000000cc";
+    let said = g.refused(&["finding", "reproduce", &finding, "--gate", gate]);
+    assert!(
+        said.contains(&format!("no store holds {gate}"))
+            && !said.contains("is not held by any tier this machine can read"),
+        "{said}"
+    );
+    // Confined to the routed store by `--db`, no other store is searched:
+    // the router answers for the id.
+    let db = g.home.path().join("fl.redb");
+    let said = g.refused(&[
+        "--db",
+        db.to_str().unwrap(),
+        "finding",
+        "reproduce",
+        &finding,
+        "--gate",
+        gate,
+    ]);
+    assert!(
+        said.contains("is not held by any tier this machine can read"),
+        "{said}"
+    );
+    // An id the routed store holds itself is no reason to refuse: the
+    // command is about its project, and runs there.
+    g.ok(&[
+        "record",
+        "add",
+        "--project",
+        "1",
+        "--title",
+        "t",
+        "--area",
+        "code",
+    ]);
+    g.ok(&[
+        "finding", "raise", "--record", "1", "--claim", "c", "--by", "r",
+    ]);
+    let ours = {
+        use fl_core::store::{Catalog, Tracker};
+        let s = fl_store::RedbStore::open(&db).unwrap();
+        let p = s.list_projects().unwrap().remove(0).id;
+        s.list_findings(&p).unwrap().remove(0).id.iri().to_string()
+    };
+    // The routed store's own refusal, which searched it alone.
+    let said = g.refused(&["finding", "reproduce", &ours, "--gate", gate]);
+    assert!(
+        said.contains(&format!(
+            "no store holds {gate} (searched: {})",
+            db.display()
+        )),
+        "{said}"
+    );
+}
+
+// Routing spec §2.6: in a store with no routing map a routing command has
+// no item to read, so it opens no GitHub.
+#[test]
+fn a_routing_command_in_an_unrouted_bound_store_asks_github_nothing() {
+    let g = world(BOUND);
+    g.ok(&["project", "add", "."]);
+    g.fl()
+        .args(["routing", "remove", "--project", "1", "x"])
+        .assert()
+        .failure()
+        .stderr(contains("has no routing map"));
+    assert_eq!(
+        g.ok(&[
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "code",
+            "local",
+            "--not-sensitive"
+        ]),
+        "code\tlocal\t-\n"
+    );
+    assert!(
+        g.fake.state().requests.is_empty(),
+        "{:?}",
+        g.fake.state().requests
+    );
+}
+
+// A store that imported the project refuses to change its map before it
+// reads either tier.
+#[test]
+fn an_importing_machine_refuses_a_map_change_before_it_asks_github() {
+    let g = world(BOUND);
+    g.routed();
+    g.ok(&["manifest", "export", "--project", "1"]);
+    let other = tempfile::tempdir().unwrap();
+    g.configure(other.path(), BOUND);
+    g.fl_at(other.path())
+        .args(["manifest", "import"])
+        .assert()
+        .success();
+    let asked = g.fake.state().requests.len();
+    for args in [
+        vec!["routing", "remove", "--project", "1", "product"],
+        vec![
+            "routing",
+            "set",
+            "--project",
+            "1",
+            "security",
+            "local",
+            "--not-sensitive",
+        ],
+        vec!["routing", "set", "--project", "1", "ops", "local"],
+    ] {
+        g.fl_at(other.path())
+            .args(&args)
+            .assert()
+            .failure()
+            .stderr(contains(
+                "was imported from a manifest, so this store cannot change the routing map of it",
+            ));
+    }
+    // One lock: the message must not take the fake's state a second time.
+    let requests = g.fake.state().requests.clone();
+    assert_eq!(requests.len(), asked, "{requests:?}");
+}
