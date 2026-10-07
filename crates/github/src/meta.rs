@@ -25,8 +25,9 @@ pub const FL_FORMAT_ESCALATED: u64 = 3;
 pub const AREA_LABEL_PREFIX: &str = "fl:area/";
 pub const META_OPEN: &str = "<!-- fl:meta";
 pub const META_CLOSE: &str = "-->";
-/// GitHub limits an issue title to 256 characters.
-pub const TITLE_MAX: usize = 256;
+/// GitHub limits an issue title to 256 characters. The router's check
+/// before an escalation's mark reads the same constant.
+pub const TITLE_MAX: usize = fl_core::escalate::ISSUE_TITLE_MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

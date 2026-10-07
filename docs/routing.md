@@ -139,18 +139,22 @@ declares; the list is the state at the escalation and is not kept current. A fin
 local record names that record's title and IRI, as any GitHub finding about a local record does.
 The command prints the old handle and the issue: `1\tescalated\t#4`.
 
-Everything that would make the GitHub create refuse is checked first, and a refusal writes
-nothing: the project must be routed and this machine must bind its repository; the item must be
-a local item of the kind named, not closed (a record `done`, a finding `fixed` or `withdrawn`),
-and, for a record, have a title GitHub takes; no name of the item may already name something on
-GitHub; the routing map must be current, as for a new item; and a finding's reproduction gate
-must be in the committed manifest. Nothing sensitive reaches a repository that is not private: a
-record in a sensitive area, a security finding, a finding in a sensitive area or about a local
-record in one — or in an area the map no longer declares — is refused, and stays local. Anything
-else escalated to a repository that is not private is published after a `warning:` that names the
-repository, its visibility, and what goes out: the title or claim, the item's local IRI, the
-reason, who escalated it, and — for a finding — who raised it and who it is assigned to, or — for
-a record — how many open findings go out with their claims, states and IRIs.
+Everything that would make the GitHub create refuse is checked first, and a refusal writes nothing:
+the project must be routed and this machine must bind its repository; the item must be a local item
+of the kind named, not closed (a record `done`, a finding `fixed` or `withdrawn`), and, for a
+record, have a title GitHub takes; no name of the item may already name something on GitHub; the
+routing map must be current, as for a new item; and a finding's reproduction gate must be in the
+committed manifest. The issue's body must fit GitHub's limit of 65,536 characters: a record's issue
+lists at most 25 open findings, each claim cut short, and counts the rest, while a finding's claim,
+the title of the local record a finding is about, the reason, who escalated it and the item's
+aliases are checked first, and a refusal names the one to shorten. Nothing sensitive reaches a
+repository that is not private: a record in a sensitive area, a security finding, a finding in a
+sensitive area or about a local record in one — or in an area the map no longer declares — is
+refused, and stays local. Anything else escalated to a repository that is not private is published
+after a `warning:` that names the repository, its visibility, and what goes out: the title or claim,
+the item's local IRI, the reason, who escalated it, and — for a finding — who raised it and who it
+is assigned to, or — for a record — how many open findings go out with their claims, states and
+IRIs.
 
 The escalation then marks the local item "escalating", with who, why and the time. While it is
 marked, the local store refuses every write to it, naming the command that finishes it; a finding

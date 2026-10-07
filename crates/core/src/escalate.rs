@@ -13,9 +13,30 @@ use crate::store::StoreError;
 use crate::tiered::{RecordSeen, TieredTracker};
 
 /// The longest issue title the GitHub tracker writes: GitHub's limit, in
-/// characters (routing spec §3.2). fl-core cannot see `fl_github`'s own
-/// `TITLE_MAX`, so it keeps this one for the check before the mark.
+/// characters (routing spec §3.2). `fl_github`'s `TITLE_MAX` is this one,
+/// so the check before the mark and the tracker's own cannot drift.
 pub const ISSUE_TITLE_MAX: usize = 256;
+
+/// GitHub's limit on an issue's body, in characters: a longer one is
+/// refused (a 422).
+pub const ISSUE_BODY_MAX: usize = 65_536;
+
+/// The most an escalation's unbounded parts may weigh in its issue's body
+/// (routing spec §3.2): in bytes of UTF-8, so the bound holds however
+/// GitHub counts characters, and each byte at the most its escaping can
+/// make it ([`body_parts`]). It leaves 15,536 of [`ISSUE_BODY_MAX`] for
+/// what the GitHub tracker bounds by construction: a record's list of open
+/// findings (at most about 11,000 bytes), the words of the lines around
+/// the parts, and the block's other fields — short IRIs, names and words.
+pub const ESCALATION_BODY_BUDGET: usize = 50_000;
+
+/// The most bytes one byte of a part becomes where the issue's text shows
+/// it, escaped as Markdown: eight (`@` becomes `@&#8203;`).
+const SHOWN: usize = 8;
+
+/// The most bytes one byte of a part becomes in the issue's block, escaped
+/// as JSON: six (`<` becomes `\u003c`, a control character `\u0001`).
+const KEPT: usize = 6;
 
 /// An escalation checked and ready to run (routing spec §3.2): what goes
 /// out, and where an earlier run stopped. Only the router builds one.
@@ -95,6 +116,61 @@ impl Local {
 /// with no area — made before the project was routed — is not.
 fn sensitive(map: &RoutingMap, area: Option<&str>) -> bool {
     area.is_some_and(|a| map.route(a).is_none_or(|r| r.sensitive))
+}
+
+/// The parts of an escalated item's issue body that nothing else bounds:
+/// what each is, its length in bytes, and the most bytes one of its bytes
+/// becomes there. (A record's open findings are not among them: the
+/// tracker bounds that list itself.)
+fn body_parts(out: &Outgoing, by: &str, reason: &str) -> Vec<(&'static str, usize, usize)> {
+    let mut parts = Vec::new();
+    let aliases = match out {
+        Outgoing::Record { record, .. } => &record.also_known_as,
+        Outgoing::Finding { finding, record } => {
+            // The issue's text, as written.
+            parts.push(("the finding's claim", finding.claim.len(), 1));
+            // A local record is named in a line, and its title kept in the
+            // block; a record on GitHub is named by its issue alone.
+            if record.tier == Tier::Local {
+                parts.push((
+                    "the title of the record it is about",
+                    record.title.len(),
+                    SHOWN + KEPT,
+                ));
+            }
+            &finding.also_known_as
+        }
+    };
+    // Who and why are shown in the line naming where the issue came from,
+    // and kept in the block.
+    parts.push(("the name of who escalates it", by.len(), SHOWN + KEPT));
+    parts.push(("the reason", reason.len(), SHOWN + KEPT));
+    // Kept in the block; six bytes a byte covers each one's quotes and comma.
+    let aliases = aliases.iter().map(|a| a.as_str().len()).sum();
+    parts.push(("the list of its aliases", aliases, KEPT));
+    parts
+}
+
+/// Why GitHub would refuse the body of `out`'s issue, escalated by `by`
+/// for `reason`, if it might: its parts outweigh [`ESCALATION_BODY_BUDGET`].
+/// The refusal names the heaviest part, and the most of it that fits
+/// beside the others.
+fn body_refused(id: &Iri, out: &Outgoing, by: &str, reason: &str) -> Option<EscalationFault> {
+    let parts = body_parts(out, by, reason);
+    let weight = |(_, len, per): &(&str, usize, usize)| len.saturating_mul(*per);
+    let total = parts.iter().map(weight).fold(0, usize::saturating_add);
+    if total <= ESCALATION_BODY_BUDGET {
+        return None;
+    }
+    let heaviest = parts.iter().max_by_key(|p| weight(p))?;
+    let (what, len, per) = *heaviest;
+    let others = total - weight(heaviest);
+    Some(EscalationFault::TooLong {
+        id: id.clone(),
+        what: what.to_string(),
+        len,
+        max: ESCALATION_BODY_BUDGET.saturating_sub(others) / per,
+    })
 }
 
 /// Why the GitHub tracker would refuse `title` for an issue, if it would.
@@ -275,7 +351,9 @@ impl TieredTracker<'_> {
     ///
     /// ⚠ A run that resumes a mark keeps the mark's who, why and time, and
     /// ignores `by`, `reason` and `now_ms`. Any error after the mark leaves
-    /// it: the item stays unwritable, and a rerun resumes.
+    /// it: the item stays unwritable, and a rerun resumes. A run that marks
+    /// first checks that `by` and `reason` fit the issue's body (routing
+    /// spec §3.2), so GitHub's refusal of it never strands a mark.
     ///
     /// ⚠ An issue an earlier run made goes through `create_escalated` too:
     /// it searches first and makes no second issue, and it gives a found
@@ -292,6 +370,9 @@ impl TieredTracker<'_> {
         let mark = match &at.resumes {
             Some(mark) => mark.clone(),
             None => {
+                if let Some(fault) = body_refused(&at.id, &at.outgoing, by, reason) {
+                    return Err(fault.into());
+                }
                 let mark = Mark {
                     by: by.to_string(),
                     reason: reason.to_string(),
@@ -1215,6 +1296,86 @@ mod tests {
             (tomb.by.as_str(), tomb.reason.as_str(), tomb.at_ms),
             ("alice", "first", 10)
         );
+    }
+
+    // Routing spec §3.2: GitHub refuses an issue body over 65,536
+    // characters, so an escalation whose body could be longer — a long
+    // claim, a long title of the local record a finding is about, a long
+    // reason or name — is refused before the mark, naming the part.
+    #[test]
+    fn a_body_github_would_refuse_is_refused_before_the_mark() {
+        let w = world();
+        let r = w.record(Some("code"), "t");
+        let finding = |claim: &str| {
+            let mut f = Finding::raise(w.p.clone(), r.clone(), "bob", claim);
+            f.area = Some("code".into());
+            w.local.add_finding(f).unwrap()
+        };
+        let too_long = |err: &StoreError| match escalation(err) {
+            Some(EscalationFault::TooLong { what, len, max, .. }) => (what.clone(), *len, *max),
+            _ => panic!("{err:?}"),
+        };
+        // The claim is shown as written; the record's title, who and why
+        // are shown escaped and kept in the block, at most fourteen bytes a
+        // byte: 14 + 70 + 224 bytes beside the claim.
+        let fits = ESCALATION_BODY_BUDGET - 14 - 5 * 14 - 16 * 14;
+        let long = finding(&"a".repeat(fits + 1));
+        let err = w.refused(long.iri(), Kind::Finding);
+        assert_eq!(
+            too_long(&err),
+            ("the finding's claim".to_string(), fits + 1, fits)
+        );
+        assert!(err.to_string().contains("is too long to escalate"), "{err}");
+        let just = finding(&"a".repeat(fits));
+        w.run(just.iri(), Kind::Finding).unwrap();
+        assert_eq!(w.issues.creates(), 1);
+
+        // The title of the local record a finding is about.
+        let titled = w.record(Some("code"), &"t".repeat(4_000));
+        let mut f = Finding::raise(w.p.clone(), titled, "bob", "c");
+        f.area = Some("code".into());
+        let f = w.local.add_finding(f).unwrap();
+        let err = w.run(f.iri(), Kind::Finding).unwrap_err();
+        assert_eq!(too_long(&err).0, "the title of the record it is about");
+        assert_eq!(w.local.mark_of(f.iri()).unwrap(), None);
+        // A record on GitHub is named by its issue, and its title is not
+        // written: beside it, a claim may take what a local record's title
+        // would.
+        let escalated = w.record(Some("code"), &"t".repeat(ISSUE_TITLE_MAX));
+        let claim = "a".repeat(ESCALATION_BODY_BUDGET - 5 * 14 - 16 * 14);
+        let mut f = Finding::raise(w.p.clone(), escalated.clone(), "bob", &claim);
+        f.area = Some("code".into());
+        let f = w.local.add_finding(f).unwrap();
+        w.run(escalated.iri(), Kind::Record).unwrap();
+        w.run(f.iri(), Kind::Finding).unwrap();
+        assert_eq!(w.issues.creates(), 3);
+
+        // The reason, and who escalates it.
+        let s = w.record(Some("code"), "s");
+        for (by, why, what) in [
+            (BY.to_string(), "r".repeat(4_000), "the reason"),
+            (
+                "b".repeat(4_000),
+                WHY.to_string(),
+                "the name of who escalates it",
+            ),
+        ] {
+            let err = w.run_as(s.iri(), Kind::Record, &by, &why, NOW).unwrap_err();
+            assert_eq!(too_long(&err).0, what, "{err}");
+            assert_eq!(w.local.mark_of(s.iri()).unwrap(), None);
+        }
+
+        // Its aliases, kept in the block.
+        for n in 0..100 {
+            let alias = format!("urn:x-acme:{n:03}-{}", "a".repeat(90));
+            w.local
+                .add_alias(s.iri(), Iri::parse(&alias).unwrap())
+                .unwrap();
+        }
+        let err = w.run(s.iri(), Kind::Record).unwrap_err();
+        assert_eq!(too_long(&err).0, "the list of its aliases", "{err}");
+        assert_eq!(w.local.mark_of(s.iri()).unwrap(), None);
+        assert_eq!(w.issues.creates(), 3, "no issue made");
     }
 
     // Routing spec §3.3: `--abandon` removes the mark only after the search

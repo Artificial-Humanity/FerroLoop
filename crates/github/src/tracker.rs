@@ -2032,14 +2032,27 @@ impl GithubTracker {
     }
 }
 
+/// How many open findings an escalated record's issue lists; a last line
+/// counts the rest. GitHub refuses an issue body over 65,536 characters
+/// (`fl_core::escalate::ISSUE_BODY_MAX`), and the router checks only the
+/// parts it cannot bound, leaving this list room it never approaches: at
+/// most 25 lines of about 420 bytes each, about 11,000 bytes in all.
+const FINDINGS_LISTED: usize = 25;
+
+/// The most bytes a listed finding's escaped claim, or its escaped IRI,
+/// holds; a longer one is cut, and ends in `…`.
+const FINDING_SHOWN: usize = 200;
+
 /// An escalated record's text (routing spec decision 18): its open
 /// findings, one line each — state, claim and IRI, each escaped so none
-/// mentions anyone, links anything or breaks the line — under a heading;
-/// empty when there are none. The list is as of the escalation, and is not
-/// kept current.
+/// mentions anyone, links anything or breaks the line, and each cut to
+/// [`FINDING_SHOWN`] — under a heading; at most [`FINDINGS_LISTED`] of them,
+/// then a line counting the rest; empty when there are none. The list is
+/// as of the escalation, and is not kept current.
 fn escalated_findings(findings: &[Finding]) -> String {
     let escape = crate::ledger::render::escape;
-    let lines: Vec<String> = findings
+    let capped = |s: &str| crate::ledger::render::escape_capped(s, FINDING_SHOWN);
+    let mut lines: Vec<String> = findings
         .iter()
         // Defence in depth: the router leaves security findings out too
         // (routing spec decision 18), and a public issue must never list one.
@@ -2051,13 +2064,18 @@ fn escalated_findings(findings: &[Finding]) -> String {
             format!(
                 "- {}: {} — {}",
                 escape(f.state.as_wire()),
-                escape(&f.claim),
-                escape(f.id.iri().as_str())
+                capped(&f.claim),
+                capped(f.id.iri().as_str())
             )
         })
         .collect();
     if lines.is_empty() {
         return String::new();
+    }
+    if lines.len() > FINDINGS_LISTED {
+        let more = lines.len() - FINDINGS_LISTED;
+        lines.truncate(FINDINGS_LISTED);
+        lines.push(format!("- and {more} more open findings"));
     }
     format!(
         "Open findings when this record was escalated:\n\n{}",
@@ -4712,6 +4730,53 @@ mod tests {
              - raised: slow &lt;b&gt;always&lt;/b&gt; — \
              urn:uuid:00000000-0000-7000-8000-000000000008"
         );
+    }
+
+    // Routing spec §3.2: GitHub refuses an issue body over 65,536
+    // characters. The findings list is bounded here — each claim and IRI
+    // cut, the count capped and the rest counted — so it stays in the room
+    // the router's budget leaves it, and the whole body of a record with
+    // many long findings, a reason at the budget's limit and the
+    // costliest characters to escape stays under GitHub's limit.
+    #[test]
+    fn an_escalated_records_findings_list_is_bounded_under_githubs_body_limit() {
+        use fl_core::escalate::{ESCALATION_BODY_BUDGET, ISSUE_BODY_MAX};
+        let old = local_iri(7);
+        let findings: Vec<Finding> = (0..1_000)
+            .map(|n| {
+                let mut f = Finding::raise(p(), RecordId(old.clone()), "rev", &"@<".repeat(5_000));
+                let iri = format!("urn:x-local:{n}-{}", "#".repeat(1_000));
+                f.id = FindingId(Iri::parse(&iri).unwrap());
+                f.state = FindingState::Reproduced;
+                f
+            })
+            .collect();
+        let list = escalated_findings(&findings);
+        assert!(
+            list.ends_with("\n- and 975 more open findings"),
+            "{}",
+            &list[list.len() - 80..]
+        );
+        assert_eq!(list.lines().filter(|l| l.starts_with("- ")).count(), 26);
+        assert!(list.len() < 11_000, "{}", list.len());
+        assert!(list.len() < ISSUE_BODY_MAX - ESCALATION_BODY_BUDGET);
+
+        // `<` is the costliest to escape in both places: `&lt;` in the line,
+        // `\u003c` in the block — ten bytes of the fourteen the budget
+        // allows each byte of the reason.
+        let by = "alice";
+        let reason = "<".repeat((ESCALATION_BODY_BUDGET - by.len() * 14) / 14);
+        let mut meta = Meta::new(ItemKind::Record, "needs_human", p());
+        meta.area = Some("code".into());
+        meta.create_key = old.to_string();
+        meta.also_known_as = vec![old.clone()];
+        meta.escalated = Some(EscalatedFrom {
+            from: old,
+            by: by.into(),
+            reason,
+        });
+        let body = meta::render_body(&list, &meta);
+        assert!(body.len() <= ISSUE_BODY_MAX, "{}", body.len());
     }
 
     // Routing spec §3.3 step 2: the issue has the record's own state, area

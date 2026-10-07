@@ -148,6 +148,17 @@ pub enum EscalationFault {
         escalate_command(*kind, id)
     )]
     IssueExists { id: Iri, kind: Kind, issue: Iri },
+    #[error(
+        "{what} is too long to escalate {id}: it is {len} bytes, and at most {max} fit beside \
+         the rest of the issue under GitHub's limit on an issue's body. Shorten it and run the \
+         command again. Nothing was written; it stays in the local tier"
+    )]
+    TooLong {
+        id: Iri,
+        what: String,
+        len: usize,
+        max: usize,
+    },
 }
 
 #[cfg(test)]
@@ -226,6 +237,16 @@ mod tests {
                 "its issue exists",
             ),
             (
+                EscalationFault::TooLong {
+                    id: id.clone(),
+                    what: "the reason".into(),
+                    len: 9,
+                    max: 5,
+                }
+                .into(),
+                "is too long to escalate",
+            ),
+            (
                 StoreError::Escalating {
                     id: id.clone(),
                     to_finish: escalate_command(Kind::Record, &id),
@@ -253,10 +274,15 @@ mod tests {
         assert!(messages[7].contains(&finish), "{}", messages[7]);
         assert!(messages[7].contains(issue(7).as_str()), "{}", messages[7]);
         assert!(messages[1].contains(issue(7).as_str()), "{}", messages[1]);
-        assert!(messages[8].contains(&finish), "{}", messages[8]);
+        let long = &messages[8];
+        assert!(
+            long.starts_with("the reason ") && long.contains("Shorten it"),
+            "{long}"
+        );
+        assert!(messages[9].contains(&finish), "{}", messages[9]);
         let abandon = format!("`fl record escalate {id} --abandon`");
-        assert!(messages[8].contains(&abandon), "{}", messages[8]);
-        assert!(messages[9].contains(issue(7).as_str()), "{}", messages[9]);
+        assert!(messages[9].contains(&abandon), "{}", messages[9]);
+        assert!(messages[10].contains(issue(7).as_str()), "{}", messages[10]);
     }
 
     #[test]
