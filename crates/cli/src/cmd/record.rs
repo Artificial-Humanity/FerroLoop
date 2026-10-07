@@ -35,6 +35,22 @@ pub enum Cmd {
         #[arg(long = "to")]
         to: String,
     },
+    /// Move a local record to GitHub (routing spec §3): every check first,
+    /// then the mark, the issue, and the tombstone. A rerun finishes an
+    /// escalation that stopped.
+    Escalate {
+        id: Ref,
+        /// Who escalates it, named on the issue.
+        #[arg(long, required_unless_present = "abandon")]
+        by: Option<String>,
+        /// Why, named on the issue.
+        #[arg(long, required_unless_present = "abandon")]
+        reason: Option<String>,
+        /// Remove the mark of an escalation that stopped before its issue
+        /// was made.
+        #[arg(long, conflicts_with_all = ["by", "reason"])]
+        abandon: bool,
+    },
 }
 
 impl Cmd {
@@ -47,6 +63,7 @@ impl Cmd {
             Cmd::Add { project, .. } => vec![project],
             Cmd::List { project, .. } => vec![project],
             Cmd::Move { id, .. } => vec![id],
+            Cmd::Escalate { id, .. } => vec![id],
         }
     }
 
@@ -226,6 +243,21 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     unreachable!("an ungated move returns above, before any transition is printed")
                 }
             }
+        }
+        Cmd::Escalate {
+            id,
+            by,
+            reason,
+            abandon,
+        } => {
+            return crate::cmd::escalate::run(
+                ctx,
+                Kind::Record,
+                &id,
+                by.as_deref(),
+                reason.as_deref(),
+                abandon,
+            );
         }
     }
     Ok(0)

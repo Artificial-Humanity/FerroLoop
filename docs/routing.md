@@ -126,6 +126,46 @@ local items that name the area no longer count as sensitive. A `--not-sensitive`
 or clears a sensitive one says so in a `note:` when it succeeds; one that changes nothing says
 nothing.
 
+## Escalating an item
+
+`fl record escalate <id> --by <who> --reason <why>` moves a local record to GitHub, and `fl
+finding escalate <id> --by <who> --reason <why>` a local finding. The item becomes an issue with
+its own title, state, area and aliases; the issue names who escalated it, why, and the item's
+old IRI. A record's issue also lists the record's open findings in both tiers — claim, state and
+IRI — leaving out security findings and findings in a sensitive area or one the map no longer
+declares; the list is the state at the escalation and is not kept current. A finding about a
+local record names that record's title and IRI, as any GitHub finding about a local record does.
+The command prints the old handle and the issue: `1\tescalated\t#4`.
+
+Everything that would make the GitHub create refuse is checked first, and a refusal writes
+nothing: the project must be routed and this machine must bind its repository; the item must be
+a local item of the kind named, not closed (a record `done`, a finding `fixed` or `withdrawn`),
+and, for a record, have a title GitHub takes; no name of the item may already name something on
+GitHub; the routing map must be current, as for a new item; and a finding's reproduction gate
+must be in the committed manifest. Nothing sensitive reaches a repository that is not private: a
+record in a sensitive area, a security finding, a finding in a sensitive area or about a local
+record in one — or in an area the map no longer declares — is refused, and stays local. Anything
+else escalated to a repository that is not private is published after a `warning:` that names the
+repository, its visibility, and what goes out: the title or claim, the item's local IRI, the
+reason, who escalated it, and a record's number of open findings.
+
+The escalation then marks the local item "escalating", with who, why and the time. While it is
+marked, the local store refuses every write to it, naming the command that finishes it; a finding
+raised about a marked record is allowed. Once the item's issue exists and GitHub reads it as an fl
+item, fl's lookups and writes of the item go to the issue; otherwise — no issue yet, an issue a stop
+left without fl's labels, or GitHub out of reach — the local copy answers, as it last was, and
+refuses writes. If the command stops after the mark — GitHub could not be reached, or it stopped
+between the create and the labels — it says so: run the same command again to finish. A rerun
+resumes with the mark's who and why, and a `note:` says so if it was given others; it searches for
+the issue the stopped run may have made, by the old IRI, and never makes a second one. `--abandon`
+(`fl record escalate <id> --abandon`) removes the mark instead, and only once the search proves no
+issue exists: once the issue exists it is refused, naming the issue, and only finishing is left.
+`--abandon` takes neither `--by` nor `--reason`, and prints `1\tabandoned`.
+
+Last, the local item is replaced by a tombstone: the old IRI, the issue, who, when and why. The
+old handle and the old IRI then name the issue — a lookup, a move, `fl finding list --record` —
+and the local row is left out of lists.
+
 ## Limits
 
 * A machine with no binding for the project lists with `--tier local`: a list of both tiers needs

@@ -63,6 +63,22 @@ pub enum Cmd {
         #[arg(long, value_parser = crate::cmd::routing::parse_tier)]
         tier: Option<Tier>,
     },
+    /// Move a local finding to GitHub (routing spec §3): every check first,
+    /// then the mark, the issue, and the tombstone. A rerun finishes an
+    /// escalation that stopped.
+    Escalate {
+        id: Ref,
+        /// Who escalates it, named on the issue.
+        #[arg(long, required_unless_present = "abandon")]
+        by: Option<String>,
+        /// Why, named on the issue.
+        #[arg(long, required_unless_present = "abandon")]
+        reason: Option<String>,
+        /// Remove the mark of an escalation that stopped before its issue
+        /// was made.
+        #[arg(long, conflicts_with_all = ["by", "reason"])]
+        abandon: bool,
+    },
 }
 
 impl Cmd {
@@ -77,6 +93,7 @@ impl Cmd {
             Cmd::Assign { finding, .. } => vec![finding],
             Cmd::Verify { finding } => vec![finding],
             Cmd::Withdraw { finding, .. } => vec![finding],
+            Cmd::Escalate { id, .. } => vec![id],
             Cmd::List {
                 project, record, ..
             } => project.iter().chain(record.iter()).collect(),
@@ -444,6 +461,21 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
                     }
                 }
             }
+        }
+        Cmd::Escalate {
+            id,
+            by,
+            reason,
+            abandon,
+        } => {
+            return crate::cmd::escalate::run(
+                ctx,
+                Kind::Finding,
+                &id,
+                by.as_deref(),
+                reason.as_deref(),
+                abandon,
+            );
         }
     }
     Ok(0)

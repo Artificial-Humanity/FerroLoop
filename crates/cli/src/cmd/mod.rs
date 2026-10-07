@@ -1,5 +1,6 @@
 pub mod attempt;
 pub mod check;
+pub mod escalate;
 pub mod finding;
 pub mod gate;
 pub mod github;
