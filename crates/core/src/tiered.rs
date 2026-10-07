@@ -112,7 +112,7 @@ impl<'a> TieredTracker<'a> {
         }
     }
 
-    fn map_of(&self, project: &ProjectId) -> Result<RoutingMap, StoreError> {
+    pub(crate) fn map_of(&self, project: &ProjectId) -> Result<RoutingMap, StoreError> {
         self.routes.routes(project)?.ok_or_else(|| {
             RoutingFault::Unrouted {
                 project: project.clone(),
@@ -271,7 +271,7 @@ impl<'a> TieredTracker<'a> {
     /// chose the tier, the refusal names `--tier local` (§2.1); when the
     /// person named it, the refusal says what was refused and does not claim
     /// the map sent it.
-    fn private_or_refuse(&self, by_map: bool, what: &str) -> Result<(), StoreError> {
+    pub(crate) fn private_or_refuse(&self, by_map: bool, what: &str) -> Result<(), StoreError> {
         match self.github.require_private() {
             Err(StoreError::SecurityNotPrivate { repo, visibility }) => {
                 let what = what.to_string();
