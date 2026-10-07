@@ -1,4 +1,5 @@
 use crate::decision::{Decision, Flushed};
+use crate::escalation::EscalationFault;
 use crate::fault::LedgerFault;
 use crate::finding::Finding;
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
@@ -190,6 +191,24 @@ pub enum StoreError {
     /// ⚠ The routing tracker refused (routing spec §4).
     #[error(transparent)]
     Routing(#[from] RoutingFault),
+    /// ⚠ The item is marked escalating (routing spec §3.3 step 1, §3.6): the
+    /// escalation is moving its one live copy to GitHub, so a local write
+    /// could be lost. `to_finish` is `fl <kind> escalate <id>`.
+    #[error(
+        "{id} is marked escalating, so this store refuses to change it. Run `{to_finish}` to \
+         finish the escalation, or `{to_finish} --abandon` to stop it"
+    )]
+    Escalating { id: Iri, to_finish: String },
+    /// ⚠ The item was escalated (routing spec §3.6): the store holds only its
+    /// tombstone, which the router follows to `to`.
+    #[error(
+        "{from} was escalated to GitHub and is now {to}. Read and change it there: this store \
+         keeps only its tombstone"
+    )]
+    Escalated { from: Iri, to: Iri },
+    /// ⚠ The escalation refused (routing spec §3.2, §4).
+    #[error(transparent)]
+    Escalation(#[from] EscalationFault),
     /// ⚠ A decision may rest only on entries it publishes or that are
     /// already published (ruling 8).
     #[error(
@@ -909,6 +928,19 @@ mod tests {
             },
             StoreError::Ledger(LedgerFault::NotSetUp {
                 repo: "acme/widgets".into(),
+            }),
+            // Routing spec §3.6: an escalation is finished or abandoned, and a
+            // tombstone is followed — waiting changes neither.
+            StoreError::Escalating {
+                id: seq_iri(1),
+                to_finish: "fl record escalate x".into(),
+            },
+            StoreError::Escalated {
+                from: seq_iri(1),
+                to: seq_iri(2),
+            },
+            StoreError::Escalation(crate::escalation::EscalationFault::NotMarked {
+                id: seq_iri(1),
             }),
         ];
         for e in &lasting {

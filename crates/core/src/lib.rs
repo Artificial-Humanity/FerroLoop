@@ -7,6 +7,7 @@ pub mod at;
 #[doc(hidden)]
 pub mod conformance;
 pub mod decision;
+pub mod escalation;
 pub mod fault;
 pub mod finding;
 pub mod ids;
@@ -26,6 +27,7 @@ pub mod verdict;
 
 pub use at::{At, AtError};
 pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
+pub use escalation::{EscalationFault, Escalations, Mark, Outgoing, Provenance, Tombstone};
 pub use fault::LedgerFault;
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{FindingId, GateId, Kind, ProjectId, RecordId};

@@ -13,6 +13,7 @@
 
 use crate::at::At;
 use crate::decision::{Decision, LeftLocal, Outcome, TransitionOutcome};
+use crate::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
 use crate::fault::LedgerFault;
 use crate::finding::{Finding, FindingState};
 use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
@@ -156,6 +157,8 @@ const ALL_ROLES_CASES: usize = 7;
 const LOCAL_HANDLES_CASES: usize = 1;
 /// How many cases [`ledger_cache`] runs. Update deliberately — see [`run_suite`].
 const LEDGER_CACHE_CASES: usize = 6;
+/// How many cases [`escalations`] runs. Update deliberately — see [`run_suite`].
+const ESCALATION_CASES: usize = 8;
 
 pub fn catalog<S: Catalog, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -265,6 +268,59 @@ pub fn ledger_cache<S: LedgerCache, G>(make: impl Fn() -> (S, G)) {
         a_cached_file_keeps_bytes_that_are_not_utf8_exactly::<S>,
     ];
     run_suite("ledger-cache", LEDGER_CACHE_CASES, cases, make);
+}
+
+/// The roles an escalation case uses (routing spec §3.3, §3.6): a local
+/// store's catalog and tracker, and its marks and tombstones — one store.
+pub struct EscalationBound<'a> {
+    pub catalog: &'a dyn Catalog,
+    pub tracker: &'a dyn Tracker,
+    pub escalations: &'a dyn Escalations,
+}
+
+/// Hands one escalation case its [`EscalationBound`], as [`Fixture`] does.
+pub trait EscalationFixture {
+    fn with_escalations(&self, f: &mut dyn FnMut(&EscalationBound<'_>));
+}
+
+impl<S: Catalog + Tracker + Escalations, G> EscalationFixture for Single<S, G> {
+    fn with_escalations(&self, f: &mut dyn FnMut(&EscalationBound<'_>)) {
+        f(&EscalationBound {
+            catalog: &self.0,
+            tracker: &self.0,
+            escalations: &self.0,
+        });
+    }
+}
+
+/// What every local store does with an escalation's mark and tombstone
+/// (routing spec §3.3, §3.6): a marked item reads as itself and refuses
+/// every write, naming the command that finishes it; a tombstoned item
+/// reads as `Escalated` from every name it has, refuses every write, and
+/// is left out of every list.
+pub fn escalations<F: EscalationFixture>(make: impl Fn() -> F) {
+    let cases: &[fn(&EscalationBound<'_>)] = &[
+        a_mark_reads_back_and_a_second_mark_is_refused,
+        unmarking_clears_the_mark_and_a_second_unmark_is_refused,
+        a_tombstone_is_made_from_the_mark_and_replaces_it,
+        a_tombstoned_item_reads_as_escalated_and_refuses_every_write,
+        a_marked_item_refuses_every_write_and_a_finding_about_it_is_allowed,
+        a_tombstoned_item_is_left_out_of_every_list,
+        an_id_this_store_never_held_has_no_mark_and_no_tombstone,
+        an_alias_reaches_the_primary_in_every_escalation_method,
+    ];
+    assert_eq!(
+        cases.len(),
+        ESCALATION_CASES,
+        "the escalation suite lists {} cases but declares {ESCALATION_CASES}. A case was \
+         added or removed: if that was deliberate, update the count beside the list; if not, \
+         restore the case",
+        cases.len()
+    );
+    for case in cases {
+        let fixture = make();
+        fixture.with_escalations(&mut |b| case(b));
+    }
 }
 
 fn the_last_head_is_kept_per_repository_and_replaced<S: LedgerCache>(s: &S) {
@@ -1606,6 +1662,382 @@ fn no_operation_gives_up_an_owned_id(roles: &Bound<'_>) {
     assert!(roles.catalog.get_gate(&g).unwrap().is_some());
     assert!(roles.tracker.get_record(&r).unwrap().is_some());
     assert!(roles.tracker.get_finding(&f).unwrap().is_some());
+}
+
+/// A project, a record in it, and a finding about the record.
+fn escalation_world(b: &EscalationBound<'_>) -> (ProjectId, RecordId, FindingId) {
+    let p = b.catalog.add_project("/p").unwrap();
+    let r = b.tracker.add_record(&p, "look at the layout").unwrap();
+    let f = b
+        .tracker
+        .add_finding(Finding::raise(
+            p.clone(),
+            r.clone(),
+            "rev",
+            "the margin is off",
+        ))
+        .unwrap();
+    (p, r, f)
+}
+
+fn sample_mark() -> Mark {
+    Mark {
+        by: "alice".into(),
+        reason: "needs a design review".into(),
+        at_ms: 1_000,
+    }
+}
+
+fn sample_issue(n: u64) -> Iri {
+    Iri::parse(&format!("https://github.com/acme/widgets/issues/{n}")).unwrap()
+}
+
+/// `Escalating`, naming `id` and the command that finishes its escalation.
+fn assert_escalating(err: StoreError, id: &Iri, kind: Kind) {
+    assert!(
+        matches!(
+            err,
+            StoreError::Escalating { id: ref i, ref to_finish }
+                if i == id && *to_finish == escalate_command(kind, id)
+        ),
+        "{err:?}"
+    );
+}
+
+/// `Escalated`, from `from` to `to`.
+fn assert_escalated(err: StoreError, from: &Iri, to: &Iri) {
+    assert!(
+        matches!(err, StoreError::Escalated { from: ref f, to: ref t } if f == from && t == to),
+        "{err:?}"
+    );
+}
+
+/// Routing spec §3.3 step 1: the mark holds who, why and when; an item is
+/// marked once; only a record or a finding is escalated.
+pub fn a_mark_reads_back_and_a_second_mark_is_refused(b: &EscalationBound<'_>) {
+    let (p, r, f) = escalation_world(b);
+    let later = Mark {
+        by: "bob".into(),
+        reason: "again".into(),
+        at_ms: 2_000,
+    };
+    for (id, kind) in [(r.iri(), Kind::Record), (f.iri(), Kind::Finding)] {
+        assert_eq!(b.escalations.mark_of(id).unwrap(), None);
+        b.escalations.mark(id, &sample_mark()).unwrap();
+        assert_eq!(b.escalations.mark_of(id).unwrap(), Some(sample_mark()));
+        let err = b.escalations.mark(id, &later).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::Escalation(EscalationFault::AlreadyMarked { id: ref i, kind: k })
+                    if i == id && k == kind
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            b.escalations.mark_of(id).unwrap(),
+            Some(sample_mark()),
+            "the first mark is kept"
+        );
+    }
+    let err = b.escalations.mark(p.iri(), &sample_mark()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::WrongKind {
+                found: Kind::Project,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(b.escalations.mark_of(p.iri()).unwrap(), None);
+}
+
+/// Routing spec §3.3, "Abandoning": the mark is removed, and an item with
+/// no mark has nothing to abandon.
+pub fn unmarking_clears_the_mark_and_a_second_unmark_is_refused(b: &EscalationBound<'_>) {
+    let (_p, r, _f) = escalation_world(b);
+    b.escalations.mark(r.iri(), &sample_mark()).unwrap();
+    b.escalations.unmark(r.iri()).unwrap();
+    assert_eq!(b.escalations.mark_of(r.iri()).unwrap(), None);
+    let err = b.escalations.unmark(r.iri()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Escalation(EscalationFault::NotMarked { id: ref i }) if i == r.iri()
+        ),
+        "{err:?}"
+    );
+    b.tracker.set_record_state(&r, State::Doing).unwrap();
+    b.escalations.mark(r.iri(), &sample_mark()).unwrap();
+}
+
+/// Routing spec §3.3 step 3: the tombstone takes the mark's who, why and
+/// time, and replaces the mark in the same write; with no mark there is no
+/// escalation to finish.
+pub fn a_tombstone_is_made_from_the_mark_and_replaces_it(b: &EscalationBound<'_>) {
+    let (_p, r, _f) = escalation_world(b);
+    let err = b
+        .escalations
+        .tombstone(r.iri(), &sample_issue(7))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Escalation(EscalationFault::NotMarked { id: ref i }) if i == r.iri()
+        ),
+        "{err:?}"
+    );
+    assert_eq!(b.escalations.tombstone_of(r.iri()).unwrap(), None);
+    b.escalations.mark(r.iri(), &sample_mark()).unwrap();
+    let tomb = b.escalations.tombstone(r.iri(), &sample_issue(7)).unwrap();
+    assert_eq!(
+        tomb,
+        Tombstone {
+            from: r.iri().clone(),
+            to: sample_issue(7),
+            by: "alice".into(),
+            reason: "needs a design review".into(),
+            at_ms: 1_000,
+        }
+    );
+    assert_eq!(
+        b.escalations.tombstone_of(r.iri()).unwrap(),
+        Some(tomb.clone())
+    );
+    assert_eq!(
+        b.escalations.mark_of(r.iri()).unwrap(),
+        None,
+        "the mark is gone"
+    );
+    assert_eq!(
+        b.catalog.kind_of(r.iri()).unwrap(),
+        Kind::Record,
+        "the id still chooses this store"
+    );
+    let err = b.escalations.mark(r.iri(), &sample_mark()).unwrap_err();
+    assert_escalated(err, r.iri(), &sample_issue(7));
+    let err = b
+        .escalations
+        .tombstone(r.iri(), &sample_issue(8))
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Escalation(EscalationFault::NotMarked { .. })
+        ),
+        "{err:?}"
+    );
+    assert_eq!(b.escalations.tombstone_of(r.iri()).unwrap(), Some(tomb));
+}
+
+/// Routing spec §3.3 step 1, §3.6: a marked item reads as itself and is
+/// listed, and every write to it is refused naming the command that
+/// finishes the escalation. A finding raised about a marked record is not a
+/// write to it.
+pub fn a_marked_item_refuses_every_write_and_a_finding_about_it_is_allowed(
+    b: &EscalationBound<'_>,
+) {
+    let (p, r, f) = escalation_world(b);
+    let other = b.tracker.add_record(&p, "unmarked").unwrap();
+    b.escalations.mark(r.iri(), &sample_mark()).unwrap();
+    b.escalations.mark(f.iri(), &sample_mark()).unwrap();
+
+    assert_eq!(b.tracker.get_record(&r).unwrap().unwrap().id, r);
+    let held = b.tracker.get_finding(&f).unwrap().unwrap();
+    assert_eq!(held.id, f);
+    let records: Vec<RecordId> = b
+        .tracker
+        .list_records(&p)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(records, vec![r.clone(), other.clone()]);
+    assert_eq!(b.tracker.list_findings(&p).unwrap().len(), 1);
+
+    let err = b.tracker.set_record_state(&r, State::Doing).unwrap_err();
+    assert_escalating(err, r.iri(), Kind::Record);
+    assert_eq!(
+        b.tracker.get_record(&r).unwrap().unwrap().state,
+        State::Todo
+    );
+    let mut changed = held;
+    changed.withdraw("not concrete").unwrap();
+    let err = b.tracker.update_finding(&changed).unwrap_err();
+    assert_escalating(err, f.iri(), Kind::Finding);
+    assert_eq!(
+        b.tracker.get_finding(&f).unwrap().unwrap().state,
+        FindingState::Raised
+    );
+    let err = b.tracker.add_alias(r.iri(), sample_issue(41)).unwrap_err();
+    assert_escalating(err, r.iri(), Kind::Record);
+    let err = b.tracker.add_alias(f.iri(), sample_issue(42)).unwrap_err();
+    assert_escalating(err, f.iri(), Kind::Finding);
+    assert!(
+        b.tracker.get_record(&RecordId(sample_issue(41))).is_err(),
+        "no alias was added"
+    );
+
+    let raised = b
+        .tracker
+        .add_finding(Finding::raise(p, r.clone(), "rev", "and the gutter"))
+        .unwrap();
+    assert_eq!(b.tracker.get_finding(&raised).unwrap().unwrap().record, r);
+    b.tracker.set_record_state(&other, State::Doing).unwrap();
+}
+
+/// Routing spec §3.6: a tombstoned id reads as `Escalated`, every write to
+/// it is refused the same way, and so is a finding raised about a
+/// tombstoned record — the router follows the tombstone instead.
+pub fn a_tombstoned_item_reads_as_escalated_and_refuses_every_write(b: &EscalationBound<'_>) {
+    let (p, r, f) = escalation_world(b);
+    let held = b.tracker.get_finding(&f).unwrap().unwrap();
+    b.escalations.mark(r.iri(), &sample_mark()).unwrap();
+    b.escalations.tombstone(r.iri(), &sample_issue(7)).unwrap();
+    b.escalations.mark(f.iri(), &sample_mark()).unwrap();
+    b.escalations.tombstone(f.iri(), &sample_issue(8)).unwrap();
+
+    assert_escalated(
+        b.tracker.get_record(&r).unwrap_err(),
+        r.iri(),
+        &sample_issue(7),
+    );
+    assert_escalated(
+        b.tracker.get_finding(&f).unwrap_err(),
+        f.iri(),
+        &sample_issue(8),
+    );
+    let err = b.tracker.set_record_state(&r, State::Doing).unwrap_err();
+    assert_escalated(err, r.iri(), &sample_issue(7));
+    let mut changed = held;
+    changed.withdraw("not concrete").unwrap();
+    let err = b.tracker.update_finding(&changed).unwrap_err();
+    assert_escalated(err, f.iri(), &sample_issue(8));
+    let err = b.tracker.add_alias(r.iri(), sample_issue(41)).unwrap_err();
+    assert_escalated(err, r.iri(), &sample_issue(7));
+    let err = b.tracker.add_alias(f.iri(), sample_issue(42)).unwrap_err();
+    assert_escalated(err, f.iri(), &sample_issue(8));
+    let err = b
+        .tracker
+        .add_finding(Finding::raise(p, r.clone(), "rev", "and the gutter"))
+        .unwrap_err();
+    assert_escalated(err, r.iri(), &sample_issue(7));
+}
+
+/// Routing spec §2.4: tombstones are not listed, and a withdrawal is
+/// counted once — by the tier the finding lives in now.
+pub fn a_tombstoned_item_is_left_out_of_every_list(b: &EscalationBound<'_>) {
+    let p = b.catalog.add_project("/p").unwrap();
+    let kept = b.tracker.add_record(&p, "kept").unwrap();
+    let gone = b.tracker.add_record(&p, "gone").unwrap();
+    let mut findings = vec![];
+    for claim in ["stays", "goes"] {
+        let id = b
+            .tracker
+            .add_finding(Finding::raise(p.clone(), kept.clone(), "hasty", claim))
+            .unwrap();
+        let mut f = b.tracker.get_finding(&id).unwrap().unwrap();
+        f.withdraw("not concrete").unwrap();
+        b.tracker.update_finding(&f).unwrap();
+        findings.push(id);
+    }
+    assert_eq!(b.tracker.withdrawals_by("hasty").unwrap(), 2);
+    for (id, n) in [(gone.iri(), 7), (findings[1].iri(), 8)] {
+        b.escalations.mark(id, &sample_mark()).unwrap();
+        b.escalations.tombstone(id, &sample_issue(n)).unwrap();
+    }
+    let records: Vec<RecordId> = b
+        .tracker
+        .list_records(&p)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(records, vec![kept]);
+    let listed: Vec<FindingId> = b
+        .tracker
+        .list_findings(&p)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(listed, vec![findings[0].clone()]);
+    assert_eq!(b.tracker.withdrawals_by("hasty").unwrap(), 1);
+}
+
+/// `mark_of` and `tombstone_of` answer `None` for an id the store does not
+/// hold — the router asks before it knows — while the writes refuse it as
+/// `NotOwned`, never as "not marked".
+pub fn an_id_this_store_never_held_has_no_mark_and_no_tombstone(b: &EscalationBound<'_>) {
+    let _ = escalation_world(b);
+    let id = stranger();
+    assert_eq!(b.escalations.mark_of(&id).unwrap(), None);
+    assert_eq!(b.escalations.tombstone_of(&id).unwrap(), None);
+    assert_eq!(b.escalations.mark_of(&sample_issue(7)).unwrap(), None);
+    assert_all_not_owned(
+        &id,
+        vec![
+            ("mark", b.escalations.mark(&id, &sample_mark())),
+            ("unmark", b.escalations.unmark(&id)),
+            (
+                "tombstone",
+                b.escalations.tombstone(&id, &sample_issue(7)).map(|_| ()),
+            ),
+        ],
+    );
+}
+
+/// Every escalation method resolves an alias to the item's primary IRI:
+/// the mark, the tombstone and the refusals all name the primary.
+pub fn an_alias_reaches_the_primary_in_every_escalation_method(b: &EscalationBound<'_>) {
+    let (p, r, f) = escalation_world(b);
+    let ra = sample_issue(41);
+    let fa = sample_issue(42);
+    b.tracker.add_alias(r.iri(), ra.clone()).unwrap();
+    b.tracker.add_alias(f.iri(), fa.clone()).unwrap();
+
+    b.escalations.mark(&ra, &sample_mark()).unwrap();
+    assert_eq!(b.escalations.mark_of(r.iri()).unwrap(), Some(sample_mark()));
+    assert_eq!(b.escalations.mark_of(&ra).unwrap(), Some(sample_mark()));
+    let err = b.escalations.mark(r.iri(), &sample_mark()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            StoreError::Escalation(EscalationFault::AlreadyMarked { id: ref i, .. })
+                if i == r.iri()
+        ),
+        "{err:?}"
+    );
+    let err = b
+        .tracker
+        .set_record_state(&RecordId(ra.clone()), State::Doing)
+        .unwrap_err();
+    assert_escalating(err, r.iri(), Kind::Record);
+    b.escalations.unmark(&ra).unwrap();
+    assert_eq!(b.escalations.mark_of(r.iri()).unwrap(), None);
+
+    b.escalations.mark(&fa, &sample_mark()).unwrap();
+    let tomb = b.escalations.tombstone(&fa, &sample_issue(8)).unwrap();
+    assert_eq!(&tomb.from, f.iri(), "the tombstone names the primary");
+    assert_eq!(
+        b.escalations.tombstone_of(f.iri()).unwrap(),
+        Some(tomb.clone())
+    );
+    assert_eq!(b.escalations.tombstone_of(&fa).unwrap(), Some(tomb));
+    let err = b.tracker.get_finding(&FindingId(fa)).unwrap_err();
+    assert_escalated(err, f.iri(), &sample_issue(8));
+
+    b.escalations.mark(&ra, &sample_mark()).unwrap();
+    b.escalations.tombstone(&ra, &sample_issue(7)).unwrap();
+    let err = b.tracker.get_record(&RecordId(ra.clone())).unwrap_err();
+    assert_escalated(err, r.iri(), &sample_issue(7));
+    let err = b
+        .tracker
+        .add_finding(Finding::raise(p, RecordId(ra), "rev", "c"))
+        .unwrap_err();
+    assert_escalated(err, r.iri(), &sample_issue(7));
 }
 
 /// A well-formed id that no store in these tests ever mints.
