@@ -1,5 +1,6 @@
 //! redb persistence for the `fl-core` store roles.
 
+use fl_core::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
 use fl_core::finding::{Finding, FindingState};
 use fl_core::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
@@ -8,7 +9,8 @@ use fl_core::model::{GateDef, GateKind, Project, Record, Selector, State, Transi
 use fl_core::routing::{ForeignRecord, Routes, RoutingMap, check_foreign_for_local};
 use fl_core::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use fl_core::store::{Bindings, Catalog, Handles, Ledger, StoreError, Tracker};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 pub mod manifest;
@@ -82,11 +84,13 @@ pub const FORMAT_WITH_IMPORTS: u64 = 3;
 /// and 4. A format is only ever raised (`raise_format`).
 pub const FORMAT_WITH_LEDGER_ROOT: u64 = 4;
 
-/// ⚠ The format of a store that holds a routing map or an item with an
-/// area (routing spec §1.4). An older fl would read such an item and drop
-/// its area — or route nothing — so the first such write raises the store
-/// to 5 in the same transaction, and an older fl refuses it. This build
-/// opens 2 to 5. A store that never routes stays where it was.
+/// ⚠ The format of a store that holds a routing map, an item with an area,
+/// or an escalation's mark or tombstone (routing spec §1.4, §3.6). An older
+/// fl would read such an item and drop its area, route nothing, or ignore a
+/// mark and write to the item it guards — so the first such write raises
+/// the store to 5 in the same transaction, and an older fl refuses it. A
+/// tombstone is written only over a mark, so its store is 5 already. This
+/// build opens 2 to 5. A store that never routes stays where it was.
 pub const FORMAT_WITH_ROUTING: u64 = 5;
 
 /// repository `node_id` → the first commit of its `fl/ledger` branch
@@ -104,6 +108,16 @@ const LEDGER_SEGMENTS: TableDefinition<(&str, &str), &str> =
 /// first map written; writing one raises the store to
 /// [`FORMAT_WITH_ROUTING`] in the same transaction.
 const ROUTING: TableDefinition<&str, &str> = TableDefinition::new("routing");
+/// primary IRI → the mark of an escalation under way, as JSON (`Mark`;
+/// routing spec §3.3 step 1). Created by the first mark, which raises the
+/// store to [`FORMAT_WITH_ROUTING`] in the same transaction. While a mark
+/// stands, every write to its item is refused.
+const ESCALATING: TableDefinition<&str, &str> = TableDefinition::new("escalating");
+/// primary IRI → the tombstone of an escalated item, as JSON (`Tombstone`;
+/// routing spec §3.3 step 3). Created by the first tombstone. The item's
+/// row, id, handle and aliases stay: its id still chooses this store, and
+/// its handle still resolves (§2.3).
+const TOMBSTONES: TableDefinition<&str, &str> = TableDefinition::new("tombstones");
 
 const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
@@ -169,6 +183,112 @@ fn alias_primary(
         )));
     };
     Ok((primary, pk.value().to_string()))
+}
+
+/// The primary id and kind behind `id`, read from `ids` — `IDS`, open in
+/// any transaction — following one alias hop through the `ALIASES` table
+/// `aliases` opens in the same one. `"alias"` is an index marker in `IDS`,
+/// not a `Kind`, so it is handled here before `Kind::from_wire` sees it.
+fn locate_in<A: ReadableTable<&'static str, &'static str>>(
+    label: &str,
+    id: &Iri,
+    ids: &impl ReadableTable<&'static str, &'static str>,
+    aliases: impl FnOnce() -> Result<A, StoreError>,
+) -> Result<(Iri, Kind), StoreError> {
+    let Some(v) = ids.get(id.as_str()).map_err(backend)? else {
+        return Err(StoreError::NotOwned {
+            id: id.clone(),
+            searched: vec![label.to_string()],
+        });
+    };
+    let (primary, wire) = if v.value() == "alias" {
+        alias_primary(id, ids, &aliases()?)?
+    } else {
+        (id.clone(), v.value().to_string())
+    };
+    let kind = Kind::from_wire(&wire)
+        .ok_or_else(|| decode(format!("unknown kind `{wire}` for {primary}")))?;
+    Ok((primary, kind))
+}
+
+/// The JSON row `key` names in `table`, if it has one.
+fn json_at<T: serde::de::DeserializeOwned>(
+    table: &impl ReadableTable<&'static str, &'static str>,
+    key: &Iri,
+) -> Result<Option<T>, StoreError> {
+    match table.get(key.as_str()).map_err(backend)? {
+        Some(v) => Ok(Some(serde_json::from_str(v.value()).map_err(decode)?)),
+        None => Ok(None),
+    }
+}
+
+/// The JSON row `key` names in an additive `table`, read inside `tx`. A
+/// table no write has created yet holds nothing.
+fn additive<T: serde::de::DeserializeOwned>(
+    tx: &redb::ReadTransaction,
+    table: TableDefinition<&str, &str>,
+    key: &Iri,
+) -> Result<Option<T>, StoreError> {
+    match tx.open_table(table) {
+        Ok(t) => json_at(&t, key),
+        Err(redb::TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(e) => Err(backend(e)),
+    }
+}
+
+/// [`additive`], inside a write transaction. ⚠ A write transaction's
+/// `open_table` creates the table, so this asks whether it exists first: a
+/// write that only looks for a mark leaves a store that never marked
+/// without the table.
+fn additive_in_write<T: serde::de::DeserializeOwned>(
+    tx: &redb::WriteTransaction,
+    table: TableDefinition<&str, &str>,
+    key: &Iri,
+) -> Result<Option<T>, StoreError> {
+    let exists = tx
+        .list_tables()
+        .map_err(backend)?
+        .any(|t| t.name() == table.name());
+    if !exists {
+        return Ok(None);
+    }
+    json_at(&tx.open_table(table).map_err(backend)?, key)
+}
+
+/// `Escalated` when `primary` has a tombstone, read inside the write
+/// transaction `tx` that is about to write (routing spec §3.6).
+fn refuse_escalated(tx: &redb::WriteTransaction, primary: &Iri) -> Result<(), StoreError> {
+    if let Some(t) = additive_in_write::<Tombstone>(tx, TOMBSTONES, primary)? {
+        return Err(StoreError::Escalated {
+            from: primary.clone(),
+            to: t.to,
+        });
+    }
+    Ok(())
+}
+
+/// Refuse a write to `primary`, a `kind`, inside the write transaction `tx`
+/// that would make it: a tombstoned item is `Escalated`, and a marked one is
+/// `Escalating` — a write would change the copy the escalation is moving
+/// (routing spec §3.3 step 1, §3.6).
+fn refuse_unwritable(
+    tx: &redb::WriteTransaction,
+    primary: &Iri,
+    kind: Kind,
+) -> Result<(), StoreError> {
+    refuse_escalated(tx, primary)?;
+    if additive_in_write::<Mark>(tx, ESCALATING, primary)?.is_some() {
+        return Err(StoreError::Escalating {
+            id: primary.clone(),
+            to_finish: escalate_command(kind, primary),
+        });
+    }
+    Ok(())
+}
+
+/// A new item's id.
+fn mint() -> Result<Iri, StoreError> {
+    Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).map_err(backend)
 }
 
 /// Index `id` as a new item of `kind` and give it the next handle, inside a
@@ -386,8 +506,19 @@ impl RedbStore {
         raise: Option<u64>,
         build: impl FnOnce(Iri) -> T,
     ) -> Result<Iri, StoreError> {
-        let id = Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).map_err(backend)?;
-        self.insert_new_with_id(id, kind, table, raise, build)
+        self.insert_new_with_id(mint()?, kind, table, raise, build)
+    }
+
+    /// `insert_new`, with `build` given the write transaction: what the new
+    /// row depends on is read — and refused — in the write that adds it.
+    fn insert_new_in<T: serde::Serialize>(
+        &self,
+        kind: Kind,
+        table: TableDefinition<&str, &str>,
+        raise: Option<u64>,
+        build: impl FnOnce(&redb::WriteTransaction, Iri) -> Result<T, StoreError>,
+    ) -> Result<Iri, StoreError> {
+        self.insert_in(mint()?, kind, table, raise, build)
     }
 
     /// Mint, index, hand out a handle, and write the row — in ONE write
@@ -411,8 +542,21 @@ impl RedbStore {
         raise: Option<u64>,
         build: impl FnOnce(Iri) -> T,
     ) -> Result<Iri, StoreError> {
-        let json = serde_json::to_string(&build(id.clone())).map_err(backend)?;
+        self.insert_in(id, kind, table, raise, |_, id| Ok(build(id)))
+    }
+
+    /// `insert_new_with_id`'s one write transaction, with `build` run inside
+    /// it: an error from `build` drops the transaction like any other.
+    fn insert_in<T: serde::Serialize>(
+        &self,
+        id: Iri,
+        kind: Kind,
+        table: TableDefinition<&str, &str>,
+        raise: Option<u64>,
+        build: impl FnOnce(&redb::WriteTransaction, Iri) -> Result<T, StoreError>,
+    ) -> Result<Iri, StoreError> {
         let tx = self.db.begin_write().map_err(backend)?;
+        let json = serde_json::to_string(&build(&tx, id.clone())?).map_err(backend)?;
         index_new(&tx, &id, kind)?;
         tx.open_table(table)
             .map_err(backend)?
@@ -437,22 +581,75 @@ impl RedbStore {
     fn locate(&self, id: &Iri) -> Result<(Iri, Kind), StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let ids = tx.open_table(IDS).map_err(backend)?;
-        let Some(v) = ids.get(id.as_str()).map_err(backend)? else {
-            return Err(StoreError::NotOwned {
-                id: id.clone(),
-                searched: vec![self.label.clone()],
-            });
-        };
-        if v.value() == "alias" {
-            let aliases = tx.open_table(ALIASES).map_err(backend)?;
-            let (primary, wire) = alias_primary(id, &ids, &aliases)?;
-            let kind = Kind::from_wire(&wire)
-                .ok_or_else(|| decode(format!("unknown kind `{wire}` for {primary}")))?;
-            return Ok((primary, kind));
+        locate_in(&self.label, id, &ids, || {
+            tx.open_table(ALIASES).map_err(backend)
+        })
+    }
+
+    /// [`Self::locate`], inside the write transaction `tx` that is about to
+    /// write: a check made here holds when the write lands.
+    fn locate_for_write(
+        &self,
+        tx: &redb::WriteTransaction,
+        id: &Iri,
+    ) -> Result<(Iri, Kind), StoreError> {
+        let ids = tx.open_table(IDS).map_err(backend)?;
+        locate_in(&self.label, id, &ids, || {
+            tx.open_table(ALIASES).map_err(backend)
+        })
+    }
+
+    /// The primary `id` names, or `None` when this store does not hold it.
+    fn held(&self, id: &Iri) -> Result<Option<Iri>, StoreError> {
+        match self.locate(id) {
+            Ok((primary, _)) => Ok(Some(primary)),
+            Err(StoreError::NotOwned { .. }) => Ok(None),
+            Err(e) => Err(e),
         }
-        let kind = Kind::from_wire(v.value())
-            .ok_or_else(|| decode(format!("unknown kind `{}` for {id}", v.value())))?;
-        Ok((id.clone(), kind))
+    }
+
+    /// The primary IRIs this store holds a tombstone for: what every list
+    /// leaves out (routing spec §2.4).
+    fn tombstoned(&self) -> Result<BTreeSet<String>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let table = match tx.open_table(TOMBSTONES) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(BTreeSet::new()),
+            Err(e) => return Err(backend(e)),
+        };
+        let mut out = BTreeSet::new();
+        for entry in table.iter().map_err(backend)? {
+            let (k, _) = entry.map_err(backend)?;
+            out.insert(k.value().to_string());
+        }
+        Ok(out)
+    }
+
+    /// Change the row `id` names in `table` with `change` — in ONE write
+    /// transaction that first refuses an escalated or escalating item
+    /// (routing spec §3.3 step 1, §3.6), so nothing lands between the check
+    /// and the write. The row is keyed by the primary, whatever name `id`
+    /// is. `false`, writing nothing, when `table` holds no row for it: an id
+    /// held under another kind.
+    fn rewrite<T: serde::Serialize + serde::de::DeserializeOwned>(
+        &self,
+        table: TableDefinition<&str, &str>,
+        id: &Iri,
+        change: impl FnOnce(T) -> T,
+    ) -> Result<bool, StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        let (primary, kind) = self.locate_for_write(&tx, id)?;
+        refuse_unwritable(&tx, &primary, kind)?;
+        {
+            let mut t = tx.open_table(table).map_err(backend)?;
+            let Some(old) = json_at::<T>(&t, &primary)? else {
+                return Ok(false);
+            };
+            let json = serde_json::to_string(&change(old)).map_err(backend)?;
+            t.insert(primary.as_str(), json.as_str()).map_err(backend)?;
+        }
+        tx.commit().map_err(backend)?;
+        Ok(true)
     }
 
     /// The kind this store holds `id` under, or `NotOwned` naming this store.
@@ -551,6 +748,14 @@ impl RedbStore {
     ) -> Result<Option<T>, StoreError> {
         let (target, _kind) = self.locate(key)?;
         let tx = self.db.begin_read().map_err(backend)?;
+        // An escalated item reads as `Escalated`, under every name it has
+        // (routing spec §3.6).
+        if let Some(t) = additive::<Tombstone>(&tx, TOMBSTONES, &target)? {
+            return Err(StoreError::Escalated {
+                from: target,
+                to: t.to,
+            });
+        }
         let t = tx.open_table(table).map_err(backend)?;
         // `ReadOnlyTable::get_owned` (unlike `Table::get`) keeps the read
         // transaction alive via a reference-counted guard, so the returned
@@ -1097,40 +1302,50 @@ impl Tracker for RedbStore {
     fn list_records(&self, project: &ProjectId) -> Result<Vec<Record>, StoreError> {
         self.check_kind(project.iri(), Kind::Project)?;
         let all: Vec<Record> = self.all_json(RECORDS)?;
-        Ok(all.into_iter().filter(|r| r.project == *project).collect())
+        let gone = self.tombstoned()?;
+        Ok(all
+            .into_iter()
+            .filter(|r| r.project == *project && !gone.contains(r.id.iri().as_str()))
+            .collect())
     }
 
     fn set_record_state(&self, id: &RecordId, state: State) -> Result<(), StoreError> {
-        let mut rec: Record = self
-            .get_record(id)?
-            .ok_or_else(|| StoreError::NoSuchRecord(id.clone()))?;
-        rec.state = state;
-        // Write under `rec.id`, not `id`: `id` may be an alias, and `rec.id`
-        // is always the primary (an alias never changes what a fetched item
-        // reports as its own id). Writing under an alias key would leave a
-        // stray row behind instead of updating the one that exists.
-        self.put_json(RECORDS, rec.id.iri(), &rec)
+        // `rewrite` writes under the primary, not `id`: `id` may be an
+        // alias, and writing under an alias key would leave a stray row
+        // behind instead of updating the one that exists.
+        let changed = self.rewrite(RECORDS, id.iri(), |mut rec: Record| {
+            rec.state = state;
+            rec
+        })?;
+        if !changed {
+            return Err(StoreError::NoSuchRecord(id.clone()));
+        }
+        Ok(())
     }
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         self.check_kind(finding.project.iri(), Kind::Project)?;
-        // `record` may be given as an alias (e.g. the CLI stores whatever
-        // the caller typed): resolve to the primary, so two findings raised
-        // against the same record always agree on which IRI names it.
-        let (record_primary, record_kind) = self.locate(finding.record.iri())?;
-        if record_kind != Kind::Record {
-            return Err(StoreError::WrongKind {
-                id: finding.record.iri().clone(),
-                expected: Kind::Record,
-                found: record_kind,
-            });
-        }
         let raise = finding.area.as_ref().map(|_| FORMAT_WITH_ROUTING);
-        let id = self.insert_new(Kind::Finding, FINDINGS, raise, |id| {
+        let id = self.insert_new_in(Kind::Finding, FINDINGS, raise, |tx, id| {
+            // `record` may be given as an alias (e.g. the CLI stores
+            // whatever the caller typed): resolve to the primary, so two
+            // findings raised against the same record always agree on which
+            // IRI names it.
+            let (record_primary, record_kind) = self.locate_for_write(tx, finding.record.iri())?;
+            if record_kind != Kind::Record {
+                return Err(StoreError::WrongKind {
+                    id: finding.record.iri().clone(),
+                    expected: Kind::Record,
+                    found: record_kind,
+                });
+            }
+            // A marked record takes findings (routing spec §3.3 step 1); an
+            // escalated one is `Escalated`, which the router follows.
+            refuse_escalated(tx, &record_primary)?;
             let mut finding = finding;
             finding.id = FindingId(id);
             finding.record = RecordId(record_primary);
-            finding
+            Ok(finding)
         })?;
         Ok(FindingId(id))
     }
@@ -1157,42 +1372,51 @@ impl Tracker for RedbStore {
     }
 
     fn update_finding(&self, finding: &Finding) -> Result<(), StoreError> {
-        let Some(mut stored) = self.get_finding(&finding.id)? else {
+        let changed = self.rewrite(FINDINGS, finding.id.iri(), |kept: Finding| {
+            // `kept.id` is always the primary: the row is keyed by it. Take
+            // every other field from the caller's version, but keep the id
+            // pinned to the primary — even if `finding.id` (what the caller
+            // passed) is an alias — so an update through an alias still
+            // lands on, and stays keyed by, the primary, rather than writing
+            // a second row under the alias.
+            //
+            // The stored `also_known_as` is kept and the caller's ignored
+            // (see the trait): only `add_alias` adds a name.
+            let mut stored = finding.clone();
+            stored.id = kept.id;
+            stored.also_known_as = kept.also_known_as;
+            // Fixed when the finding is raised (routing spec §1.1; GitHub
+            // tracker spec §6): the caller's copy never changes them.
+            stored.record = kept.record;
+            stored.raised_by = kept.raised_by;
+            stored.security = kept.security;
+            stored.area = kept.area;
+            stored
+        })?;
+        if !changed {
             return Err(StoreError::NoSuchFinding(finding.id.clone()));
-        };
-        // `stored.id` is always the primary: `get_finding` already resolved
-        // any alias before returning it. Take every other field from the
-        // caller's version, but keep the id pinned to the primary — even if
-        // `finding.id` (what the caller passed) is an alias — so an update
-        // through an alias still lands on, and stays keyed by, the primary,
-        // rather than writing a second row under the alias.
-        //
-        // The stored `also_known_as` is kept and the caller's ignored (see
-        // the trait): only `add_alias` adds a name.
-        let primary = stored.id.clone();
-        let kept = std::mem::replace(&mut stored, finding.clone());
-        stored.id = primary.clone();
-        stored.also_known_as = kept.also_known_as;
-        // Fixed when the finding is raised (routing spec §1.1; GitHub
-        // tracker spec §6): the caller's copy never changes them.
-        stored.record = kept.record;
-        stored.raised_by = kept.raised_by;
-        stored.security = kept.security;
-        stored.area = kept.area;
-        self.put_json(FINDINGS, primary.iri(), &stored)
+        }
+        Ok(())
     }
 
     fn list_findings(&self, project: &ProjectId) -> Result<Vec<Finding>, StoreError> {
         self.check_kind(project.iri(), Kind::Project)?;
         let all: Vec<Finding> = self.all_json(FINDINGS)?;
-        Ok(all.into_iter().filter(|f| f.project == *project).collect())
+        let gone = self.tombstoned()?;
+        Ok(all
+            .into_iter()
+            .filter(|f| f.project == *project && !gone.contains(f.id.iri().as_str()))
+            .collect())
     }
 
+    /// An escalated finding is counted by the tier it lives in now.
     fn withdrawals_by(&self, actor: &str) -> Result<u64, StoreError> {
         let all: Vec<Finding> = self.all_json(FINDINGS)?;
+        let gone = self.tombstoned()?;
         Ok(all
             .into_iter()
             .filter(|f| f.raised_by == actor && f.state == FindingState::Withdrawn)
+            .filter(|f| !gone.contains(f.id.iri().as_str()))
             .count() as u64)
     }
 
@@ -1232,6 +1456,10 @@ impl Tracker for RedbStore {
                 (primary.clone(), kind)
             }
         };
+
+        // An alias is a write to the item it names (routing spec §3.3 step
+        // 1, §3.6), checked in this transaction.
+        refuse_unwritable(&tx, &resolved, kind)?;
 
         let table = match kind {
             Kind::Record => RECORDS,
@@ -1287,6 +1515,93 @@ impl Tracker for RedbStore {
 
         tx.commit().map_err(backend)?;
         Ok(())
+    }
+}
+
+/// Each method is one write transaction, or one read: a check made in it
+/// holds when its write lands (routing spec §2.7: the store is opened by
+/// one process at a time).
+impl Escalations for RedbStore {
+    fn mark(&self, id: &Iri, mark: &Mark) -> Result<(), StoreError> {
+        let json = serde_json::to_string(mark).map_err(backend)?;
+        let tx = self.db.begin_write().map_err(backend)?;
+        let (primary, kind) = self.locate_for_write(&tx, id)?;
+        refuse_escalated(&tx, &primary)?;
+        if !matches!(kind, Kind::Record | Kind::Finding) {
+            return Err(StoreError::WrongKind {
+                id: id.clone(),
+                expected: Kind::Record,
+                found: kind,
+            });
+        }
+        if additive_in_write::<Mark>(&tx, ESCALATING, &primary)?.is_some() {
+            return Err(EscalationFault::AlreadyMarked { id: primary, kind }.into());
+        }
+        tx.open_table(ESCALATING)
+            .map_err(backend)?
+            .insert(primary.as_str(), json.as_str())
+            .map_err(backend)?;
+        raise_format(&tx, FORMAT_WITH_ROUTING)?;
+        tx.commit().map_err(backend)
+    }
+
+    fn mark_of(&self, id: &Iri) -> Result<Option<Mark>, StoreError> {
+        let Some(primary) = self.held(id)? else {
+            return Ok(None);
+        };
+        let tx = self.db.begin_read().map_err(backend)?;
+        additive(&tx, ESCALATING, &primary)
+    }
+
+    fn unmark(&self, id: &Iri) -> Result<(), StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        let (primary, _) = self.locate_for_write(&tx, id)?;
+        let removed = tx
+            .open_table(ESCALATING)
+            .map_err(backend)?
+            .remove(primary.as_str())
+            .map_err(backend)?
+            .is_some();
+        if !removed {
+            return Err(EscalationFault::NotMarked { id: primary }.into());
+        }
+        tx.commit().map_err(backend)
+    }
+
+    fn tombstone(&self, id: &Iri, to: &Iri) -> Result<Tombstone, StoreError> {
+        let tx = self.db.begin_write().map_err(backend)?;
+        let (primary, _) = self.locate_for_write(&tx, id)?;
+        // The mark is removed and the tombstone written in this one
+        // transaction: the item is never both, and never neither.
+        let mark: Mark = {
+            let mut t = tx.open_table(ESCALATING).map_err(backend)?;
+            let Some(v) = t.remove(primary.as_str()).map_err(backend)? else {
+                return Err(EscalationFault::NotMarked { id: primary }.into());
+            };
+            serde_json::from_str(v.value()).map_err(decode)?
+        };
+        let tomb = Tombstone {
+            from: primary.clone(),
+            to: to.clone(),
+            by: mark.by,
+            reason: mark.reason,
+            at_ms: mark.at_ms,
+        };
+        let json = serde_json::to_string(&tomb).map_err(backend)?;
+        tx.open_table(TOMBSTONES)
+            .map_err(backend)?
+            .insert(primary.as_str(), json.as_str())
+            .map_err(backend)?;
+        tx.commit().map_err(backend)?;
+        Ok(tomb)
+    }
+
+    fn tombstone_of(&self, id: &Iri) -> Result<Option<Tombstone>, StoreError> {
+        let Some(primary) = self.held(id)? else {
+            return Ok(None);
+        };
+        let tx = self.db.begin_read().map_err(backend)?;
+        additive(&tx, TOMBSTONES, &primary)
     }
 }
 
@@ -2103,6 +2418,27 @@ mod tests {
         fl_core::conformance::all_roles(single);
         fl_core::conformance::local_handles(fresh);
         fl_core::conformance::ledger_cache(fresh);
+    }
+
+    #[test]
+    fn redb_store_meets_the_escalation_contract() {
+        use fl_core::conformance::Single;
+        fl_core::conformance::escalations(|| {
+            let (s, g) = fresh();
+            Single(s, g)
+        });
+    }
+
+    // Routing spec §3.3 step 1: the shared case, run on its own by name.
+    #[test]
+    fn a_marked_item_refuses_every_write_and_a_finding_about_it_is_allowed() {
+        use fl_core::conformance::{EscalationFixture, Single};
+        let (s, g) = fresh();
+        Single(s, g).with_escalations(&mut |b| {
+            fl_core::conformance::a_marked_item_refuses_every_write_and_a_finding_about_it_is_allowed(
+                b,
+            )
+        });
     }
 
     /// A project with one gate and one record, in `s`.
@@ -3022,5 +3358,125 @@ mod tests {
             err.contains("is held by this store, so a finding about it"),
             "{err}"
         );
+    }
+
+    fn sample_mark() -> Mark {
+        Mark {
+            by: "alice".into(),
+            reason: "needs a design review".into(),
+            at_ms: 1_000,
+        }
+    }
+
+    fn issue(n: u64) -> Iri {
+        Iri::parse(&format!("https://github.com/acme/widgets/issues/{n}")).unwrap()
+    }
+
+    // Routing spec §3.3: "running the command again resumes from where it
+    // stopped" — so the mark and the tombstone are the store's, and a new
+    // process reads them back.
+    #[test]
+    fn marks_and_tombstones_survive_a_close_and_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.redb");
+        let (r, f, tomb) = {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let r = s.add_record(&p, "t").unwrap();
+            let f = s
+                .add_finding(Finding::raise(p, r.clone(), "rev", "c"))
+                .unwrap();
+            s.mark(r.iri(), &sample_mark()).unwrap();
+            s.mark(f.iri(), &sample_mark()).unwrap();
+            let tomb = s.tombstone(f.iri(), &issue(7)).unwrap();
+            (r, f, tomb)
+        };
+        let s = RedbStore::open(&path).unwrap();
+        assert_eq!(s.mark_of(r.iri()).unwrap(), Some(sample_mark()));
+        assert_eq!(s.tombstone_of(r.iri()).unwrap(), None);
+        assert_eq!(s.tombstone_of(f.iri()).unwrap(), Some(tomb));
+        assert_eq!(s.mark_of(f.iri()).unwrap(), None);
+        let err = s.set_record_state(&r, State::Doing).unwrap_err();
+        assert!(matches!(err, StoreError::Escalating { .. }), "{err:?}");
+        let err = s.get_finding(&f).unwrap_err();
+        assert!(matches!(err, StoreError::Escalated { .. }), "{err:?}");
+    }
+
+    // Routing spec §1.4, §3.6: an older fl would ignore a mark and let a
+    // write through, so the first mark raises the store to 5. A store that
+    // never marks stays where it was, and holds neither table: a write that
+    // only looks for a mark or a tombstone creates nothing.
+    #[test]
+    fn the_first_mark_raises_the_store_to_format_5_and_a_store_that_never_marks_stays() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.redb");
+        let r = {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            let r = s.add_record(&p, "t").unwrap();
+            let f = s
+                .add_finding(Finding::raise(p, r.clone(), "rev", "c"))
+                .unwrap();
+            s.set_record_state(&r, State::Doing).unwrap();
+            let mut held = s.get_finding(&f).unwrap().unwrap();
+            held.withdraw("not concrete").unwrap();
+            s.update_finding(&held).unwrap();
+            s.add_alias(r.iri(), issue(41)).unwrap();
+            assert_eq!(s.mark_of(r.iri()).unwrap(), None);
+            r
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_VERSION));
+        {
+            let db = redb::Database::open(&path).unwrap();
+            let tx = db.begin_read().unwrap();
+            for table in [ESCALATING, TOMBSTONES] {
+                assert!(
+                    matches!(
+                        tx.open_table(table),
+                        Err(redb::TableError::TableDoesNotExist(_))
+                    ),
+                    "{} was created",
+                    table.name()
+                );
+            }
+        }
+        RedbStore::open(&path)
+            .unwrap()
+            .mark(r.iri(), &sample_mark())
+            .unwrap();
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
+
+        let path = dir.path().join("b.redb");
+        let r = {
+            let s = RedbStore::open(&path).unwrap();
+            let p = s.add_project("/p").unwrap();
+            s.set_ledger_root("node", "abc").unwrap();
+            s.add_record(&p, "t").unwrap()
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_LEDGER_ROOT));
+        RedbStore::open(&path)
+            .unwrap()
+            .mark(r.iri(), &sample_mark())
+            .unwrap();
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_ROUTING));
+    }
+
+    // Routing spec §2.3: a local handle of an escalated item resolves
+    // through its tombstone, so its id, its handle and its row stay, and the
+    // id still chooses this store.
+    #[test]
+    fn an_escalated_items_handle_still_resolves_and_the_store_still_owns_it() {
+        let (s, _d) = fresh();
+        let p = s.add_project("/p").unwrap();
+        let r = s.add_record(&p, "t").unwrap();
+        s.mark(r.iri(), &sample_mark()).unwrap();
+        s.tombstone(r.iri(), &issue(7)).unwrap();
+        assert_eq!(
+            s.resolve_handle(Kind::Record, 1).unwrap(),
+            Some(r.0.clone())
+        );
+        assert_eq!(s.handle_of(Kind::Record, r.iri()).unwrap(), Some(1));
+        assert!(s.owns(r.iri()).unwrap());
+        assert_eq!(s.kind_of(r.iri()).unwrap(), Kind::Record);
     }
 }
