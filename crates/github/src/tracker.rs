@@ -2815,6 +2815,30 @@ mod tests {
         assert_eq!(fake.issue_count(), 1, "exactly one issue");
     }
 
+    /// A 5xx whose body is over the cap is as ambiguous as any other 5xx
+    /// (spec §3.3): the create may have landed, so fl searches by the create
+    /// key before it sends again, and never says "retry later".
+    #[test]
+    fn a_create_answered_5xx_with_a_body_over_the_cap_searches_by_key_before_resending() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake).without_settle();
+        fake.state().gzip_bomb_next = Some(("POST /repos/acme/widgets/issues".into(), 502));
+        t.add_record(&p(), "t").unwrap();
+        assert_eq!(fake.issue_count(), 1, "exactly one issue");
+        let log = fake.state().requests.clone();
+        let creates: Vec<usize> = (log.iter().enumerate())
+            .filter(|(_, r)| *r == "POST /repos/acme/widgets/issues")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(creates.len(), 2, "the create and its one resend: {log:?}");
+        assert!(
+            log[creates[0] + 1..creates[1]]
+                .iter()
+                .any(|r| r.starts_with("POST /graphql")),
+            "a search between them: {log:?}"
+        );
+    }
+
     /// A 201 whose own body cannot be read as an issue
     /// is exactly as ambiguous as a 5xx or a dropped connection (spec §3.3)
     /// — the create may have landed regardless of whether fl could read

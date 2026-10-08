@@ -210,6 +210,11 @@ NAME=ENV:SCHEME` sends `<SCHEME> <value>`. `NAME` must be a header's name, lette
 and `_` — so a token typed in either place is refused, and the refusal does not repeat it. A
 literal header is added by editing the catalog.
 
+The arguments after `--` and the `--url` are recorded as given, and a server's README often
+shows a key as one of them (`--api-key YOUR_KEY`). A by-hand `add` that records either warns that
+it is committed with the catalog, and is public if the repository is, and says to pass a secret
+with `--env NAME` or `--header NAME` instead. The warning does not repeat the arguments or the URL.
+
 Each form of `add` takes its own flags: `--version`, `--package`, `--remote` and `--with` go with
 `--from` only, `--header` with `--url` only, and `--env` with `--from` or a command. Any other is
 refused, naming it, rather than ignored.
@@ -245,7 +250,8 @@ never through a link into a file git tracks or one outside the project. The proj
 reached through a link. It is all or nothing:
 every file is planned before any is written, and one refusal writes nothing.
 The files are written under a lock, each read again before any is written; a file that changed
-since it was planned is refused, and nothing is written. Each file is written to a temporary file
+since it was planned is refused, and nothing is written, and so is a file that has become a link,
+or sits below a directory that has, since the plan. Each file is written to a temporary file
 beside it and renamed over it, keeping its mode.
 
 ### `fl mcp check`
@@ -308,8 +314,11 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
   docker's `-e NAME={secret}`, which becomes `-e NAME` and a reference; a required argument or
   variable with no value; an argument of a type fl does not know. Each refusal names what to do,
   often `fl mcp add <name> -- <command>` by hand. An `upgrade` whose pinned route the new
-  version no longer offers is told to `fl mcp remove` the server and `fl mcp add` it again with
-  `--package <type>` or `--remote`. An `--env` key or a `--with` name that the
+  version no longer offers, or that cannot tell which of several routes to take, is told to
+  `fl mcp remove` the server and `fl mcp add` it again with `--package <type>` or `--remote`, and
+  with `--version` to take the version it was moving to. Adding it again resets every setting of
+  the entry (`enabled`, `vendors`, the `env` values it holds and the `--with` inclusions), so the
+  refusal says to note them first. An `--env` key or a `--with` name that the
   entry does not use is refused too; when it is not a variable's name, the refusal does not
   repeat it.
 * **A secret given as a value.** `--env NAME=value` for a variable the registry marks secret, a
@@ -329,11 +338,14 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
   refusal names the fields that differ, never their values, since a hand-edited entry may hold a
   pasted token. Restore the entry, or run `fl mcp sync --replace <name>`, which shows the same
   difference and writes fl's entry over it. An entry fl wrote that was changed by hand while
-  the catalog no longer wants it is refused too, and `--replace <name>` removes it.
+  the catalog no longer wants it is refused too, and `--replace <name>` removes it. A
+  `--replace` name that matches no refused entry in any file is itself refused, with nothing
+  written, rather than ignored; run `sync` without it to see which entries fl refuses. The refusal
+  repeats a name only when it is a server name.
 * **A file that changed while `sync` planned**, by another program or a person. Run `sync` again.
 * **A vendor file git would commit.** See the `.gitignore` lines above.
 * **A vendor file reached through a link**: the file, or a directory on its way, is a symbolic
-  link.
+  link, whether it was one when `sync` planned or became one before it wrote.
 * **No catalog**, for `sync` and `check`: fl never reads a missing catalog as an empty one, which
   would remove every entry it wrote. `remove`, `enable`, `disable` and `upgrade` refuse a server
   the catalog does not have (there is no server `x`), even when there is no catalog file. **No registry**

@@ -779,6 +779,48 @@ mod tests {
         assert_eq!(fake.ledger_commits(), 1, "nothing landed");
     }
 
+    // A commit answered 5xx says nothing about whether it landed, whatever
+    // the size of the body the 5xx carried: the try is `Unknown`, and the next
+    // reads the ledger before it adds anything (spec §3.2).
+    #[test]
+    fn a_commit_answered_5xx_with_a_body_over_the_cap_is_unknown() {
+        let (fake, local, _root) = world();
+        fake.state().gzip_bomb_next = Some(("createCommitOnBranch".into(), 502));
+        let c = client(&fake);
+        let l = open(&c, &local);
+        l.publish(&batch(1, vec![run(1)], vec![])).unwrap();
+        assert_eq!(
+            l.runs(&gate()).unwrap().len(),
+            1,
+            "landed once, on the retry"
+        );
+        assert_eq!(fake.ledger_commits(), 2, "the start and the retry");
+    }
+
+    // A commit refused with a 403 keeps its own refusal when the body of the
+    // refusal is over the cap: nothing was published, and it is not transient.
+    #[test]
+    fn a_commit_answered_403_with_a_body_over_the_cap_is_the_permission_refusal() {
+        let (fake, local, _root) = world();
+        fake.state().gzip_bomb_next = Some(("createCommitOnBranch".into(), 403));
+        let c = client(&fake);
+        let err = open(&c, &local)
+            .publish(&batch(1, vec![], vec![]))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("403") && msg.contains("nothing was published"),
+            "{msg}"
+        );
+        assert!(msg.contains("grant it"), "{msg}");
+        assert!(!msg.contains("larger than"), "{msg}");
+        assert!(
+            matches!(err, StoreError::Backend(_)) && !err.is_transient(),
+            "{err:?}"
+        );
+        assert_eq!(fake.ledger_commits(), 1);
+    }
+
     // ⚠ Ruling 14, the boundary: `Contended` only when EVERY try found the
     // head moved. Four that did and one answer that said nothing is
     // `Unreachable` — the one lost answer may hide a commit.

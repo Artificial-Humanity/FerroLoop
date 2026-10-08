@@ -396,6 +396,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "fl-core",
+ "flate2",
  "ring",
  "serde",
  "serde_json",

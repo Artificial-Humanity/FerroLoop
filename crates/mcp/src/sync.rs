@@ -71,6 +71,12 @@ pub struct Target {
     /// order first, then the rest by name.
     pub entries: Vec<Entry>,
     canonical: PathBuf,
+    /// The project root as given, the same root canonical, and the vendor's
+    /// file relative to it: what the link check runs on, again, under the
+    /// lock.
+    root: PathBuf,
+    owner: PathBuf,
+    relative: PathBuf,
     /// The file as planned; `None` when it did not exist.
     before: Option<Vec<u8>>,
     /// The file to write; `None` when no entry in it changes.
@@ -281,15 +287,42 @@ pub fn plan(
 ) -> Result<Plan, McpError> {
     let (desired, skipped, warnings) = desired(root, catalog, switches);
     let owner = canonical(root)?;
-    let targets = VendorName::ALL
+    let targets: Vec<Target> = VendorName::ALL
         .into_iter()
         .map(|v| plan_target(root, &owner, v, &desired[&v], records, replace))
         .collect::<Result<_, _>>()?;
+    unmatched_replaces(&targets, replace)?;
     Ok(Plan {
         records: records.to_path_buf(),
         targets,
         skipped,
         warnings,
+    })
+}
+
+/// MCP spec §4.3: a `--replace` name that overwrote an entry in no target
+/// matched nothing, and is refused. A name is repeated only when it is a
+/// server name; any other may be a secret someone pasted (MCP spec §6).
+fn unmatched_replaces(targets: &[Target], replace: &[String]) -> Result<(), McpError> {
+    let replaced: BTreeSet<&str> = targets
+        .iter()
+        .flat_map(|t| &t.entries)
+        .filter(|e| matches!(e.action, Action::Replace { .. }))
+        .map(|e| e.name.as_str())
+        .collect();
+    let unmatched: BTreeSet<&String> = replace
+        .iter()
+        .filter(|n| !replaced.contains(n.as_str()))
+        .collect();
+    if unmatched.is_empty() {
+        return Ok(());
+    }
+    let (names, others): (Vec<&String>, Vec<&String>) = unmatched
+        .into_iter()
+        .partition(|n| crate::catalog::is_server_name(n));
+    Err(McpError::UnmatchedReplace {
+        names: names.into_iter().cloned().collect(),
+        others: others.len(),
     })
 }
 
@@ -308,23 +341,11 @@ fn plan_target(
     // A link would carry fl's write into a file it cannot see whole: one git
     // tracks (the gitignore guard asks about the link's own path), or one
     // outside the project.
-    if let Some(link) = link_in(owner, Path::new(v.target()))? {
-        let problem = if link == Path::new(v.target()) {
-            "it is a symbolic link, and fl writes only plain files it can see whole".to_string()
-        } else {
-            format!(
-                "{} is a symbolic link, and fl writes only plain files it can see whole",
-                root.join(&link).display()
-            )
-        };
-        return Err(McpError::VendorFile(vendor::FileRefusal {
-            path,
-            problem,
-            next: "Replace the link with a plain file or directory, then run `fl mcp sync` again"
-                .into(),
-        }));
+    let relative = PathBuf::from(v.target());
+    if let Some(link) = link_in(owner, &relative)? {
+        return Err(link_refusal(root, &relative, &link));
     }
-    let canonical = canonical(&path)?;
+    let canonical = target_path(owner, &relative);
     let before = read(&canonical, &path)?;
     let mut file = v.open(&path, before.as_deref())?;
     let record_file = record_file(records, &canonical);
@@ -394,6 +415,9 @@ fn plan_target(
         path,
         entries,
         canonical,
+        root: root.to_path_buf(),
+        owner: owner.to_path_buf(),
+        relative,
         after: changed.then(|| file.to_bytes()),
         before,
         record_file,
@@ -498,6 +522,12 @@ pub fn apply(plan: &Plan) -> Result<(), McpError> {
     // Every target read again before any is written: `agy mcp add`, or a
     // person, may have written one since the plan (MCP spec §4.3).
     for target in &work {
+        // ⚠ A link made since the plan would carry the write somewhere the
+        // plan never saw; no byte comparison can tell (a link to nothing
+        // reads as a file that is not there).
+        if let Some(link) = link_in(&target.owner, &target.relative)? {
+            return Err(link_refusal(&target.root, &target.relative, &link));
+        }
         if read(&target.canonical, &target.path)? != target.before {
             return Err(McpError::Changed {
                 path: target.path.clone(),
@@ -758,6 +788,37 @@ fn canonical(path: &Path) -> Result<PathBuf, McpError> {
     }
 }
 
+/// The target's real path: the canonical project root joined with the
+/// vendor's file. ⚠ Never resolved again. Nothing below the owner was a link
+/// when it was checked, so this is where the file is; resolving it here
+/// would follow a link made since that check, and the write would go
+/// wherever the link points. The check under the lock catches such a link
+/// before the write, but only this keeps the plan from naming the
+/// destination.
+fn target_path(owner: &Path, relative: &Path) -> PathBuf {
+    owner.join(relative)
+}
+
+/// A link would carry fl's write into a file it cannot see whole: one git
+/// tracks (the gitignore guard asks about the link's own path), or one
+/// outside the project. `link` is the first one, relative to the project.
+fn link_refusal(root: &Path, relative: &Path, link: &Path) -> McpError {
+    let problem = if link == relative {
+        "it is a symbolic link, and fl writes only plain files it can see whole".to_string()
+    } else {
+        format!(
+            "{} is a symbolic link, and fl writes only plain files it can see whole",
+            root.join(link).display()
+        )
+    };
+    McpError::VendorFile(vendor::FileRefusal {
+        path: root.join(relative),
+        problem,
+        next: "Replace the link with a plain file or directory, then run `fl mcp sync` again"
+            .into(),
+    })
+}
+
 /// The first symbolic link on the way from the canonical project root to
 /// `target`, relative to it: the root itself may be reached through a link,
 /// nothing below it may.
@@ -902,7 +963,11 @@ env.NOTES_TOKEN = { secret = true }
             fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
                 for entry in fs::read_dir(dir).unwrap() {
                     let path = entry.unwrap().path();
-                    if path.is_dir() {
+                    if fs::symlink_metadata(&path).unwrap().is_symlink() {
+                        // A link is recorded by where it points, not followed.
+                        let to = fs::read_link(&path).unwrap();
+                        out.push((path, to.as_os_str().as_encoded_bytes().to_vec()));
+                    } else if path.is_dir() {
                         walk(&path, out);
                     } else if path.file_name().unwrap() != LOCK {
                         out.push((path.clone(), fs::read(&path).unwrap()));
@@ -1307,6 +1372,118 @@ env.NOTES_TOKEN = { secret = true }
         assert_eq!(record["entries"]["notes"]["sha256"], sha(&notes));
     }
 
+    /// The error of planning `text` with these `--replace` names; the plan
+    /// is not printed when there is none.
+    fn refused_replace(f: &Fixture, text: &str, names: &[&str]) -> McpError {
+        let replace: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        match plan(
+            &f.root,
+            &catalog(text),
+            &Switches::default(),
+            &f.records,
+            &replace,
+        ) {
+            Ok(_) => panic!("a `--replace` that matches no refused entry was planned"),
+            Err(e) => e,
+        }
+    }
+
+    // MCP spec §4.3: a `--replace` that names no refused entry would be
+    // ignored, and the person would think the entry was overwritten. It is
+    // refused before anything is written.
+    #[test]
+    fn a_replace_that_matches_no_refused_entry_is_refused_and_nothing_is_written() {
+        let f = fixture();
+        f.sync(CATALOG);
+        let docs = "https://docs.example.com/mcp";
+        f.edit(VendorName::Claude, docs, "https://docs.example.com/v2");
+        let before = f.snapshot();
+
+        // A name nothing has, and the name of an entry that is not refused.
+        for name in ["nosuch", "notes"] {
+            let err = refused_replace(&f, CATALOG, &[name]);
+            assert!(matches!(err, McpError::UnmatchedReplace { .. }), "{err:?}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("`--replace` names `{name}`")),
+                "{msg}"
+            );
+            assert!(msg.contains("nothing was written"), "{msg}");
+            assert!(msg.contains("Run `fl mcp sync` without it"), "{msg}");
+        }
+        // A name that matches does not excuse one that does not; only the
+        // one that does not is named.
+        let msg = refused_replace(&f, CATALOG, &["docs", "nosuch"]).to_string();
+        assert!(msg.contains("`nosuch`") && !msg.contains("`docs`"), "{msg}");
+        assert_eq!(f.snapshot(), before);
+        // The one that matches is replaced.
+        let replace = vec!["docs".to_string()];
+        let plan = plan(
+            &f.root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            &f.records,
+            &replace,
+        );
+        apply(&plan.unwrap()).unwrap();
+        assert_eq!(
+            f.entry(VendorName::Claude, "docs"),
+            Some(rendered(VendorName::Claude, CATALOG, "docs"))
+        );
+    }
+
+    // One name is "that name", several are "those names".
+    #[test]
+    fn the_unmatched_replace_message_agrees_with_the_number_of_names() {
+        let f = fixture();
+        f.sync(CATALOG);
+        let one = refused_replace(&f, CATALOG, &["nosuch"]).to_string();
+        assert!(one.contains("refused an entry by that name."), "{one}");
+        let one = refused_replace(&f, CATALOG, &["ghp_example0token"]).to_string();
+        assert!(one.contains("refused an entry by that name."), "{one}");
+        let two = refused_replace(&f, CATALOG, &["nosuch", "other"]).to_string();
+        assert!(two.contains("`nosuch`, `other`"), "{two}");
+        assert!(two.contains("refused an entry by those names."), "{two}");
+        let mixed = refused_replace(&f, CATALOG, &["nosuch", "Other_Token"]).to_string();
+        assert!(
+            mixed.contains("refused an entry by those names."),
+            "{mixed}"
+        );
+        let twice = refused_replace(&f, CATALOG, &["nosuch", "nosuch"]).to_string();
+        assert!(twice.contains("refused an entry by that name."), "{twice}");
+    }
+
+    // A name that is not a server name may be a secret someone pasted: it is
+    // counted, never repeated (MCP spec §6).
+    #[test]
+    fn a_replace_name_that_is_not_a_server_name_is_not_repeated() {
+        let f = fixture();
+        f.sync(CATALOG);
+        let long = "a".repeat(33);
+        for token in [
+            "ghp_example0token",
+            "Sk-Example0Token",
+            "a b",
+            "",
+            long.as_str(),
+        ] {
+            let msg = refused_replace(&f, CATALOG, &[token, "nosuch"]).to_string();
+            assert!(msg.contains("`nosuch`"), "{msg}");
+            assert!(msg.contains("a name that is not a server name"), "{msg}");
+            assert!(!msg.to_lowercase().contains("example0token"), "{msg}");
+            assert!(!msg.contains("a b") && !msg.contains(&long), "{msg}");
+        }
+        let msg = refused_replace(&f, CATALOG, &["ghp_example0token", "Other_Token"]).to_string();
+        assert!(
+            msg.contains("`--replace` names 2 names that are not server names"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Other_Token") && !msg.contains("ghp_"),
+            "{msg}"
+        );
+    }
+
     #[test]
     fn a_disabled_server_is_removed_from_every_vendor_file_it_was_in() {
         let f = fixture();
@@ -1539,6 +1716,97 @@ env.NOTES_TOKEN = { secret = true }
             &[],
         );
         apply(&plan.unwrap()).unwrap();
+        assert!(f.read(VendorName::Claude).unwrap().contains("notes"));
+    }
+
+    // The path a target is planned at is the owner joined with the vendor's
+    // file, never the link's destination: with a link already in place, it is
+    // still where the file would be in the project.
+    #[test]
+    fn a_targets_path_is_the_owner_joined_with_the_file_never_a_links_destination() {
+        let f = fixture();
+        let owner = fs::canonicalize(&f.root).unwrap();
+        let elsewhere = f.dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, f.root.join(".codex")).unwrap();
+        let relative = Path::new(".codex/config.toml");
+        assert_eq!(
+            target_path(&owner, relative),
+            owner.join(".codex/config.toml")
+        );
+        // What resolving it would have given.
+        let resolved = canonical(&owner.join(relative)).unwrap();
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&elsewhere).unwrap().join("config.toml")
+        );
+        assert_ne!(target_path(&owner, relative), resolved);
+    }
+
+    // MCP spec §4.3: the link check runs again under the lock. A link made
+    // between the plan and the write, on the file or on a directory above it,
+    // is refused with the plan's own refusal, and nothing is written there or
+    // anywhere else.
+    #[test]
+    fn a_link_made_between_the_plan_and_the_write_is_refused_and_nothing_is_written() {
+        let f = fixture();
+        let elsewhere = f.dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        // A link to a file that does not exist: its bytes read as `None`, as
+        // the planned file's did.
+        let outside = elsewhere.join("mcp.json");
+        let next = "Replace the link with a plain file or directory, then run `fl mcp sync` again";
+        let apply_refused = |plan: &Plan| match apply(plan) {
+            Ok(()) => panic!("a plan whose target became a link was applied"),
+            Err(e) => e.to_string(),
+        };
+
+        // The file itself becomes a link to a file outside the project.
+        let planned = f.plan(CATALOG);
+        assert!(planned.targets().iter().all(|t| t.changes()));
+        std::os::unix::fs::symlink(&outside, f.path(VendorName::Claude)).unwrap();
+        let before = f.snapshot();
+        assert_eq!(
+            apply_refused(&planned),
+            format!(
+                "{}: it is a symbolic link, and fl writes only plain files it can see whole. \
+                 {next}",
+                f.path(VendorName::Claude).display()
+            )
+        );
+        assert_eq!(f.snapshot(), before);
+        assert!(!outside.exists(), "nothing is written through the link");
+        assert!(
+            fs::symlink_metadata(f.path(VendorName::Claude))
+                .unwrap()
+                .is_symlink()
+        );
+        assert_eq!(f.read(VendorName::Codex), None);
+        assert_eq!(f.read(VendorName::Antigravity), None);
+        fs::remove_file(f.path(VendorName::Claude)).unwrap();
+
+        // A directory above a file that does not exist yet becomes a link to
+        // a directory outside the project: `None == None` once passed.
+        let planned = f.plan(CATALOG);
+        let dir = elsewhere.join("codex");
+        fs::create_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(&dir, f.root.join(".codex")).unwrap();
+        let before = f.snapshot();
+        let msg = apply_refused(&planned);
+        assert!(
+            msg.contains(&format!(
+                "{} is a symbolic link, and fl writes only plain files it can see whole",
+                f.root.join(".codex").display()
+            )),
+            "{msg}"
+        );
+        assert_eq!(f.snapshot(), before);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(f.read(VendorName::Claude), None);
+        assert_eq!(f.read(VendorName::Antigravity), None);
+        // With the link gone, the same plan writes.
+        fs::remove_file(f.root.join(".codex")).unwrap();
+        apply(&f.plan(CATALOG)).unwrap();
         assert!(f.read(VendorName::Claude).unwrap().contains("notes"));
     }
 

@@ -330,6 +330,47 @@ fn check_exits_0_when_synced_1_after_a_catalog_change_and_2_on_a_refusal() {
     assert_eq!(w.read(CLAUDE), edited);
 }
 
+// MCP spec §4.3: a `--replace` that matches no refused entry is refused, with
+// nothing written; a name that is not a server name is never repeated.
+#[test]
+fn a_replace_that_matches_no_refused_entry_is_refused_writing_nothing() {
+    let w = World::new();
+    w.with_registry();
+    w.ok(&["add", "notes", "--from", fake::NOTES]);
+    w.ok(&["sync"]);
+    let edited = w.read(CLAUDE).replace("notes-mcp@1.2.0", "notes-mcp@9.9.9");
+    fs::write(w.app().join(CLAUDE), &edited).unwrap();
+    let before = listing(w.home());
+
+    let (out, err) = w.refused(&["sync", "--replace", "nosuch"]);
+    assert!(
+        err.contains("`--replace` names `nosuch`") && err.contains("Run `fl mcp sync` without it"),
+        "{err}"
+    );
+    assert!(
+        out.is_empty(),
+        "no plan is printed for a refused flag: {out}"
+    );
+    assert_eq!(listing(w.home()), before, "nothing is written");
+    // The refused entry is not the one named: still refused, still nothing.
+    let (_, err) = w.refused(&["sync", "--replace", "nosuch", "--replace", "notes"]);
+    assert!(
+        err.contains("`nosuch`") && !err.contains("`notes`"),
+        "{err}"
+    );
+    assert_eq!(listing(w.home()), before, "nothing is written");
+
+    // A token where a name goes is counted, never repeated.
+    let (_, err) = w.refused(&["sync", "--replace", "ghp_example0token"]);
+    assert!(err.contains("a name that is not a server name"), "{err}");
+    assert!(!err.to_lowercase().contains("example0token"), "{err}");
+    assert_eq!(listing(w.home()), before, "nothing is written");
+
+    // The name of the entry that was refused still overwrites it.
+    w.ok(&["sync", "--replace", "notes"]);
+    assert!(w.read(CLAUDE).contains("notes-mcp@1.2.0"));
+}
+
 #[test]
 fn disable_then_sync_removes_the_server_from_every_file_and_enable_brings_it_back() {
     let w = World::new();
@@ -608,6 +649,58 @@ fn add_by_hand_records_a_command_and_a_remote_with_secret_headers_by_reference()
     let catalog = w.read(CATALOG);
     assert!(!catalog.contains("leak"));
     assert!(!catalog.contains("c2VjcmV0dG9rZW4"), "{catalog}");
+}
+
+// MCP spec §6: arguments after `--` and `--url` are recorded as given, and a
+// server's README often shows a key as an argument. A by-hand add that records
+// either warns once, without repeating it; one that records neither is quiet.
+#[test]
+fn a_by_hand_add_warns_that_its_arguments_and_url_are_committed() {
+    const PHRASE: &str = "recorded as given";
+    let w = World::new();
+    w.with_registry();
+
+    let (_, err) = w.ok(&[
+        "add",
+        "local",
+        "--",
+        "node",
+        "server.js",
+        "--api-key",
+        "sk-example0key",
+    ]);
+    assert_eq!(err.matches(PHRASE).count(), 1, "{err}");
+    assert!(
+        err.contains("committed with the catalog") && err.contains("`--env NAME`"),
+        "{err}"
+    );
+    assert!(!err.to_lowercase().contains("example0key"), "{err}");
+    assert!(
+        !err.contains("server.js") && !err.contains("--api-key"),
+        "{err}"
+    );
+
+    let (_, err) = w.ok(&[
+        "add",
+        "docs",
+        "--url",
+        "https://example.com/mcp?key=example0key",
+    ]);
+    assert_eq!(err.matches(PHRASE).count(), 1, "{err}");
+    assert!(
+        err.contains("committed with the catalog") && err.contains("`--header NAME`"),
+        "{err}"
+    );
+    assert!(!err.to_lowercase().contains("example0key"), "{err}");
+    assert!(!err.contains("example.com"), "{err}");
+
+    // Neither: a bare command, with a variable by name, is quiet.
+    let (_, err) = w.ok(&["add", "bare", "--env", "API_TOKEN", "--", "node"]);
+    assert!(!err.contains(PHRASE), "{err}");
+    // The literal-value warning is its own, and still said once alongside.
+    let (_, err) = w.ok(&["add", "mixed", "--env", "LOG=debug", "--", "node", "x"]);
+    assert_eq!(err.matches(PHRASE).count(), 1, "{err}");
+    assert_eq!(err.matches("is a literal value").count(), 1, "{err}");
 }
 
 // `upgrade` takes `--env` and `--with` for what the new version needs, so
@@ -981,7 +1074,12 @@ fn no_fl_mcp_command_creates_or_opens_a_store() {
     w.ok(&["upgrade", "notes"]);
     w.ok(&["sync"]);
     w.run(&["check"]);
+    // A hand edit is refused, and `--replace` overwrites it.
+    let edited = w.read(CLAUDE).replace("notes-mcp@1.2.0", "notes-mcp@9.9.9");
+    assert_ne!(edited, w.read(CLAUDE), "the entry was edited");
+    fs::write(w.app().join(CLAUDE), edited).unwrap();
     w.ok(&["sync", "--replace", "notes"]);
+    assert!(w.read(CLAUDE).contains("notes-mcp@1.2.0"));
     w.ok(&["remove", "local"]);
     assert!(
         !w.home().join("data").exists(),
