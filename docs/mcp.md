@@ -250,7 +250,8 @@ never through a link into a file git tracks or one outside the project. The proj
 reached through a link. It is all or nothing:
 every file is planned before any is written, and one refusal writes nothing.
 The files are written under a lock, each read again before any is written; a file that changed
-since it was planned is refused, and nothing is written. Each file is written to a temporary file
+since it was planned is refused, and nothing is written, and so is a file that has become a link,
+or sits below a directory that has, since the plan. Each file is written to a temporary file
 beside it and renamed over it, keeping its mode.
 
 ### `fl mcp check`
@@ -341,7 +342,7 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
 * **A file that changed while `sync` planned**, by another program or a person. Run `sync` again.
 * **A vendor file git would commit.** See the `.gitignore` lines above.
 * **A vendor file reached through a link**: the file, or a directory on its way, is a symbolic
-  link.
+  link, whether it was one when `sync` planned or became one before it wrote.
 * **No catalog**, for `sync` and `check`: fl never reads a missing catalog as an empty one, which
   would remove every entry it wrote. `remove`, `enable`, `disable` and `upgrade` refuse a server
   the catalog does not have (there is no server `x`), even when there is no catalog file. **No registry**
