@@ -210,6 +210,11 @@ NAME=ENV:SCHEME` sends `<SCHEME> <value>`. `NAME` must be a header's name, lette
 and `_` — so a token typed in either place is refused, and the refusal does not repeat it. A
 literal header is added by editing the catalog.
 
+The arguments after `--` and the `--url` are recorded as given, and a server's README often
+shows a key as one of them (`--api-key YOUR_KEY`). A by-hand `add` that records either warns that
+it is committed with the catalog, and is public if the repository is, and says to pass a secret
+with `--env NAME` or `--header NAME` instead. The warning does not repeat the arguments or the URL.
+
 Each form of `add` takes its own flags: `--version`, `--package`, `--remote` and `--with` go with
 `--from` only, `--header` with `--url` only, and `--env` with `--from` or a command. Any other is
 refused, naming it, rather than ignored.

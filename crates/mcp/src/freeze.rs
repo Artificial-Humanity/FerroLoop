@@ -951,6 +951,30 @@ pub fn literal_warnings(server: &Server) -> Vec<String> {
         .collect()
 }
 
+/// The warning for what a server added by hand records as given: the
+/// arguments after `--` and the `--url`. A server's README often shows a key
+/// there, and both are committed with the catalog (MCP spec §6). Says what is
+/// recorded, never its text.
+pub fn by_hand_warnings(server: &Server) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if server.args.as_ref().is_some_and(|a| !a.is_empty()) {
+        warnings.push(
+            "the arguments after `--` are recorded as given: they are committed with the \
+             catalog, and are public if the repository is. Pass a secret with `--env NAME`, \
+             not as an argument"
+                .to_string(),
+        );
+    }
+    if server.url.is_some() {
+        warnings.push(
+            "the `--url` is recorded as given: it is committed with the catalog, and is \
+             public if the repository is. Pass a secret with `--header NAME`, not in the URL"
+                .to_string(),
+        );
+    }
+    warnings
+}
+
 /// An HTTP authentication scheme, such as `Bearer`: one token of letters,
 /// digits and `-`. `fl mcp add --header` takes a header name in the same
 /// shape.

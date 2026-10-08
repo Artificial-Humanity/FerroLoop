@@ -610,6 +610,58 @@ fn add_by_hand_records_a_command_and_a_remote_with_secret_headers_by_reference()
     assert!(!catalog.contains("c2VjcmV0dG9rZW4"), "{catalog}");
 }
 
+// MCP spec §6: arguments after `--` and `--url` are recorded as given, and a
+// server's README often shows a key as an argument. A by-hand add that records
+// either warns once, without repeating it; one that records neither is quiet.
+#[test]
+fn a_by_hand_add_warns_that_its_arguments_and_url_are_committed() {
+    const PHRASE: &str = "recorded as given";
+    let w = World::new();
+    w.with_registry();
+
+    let (_, err) = w.ok(&[
+        "add",
+        "local",
+        "--",
+        "node",
+        "server.js",
+        "--api-key",
+        "sk-example0key",
+    ]);
+    assert_eq!(err.matches(PHRASE).count(), 1, "{err}");
+    assert!(
+        err.contains("committed with the catalog") && err.contains("`--env NAME`"),
+        "{err}"
+    );
+    assert!(!err.to_lowercase().contains("example0key"), "{err}");
+    assert!(
+        !err.contains("server.js") && !err.contains("--api-key"),
+        "{err}"
+    );
+
+    let (_, err) = w.ok(&[
+        "add",
+        "docs",
+        "--url",
+        "https://example.com/mcp?key=example0key",
+    ]);
+    assert_eq!(err.matches(PHRASE).count(), 1, "{err}");
+    assert!(
+        err.contains("committed with the catalog") && err.contains("`--header NAME`"),
+        "{err}"
+    );
+    assert!(!err.to_lowercase().contains("example0key"), "{err}");
+    assert!(!err.contains("example.com"), "{err}");
+
+    // Neither: a bare command, with a variable by name, is quiet.
+    let (_, err) = w.ok(&["add", "bare", "--env", "API_TOKEN", "--", "node"]);
+    assert!(!err.contains(PHRASE), "{err}");
+    // The literal-value warning is its own, and still said once alongside.
+    let (_, err) = w.ok(&["add", "mixed", "--env", "LOG=debug", "--", "node", "x"]);
+    assert_eq!(err.matches(PHRASE).count(), 1, "{err}");
+    assert_eq!(err.matches("is a literal value").count(), 1, "{err}");
+}
+
 // `upgrade` takes `--env` and `--with` for what the new version needs, so
 // the remedies its own refusals name work.
 #[test]

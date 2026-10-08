@@ -414,7 +414,8 @@ fn add_by_hand(root: &Path, add: Add) -> Result<()> {
     let mut editor = Editor::open(root)?;
     editor.add(&add.name, &server)?;
     editor.save()?;
-    let warnings = freeze::literal_warnings(&server);
+    let mut warnings = freeze::literal_warnings(&server);
+    warnings.extend(freeze::by_hand_warnings(&server));
     let secrets: Vec<String> = (server.secret_vars().into_iter())
         .map(str::to_string)
         .collect();
