@@ -5,7 +5,7 @@
 //! network: these functions take what the registry client read.
 
 use crate::McpError;
-use crate::catalog::{EnvValue, HeaderValue, Server, Transport, is_env_name};
+use crate::catalog::{EnvValue, HeaderValue, Server, Transport, is_env_name, is_variable_name};
 use crate::registry::{
     Argument, ArgumentKind, Input, KeyValueInput, Package, RegistryType, Remote, ServerJson,
     ServerResponse, Status, TransportKind, has_unseen, printable,
@@ -200,16 +200,34 @@ fn freeze_entry(resp: &ServerResponse, opts: &FreezeOptions) -> Result<Frozen, R
     };
     for k in opts.env.keys() {
         if !b.env_names.contains(k) {
+            // A key that is not a variable's name may be a token pasted by
+            // mistake: it is not repeated (MCP spec §6).
+            let problem = match is_variable_name(k) {
+                true => format!("`--env {k}=…` names no environment variable of this launch route"),
+                false => "an `--env` key that is not a variable's name names no environment \
+                          variable of this launch route, and fl does not repeat it"
+                    .to_string(),
+            };
             return refuse(
-                format!("`--env {k}=…` names no environment variable of this launch route"),
+                problem,
                 "Drop it, or check its name against the registry entry",
             );
         }
     }
     for k in &opts.with {
         if !b.with_keys.contains(k) {
+            let problem = match is_variable_name(k) {
+                true => {
+                    format!(
+                        "`--with {k}` names no optional argument or variable that needs a secret"
+                    )
+                }
+                false => "a `--with` name that is not a variable's name names no optional \
+                          argument or variable that needs a secret, and fl does not repeat it"
+                    .to_string(),
+            };
             return refuse(
-                format!("`--with {k}` names no optional argument or variable that needs a secret"),
+                problem,
                 "Drop it, or check its name against the registry entry",
             );
         }
@@ -2094,6 +2112,26 @@ mod tests {
                     o.with.insert("SAMPLE_NOPE".to_string());
                 }),
                 "`--with SAMPLE_NOPE` names no optional argument or variable that needs a secret",
+                "Drop it",
+            ),
+            (
+                "an --env key that is no variable's name",
+                plain(json!([npm(json!({}))])),
+                opts_with(&|o| {
+                    o.env.insert(VALUE.to_string(), "x".to_string());
+                }),
+                "an `--env` key that is not a variable's name names no environment variable of \
+                 this launch route, and fl does not repeat it",
+                "Drop it",
+            ),
+            (
+                "a --with name that is no variable's name",
+                plain(json!([npm(json!({}))])),
+                opts_with(&|o| {
+                    o.with.insert(VALUE.to_string());
+                }),
+                "a `--with` name that is not a variable's name names no optional argument or \
+                 variable that needs a secret, and fl does not repeat it",
                 "Drop it",
             ),
             (

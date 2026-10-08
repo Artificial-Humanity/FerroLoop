@@ -10,7 +10,9 @@ use clap::{Args, Subcommand, ValueEnum};
 use fl_exec::git::Git;
 use fl_exec::population::ExecError;
 use fl_mcp::McpError;
-use fl_mcp::catalog::{Catalog, Editor, EnvValue, HeaderValue, Server, Transport, VendorName};
+use fl_mcp::catalog::{
+    Catalog, Editor, EnvValue, HeaderValue, Server, Transport, VendorName, is_variable_name,
+};
 use fl_mcp::freeze::{self, FreezeOptions, Route};
 use fl_mcp::registry::{Registry, printable};
 use fl_mcp::sync::{self, Action, Plan, Switches};
@@ -330,7 +332,7 @@ fn literals(given: &[String], with: &str) -> Result<BTreeMap<String, String>> {
     for given in given {
         let Some((name, value)) = given.split_once('=') else {
             // A token pasted where a name goes is never repeated (MCP spec §6).
-            if !is_variable(given) {
+            if !is_variable_name(given) {
                 bail!(
                     "an `--env` with no `=` needs `=<value>` with {with}, and this one is not a \
                      variable's name, so fl does not repeat it. The registry says which \
@@ -355,7 +357,7 @@ fn add_by_hand(root: &Path, add: Add) -> Result<()> {
         let (name, value) = match given.split_once('=') {
             // The part before `=` is a variable's name: a token pasted there
             // is refused, and never repeated (MCP spec §6).
-            Some((name, _)) if !is_variable(name) => bail!(
+            Some((name, _)) if !is_variable_name(name) => bail!(
                 "`--env <NAME>=<value>` needs an environment variable's name before the `=` \
                  (capital letters, digits and `_`); this one is not such a name, so fl does \
                  not repeat it"
@@ -363,7 +365,7 @@ fn add_by_hand(root: &Path, add: Add) -> Result<()> {
             Some((name, value)) => (name, EnvValue::Literal(value.to_string())),
             // A secret reference: the name is the variable, so a token pasted
             // here is refused, and never repeated (MCP spec §6).
-            None if !is_variable(given) => bail!(
+            None if !is_variable_name(given) => bail!(
                 "`--env` with no `=` names a secret's environment variable (capital letters, \
                  digits and `_`), never a value; this one is not such a name. fl records a \
                  secret by reference: put the value in that variable, and name the variable"
@@ -447,7 +449,7 @@ fn header(server: &str, given: &str) -> Result<(String, HeaderValue)> {
                 Some((env, scheme)) => (env, Some(scheme)),
                 None => (rest, None),
             };
-            if !is_variable(env) || !scheme.is_none_or(freeze::is_scheme) {
+            if !is_variable_name(env) || !scheme.is_none_or(freeze::is_scheme) {
                 bail!(
                     "`--header {name}=…`: after `=` comes the name of an environment variable \
                      (capital letters, digits and `_`), then optionally `:` and a scheme such \
@@ -460,17 +462,6 @@ fn header(server: &str, given: &str) -> Result<(String, HeaderValue)> {
         }
     };
     Ok((name.to_string(), HeaderValue::Secret { env, scheme }))
-}
-
-/// A variable's name as `--header` and `--env NAME` take it: capital letters,
-/// digits and `_`, not starting with a digit. Stricter than the catalog's
-/// rule, so a pasted token is not taken for a name.
-fn is_variable(s: &str) -> bool {
-    let mut bytes = s.bytes();
-    bytes
-        .next()
-        .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
-        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 /// What `add` says: the launch it recorded, the warnings and notes the

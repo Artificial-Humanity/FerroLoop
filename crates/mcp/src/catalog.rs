@@ -276,6 +276,18 @@ pub fn is_env_name(name: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// `[A-Z_][A-Z0-9_]*`: a variable's name as fl asks a person to type one
+/// (`fl mcp add --env`, `--header`). Stricter than [`is_env_name`], so a
+/// token a person pastes by mistake is not taken for a name, and a message
+/// repeats a name only when it passes this (MCP spec §6).
+pub fn is_variable_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+}
+
 /// Why fl will not read a registry at `url`, as a clause. A registry is read
 /// over https, or over http to this machine only, and never with a user name
 /// or password in the URL (MCP spec §3.1).
@@ -967,6 +979,26 @@ env.LOG_LEVEL = "info"
         assert_eq!(c.servers["github"].literal_values(), ["env.LOG_LEVEL"]);
         assert_eq!(c.servers["docs"].literal_values(), ["headers.X-Team"]);
         assert!(c.servers["events"].literal_values().is_empty());
+    }
+
+    #[test]
+    fn a_variable_name_as_fl_asks_for_one_is_capitals_digits_and_underscores() {
+        for ok in ["A", "_", "GITHUB_TOKEN", "_TOKEN_2"] {
+            assert!(is_variable_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "2A",
+            "a",
+            "Ab",
+            "Api_Token",
+            "ghp_example0token",
+            "c2VjcmV0dG9rZW4",
+            "A B",
+            "A-B",
+        ] {
+            assert!(!is_variable_name(bad), "{bad}");
+        }
     }
 
     #[test]

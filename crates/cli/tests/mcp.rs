@@ -692,6 +692,17 @@ fn upgrade_takes_env_and_with_for_what_the_new_version_needs() {
         "{err}"
     );
     assert!(!err.to_lowercase().contains("example0token"), "{err}");
+    // A token pasted as the key of `--env KEY=…` or as a `--with` name,
+    // which the freeze refuses because the version has no such variable, is
+    // not repeated either.
+    for flag in [
+        ["--env", "ghp_example0token=x"],
+        ["--with", "ghp_example0token"],
+    ] {
+        let (_, err) = w.refused(&["upgrade", "full", "--to", "2.0.0", flag[0], flag[1]]);
+        assert!(err.contains("and fl does not repeat it"), "{flag:?}: {err}");
+        assert!(!err.to_lowercase().contains("example0token"), "{err}");
+    }
 }
 
 #[test]
