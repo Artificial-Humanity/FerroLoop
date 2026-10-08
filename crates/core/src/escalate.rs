@@ -141,6 +141,12 @@ fn body_parts(out: &Outgoing, by: &str, reason: &str) -> Vec<(&'static str, usiz
                     SHOWN + KEPT,
                 ));
             }
+            // Who raised it, and who it is assigned to, are kept in the
+            // block; both are names a person typed, with no bound of their
+            // own.
+            parts.push(("the name of who raised it", finding.raised_by.len(), KEPT));
+            let assignee = finding.assigned_to.as_deref().map_or(0, str::len);
+            parts.push(("the name of who it is assigned to", assignee, KEPT));
             &finding.also_known_as
         }
     };
@@ -1345,8 +1351,9 @@ mod tests {
         };
         // The claim is shown as written; the record's title, who and why
         // are shown escaped and kept in the block, at most fourteen bytes a
-        // byte: 14 + 70 + 224 bytes beside the claim.
-        let fits = ESCALATION_BODY_BUDGET - 14 - 5 * 14 - 16 * 14;
+        // byte, and who raised it is kept in the block, at most six: 14 +
+        // 70 + 224 + 18 bytes beside the claim.
+        let fits = ESCALATION_BODY_BUDGET - 14 - 5 * 14 - 16 * 14 - 3 * 6;
         let long = finding(&"a".repeat(fits + 1));
         let err = w.refused(long.iri(), Kind::Finding);
         assert_eq!(
@@ -1370,7 +1377,7 @@ mod tests {
         // written: beside it, a claim may take what a local record's title
         // would.
         let escalated = w.record(Some("code"), &"t".repeat(ISSUE_TITLE_MAX));
-        let claim = "a".repeat(ESCALATION_BODY_BUDGET - 5 * 14 - 16 * 14);
+        let claim = "a".repeat(ESCALATION_BODY_BUDGET - 5 * 14 - 16 * 14 - 3 * 6);
         let mut f = Finding::raise(w.p.clone(), escalated.clone(), "bob", &claim);
         f.area = Some("code".into());
         let f = w.local.add_finding(f).unwrap();
@@ -1391,6 +1398,25 @@ mod tests {
             let err = w.run_as(s.iri(), Kind::Record, &by, &why, NOW).unwrap_err();
             assert_eq!(too_long(&err).0, what, "{err}");
             assert_eq!(w.local.mark_of(s.iri()).unwrap(), None);
+        }
+
+        // Who raised a finding, and who it is assigned to, kept in the
+        // block.
+        for (raiser, assignee, what) in [
+            ("r".repeat(9_000), None, "the name of who raised it"),
+            (
+                "bob".to_string(),
+                Some("a".repeat(9_000)),
+                "the name of who it is assigned to",
+            ),
+        ] {
+            let mut f = Finding::raise(w.p.clone(), r.clone(), &raiser, "c");
+            f.area = Some("code".into());
+            f.assigned_to = assignee;
+            let f = w.local.add_finding(f).unwrap();
+            let err = w.run(f.iri(), Kind::Finding).unwrap_err();
+            assert_eq!(too_long(&err).0, what, "{err}");
+            assert_eq!(w.local.mark_of(f.iri()).unwrap(), None);
         }
 
         // Its aliases, kept in the block.
