@@ -316,8 +316,9 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
   often `fl mcp add <name> -- <command>` by hand. An `upgrade` whose pinned route the new
   version no longer offers, or that cannot tell which of several routes to take, is told to
   `fl mcp remove` the server and `fl mcp add` it again with `--package <type>` or `--remote`, and
-  with `--version` to take the version it was moving to. Adding it again resets the entry's
-  `enabled` and `vendors` settings, so the refusal says to note them first. An `--env` key or a `--with` name that the
+  with `--version` to take the version it was moving to. Adding it again resets every setting of
+  the entry (`enabled`, `vendors`, the `env` values it holds and the `--with` inclusions), so the
+  refusal says to note them first. An `--env` key or a `--with` name that the
   entry does not use is refused too; when it is not a variable's name, the refusal does not
   repeat it.
 * **A secret given as a value.** `--env NAME=value` for a variable the registry marks secret, a

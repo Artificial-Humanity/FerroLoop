@@ -342,13 +342,15 @@ impl Offer<'_> {
 /// What an `upgrade` that cannot pick a route says to do instead (MCP spec
 /// §3.3): remove the entry and add it again by a route, at the version it was
 /// moving to. Adding it again starts a new entry, so its `enabled` and
-/// `vendors` settings are not carried over.
+/// `vendors` settings, and the literal `env` values and `--with` inclusions
+/// an `upgrade` carries over (`FreezeOptions::upgrading`), are not.
 fn remove_then_add(n: &str, s: &ServerJson) -> String {
     format!(
         "`fl mcp remove {n}`, then `fl mcp add {n} --from {} --package <type>` or `--remote`. \
          Add `--version {}` to take the version you were moving to. Adding it again resets \
-         the entry's `enabled` and `vendors` settings: note them before removing it, and set \
-         them again afterwards",
+         every setting of the entry: its `enabled` and `vendors`, the `env` values it holds and \
+         the `--with` inclusions. Note them before removing it, and set them again afterwards \
+         (`--env NAME=VALUE` and `--with NAME` on `add`)",
         printable(&s.name),
         printable(&s.version)
     )
@@ -2575,8 +2577,9 @@ mod tests {
         );
         assert!(
             msg.contains(
-                "Adding it again resets the entry's `enabled` and `vendors` settings: note \
-                 them before removing it, and set them again afterwards"
+                "Adding it again resets every setting of the entry: its `enabled` and \
+                 `vendors`, the `env` values it holds and the `--with` inclusions. Note them \
+                 before removing it, and set them again afterwards"
             ),
             "{msg}"
         );
@@ -2620,7 +2623,10 @@ mod tests {
             "{msg}"
         );
         assert!(
-            msg.contains("Adding it again resets the entry's `enabled` and `vendors`"),
+            msg.contains(
+                "Adding it again resets every setting of the entry: its `enabled` and \
+                 `vendors`, the `env` values it holds and the `--with` inclusions"
+            ),
             "{msg}"
         );
         assert!(!msg.contains("Choose one with"), "{msg}");

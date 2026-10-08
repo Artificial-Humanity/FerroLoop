@@ -345,10 +345,7 @@ fn plan_target(
     if let Some(link) = link_in(owner, &relative)? {
         return Err(link_refusal(root, &relative, &link));
     }
-    // ⚠ Not resolved again: the owner is canonical and nothing below it is a
-    // link (just checked), so this is the target's real path. Resolving
-    // `path` here would follow a link made since the check.
-    let canonical = owner.join(&relative);
+    let canonical = target_path(owner, &relative);
     let before = read(&canonical, &path)?;
     let mut file = v.open(&path, before.as_deref())?;
     let record_file = record_file(records, &canonical);
@@ -789,6 +786,17 @@ fn canonical(path: &Path) -> Result<PathBuf, McpError> {
             Err(e) => return Err(io_error("read", path, e)),
         }
     }
+}
+
+/// The target's real path: the canonical project root joined with the
+/// vendor's file. ⚠ Never resolved again. Nothing below the owner was a link
+/// when it was checked, so this is where the file is; resolving it here
+/// would follow a link made since that check, and the write would go
+/// wherever the link points. The check under the lock catches such a link
+/// before the write, but only this keeps the plan from naming the
+/// destination.
+fn target_path(owner: &Path, relative: &Path) -> PathBuf {
+    owner.join(relative)
 }
 
 /// A link would carry fl's write into a file it cannot see whole: one git
@@ -1424,6 +1432,27 @@ env.NOTES_TOKEN = { secret = true }
         );
     }
 
+    // One name is "that name", several are "those names".
+    #[test]
+    fn the_unmatched_replace_message_agrees_with_the_number_of_names() {
+        let f = fixture();
+        f.sync(CATALOG);
+        let one = refused_replace(&f, CATALOG, &["nosuch"]).to_string();
+        assert!(one.contains("refused an entry by that name."), "{one}");
+        let one = refused_replace(&f, CATALOG, &["ghp_example0token"]).to_string();
+        assert!(one.contains("refused an entry by that name."), "{one}");
+        let two = refused_replace(&f, CATALOG, &["nosuch", "other"]).to_string();
+        assert!(two.contains("`nosuch`, `other`"), "{two}");
+        assert!(two.contains("refused an entry by those names."), "{two}");
+        let mixed = refused_replace(&f, CATALOG, &["nosuch", "Other_Token"]).to_string();
+        assert!(
+            mixed.contains("refused an entry by those names."),
+            "{mixed}"
+        );
+        let twice = refused_replace(&f, CATALOG, &["nosuch", "nosuch"]).to_string();
+        assert!(twice.contains("refused an entry by that name."), "{twice}");
+    }
+
     // A name that is not a server name may be a secret someone pasted: it is
     // counted, never repeated (MCP spec §6).
     #[test]
@@ -1688,6 +1717,30 @@ env.NOTES_TOKEN = { secret = true }
         );
         apply(&plan.unwrap()).unwrap();
         assert!(f.read(VendorName::Claude).unwrap().contains("notes"));
+    }
+
+    // The path a target is planned at is the owner joined with the vendor's
+    // file, never the link's destination: with a link already in place, it is
+    // still where the file would be in the project.
+    #[test]
+    fn a_targets_path_is_the_owner_joined_with_the_file_never_a_links_destination() {
+        let f = fixture();
+        let owner = fs::canonicalize(&f.root).unwrap();
+        let elsewhere = f.dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, f.root.join(".codex")).unwrap();
+        let relative = Path::new(".codex/config.toml");
+        assert_eq!(
+            target_path(&owner, relative),
+            owner.join(".codex/config.toml")
+        );
+        // What resolving it would have given.
+        let resolved = canonical(&owner.join(relative)).unwrap();
+        assert_eq!(
+            resolved,
+            fs::canonicalize(&elsewhere).unwrap().join("config.toml")
+        );
+        assert_ne!(target_path(&owner, relative), resolved);
     }
 
     // MCP spec §4.3: the link check runs again under the lock. A link made

@@ -154,9 +154,14 @@ fn unmatched(names: &[String], others: usize) -> String {
             "{n} names that are not server names, which fl does not repeat"
         )),
     }
+    let (by, check) = if names.len() + others == 1 {
+        ("that name", "the name")
+    } else {
+        ("those names", "the names")
+    };
     format!(
-        "nothing was written: `--replace` names {}, and no target refused an entry by that \
-         name. Run `fl mcp sync` without it to see which entries fl refuses, or check the name",
+        "nothing was written: `--replace` names {}, and no target refused an entry by {by}. \
+         Run `fl mcp sync` without it to see which entries fl refuses, or check {check}",
         parts.join(", ")
     )
 }

@@ -1074,9 +1074,12 @@ fn no_fl_mcp_command_creates_or_opens_a_store() {
     w.ok(&["upgrade", "notes"]);
     w.ok(&["sync"]);
     w.run(&["check"]);
-    // Nothing is refused, so this `--replace` is itself refused; it still
-    // opens no store.
-    w.refused(&["sync", "--replace", "notes"]);
+    // A hand edit is refused, and `--replace` overwrites it.
+    let edited = w.read(CLAUDE).replace("notes-mcp@1.2.0", "notes-mcp@9.9.9");
+    assert_ne!(edited, w.read(CLAUDE), "the entry was edited");
+    fs::write(w.app().join(CLAUDE), edited).unwrap();
+    w.ok(&["sync", "--replace", "notes"]);
+    assert!(w.read(CLAUDE).contains("notes-mcp@1.2.0"));
     w.ok(&["remove", "local"]);
     assert!(
         !w.home().join("data").exists(),
