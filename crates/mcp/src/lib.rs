@@ -8,12 +8,14 @@ pub mod catalog;
 pub mod fake;
 pub mod freeze;
 pub mod registry;
+pub mod sync;
 pub mod vendor;
 
 /// Every refusal names the file, the entry and what to do next (MCP spec §5).
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
-    /// The file could not be read or written. `op` is `read` or `write`.
+    /// The file could not be read, written or locked. `op` is `read`,
+    /// `write` or `lock`.
     #[error("could not {op} {}: {cause}", path.display())]
     Io {
         op: &'static str,
@@ -102,6 +104,26 @@ pub enum McpError {
         problem: String,
         next: String,
     },
+    /// A vendor file fl will not rewrite.
+    #[error(transparent)]
+    VendorFile(#[from] vendor::FileRefusal),
+    /// An ownership record that is not one.
+    #[error(
+        "{} is not an ownership record fl can read: {cause}. Delete it; the next \
+         `fl mcp sync` adopts every entry that still matches the catalog",
+        path.display()
+    )]
+    Record { path: PathBuf, cause: String },
+    /// `sync` refused one entry or more, so it wrote nothing (MCP spec §4.3).
+    #[error("nothing was written:\n{}", lines(refusals))]
+    Refused { refusals: Vec<sync::Refusal> },
+    /// A target changed between the plan and the write (MCP spec §4.3).
+    #[error(
+        "{} changed while fl was planning its write: another program or a person wrote it. \
+         Nothing was written; run `fl mcp sync` again",
+        path.display()
+    )]
+    Changed { path: PathBuf },
 }
 
 fn on_server(server: &Option<String>) -> String {
@@ -116,4 +138,9 @@ fn missing(name: &str, version: &Option<String>) -> String {
         Some(v) => format!("version `{v}` of server `{name}`"),
         None => format!("server `{name}`"),
     }
+}
+
+fn lines(refusals: &[sync::Refusal]) -> String {
+    let lines: Vec<String> = refusals.iter().map(ToString::to_string).collect();
+    lines.join("\n")
 }
