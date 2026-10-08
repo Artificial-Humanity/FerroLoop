@@ -134,8 +134,10 @@ variables it forwards) for a `stdio` server. It connects to streamable HTTP only
 server is left out. For an `http` server it gets `url`; a secret `Authorization` header with the
 scheme `Bearer` becomes `bearer_token_env_var`, a secret header with no scheme becomes
 `env_http_headers` (the variable holds the whole value), and a literal header `http_headers`. A
-secret header with any other scheme, and a secret read from a variable of another name (`env =
-"OTHER"`), are refused for Codex: it can add neither a prefix nor a new name. Codex reads a
+secret header with any other scheme, and a `Bearer` scheme on a header other than
+`Authorization`, are left out of Codex's file: it can add no other prefix. So is a `stdio` server
+with a secret read from a variable of another name (`env = "OTHER"`): Codex forwards a variable
+under its own name. A header may read any variable, through `env_http_headers`. Codex reads a
 project's `.codex/config.toml` only when its user trusts the project. `fl mcp sync` and `fl mcp
 check` read `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`), never write it, and warn
 unless it trusts the project's root, the directory holding `.git`: a `[projects."<root>"]` table
@@ -199,11 +201,13 @@ By hand, `fl mcp add <name> -- <command> [args…]` records a `stdio` server: `-
 literal, and `--env NAME` alone a secret reference. Either way `NAME` must be a variable's name,
 capital letters, digits and `_`, as after `--header NAME=` below, or the refusal does not repeat
 it. Under `--from` and `upgrade`, an `--env` with no `=` is refused as well, and repeated only if
-it is a variable's name. `fl mcp add <name> --url <url>` records an
+it is a variable's name. A variable with a lower-case name can be added by editing the catalog
+(`env.<name> = "…"`). `fl mcp add <name> --url <url>` records an
 `http` server, whose `--header` is always a secret reference: `--header NAME` reads the variable
 `<SERVER>_<NAME>` (uppercased, `-` as `_`), `--header NAME=ENV` reads `ENV`, and `--header
-NAME=ENV:SCHEME` sends `<SCHEME> <value>`. What follows `=` must be a variable's name — capital
-letters, digits and `_` — so a token typed there is refused, and the refusal does not repeat it. A
+NAME=ENV:SCHEME` sends `<SCHEME> <value>`. `NAME` must be a header's name, letters and `-` only
+(`Authorization`, `X-Api-Key`), and what follows `=` a variable's name — capital letters, digits
+and `_` — so a token typed in either place is refused, and the refusal does not repeat it. A
 literal header is added by editing the catalog.
 
 Each form of `add` takes its own flags: `--version`, `--package`, `--remote` and `--with` go with
@@ -211,7 +215,9 @@ Each form of `add` takes its own flags: `--version`, `--package`, `--remote` and
 refused, naming it, rather than ignored.
 
 `add` prints the launch it recorded: the transport and the command with its arguments, or the URL
-and the names of its headers. It never prints a value.
+and the names of its headers, as recorded, so a secret typed into an argument or the URL is
+printed back: give a secret as an `--env` or `--header` reference. It never prints the value of an
+`env` entry or a header, literal or secret.
 
 `fl mcp remove`, `fl mcp enable` and `fl mcp disable` change the catalog: the server, or its team
 default.
@@ -291,7 +297,7 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
   shape (a body that is not valid UTF-8 is one), an error status: each is reported as the
   registry's failure. `sync` and `check` need no registry.
 * **A registry entry fl cannot freeze honestly.** A deleted server, naming the publisher's
-  message; several launch routes and no `--package` or `--remote`; a package type other than npm,
+  message, or a status fl does not know (`archived`, say), naming it; several launch routes and no `--package` or `--remote`; a package type other than npm,
   PyPI and OCI, such as `mcpb`, `cargo` or `nuget`; a package that serves HTTP itself, which would
   need starting; an OCI image with neither a tag nor a digest, tagged `latest`, or whose name starts with
   `-`, which docker would read as an option; a version that is not exact (an npm package's
@@ -301,17 +307,21 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
   runtime arguments with a positional argument; a secret inside an argument, except
   docker's `-e NAME={secret}`, which becomes `-e NAME` and a reference; a required argument or
   variable with no value; an argument of a type fl does not know. Each refusal names what to do,
-  often `fl mcp add <name> -- <command>` by hand. An `--env` key or a `--with` name that the
+  often `fl mcp add <name> -- <command>` by hand. An `upgrade` whose pinned route the new
+  version no longer offers is told to `fl mcp remove` the server and `fl mcp add` it again with
+  `--package <type>` or `--remote`. An `--env` key or a `--with` name that the
   entry does not use is refused too; when it is not a variable's name, the refusal does not
   repeat it.
 * **A secret given as a value.** `--env NAME=value` for a variable the registry marks secret, a
-  value after `--header NAME=`, and an `--env` with no `=` that is not a variable's name: a
-  secret is never recorded. Set it in the environment instead. The
-  refusal does not repeat the value.
+  value after `--header NAME=`, a token in the place of a header's name, and an `--env` with no `=`
+  that is not a variable's name: a secret is never recorded. Set it in the environment instead.
+  The refusal does not repeat the value, and a key or name given twice is repeated only when it
+  is a variable's or header's name.
 * **An upgrade that is not newer**, unless named with `--to`.
 * **A vendor file fl cannot edit safely.** A JSON file that is not strict JSON, whose top level or
   `mcpServers` is not an object, or with a key twice; a Codex file that is not valid TOML, or whose
-  `mcp_servers` is not a table. Fix it by hand; the message never shows the file's text.
+  `mcp_servers` is not a table. Fix it by hand; the message never shows a value, and for a key
+  twice it names that key.
 * **An entry someone else changed.** An entry fl wrote that was changed by hand since (not just laid
   out anew), or removed by hand from a file that still exists while the catalog still wants it,
   and an entry fl did not write that differs from what fl would write under the same name. fl
@@ -324,9 +334,10 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
 * **A vendor file git would commit.** See the `.gitignore` lines above.
 * **A vendor file reached through a link**: the file, or a directory on its way, is a symbolic
   link.
-* **No catalog**, for `sync`, `check` and the edits other than `registry` and `add`: fl never reads
-  a missing catalog as an empty one, which would remove every entry it wrote. **No registry** in the
-  catalog, for `search`, `add --from` and `upgrade`.
+* **No catalog**, for `sync` and `check`: fl never reads a missing catalog as an empty one, which
+  would remove every entry it wrote. `remove`, `enable`, `disable` and `upgrade` refuse a server
+  the catalog does not have (there is no server `x`), even when there is no catalog file. **No registry**
+  in the catalog, for `search`, `add --from` and `upgrade`.
 
 A vendor that cannot run a server — an `sse` server for Codex or Antigravity, a secret header for
 Antigravity, a secret under another name or a header scheme Codex cannot send — is not a refusal:
@@ -339,7 +350,9 @@ Any registry that serves the MCP registry API, version `v0.1`, will do; the offi
 `fl mcp search` uses the registry's own search, which matches a substring of the server's name,
 not its description, and keeps only the servers whose name holds the text, whatever the registry
 sends. It reads up to 20 pages of results, saying so when it stops there, and prints the
-registry's text without its control characters.
+registry's text through the same filter as every message that quotes it: control and invisible
+characters (bidirectional marks, zero-width and variation selectors, line and paragraph
+separators) are dropped, and it is cut to 300 characters.
 
 `add --from` and `upgrade` record the version the registry returns, never the word `latest`. A
 server the registry marks deprecated is added with a warning that gives its message; one marked
