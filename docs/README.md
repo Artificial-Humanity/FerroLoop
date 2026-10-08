@@ -20,6 +20,9 @@ File naming in this directory follows
   recovery, cost, errors and limits.
 * [routing.md](routing.md) — keep developer-level items in the local store and human-level
   items in GitHub: areas, the routing map, handles, lists and their limits.
+* [mcp.md](mcp.md) — one committed catalog of a project's MCP servers, written into Claude
+  Code's, Codex's and Antigravity's own files: the catalog, secrets, each machine's switches, the
+  commands, what fl refuses and why.
 
 No anchor document exists yet.
 

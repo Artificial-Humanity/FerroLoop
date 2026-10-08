@@ -5,9 +5,12 @@
 
 use assert_cmd::Command;
 use fl_mcp::fake::{self, FakeRegistry};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command as Sys;
+use std::time::SystemTime;
 
 fn git(dir: &Path, args: &[&str]) {
     let out = Sys::new("git")
@@ -1296,5 +1299,637 @@ fn sync_with_no_state_directory_is_refused() {
     assert!(
         err.contains("neither $CODEX_HOME nor $HOME is set"),
         "{err}"
+    );
+}
+
+/// What every value in [`SECRETS`] holds, so a value written whole, cut
+/// short or quoted is still found.
+const MARK: &str = "Qv7Wd3";
+
+/// A real-looking value for every variable a secret reads in
+/// `no_secret_value_reaches_any_file_fl_writes_or_any_message`: the
+/// fixtures' `NOTES_TOKEN` (npm), `WEATHER_API_KEY` (PyPI), `TRACKER_TOKEN`
+/// (a docker `-e`, optional, included with `--with`) and
+/// `DOCS_AUTHORIZATION` (a remote's header, its variable named by fl), and
+/// the ones added by hand there. None has the shape of a real provider's
+/// token.
+const SECRETS: [(&str, &str); 8] = [
+    ("NOTES_TOKEN", "nt_Qv7Wd3x8kLm2Pa9Yc4KdTr5Uw1Zs6Bv0"),
+    ("WEATHER_API_KEY", "wk_Qv7Wd3e1b0e7f29c4d8a6f"),
+    ("TRACKER_TOKEN", "tt_Qv7Wd3Zp8mT4rKq2Ln5xHj"),
+    (
+        "DOCS_AUTHORIZATION",
+        "Bearer dk.Qv7Wd3.c2lnbmF0dXJlLXRva2Vu",
+    ),
+    ("API_TOKEN", "at_Qv7Wd3h4nd9q2LxWm8Rt3e"),
+    ("WEB_TOKEN", "wt_Qv7Wd3c51e8b0a4f7d29"),
+    ("WEB_X_TEAM", "acme_Qv7Wd3_team"),
+    ("GH_PAT", "pat_Qv7Wd3r3n4m3dK9s1Vb"),
+];
+
+fn secret(name: &str) -> &'static str {
+    let found = SECRETS.iter().find(|(n, _)| *n == name);
+    found.unwrap_or_else(|| panic!("no secret {name}")).1
+}
+
+/// `fl mcp` in `app` with every secret in [`SECRETS`] set in its
+/// environment, and `git` behind a wrapper that logs the arguments fl
+/// starts it with. After each command, every file fl writes, git's
+/// arguments and what the command printed are searched for [`MARK`].
+struct Secrets<'w> {
+    w: &'w World,
+    path: OsString,
+    log: PathBuf,
+    /// The command, and what it printed: stdout, then stderr.
+    said: Vec<(String, String, String)>,
+    /// A person put a value in `.mcp.json`, so it is not searched.
+    pasted: bool,
+    /// A person put a value in a catalog that does not parse, so the
+    /// catalog is not searched.
+    malformed: bool,
+}
+
+impl<'w> Secrets<'w> {
+    fn new(w: &'w World) -> Secrets<'w> {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::var_os("PATH").expect("PATH is set");
+        let real = std::env::split_paths(&path)
+            .map(|d| d.join("git"))
+            .find(|g| g.is_file())
+            .expect("git is on PATH");
+        let bin = w.home().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = w.home().join("git-argv.log");
+        let wrapper = bin.join("git");
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+                log.display(),
+                real.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let dirs = std::iter::once(bin).chain(std::env::split_paths(&path));
+        Secrets {
+            w,
+            path: std::env::join_paths(dirs).unwrap(),
+            log,
+            said: Vec::new(),
+            pasted: false,
+            malformed: false,
+        }
+    }
+
+    /// `fl mcp <args>`: its exit code and stderr, after the search.
+    fn run(&mut self, args: &[&str]) -> (i32, String) {
+        let mut c = self.w.fl_in(&self.w.app());
+        c.env("PATH", &self.path);
+        for (name, value) in SECRETS {
+            c.env(name, value);
+        }
+        let out = c.arg("mcp").args(args).output().unwrap();
+        // Named by its subcommand only: an argument may hold a value.
+        let what = format!("command {} (fl mcp {})", self.said.len(), args[0]);
+        let said = String::from_utf8(out.stdout).unwrap();
+        let err = String::from_utf8(out.stderr).unwrap();
+        self.said.push((what.clone(), said, err.clone()));
+        let leaked = self.leaked();
+        assert!(
+            leaked.is_empty(),
+            "after {what}, a secret's value is in {leaked:?}"
+        );
+        (out.status.code().expect("an exit code"), err)
+    }
+
+    fn ok(&mut self, args: &[&str]) {
+        let (code, err) = self.run(args);
+        assert_eq!(code, 0, "fl mcp {}: {err}", args[0]);
+    }
+
+    /// `fl mcp <args>`, which must exit 2: its stderr.
+    fn refused(&mut self, args: &[&str]) -> String {
+        let (code, err) = self.run(args);
+        assert_eq!(code, 2, "fl mcp {}: {err}", args[0]);
+        err
+    }
+
+    /// What the last command printed on stdout.
+    fn stdout(&self) -> &str {
+        &self.said.last().expect("a command ran").1
+    }
+
+    /// Every file fl writes — the catalog, the vendor files, the records —
+    /// git's arguments, and every message: their contents.
+    fn texts(&self) -> Vec<(String, String)> {
+        let mut paths: Vec<PathBuf> = [CATALOG, CLAUDE, CODEX, AGY]
+            .iter()
+            .filter(|rel| !(self.pasted && **rel == CLAUDE))
+            .filter(|rel| !(self.malformed && **rel == CATALOG))
+            .map(|rel| self.w.app().join(rel))
+            .collect();
+        if let Ok(records) = fs::read_dir(self.w.home().join("state/fl/mcp")) {
+            paths.extend(records.map(|e| e.unwrap().path()));
+        }
+        paths.push(self.log.clone());
+        let mut texts: Vec<(String, String)> = (paths.iter())
+            .filter_map(|p| Some((p.display().to_string(), fs::read_to_string(p).ok()?)))
+            .collect();
+        for (what, out, err) in &self.said {
+            texts.push((format!("{what}, stdout"), out.clone()));
+            texts.push((format!("{what}, stderr"), err.clone()));
+        }
+        texts
+    }
+
+    /// Where a secret's value is.
+    fn leaked(&self) -> Vec<String> {
+        (self.texts().into_iter())
+            .filter(|(_, text)| text.contains(MARK))
+            .map(|(what, _)| what)
+            .collect()
+    }
+}
+
+#[test]
+fn no_secret_value_reaches_any_file_fl_writes_or_any_message() {
+    let w = World::new();
+    // Codex's config, which fl reads for trust, holds a key of its own.
+    w.write_codex(&format!(
+        "model = \"o3\"\napi_key = \"{}\"\n",
+        secret("API_TOKEN")
+    ));
+    let mut s = Secrets::new(&w);
+    s.ok(&["registry", &w.fake().url()]);
+    // Each registry route that carries a secret.
+    s.ok(&["add", "notes", "--from", fake::NOTES, "--version", "1.1.0"]);
+    s.ok(&["add", "weather", "--from", fake::WEATHER]);
+    s.ok(&[
+        "add",
+        "tracker",
+        "--from",
+        fake::TRACKER,
+        "--with",
+        "TRACKER_TOKEN",
+    ]);
+    s.ok(&["add", "docs", "--from", fake::DOCS]);
+    // By hand: a secret variable, and secret headers.
+    s.ok(&[
+        "add",
+        "local",
+        "--env",
+        "API_TOKEN",
+        "--",
+        "node",
+        "server.js",
+    ]);
+    s.ok(&[
+        "add",
+        "web",
+        "--url",
+        "https://web.example.com/mcp",
+        "--header",
+        "Authorization=WEB_TOKEN:Bearer",
+        "--header",
+        "X-Team",
+    ]);
+    // A secret read from a variable of another name, which only Claude
+    // Code can pass on.
+    let mut catalog = w.read(CATALOG);
+    catalog.push_str(
+        "\n[server.renamed]\nvendors = [\"claude\"]\ntransport = \"stdio\"\n\
+         command = \"gh-mcp\"\nenv.GITHUB_TOKEN = { secret = true, env = \"GH_PAT\" }\n",
+    );
+    fs::write(w.app().join(CATALOG), catalog).unwrap();
+    s.ok(&["sync"]);
+    s.ok(&["check"]);
+    s.ok(&["upgrade", "notes"]);
+    s.ok(&["sync"]);
+
+    // A secret given as a value is refused, and not repeated.
+    let given = format!("NOTES_TOKEN={}", secret("NOTES_TOKEN"));
+    let err = s.refused(&["add", "leak", "--from", fake::NOTES, "--env", &given]);
+    assert!(
+        err.contains("`--env NOTES_TOKEN=…` names a secret, and a secret is never recorded"),
+        "{err}"
+    );
+    let given = format!("Authorization={}", secret("WEB_TOKEN"));
+    let err = s.refused(&["add", "leak", "--url", fake::DOCS_URL, "--header", &given]);
+    assert!(err.contains("never a value"), "{err}");
+
+    // A person pastes the value into fl's entry: refused, naming the field
+    // and not its value; `--replace` says the same and writes the reference
+    // back.
+    let pasted = w
+        .read(CLAUDE)
+        .replace("${NOTES_TOKEN}", secret("NOTES_TOKEN"));
+    assert!(pasted.contains(MARK));
+    fs::write(w.app().join(CLAUDE), pasted).unwrap();
+    s.pasted = true;
+    assert_eq!(s.run(&["check"]).0, 2);
+    assert_eq!(s.run(&["sync"]).0, 2);
+    s.ok(&["sync", "--replace", "notes"]);
+    assert!(
+        s.stdout()
+            .contains("  replace notes (`env.NOTES_TOKEN` differs)"),
+        "{}",
+        s.stdout()
+    );
+    s.pasted = false;
+    assert_eq!(s.leaked(), Vec::<String>::new());
+
+    // A value pasted where the catalog's grammar has no place for it: the
+    // parse error names the line and the column, and never the value, even
+    // where the parser would quote it back.
+    let catalog = w.read(CATALOG);
+    let token = secret("API_TOKEN");
+    s.malformed = true;
+    for bad in [
+        format!("x = {token}\n"),
+        format!("[server.bad]\ntransport = \"stdio\"\ncommand = \"x\"\nenabled = \"{token}\"\n"),
+        format!("[server.bad]\ntransport = \"{token}\"\nurl = \"https://x.example.com\"\n"),
+        format!(
+            "[server.bad]\ntransport = \"stdio\"\ncommand = \"x\"\n\
+             env.T = {{ secret = \"{token}\" }}\n"
+        ),
+        format!("[server.bad]\ntransport = \"stdio\"\ncommand = \"x\"\n{token} = 1\n"),
+    ] {
+        fs::write(w.app().join(CATALOG), format!("{catalog}\n{bad}")).unwrap();
+        let err = s.refused(&["check"]);
+        assert!(err.contains("is not a valid MCP catalog: line "), "{err}");
+    }
+    // A catalog that parses, with a value where a variable's name goes:
+    // the rule's refusal names the field, not the value.
+    let bad = format!(
+        "[server.bad]\ntransport = \"http\"\nurl = \"https://x.example.com\"\n\
+         headers.Authorization = {{ secret = true, env = \"Bearer {token}\" }}\n"
+    );
+    fs::write(w.app().join(CATALOG), format!("{catalog}\n{bad}")).unwrap();
+    let err = s.refused(&["check"]);
+    assert!(
+        err.contains("field `headers.Authorization`: the variable it reads is not a valid"),
+        "{err}"
+    );
+    fs::write(w.app().join(CATALOG), &catalog).unwrap();
+    s.malformed = false;
+    // By hand, a value where `--env NAME` wants a variable's name.
+    let err = s.refused(&["add", "leak", "--env", token, "--", "node"]);
+    assert!(
+        err.contains("names a secret's environment variable"),
+        "{err}"
+    );
+    assert_eq!(s.leaked(), Vec::<String>::new());
+
+    // What was searched is what matters: every reference is in place, a
+    // record for each vendor file, git was started, and Codex's config
+    // was read.
+    let claude = w.read(CLAUDE);
+    for reference in [
+        "${NOTES_TOKEN}",
+        "${WEATHER_API_KEY}",
+        "${TRACKER_TOKEN}",
+        "${DOCS_AUTHORIZATION}",
+        "${API_TOKEN}",
+        "Bearer ${WEB_TOKEN}",
+        "${WEB_X_TEAM}",
+        "${GH_PAT}",
+    ] {
+        assert!(claude.contains(reference), "{reference}: {claude}");
+    }
+    let texts = s.texts();
+    let records = (texts.iter())
+        .filter(|(what, _)| what.contains("/state/fl/mcp/") && what.ends_with(".json"))
+        .count();
+    assert_eq!(records, 3, "a record for each vendor file");
+    let argv = fs::read_to_string(&s.log).unwrap();
+    assert!(
+        argv.contains("ls-files") && argv.contains("check-ignore"),
+        "{argv}"
+    );
+    assert!(
+        (s.said.iter()).any(|(_, _, err)| err.contains("does not trust")),
+        "Codex's config was read"
+    );
+}
+
+/// Each entry under a directory by its path relative to it: `None` for a
+/// directory, else the file's modification time and bytes.
+type Listing = BTreeMap<PathBuf, Option<(SystemTime, Vec<u8>)>>;
+
+/// `dir`'s [`Listing`]. `.git` is left out: git, which fl starts, keeps it.
+fn listing(dir: &Path) -> Listing {
+    let mut out = Listing::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for entry in fs::read_dir(&d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            let rel = path.strip_prefix(dir).unwrap().to_path_buf();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                todo.push(path);
+                out.insert(rel, None);
+            } else {
+                let bytes = fs::read(&path).unwrap_or_default();
+                out.insert(rel, Some((meta.modified().unwrap(), bytes)));
+            }
+        }
+    }
+    out
+}
+
+/// The entries that are new, changed or gone between two listings.
+fn changed(before: &Listing, after: &Listing) -> BTreeSet<PathBuf> {
+    (before.keys().chain(after.keys()))
+        .filter(|p| before.get(*p) != after.get(*p))
+        .cloned()
+        .collect()
+}
+
+/// Every absolute path `text` names: a `/` that begins a word (after a
+/// space, a quote, a backtick or a bracket), to the end of the word, less
+/// a trailing `.`, `:` or `,`.
+fn paths_named(text: &str) -> Vec<PathBuf> {
+    let edge = |c: char| c.is_whitespace() || "`\"'()[]{}<>,;".contains(c);
+    let mut out = Vec::new();
+    let mut prev = ' ';
+    for (i, c) in text.char_indices() {
+        if c == '/' && edge(prev) {
+            let word = text[i..].split(edge).next().unwrap_or_default();
+            out.push(PathBuf::from(word.trim_end_matches(['.', ':', ','])));
+        }
+        prev = c;
+    }
+    out
+}
+
+#[test]
+fn every_fl_mcp_command_reads_and_writes_only_in_its_home_and_its_project() {
+    let home = tempfile::tempdir().unwrap();
+    let place = tempfile::tempdir().unwrap();
+    let (h, app) = (home.path(), place.path().join("widgets"));
+    repo_at(&app, &[(".gitignore", IGNORED)]);
+    for dir in ["config/fl", "cache", "run", "tmp"] {
+        fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    let config = h.join("config/fl/config.toml");
+    let switches = format!("[[mcp]]\nroot = \"{}\"\n", app.display());
+    fs::write(&config, &switches).unwrap();
+    let fake = FakeRegistry::start();
+    let roots = [
+        h.to_path_buf(),
+        h.canonicalize().unwrap(),
+        place.path().to_path_buf(),
+        place.path().canonicalize().unwrap(),
+    ];
+    // What fl may write: its records, and the project's catalog and vendor
+    // files (each with the directories above it).
+    let records = Path::new("state/fl/mcp");
+    let project = [CATALOG, CLAUDE, CODEX, AGY].map(|rel| Path::new("widgets").join(rel));
+    // The `.gitignore` lines a refusal prints, which are not paths.
+    let anchors: Vec<PathBuf> = IGNORED.lines().map(PathBuf::from).collect();
+    let path = std::env::var_os("PATH").expect("PATH is set");
+    let (mut named, mut said) = (BTreeSet::new(), Vec::new());
+
+    // `fl mcp <args>` with nothing of this process's environment but PATH:
+    // every place fl knows of comes from these variables and the
+    // working directory. Its exit code.
+    let mut fl = |args: &[&str]| -> i32 {
+        let before = (listing(h), listing(place.path()));
+        let out = Command::cargo_bin("fl")
+            .unwrap()
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", h)
+            .env("XDG_CONFIG_HOME", h.join("config"))
+            .env("XDG_STATE_HOME", h.join("state"))
+            .env("XDG_DATA_HOME", h.join("data"))
+            .env("XDG_CACHE_HOME", h.join("cache"))
+            .env("XDG_RUNTIME_DIR", h.join("run"))
+            .env("TMPDIR", h.join("tmp"))
+            .current_dir(&app)
+            .arg("mcp")
+            .args(args)
+            .output()
+            .unwrap();
+        for p in changed(&before.0, &listing(h)) {
+            assert!(
+                records.starts_with(&p) || p.starts_with(records),
+                "fl mcp {args:?} wrote {} in the home",
+                p.display()
+            );
+        }
+        for p in changed(&before.1, &listing(place.path())) {
+            assert!(
+                project.iter().any(|f| f.starts_with(&p)),
+                "fl mcp {args:?} wrote {} in the project's directory",
+                p.display()
+            );
+        }
+        for text in [out.stdout, out.stderr] {
+            let text = String::from_utf8(text).unwrap();
+            for p in paths_named(&text)
+                .into_iter()
+                .filter(|p| !anchors.contains(p))
+            {
+                assert!(
+                    roots.iter().any(|r| p.starts_with(r)),
+                    "fl mcp {args:?} named {}, outside its home and its project:\n{text}",
+                    p.display()
+                );
+                named.insert(p);
+            }
+            said.push(text);
+        }
+        out.status.code().expect("an exit code")
+    };
+
+    assert_eq!(fl(&["registry", &fake.url()]), 0);
+    assert_eq!(fl(&["search", "io.example"]), 0);
+    assert_eq!(
+        fl(&["add", "notes", "--from", fake::NOTES, "--version", "1.1.0"]),
+        0
+    );
+    assert_eq!(
+        fl(&[
+            "add",
+            "tracker",
+            "--from",
+            fake::TRACKER,
+            "--with",
+            "TRACKER_TOKEN"
+        ]),
+        0
+    );
+    assert_eq!(fl(&["add", "docs", "--from", fake::DOCS]), 0);
+    assert_eq!(
+        fl(&[
+            "add",
+            "local",
+            "--env",
+            "API_TOKEN",
+            "--",
+            "node",
+            "server.js"
+        ]),
+        0
+    );
+    assert_eq!(
+        fl(&[
+            "add",
+            "web",
+            "--url",
+            "https://web.example.com/mcp",
+            "--header",
+            "Authorization=WEB_TOKEN:Bearer"
+        ]),
+        0
+    );
+    assert_eq!(fl(&["disable", "local"]), 0);
+    assert_eq!(fl(&["enable", "local"]), 0);
+    assert_eq!(fl(&["upgrade", "notes"]), 0);
+    // Codex's config does not exist yet: a warning names where it looked.
+    assert_eq!(fl(&["sync"]), 0);
+    assert_eq!(fl(&["check"]), 0);
+
+    // The records are in the temporary `$XDG_STATE_HOME`, one for each
+    // vendor file, and each names a file in the project.
+    let kept: Vec<PathBuf> = fs::read_dir(h.join(records))
+        .unwrap_or_else(|e| panic!("no record under $XDG_STATE_HOME/fl/mcp: {e}"))
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    assert_eq!(kept.len(), 3, "{kept:?}");
+    let canonical = app.canonicalize().unwrap().display().to_string();
+    for record in &kept {
+        let text = fs::read_to_string(record).unwrap();
+        assert!(text.contains(&canonical), "{text}");
+    }
+
+    // Codex's config, read where `$HOME` puts it.
+    fs::create_dir_all(h.join(".codex")).unwrap();
+    fs::write(h.join(".codex/config.toml"), "model = \"o3\"\n").unwrap();
+    assert_eq!(fl(&["check"]), 0);
+    // A hand edit is refused, naming the file; `--replace` overwrites it.
+    let claude = app.join(CLAUDE);
+    let edited = fs::read_to_string(&claude)
+        .unwrap()
+        .replace("notes-mcp@1.2.0", "notes-mcp@9.9.9");
+    fs::write(&claude, edited).unwrap();
+    assert_eq!(fl(&["check"]), 2);
+    assert_eq!(fl(&["sync", "--replace", "notes"]), 0);
+    // A record fl cannot read is refused, naming it; without it, `sync`
+    // adopts what matches.
+    fs::write(&kept[0], "{").unwrap();
+    assert_eq!(fl(&["check"]), 2);
+    fs::remove_file(&kept[0]).unwrap();
+    assert_eq!(fl(&["sync"]), 0);
+    // A vendor file git would not ignore is refused, naming `.gitignore`.
+    fs::write(app.join(".gitignore"), "").unwrap();
+    assert_eq!(fl(&["check"]), 2);
+    fs::write(app.join(".gitignore"), IGNORED).unwrap();
+    // A config fl cannot read is refused, naming it.
+    fs::write(&config, "[[mcp]]\nroots = \"x\"\n").unwrap();
+    assert_eq!(fl(&["check"]), 2);
+    fs::write(&config, &switches).unwrap();
+    assert_eq!(fl(&["remove", "tracker"]), 0);
+    assert_eq!(fl(&["sync"]), 0);
+
+    // Each kind of file fl reads was named at least once, inside.
+    let record = kept[0].strip_prefix(h).unwrap();
+    for tail in [
+        Path::new("widgets").join(CATALOG),
+        Path::new("widgets").join(CLAUDE),
+        Path::new("widgets/.gitignore").to_path_buf(),
+        Path::new(".codex/config.toml").to_path_buf(),
+        Path::new("config/fl/config.toml").to_path_buf(),
+        record.to_path_buf(),
+    ] {
+        assert!(
+            named.iter().any(|p| p.ends_with(&tail)),
+            "{} was never named: {named:?}",
+            tail.display()
+        );
+    }
+    // This process's own home is never named, unless the temporary
+    // directories lie inside it.
+    let real = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(real) =
+        real.filter(|r| r.parent().is_some() && !roots.iter().any(|t| t.starts_with(r)))
+    {
+        let real = real.display().to_string();
+        for text in &said {
+            assert!(!text.contains(&real), "{text}");
+        }
+    }
+}
+
+/// A file of the repository, by its path from the repository's root.
+fn repository_file(rel: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel);
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+#[test]
+fn the_docs_name_every_fl_mcp_command_and_every_catalog_field() {
+    let w = World::new();
+    let doc = repository_file("docs/mcp.md");
+    // Every subcommand, as `fl mcp --help` lists them.
+    let out = w.fl_in(&w.app()).args(["mcp", "--help"]).output().unwrap();
+    let help = String::from_utf8(out.stdout).unwrap();
+    let commands: Vec<&str> = (help.lines())
+        .skip_while(|l| *l != "Commands:")
+        .skip(1)
+        .take_while(|l| !l.is_empty())
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|c| *c != "help")
+        .collect();
+    assert!(commands.len() >= 9, "{help}");
+    for c in &commands {
+        assert!(
+            doc.contains(&format!("fl mcp {c}")),
+            "docs/mcp.md does not name `fl mcp {c}`"
+        );
+    }
+    // Every key and value of the catalog, as its own refusals list them.
+    fs::create_dir_all(w.app().join(".fl")).unwrap();
+    let mut words = BTreeSet::new();
+    for probe in [
+        "bogus = 1\n",
+        "[server.x]\nbogus = 1\n",
+        "[server.x]\ntransport = \"stdio\"\ncommand = \"a\"\nenv.A = { secret = true, bogus = 1 }\n",
+        "[server.x]\ntransport = \"http\"\nurl = \"https://a.example\"\n\
+         headers.A = { secret = true, env = \"B\", bogus = 1 }\n",
+        "[server.x]\ntransport = \"bogus\"\n",
+        "[server.x]\nvendors = [\"bogus\"]\ntransport = \"stdio\"\ncommand = \"a\"\n",
+    ] {
+        fs::write(w.app().join(CATALOG), probe).unwrap();
+        let (_, err) = w.refused(&["check"]);
+        let (_, listed) = err
+            .split_once(", expected ")
+            .unwrap_or_else(|| panic!("{err}"));
+        let listed = listed.lines().next().unwrap_or_default();
+        words.extend(listed.split('`').skip(1).step_by(2).map(str::to_string));
+    }
+    assert!(words.len() >= 20, "{words:?}");
+    for word in &words {
+        assert!(
+            doc.contains(&format!("`{word}`")),
+            "docs/mcp.md does not name `{word}`"
+        );
+    }
+    // Both indexes link it.
+    assert!(
+        repository_file("README.md").contains("(docs/mcp.md)"),
+        "README.md does not link docs/mcp.md"
+    );
+    assert!(
+        repository_file("docs/README.md").contains("(mcp.md)"),
+        "docs/README.md does not link mcp.md"
     );
 }
