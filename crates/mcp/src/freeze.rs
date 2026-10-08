@@ -247,17 +247,12 @@ fn freeze_entry(resp: &ServerResponse, opts: &FreezeOptions) -> Result<Frozen, R
             ),
         );
     }
-    let env_secrets = (server.env.iter().flatten()).filter_map(|(k, v)| v.secret_var(k));
-    let secrets: BTreeSet<&str> = env_secrets
-        .chain(secret_headers.iter().map(|e| e.as_str()))
+    let secrets = server
+        .secret_vars()
+        .into_iter()
+        .map(str::to_string)
         .collect();
-    let secrets = secrets.into_iter().map(str::to_string).collect();
-    warnings.extend(server.literal_values().into_iter().map(|field| {
-        format!(
-            "`{field}` is a literal value: it will be committed with the catalog, and is \
-             public if the repository is"
-        )
-    }));
+    warnings.extend(literal_warnings(&server));
     Ok(Frozen {
         server,
         warnings,
@@ -896,13 +891,29 @@ fn unseen_field(server: &Server) -> Option<String> {
     None
 }
 
-/// An HTTP authentication scheme, such as `Bearer`: one token.
-fn is_scheme(s: &str) -> bool {
+/// The warning for each literal value `server` records: it is committed with
+/// the catalog (MCP spec §6). Names the field, never the value.
+pub fn literal_warnings(server: &Server) -> Vec<String> {
+    (server.literal_values().into_iter())
+        .map(|field| {
+            format!(
+                "`{field}` is a literal value: it will be committed with the catalog, and is \
+                 public if the repository is"
+            )
+        })
+        .collect()
+}
+
+/// An HTTP authentication scheme, such as `Bearer`: one token of letters,
+/// digits and `-`. `fl mcp add --header` takes a header name in the same
+/// shape.
+pub fn is_scheme(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// `<SERVER>_<PART>`, uppercased, `-` as `_`.
-fn derived(server: &str, part: &str) -> String {
+/// `<SERVER>_<PART>`, uppercased, `-` as `_`: the variable a secret header
+/// reads when the registry or the person names none.
+pub fn derived(server: &str, part: &str) -> String {
     format!("{server}_{part}")
         .to_ascii_uppercase()
         .replace('-', "_")
@@ -1247,6 +1258,40 @@ mod tests {
 
     fn literal(value: &str) -> EnvValue {
         EnvValue::Literal(value.to_string())
+    }
+
+    // The rules a hand-made entry shares with a frozen one live here once.
+    #[test]
+    fn literal_warnings_name_the_field_and_never_the_value() {
+        let server = Server {
+            from: None,
+            version: None,
+            enabled: true,
+            vendors: None,
+            transport: Transport::Stdio,
+            command: Some("node".into()),
+            args: None,
+            env: Some(BTreeMap::from([
+                ("LOG".to_string(), literal("hunter2")),
+                ("TOKEN".to_string(), secret()),
+            ])),
+            url: None,
+            headers: None,
+        };
+        assert_eq!(
+            literal_warnings(&server),
+            [
+                "`env.LOG` is a literal value: it will be committed with the catalog, and is \
+              public if the repository is"
+            ]
+        );
+    }
+
+    #[test]
+    fn derived_names_and_one_token_shapes_are_shared_rules() {
+        assert_eq!(derived("my-docs", "X-Team"), "MY_DOCS_X_TEAM");
+        assert!(is_scheme("Bearer") && is_scheme("X-Team"));
+        assert!(!is_scheme("") && !is_scheme("a b") && !is_scheme("a_b"));
     }
 
     // MCP spec §3.2 step 4: npm runs as `npx -y <identifier>@<version>`,

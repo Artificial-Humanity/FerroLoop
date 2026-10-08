@@ -15,7 +15,7 @@ use fl_mcp::freeze::{self, FreezeOptions, Route};
 use fl_mcp::registry::{Registry, printable};
 use fl_mcp::sync::{self, Action, Plan, Switches};
 use fl_mcp::vendor;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
@@ -329,6 +329,14 @@ fn literals(given: &[String], with: &str) -> Result<BTreeMap<String, String>> {
     let mut env = BTreeMap::new();
     for given in given {
         let Some((name, value)) = given.split_once('=') else {
+            // A token pasted where a name goes is never repeated (MCP spec §6).
+            if !is_variable(given) {
+                bail!(
+                    "an `--env` with no `=` needs `=<value>` with {with}, and this one is not a \
+                     variable's name, so fl does not repeat it. The registry says which \
+                     variables are secrets, and fl records those by reference itself"
+                );
+            }
             bail!(
                 "`--env {given}` needs `=<value>` with {with}: the registry says which \
                  variables are secrets, and fl records those by reference itself"
@@ -345,6 +353,13 @@ fn add_by_hand(root: &Path, add: Add) -> Result<()> {
     let mut env = BTreeMap::new();
     for given in &add.env {
         let (name, value) = match given.split_once('=') {
+            // The part before `=` is a variable's name: a token pasted there
+            // is refused, and never repeated (MCP spec §6).
+            Some((name, _)) if !is_variable(name) => bail!(
+                "`--env <NAME>=<value>` needs an environment variable's name before the `=` \
+                 (capital letters, digits and `_`); this one is not such a name, so fl does \
+                 not repeat it"
+            ),
             Some((name, value)) => (name, EnvValue::Literal(value.to_string())),
             // A secret reference: the name is the variable, so a token pasted
             // here is refused, and never repeated (MCP spec §6).
@@ -385,21 +400,10 @@ fn add_by_hand(root: &Path, add: Add) -> Result<()> {
     let mut editor = Editor::open(root)?;
     editor.add(&add.name, &server)?;
     editor.save()?;
-    let warnings: Vec<String> = (server.literal_values().iter())
-        .map(|field| {
-            format!(
-                "`{field}` is a literal value: it will be committed with the catalog, and is \
-                 public if the repository is"
-            )
-        })
+    let warnings = freeze::literal_warnings(&server);
+    let secrets: Vec<String> = (server.secret_vars().into_iter())
+        .map(str::to_string)
         .collect();
-    let env_secrets = (server.env.iter().flatten()).filter_map(|(k, v)| v.secret_var(k));
-    let header_secrets = (server.headers.iter().flatten()).filter_map(|(_, v)| match v {
-        HeaderValue::Secret { env, .. } => Some(env.as_str()),
-        HeaderValue::Literal(_) => None,
-    });
-    let secrets: BTreeSet<&str> = env_secrets.chain(header_secrets).collect();
-    let secrets: Vec<String> = secrets.into_iter().map(str::to_string).collect();
     added(&add.name, editor.path(), &server, &warnings, &secrets, &[]);
     Ok(())
 }
@@ -430,25 +434,20 @@ fn header(server: &str, given: &str) -> Result<(String, HeaderValue)> {
         Some((name, rest)) => (name, Some(rest)),
         None => (given, None),
     };
-    if !is_token(name) {
+    if !freeze::is_scheme(name) {
         bail!(
             "a `--header` starts with a header name (letters, digits and `-`), then \
              optionally `=<ENV>` and `:<SCHEME>`; this one does not"
         );
     }
     let (env, scheme) = match rest {
-        None => (
-            format!("{server}_{name}")
-                .to_ascii_uppercase()
-                .replace('-', "_"),
-            None,
-        ),
+        None => (freeze::derived(server, name), None),
         Some(rest) => {
             let (env, scheme) = match rest.split_once(':') {
                 Some((env, scheme)) => (env, Some(scheme)),
                 None => (rest, None),
             };
-            if !is_variable(env) || !scheme.is_none_or(is_token) {
+            if !is_variable(env) || !scheme.is_none_or(freeze::is_scheme) {
                 bail!(
                     "`--header {name}=…`: after `=` comes the name of an environment variable \
                      (capital letters, digits and `_`), then optionally `:` and a scheme such \
@@ -461,11 +460,6 @@ fn header(server: &str, given: &str) -> Result<(String, HeaderValue)> {
         }
     };
     Ok((name.to_string(), HeaderValue::Secret { env, scheme }))
-}
-
-/// A header name or an authentication scheme: letters, digits and `-`.
-fn is_token(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// A variable's name as `--header` and `--env NAME` take it: capital letters,

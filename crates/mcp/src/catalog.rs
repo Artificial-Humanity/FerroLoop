@@ -6,7 +6,7 @@
 use crate::McpError;
 use serde::Deserialize;
 use serde::de::{self, MapAccess, Visitor};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -153,6 +153,18 @@ impl Server {
     /// Whether this server is written for `vendor`.
     pub fn is_for(&self, vendor: VendorName) -> bool {
         self.vendors.as_ref().is_none_or(|v| v.contains(&vendor))
+    }
+
+    /// The variables this server reads its secrets from: each secret
+    /// environment variable's, and each secret header's. Names only, never a
+    /// value (MCP spec §6).
+    pub fn secret_vars(&self) -> BTreeSet<&str> {
+        let env = (self.env.iter().flatten()).filter_map(|(k, v)| v.secret_var(k));
+        let headers = (self.headers.iter().flatten()).filter_map(|(_, v)| match v {
+            HeaderValue::Secret { env, .. } => Some(env.as_str()),
+            HeaderValue::Literal(_) => None,
+        });
+        env.chain(headers).collect()
     }
 
     /// Every literal `env` and header value, as `env.<NAME>` and
@@ -955,6 +967,20 @@ env.LOG_LEVEL = "info"
         assert_eq!(c.servers["github"].literal_values(), ["env.LOG_LEVEL"]);
         assert_eq!(c.servers["docs"].literal_values(), ["headers.X-Team"]);
         assert!(c.servers["events"].literal_values().is_empty());
+    }
+
+    #[test]
+    fn a_server_lists_the_variables_its_secrets_are_read_from_by_name_only() {
+        let c = parse(FULL).unwrap();
+        let vars = |name: &str| {
+            c.servers[name]
+                .secret_vars()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(vars("github"), ["EXAMPLE_API_KEY", "GITHUB_TOKEN"]);
+        assert_eq!(vars("docs"), ["DOCS_KEY", "DOCS_TOKEN"]);
+        assert!(vars("events").is_empty());
     }
 
     #[test]

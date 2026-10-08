@@ -583,7 +583,28 @@ fn add_by_hand_records_a_command_and_a_remote_with_secret_headers_by_reference()
         assert!(!err.to_lowercase().contains("example0token"), "{err}");
         assert!(!err.contains("Api_Token"), "{err}");
     }
-    assert!(!w.read(CATALOG).contains("leak"));
+    // The name before `=` is a variable's name too: a token pasted there
+    // (a base64 string, a key) is refused, never repeated, never recorded.
+    for given in [
+        "c2VjcmV0dG9rZW4=",
+        "c2VjcmV0dG9rZW4=value",
+        "ghp_example0token=x",
+        "=x",
+    ] {
+        let (_, err) = w.refused(&["add", "leak", "--env", given, "--", "node"]);
+        assert!(
+            err.contains("needs an environment variable's name before the `=`"),
+            "{given}: {err}"
+        );
+        assert!(!err.contains("c2VjcmV0dG9rZW4"), "{given}: {err}");
+        assert!(
+            !err.to_lowercase().contains("example0token"),
+            "{given}: {err}"
+        );
+    }
+    let catalog = w.read(CATALOG);
+    assert!(!catalog.contains("leak"));
+    assert!(!catalog.contains("c2VjcmV0dG9rZW4"), "{catalog}");
 }
 
 // `upgrade` takes `--env` and `--with` for what the new version needs, so
@@ -664,6 +685,13 @@ fn upgrade_takes_env_and_with_for_what_the_new_version_needs() {
         err.contains("`--env UPGRADING_HOME` needs `=<value>` with `fl mcp upgrade`"),
         "{err}"
     );
+    // A token pasted where a name goes is never repeated.
+    let (_, err) = w.refused(&["upgrade", "full", "--env", "ghp_example0token"]);
+    assert!(
+        err.contains("this one is not a variable's name, so fl does not repeat it"),
+        "{err}"
+    );
+    assert!(!err.to_lowercase().contains("example0token"), "{err}");
 }
 
 #[test]
@@ -1086,6 +1114,20 @@ fn a_flag_given_twice_or_an_add_with_no_source_is_refused() {
         err.contains("`--env UNITS` needs `=<value>` with `--from`"),
         "{err}"
     );
+    // A token pasted where a name goes is never repeated.
+    let (_, err) = w.refused(&[
+        "add",
+        "weather",
+        "--from",
+        fake::WEATHER,
+        "--env",
+        "ghp_example0token",
+    ]);
+    assert!(
+        err.contains("this one is not a variable's name, so fl does not repeat it"),
+        "{err}"
+    );
+    assert!(!err.to_lowercase().contains("example0token"), "{err}");
     assert!(!w.exists(CATALOG) || !w.read(CATALOG).contains("[server."));
     assert_eq!(
         w.requests().len(),
