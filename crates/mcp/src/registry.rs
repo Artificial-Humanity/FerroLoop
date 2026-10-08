@@ -11,6 +11,7 @@ use crate::catalog::check_registry_url;
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Read as _;
 use std::time::Duration;
 
 /// The registry API version fl reads (MCP spec §3.1).
@@ -197,23 +198,34 @@ impl Registry {
                 version: version.map(str::to_string),
             });
         }
-        let text = match resp
+        // The cap counts the DECODED bytes (the reader reads one more than the
+        // cap, to tell a body of exactly the cap from a longer one): ureq's own
+        // limit sits under its gzip decoder, so alone it counts the wire.
+        let too_big = || {
+            failed(
+                "its answer is larger than 4 MiB, which fl will not read. The address may \
+                 not be a registry; check it"
+                    .to_string(),
+            )
+        };
+        let mut bytes = Vec::new();
+        let read = resp
             .body_mut()
             .with_config()
             .limit(BODY_LIMIT)
             .lossy_utf8(true)
-            .read_to_string()
-        {
-            Ok(text) => text,
-            Err(ureq::Error::BodyExceedsLimit(_)) => {
-                return Err(failed(
-                    "its answer is larger than 4 MiB, which fl will not read. The address may \
-                     not be a registry; check it"
-                        .to_string(),
-                ));
-            }
+            .reader()
+            .take(BODY_LIMIT + 1)
+            .read_to_end(&mut bytes);
+        match read.map_err(ureq::Error::from) {
+            Ok(_) => {}
+            Err(ureq::Error::BodyExceedsLimit(_)) => return Err(too_big()),
             Err(e) => return Err(unreachable(e)),
-        };
+        }
+        if bytes.len() as u64 > BODY_LIMIT {
+            return Err(too_big());
+        }
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         if !(200..300).contains(&status) {
             let detail = (mime == "application/problem+json")
                 .then(|| serde_json::from_str::<ProblemJson>(&text).ok())
@@ -1009,6 +1021,22 @@ mod tests {
         holds_only(&msg, "cannot reach the registry");
 
         // And a registry that behaves is read as one, after all of that.
+        assert_eq!(
+            names(&registry.search("notes").unwrap().servers),
+            [fake::NOTES]
+        );
+    }
+
+    // MCP spec §3.1: the cap counts the decoded body. A gzip answer a few KiB
+    // long on the wire decodes to 32 MiB; ureq's own limit sits under its
+    // decoder and would let it through.
+    #[test]
+    fn a_gzip_answer_that_decodes_past_the_cap_is_refused() {
+        let fake = FakeRegistry::start();
+        let registry = client(&fake);
+        fake.state().gzip_bomb_next = true;
+        let msg = registry.search("notes").unwrap_err().to_string();
+        holds_only(&msg, "larger than 4 MiB");
         assert_eq!(
             names(&registry.search("notes").unwrap().servers),
             [fake::NOTES]

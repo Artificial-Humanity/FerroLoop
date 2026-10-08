@@ -68,6 +68,9 @@ pub struct State {
     pub html_502_next: bool,
     /// The next request answers 200 with a valid list over 4 MiB. One-shot.
     pub oversized_next: bool,
+    /// The next request answers 200 with a valid list, gzip-encoded: a few
+    /// KiB on the wire, 32 MiB decoded. One-shot.
+    pub gzip_bomb_next: bool,
     /// The next request answers 500 with `application/problem+json`, as the
     /// real registry once did. One-shot.
     pub problem_500_next: bool,
@@ -114,9 +117,12 @@ impl FakeRegistry {
                     s.headers.push(headers);
                     route(&mut s, &url)
                 };
-                let mut resp = tiny_http::Response::from_string(answer.body)
+                let mut resp = tiny_http::Response::from_data(answer.body)
                     .with_status_code(answer.status)
                     .with_header(header("Content-Type", answer.content_type));
+                if let Some(encoding) = answer.encoding {
+                    resp = resp.with_header(header("Content-Encoding", encoding));
+                }
                 if let Some(location) = answer.location {
                     resp = resp.with_header(header("Location", &location));
                 }
@@ -170,8 +176,10 @@ fn header(k: &str, v: &str) -> tiny_http::Header {
 struct Answer {
     status: u16,
     content_type: &'static str,
-    body: String,
+    body: Vec<u8>,
     location: Option<String>,
+    /// The `Content-Encoding`, when the body is encoded.
+    encoding: Option<&'static str>,
 }
 
 impl Answer {
@@ -179,8 +187,9 @@ impl Answer {
         Answer {
             status,
             content_type: "application/json",
-            body: body.to_string(),
+            body: body.to_string().into_bytes(),
             location: None,
+            encoding: None,
         }
     }
 
@@ -188,8 +197,11 @@ impl Answer {
         Answer {
             status,
             content_type: "application/problem+json",
-            body: json!({ "title": title, "status": status, "detail": detail }).to_string(),
+            body: json!({ "title": title, "status": status, "detail": detail })
+                .to_string()
+                .into_bytes(),
             location: None,
+            encoding: None,
         }
     }
 }
@@ -200,16 +212,18 @@ fn route(s: &mut State, url: &str) -> Answer {
         return Answer {
             status: 302,
             content_type: "text/html; charset=utf-8",
-            body: format!("<a href=\"{location}\">Found</a>."),
+            body: format!("<a href=\"{location}\">Found</a>.").into_bytes(),
             location: Some(location),
+            encoding: None,
         };
     }
     if std::mem::take(&mut s.html_502_next) {
         return Answer {
             status: 502,
             content_type: "text/html; charset=utf-8",
-            body: "<html><body><h1>502 Bad Gateway</h1></body></html>".into(),
+            body: b"<html><body><h1>502 Bad Gateway</h1></body></html>".to_vec(),
             location: None,
+            encoding: None,
         };
     }
     if std::mem::take(&mut s.problem_500_next) {
@@ -219,6 +233,21 @@ fn route(s: &mut State, url: &str) -> Answer {
         let mut big = entry(NOTES, "1.2.0", true, vec![], vec![]);
         big["server"]["description"] = Value::String("x".repeat(9 << 19));
         return Answer::json(200, json!({ "servers": [big], "metadata": { "count": 1 } }));
+    }
+    if std::mem::take(&mut s.gzip_bomb_next) {
+        use std::io::Write as _;
+        let mut big = entry(NOTES, "1.2.0", true, vec![], vec![]);
+        big["server"]["description"] = Value::String("x".repeat(32 << 20));
+        let list = json!({ "servers": [big], "metadata": { "count": 1 } }).to_string();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(list.as_bytes()).expect("compress in memory");
+        return Answer {
+            status: 200,
+            content_type: "application/json",
+            body: gz.finish().expect("compress in memory"),
+            location: None,
+            encoding: Some("gzip"),
+        };
     }
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
     let param = |key: &str| {

@@ -409,6 +409,7 @@ dependencies = [
 name = "fl-mcp"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "indexmap",
  "serde",
  "serde_json",
