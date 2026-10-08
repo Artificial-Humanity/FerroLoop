@@ -401,9 +401,9 @@ retrying.
 
 ## The live tests
 
-**Status: the first three passed on 2026-09-29, writing with a fine-grained token; the
-escalation test has not yet been run.** The concurrency test counted 1 clean round, 9 conflicts
-caught and 0 updates lost. None has yet been run writing as the App.
+**Status: the first three passed on 2026-09-29, and the escalation test on 2026-10-07, writing
+with a fine-grained token.** The concurrency test counted 1 clean round, 9 conflicts caught and 0
+updates lost. None has yet been run writing as the App.
 
 The tests that run in CI use an in-process fake GitHub. It proves the structure, not how
 GitHub behaves, so four more tests in `crates/github/tests/live.rs` run against GitHub

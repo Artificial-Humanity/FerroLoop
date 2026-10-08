@@ -146,8 +146,9 @@ record, have a title GitHub takes; no name of the item may already name somethin
 routing map must be current, as for a new item; and a finding's reproduction gate must be in the
 committed manifest. The issue's body must fit GitHub's limit of 65,536 characters: a record's issue
 lists at most 25 open findings, each claim cut short, and counts the rest, while a finding's claim,
-the title of the local record a finding is about, the reason, who escalated it and the item's
-aliases are checked first, and a refusal names the one to shorten. Nothing sensitive reaches a
+the title of the local record a finding is about, who raised the finding and who it is assigned
+to, the reason, who escalated it and the item's aliases are checked first, and a refusal names
+the one to shorten. Nothing sensitive reaches a
 repository that is not private: a record in a sensitive area, a security finding, a finding in a
 sensitive area or about a local record in one — or in an area the map no longer declares — is
 refused, and stays local. Anything else escalated to a repository that is not private is published
