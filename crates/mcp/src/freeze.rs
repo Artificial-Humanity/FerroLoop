@@ -339,6 +339,21 @@ impl Offer<'_> {
     }
 }
 
+/// What an `upgrade` that cannot pick a route says to do instead (MCP spec
+/// §3.3): remove the entry and add it again by a route, at the version it was
+/// moving to. Adding it again starts a new entry, so its `enabled` and
+/// `vendors` settings are not carried over.
+fn remove_then_add(n: &str, s: &ServerJson) -> String {
+    format!(
+        "`fl mcp remove {n}`, then `fl mcp add {n} --from {} --package <type>` or `--remote`. \
+         Add `--version {}` to take the version you were moving to. Adding it again resets \
+         the entry's `enabled` and `vendors` settings: note them before removing it, and set \
+         them again afterwards",
+        printable(&s.name),
+        printable(&s.version)
+    )
+}
+
 /// MCP spec §3.2 step 3: the route named, or the only one on offer.
 fn choose<'a>(s: &'a ServerJson, opts: &FreezeOptions) -> Result<Offer<'a>, Refusal> {
     let n = &opts.name;
@@ -363,7 +378,15 @@ fn choose<'a>(s: &'a ServerJson, opts: &FreezeOptions) -> Result<Offer<'a>, Refu
         }
         return refuse(
             format!("it offers more than one launch route: {}", list()),
-            "Choose one with `--package <type>` or `--remote`",
+            if opts.upgrading {
+                format!(
+                    "`fl mcp upgrade` takes no `--package` or `--remote`. Choose a route by \
+                     removing the entry and adding it again: {}",
+                    remove_then_add(n, s)
+                )
+            } else {
+                "Choose one with `--package <type>` or `--remote`".to_string()
+            },
         );
     };
     let mut hits = offers.iter().filter(|o| o.route() == Some(route));
@@ -376,9 +399,8 @@ fn choose<'a>(s: &'a ServerJson, opts: &FreezeOptions) -> Result<Offer<'a>, Refu
                 // removed and added again by the route the new version offers.
                 format!(
                     "`fl mcp upgrade` keeps the route the entry was frozen from. Take the route \
-                     the new version offers: `fl mcp remove {n}`, then `fl mcp add {n} --from {} \
-                     --package <type>` or `--remote`",
-                    printable(&s.name)
+                     the new version offers: {}",
+                    remove_then_add(n, s)
                 )
             } else {
                 "Choose one it offers".to_string()
@@ -2545,11 +2567,73 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("Choose one it offers"), "{msg}");
+        // The version they were moving to is picked with `--version`, and the
+        // new entry starts again: its switches are not carried over.
+        assert!(
+            msg.contains("Add `--version 1.0.0` to take the version you were moving to"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "Adding it again resets the entry's `enabled` and `vendors` settings: note \
+                 them before removing it, and set them again afterwards"
+            ),
+            "{msg}"
+        );
         // `add` has the flags: its refusal is unchanged.
         let msg = freeze(&gone, &routed("sample", Route::Remote))
             .unwrap_err()
             .to_string();
         assert!(msg.contains("Choose one it offers"), "{msg}");
+        assert!(
+            !msg.contains("--version") && !msg.contains("resets"),
+            "{msg}"
+        );
+    }
+
+    // The same refusal is reached under `upgrade` when the pinned entry names
+    // no route and the new version offers several: `upgrade` has no `--package`
+    // or `--remote` either, so it names remove-then-add too, and `add` keeps
+    // its own wording.
+    #[test]
+    fn an_upgrade_that_cannot_tell_the_route_names_remove_then_add_and_add_keeps_its_wording() {
+        let two = response(sample(json!([npm(json!({}))]), json!([remote(json!({}))])));
+        let upgrading = FreezeOptions {
+            upgrading: true,
+            ..named("sample")
+        };
+        let msg = freeze(&two, &upgrading).unwrap_err().to_string();
+        assert!(msg.contains("offers more than one launch route"), "{msg}");
+        assert!(
+            msg.contains("`fl mcp upgrade` takes no `--package` or `--remote`"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "`fl mcp remove sample`, then `fl mcp add sample --from io.example/sample \
+                 --package <type>` or `--remote`"
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Add `--version 1.0.0` to take the version you were moving to"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Adding it again resets the entry's `enabled` and `vendors`"),
+            "{msg}"
+        );
+        assert!(!msg.contains("Choose one with"), "{msg}");
+        // `add` has the flags: unchanged.
+        let msg = freeze(&two, &named("sample")).unwrap_err().to_string();
+        assert!(
+            msg.contains("Choose one with `--package <type>` or `--remote`"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("--version") && !msg.contains("resets"),
+            "{msg}"
+        );
     }
 
     // `status` is an open string: one fl does not know is refused at freeze,
