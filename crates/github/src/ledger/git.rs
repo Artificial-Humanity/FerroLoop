@@ -673,6 +673,60 @@ mod tests {
         assert!(err.to_string().contains("502"), "{err}");
     }
 
+    // The same, when the server error's body is over the cap: its status is
+    // still what is judged.
+    #[test]
+    fn a_server_error_with_a_body_over_the_cap_on_any_ledger_read_is_transient() {
+        let fake = FakeGithub::start("acme/widgets");
+        let root = fake.seed_ledger();
+        let tree = fake.state().git.commits[&root].tree.clone();
+        let local = MemStore::default();
+        let c = client(&fake);
+        let l = open(&c, &local);
+        type Read<'a> = Box<dyn Fn() -> Result<(), StoreError> + 'a>;
+        let reads: Vec<(&str, &str, Read<'_>)> = vec![
+            (
+                "branch_head",
+                "/git/ref/heads/",
+                Box::new(|| l.branch_head(BRANCH).map(drop)),
+            ),
+            (
+                "compare",
+                "/compare/",
+                Box::new(|| l.compare(&root, &root).map(drop)),
+            ),
+            (
+                "objects",
+                "/graphql",
+                Box::new(|| l.objects(&root, &[FORMAT_FILE.to_string()]).map(drop)),
+            ),
+            (
+                "blob_bytes",
+                "/git/blobs/",
+                Box::new(|| l.blob_bytes("deadbeef").map(drop)),
+            ),
+            (
+                "commit_object",
+                "/git/commits/",
+                Box::new(|| l.commit_object(&root).map(drop)),
+            ),
+            (
+                "tree_files",
+                "/git/trees/",
+                Box::new(|| l.tree_files(&tree).map(drop)),
+            ),
+        ];
+        for (name, frag, read) in &reads {
+            fake.state().gzip_bomb_next = Some(((*frag).to_string(), 502));
+            let err = read().unwrap_err();
+            assert!(
+                matches!(err, StoreError::Unreachable { .. }) && err.is_transient(),
+                "{name}: {err:?}"
+            );
+            assert!(err.to_string().contains("502"), "{name}: {err}");
+        }
+    }
+
     // A server error on any ledger read says nothing lasting: it is
     // transient (`Unreachable`), so a report falls back to the local store
     // and a refused publish says the next one adds what is missing — never

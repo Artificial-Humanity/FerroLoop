@@ -146,12 +146,15 @@ pub struct State {
     /// The next request answers 502 with an HTML body — what a load
     /// balancer sends, not GitHub's JSON. One-shot.
     pub html_502_next: bool,
-    /// The next request answers 200 with a valid JSON object, gzip-encoded: a
-    /// few KiB on the wire, 32 MiB decoded. One-shot.
-    pub gzip_bomb_next: bool,
-    /// The next request answers 200 with a JSON object holding a byte that
-    /// is not UTF-8. One-shot.
-    pub invalid_utf8_next: bool,
+    /// The next request whose `METHOD url body` contains this text answers
+    /// with this status and a valid JSON object, gzip-encoded: a few KiB on
+    /// the wire, 32 MiB decoded. An empty text matches any request.
+    /// One-shot.
+    pub gzip_bomb_next: Option<(String, u16)>,
+    /// The next request answers with this status and a body holding a byte
+    /// that is not UTF-8: JSON for a 2xx, an HTML page (Latin-1) for any
+    /// other status. One-shot.
+    pub invalid_utf8_next: Option<u16>,
     /// The next request answers 200, gzip-encoded, with 11 MiB on the wire: a
     /// valid small object, then empty gzip members. One-shot.
     pub gzip_padded_next: bool,
@@ -507,9 +510,15 @@ impl FakeGithub {
                     continue;
                 }
                 if let Some(bytes) = answer.encoded_body {
-                    let mut resp = tiny_http::Response::from_data(bytes)
-                        .with_status_code(answer.status)
-                        .with_header(header("Content-Type", "application/json"));
+                    let mut resp =
+                        tiny_http::Response::from_data(bytes).with_status_code(answer.status);
+                    if !answer
+                        .headers
+                        .iter()
+                        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                    {
+                        resp = resp.with_header(header("Content-Type", "application/json"));
+                    }
                     for (k, v) in answer.headers {
                         resp = resp.with_header(header(&k, &v));
                     }
@@ -764,9 +773,9 @@ fn gzip_member(data: &[u8]) -> Vec<u8> {
     gz.finish().expect("compress in memory")
 }
 
-/// A 200 whose body is `gzip`, named as such.
-fn gzip_answer(gzip: Vec<u8>) -> Answer {
-    let mut a = answer(200, Value::Null);
+/// An answer with this status whose body is `gzip`, named as such.
+fn gzip_answer(status: u16, gzip: Vec<u8>) -> Answer {
+    let mut a = answer(status, Value::Null);
     a.headers.push(("Content-Encoding".into(), "gzip".into()));
     a.encoded_body = Some(gzip);
     a
@@ -1206,9 +1215,12 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         a.hang_up = true;
         return a;
     }
-    if std::mem::take(&mut s.gzip_bomb_next) {
+    if let Some((frag, status)) = s.gzip_bomb_next.clone()
+        && format!("{method} {url} {body}").contains(&frag)
+    {
+        s.gzip_bomb_next = None;
         let object = json!({"message": "x".repeat(32 << 20)}).to_string();
-        return gzip_answer(gzip_member(object.as_bytes()));
+        return gzip_answer(status, gzip_member(object.as_bytes()));
     }
     if std::mem::take(&mut s.gzip_padded_next) {
         let mut body = gzip_member(br#"{"message":"ok"}"#);
@@ -1216,12 +1228,17 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         while body.len() < 11 << 20 {
             body.extend_from_slice(&empty);
         }
-        return gzip_answer(body);
+        return gzip_answer(200, body);
     }
-    if std::mem::take(&mut s.invalid_utf8_next) {
-        let mut a = raw_answer(200, "");
-        a.raw_body = None;
-        a.encoded_body = Some(b"{\"message\":\"caf\xE9\"}".to_vec());
+    if let Some(status) = s.invalid_utf8_next.take() {
+        let mut a = answer(status, Value::Null);
+        if (200..300).contains(&status) {
+            a.encoded_body = Some(b"{\"message\":\"caf\xE9\"}".to_vec());
+        } else {
+            a.encoded_body = Some(b"<html>caf\xE9</html>".to_vec());
+            a.headers
+                .push(("Content-Type".into(), "text/html; charset=utf-8".into()));
+        }
         return a;
     }
     if let Some(i) = s
