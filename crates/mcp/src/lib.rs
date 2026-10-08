@@ -117,6 +117,11 @@ pub enum McpError {
     /// `sync` refused one entry or more, so it wrote nothing (MCP spec §4.3).
     #[error("nothing was written:\n{}", lines(refusals))]
     Refused { refusals: Vec<sync::Refusal> },
+    /// `sync --replace` names an entry no target refused, so it would be
+    /// ignored (MCP spec §4.3). `names` holds those that are server names,
+    /// which are safe to repeat; `others` counts the rest, never repeated.
+    #[error("{}", unmatched(names, *others))]
+    UnmatchedReplace { names: Vec<String>, others: usize },
     /// A target changed between the plan and the write (MCP spec §4.3).
     #[error(
         "{} changed while fl was planning its write: another program or a person wrote it. \
@@ -138,6 +143,22 @@ fn missing(name: &str, version: &Option<String>) -> String {
         Some(v) => format!("version `{v}` of server `{name}`"),
         None => format!("server `{name}`"),
     }
+}
+
+fn unmatched(names: &[String], others: usize) -> String {
+    let mut parts: Vec<String> = names.iter().map(|n| format!("`{n}`")).collect();
+    match others {
+        0 => {}
+        1 => parts.push("a name that is not a server name, which fl does not repeat".into()),
+        n => parts.push(format!(
+            "{n} names that are not server names, which fl does not repeat"
+        )),
+    }
+    format!(
+        "nothing was written: `--replace` names {}, and no target refused an entry by that \
+         name. Run `fl mcp sync` without it to see which entries fl refuses, or check the name",
+        parts.join(", ")
+    )
 }
 
 fn lines(refusals: &[sync::Refusal]) -> String {

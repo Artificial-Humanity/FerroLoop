@@ -330,6 +330,47 @@ fn check_exits_0_when_synced_1_after_a_catalog_change_and_2_on_a_refusal() {
     assert_eq!(w.read(CLAUDE), edited);
 }
 
+// MCP spec §4.3: a `--replace` that matches no refused entry is refused, with
+// nothing written; a name that is not a server name is never repeated.
+#[test]
+fn a_replace_that_matches_no_refused_entry_is_refused_writing_nothing() {
+    let w = World::new();
+    w.with_registry();
+    w.ok(&["add", "notes", "--from", fake::NOTES]);
+    w.ok(&["sync"]);
+    let edited = w.read(CLAUDE).replace("notes-mcp@1.2.0", "notes-mcp@9.9.9");
+    fs::write(w.app().join(CLAUDE), &edited).unwrap();
+    let before = listing(w.home());
+
+    let (out, err) = w.refused(&["sync", "--replace", "nosuch"]);
+    assert!(
+        err.contains("`--replace` names `nosuch`") && err.contains("Run `fl mcp sync` without it"),
+        "{err}"
+    );
+    assert!(
+        out.is_empty(),
+        "no plan is printed for a refused flag: {out}"
+    );
+    assert_eq!(listing(w.home()), before, "nothing is written");
+    // The refused entry is not the one named: still refused, still nothing.
+    let (_, err) = w.refused(&["sync", "--replace", "nosuch", "--replace", "notes"]);
+    assert!(
+        err.contains("`nosuch`") && !err.contains("`notes`"),
+        "{err}"
+    );
+    assert_eq!(listing(w.home()), before, "nothing is written");
+
+    // A token where a name goes is counted, never repeated.
+    let (_, err) = w.refused(&["sync", "--replace", "ghp_example0token"]);
+    assert!(err.contains("a name that is not a server name"), "{err}");
+    assert!(!err.to_lowercase().contains("example0token"), "{err}");
+    assert_eq!(listing(w.home()), before, "nothing is written");
+
+    // The name of the entry that was refused still overwrites it.
+    w.ok(&["sync", "--replace", "notes"]);
+    assert!(w.read(CLAUDE).contains("notes-mcp@1.2.0"));
+}
+
 #[test]
 fn disable_then_sync_removes_the_server_from_every_file_and_enable_brings_it_back() {
     let w = World::new();
@@ -1033,7 +1074,9 @@ fn no_fl_mcp_command_creates_or_opens_a_store() {
     w.ok(&["upgrade", "notes"]);
     w.ok(&["sync"]);
     w.run(&["check"]);
-    w.ok(&["sync", "--replace", "notes"]);
+    // Nothing is refused, so this `--replace` is itself refused; it still
+    // opens no store.
+    w.refused(&["sync", "--replace", "notes"]);
     w.ok(&["remove", "local"]);
     assert!(
         !w.home().join("data").exists(),

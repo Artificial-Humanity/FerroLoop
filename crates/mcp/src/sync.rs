@@ -281,15 +281,42 @@ pub fn plan(
 ) -> Result<Plan, McpError> {
     let (desired, skipped, warnings) = desired(root, catalog, switches);
     let owner = canonical(root)?;
-    let targets = VendorName::ALL
+    let targets: Vec<Target> = VendorName::ALL
         .into_iter()
         .map(|v| plan_target(root, &owner, v, &desired[&v], records, replace))
         .collect::<Result<_, _>>()?;
+    unmatched_replaces(&targets, replace)?;
     Ok(Plan {
         records: records.to_path_buf(),
         targets,
         skipped,
         warnings,
+    })
+}
+
+/// MCP spec §4.3: a `--replace` name that overwrote an entry in no target
+/// matched nothing, and is refused. A name is repeated only when it is a
+/// server name; any other may be a secret someone pasted (MCP spec §6).
+fn unmatched_replaces(targets: &[Target], replace: &[String]) -> Result<(), McpError> {
+    let replaced: BTreeSet<&str> = targets
+        .iter()
+        .flat_map(|t| &t.entries)
+        .filter(|e| matches!(e.action, Action::Replace { .. }))
+        .map(|e| e.name.as_str())
+        .collect();
+    let unmatched: BTreeSet<&String> = replace
+        .iter()
+        .filter(|n| !replaced.contains(n.as_str()))
+        .collect();
+    if unmatched.is_empty() {
+        return Ok(());
+    }
+    let (names, others): (Vec<&String>, Vec<&String>) = unmatched
+        .into_iter()
+        .partition(|n| crate::catalog::is_server_name(n));
+    Err(McpError::UnmatchedReplace {
+        names: names.into_iter().cloned().collect(),
+        others: others.len(),
     })
 }
 
@@ -1305,6 +1332,97 @@ env.NOTES_TOKEN = { secret = true }
         assert_eq!(f.entry(VendorName::Claude, "theirs"), theirs);
         let record = f.record(VendorName::Claude).unwrap();
         assert_eq!(record["entries"]["notes"]["sha256"], sha(&notes));
+    }
+
+    /// The error of planning `text` with these `--replace` names; the plan
+    /// is not printed when there is none.
+    fn refused_replace(f: &Fixture, text: &str, names: &[&str]) -> McpError {
+        let replace: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        match plan(
+            &f.root,
+            &catalog(text),
+            &Switches::default(),
+            &f.records,
+            &replace,
+        ) {
+            Ok(_) => panic!("a `--replace` that matches no refused entry was planned"),
+            Err(e) => e,
+        }
+    }
+
+    // MCP spec §4.3: a `--replace` that names no refused entry would be
+    // ignored, and the person would think the entry was overwritten. It is
+    // refused before anything is written.
+    #[test]
+    fn a_replace_that_matches_no_refused_entry_is_refused_and_nothing_is_written() {
+        let f = fixture();
+        f.sync(CATALOG);
+        let docs = "https://docs.example.com/mcp";
+        f.edit(VendorName::Claude, docs, "https://docs.example.com/v2");
+        let before = f.snapshot();
+
+        // A name nothing has, and the name of an entry that is not refused.
+        for name in ["nosuch", "notes"] {
+            let err = refused_replace(&f, CATALOG, &[name]);
+            assert!(matches!(err, McpError::UnmatchedReplace { .. }), "{err:?}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("`--replace` names `{name}`")),
+                "{msg}"
+            );
+            assert!(msg.contains("nothing was written"), "{msg}");
+            assert!(msg.contains("Run `fl mcp sync` without it"), "{msg}");
+        }
+        // A name that matches does not excuse one that does not; only the
+        // one that does not is named.
+        let msg = refused_replace(&f, CATALOG, &["docs", "nosuch"]).to_string();
+        assert!(msg.contains("`nosuch`") && !msg.contains("`docs`"), "{msg}");
+        assert_eq!(f.snapshot(), before);
+        // The one that matches is replaced.
+        let replace = vec!["docs".to_string()];
+        let plan = plan(
+            &f.root,
+            &catalog(CATALOG),
+            &Switches::default(),
+            &f.records,
+            &replace,
+        );
+        apply(&plan.unwrap()).unwrap();
+        assert_eq!(
+            f.entry(VendorName::Claude, "docs"),
+            Some(rendered(VendorName::Claude, CATALOG, "docs"))
+        );
+    }
+
+    // A name that is not a server name may be a secret someone pasted: it is
+    // counted, never repeated (MCP spec §6).
+    #[test]
+    fn a_replace_name_that_is_not_a_server_name_is_not_repeated() {
+        let f = fixture();
+        f.sync(CATALOG);
+        let long = "a".repeat(33);
+        for token in [
+            "ghp_example0token",
+            "Sk-Example0Token",
+            "a b",
+            "",
+            long.as_str(),
+        ] {
+            let msg = refused_replace(&f, CATALOG, &[token, "nosuch"]).to_string();
+            assert!(msg.contains("`nosuch`"), "{msg}");
+            assert!(msg.contains("a name that is not a server name"), "{msg}");
+            assert!(!msg.to_lowercase().contains("example0token"), "{msg}");
+            assert!(!msg.contains("a b") && !msg.contains(&long), "{msg}");
+        }
+        let msg = refused_replace(&f, CATALOG, &["ghp_example0token", "Other_Token"]).to_string();
+        assert!(
+            msg.contains("`--replace` names 2 names that are not server names"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("Other_Token") && !msg.contains("ghp_"),
+            "{msg}"
+        );
     }
 
     #[test]

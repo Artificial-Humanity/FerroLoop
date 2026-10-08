@@ -334,7 +334,10 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
   refusal names the fields that differ, never their values, since a hand-edited entry may hold a
   pasted token. Restore the entry, or run `fl mcp sync --replace <name>`, which shows the same
   difference and writes fl's entry over it. An entry fl wrote that was changed by hand while
-  the catalog no longer wants it is refused too, and `--replace <name>` removes it.
+  the catalog no longer wants it is refused too, and `--replace <name>` removes it. A
+  `--replace` name that matches no refused entry in any file is itself refused, with nothing
+  written, rather than ignored; run `sync` without it to see which entries fl refuses. The refusal
+  repeats a name only when it is a server name.
 * **A file that changed while `sync` planned**, by another program or a person. Run `sync` again.
 * **A vendor file git would commit.** See the `.gitignore` lines above.
 * **A vendor file reached through a link**: the file, or a directory on its way, is a symbolic
