@@ -142,11 +142,20 @@ pub enum RefusalKind {
     Foreign,
 }
 
+/// The difference of an entry the catalog no longer wants in this file.
+const NO_LONGER_WANTED: &str = "the catalog no longer has it here, so fl would remove it";
+
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (path, name, difference) = (self.path.display(), &self.name, &self.difference);
         let replace = format!("run `fl mcp sync --replace {name}`");
         match self.kind {
+            // The catalog no longer wants it here: `--replace` removes it.
+            RefusalKind::HandEdited if difference == NO_LONGER_WANTED => write!(
+                f,
+                "{path}: `{name}` was changed by hand since fl wrote it ({difference}). Add the \
+                 server back to the catalog to keep the entry, or {replace}, which removes it"
+            ),
             RefusalKind::HandEdited => write!(
                 f,
                 "{path}: `{name}` was changed by hand since fl wrote it ({difference}). Restore \
@@ -618,7 +627,7 @@ fn difference(
 ) -> String {
     let (current, fl) = match (current, fl) {
         (None, _) => return "it is not in the file".to_string(),
-        (_, None) => return "the catalog no longer has it here, so fl would remove it".to_string(),
+        (_, None) => return NO_LONGER_WANTED.to_string(),
         (Some(current), Some(fl)) => (current, fl.bytes()),
     };
     let (Some(theirs), Some(ours)) = (fields(vendor, name, current), fields(vendor, name, fl))
@@ -1064,6 +1073,57 @@ env.NOTES_TOKEN = { secret = true }
         apply(&plan).unwrap();
         let record = f.record(VendorName::Codex).unwrap();
         assert!(record["entries"].get("notes").is_none(), "{record}");
+        assert!(f.plan(docs_only).targets().iter().all(|t| !t.changes()));
+    }
+
+    #[test]
+    fn a_hand_edited_entry_the_catalog_no_longer_wants_is_refused_not_removed() {
+        let f = fixture();
+        f.sync(CATALOG);
+        f.edit(VendorName::Claude, PINNED, "@example/notes-mcp@1.2.1");
+        let docs_only = CATALOG.split("[server.notes]").next().unwrap();
+        let before = f.snapshot();
+        let plan = f.plan(docs_only);
+        let claude = actions(&plan, VendorName::Claude);
+        assert_eq!(claude[0], ("docs".into(), Action::Unchanged));
+        assert_eq!(
+            refusal(&claude[1].1),
+            format!(
+                "{}: `notes` was changed by hand since fl wrote it (the catalog no longer has it \
+                 here, so fl would remove it). Add the server back to the catalog to keep the \
+                 entry, or run `fl mcp sync --replace notes`, which removes it",
+                f.path(VendorName::Claude).display()
+            )
+        );
+        assert_eq!(plan.check(), Check::Refused);
+        let err = apply(&plan).unwrap_err();
+        assert!(matches!(err, McpError::Refused { .. }), "{err:?}");
+        assert!(err.to_string().contains("was changed by hand"), "{err}");
+        assert!(err.to_string().contains("which removes it"), "{err}");
+        assert_eq!(f.snapshot(), before);
+    }
+
+    #[test]
+    fn replace_removes_a_hand_edited_entry_the_catalog_no_longer_wants() {
+        let f = fixture();
+        f.sync(CATALOG);
+        f.edit(VendorName::Claude, PINNED, "@example/notes-mcp@1.2.1");
+        let docs_only = CATALOG.split("[server.notes]").next().unwrap();
+        let plan = f.plan_with(docs_only, &Switches::default(), &["notes"]);
+        let difference = "the catalog no longer has it here, so fl would remove it".to_string();
+        assert_eq!(
+            actions(&plan, VendorName::Claude)[1],
+            ("notes".into(), Action::Replace { difference })
+        );
+        apply(&plan).unwrap();
+        assert_eq!(f.entry(VendorName::Claude, "notes"), None);
+        assert!(f.entry(VendorName::Claude, "docs").is_some());
+        let record = f.record(VendorName::Claude).unwrap();
+        assert!(record["entries"].get("notes").is_none(), "{record}");
+        assert!(record["entries"].get("docs").is_some(), "{record}");
+        for v in [VendorName::Codex, VendorName::Antigravity] {
+            assert_eq!(f.entry(v, "notes"), None, "{v:?}");
+        }
         assert!(f.plan(docs_only).targets().iter().all(|t| !t.changes()));
     }
 
