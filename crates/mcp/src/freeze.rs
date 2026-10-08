@@ -8,7 +8,7 @@ use crate::McpError;
 use crate::catalog::{EnvValue, HeaderValue, Server, Transport, is_env_name};
 use crate::registry::{
     Argument, ArgumentKind, Input, KeyValueInput, Package, RegistryType, Remote, ServerJson,
-    ServerResponse, Status, TransportKind, printable,
+    ServerResponse, Status, TransportKind, has_unseen, printable,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -169,6 +169,12 @@ fn freeze_entry(resp: &ServerResponse, opts: &FreezeOptions) -> Result<Frozen, R
         )),
         Status::Active => {}
     }
+    if has_unseen(&s.name) {
+        return unseen("its server name", n);
+    }
+    if has_unseen(&s.version) {
+        return unseen("its version", n);
+    }
     if !is_exact(&s.version) {
         return refuse(
             format!(
@@ -216,6 +222,9 @@ fn freeze_entry(resp: &ServerResponse, opts: &FreezeOptions) -> Result<Frozen, R
         env: (!b.env.is_empty()).then_some(b.env),
         ..launch
     };
+    if let Some(what) = unseen_field(&server) {
+        return unseen(&what, n);
+    }
     let secret_headers: Vec<&String> = (server.headers.iter().flatten())
         .filter_map(|(_, v)| match v {
             HeaderValue::Secret { env, .. } => Some(env),
@@ -364,6 +373,12 @@ impl Build<'_> {
     fn package(&mut self, p: &Package) -> Result<Server, Refusal> {
         let n = &self.opts.name;
         let id = printable(&p.identifier);
+        if has_unseen(&p.identifier) {
+            return unseen("its package identifier", n);
+        }
+        if p.version.as_deref().is_some_and(has_unseen) {
+            return unseen("its package version", n);
+        }
         if let RegistryType::Other(kind) = &p.registry_type {
             return refuse(
                 format!(
@@ -405,6 +420,30 @@ impl Build<'_> {
                 };
                 return refuse(
                     format!("its package `{id}` names no exact version (it gives {gives})"),
+                    by_hand(n),
+                );
+            }
+            let (kind, name_ok, version_ok) = match p.registry_type {
+                RegistryType::Npm => ("npm", is_npm_name(&p.identifier), is_npm_version(version)),
+                _ => (
+                    "PyPI",
+                    is_pypi_name(&p.identifier),
+                    is_pypi_version(version),
+                ),
+            };
+            if !name_ok {
+                return refuse(
+                    format!("its package name `{id}` is not a valid {kind} package name"),
+                    by_hand(n),
+                );
+            }
+            if !version_ok {
+                return refuse(
+                    format!(
+                        "its package `{id}` has the version `{}`, which is not an exact {kind} \
+                         version",
+                        printable(version)
+                    ),
                     by_hand(n),
                 );
             }
@@ -602,7 +641,10 @@ impl Build<'_> {
         for (var, input) in names_in(&r.url, &r.variables) {
             if input.is_secret {
                 return refuse(
-                    format!("the remote URL names `{{{var}}}`, which is a secret"),
+                    format!(
+                        "the remote URL names `{{{}}}`, which is a secret",
+                        printable(var)
+                    ),
                     by_hand_url(n),
                 );
             }
@@ -641,7 +683,18 @@ impl Build<'_> {
     fn header(&mut self, h: &KeyValueInput) -> Result<Option<HeaderValue>, Refusal> {
         let n = &self.opts.name;
         let shown = printable(&h.name);
+        if has_unseen(&h.name) {
+            return unseen("its header name", n);
+        }
         let next = format!("Add it by hand with `fl mcp add {n} --url <url> --header {shown}`");
+        if !is_token(&h.name) {
+            return refuse(
+                format!(
+                    "its header `{shown}` is not an HTTP header name, a shape fl cannot record"
+                ),
+                next,
+            );
+        }
         let template = h.value.as_deref().or(h.default.as_deref());
         let secret = h.is_secret
             || template.is_some_and(|t| names_in(t, &h.variables).any(|(_, i)| i.is_secret));
@@ -716,6 +769,12 @@ fn env_shape(a: &Argument) -> Option<String> {
 /// other than `latest`, or a digest (`@sha256:…`, whose colon reads as a tag
 /// here, which is as good). A registry's port is in an earlier segment.
 fn image_pin(id: &str) -> Result<(), String> {
+    if id.starts_with('-') {
+        return Err(format!(
+            "its image `{}` starts with `-`, which docker would read as an option",
+            printable(id)
+        ));
+    }
     let last = id.rsplit('/').next().unwrap_or(id);
     let id = printable(id);
     match last.split_once(':') {
@@ -727,6 +786,114 @@ fn image_pin(id: &str) -> Result<(), String> {
         )),
         Some(_) => Ok(()),
     }
+}
+
+/// An exact npm version: `MAJOR.MINOR.PATCH`, numbers without leading zeros,
+/// then an optional `-prerelease` and `+build`, each dot-separated identifiers
+/// of letters, digits and `-`. A range, a tag or a wildcard is not one.
+fn is_npm_version(version: &str) -> bool {
+    let (rest, build) = match version.split_once('+') {
+        Some((rest, build)) => (rest, Some(build)),
+        None => (version, None),
+    };
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
+    };
+    let identifiers = |s: &str| {
+        s.split('.')
+            .all(|i| !i.is_empty() && i.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    };
+    let number = |p: &str| {
+        !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && (p == "0" || !p.starts_with('0'))
+    };
+    let mut parts = core.split('.');
+    let numbers = (0..3).all(|_| parts.next().is_some_and(number));
+    numbers
+        && parts.next().is_none()
+        && pre.is_none_or(identifiers)
+        && build.is_none_or(identifiers)
+}
+
+/// An exact PyPI version: it starts with a digit and holds letters, digits and
+/// `.`, `!`, `+`, `-` only: no wildcard, operator or space.
+fn is_pypi_version(version: &str) -> bool {
+    version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'!' | b'+' | b'-'))
+}
+
+/// An npm package name, `name` or `@scope/name`: lower-case letters, digits
+/// and `.`, `_`, `~`, `-`, each part starting with neither `-` nor `.`. A URL,
+/// a path or an option is not one.
+fn is_npm_name(id: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && !p.starts_with(['-', '.'])
+            && p.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'.' | b'_' | b'~' | b'-')
+            })
+    };
+    match id.strip_prefix('@') {
+        Some(rest) => rest
+            .split_once('/')
+            .is_some_and(|(scope, name)| part(scope) && part(name)),
+        None => part(id),
+    }
+}
+
+/// A PyPI project name: letters, digits and `.`, `_`, `-`, starting with a
+/// letter or digit.
+fn is_pypi_name(id: &str) -> bool {
+    id.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// An HTTP field name (RFC 9110 `token`).
+fn is_token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// The refusal for a registry string that holds a control or invisible
+/// character: it would be committed to the catalog or shown as another text.
+fn unseen<T>(what: &str, n: &str) -> Result<T, Refusal> {
+    refuse(
+        format!("{what} holds a control or invisible character, which fl would have to commit"),
+        format!(
+            "Check the entry in the registry, or add the server by hand with \
+             `fl mcp add {n} -- <command>` or `fl mcp add {n} --url <url>`"
+        ),
+    )
+}
+
+/// What a frozen entry holds that a person cannot see, named for a message.
+fn unseen_field(server: &Server) -> Option<String> {
+    if server.args.iter().flatten().any(|a| has_unseen(a)) {
+        return Some("an argument it passes".to_string());
+    }
+    let env = server.env.iter().flatten();
+    for (k, v) in env {
+        if has_unseen(k) || matches!(v, EnvValue::Literal(x) if has_unseen(x)) {
+            return Some(format!("its environment variable `{}`", printable(k)));
+        }
+    }
+    if server.url.as_deref().is_some_and(has_unseen) {
+        return Some("its remote URL".to_string());
+    }
+    for (k, v) in server.headers.iter().flatten() {
+        if matches!(v, HeaderValue::Literal(x) if has_unseen(x)) {
+            return Some(format!("its header `{}`", printable(k)));
+        }
+    }
+    None
 }
 
 /// An HTTP authentication scheme, such as `Bearer`: one token.
@@ -2197,6 +2364,272 @@ mod tests {
                 "{msg}"
             );
             assert!(check_upgrade("notes", pinned, offered, true).is_ok());
+        }
+    }
+
+    /// `io.example/sample` with one package of this type, identifier and
+    /// version.
+    fn package_of(kind: &str, identifier: &str, version: &str) -> ServerResponse {
+        let package = json!({
+            "registryType": kind,
+            "identifier": identifier,
+            "version": version,
+            "transport": { "type": "stdio" }
+        });
+        response(sample(json!([package]), json!([])))
+    }
+
+    fn refusal(resp: &ServerResponse) -> String {
+        freeze(resp, &named("s")).unwrap_err().to_string()
+    }
+
+    // MCP spec §2.1: the pin is exact. A range, a wildcard, a tag, a URL or an
+    // option in a package's version or name would let the registry (or the
+    // package manager) choose what runs.
+    #[test]
+    fn an_npm_or_pypi_package_pins_an_exact_version_of_a_plain_name() {
+        let accepted = [
+            ("npm", "@example/sample-mcp", "1.2.3"),
+            ("npm", "sample.mcp_x~y", "0.0.0"),
+            ("npm", "@a/b", "10.20.30-beta.1+build-5.x"),
+            ("npm", "@a1/b2", "1.0.0"),
+            ("pypi", "Example_Sample.mcp-2", "1.0.0"),
+            ("pypi", "x", "2!1.0.0rc1+local.1"),
+        ];
+        for (kind, id, version) in accepted {
+            let resp = package_of(kind, id, version);
+            let frozen = freeze(&resp, &named("s"));
+            assert!(frozen.is_ok(), "{kind} {id} {version}: {frozen:?}");
+        }
+
+        let npm_versions = [
+            "^1.2.0",
+            "~1.2.3",
+            ">=1.0.0",
+            "1.*",
+            "next",
+            "1.2",
+            "01.2.3",
+            "1.02.3",
+            "1.2.3-",
+            "1.2.3+",
+            "1.2.3-a..b",
+            "1.2.3-beta_1",
+            "1..3",
+            "1.2.",
+            "1.a.3",
+            "1.2.3 ",
+            "1.2.3.4",
+            "v1.2.3",
+        ];
+        for version in npm_versions {
+            let msg = refusal(&package_of("npm", "@example/x", version));
+            assert!(
+                msg.contains("which is not an exact npm version"),
+                "{version}: {msg}"
+            );
+        }
+        let pypi_versions = ["1.*", "*", "next", "==1.0", ">=1", "1.0 ", "1.0;x", "v1"];
+        for version in pypi_versions {
+            let msg = refusal(&package_of("pypi", "example-x", version));
+            assert!(
+                msg.contains("which is not an exact PyPI version"),
+                "{version}: {msg}"
+            );
+        }
+
+        let npm_names = [
+            "https://evil.example/x.tgz#",
+            "git+https://example.com/x.git",
+            "-x",
+            ".x",
+            "@scope",
+            "@/x",
+            "@scope/",
+            "@-s/x",
+            "@.s/x",
+            "@a/b/c",
+            "a/b",
+            "Sample",
+            "x y",
+            "",
+        ];
+        for id in npm_names {
+            let msg = refusal(&package_of("npm", id, "1.0.0"));
+            assert!(
+                msg.contains("is not a valid npm package name"),
+                "{id}: {msg}"
+            );
+        }
+        let pypi_names = [
+            "-x",
+            "_x",
+            ".x",
+            "x y",
+            "x==1",
+            "https://example.com/x",
+            "x/y",
+            "",
+        ];
+        for id in pypi_names {
+            let msg = refusal(&package_of("pypi", id, "1.0.0"));
+            assert!(
+                msg.contains("is not a valid PyPI package name"),
+                "{id}: {msg}"
+            );
+        }
+
+        // An image name that starts with `-` is an option to `docker run`.
+        let package = oci(json!({ "identifier": "--volume=/:/host:rw" }));
+        let msg = refusal(&response(sample(json!([package]), json!([]))));
+        assert!(
+            msg.contains("starts with `-`, which docker would read as an option"),
+            "{msg}"
+        );
+    }
+
+    // A variable's name comes from the registry and is shown in a message:
+    // never raw.
+    #[test]
+    fn a_variable_name_is_shown_without_its_control_characters() {
+        let esc = "\u{1b}[2Jtok";
+        let url_secret = remote(json!({
+            "url": format!("https://x.example/{{{esc}}}"),
+            "variables": { esc: { "isSecret": true } }
+        }));
+        let url_unset = remote(json!({
+            "url": format!("https://x.example/{{{esc}}}"),
+            "variables": { esc: {} }
+        }));
+        let argument = npm(json!({
+            "packageArguments": [{
+                "type": "positional", "value": format!("{{{esc}}}"), "isRequired": true,
+                "variables": { esc: {} }
+            }]
+        }));
+        let cases = [
+            (
+                sample(json!([]), json!([url_secret])),
+                "names `{[2Jtok}`, which is a secret",
+            ),
+            (
+                sample(json!([]), json!([url_unset])),
+                "names `{[2Jtok}`, which has neither",
+            ),
+            (
+                sample(json!([argument]), json!([])),
+                "names an unset variable, `{[2Jtok}`",
+            ),
+        ];
+        for (server, expected) in cases {
+            let msg = refusal(&response(server));
+            assert!(msg.contains(expected), "{msg:?}");
+            assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        }
+    }
+
+    // MCP spec §4.2: a header name goes into a vendor file and onto the wire.
+    #[test]
+    fn a_header_name_must_be_an_http_token() {
+        for name in ["X A", "X:A", "X(A)", "X/A", "X\"A", "Ä-A", ""] {
+            let header = json!({ "name": name, "value": "v" });
+            let server = sample(json!([]), json!([remote(json!({ "headers": [header] }))]));
+            let msg = refusal(&response(server));
+            assert!(
+                msg.contains("is not an HTTP header name, a shape fl cannot record"),
+                "{name}: {msg}"
+            );
+        }
+        let name = "Authorization-X_1.0!#$%&'*+^`|~";
+        let header = json!({ "name": name, "value": "v" });
+        let server = sample(json!([]), json!([remote(json!({ "headers": [header] }))]));
+        let frozen = freeze(&response(server), &named("s")).unwrap();
+        let headers = frozen.server.headers.unwrap();
+        assert_eq!(headers[name], HeaderValue::Literal("v".to_string()));
+    }
+
+    // Every registry string fl records is refused when it holds a control,
+    // format or invisible character: it would reach the committed catalog,
+    // and a bidirectional override makes a line read as another.
+    #[test]
+    fn a_registry_string_with_a_control_or_invisible_character_is_refused() {
+        let bidi = "\u{202e}";
+        let with_package = |extra: Value| sample(json!([npm(extra)]), json!([]));
+        let with_header =
+            |header: Value| sample(json!([]), json!([remote(json!({ "headers": [header] }))]));
+        let cases = [
+            (
+                with(
+                    sample(json!([npm(json!({}))]), json!([])),
+                    json!({ "name": "io.example/s\u{202e}" }),
+                ),
+                "its server name",
+            ),
+            (
+                with(
+                    sample(json!([npm(json!({}))]), json!([])),
+                    json!({ "version": "1.0.0\u{1b}[2J\u{202e}" }),
+                ),
+                "its version",
+            ),
+            (
+                with_package(json!({ "identifier": format!("@example/sample{bidi}") })),
+                "its package identifier",
+            ),
+            (
+                sample(
+                    json!([oci(
+                        json!({ "identifier": "ghcr.io/example/x\u{200b}:1.0.0" })
+                    )]),
+                    json!([]),
+                ),
+                "its package identifier",
+            ),
+            (
+                with_package(json!({ "version": format!("1.0.0{bidi}") })),
+                "its package version",
+            ),
+            (
+                with_package(json!({ "packageArguments": [
+                    { "type": "positional", "value": format!("a{bidi}b") }
+                ] })),
+                "an argument it passes",
+            ),
+            (
+                with_package(json!({ "environmentVariables": [
+                    { "name": "SAMPLE_X", "default": "v\u{2066}" }
+                ] })),
+                "its environment variable `SAMPLE_X`",
+            ),
+            (
+                with_package(json!({ "environmentVariables": [
+                    { "name": format!("SAMPLE{bidi}"), "default": "v" }
+                ] })),
+                "its environment variable `SAMPLE`",
+            ),
+            (
+                sample(
+                    json!([]),
+                    json!([remote(
+                        json!({ "url": format!("https://sample.example.com/m{bidi}cp") })
+                    )]),
+                ),
+                "its remote URL",
+            ),
+            (
+                with_header(json!({ "name": "X-A\u{1b}[2J\r\nInjected: 1", "value": "v" })),
+                "its header name",
+            ),
+            (
+                with_header(json!({ "name": "X-A", "value": "v\u{feff}" })),
+                "its header `X-A`",
+            ),
+        ];
+        for (server, what) in cases {
+            let msg = refusal(&response(server));
+            let expected = format!("{what} holds a control or invisible character");
+            assert!(msg.contains(&expected), "{what}: {msg:?}");
+            assert!(!msg.chars().any(crate::registry::is_unseen), "{msg:?}");
         }
     }
 }

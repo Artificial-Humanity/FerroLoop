@@ -295,10 +295,40 @@ fn encode(s: &str) -> String {
     out
 }
 
-/// Registry text for a terminal: no control characters, at most 300 of the
-/// rest.
+/// Registry text for a terminal: no control, format or invisible characters
+/// (see [`is_unseen`]), at most 300 of the rest.
 pub(crate) fn printable(text: &str) -> String {
-    text.chars().filter(|c| !c.is_control()).take(300).collect()
+    text.chars().filter(|c| !is_unseen(*c)).take(300).collect()
+}
+
+/// A character a person cannot see for what it is: a control character, or a
+/// format or invisible one (soft hyphen, zero-width, bidirectional marks and
+/// overrides, the byte-order mark, language tags). Such a character in a text
+/// can make it read as another.
+pub(crate) fn is_unseen(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{AD}'
+                | '\u{600}'..='\u{605}'
+                | '\u{61C}'
+                | '\u{6DD}'
+                | '\u{70F}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+        )
+}
+
+/// Whether `text` holds an [`is_unseen`] character.
+pub(crate) fn has_unseen(text: &str) -> bool {
+    text.chars().any(is_unseen)
 }
 
 #[derive(Deserialize)]
@@ -1152,6 +1182,75 @@ mod tests {
     fn registry_text_is_shown_without_control_characters_and_cut_short() {
         assert_eq!(printable("a\u{1b}[31mb\r\nc"), "a[31mbc");
         assert_eq!(printable(&"x".repeat(400)).len(), 300);
+    }
+
+    // Text from the registry is shown without anything that could make it
+    // read as another: control, format and invisible characters go.
+    #[test]
+    fn printable_drops_bidirectional_and_invisible_characters_too() {
+        assert_eq!(
+            printable("a\u{202e}b\u{200b}c\u{feff}d\u{2066}e\u{ad}f\u{1b}g"),
+            "abcdefg"
+        );
+        let unseen = [
+            '\u{7f}',
+            '\u{85}',
+            '\u{ad}',
+            '\u{600}',
+            '\u{605}',
+            '\u{61c}',
+            '\u{6dd}',
+            '\u{70f}',
+            '\u{180e}',
+            '\u{200b}',
+            '\u{200f}',
+            '\u{202a}',
+            '\u{202e}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{2066}',
+            '\u{206f}',
+            '\u{feff}',
+            '\u{fff9}',
+            '\u{fffb}',
+            '\u{e0001}',
+            '\u{e0020}',
+            '\u{e007f}',
+        ];
+        for c in unseen {
+            assert!(is_unseen(c), "U+{:04X}", c as u32);
+        }
+        let seen = [
+            'a',
+            ' ',
+            '\u{e9}',
+            '\u{ac}',
+            '\u{ae}',
+            '\u{5ff}',
+            '\u{606}',
+            '\u{61b}',
+            '\u{61d}',
+            '\u{6dc}',
+            '\u{6de}',
+            '\u{70e}',
+            '\u{180d}',
+            '\u{200a}',
+            '\u{2010}',
+            '\u{2029}',
+            '\u{202f}',
+            '\u{205f}',
+            '\u{2065}',
+            '\u{2070}',
+            '\u{fefe}',
+            '\u{fff8}',
+            '\u{fffc}',
+            '\u{e0000}',
+            '\u{e001f}',
+            '\u{e0080}',
+        ];
+        for c in seen {
+            assert!(!is_unseen(c), "U+{:04X}", c as u32);
+        }
     }
 
     // MCP spec §3.1: https, or http to this machine, with no user name.
