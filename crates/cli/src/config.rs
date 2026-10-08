@@ -86,10 +86,27 @@ pub struct GithubApp {
     pub private_key: PathBuf,
 }
 
+/// `[[mcp]]`: this machine's switches for one project's MCP catalog (MCP
+/// spec §2.2), found by the same longest-ancestor rule as `[[project]]` and
+/// independent of it, so a project needs no store binding to use the
+/// catalog. `disable` turns off a server the team default turns on, and
+/// `enable` the reverse. Whether each name is in the catalog is checked
+/// against the catalog, not here.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpEntry {
+    pub root: PathBuf,
+    #[serde(default)]
+    pub disable: Vec<String>,
+    #[serde(default)]
+    pub enable: Vec<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Config {
     pub projects: Vec<Entry>,
     pub github: Option<GithubApp>,
+    pub mcp: Vec<McpEntry>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +116,12 @@ struct File {
     project: Vec<Entry>,
     #[serde(default)]
     github: Option<GithubApp>,
+    /// ⚠ The top level refuses a key it does not know, so an fl older than
+    /// this table refuses a config that has one — for every command, since
+    /// every command reads the config first. Upgrading fl on that machine is
+    /// the remedy (MCP spec §2.2, release scope).
+    #[serde(default)]
+    mcp: Vec<McpEntry>,
 }
 
 /// The XDG config base directory: `xdg_config_home` if it is a non-empty,
@@ -119,7 +142,25 @@ pub fn data_dir(xdg_data_home: Option<PathBuf>, home: Option<PathBuf>) -> Option
     xdg_base(xdg_data_home, home, ".local/share")
 }
 
-/// The one rule both XDG bases follow: the variable if it is absolute, else
+/// The XDG state base directory, by the same rule as [`data_dir`]:
+/// `xdg_state_home` if it is an ABSOLUTE path, else `home/.local/state`. An
+/// empty or relative `$XDG_STATE_HOME` is treated as unset.
+pub fn state_dir(xdg_state_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    xdg_base(xdg_state_home, home, ".local/state")
+}
+
+/// fl's own state directory, `<state base>/fl`, from this process's
+/// `$XDG_STATE_HOME` and `$HOME` by [`state_dir`]'s rule. `None` when
+/// neither gives an absolute base.
+pub fn fl_state_dir() -> Option<PathBuf> {
+    let base = state_dir(
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )?;
+    Some(base.join("fl"))
+}
+
+/// The one rule every XDG base follows: the variable if it is absolute, else
 /// `home` joined with the spec's default for that base.
 fn xdg_base(var: Option<PathBuf>, home: Option<PathBuf>, default: &str) -> Option<PathBuf> {
     var.filter(|p| p.is_absolute())
@@ -173,9 +214,28 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
             app.private_key.display()
         );
     }
+    for m in &file.mcp {
+        if !m.root.is_absolute() {
+            bail!(
+                "{}: `root` in `[[mcp]]` must be an absolute path (got `{}`)",
+                path.display(),
+                m.root.display()
+            );
+        }
+        // MCP spec §2.2: one name switched both ways says nothing.
+        if let Some(name) = m.enable.iter().find(|n| m.disable.contains(n)) {
+            bail!(
+                "{}: in the `[[mcp]]` entry for {}, `{name}` is in both `enable` and \
+                 `disable`; keep it in one",
+                path.display(),
+                m.root.display()
+            );
+        }
+    }
     Ok(Config {
         projects: file.project,
         github: file.github,
+        mcp: file.mcp,
     })
 }
 
@@ -202,6 +262,40 @@ fn canonicalize(path: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
+/// The items whose root is the longest ancestor of `cwd`, in their order in
+/// `items`, with `cwd` canonicalized; `None` when `cwd` does not exist or no
+/// item's root is an ancestor of it. Both sides are canonicalized, so a
+/// symlinked path binds like the real one, and a root that does not exist
+/// is skipped. More than one item comes back only when their roots are the
+/// same directory: the caller decides whether that tie is a conflict.
+fn longest_ancestor<'a, T>(
+    items: &'a [T],
+    root_of: impl Fn(&T) -> &Path,
+    cwd: &Path,
+) -> Result<Option<(PathBuf, Vec<&'a T>)>> {
+    let Some(cwd) = canonicalize(cwd)? else {
+        return Ok(None);
+    };
+    let mut matches: Vec<(PathBuf, &T)> = Vec::new();
+    for item in items {
+        let Some(root) = canonicalize(root_of(item))? else {
+            continue;
+        };
+        if cwd.starts_with(&root) {
+            matches.push((root, item));
+        }
+    }
+    let Some(longest) = matches.iter().map(|(r, _)| r.components().count()).max() else {
+        return Ok(None);
+    };
+    let winners = matches
+        .into_iter()
+        .filter(|(r, _)| r.components().count() == longest)
+        .map(|(_, item)| item)
+        .collect();
+    Ok(Some((cwd, winners)))
+}
+
 /// The config entry for the project containing `cwd`: the entry whose root
 /// is the longest ancestor of `cwd`. Both sides are canonicalized, so a
 /// symlinked path binds like the real one.
@@ -211,27 +305,11 @@ fn canonicalize(path: &Path) -> Result<Option<PathBuf>> {
 /// longest match is therefore tied — but whose `(store, tracker)` differs
 /// are refused rather than silently picking one: nothing chose between them.
 pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
-    let Some(cwd) = canonicalize(cwd)? else {
+    let Some((cwd, winners)) = longest_ancestor(entries, |e| &e.root, cwd)? else {
         return Ok(None);
     };
-    let mut matches: Vec<(PathBuf, &Entry)> = Vec::new();
-    for e in entries {
-        let Some(root) = canonicalize(&e.root)? else {
-            continue;
-        };
-        if cwd.starts_with(&root) {
-            matches.push((root, e));
-        }
-    }
-    let Some(longest) = matches.iter().map(|(r, _)| r.components().count()).max() else {
-        return Ok(None);
-    };
-    let winners: Vec<&(PathBuf, &Entry)> = matches
-        .iter()
-        .filter(|(r, _)| r.components().count() == longest)
-        .collect();
     let mut distinct: Vec<(&PathBuf, &Option<TrackerBinding>)> = Vec::new();
-    for (_, e) in &winners {
+    for e in &winners {
         if !distinct.contains(&(&e.store, &e.tracker)) {
             distinct.push((&e.store, &e.tracker));
         }
@@ -239,7 +317,7 @@ pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
     if distinct.len() > 1 {
         let names = winners
             .iter()
-            .map(|(_, e)| {
+            .map(|e| {
                 let tracker = match &e.tracker {
                     Some(t) if t.github_ledger() => format!("github:{} (ledger github)", t.github),
                     Some(t) => format!("github:{}", t.github),
@@ -255,7 +333,42 @@ pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
             cwd.display()
         );
     }
-    Ok(Some(winners[0].1.clone()))
+    Ok(Some(winners[0].clone()))
+}
+
+/// The `[[mcp]]` entry for the project containing `cwd`, by
+/// [`bound_entry`]'s rule: the entry whose root is the longest ancestor of
+/// `cwd` (MCP spec §2.2). Two entries on one root that switch differently
+/// are refused, naming both: nothing chose between them. Two that switch
+/// alike are one choice, however their roots are spelled.
+pub fn mcp_entry(entries: &[McpEntry], cwd: &Path) -> Result<Option<McpEntry>> {
+    let Some((cwd, winners)) = longest_ancestor(entries, |e| &e.root, cwd)? else {
+        return Ok(None);
+    };
+    let first = winners[0];
+    if winners
+        .iter()
+        .any(|e| (&e.disable, &e.enable) != (&first.disable, &first.enable))
+    {
+        let names = winners
+            .iter()
+            .map(|e| {
+                format!(
+                    "{} (disable {:?}, enable {:?})",
+                    e.root.display(),
+                    e.disable,
+                    e.enable
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "the project at {} has more than one `[[mcp]]` entry in the config: {names}. \
+             Keep one of these entries",
+            cwd.display()
+        );
+    }
+    Ok(Some(first.clone()))
 }
 
 #[cfg(test)]
@@ -561,5 +674,206 @@ mod tests {
             "{msg}"
         );
         assert!(msg.contains("-> github:acme/widgets,"), "{msg}");
+    }
+
+    fn mcp(root: &Path, disable: &[&str], enable: &[&str]) -> McpEntry {
+        McpEntry {
+            root: root.to_path_buf(),
+            disable: disable.iter().map(|s| s.to_string()).collect(),
+            enable: enable.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    // MCP spec §2.2: a project's machine switches, independent of any
+    // `[[project]]` binding; both lists default to empty.
+    #[test]
+    fn an_mcp_entry_loads_with_its_switches() {
+        let cfg = load_text(
+            "[[mcp]]\nroot = \"/code/app\"\ndisable = [\"github\"]\nenable = [\"sentry\"]\n\
+             [[mcp]]\nroot = \"/code/other\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.mcp,
+            vec![
+                mcp(Path::new("/code/app"), &["github"], &["sentry"]),
+                mcp(Path::new("/code/other"), &[], &[]),
+            ]
+        );
+        assert!(cfg.projects.is_empty());
+        let cfg = load_text("[[project]]\nroot = \"/r\"\nstore = \"/s.redb\"\n").unwrap();
+        assert!(
+            cfg.mcp.is_empty(),
+            "a config with no [[mcp]] has no switches"
+        );
+    }
+
+    // A typo in a switch is refused, not ignored; `antigravity` was a key
+    // of an earlier design and is not one now (MCP spec §2.2).
+    #[test]
+    fn an_unknown_key_in_an_mcp_entry_is_refused() {
+        for key in ["antigravity", "disabled", "store"] {
+            let text = format!("[[mcp]]\nroot = \"/code/app\"\n{key} = \"x\"\n");
+            let msg = format!("{:#}", load_text(&text).expect_err(key));
+            assert!(
+                msg.contains(&format!("unknown field `{key}`")),
+                "{key}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_relative_mcp_root_is_refused() {
+        for bad in ["code/app", ""] {
+            let text = format!("[[mcp]]\nroot = \"{bad}\"\n");
+            let msg = format!("{:#}", load_text(&text).expect_err(bad));
+            assert!(
+                msg.contains("`root` in `[[mcp]]` must be an absolute path"),
+                "{bad:?}: {msg}"
+            );
+        }
+        assert_eq!(
+            load_text("[[mcp]]\nroot = \"/code/app\"\n")
+                .unwrap()
+                .mcp
+                .len(),
+            1
+        );
+    }
+
+    // MCP spec §2.2: "The same name in `enable` and `disable` is an error"
+    // — within one entry; two projects may switch one name each way.
+    #[test]
+    fn a_server_both_enabled_and_disabled_is_refused_naming_it() {
+        let text = "[[mcp]]\nroot = \"/code/app\"\n\
+                    enable = [\"sentry\", \"github\"]\ndisable = [\"docs\", \"github\"]\n";
+        let msg = format!("{:#}", load_text(text).unwrap_err());
+        assert!(
+            msg.contains("`github` is in both `enable` and `disable`"),
+            "{msg}"
+        );
+        assert!(!msg.contains("`sentry` is in both"), "{msg}");
+        let cfg = load_text(
+            "[[mcp]]\nroot = \"/code/app\"\nenable = [\"github\"]\n\
+             [[mcp]]\nroot = \"/code/other\"\ndisable = [\"github\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp.len(), 2);
+    }
+
+    // MCP spec §2.2: the `[[project]]` rule — the entry whose root is the
+    // longest ancestor of the working directory — and no other.
+    #[test]
+    fn mcp_entry_picks_the_entry_with_the_longest_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let inner = outer.path().join("app");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let entries = vec![
+            mcp(outer.path(), &["outer"], &[]),
+            mcp(&inner, &["inner"], &[]),
+            mcp(outer.path(), &["outer-too"], &[]),
+            mcp(elsewhere.path(), &["elsewhere"], &[]),
+        ];
+        let got = mcp_entry(&entries, &inner.join("src")).unwrap();
+        assert_eq!(got, Some(entries[1].clone()), "the longest root wins");
+        assert_eq!(
+            mcp_entry(&entries, &inner).unwrap(),
+            Some(entries[1].clone())
+        );
+        let none = tempfile::tempdir().unwrap();
+        assert_eq!(mcp_entry(&entries, none.path()).unwrap(), None);
+        assert_eq!(
+            mcp_entry(&entries, &none.path().join("not-there")).unwrap(),
+            None,
+            "a working directory that does not exist binds nothing"
+        );
+        assert_eq!(mcp_entry(&[], &inner).unwrap(), None);
+    }
+
+    #[test]
+    fn two_different_mcp_entries_on_one_root_are_refused_naming_both() {
+        let root = tempfile::tempdir().unwrap();
+        for (a, b) in [
+            (
+                mcp(root.path(), &["github"], &[]),
+                mcp(root.path(), &["sentry"], &[]),
+            ),
+            (
+                mcp(root.path(), &["github"], &["docs"]),
+                mcp(root.path(), &["github"], &[]),
+            ),
+        ] {
+            let msg = format!("{:#}", mcp_entry(&[a, b], root.path()).unwrap_err());
+            assert!(
+                msg.contains("has more than one `[[mcp]]` entry in the config"),
+                "{msg}"
+            );
+            assert!(msg.contains("Keep one of these entries"), "{msg}");
+            assert_eq!(msg.matches(" (disable [").count(), 2, "{msg}");
+        }
+        let msg = format!(
+            "{:#}",
+            mcp_entry(
+                &[
+                    mcp(root.path(), &["github"], &[]),
+                    mcp(root.path(), &["sentry"], &["docs"]),
+                ],
+                root.path()
+            )
+            .unwrap_err()
+        );
+        assert!(
+            msg.contains("(disable [\"github\"], enable [])")
+                && msg.contains("(disable [\"sentry\"], enable [\"docs\"])"),
+            "the refusal must name both entries: {msg}"
+        );
+    }
+
+    // Two entries that say the same thing about one root — however the root
+    // is spelled — are one choice, not a conflict.
+    #[test]
+    fn identical_mcp_entries_on_one_root_are_not_a_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("sub")).unwrap();
+        let e = mcp(root.path(), &["github"], &["sentry"]);
+        let respelled = mcp(&root.path().join("sub/.."), &["github"], &["sentry"]);
+        assert_eq!(
+            mcp_entry(&[e.clone(), respelled], root.path()).unwrap(),
+            Some(e.clone())
+        );
+        assert_eq!(
+            mcp_entry(&[e.clone(), e.clone()], root.path()).unwrap(),
+            Some(e)
+        );
+    }
+
+    #[test]
+    fn an_empty_or_relative_xdg_state_home_falls_back_to_home() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            state_dir(Some(PathBuf::from("")), home.clone()),
+            Some(PathBuf::from("/home/u/.local/state")),
+            "an empty XDG_STATE_HOME must be treated as unset"
+        );
+        assert_eq!(
+            state_dir(Some(PathBuf::from("relative/state")), home.clone()),
+            Some(PathBuf::from("/home/u/.local/state")),
+            "a relative XDG_STATE_HOME must be treated as unset"
+        );
+        assert_eq!(
+            state_dir(Some(PathBuf::from("/abs/state")), home.clone()),
+            Some(PathBuf::from("/abs/state")),
+            "an absolute XDG_STATE_HOME must still win"
+        );
+        assert_eq!(
+            state_dir(None, home),
+            Some(PathBuf::from("/home/u/.local/state"))
+        );
+        assert_eq!(state_dir(Some(PathBuf::from("rel")), None), None);
+        assert_eq!(
+            state_dir(Some(PathBuf::from("/abs/state")), None),
+            Some(PathBuf::from("/abs/state"))
+        );
     }
 }

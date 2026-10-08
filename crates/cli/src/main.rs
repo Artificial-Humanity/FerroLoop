@@ -56,6 +56,9 @@ enum Command {
     /// Route a project's new items between its local store and GitHub.
     #[command(subcommand)]
     Routing(cmd::routing::Cmd),
+    /// A project's MCP servers: one committed catalog, written into each agent CLI's file.
+    #[command(subcommand)]
+    Mcp(cmd::mcp::Cmd),
 }
 
 impl Command {
@@ -74,6 +77,7 @@ impl Command {
             Command::Manifest(c) => c.iris(),
             Command::Github(c) => c.iris(),
             Command::Routing(c) => c.iris(),
+            Command::Mcp(_) => Vec::new(),
         }
     }
 
@@ -104,6 +108,7 @@ impl Command {
             Command::Manifest(c) => c.has_handle(),
             Command::Github(c) => c.has_handle(),
             Command::Routing(c) => c.has_handle(),
+            Command::Mcp(_) => false,
         }
     }
 
@@ -127,7 +132,8 @@ impl Command {
             | Command::Gate(_)
             | Command::Transition(_)
             | Command::Stats(_)
-            | Command::Manifest(_) => false,
+            | Command::Manifest(_)
+            | Command::Mcp(_) => false,
         }
     }
 }
@@ -572,6 +578,25 @@ fn main() {
 fn run(cli: Cli) -> Result<i32> {
     let cwd = std::env::current_dir().context("could not determine the current directory")?;
     let cfg = config::load(config::path().as_deref())?;
+    // MCP spec §1.1: `fl mcp` never opens a store, so it returns here, before
+    // any store path is resolved or its directory created. `$FL_DB` is the
+    // environment's, set for every command, so it is ignored here; `--db`
+    // was given to this command, and is refused rather than ignored.
+    let cli = match cli {
+        Cli {
+            db,
+            command: Command::Mcp(c),
+        } => {
+            if db.is_some() {
+                bail!(
+                    "`fl mcp` opens no store, so `--db` names nothing here. Drop it; `fl mcp` \
+                     works on the project the current directory is in"
+                );
+            }
+            return cmd::mcp::run(c, &cfg.mcp, &cwd);
+        }
+        cli => cli,
+    };
     let entries = &cfg.projects;
     let locus = match cli.command.project_root() {
         Some(root) => cwd.join(root),
@@ -873,6 +898,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
         Command::Routing(c) => cmd::routing::run(&ctx, c, here_for_store.map(|b| b.is_some())),
+        Command::Mcp(_) => unreachable!("`fl mcp` returns before any store is opened"),
     };
     // What the GitHub ledger's reads noted without refusing — a quarantined
     // line skipped (spec §3.3, §3.6) — once each, whatever became of the
