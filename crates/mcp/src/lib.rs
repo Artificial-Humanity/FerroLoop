@@ -8,6 +8,7 @@ pub mod catalog;
 pub mod fake;
 pub mod freeze;
 pub mod registry;
+pub mod vendor;
 
 /// Every refusal names the file, the entry and what to do next (MCP spec §5).
 #[derive(Debug, thiserror::Error)]
