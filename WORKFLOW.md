@@ -5,10 +5,15 @@ Follow [AGENTS.md](AGENTS.md) for repository rules and git configuration.
 ## Branch, review, merge
 
 1. Branch off local `main`. All work happens on a branch.
-2. When the work is complete, use `superpowers:requesting-code-review` to dispatch
-   a review.
-3. Use `superpowers:receiving-code-review` to evaluate the findings. Address them,
-   then commit the fixes.
+2. Review and remediation are subagent-driven. The working session coordinates: it
+   dispatches the work, rules on findings, and does not fix findings itself.
+   * A written plan is executed with `superpowers:subagent-driven-development`: a fresh
+     implementer and a fresh reviewer for each task, then a whole-branch review.
+   * Other work is reviewed by a fresh reviewer subagent, dispatched with
+     `superpowers:requesting-code-review`.
+3. Evaluate the findings with `superpowers:receiving-code-review`. A subagent fixes
+   them and commits the fixes; a fresh reviewer subagent then re-reviews the fix diff.
+   Repeat until no Critical or Important finding is open.
 4. Push the branch and open a pull request against `main`. CI runs the verification
    trio on the pull request; the `test, clippy, fmt` check must pass before the merge
    button is available. A pull request opened ready for review (not a draft) is put in
