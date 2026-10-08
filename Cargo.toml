@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/core", "crates/store", "crates/exec", "crates/cli", "crates/github"]
+members = ["crates/core", "crates/store", "crates/exec", "crates/cli", "crates/github", "crates/mcp"]
 resolver = "3"
 
 [workspace.package]
@@ -31,3 +31,5 @@ ureq = { version = "3.4", features = ["json"] }
 ring = "0.17"
 base64 = "0.22"
 tiny_http = "0.12"
+toml_edit = "0.25"
+indexmap = { version = "2.14", features = ["serde"] }

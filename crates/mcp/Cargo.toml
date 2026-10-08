@@ -1,0 +1,19 @@
+[package]
+name = "fl-mcp"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+# `raw_value` keeps a foreign entry in a vendor's JSON file byte for byte.
+# Never `preserve_order`: see the workspace Cargo.toml.
+serde_json = { workspace = true, features = ["raw_value"] }
+toml.workspace = true
+toml_edit.workspace = true
+indexmap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
