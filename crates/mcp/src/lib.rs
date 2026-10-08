@@ -4,6 +4,9 @@
 use std::path::PathBuf;
 
 pub mod catalog;
+#[cfg(any(test, feature = "fake"))]
+pub mod fake;
+pub mod registry;
 
 /// Every refusal names the file, the entry and what to do next (MCP spec §5).
 #[derive(Debug, thiserror::Error)]
@@ -46,11 +49,51 @@ pub enum McpError {
         path.display()
     )]
     AlreadyPresent { path: PathBuf, name: String },
+    /// A registry address the client will not read (MCP spec §3.1).
+    #[error(
+        "{url} is not a registry address fl will use: {clause}. Use an https:// address, or \
+         http:// to this machine"
+    )]
+    RegistryAddress { url: String, clause: String },
+    /// The registry could not be reached. `sync` and `check` never need it
+    /// (MCP spec §5).
+    #[error(
+        "cannot reach the registry at {registry}: {cause}. Check the address and the network, \
+         then retry; `fl mcp sync` and `fl mcp check` need no registry"
+    )]
+    Unreachable { registry: String, cause: String },
+    /// The registry answered, but not with the registry API: a redirect,
+    /// an HTML page, a body over 4 MiB, an error status, or a body of the
+    /// wrong shape. `request` is `GET <path>`; `problem` says which, and
+    /// what to do.
+    #[error("the registry at {registry} failed {request}: {problem}")]
+    Registry {
+        registry: String,
+        request: String,
+        problem: String,
+    },
+    /// The registry has no such server, or no such version of it.
+    #[error(
+        "the registry at {registry} has no {}. `fl mcp search <text>` lists the servers it has",
+        missing(name, version)
+    )]
+    NotFound {
+        registry: String,
+        name: String,
+        version: Option<String>,
+    },
 }
 
 fn on_server(server: &Option<String>) -> String {
     match server {
         Some(name) => format!("server `{name}`, "),
         None => String::new(),
+    }
+}
+
+fn missing(name: &str, version: &Option<String>) -> String {
+    match version {
+        Some(v) => format!("version `{v}` of server `{name}`"),
+        None => format!("server `{name}`"),
     }
 }
