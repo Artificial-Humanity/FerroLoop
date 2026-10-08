@@ -8,6 +8,10 @@ use std::time::Duration;
 
 pub const DEFAULT_API: &str = "https://api.github.com";
 
+/// The most of an answer fl reads, on the wire and decoded: ureq's own
+/// default, named here because the decoded count is fl's to make.
+const BODY_LIMIT: u64 = 10 << 20;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
@@ -273,6 +277,16 @@ pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
+/// Everything `reader` yields, or `None` when it yields more than `cap` bytes.
+/// It pulls at most `cap + 1` bytes from `reader`, so a body that decodes to
+/// gigabytes never reaches memory.
+fn read_capped(reader: impl std::io::Read, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= cap).then_some(bytes))
+}
+
 fn headers<B>(rb: ureq::RequestBuilder<B>, auth: &str) -> ureq::RequestBuilder<B> {
     rb.header("Authorization", auth)
         .header("Accept", "application/vnd.github+json")
@@ -362,8 +376,55 @@ fn exchange(
     // reading (rate-limited first) has had its chance to claim the status.
     let accepted = header("x-accepted-github-permissions");
     let is_2xx = (200..300).contains(&status);
-    let text = match resp.body_mut().read_to_string() {
-        Ok(text) => text,
+    // The cap counts the DECODED bytes (the reader reads one more than the
+    // cap, to tell a body of exactly the cap from a longer one): ureq's own
+    // limit sits under its gzip decoder, so alone it counts the wire.
+    // ⚠ Bytes that are not UTF-8 are a body that cannot be read, never text
+    // rewritten until it parses: the same failure as a body that breaks off.
+    let read = read_capped(
+        resp.body_mut().with_config().limit(BODY_LIMIT).reader(),
+        BODY_LIMIT,
+    )
+    .and_then(|read| {
+        read.map(|bytes| {
+            String::from_utf8(bytes).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "stream did not contain valid UTF-8",
+                )
+            })
+        })
+        .transpose()
+    });
+    let text = match read.map_err(ureq::Error::from) {
+        Ok(Some(text)) => text,
+        // ⚠ An answer over the cap is an answer fl refuses, never a body it
+        // reads part of. Whether the request may have landed decides what
+        // the refusal is, as for a body that breaks off (below).
+        Ok(None) | Err(ureq::Error::BodyExceedsLimit(_)) => {
+            if is_2xx && !require_json_on_2xx {
+                return Ok(Reply {
+                    status,
+                    body: Value::Null,
+                    location,
+                    accepted_permissions: accepted,
+                    link_next,
+                });
+            }
+            let cause = format!(
+                "GitHub sent an answer larger than {} MiB to {method:?} {url}, which fl will \
+                 not read. Retry later; if it goes on, narrow the request or report it",
+                BODY_LIMIT >> 20
+            );
+            return Err(if judging == Judging::CallerJudges {
+                StoreError::Unreachable {
+                    store: origin.to_string(),
+                    cause,
+                }
+            } else {
+                StoreError::Backend(cause)
+            });
+        }
         // ⚠ The status line was already read as 2xx: the write landed, and
         // only its answer broke off (a truncated body, a read timeout). For
         // the one caller that judges a create itself, that is a 2xx with an
@@ -813,5 +874,125 @@ mod tests {
             .send(Method::Get, "/repos/acme/widgets", None)
             .unwrap_err();
         assert!(matches!(err, StoreError::RateLimited { .. }), "{err:?}");
+    }
+
+    // A gzip answer a few KiB long on the wire decodes to 32 MiB; ureq's own
+    // limit sits under its decoder and would let it through.
+    #[test]
+    fn a_gzip_answer_that_decodes_past_the_cap_is_refused() {
+        let fake = FakeGithub::start("acme/widgets");
+        let c = client(&fake);
+        fake.state().gzip_bomb_next = true;
+        let err = c
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref m)
+                if m.contains("larger than 10 MiB") && m.contains("narrow the request")),
+            "{err:?}"
+        );
+        // One-shot: the next answer is read as usual.
+        assert_eq!(
+            c.send(Method::Get, "/repos/acme/widgets", None)
+                .unwrap()
+                .status,
+            200
+        );
+    }
+
+    // The cap also counts the wire: 11 MiB of gzip members that decode to a
+    // small valid object can only be refused by the wire limit.
+    #[test]
+    fn an_answer_over_the_cap_on_the_wire_is_refused_whatever_it_decodes_to() {
+        let fake = FakeGithub::start("acme/widgets");
+        fake.state().gzip_padded_next = true;
+        let Err(err) = client(&fake).send(Method::Get, "/repos/acme/widgets", None) else {
+            panic!("a body past the cap on the wire was read");
+        };
+        assert!(
+            matches!(err, StoreError::Backend(ref m) if m.contains("larger than 10 MiB")),
+            "{err:?}"
+        );
+    }
+
+    // A 2xx whose body is over the cap is the same case as one that breaks
+    // off: the status proves the write landed, so the caller that judges a
+    // create itself gets `Null`, never a refusal that reads as "did not
+    // happen" (spec §3.3).
+    #[test]
+    fn a_2xx_answer_over_the_cap_is_null_for_the_caller_that_judges_a_create() {
+        let fake = FakeGithub::start("acme/widgets");
+        let c = client(&fake);
+        fake.state().gzip_bomb_next = true;
+        let r = c
+            .send_unchecked_json(Method::Get, "/repos/acme/widgets", None)
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert!(r.body.is_null(), "a body past the cap was kept");
+    }
+
+    /// A source of `left` zero bytes that counts what is pulled from it.
+    struct Source {
+        left: u64,
+        pulled: u64,
+    }
+
+    impl std::io::Read for Source {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left.min(usize::MAX as u64) as usize);
+            buf[..n].fill(0);
+            self.left -= n as u64;
+            self.pulled += n as u64;
+            Ok(n)
+        }
+    }
+
+    // A body that decodes to 64 MiB never reaches memory: the read stops at the
+    // cap plus the one byte that tells a longer body from one of exactly the
+    // cap. One 8 KiB read buffer is allowed on top, far below the 64 MiB an
+    // unbounded read pulls.
+    #[test]
+    fn a_body_past_the_cap_is_refused_having_pulled_only_the_cap() {
+        let mut source = Source {
+            left: 64 << 20,
+            pulled: 0,
+        };
+        assert_eq!(read_capped(&mut source, BODY_LIMIT).unwrap(), None);
+        assert!(
+            source.pulled <= BODY_LIMIT + 1 + 8192,
+            "pulled {} bytes",
+            source.pulled
+        );
+        let mut exact = Source {
+            left: 100,
+            pulled: 0,
+        };
+        assert_eq!(read_capped(&mut exact, 100).unwrap(), Some(vec![0; 100]));
+        let mut over = Source {
+            left: 101,
+            pulled: 0,
+        };
+        assert_eq!(read_capped(&mut over, 100).unwrap(), None);
+    }
+
+    // A byte that is not UTF-8 makes the body unreadable, as a body that breaks
+    // off is; it is never replaced by text that would parse.
+    #[test]
+    fn a_body_that_is_not_utf8_is_unreadable_and_never_rewritten() {
+        let fake = FakeGithub::start("acme/widgets");
+        let c = client(&fake);
+        fake.state().invalid_utf8_next = true;
+        let err = c
+            .send(Method::Get, "/repos/acme/widgets", None)
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Unreachable { ref cause, .. } if cause.contains("UTF-8")),
+            "{err:?}"
+        );
+        fake.state().invalid_utf8_next = true;
+        let r = c
+            .send_unchecked_json(Method::Get, "/repos/acme/widgets", None)
+            .unwrap();
+        assert!(r.body.is_null(), "{:?}", r.body);
     }
 }

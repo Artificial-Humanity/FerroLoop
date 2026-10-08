@@ -355,6 +355,11 @@ retrying.
 
 - **Rate limits are reported, not waited out.** When GitHub's limit is spent, the command
   fails, naming when it resets if GitHub said.
+- **An answer over 10 MiB is refused.** fl counts the bytes GitHub sent and the bytes they
+  decode to, and reads neither past 10 MiB. The command fails, saying so; retry later, or
+  narrow the request. A create that GitHub answered with a 2xx status and an answer that large
+  is not reported as failed: the write landed, and fl treats the answer as one whose body could
+  not be read (see Creates).
 - **Each update and each repair is several requests.** It reads the issue twice, and the
   timeline and the edit history twice each — once before the write and once after — besides
   the write itself; a repair also posts its comment. A create has no such window: once per

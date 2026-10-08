@@ -146,6 +146,15 @@ pub struct State {
     /// The next request answers 502 with an HTML body — what a load
     /// balancer sends, not GitHub's JSON. One-shot.
     pub html_502_next: bool,
+    /// The next request answers 200 with a valid JSON object, gzip-encoded: a
+    /// few KiB on the wire, 32 MiB decoded. One-shot.
+    pub gzip_bomb_next: bool,
+    /// The next request answers 200 with a JSON object holding a byte that
+    /// is not UTF-8. One-shot.
+    pub invalid_utf8_next: bool,
+    /// The next request answers 200, gzip-encoded, with 11 MiB on the wire: a
+    /// valid small object, then empty gzip members. One-shot.
+    pub gzip_padded_next: bool,
     /// The next installation lookup answers 301 with this `Location`,
     /// which is off the API's own origin. One-shot.
     pub off_origin_redirect_next: Option<String>,
@@ -497,6 +506,16 @@ impl FakeGithub {
                     let _ = std::io::Write::flush(&mut w);
                     continue;
                 }
+                if let Some(bytes) = answer.encoded_body {
+                    let mut resp = tiny_http::Response::from_data(bytes)
+                        .with_status_code(answer.status)
+                        .with_header(header("Content-Type", "application/json"));
+                    for (k, v) in answer.headers {
+                        resp = resp.with_header(header(&k, &v));
+                    }
+                    let _ = req.respond(resp);
+                    continue;
+                }
                 let content_type = if answer.raw_body.is_some() {
                     "text/html"
                 } else {
@@ -720,6 +739,9 @@ pub(crate) struct Answer {
     pub(crate) hang_up: bool,
     /// Send the status line and headers, then a body that cannot be read.
     pub(crate) break_body: bool,
+    /// When set, these exact bytes are sent (already encoded, with the
+    /// `content-encoding` header in `headers`) instead of any text.
+    pub(crate) encoded_body: Option<Vec<u8>>,
 }
 
 pub(crate) fn answer(status: u16, body: Value) -> Answer {
@@ -730,7 +752,24 @@ pub(crate) fn answer(status: u16, body: Value) -> Answer {
         headers: vec![],
         hang_up: false,
         break_body: false,
+        encoded_body: None,
     }
+}
+
+/// One gzip member holding `data`.
+fn gzip_member(data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gz.write_all(data).expect("compress in memory");
+    gz.finish().expect("compress in memory")
+}
+
+/// A 200 whose body is `gzip`, named as such.
+fn gzip_answer(gzip: Vec<u8>) -> Answer {
+    let mut a = answer(200, Value::Null);
+    a.headers.push(("Content-Encoding".into(), "gzip".into()));
+    a.encoded_body = Some(gzip);
+    a
 }
 
 /// An answer whose body is not JSON at all (spec's reading of what a load
@@ -743,6 +782,7 @@ fn raw_answer(status: u16, body: &str) -> Answer {
         headers: vec![],
         hang_up: false,
         break_body: false,
+        encoded_body: None,
     }
 }
 
@@ -1164,6 +1204,24 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
     if s.down {
         let mut a = answer(503, Value::Null);
         a.hang_up = true;
+        return a;
+    }
+    if std::mem::take(&mut s.gzip_bomb_next) {
+        let object = json!({"message": "x".repeat(32 << 20)}).to_string();
+        return gzip_answer(gzip_member(object.as_bytes()));
+    }
+    if std::mem::take(&mut s.gzip_padded_next) {
+        let mut body = gzip_member(br#"{"message":"ok"}"#);
+        let empty = gzip_member(b"");
+        while body.len() < 11 << 20 {
+            body.extend_from_slice(&empty);
+        }
+        return gzip_answer(body);
+    }
+    if std::mem::take(&mut s.invalid_utf8_next) {
+        let mut a = raw_answer(200, "");
+        a.raw_body = None;
+        a.encoded_body = Some(b"{\"message\":\"caf\xE9\"}".to_vec());
         return a;
     }
     if let Some(i) = s
