@@ -1150,6 +1150,66 @@ fn a_flag_given_twice_or_an_add_with_no_source_is_refused() {
     );
 }
 
+// A token pasted where a name goes (the `--header` NAME slot, an `--env` key
+// given twice) is refused, never written to the catalog and never printed
+// (MCP spec §6); the names a person really types still pass.
+#[test]
+fn a_token_in_a_header_name_or_an_env_key_is_never_recorded_or_repeated() {
+    let w = World::new();
+    w.with_registry();
+    let before = w.read(CATALOG);
+    let token = "sk-proj-Ab3dEf9GhIjK2LmN";
+    let (out, err) = w.refused(&["add", "docs", "--url", fake::DOCS_URL, "--header", token]);
+    assert!(
+        err.contains("not a header name, so fl does not repeat it"),
+        "{err}"
+    );
+    // The same token with a variable, and twice: refused the same way.
+    for given in [format!("{token}=DOCS_TOKEN:Bearer"), token.to_string()] {
+        let (out2, err2) = w.refused(&[
+            "add",
+            "docs",
+            "--url",
+            fake::DOCS_URL,
+            "--header",
+            &given,
+            "--header",
+            &given,
+        ]);
+        for text in [&out, &out2, &err, &err2] {
+            assert!(!text.contains("Ab3dEf9"), "{text}");
+        }
+        assert!(err2.contains("not a header name"), "{err2}");
+        assert!(!err2.contains("given twice"), "{err2}");
+    }
+    assert_eq!(w.read(CATALOG), before, "nothing was written");
+    // A key given twice to `--from` is repeated only when it is a variable's name.
+    let (_, err) = w.refused(&[
+        "add",
+        "weather",
+        "--from",
+        fake::WEATHER,
+        "--env",
+        "abc123=xx",
+        "--env",
+        "abc123=yy",
+    ]);
+    assert!(err.contains("is given twice"), "{err}");
+    assert!(!err.contains("abc123"), "{err}");
+    // A lower-case name by hand: the way to add it, and the name not repeated.
+    let (_, err) = w.refused(&["add", "local", "--env", "abc123=xx", "--", "node"]);
+    assert!(err.contains("editing .fl/mcp.toml"), "{err}");
+    assert!(err.contains("env.<name>"), "{err}");
+    assert!(!err.contains("abc123"), "{err}");
+    assert_eq!(w.read(CATALOG), before, "nothing was written");
+    // The names a person really types still pass.
+    for name in ["Authorization", "X-Api-Key", "X-Goog-Api-Key"] {
+        let server = name.to_lowercase();
+        w.ok(&["add", &server, "--url", fake::DOCS_URL, "--header", name]);
+        assert!(w.read(CATALOG).contains(&format!("headers.{name} =")));
+    }
+}
+
 // Each form of `add` takes its own flags; one of another form is refused by
 // name, never ignored, and nothing is added.
 #[test]

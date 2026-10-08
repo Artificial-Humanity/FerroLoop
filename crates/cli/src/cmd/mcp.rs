@@ -11,7 +11,8 @@ use fl_exec::git::Git;
 use fl_exec::population::ExecError;
 use fl_mcp::McpError;
 use fl_mcp::catalog::{
-    Catalog, Editor, EnvValue, HeaderValue, Server, Transport, VendorName, is_variable_name,
+    Catalog, Editor, EnvValue, HeaderValue, Server, Transport, VendorName, is_header_name,
+    is_variable_name,
 };
 use fl_mcp::freeze::{self, FreezeOptions, Route};
 use fl_mcp::registry::{Registry, printable};
@@ -345,6 +346,14 @@ fn literals(given: &[String], with: &str) -> Result<BTreeMap<String, String>> {
             );
         };
         if env.insert(name.to_string(), value.to_string()).is_some() {
+            // The key is the person's text, not yet checked: it is repeated
+            // only when it is a variable's name (MCP spec §6).
+            if !is_variable_name(name) {
+                bail!(
+                    "an `--env` key is given twice, and it is not a variable's name, so fl does \
+                     not repeat it. Give each variable once"
+                );
+            }
             bail!("`--env {name}=…` is given twice");
         }
     }
@@ -360,7 +369,8 @@ fn add_by_hand(root: &Path, add: Add) -> Result<()> {
             Some((name, _)) if !is_variable_name(name) => bail!(
                 "`--env <NAME>=<value>` needs an environment variable's name before the `=` \
                  (capital letters, digits and `_`); this one is not such a name, so fl does \
-                 not repeat it"
+                 not repeat it. A variable with a lower-case name can be added by editing \
+                 .fl/mcp.toml: `env.<name> = \"…\"` under the server"
             ),
             Some((name, value)) => (name, EnvValue::Literal(value.to_string())),
             // A secret reference: the name is the variable, so a token pasted
@@ -379,6 +389,8 @@ fn add_by_hand(root: &Path, add: Add) -> Result<()> {
     let mut headers = BTreeMap::new();
     for given in &add.header {
         let (name, value) = header(&add.name, given)?;
+        // `header` passed the name (letters and `-` only), so repeating it is
+        // safe (MCP spec §6).
         if headers.insert(name.clone(), value).is_some() {
             bail!("`--header {name}` is given twice");
         }
@@ -436,10 +448,14 @@ fn header(server: &str, given: &str) -> Result<(String, HeaderValue)> {
         Some((name, rest)) => (name, Some(rest)),
         None => (given, None),
     };
-    if !freeze::is_scheme(name) {
+    if !is_header_name(name) {
+        // A token pasted where a name goes must not reach the catalog or a
+        // message: the text is never repeated (MCP spec §6).
         bail!(
-            "a `--header` starts with a header name (letters, digits and `-`), then \
-             optionally `=<ENV>` and `:<SCHEME>`; this one does not"
+            "a `--header` starts with a header name (letters and `-`, such as \
+             `Authorization` or `X-Api-Key`), then optionally `=<ENV>` and `:<SCHEME>`; this \
+             one is not a header name, so fl does not repeat it. A header carries a secret \
+             by reference: name the header, then the variable that holds the value"
         );
     }
     let (env, scheme) = match rest {

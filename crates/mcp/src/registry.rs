@@ -231,12 +231,7 @@ impl Registry {
                  operator can say why"
             )));
         }
-        serde_json::from_slice(&bytes).map_err(|e| {
-            failed(format!(
-                "its answer is not the registry API's shape ({e}). Check that the address is a \
-                 registry serving API {API_VERSION}"
-            ))
-        })
+        serde_json::from_slice(&bytes).map_err(|e| failed(shape_problem(&e.to_string())))
     }
 
     /// A redirect names where it points only when that is the registry's
@@ -260,6 +255,17 @@ impl Registry {
              registry has moved, set its new address with `fl mcp registry <url>`"
         )
     }
+}
+
+/// What `problem` says of an answer that is not the registry API's shape.
+/// The parser's text can quote a value it found, unescaped: registry text,
+/// so it reaches the terminal through [`printable`] like any other.
+fn shape_problem(parser: &str) -> String {
+    format!(
+        "its answer is not the registry API's shape ({}). Check that the address is a \
+         registry serving API {API_VERSION}",
+        printable(parser)
+    )
 }
 
 /// Everything `reader` yields, or `None` when it yields more than `cap` bytes.
@@ -301,28 +307,51 @@ pub fn printable(text: &str) -> String {
     text.chars().filter(|c| !is_unseen(*c)).take(300).collect()
 }
 
-/// A character a person cannot see for what it is: a control character, or a
+/// A character a person cannot see for what it is: a control character, a
 /// format or invisible one (soft hyphen, zero-width, bidirectional marks and
-/// overrides, the byte-order mark, language tags). Such a character in a text
-/// can make it read as another.
+/// overrides, variation selectors, the byte-order mark, language tags), or a
+/// line or paragraph separator. Such a character in a text can make it read
+/// as another.
+///
+/// The ranges are the union of three Unicode 16.0 sets: the characters with
+/// property `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt), those
+/// of `General_Category=Cf` (UnicodeData.txt), and U+2028 and U+2029
+/// (`Zl` and `Zp`). `Cc` is `char::is_control`. Unassigned code points inside
+/// a Default_Ignorable block (U+2065, U+FFF0..U+FFF8, U+E0000, U+E0002..U+E001F,
+/// U+E0080..U+E00FF, U+E01F0..U+E0FFF) are not listed: they are not
+/// characters a registry can send as text that reads as another.
 pub(crate) fn is_unseen(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
             '\u{AD}'
+                | '\u{34F}'
                 | '\u{600}'..='\u{605}'
                 | '\u{61C}'
                 | '\u{6DD}'
                 | '\u{70F}'
-                | '\u{180E}'
+                | '\u{890}'..='\u{891}'
+                | '\u{8E2}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
                 | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
+                | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
                 | '\u{2066}'..='\u{206F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
                 | '\u{FEFF}'
+                | '\u{FFA0}'
                 | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
                 | '\u{E0001}'
                 | '\u{E0020}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
         )
 }
 
@@ -415,12 +444,27 @@ pub struct Official {
     pub is_latest: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
+/// A version's status: an open string in the registry's schema, so a status
+/// fl does not know (`archived`, say) is kept as given and refused at freeze,
+/// not mistaken for an answer of the wrong shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "String")]
 pub enum Status {
     Active,
     Deprecated,
     Deleted,
+    Other(String),
+}
+
+impl From<String> for Status {
+    fn from(s: String) -> Self {
+        match s.as_str() {
+            "active" => Status::Active,
+            "deprecated" => Status::Deprecated,
+            "deleted" => Status::Deleted,
+            _ => Status::Other(s),
+        }
+    }
 }
 
 /// A server's `server.json`.
@@ -880,6 +924,32 @@ mod tests {
         assert_eq!(named.kind.as_str(), "named");
     }
 
+    // `status` is an open string in the registry's schema: a status fl does
+    // not know is listed by a search, read in full and kept as spelled, so
+    // freezing can refuse it by name; it is not "the wrong shape".
+    #[test]
+    fn a_status_fl_does_not_know_is_listed_read_and_kept_as_spelled() {
+        let fake = FakeRegistry::start();
+        let mut entry = fake
+            .state()
+            .entries
+            .iter()
+            .find(|e| e["server"]["name"] == fake::WEATHER)
+            .cloned()
+            .unwrap();
+        entry["server"]["name"] = "io.example/archived".into();
+        entry["_meta"]["io.modelcontextprotocol.registry/official"]["status"] = "archived".into();
+        fake.state().entries.push(entry);
+        let registry = client(&fake);
+        let found = registry.search("io.example/archived").unwrap();
+        assert_eq!(names(&found.servers), ["io.example/archived"]);
+        assert_eq!(found.servers[0].status, "archived");
+        let full = registry.version("io.example/archived", "latest").unwrap();
+        assert_eq!(full.meta.status, Status::Other("archived".into()));
+        let known = registry.version(fake::LEGACY, "latest").unwrap();
+        assert_eq!(known.meta.status, Status::Deprecated);
+    }
+
     // The registry serves entries its own schema does not allow: a search
     // reads only what it shows, so one such server never fails a page.
     #[test]
@@ -1132,6 +1202,24 @@ mod tests {
         assert_eq!(read_capped(&mut over, 100).unwrap(), None);
     }
 
+    // The parser's own text can quote what the registry sent: it is shown
+    // without control, bidirectional or invisible characters, and cut short.
+    #[test]
+    fn the_shape_error_shows_the_parsers_text_through_printable() {
+        let parser = format!(
+            "unknown variant `a\u{1b}]0;pwn\u{7}\u{202e}b{}`, expected one of `x`",
+            "z".repeat(400)
+        );
+        let msg = shape_problem(&parser);
+        assert!(msg.contains("is not the registry API's shape (unknown variant `a]0;pwnb"));
+        assert!(!msg.chars().any(is_unseen), "{msg:?}");
+        assert!(
+            !msg.contains(&"z".repeat(300)),
+            "cut short: {} bytes",
+            msg.len()
+        );
+    }
+
     // The registry's data is read as it came: a byte that is not UTF-8 makes
     // the body not the registry API's, and is never replaced.
     #[test]
@@ -1192,30 +1280,59 @@ mod tests {
             printable("a\u{202e}b\u{200b}c\u{feff}d\u{2066}e\u{ad}f\u{1b}g"),
             "abcdefg"
         );
+        // The endpoints of every range `is_unseen` lists, and the characters
+        // just outside them.
         let unseen = [
             '\u{7f}',
             '\u{85}',
             '\u{ad}',
+            '\u{34f}',
             '\u{600}',
             '\u{605}',
             '\u{61c}',
             '\u{6dd}',
             '\u{70f}',
+            '\u{890}',
+            '\u{891}',
+            '\u{8e2}',
+            '\u{115f}',
+            '\u{1160}',
+            '\u{17b4}',
+            '\u{17b5}',
+            '\u{180b}',
+            '\u{180d}',
             '\u{180e}',
+            '\u{180f}',
             '\u{200b}',
             '\u{200f}',
+            '\u{2028}',
+            '\u{2029}',
             '\u{202a}',
             '\u{202e}',
             '\u{2060}',
             '\u{2064}',
             '\u{2066}',
             '\u{206f}',
+            '\u{3164}',
+            '\u{fe00}',
+            '\u{fe0f}',
             '\u{feff}',
+            '\u{ffa0}',
             '\u{fff9}',
             '\u{fffb}',
+            '\u{110bd}',
+            '\u{110cd}',
+            '\u{13430}',
+            '\u{1343f}',
+            '\u{1bca0}',
+            '\u{1bca3}',
+            '\u{1d173}',
+            '\u{1d17a}',
             '\u{e0001}',
             '\u{e0020}',
             '\u{e007f}',
+            '\u{e0100}',
+            '\u{e01ef}',
         ];
         for c in unseen {
             assert!(is_unseen(c), "U+{:04X}", c as u32);
@@ -1226,6 +1343,8 @@ mod tests {
             '\u{e9}',
             '\u{ac}',
             '\u{ae}',
+            '\u{34e}',
+            '\u{350}',
             '\u{5ff}',
             '\u{606}',
             '\u{61b}',
@@ -1233,20 +1352,47 @@ mod tests {
             '\u{6dc}',
             '\u{6de}',
             '\u{70e}',
-            '\u{180d}',
+            '\u{88f}',
+            '\u{892}',
+            '\u{8e1}',
+            '\u{8e3}',
+            '\u{115e}',
+            '\u{1161}',
+            '\u{17b3}',
+            '\u{17b6}',
+            '\u{180a}',
+            '\u{1810}',
             '\u{200a}',
             '\u{2010}',
-            '\u{2029}',
+            '\u{2027}',
             '\u{202f}',
             '\u{205f}',
             '\u{2065}',
             '\u{2070}',
+            '\u{3163}',
+            '\u{3165}',
+            '\u{fdff}',
+            '\u{fe10}',
             '\u{fefe}',
+            '\u{ff9f}',
+            '\u{ffa1}',
             '\u{fff8}',
             '\u{fffc}',
+            '\u{110bc}',
+            '\u{110be}',
+            '\u{110cc}',
+            '\u{110ce}',
+            '\u{1342f}',
+            '\u{13440}',
+            '\u{1bc9f}',
+            '\u{1bca4}',
+            '\u{1d172}',
+            '\u{1d17b}',
             '\u{e0000}',
             '\u{e001f}',
             '\u{e0080}',
+            '\u{e00ff}',
+            '\u{e01f0}',
         ];
         for c in seen {
             assert!(!is_unseen(c), "U+{:04X}", c as u32);

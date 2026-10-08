@@ -288,6 +288,20 @@ pub fn is_variable_name(s: &str) -> bool {
         && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
+/// `[A-Za-z][A-Za-z-]{0,63}`: a header's name as fl asks a person to type one
+/// (`fl mcp add --header`). No digits and no `_`, so a token pasted where a
+/// name goes (`sk-proj-Ab3dEf9GhIjK2LmN`) is not taken for a name, and a
+/// message repeats a name only when it passes this (MCP spec §6). Real names
+/// (`Authorization`, `X-Api-Key`, `X-Goog-Api-Key`) pass. A header a registry
+/// names keeps the looser RFC token rule in `freeze`: that text is printed
+/// through `printable`, and a registry may name `X-Api-Key2`.
+pub fn is_header_name(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    s.len() <= 64
+        && bytes.next().is_some_and(|b| b.is_ascii_alphabetic())
+        && bytes.all(|b| b.is_ascii_alphabetic() || b == b'-')
+}
+
 /// Why fl will not read a registry at `url`, as a clause. A registry is read
 /// over https, or over http to this machine only, and never with a user name
 /// or password in the URL (MCP spec §3.1).
@@ -999,6 +1013,27 @@ env.LOG_LEVEL = "info"
         ] {
             assert!(!is_variable_name(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_header_name_as_fl_asks_for_one_is_letters_and_hyphens_only() {
+        for ok in ["Authorization", "X-Api-Key", "X-Goog-Api-Key", "A"] {
+            assert!(is_header_name(ok), "{ok}");
+        }
+        assert!(is_header_name(&"a".repeat(64)));
+        for bad in [
+            "",
+            "-A",
+            "2A",
+            "X_Key",
+            "sk-proj-Ab3dEf9GhIjK2LmN",
+            "ghp_example0token",
+            "c2VjcmV0dG9rZW4",
+            "A B",
+        ] {
+            assert!(!is_header_name(bad), "{bad}");
+        }
+        assert!(!is_header_name(&"a".repeat(65)));
     }
 
     #[test]

@@ -1352,7 +1352,7 @@ env.NOTES_TOKEN = { secret = true }
         assert_eq!(names(&f.plan_with(CATALOG, &on, &[])), ["docs", "notes"]);
     }
 
-    // Owner decision 15: a switch naming a server the catalog no longer has
+    // MCP spec §0.1 decision 15: a switch naming a server the catalog no longer has
     // is ignored, with a warning; the rest of the plan goes on.
     #[test]
     fn a_machine_switch_naming_an_unknown_server_is_a_warning() {
@@ -1385,7 +1385,7 @@ env.NOTES_TOKEN = { secret = true }
         assert!(f.plan(CATALOG).warnings().is_empty());
     }
 
-    // Owner decision 14: after a fresh clone or `git clean -X`, fl's own
+    // MCP spec §0.1 decision 14: after a fresh clone or `git clean -X`, fl's own
     // files are gone as a whole; `sync` writes them anew from the catalog.
     #[test]
     fn a_vendor_file_gone_as_a_whole_is_written_anew() {

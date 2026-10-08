@@ -68,6 +68,10 @@ pub struct FreezeOptions {
     /// they do not. `env` and `with` win over them.
     pub kept_env: BTreeMap<String, String>,
     pub kept_with: BTreeSet<String>,
+    /// Set by [`FreezeOptions::upgrading`]: the freeze is an `upgrade`, which
+    /// takes no `--package` or `--remote`, so a refusal about the route
+    /// names the commands that do.
+    pub upgrading: bool,
 }
 
 impl FreezeOptions {
@@ -93,6 +97,7 @@ impl FreezeOptions {
             route: Route::of(pinned),
             kept_env,
             kept_with,
+            upgrading: true,
             ..FreezeOptions::default()
         }
     }
@@ -154,7 +159,7 @@ fn freeze_entry(resp: &ServerResponse, opts: &FreezeOptions) -> Result<Frozen, R
         Some(m) => printable(m),
         None => "no reason given".to_string(),
     };
-    match resp.meta.status {
+    match &resp.meta.status {
         Status::Deleted => {
             return refuse(
                 format!("it is deleted in the registry ({})", said()),
@@ -168,6 +173,19 @@ fn freeze_entry(resp: &ServerResponse, opts: &FreezeOptions) -> Result<Frozen, R
             said()
         )),
         Status::Active => {}
+        Status::Other(status) => {
+            return refuse(
+                format!(
+                    "its status in the registry is `{}`, one fl does not know, so it cannot \
+                     tell whether the version may be used",
+                    printable(status)
+                ),
+                format!(
+                    "Choose another version or server: `fl mcp search <text>` lists them. Or add \
+                     it by hand with `fl mcp add {n} -- <command>` or `fl mcp add {n} --url <url>`"
+                ),
+            );
+        }
     }
     if has_unseen(&s.name) {
         return unseen("its server name", n);
@@ -353,7 +371,18 @@ fn choose<'a>(s: &'a ServerJson, opts: &FreezeOptions) -> Result<Offer<'a>, Refu
         (Some(only), None) => Ok(*only),
         (None, _) => refuse(
             format!("it offers no `{}` route, only {}", route.flag(), list()),
-            "Choose one it offers",
+            if opts.upgrading {
+                // `upgrade` has no `--package` or `--remote`: the entry is
+                // removed and added again by the route the new version offers.
+                format!(
+                    "`fl mcp upgrade` keeps the route the entry was frozen from. Take the route \
+                     the new version offers: `fl mcp remove {n}`, then `fl mcp add {n} --from {} \
+                     --package <type>` or `--remote`",
+                    printable(&s.name)
+                )
+            } else {
+                "Choose one it offers".to_string()
+            },
         ),
         (Some(_), Some(_)) => refuse(
             format!(
@@ -2464,6 +2493,74 @@ mod tests {
 
     fn refusal(resp: &ServerResponse) -> String {
         freeze(resp, &named("s")).unwrap_err().to_string()
+    }
+
+    // `upgrade` has no `--package` or `--remote`: when the pinned route is
+    // gone from the new version, the refusal names the commands that can be
+    // followed, not "choose one".
+    #[test]
+    fn an_upgrade_whose_pinned_route_is_gone_names_remove_then_add() {
+        let pinned = freeze(
+            &response(sample(json!([]), json!([remote(json!({}))]))),
+            &named("sample"),
+        )
+        .unwrap()
+        .server;
+        let carried = FreezeOptions::upgrading("sample", &pinned);
+        let gone = response(sample(json!([npm(json!({}))]), json!([])));
+        let msg = freeze(&gone, &carried).unwrap_err().to_string();
+        assert!(
+            msg.contains("offers no `--remote` route, only `--package npm`"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "`fl mcp remove sample`, then `fl mcp add sample --from io.example/sample \
+                 --package <type>` or `--remote`"
+            ),
+            "{msg}"
+        );
+        assert!(!msg.contains("Choose one it offers"), "{msg}");
+        // `add` has the flags: its refusal is unchanged.
+        let msg = freeze(&gone, &routed("sample", Route::Remote))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("Choose one it offers"), "{msg}");
+    }
+
+    // `status` is an open string: one fl does not know is refused at freeze,
+    // naming it and what to do, and its text reaches the message through
+    // `printable`.
+    #[test]
+    fn a_status_fl_does_not_know_is_refused_naming_it() {
+        let server = || sample(json!([]), json!([remote(json!({}))]));
+        let msg = freeze(&response_with(server(), "archived", None), &named("s"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("its status in the registry is `archived`, one fl does not know"),
+            "{msg}"
+        );
+        assert!(msg.contains("Choose another version or server"), "{msg}");
+        assert!(msg.contains("fl mcp add s -- <command>"), "{msg}");
+        let hostile = "arch\u{1b}]0;pwn\u{7}\u{202e}ived";
+        let msg = freeze(&response_with(server(), hostile, None), &named("s"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("its status in the registry is `arch]0;pwnived`"),
+            "{msg}"
+        );
+        assert!(!msg.chars().any(crate::registry::is_unseen), "{msg:?}");
+        let long = "x".repeat(400);
+        let msg = freeze(&response_with(server(), &long, None), &named("s"))
+            .unwrap_err()
+            .to_string();
+        assert!(!msg.contains(&"x".repeat(301)), "{msg}");
+        // The statuses fl knows are not refused for their status.
+        for status in ["active", "deprecated"] {
+            freeze(&response_with(server(), status, None), &named("s")).unwrap();
+        }
     }
 
     // MCP spec §2.1: the pin is exact. A range, a wildcard, a tag, a URL or an
