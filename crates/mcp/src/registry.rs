@@ -11,7 +11,7 @@ use crate::catalog::check_registry_url;
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::Read as _;
+use std::io::Read;
 use std::time::Duration;
 
 /// The registry API version fl reads (MCP spec §3.1).
@@ -208,27 +208,20 @@ impl Registry {
                     .to_string(),
             )
         };
-        let mut bytes = Vec::new();
-        let read = resp
-            .body_mut()
-            .with_config()
-            .limit(BODY_LIMIT)
-            .lossy_utf8(true)
-            .reader()
-            .take(BODY_LIMIT + 1)
-            .read_to_end(&mut bytes);
-        match read.map_err(ureq::Error::from) {
-            Ok(_) => {}
-            Err(ureq::Error::BodyExceedsLimit(_)) => return Err(too_big()),
+        // Bytes, not text: the registry's data is read as it came, so a byte that is
+        // not UTF-8 is a body that is not the registry API's, never rewritten.
+        let read = read_capped(
+            resp.body_mut().with_config().limit(BODY_LIMIT).reader(),
+            BODY_LIMIT,
+        );
+        let bytes = match read.map_err(ureq::Error::from) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) | Err(ureq::Error::BodyExceedsLimit(_)) => return Err(too_big()),
             Err(e) => return Err(unreachable(e)),
-        }
-        if bytes.len() as u64 > BODY_LIMIT {
-            return Err(too_big());
-        }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        };
         if !(200..300).contains(&status) {
             let detail = (mime == "application/problem+json")
-                .then(|| serde_json::from_str::<ProblemJson>(&text).ok())
+                .then(|| serde_json::from_slice::<ProblemJson>(&bytes).ok())
                 .flatten()
                 .and_then(|p| p.detail)
                 .map(|d| format!(": {}", printable(&d)))
@@ -238,7 +231,7 @@ impl Registry {
                  operator can say why"
             )));
         }
-        serde_json::from_str(&text).map_err(|e| {
+        serde_json::from_slice(&bytes).map_err(|e| {
             failed(format!(
                 "its answer is not the registry API's shape ({e}). Check that the address is a \
                  registry serving API {API_VERSION}"
@@ -267,6 +260,15 @@ impl Registry {
              registry has moved, set its new address with `fl mcp registry <url>`"
         )
     }
+}
+
+/// Everything `reader` yields, or `None` when it yields more than `cap` bytes.
+/// It pulls at most `cap + 1` bytes from `reader`, so a body that decodes to
+/// gigabytes never reaches memory.
+fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader.take(cap + 1).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= cap).then_some(bytes))
 }
 
 /// No redirect is followed, and nothing is sent but the request.
@@ -1041,6 +1043,74 @@ mod tests {
             names(&registry.search("notes").unwrap().servers),
             [fake::NOTES]
         );
+    }
+
+    // MCP spec §3.1: the cap also counts the wire. A gzip answer of one tiny
+    // member and a run of empty ones is 5 MiB on the wire and decodes to a
+    // valid empty list, so only the wire limit can refuse it.
+    #[test]
+    fn an_answer_over_the_cap_on_the_wire_is_refused_whatever_it_decodes_to() {
+        let fake = FakeRegistry::start();
+        let registry = client(&fake);
+        fake.state().gzip_padded_next = true;
+        let msg = registry.search("notes").unwrap_err().to_string();
+        holds_only(&msg, "larger than 4 MiB");
+    }
+
+    /// A source of `left` zero bytes that counts what is pulled from it.
+    struct Source {
+        left: u64,
+        pulled: u64,
+    }
+
+    impl Read for Source {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left.min(usize::MAX as u64) as usize);
+            buf[..n].fill(0);
+            self.left -= n as u64;
+            self.pulled += n as u64;
+            Ok(n)
+        }
+    }
+
+    // A body that decodes to 64 MiB never reaches memory: the read stops at the
+    // cap plus the one byte that tells a longer body from one of exactly the
+    // cap. `Take` hands its source a buffer no longer than what is left of that,
+    // so the bound is exact; one 8 KiB read buffer is allowed on top, far below
+    // the 64 MiB an unbounded read pulls.
+    #[test]
+    fn a_body_past_the_cap_is_refused_having_pulled_only_the_cap() {
+        let mut source = Source {
+            left: 64 << 20,
+            pulled: 0,
+        };
+        assert_eq!(read_capped(&mut source, BODY_LIMIT).unwrap(), None);
+        assert!(
+            source.pulled <= BODY_LIMIT + 1 + 8192,
+            "pulled {} bytes",
+            source.pulled
+        );
+        let mut exact = Source {
+            left: 100,
+            pulled: 0,
+        };
+        assert_eq!(read_capped(&mut exact, 100).unwrap(), Some(vec![0; 100]));
+        let mut over = Source {
+            left: 101,
+            pulled: 0,
+        };
+        assert_eq!(read_capped(&mut over, 100).unwrap(), None);
+    }
+
+    // The registry's data is read as it came: a byte that is not UTF-8 makes
+    // the body not the registry API's, and is never replaced.
+    #[test]
+    fn a_body_that_is_not_utf8_is_not_the_registry_api() {
+        let fake = FakeRegistry::start();
+        let registry = client(&fake);
+        fake.state().invalid_utf8_next = true;
+        let msg = registry.search("notes").unwrap_err().to_string();
+        holds_only(&msg, "is not the registry API's shape");
     }
 
     // MCP spec §3.1: reads are unauthenticated.

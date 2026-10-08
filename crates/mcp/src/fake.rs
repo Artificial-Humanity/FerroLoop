@@ -71,6 +71,12 @@ pub struct State {
     /// The next request answers 200 with a valid list, gzip-encoded: a few
     /// KiB on the wire, 32 MiB decoded. One-shot.
     pub gzip_bomb_next: bool,
+    /// The next request answers 200, gzip-encoded, with 5 MiB on the wire: a
+    /// valid empty list, then empty gzip members. One-shot.
+    pub gzip_padded_next: bool,
+    /// The next request answers 200 with a list whose one name holds the byte
+    /// 0xFF, which is not UTF-8. One-shot.
+    pub invalid_utf8_next: bool,
     /// The next request answers 500 with `application/problem+json`, as the
     /// real registry once did. One-shot.
     pub problem_500_next: bool,
@@ -247,6 +253,45 @@ fn route(s: &mut State, url: &str) -> Answer {
             body: gz.finish().expect("compress in memory"),
             location: None,
             encoding: Some("gzip"),
+        };
+    }
+    if std::mem::take(&mut s.gzip_padded_next) {
+        use std::io::Write as _;
+        let member = |data: &[u8]| {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            gz.write_all(data).expect("compress in memory");
+            gz.finish().expect("compress in memory")
+        };
+        let mut body = member(br#"{"servers":[],"metadata":{"count":0}}"#);
+        let empty = member(b"");
+        while body.len() < 5 << 20 {
+            body.extend_from_slice(&empty);
+        }
+        return Answer {
+            status: 200,
+            content_type: "application/json",
+            body,
+            location: None,
+            encoding: Some("gzip"),
+        };
+    }
+    if std::mem::take(&mut s.invalid_utf8_next) {
+        let list = json!({
+            "servers": [entry("io.example/notes-MARK", "1.0.0", true, vec![], vec![])],
+            "metadata": { "count": 1 }
+        });
+        let mut body = list.to_string().into_bytes();
+        let at = body
+            .windows(4)
+            .position(|w| w == b"MARK")
+            .expect("the mark");
+        body.splice(at..at + 4, [0xFF]);
+        return Answer {
+            status: 200,
+            content_type: "application/json",
+            body,
+            location: None,
+            encoding: None,
         };
     }
     let (path, query) = url.split_once('?').unwrap_or((url, ""));
