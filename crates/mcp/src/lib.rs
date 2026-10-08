@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub mod catalog;
 #[cfg(any(test, feature = "fake"))]
 pub mod fake;
+pub mod freeze;
 pub mod registry;
 
 /// Every refusal names the file, the entry and what to do next (MCP spec §5).
@@ -81,6 +82,24 @@ pub enum McpError {
         registry: String,
         name: String,
         version: Option<String>,
+    },
+    /// A registry entry fl cannot freeze into the catalog honestly (MCP spec
+    /// §3.2). `from` and `version` are the registry's; `next` says what to
+    /// do instead.
+    #[error("`{from}` {version} cannot be frozen into the catalog: {problem}. {next}")]
+    Unfreezable {
+        from: String,
+        version: String,
+        problem: String,
+        next: String,
+    },
+    /// `upgrade` to a version that is not newer than the pinned one, without
+    /// `--to` (MCP spec §3.3).
+    #[error("server `{name}`: {problem}. {next}")]
+    NotNewer {
+        name: String,
+        problem: String,
+        next: String,
     },
 }
 

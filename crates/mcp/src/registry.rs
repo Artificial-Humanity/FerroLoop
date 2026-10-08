@@ -297,7 +297,7 @@ fn encode(s: &str) -> String {
 
 /// Registry text for a terminal: no control characters, at most 300 of the
 /// rest.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).take(300).collect()
 }
 
