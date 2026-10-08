@@ -14,6 +14,7 @@ fl-core = { path = "../core" }
 fl-store = { path = "../store" }
 fl-exec = { path = "../exec" }
 fl-github = { path = "../github" }
+fl-mcp = { path = "../mcp" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -24,6 +25,7 @@ ureq.workspace = true
 
 [dev-dependencies]
 fl-github = { path = "../github", features = ["fake"] }
+fl-mcp = { path = "../mcp", features = ["fake"] }
 tempfile.workspace = true
 assert_cmd.workspace = true
 predicates.workspace = true

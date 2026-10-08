@@ -64,6 +64,7 @@ Commands:
   manifest    Share a project's gates through a committed manifest
   github      GitHub tracker: who fl writes as, and repair of a diverged issue
   routing     Route a project's new items between its local store and GitHub
+  mcp         A project's MCP servers: one committed catalog, written into each agent CLI's file
   help        Print this message or the help of the given subcommand(s)
 
 Options:

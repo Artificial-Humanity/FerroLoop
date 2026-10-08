@@ -30,9 +30,16 @@ impl Git {
     /// change. Untracked is `false`, not an error; a git that cannot answer
     /// is an error, never `false`.
     pub fn is_committed(root: &Path, rel: &str) -> Result<bool, ExecError> {
-        let tracked = !git(root, &["ls-files", "--", rel])?.is_empty();
+        let tracked = Self::is_tracked(root, rel)?;
         let clean = git(root, &["status", "--porcelain", "--", rel])?.is_empty();
         Ok(tracked && clean)
+    }
+
+    /// Whether `rel` (relative to `root`) is in git's index: committed, or
+    /// added and not yet committed, ignored or not. A path git does not know
+    /// is `false`; a git that cannot answer is an error, never `false`.
+    pub fn is_tracked(root: &Path, rel: &str) -> Result<bool, ExecError> {
+        Ok(!git(root, &["ls-files", "--", rel])?.is_empty())
     }
 
     /// Whether `rel` (relative to `root`) is excluded by a `.gitignore`
@@ -197,6 +204,35 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         assert!(matches!(
             Git::is_ignored(d.path(), "x"),
+            Err(ExecError::Git(_))
+        ));
+    }
+
+    #[test]
+    fn is_tracked_tells_a_tracked_path_from_an_untracked_or_ignored_one() {
+        let d = repo();
+        assert!(Git::is_tracked(d.path(), "README.md").unwrap(), "committed");
+        fs::write(d.path().join(".gitignore"), ".mcp.json\n").unwrap();
+        fs::write(d.path().join(".mcp.json"), "{}").unwrap();
+        assert!(!Git::is_tracked(d.path(), ".mcp.json").unwrap(), "ignored");
+        assert!(!Git::is_tracked(d.path(), "absent.json").unwrap(), "absent");
+        fs::write(d.path().join("new.rs"), "fn b() {}").unwrap();
+        assert!(!Git::is_tracked(d.path(), "new.rs").unwrap(), "untracked");
+        // Ignored, and tracked anyway: a `git add -f` makes it tracked.
+        let run = Command::new("git")
+            .args(["add", "-f", ".mcp.json"])
+            .current_dir(d.path())
+            .output()
+            .unwrap();
+        assert!(run.status.success());
+        assert!(Git::is_tracked(d.path(), ".mcp.json").unwrap(), "added");
+    }
+
+    #[test]
+    fn is_tracked_outside_a_repository_is_an_error_not_false() {
+        let d = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            Git::is_tracked(d.path(), ".mcp.json"),
             Err(ExecError::Git(_))
         ));
     }

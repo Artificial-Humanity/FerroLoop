@@ -6,6 +6,7 @@ pub mod gate;
 pub mod github;
 pub mod ledger;
 pub mod manifest;
+pub mod mcp;
 pub mod project;
 pub mod record;
 pub mod routing;

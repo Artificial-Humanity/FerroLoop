@@ -297,7 +297,7 @@ fn encode(s: &str) -> String {
 
 /// Registry text for a terminal: no control, format or invisible characters
 /// (see [`is_unseen`]), at most 300 of the rest.
-pub(crate) fn printable(text: &str) -> String {
+pub fn printable(text: &str) -> String {
     text.chars().filter(|c| !is_unseen(*c)).take(300).collect()
 }
 

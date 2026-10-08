@@ -355,6 +355,7 @@ dependencies = [
  "fl-core",
  "fl-exec",
  "fl-github",
+ "fl-mcp",
  "fl-store",
  "predicates",
  "serde",

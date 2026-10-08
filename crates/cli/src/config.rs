@@ -106,10 +106,6 @@ pub struct McpEntry {
 pub struct Config {
     pub projects: Vec<Entry>,
     pub github: Option<GithubApp>,
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by `fl mcp`, not yet built")
-    )]
     pub mcp: Vec<McpEntry>,
 }
 
@@ -156,7 +152,6 @@ pub fn state_dir(xdg_state_home: Option<PathBuf>, home: Option<PathBuf>) -> Opti
 /// fl's own state directory, `<state base>/fl`, from this process's
 /// `$XDG_STATE_HOME` and `$HOME` by [`state_dir`]'s rule. `None` when
 /// neither gives an absolute base.
-#[expect(dead_code, reason = "read by `fl mcp`, not yet built")]
 pub fn fl_state_dir() -> Option<PathBuf> {
     let base = state_dir(
         std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
@@ -346,10 +341,6 @@ pub fn bound_entry(entries: &[Entry], cwd: &Path) -> Result<Option<Entry>> {
 /// `cwd` (MCP spec §2.2). Two entries on one root that switch differently
 /// are refused, naming both: nothing chose between them. Two that switch
 /// alike are one choice, however their roots are spelled.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "read by `fl mcp`, not yet built")
-)]
 pub fn mcp_entry(entries: &[McpEntry], cwd: &Path) -> Result<Option<McpEntry>> {
     let Some((cwd, winners)) = longest_ancestor(entries, |e| &e.root, cwd)? else {
         return Ok(None);
