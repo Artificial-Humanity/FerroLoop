@@ -24,8 +24,6 @@ File naming in this directory follows
   Code's, Codex's and Antigravity's own files: the catalog, secrets, each machine's switches, the
   commands, what fl refuses and why.
 
-No anchor document exists yet.
-
 ## Root documents
 
 These stay at the repository root and are not duplicated here:

@@ -1,6 +1,6 @@
 # Workflow — Project FerroLoop
 
-Follow [AGENTS.md](AGENTS.md) for repository rules and git configuration.
+Follow [AGENTS.md](AGENTS.md) for repository rules.
 
 ## Branch, review, merge
 
@@ -32,8 +32,7 @@ Follow [AGENTS.md](AGENTS.md) for repository rules and git configuration.
   `test, clippy, fmt` check must pass, the branch must be current with `main`, and review
   conversations must be resolved. The machine account cannot approve its own pull
   request, so the owner approves every agent pull request. Force-pushes and deletions
-  are refused. There is no pre-push gate on the local side — observe the git safeguards
-  in `AGENTS.md`.
+  are refused. There is no pre-push gate on the local side.
 * **The rules bind everyone, the owner included.** The ruleset has no bypass list, so
   no account can push to `main` directly or merge with a red check. Changes to the
   ruleset belong to the owner.

@@ -30,7 +30,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>
 
 ## Engineering Judgment
 
-* Hold to the stack, verification and test-layout rules in [AGENTS.md](AGENTS.md).
+* Hold to the stack, capability-truth, verification and test-layout rules in [AGENTS.md](AGENTS.md).
 * Treat protocol schemas and adapter interfaces as public APIs with rigorous backward compatibility.
 * Validate all agent-submitted parameters strictly; return actionable refusal messages instead of silently falling back.
 * Enforce hard ceilings on token spend, retry counts, and execution timeouts.
