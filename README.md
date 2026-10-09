@@ -89,7 +89,7 @@ that store does not hold is refused, not looked for elsewhere.
 * [docs/getting-started.md](docs/getting-started.md) — build the CLI and gate a real action, with real commands and their output.
 * [docs/github-tracker.md](docs/github-tracker.md) — keep a project's records and findings in a GitHub repository's Issues: binding, credentials, repair, conflicts and limits.
 * [docs/mcp.md](docs/mcp.md) — one committed catalog of a project's MCP servers, written into each agent CLI's own file: the catalog, secrets, switches, commands and refusals.
-* [AGENTS.md](AGENTS.md) — Working rules, core stack matrix, and environment conventions for agents and contributors.
+* [AGENTS.md](AGENTS.md) — Working rules, core stack matrix, and file-naming conventions for agents and contributors.
 * [WORKFLOW.md](WORKFLOW.md) — Development workflow, review requirements, and commit conventions.
 * [PERSONA.md](PERSONA.md) — Developer persona and domain expertise (Ferris).
 * [docs/README.md](docs/README.md) — Index of the public documentation directory.
