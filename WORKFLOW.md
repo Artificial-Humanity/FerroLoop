@@ -45,3 +45,5 @@ Follow [AGENTS.md](AGENTS.md) for repository rules and git configuration.
   `gh pr checks` can fail. Read the check's result on the pull request page instead.
 * Use the workflow stated here. Do not reconstruct additional rules from git history;
   changes to the workflow belong to the owner.
+* The design records under `docs/superpowers/` (specs and plans) keep their history and
+  dated decisions; the present-only rule for instruction files does not apply to them.
