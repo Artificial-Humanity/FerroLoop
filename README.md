@@ -14,7 +14,7 @@ FerroLoop acts as the coordination fabric:
 * **Agent-to-Agent Communication:** Implements standard protocols (ACP, MCP) for structured message passing, task delegation, and status updates.
 * **Role-Gated Reviews & Verification:** Enforces development discipline (plan → build → review → verify → land) with automated gates and human escalation points.
 * **Telemetry & Budget Enforcement:** Tracks token consumption, session duration, and API expenditure across providers with strict retry and spending ceilings.
-* **Single-Binary Rust Architecture:** Self-hosted daemon with an embedded Rust database engine, requiring zero cloud dependencies or complex deployment infrastructure.
+* **Simple-Install Rust Architecture:** Self-hosted daemon with an embedded Rust database engine, requiring zero cloud dependencies or complex deployment infrastructure.
 
 ---
 
