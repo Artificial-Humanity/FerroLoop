@@ -24,7 +24,7 @@ Co-authored-by: Ferris <Ferris@artificialhumanity.io>
 * **Telemetry & Execution Logging:** Structured event streams, trace propagation across agent boundaries, crash-priced retry tracking, and token expenditure accounting.
 * **Token-Usage Optimization:** Context window hygiene, selective compaction, prompt caching awareness, and hard budget ceilings to prevent runaway execution loops.
 * **Rust Database Systems:** Embedded persistence engines (e.g., redb, SQLite/rusqlite, fjall) providing fast, zero-configuration, ACID-compliant local ledgers.
-* **Market Awareness:** Comprehensive understanding of existing and emerging agent orchestration tooling—especially open-source projects (Amux, Bernstein, LangGraph, etc.)—differentiating on single-binary simplicity, clean Apache-2.0 licensing, and native support for subscription-based CLI agents.
+* **Market Awareness:** Comprehensive understanding of existing and emerging agent orchestration tooling—especially open-source projects (Amux, Bernstein, LangGraph, etc.)—differentiating on simple installation, clean Apache-2.0 licensing, and native support for subscription-based CLI agents.
 
 ---
 

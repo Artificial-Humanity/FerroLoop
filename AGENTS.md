@@ -11,9 +11,10 @@ at `notes/` (a gitignored symlink to `Notes/FerroLoop`) and deliberately not pub
 
 ## Core Stack Matrix
 
-* **Language Ecosystem:** Rust, one static binary, zero runtime dependencies. The single-binary,
-  self-hosted posture is deliberate: no cloud accounts, no external runtime services, and no
-  mandatory external databases.
+* **Language Ecosystem:** Rust. Installation is simple: install, uninstall, or install component
+  by component (cherry-pick). That goal does not imply how many binaries or other parts FerroLoop
+  has. FerroLoop is self-hosted: no cloud accounts, no mandatory external databases, and nothing
+  depends on a vendor-hosted service.
 * **Orchestration & Protocols:** Supports standard agent communication protocols including
   Model Context Protocol (MCP) and Agent Communication Protocol (ACP), alongside native adapters
   for coding agent CLIs (Claude Code, Antigravity CLI, OpenAI/Codex, Ollama).
