@@ -15,11 +15,13 @@ at `notes/` (a gitignored symlink to `Notes/FerroLoop`) and deliberately not pub
   by component (cherry-pick). That goal does not imply how many binaries or other parts FerroLoop
   has. FerroLoop is self-hosted: no cloud accounts, no mandatory external databases, and nothing
   depends on a vendor-hosted service.
-* **Orchestration & Protocols:** Supports standard agent communication protocols including
-  Model Context Protocol (MCP) and Agent Communication Protocol (ACP), alongside native adapters
-  for coding agent CLIs (Claude Code, Antigravity CLI, OpenAI/Codex, Ollama).
-* **Storage & Telemetry:** Embedded Rust-native database systems for persistent session state,
-  task ledgers, role transition histories, and token/cost telemetry.
+* **Orchestration & Protocols:** One execution adapter exists, for the Claude Code CLI
+  (`fl attempt`). `fl mcp` keeps a project's catalog of MCP servers and writes it into the MCP
+  config files of Claude Code, Codex and Antigravity; `fl mcp` only writes their configuration and
+  starts neither the CLIs nor the MCP servers. Planned, not built: more execution adapters, and agent-to-agent messaging.
+* **Storage & Telemetry:** An embedded redb store holds a project's gates, transitions, gate runs
+  and attempts (each with its outcome and duration), and its records and findings unless the
+  project keeps those in GitHub Issues. Planned, not built: token and cost telemetry (attempts record zero tokens and zero cost today).
 * **Capability truth lives in code, not prose:** Enums, adapter registries, and protocol
   schemas generate capability lists wherever possible. Avoid duplicating hard-coded provider or
   feature lists in documentation that easily rots.
