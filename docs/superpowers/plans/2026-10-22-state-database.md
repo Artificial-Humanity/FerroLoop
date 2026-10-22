@@ -10941,6 +10941,7 @@ fn mcp_stdio_round_trip_and_releases_redb_lock_between_calls() {
 
 Run:
 ```bash
+cargo fmt --all
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
@@ -10950,7 +10951,7 @@ Expected: zero formatting diffs, zero clippy warnings, and all 1,424 workspace u
 - [ ] **Step 5: Commit Task 7**
 
 ```bash
-git add crates/cli/src/cmd/state_mcp.rs crates/cli/src/cmd/mod.rs crates/cli/src/cmd/state.rs crates/cli/tests/state_sync.rs
+git add crates/cli/src/cmd/state_mcp.rs crates/cli/src/cmd/mod.rs crates/cli/src/cmd/state.rs crates/cli/tests/state_sync.rs crates/core/src/state.rs crates/core/src/store.rs crates/core/src/mem.rs
 git commit -m "$(cat <<'EOF'
 feat(cli): add fl state mcp stdio server and end-to-end state sync tests
 
