@@ -412,9 +412,11 @@ Each `StateRevision` holds:
    with `S_local != S_remote`:
    1. `S_remote` becomes the canonical `StateId` for `(scope, concern, slug)`.
    2. `S_local` is converted in `IDS` from `"state"` to `"alias"` and recorded in `ALIASES`
-      (`S_local -> S_remote`), so any local caller or `superseded_by` reference holding
-      `S_local` resolves to `S_remote` (extending `RedbStore` and `MemStore` alias support to
-      allow aliasing an unpublished `Kind::State` or `Kind::Agent` ID during sync).
+      (`S_local -> S_remote`), removing the superseded `state_entries[S_local]` row and updating
+      `state_keys` to `S_remote` in the same transaction so any local caller or `superseded_by`
+      reference holding `S_local` resolves to `S_remote` without leaving duplicate primary rows
+      (extending `RedbStore` and `MemStore` alias support to allow aliasing an unpublished
+      `Kind::State` or `Kind::Agent` ID during sync).
    3. Any local unpublished `StateRevision`s for `S_local` have their `entry_id` updated in
       place to `S_remote` before publication, and their divergence with `S_remote`'s revision
       chain is resolved via rule 2 (`StateConflict`, `Append`, or `LastWriter`).
@@ -484,12 +486,14 @@ configured target repository directory (`repo_dir`):
        `Retired` (never failing sync with `LeadTaken`).
      * If an imported `AgentUpsert` has the same `name_key` as an existing unpublished local
        `AgentRecord` with a different `AgentId`, the first-published (remote) `AgentId` wins as
-       primary and the unpublished local `AgentId` is converted in `IDS` to `"alias"` and
-       aliased in `ALIASES` (`local_id -> remote_id`), matching §3.3 rule 3. *(Invariant)*
+       primary and the unpublished local `AgentId` is converted in `IDS` to `"alias"`,
+       removed from `agents[local_id]`, and aliased in `ALIASES` (`local_id -> remote_id`),
+       matching §3.3 rule 3. *(Invariant)*
 3. **Remote-scoped collection & sensitivity pre-flight (§4.3):** each `StateSyncCursor` is
    keyed by `(repo_dir, remote)`. Collect after `last_published_*_seq` **only** the
-   unpublished `StateRevision`s (and `RegistryEvent`s, when syncing the workspace state store)
-   whose scope resolves to that target `(repo_dir, remote)`. If any collected `StateRevision`
+   unpublished local `StateRevision`s (and `RegistryEvent`s, when syncing the workspace state
+   store) whose scope resolves to that target `(repo_dir, remote)` and that were not just
+   imported from `remote_head` in step 2. If any collected `StateRevision`
    belongs to an entry with `ever_sensitive == true` (or `sensitive == true`), verify that the
    target `(repo_dir, remote)` has `private == true` (§4.3) **before** creating any git blob
    or pushing. If there are no unpublished local revisions or registry events for this
@@ -682,10 +686,11 @@ no network sockets and no external runtime dependencies), exposing eight tools:
    * Custom flat-string serde types (`StateScope` and `AgentRole`) have dedicated
      `as_wire`/`from_wire` and JSON round-trip + invalid-input unit tests.
    * `crates/core/src/conformance.rs` adds `STATE_STORE_CASES` and `AGENT_REGISTRY_CASES`
-     case-count floor constants, updates `ALL_ROLES_CASES` and `LOCAL_HANDLES_CASES` (including
-     `an_id_has_no_handle_under_any_kind_but_its_own` across all 6 `Kind`s), and extends the
-     `--json` reference-field IRI scan floor (`2026-09-23-identity-and-store-roles-design.md`
-     §6.5) to cover `StateId`, `RevisionId`, and `AgentId` fields.
+     case-count floor constants and updates `ALL_ROLES_CASES` and `LOCAL_HANDLES_CASES`
+     (including `an_id_has_no_handle_under_any_kind_but_its_own` across all 6 `Kind`s), while
+     `crates/core/tests/wire_refs.rs` extends the `--json` reference-field IRI scan floor
+     (`2026-09-23-identity-and-store-roles-design.md` §6.5) to cover `StateEntry`,
+     `StateRevision`, `AgentRecord`, and `RegistryEvent`.
 2. **Store conformance (`crates/core/src/conformance.rs`):**
    * Shared conformance tests run against both `MemStore` and `RedbStore` covering:
      * Format 6 upgrade on first `StateStore` or `AgentRegistry` write (and format preservation
