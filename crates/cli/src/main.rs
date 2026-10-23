@@ -59,6 +59,16 @@ enum Command {
     /// A project's MCP servers: one committed catalog, written into each agent CLI's file.
     #[command(subcommand)]
     Mcp(cmd::mcp::Cmd),
+    /// Manage the workspace agent and coverage-area registry.
+    Agent {
+        #[command(subcommand)]
+        cmd: cmd::agent::AgentCmd,
+    },
+    /// Manage durable memories, handoffs, runtime state, and git state sync.
+    State {
+        #[command(subcommand)]
+        cmd: cmd::state::StateCmd,
+    },
 }
 
 impl Command {
@@ -77,7 +87,7 @@ impl Command {
             Command::Manifest(c) => c.iris(),
             Command::Github(c) => c.iris(),
             Command::Routing(c) => c.iris(),
-            Command::Mcp(_) => Vec::new(),
+            Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } => Vec::new(),
         }
     }
 
@@ -108,7 +118,7 @@ impl Command {
             Command::Manifest(c) => c.has_handle(),
             Command::Github(c) => c.has_handle(),
             Command::Routing(c) => c.has_handle(),
-            Command::Mcp(_) => false,
+            Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } => false,
         }
     }
 
@@ -133,7 +143,9 @@ impl Command {
             | Command::Transition(_)
             | Command::Stats(_)
             | Command::Manifest(_)
-            | Command::Mcp(_) => false,
+            | Command::Mcp(_)
+            | Command::Agent { .. }
+            | Command::State { .. } => false,
         }
     }
 }
@@ -252,6 +264,16 @@ fn explicit_db(flag: Option<PathBuf>) -> Option<PathBuf> {
 /// redb I/O error instead of a clear refusal from this function. `--db
 /// path/to/db` and `$FL_DB=path/to/db` behave identically to each other and
 /// to the XDG fallback.
+/// Default XDG state store path (`$XDG_DATA_HOME/fl/fl.redb` or `$HOME/.local/share/fl/fl.redb`).
+fn default_state_store_path() -> Result<PathBuf> {
+    let base = config::data_dir(
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+    .context("neither --db, $FL_DB, a store configured in [state], an absolute $XDG_DATA_HOME nor $HOME is set, so there is nowhere to put the state store")?;
+    Ok(base.join("fl").join("fl.redb"))
+}
+
 fn db_path(explicit: Option<PathBuf>, configured: Option<PathBuf>) -> Result<(PathBuf, bool)> {
     let (path, confined) = if let Some(p) = explicit {
         (p, true)
@@ -615,6 +637,52 @@ fn run(cli: Cli) -> Result<i32> {
             }
             return cmd::mcp::run(c, &cfg.mcp, &cwd);
         }
+        Cli {
+            db,
+            command: Command::Agent { cmd },
+        } => {
+            let explicit = explicit_db(db);
+            let default_store = default_state_store_path()?;
+            let store_path = match explicit {
+                Some(p) => p,
+                None => cfg.workspace_state_store(&default_store),
+            };
+            if let Some(dir) = store_path.parent()
+                && !dir.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(dir)
+                    .with_context(|| format!("could not create {}", dir.display()))?;
+            }
+            let store = RedbStore::open(&store_path)
+                .with_context(|| format!("could not open the store at {}", store_path.display()))?;
+            return match cmd::agent::run(&store, cmd) {
+                Ok(()) => Ok(0),
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+            };
+        }
+        Cli {
+            db,
+            command: Command::State { cmd },
+        } => {
+            let explicit = explicit_db(db);
+            let default_store = default_state_store_path()?;
+            let state_env = cmd::state::StateEnv {
+                explicit_db: explicit.as_deref(),
+                default_store: &default_store,
+                cfg: &cfg,
+                cwd: &cwd,
+            };
+            return match cmd::state::run(&state_env, cmd) {
+                Ok(()) => Ok(0),
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    Ok(1)
+                }
+            };
+        }
         cli => cli,
     };
     let entries = &cfg.projects;
@@ -919,7 +987,9 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
         Command::Routing(c) => cmd::routing::run(&ctx, c, here_for_store.map(|b| b.is_some())),
-        Command::Mcp(_) => unreachable!("`fl mcp` returns before any store is opened"),
+        Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } => {
+            unreachable!("dispatched before opening catalog/tracker store")
+        }
     };
     // What the GitHub ledger's reads noted without refusing — a quarantined
     // line skipped (spec §3.3, §3.6) — once each, whatever became of the

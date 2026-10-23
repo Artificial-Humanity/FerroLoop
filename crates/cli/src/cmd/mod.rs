@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod attempt;
 pub mod check;
 pub mod escalate;
@@ -10,5 +11,6 @@ pub mod mcp;
 pub mod project;
 pub mod record;
 pub mod routing;
+pub mod state;
 pub mod stats;
 pub mod transition;
