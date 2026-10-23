@@ -1023,7 +1023,7 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             }
             Ok(())
         }
-        StateCmd::Mcp => unreachable!("`fl state mcp` is dispatched in Task 7"),
+        StateCmd::Mcp => crate::cmd::state_mcp::run(env),
     }
 }
 

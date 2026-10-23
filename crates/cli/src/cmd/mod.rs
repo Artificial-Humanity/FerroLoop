@@ -12,5 +12,6 @@ pub mod project;
 pub mod record;
 pub mod routing;
 pub mod state;
+pub mod state_mcp;
 pub mod stats;
 pub mod transition;
