@@ -175,4 +175,60 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
     assert_every_reference_refuses_a_handle("GateRun", &gate_run, 3);
     assert_every_reference_refuses_a_handle("Attempt", &attempt, 3);
     assert_every_reference_refuses_a_handle("Decision", &decision, 6);
+
+    let state_entry = StateEntry {
+        id: StateId(iri(11)),
+        scope: StateScope::Project("ferroloop".into()),
+        concern: StateConcern::Memory,
+        slug: "arch".into(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: StatePayload::Memory(MemoryEntry {
+            category: MemoryCategory::Decision,
+            basis: MemoryBasis::Ruling,
+            lifecycle: MemoryLifecycle::Superseded,
+            superseded_by: Some(StateId(iri(13))),
+            pinned: true,
+            summary: "summary".into(),
+            body: "body".into(),
+        }),
+        head_revision: RevisionId(iri(12)),
+        updated_at: At::from_unix_millis(5),
+        by: "ferris".into(),
+    };
+    let state_revision = StateRevision {
+        revision_id: RevisionId(iri(12)),
+        entry_id: StateId(iri(11)),
+        parent_revisions: vec![RevisionId(iri(14))],
+        scope: StateScope::Project("ferroloop".into()),
+        concern: StateConcern::Memory,
+        slug: "arch".into(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: state_entry.payload.clone(),
+        at: At::from_unix_millis(5),
+        by: "ferris".into(),
+    };
+    let agent_record = AgentRecord {
+        id: AgentId(iri(15)),
+        name_key: "ferris".into(),
+        display_name: "Ferris".into(),
+        email: "ferris@artificialhumanity.io".into(),
+        project: "ferroloop".into(),
+        role: AgentRole::Lead,
+        extra_areas: vec![],
+        status: AgentStatus::Active,
+        updated_at: At::from_unix_millis(6),
+        by: "owner".into(),
+    };
+    let registry_event = RegistryEvent {
+        event_id: iri(16),
+        at: At::from_unix_millis(6),
+        by: "owner".into(),
+        kind: RegistryEventKind::AgentUpsert(agent_record.clone()),
+    };
+    assert_every_reference_refuses_a_handle("StateEntry", &state_entry, 3);
+    assert_every_reference_refuses_a_handle("StateRevision", &state_revision, 4);
+    assert_every_reference_refuses_a_handle("AgentRecord", &agent_record, 1);
+    assert_every_reference_refuses_a_handle("RegistryEvent", &registry_event, 2);
 }

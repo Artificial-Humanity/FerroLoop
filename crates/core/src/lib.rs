@@ -2,6 +2,7 @@
 
 mod wire;
 
+pub mod agent;
 pub mod at;
 #[cfg(any(test, feature = "conformance"))]
 #[doc(hidden)]
@@ -22,17 +23,22 @@ pub mod model;
 pub mod routing;
 pub mod split;
 pub mod stale;
+pub mod state;
 pub mod store;
 pub mod tiered;
 pub mod verdict;
 
+pub use agent::{
+    AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
+    RegistryEventKind, reports_to, validate_agent_identity,
+};
 pub use at::{At, AtError};
 pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
 pub use escalate::Prepared;
 pub use escalation::{EscalationFault, Escalations, Mark, Outgoing, Provenance, Tombstone};
 pub use fault::LedgerFault;
 pub use finding::{Finding, FindingError, FindingState};
-pub use ids::{FindingId, GateId, Kind, ProjectId, RecordId};
+pub use ids::{AgentId, FindingId, GateId, Kind, ProjectId, RecordId, RevisionId, StateId};
 pub use iri::{Iri, IriError};
 pub use log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 pub use mem::MemStore;
@@ -46,9 +52,15 @@ pub use split::{
     RemoteLedger, SplitLedger,
 };
 pub use stale::{Staleness, apply_staleness, is_stale};
+pub use state::{
+    HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
+    RuntimeEntry, SensitivityPatch, StateConcern, StateConflict, StateEntry, StateError,
+    StatePayload, StateRevision, StateScope, StateSyncCursor, UpsertStateArgs, validate_slug,
+    validate_summary,
+};
 pub use store::{
-    Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles, StoreError, Tracker,
-    as_clause, follow, ledger_root_shape, node_id_shape,
+    AgentRegistry, Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles,
+    StateStore, StoreError, Tracker, as_clause, follow, ledger_root_shape, node_id_shape,
 };
 pub use tiered::{FindingPlacement, Placement, RecordSeen, TieredTracker};
 pub use verdict::{FailReason, Population, Verdict};

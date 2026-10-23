@@ -10,6 +10,8 @@ pub enum Kind {
     Gate,
     Record,
     Finding,
+    State,
+    Agent,
 }
 
 crate::wire::wire_names!(Kind as kind_wire {
@@ -17,6 +19,8 @@ crate::wire::wire_names!(Kind as kind_wire {
     Gate => "gate",
     Record => "record",
     Finding => "finding",
+    State => "state",
+    Agent => "agent",
 });
 crate::wire::wire_parse!(Kind as kind_parse);
 
@@ -38,6 +42,9 @@ macro_rules! id_type {
             pub fn iri(&self) -> &Iri {
                 &self.0
             }
+            pub fn as_str(&self) -> &str {
+                self.0.as_str()
+            }
         }
 
         impl std::fmt::Display for $name {
@@ -52,3 +59,27 @@ id_type!(ProjectId, Kind::Project);
 id_type!(GateId, Kind::Gate);
 id_type!(RecordId, Kind::Record);
 id_type!(FindingId, Kind::Finding);
+id_type!(StateId, Kind::State);
+id_type!(AgentId, Kind::Agent);
+
+/// An immutable revision identifier (`urn:uuid:` v7) naming one revision in
+/// `state_revisions` and on `fl/state`. Like ledger entry IDs, `RevisionId` is
+/// not registered in `HANDLES`.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RevisionId(pub Iri);
+
+impl RevisionId {
+    pub fn iri(&self) -> &Iri {
+        &self.0
+    }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl std::fmt::Display for RevisionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
