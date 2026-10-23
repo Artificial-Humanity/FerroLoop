@@ -281,6 +281,7 @@ fn db_path(explicit: Option<PathBuf>, configured: Option<PathBuf>) -> Result<(Pa
 fn choose_store(
     bound: &Path,
     entries: &[config::Entry],
+    state_store: Option<&Path>,
     iris: &[Iri],
     confined: bool,
 ) -> Result<PathBuf> {
@@ -289,6 +290,12 @@ fn choose_store(
     }
     if !confined {
         let mut candidates = vec![bound.to_path_buf()];
+        if let Some(ws_store) = state_store {
+            let ws_buf = ws_store.to_path_buf();
+            if !candidates.contains(&ws_buf) {
+                candidates.push(ws_buf);
+            }
+        }
         for e in entries {
             if !candidates.contains(&e.store) {
                 candidates.push(e.store.clone());
@@ -333,11 +340,24 @@ fn bound_is_routed(bound: &Path) -> Result<bool> {
 fn held_elsewhere(
     bound: &Path,
     entries: &[config::Entry],
+    state_store: Option<&Path>,
     iris: &[Iri],
     confined: bool,
 ) -> Result<bool> {
     if confined {
         return Ok(false);
+    }
+    if let Some(ws_store) = state_store
+        && !same_store(ws_store, bound)
+        && ws_store.exists()
+    {
+        let s = RedbStore::open(ws_store)
+            .with_context(|| format!("could not open the store at {}", ws_store.display()))?;
+        for id in iris {
+            if s.owns(id)? {
+                return Ok(true);
+            }
+        }
     }
     for e in entries {
         if same_store(&e.store, bound) || !e.store.exists() {
@@ -657,7 +677,8 @@ fn run(cli: Cli) -> Result<i32> {
     if here_binding.is_some() || bound_routed {
         iris.retain(|i| !fl_github::meta::is_issue_url(i));
     }
-    let path = match choose_store(&bound, entries, &iris, confined) {
+    let state_store = cfg.state.as_ref().and_then(|s| s.store.as_deref());
+    let path = match choose_store(&bound, entries, state_store, &iris, confined) {
         // Routing spec §2.2: an id no local store holds may be an item
         // another machine moved to GitHub, or one on another machine's local
         // tier. The router says which; refusing here would say neither.
@@ -666,7 +687,7 @@ fn run(cli: Cli) -> Result<i32> {
         Err(e)
             if bound_routed
                 && is_not_owned(&e)
-                && !held_elsewhere(&bound, entries, &iris, confined)? =>
+                && !held_elsewhere(&bound, entries, state_store, &iris, confined)? =>
         {
             bound.clone()
         }
@@ -934,6 +955,7 @@ mod tests {
 
     fn entry(root: &str, store: &str, github: Option<&str>) -> config::Entry {
         config::Entry {
+            name: None,
             root: PathBuf::from(root),
             store: PathBuf::from(store),
             tracker: github.map(|g| config::TrackerBinding {
@@ -941,6 +963,7 @@ mod tests {
                 credential: config::Credential::Env,
                 ledger: None,
             }),
+            state: None,
         }
     }
 

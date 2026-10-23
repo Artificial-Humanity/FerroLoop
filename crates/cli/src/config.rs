@@ -8,17 +8,91 @@
 //! project's records in a store nobody chose.
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use fl_core::state::{StateScope, validate_slug};
+use fl_exec::state_sync::StateSyncTarget;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+
+/// Default branch name for git-backed state synchronization.
+pub const DEFAULT_STATE_BRANCH: &str = "fl/state";
+
+/// Workspace-level `[state]` configuration (spec §4.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateConfig {
+    /// Optional workspace state store path; defaults to `$XDG_DATA_HOME/fl/fl.redb`.
+    #[serde(default)]
+    pub store: Option<PathBuf>,
+    /// Default git repository for workspace/group/agent/workflow state sync.
+    #[serde(default)]
+    pub repo: Option<PathBuf>,
+    /// Git remote name (defaults to `"origin"`).
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// Git branch name (defaults to `"fl/state"`).
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Whether the target repository is private and permitted to receive sensitive entries.
+    #[serde(default)]
+    pub private: bool,
+}
+
+/// Per-project `[[project]].state` override (spec §4.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectStateConfig {
+    /// Optional override repository for this project's `fl/state` branch.
+    #[serde(default)]
+    pub repo: Option<PathBuf>,
+    /// Optional override remote name (defaults to `[state].remote` or `"origin"`).
+    #[serde(default)]
+    pub remote: Option<String>,
+    /// Optional override branch name (defaults to `"fl/state"`).
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Whether this project's state target is private.
+    #[serde(default)]
+    pub private: Option<bool>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
+    #[serde(default)]
+    pub name: Option<String>,
     pub root: PathBuf,
     pub store: PathBuf,
     /// `None`: the tracker is the local store.
     #[serde(default)]
     pub tracker: Option<TrackerBinding>,
+    #[serde(default)]
+    pub state: Option<ProjectStateConfig>,
+}
+
+impl Entry {
+    /// Matches `<slug>` by explicit `name` or by lowercase basename of `root` (spec §4.3).
+    pub fn matches_slug(&self, slug: &str) -> bool {
+        if let Some(ref name) = self.name {
+            return name.eq_ignore_ascii_case(slug);
+        }
+        self.root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|base| base.eq_ignore_ascii_case(slug))
+    }
+
+    /// Derive the normalized project `<slug>` from explicit `name` or lowercase basename of `root`.
+    pub fn inferred_slug(&self) -> Option<String> {
+        let raw = match &self.name {
+            Some(n) => n.clone(),
+            None => self
+                .root
+                .file_name()
+                .and_then(|s| s.to_str())?
+                .to_ascii_lowercase(),
+        };
+        validate_slug(&raw).ok()
+    }
 }
 
 /// A project's tracker when it is not the local store (GitHub tracker spec
@@ -104,14 +178,112 @@ pub struct McpEntry {
 
 #[derive(Debug, Default)]
 pub struct Config {
+    pub state: Option<StateConfig>,
     pub projects: Vec<Entry>,
     pub github: Option<GithubApp>,
     pub mcp: Vec<McpEntry>,
 }
 
+impl Config {
+    /// Workspace state store path (`[state].store` or `default_store`).
+    pub fn workspace_state_store(&self, default_store: &Path) -> PathBuf {
+        self.state
+            .as_ref()
+            .and_then(|s| s.store.clone())
+            .unwrap_or_else(|| default_store.to_path_buf())
+    }
+
+    /// Find a `[[project]]` entry matching `slug` by `name` or lowercase basename of `root`.
+    pub fn find_project_entry(&self, slug: &str) -> Option<&Entry> {
+        self.projects.iter().find(|e| e.matches_slug(slug))
+    }
+
+    /// Resolve which `.redb` store holds state for `scope` (spec §4.3):
+    /// - `project:<slug>` -> matching `[[project]].store` if that entry exists,
+    ///   otherwise the workspace state store.
+    /// - All other scopes (`workspace`, `group:*`, `agent:*`, `workflow:*`) -> workspace state store.
+    pub fn state_store_for_scope(&self, scope: &StateScope, default_store: &Path) -> PathBuf {
+        if let StateScope::Project(slug) = scope
+            && let Some(entry) = self.find_project_entry(slug)
+        {
+            return entry.store.clone();
+        }
+        self.workspace_state_store(default_store)
+    }
+
+    /// Resolve the `StateSyncTarget` for `fl state sync` / `fl state verify` (spec §4.3).
+    pub fn sync_target_for_scope(
+        &self,
+        scope: Option<&StateScope>,
+        cwd: &Path,
+        default_store: &Path,
+        by: &str,
+    ) -> StateSyncTarget {
+        let ws = self.state.as_ref();
+        let ws_store = self.workspace_state_store(default_store);
+        if let Some(StateScope::Project(slug)) = scope
+            && let Some(entry) = self.find_project_entry(slug)
+        {
+            let proj_state = entry.state.as_ref();
+            let repo_dir = proj_state
+                .and_then(|s| s.repo.clone())
+                .or_else(|| ws.and_then(|s| s.repo.clone()))
+                .unwrap_or_else(|| entry.root.clone());
+            let remote = proj_state
+                .and_then(|s| s.remote.clone())
+                .or_else(|| ws.and_then(|s| s.remote.clone()))
+                .unwrap_or_else(|| "origin".to_string());
+            let branch = proj_state
+                .and_then(|s| s.branch.clone())
+                .or_else(|| ws.and_then(|s| s.branch.clone()))
+                .unwrap_or_else(|| DEFAULT_STATE_BRANCH.to_string());
+            let private = proj_state
+                .and_then(|s| s.private)
+                .or_else(|| ws.map(|s| s.private))
+                .unwrap_or(false);
+            let sync_registry = entry.store == ws_store;
+            return StateSyncTarget {
+                repo_dir,
+                remote,
+                branch,
+                private,
+                sync_registry,
+                scope_filter: Some(StateScope::Project(slug.clone())),
+                by: by.to_string(),
+            };
+        }
+
+        let repo_dir = ws
+            .and_then(|s| s.repo.clone())
+            .unwrap_or_else(|| cwd.to_path_buf());
+        let remote = ws
+            .and_then(|s| s.remote.clone())
+            .unwrap_or_else(|| "origin".to_string());
+        let branch = ws
+            .and_then(|s| s.branch.clone())
+            .unwrap_or_else(|| DEFAULT_STATE_BRANCH.to_string());
+        let private = ws.map(|s| s.private).unwrap_or(false);
+        let scope_filter = match scope {
+            Some(StateScope::Project(slug)) => Some(StateScope::Project(slug.clone())),
+            _ => None,
+        };
+        StateSyncTarget {
+            repo_dir,
+            remote,
+            branch,
+            private,
+            sync_registry: true,
+            scope_filter,
+            by: by.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
+    #[serde(default)]
+    state: Option<StateConfig>,
     #[serde(default)]
     project: Vec<Entry>,
     #[serde(default)]
@@ -184,9 +356,39 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(e).with_context(|| format!("could not read {}", path.display())),
     };
-    let file: File = toml::from_str(&text)
+    let mut file: File = toml::from_str(&text)
         .with_context(|| format!("{} is not a valid fl config", path.display()))?;
-    for e in &file.project {
+    if let Some(st) = &file.state {
+        if let Some(s) = &st.store
+            && !s.is_absolute()
+        {
+            bail!(
+                "{}: `state.store` must be an absolute path (got `{}`)",
+                path.display(),
+                s.display()
+            );
+        }
+        if let Some(r) = &st.repo
+            && !r.is_absolute()
+        {
+            bail!(
+                "{}: `state.repo` must be an absolute path (got `{}`)",
+                path.display(),
+                r.display()
+            );
+        }
+    }
+    let mut seen_names = std::collections::BTreeSet::new();
+    for e in &mut file.project {
+        if let Some(raw_name) = &e.name {
+            let norm = validate_slug(raw_name).map_err(|err| {
+                anyhow::anyhow!("{}: invalid project `name`: {err}", path.display())
+            })?;
+            if !seen_names.insert(norm.clone()) {
+                bail!("{}: duplicate project name `{norm}`", path.display());
+            }
+            e.name = Some(norm);
+        }
         if !e.root.is_absolute() || !e.store.is_absolute() {
             bail!(
                 "{}: `root` and `store` must be absolute paths (got root `{}`, store `{}`)",
@@ -202,6 +404,16 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
                 "{}: `github = \"{}\"` must name a repository as `owner/repo`",
                 path.display(),
                 t.github
+            );
+        }
+        if let Some(pst) = &e.state
+            && let Some(r) = &pst.repo
+            && !r.is_absolute()
+        {
+            bail!(
+                "{}: `state.repo` in `[[project]]` must be an absolute path (got `{}`)",
+                path.display(),
+                r.display()
             );
         }
     }
@@ -233,6 +445,7 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
         }
     }
     Ok(Config {
+        state: file.state,
         projects: file.project,
         github: file.github,
         mcp: file.mcp,
@@ -434,11 +647,14 @@ mod tests {
         let store = PathBuf::from("/tmp/fl-config-test-same.redb");
         let entries = vec![
             Entry {
+                name: None,
                 root: root.path().to_path_buf(),
                 store: store.clone(),
                 tracker: None,
+                state: None,
             },
             Entry {
+                name: None,
                 root: root.path().to_path_buf(),
                 store,
                 tracker: Some(TrackerBinding {
@@ -446,6 +662,7 @@ mod tests {
                     credential: Credential::Env,
                     ledger: None,
                 }),
+                state: None,
             },
         ];
         let msg = format!("{:#}", bound_entry(&entries, root.path()).unwrap_err());
@@ -458,6 +675,7 @@ mod tests {
     fn identical_entries_are_not_a_conflict() {
         let root = tempfile::tempdir().unwrap();
         let e = Entry {
+            name: None,
             root: root.path().to_path_buf(),
             store: PathBuf::from("/tmp/fl-config-test-same.redb"),
             tracker: Some(TrackerBinding {
@@ -465,6 +683,7 @@ mod tests {
                 credential: Credential::Env,
                 ledger: None,
             }),
+            state: None,
         };
         let got = bound_entry(&[e.clone(), e], root.path()).unwrap().unwrap();
         assert_eq!(got.tracker.unwrap().github, "acme/widgets");
@@ -533,9 +752,11 @@ mod tests {
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
 
         let entries = vec![Entry {
+            name: None,
             root: real.path().to_path_buf(),
             store: store.clone(),
             tracker: None,
+            state: None,
         }];
         let got = bound_entry(&entries, &link).unwrap().map(|e| e.store);
         assert_eq!(got, Some(store));
@@ -546,14 +767,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let entries = vec![
             Entry {
+                name: None,
                 root: root.path().to_path_buf(),
                 store: PathBuf::from("/tmp/fl-config-test-one.redb"),
                 tracker: None,
+                state: None,
             },
             Entry {
+                name: None,
                 root: root.path().to_path_buf(),
                 store: PathBuf::from("/tmp/fl-config-test-two.redb"),
                 tracker: None,
+                state: None,
             },
         ];
         let err = bound_entry(&entries, root.path()).unwrap_err();
@@ -658,14 +883,18 @@ mod tests {
         };
         let entries = vec![
             Entry {
+                name: None,
                 root: root.path().to_path_buf(),
                 store: PathBuf::from("/tmp/fl-config-test-same.redb"),
                 tracker: Some(binding(None)),
+                state: None,
             },
             Entry {
+                name: None,
                 root: root.path().to_path_buf(),
                 store: PathBuf::from("/tmp/fl-config-test-same.redb"),
                 tracker: Some(binding(Some(LedgerChoice::Github))),
+                state: None,
             },
         ];
         let msg = format!("{:#}", bound_entry(&entries, root.path()).unwrap_err());
@@ -874,6 +1103,75 @@ mod tests {
         assert_eq!(
             state_dir(Some(PathBuf::from("/abs/state")), None),
             Some(PathBuf::from("/abs/state"))
+        );
+    }
+
+    #[test]
+    fn parses_workspace_and_project_state_config_and_routes_scopes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws_store = dir.path().join("ws-state.redb");
+        let ws_repo = dir.path().join("notes");
+        let proj_root = dir.path().join("FerroLoop");
+        let proj_store = dir.path().join("ferroloop.redb");
+        let proj_state_repo = dir.path().join("private-state");
+        let cfg = load_text(&format!(
+            "[state]\nstore = \"{ws}\"\nrepo = \"{wr}\"\nremote = \"origin\"\nprivate = true\n\n\
+             [[project]]\nname = \"ferroloop\"\nroot = \"{pr}\"\nstore = \"{ps}\"\n\
+             state = {{ repo = \"{psr}\", remote = \"upstream\", private = false }}\n",
+            ws = ws_store.display(),
+            wr = ws_repo.display(),
+            pr = proj_root.display(),
+            ps = proj_store.display(),
+            psr = proj_state_repo.display(),
+        ))
+        .unwrap();
+        let default_store = dir.path().join("default.redb");
+
+        assert_eq!(cfg.workspace_state_store(&default_store), ws_store);
+        assert_eq!(
+            cfg.state_store_for_scope(&StateScope::Workspace, &default_store),
+            ws_store
+        );
+        assert_eq!(
+            cfg.state_store_for_scope(&StateScope::Project("ferroloop".into()), &default_store),
+            proj_store
+        );
+        assert_eq!(
+            cfg.state_store_for_scope(&StateScope::Project("other".into()), &default_store),
+            ws_store
+        );
+
+        let proj_target = cfg.sync_target_for_scope(
+            Some(&StateScope::Project("ferroloop".into())),
+            dir.path(),
+            &default_store,
+            "ferris",
+        );
+        assert_eq!(proj_target.repo_dir, proj_state_repo);
+        assert_eq!(proj_target.remote, "upstream");
+        assert!(!proj_target.private);
+
+        let ferro_entry = cfg.find_project_entry("ferroloop").unwrap();
+        assert!(ferro_entry.matches_slug("FerroLoop"));
+        assert_eq!(ferro_entry.inferred_slug(), Some("ferroloop".into()));
+
+        let fallback_entry = Entry {
+            name: None,
+            root: PathBuf::from("/path/to/My-Project"),
+            store: PathBuf::from("/tmp/my-project.redb"),
+            tracker: None,
+            state: None,
+        };
+        assert!(fallback_entry.matches_slug("my-project"));
+        assert_eq!(fallback_entry.inferred_slug(), Some("my-project".into()));
+    }
+
+    #[test]
+    fn rejects_relative_state_store_or_repo_path() {
+        let err = load_text("[state]\nstore = \"relative/state.redb\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("must be an absolute path"),
+            "got: {err:#}"
         );
     }
 }
