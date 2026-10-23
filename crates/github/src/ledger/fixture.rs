@@ -122,6 +122,8 @@ impl SplitFixture for OverFake {
                 tracker: &checked,
                 ledger: &split,
                 handles: &routed,
+                state: &local,
+                agents: &local,
             },
             &Controls {
                 fake: &fake,

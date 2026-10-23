@@ -1885,6 +1885,8 @@ mod tests {
                 tracker: &tracker,
                 ledger: &self.local,
                 handles: &self.local,
+                state: &self.local,
+                agents: &self.local,
             });
         }
     }

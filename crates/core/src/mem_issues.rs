@@ -495,6 +495,8 @@ mod tests {
                 tracker: &self.issues,
                 ledger: &self.catalog,
                 handles: &self.catalog,
+                state: &self.catalog,
+                agents: &self.catalog,
             });
         }
     }

@@ -5237,6 +5237,8 @@ mod tests {
                     tracker: &checked,
                     ledger: &self.catalog,
                     handles: &handles,
+                    state: &self.catalog,
+                    agents: &self.catalog,
                 });
             }
         }

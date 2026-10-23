@@ -1,12 +1,25 @@
+use crate::agent::{
+    AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
+    RegistryEventKind, validate_agent_identity,
+};
+use crate::at::At;
 use crate::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
 use crate::finding::{Finding, FindingState};
-use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
+use crate::ids::{
+    AgentId, FindingId, GateId, Kind, ProjectId, RecordId, RevisionId, StateId, seq_iri,
+};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
 use crate::routing::{ForeignRecord, Routes, RoutingMap, check_foreign_for_local};
 use crate::split::{CachedSegment, LedgerCache, Outbox, Pending};
-use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
+use crate::state::{
+    MemoryLifecycle, MergeMode, SensitivityPatch, StateConcern, StateConflict, StateEntry,
+    StatePayload, StateRevision, StateScope, StateSyncCursor, UpsertStateArgs,
+    compute_append_merge, compute_last_writer_merge, is_ancestor_in_dag,
+    lowest_common_ancestor_in_dag, sorted_parents, validate_slug,
+};
+use crate::store::{AgentRegistry, Catalog, Handles, Ledger, StateStore, StoreError, Tracker};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,6 +77,21 @@ struct Inner {
     /// primary → the tombstone of an escalated item. The item's row, handle
     /// and aliases stay: its id and handle still resolve here (§2.3).
     tombstones: BTreeMap<Iri, Tombstone>,
+
+    areas: BTreeMap<String, AreaRecord>,
+    agents: BTreeMap<AgentId, AgentRecord>,
+    agent_by_name: BTreeMap<String, AgentId>,
+    registry_events: BTreeMap<u64, RegistryEvent>,
+    registry_event_ids: BTreeMap<Iri, u64>,
+    next_registry_seq: u64,
+
+    state_entries: BTreeMap<StateId, StateEntry>,
+    state_by_key: BTreeMap<(String, String, String), StateId>,
+    state_revisions: BTreeMap<u64, StateRevision>,
+    state_revision_ids: BTreeMap<RevisionId, u64>,
+    next_state_rev_seq: u64,
+    state_conflicts: BTreeMap<StateId, StateConflict>,
+    sync_cursors: BTreeMap<String, StateSyncCursor>,
 }
 
 impl Inner {
@@ -76,6 +104,309 @@ impl Inner {
         self.handles.insert((kind, *n), id.clone());
         self.handle_of.insert(id.clone(), *n);
         id
+    }
+
+    fn mint_unindexed(&mut self) -> Iri {
+        self.next_id += 1;
+        seq_iri(self.next_id)
+    }
+
+    /// Register an imported entity IRI in `owned`, `handles`, and `handle_of` if not already known.
+    fn index_imported(&mut self, kind: Kind, id: &Iri) -> Result<(), StoreError> {
+        let canonical = self.resolve(id);
+        if let Some(&existing) = self.owned.get(&canonical) {
+            if existing == kind {
+                return Ok(());
+            }
+            return Err(StoreError::WrongKind {
+                id: canonical,
+                expected: kind,
+                found: existing,
+            });
+        }
+        self.owned.insert(canonical.clone(), kind);
+        let n = self.next_handle.entry(kind).or_insert(0);
+        *n += 1;
+        self.handles.insert((kind, *n), canonical.clone());
+        self.handle_of.insert(canonical, *n);
+        Ok(())
+    }
+
+    /// Re-point an unpublished local `old_id` to `new_id` of the same `kind`,
+    /// preserving any existing numeric handle on `old_id` (spec §3.2, §4.3).
+    fn alias_unpublished_id(
+        &mut self,
+        kind: Kind,
+        old_id: &Iri,
+        new_id: &Iri,
+    ) -> Result<(), StoreError> {
+        if old_id == new_id {
+            return Ok(());
+        }
+        if let Some(&existing) = self.owned.get(old_id)
+            && existing != kind
+        {
+            return Err(StoreError::WrongKind {
+                id: old_id.clone(),
+                expected: kind,
+                found: existing,
+            });
+        }
+        self.owned.remove(old_id);
+        self.aliases.insert(old_id.clone(), new_id.clone());
+        for target in self.aliases.values_mut() {
+            if target == old_id {
+                *target = new_id.clone();
+            }
+        }
+        self.owned.insert(new_id.clone(), kind);
+        if let Some(h) = self.handle_of.remove(old_id) {
+            self.handles.insert((kind, h), new_id.clone());
+            self.handle_of.insert(new_id.clone(), h);
+        } else if !self.handle_of.contains_key(new_id) {
+            let n = self.next_handle.entry(kind).or_insert(0);
+            *n += 1;
+            self.handles.insert((kind, *n), new_id.clone());
+            self.handle_of.insert(new_id.clone(), *n);
+        }
+        Ok(())
+    }
+
+    fn append_registry_event(&mut self, ev: RegistryEvent) {
+        self.next_registry_seq += 1;
+        let seq = self.next_registry_seq;
+        self.registry_event_ids.insert(ev.event_id.clone(), seq);
+        self.registry_events.insert(seq, ev);
+    }
+
+    fn append_state_revision(&mut self, rev: StateRevision) {
+        self.next_state_rev_seq += 1;
+        let seq = self.next_state_rev_seq;
+        self.state_revision_ids.insert(rev.revision_id.clone(), seq);
+        self.state_revisions.insert(seq, rev);
+    }
+
+    fn revisions_for_entry(&self, entry_id: &StateId) -> BTreeMap<RevisionId, StateRevision> {
+        self.state_revisions
+            .values()
+            .filter(|r| &r.entry_id == entry_id)
+            .map(|r| (r.revision_id.clone(), r.clone()))
+            .collect()
+    }
+
+    fn apply_imported_state_revision(
+        &mut self,
+        rev: StateRevision,
+        merge_at: At,
+    ) -> Result<(), StoreError> {
+        rev.payload
+            .validate(&rev.entry_id)
+            .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        for parent in &rev.parent_revisions {
+            if !self.state_revision_ids.contains_key(parent) {
+                return Err(StoreError::InvalidState(format!(
+                    "revision `{}` references unknown parent `{}`",
+                    rev.revision_id, parent
+                )));
+            }
+        }
+        if let StatePayload::Memory(m) = &rev.payload
+            && let Some(target_id) = &m.superseded_by
+        {
+            let resolved_target = StateId(self.resolve(target_id.iri()));
+            match self.state_entries.get(&resolved_target) {
+                Some(target) if target.concern == StateConcern::Memory => {}
+                _ => {
+                    return Err(StoreError::InvalidState(format!(
+                        "superseded_by target `{target_id}` does not exist as a Memory entry"
+                    )));
+                }
+            }
+        }
+
+        let key = (
+            rev.scope.as_wire(),
+            rev.concern.as_wire().to_string(),
+            rev.slug.clone(),
+        );
+
+        // Check offline same-key collision (`S_local != S_remote`).
+        if let Some(existing_id) = self.state_by_key.get(&key).cloned()
+            && existing_id != rev.entry_id
+        {
+            self.alias_unpublished_id(Kind::State, existing_id.iri(), rev.entry_id.iri())?;
+            if let Some(mut local_entry) = self.state_entries.remove(&existing_id) {
+                local_entry.id = rev.entry_id.clone();
+                self.state_entries.insert(rev.entry_id.clone(), local_entry);
+            }
+            if let Some(mut conflict) = self.state_conflicts.remove(&existing_id) {
+                conflict.entry_id = rev.entry_id.clone();
+                self.state_conflicts.insert(rev.entry_id.clone(), conflict);
+            }
+            for stored_rev in self.state_revisions.values_mut() {
+                if stored_rev.entry_id == existing_id {
+                    stored_rev.entry_id = rev.entry_id.clone();
+                }
+            }
+            self.state_by_key.insert(key.clone(), rev.entry_id.clone());
+        }
+
+        let resolved_entry_id = StateId(self.resolve(rev.entry_id.iri()));
+        let mut rev = rev;
+        rev.entry_id = resolved_entry_id.clone();
+        self.index_imported(Kind::State, rev.entry_id.iri())?;
+
+        // Check immutability if entry already exists.
+        if let Some(existing) = self.state_entries.get(&resolved_entry_id)
+            && (existing.scope != rev.scope
+                || existing.concern != rev.concern
+                || existing.slug != rev.slug)
+        {
+            return Err(StoreError::Tampered {
+                id: resolved_entry_id.0,
+                detail: "revision changed immutable (scope, concern, slug) of existing state entry"
+                    .into(),
+            });
+        }
+
+        self.append_state_revision(rev.clone());
+
+        let Some(existing) = self.state_entries.get(&resolved_entry_id).cloned() else {
+            let entry = StateEntry {
+                id: resolved_entry_id.clone(),
+                scope: rev.scope,
+                concern: rev.concern,
+                slug: rev.slug,
+                sensitive: rev.sensitive,
+                ever_sensitive: rev.ever_sensitive || rev.sensitive,
+                payload: rev.payload,
+                head_revision: rev.revision_id,
+                updated_at: rev.at,
+                by: rev.by,
+            };
+            self.state_by_key.insert(key, resolved_entry_id.clone());
+            self.state_entries.insert(resolved_entry_id, entry);
+            return Ok(());
+        };
+
+        let dag = self.revisions_for_entry(&resolved_entry_id);
+        let r_local = existing.head_revision.clone();
+        let r_remote = rev.revision_id.clone();
+
+        // Case 1: Remote is descendant of local -> fast-forward.
+        if is_ancestor_in_dag(&r_local, &r_remote, &dag) {
+            let updated = StateEntry {
+                id: resolved_entry_id.clone(),
+                scope: existing.scope,
+                concern: existing.concern,
+                slug: existing.slug,
+                sensitive: rev.sensitive,
+                ever_sensitive: existing.ever_sensitive || rev.ever_sensitive || rev.sensitive,
+                payload: rev.payload,
+                head_revision: r_remote.clone(),
+                updated_at: rev.at,
+                by: rev.by,
+            };
+            self.state_entries
+                .insert(resolved_entry_id.clone(), updated);
+            if let Some(c) = self.state_conflicts.get(&resolved_entry_id)
+                && is_ancestor_in_dag(&c.local_head, &r_remote, &dag)
+                && is_ancestor_in_dag(&c.remote_head, &r_remote, &dag)
+            {
+                self.state_conflicts.remove(&resolved_entry_id);
+            }
+            return Ok(());
+        }
+
+        // Case 2: Local is already descendant of remote -> no-op.
+        if is_ancestor_in_dag(&r_remote, &r_local, &dag) {
+            return Ok(());
+        }
+
+        // Case 3: True divergence between r_local and r_remote.
+        let local_rev = dag.get(&r_local).cloned().ok_or_else(|| {
+            StoreError::InvalidState(format!("missing local head revision `{r_local}`"))
+        })?;
+        let base_rev = lowest_common_ancestor_in_dag(&r_local, &r_remote, &dag)
+            .and_then(|id| dag.get(&id).cloned());
+
+        let auto_merged: Option<StatePayload> = match (&local_rev.payload, &rev.payload) {
+            (StatePayload::Runtime(l_rt), StatePayload::Runtime(r_rt))
+                if l_rt.merge_mode == r_rt.merge_mode =>
+            {
+                match l_rt.merge_mode {
+                    MergeMode::Conflict => None,
+                    MergeMode::Append => {
+                        let base_arr = match base_rev.as_ref().map(|b| &b.payload) {
+                            Some(StatePayload::Runtime(b_rt)) => b_rt.value.as_array().cloned(),
+                            _ => Some(Vec::new()),
+                        };
+                        match (base_arr, l_rt.value.as_array(), r_rt.value.as_array()) {
+                            (Some(b), Some(l), Some(r)) => {
+                                Some(StatePayload::Runtime(crate::state::RuntimeEntry {
+                                    value: serde_json::Value::Array(compute_append_merge(b, l, r)),
+                                    merge_mode: MergeMode::Append,
+                                }))
+                            }
+                            _ => None,
+                        }
+                    }
+                    MergeMode::LastWriter => {
+                        let win_payload =
+                            compute_last_writer_merge(&local_rev, &rev).payload.clone();
+                        Some(win_payload)
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(merged_payload) = auto_merged {
+            let merge_rev_id = RevisionId(self.mint_unindexed());
+            let sensitive = local_rev.sensitive || rev.sensitive;
+            let ever_sensitive = existing.ever_sensitive
+                || local_rev.ever_sensitive
+                || rev.ever_sensitive
+                || sensitive;
+            let merge_rev = StateRevision {
+                revision_id: merge_rev_id.clone(),
+                entry_id: resolved_entry_id.clone(),
+                parent_revisions: sorted_parents(r_local, r_remote),
+                scope: existing.scope.clone(),
+                concern: existing.concern,
+                slug: existing.slug.clone(),
+                sensitive,
+                ever_sensitive,
+                payload: merged_payload.clone(),
+                at: merge_at.clone(),
+                by: "fl".to_string(),
+            };
+            self.append_state_revision(merge_rev);
+            let updated = StateEntry {
+                id: resolved_entry_id.clone(),
+                scope: existing.scope,
+                concern: existing.concern,
+                slug: existing.slug,
+                sensitive,
+                ever_sensitive,
+                payload: merged_payload,
+                head_revision: merge_rev_id,
+                updated_at: merge_at,
+                by: "fl".to_string(),
+            };
+            self.state_entries.insert(resolved_entry_id, updated);
+        } else {
+            self.state_conflicts.insert(
+                resolved_entry_id.clone(),
+                StateConflict {
+                    entry_id: resolved_entry_id,
+                    local_head: r_local,
+                    remote_head: r_remote,
+                    detected_at: merge_at,
+                },
+            );
+        }
+        Ok(())
     }
 
     /// ⚠ Every method that takes an id asks this first — list methods too.
@@ -733,6 +1064,603 @@ impl crate::store::Bindings for MemStore {
     }
 }
 
+impl AgentRegistry for MemStore {
+    fn upsert_area(&self, area: AreaRecord) -> Result<AreaRecord, StoreError> {
+        let normalized = area
+            .normalized()
+            .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let mut s = self.inner.borrow_mut();
+        let ev = RegistryEvent {
+            event_id: s.mint_unindexed(),
+            at: normalized.updated_at.clone(),
+            by: normalized.by.clone(),
+            kind: RegistryEventKind::AreaUpsert(normalized.clone()),
+        };
+        s.areas
+            .insert(normalized.area_key.clone(), normalized.clone());
+        s.append_registry_event(ev);
+        Ok(normalized)
+    }
+
+    fn get_area(&self, area_key: &str) -> Result<Option<AreaRecord>, StoreError> {
+        let key = validate_slug(area_key).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let s = self.inner.borrow();
+        Ok(s.areas.get(&key).cloned())
+    }
+
+    fn list_areas(&self) -> Result<Vec<AreaRecord>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.areas.values().cloned().collect())
+    }
+
+    fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError> {
+        let (name_key, display_name, email) =
+            validate_agent_identity(&args.display_name, args.email.as_deref())
+                .map_err(StoreError::InvalidState)?;
+        let project =
+            validate_slug(&args.project).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let mut extra_areas = Vec::with_capacity(args.extra_areas.len());
+        for a in &args.extra_areas {
+            extra_areas
+                .push(validate_slug(a).map_err(|e| StoreError::InvalidState(e.to_string()))?);
+        }
+        extra_areas.sort();
+        extra_areas.dedup();
+
+        let mut s = self.inner.borrow_mut();
+
+        // Area validation / creation.
+        for area_key in std::iter::once(&project).chain(extra_areas.iter()) {
+            if !s.areas.contains_key(area_key) {
+                if args.create_area {
+                    let area = AreaRecord {
+                        area_key: area_key.clone(),
+                        name: area_key.clone(),
+                        path: None,
+                        purpose: format!("Registered area {area_key}"),
+                        updated_at: args.at.clone(),
+                        by: args.by.clone(),
+                    };
+                    let ev = RegistryEvent {
+                        event_id: s.mint_unindexed(),
+                        at: args.at.clone(),
+                        by: args.by.clone(),
+                        kind: RegistryEventKind::AreaUpsert(area.clone()),
+                    };
+                    s.areas.insert(area_key.clone(), area);
+                    s.append_registry_event(ev);
+                } else {
+                    return Err(StoreError::NoSuchArea(area_key.clone()));
+                }
+            }
+        }
+
+        // Check name collision (active or retired).
+        let existing_by_name = s
+            .agent_by_name
+            .get(&name_key)
+            .cloned()
+            .and_then(|id| s.agents.get(&id).cloned());
+        if let Some(ref existing) = existing_by_name
+            && !args.replace
+        {
+            return Err(StoreError::AgentCollision {
+                name_key,
+                existing_id: existing.id.clone(),
+                status: existing.status,
+            });
+        }
+
+        // Check one-lead-per-project invariant.
+        if args.role == AgentRole::Lead {
+            let conflicting_lead = s
+                .agents
+                .values()
+                .find(|a| {
+                    a.status == AgentStatus::Active
+                        && a.project == project
+                        && a.role == AgentRole::Lead
+                        && a.name_key != name_key
+                })
+                .cloned();
+            if let Some(lead) = conflicting_lead {
+                if !args.replace {
+                    return Err(StoreError::LeadTaken {
+                        project,
+                        lead_name: lead.display_name,
+                        lead_id: lead.id,
+                    });
+                }
+                let mut retired = lead.clone();
+                retired.status = AgentStatus::Retired;
+                retired.updated_at = args.at.clone();
+                retired.by = args.by.clone();
+                s.agents.insert(retired.id.clone(), retired.clone());
+                let retire_ev = RegistryEvent {
+                    event_id: s.mint_unindexed(),
+                    at: args.at.clone(),
+                    by: args.by.clone(),
+                    kind: RegistryEventKind::AgentRetire { id: retired.id },
+                };
+                s.append_registry_event(retire_ev);
+            }
+        }
+
+        let agent_id = match existing_by_name {
+            Some(existing) => existing.id,
+            None => AgentId(s.mint(Kind::Agent)),
+        };
+
+        let record = AgentRecord {
+            id: agent_id.clone(),
+            name_key: name_key.clone(),
+            display_name,
+            email,
+            project,
+            role: args.role,
+            extra_areas,
+            status: AgentStatus::Active,
+            updated_at: args.at.clone(),
+            by: args.by.clone(),
+        };
+        s.agent_by_name.insert(name_key, agent_id.clone());
+        s.agents.insert(agent_id, record.clone());
+        let ev = RegistryEvent {
+            event_id: s.mint_unindexed(),
+            at: args.at,
+            by: args.by,
+            kind: RegistryEventKind::AgentUpsert(record.clone()),
+        };
+        s.append_registry_event(ev);
+        Ok(record)
+    }
+
+    fn retire_agent(&self, id: &AgentId, at: At, by: &str) -> Result<AgentRecord, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(id.iri(), Kind::Agent)?;
+        let resolved = AgentId(s.resolve(id.iri()));
+        let Some(mut rec) = s.agents.get(&resolved).cloned() else {
+            return Err(StoreError::NoSuchAgent(resolved.to_string()));
+        };
+        rec.status = AgentStatus::Retired;
+        rec.updated_at = at.clone();
+        rec.by = by.trim().to_string();
+        s.agents.insert(resolved.clone(), rec.clone());
+        let ev = RegistryEvent {
+            event_id: s.mint_unindexed(),
+            at,
+            by: rec.by.clone(),
+            kind: RegistryEventKind::AgentRetire { id: resolved },
+        };
+        s.append_registry_event(ev);
+        Ok(rec)
+    }
+
+    fn get_agent(&self, id: &AgentId) -> Result<Option<AgentRecord>, StoreError> {
+        let s = self.inner.borrow();
+        s.check(id.iri())?;
+        let resolved = AgentId(s.resolve(id.iri()));
+        Ok(s.agents.get(&resolved).cloned())
+    }
+
+    fn agent_by_name(&self, name: &str) -> Result<Option<AgentRecord>, StoreError> {
+        let key = validate_slug(name).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let s = self.inner.borrow();
+        let Some(id) = s.agent_by_name.get(&key).cloned() else {
+            return Ok(None);
+        };
+        let resolved = AgentId(s.resolve(id.iri()));
+        Ok(s.agents.get(&resolved).cloned())
+    }
+
+    fn list_agents(
+        &self,
+        project: Option<&str>,
+        include_retired: bool,
+    ) -> Result<Vec<AgentRecord>, StoreError> {
+        let project_filter = match project {
+            Some(p) => Some(validate_slug(p).map_err(|e| StoreError::InvalidState(e.to_string()))?),
+            None => None,
+        };
+        let s = self.inner.borrow();
+        let mut out: Vec<AgentRecord> = s
+            .agents
+            .values()
+            .filter(|a| include_retired || a.status == AgentStatus::Active)
+            .filter(|a| {
+                project_filter
+                    .as_ref()
+                    .is_none_or(|p| &a.project == p || a.extra_areas.contains(p))
+            })
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.name_key.cmp(&b.name_key));
+        Ok(out)
+    }
+
+    fn registry_events_after(&self, seq: u64) -> Result<Vec<(u64, RegistryEvent)>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.registry_events
+            .range((seq + 1)..)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect())
+    }
+
+    fn import_registry_events(&self, events: &[RegistryEvent]) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        for ev in events {
+            if let Some(&seq) = s.registry_event_ids.get(&ev.event_id) {
+                let existing = s.registry_events.get(&seq).unwrap();
+                if existing != ev {
+                    return Err(StoreError::Tampered {
+                        id: ev.event_id.clone(),
+                        detail: "registry event payload differs from stored copy".into(),
+                    });
+                }
+                continue;
+            }
+            match &ev.kind {
+                RegistryEventKind::AreaUpsert(area) => {
+                    let norm = area
+                        .normalized()
+                        .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+                    s.areas.insert(norm.area_key.clone(), norm);
+                }
+                RegistryEventKind::AgentUpsert(rec) => {
+                    if let Some(existing_id) = s.agent_by_name.get(&rec.name_key).cloned()
+                        && existing_id != rec.id
+                    {
+                        s.alias_unpublished_id(Kind::Agent, existing_id.iri(), rec.id.iri())?;
+                        s.agents.remove(&existing_id);
+                    }
+                    if rec.role == AgentRole::Lead && rec.status == AgentStatus::Active {
+                        for other in s.agents.values_mut() {
+                            if other.project == rec.project
+                                && other.role == AgentRole::Lead
+                                && other.status == AgentStatus::Active
+                                && other.id != rec.id
+                            {
+                                other.status = AgentStatus::Retired;
+                            }
+                        }
+                    }
+                    s.index_imported(Kind::Agent, rec.id.iri())?;
+                    s.agent_by_name.insert(rec.name_key.clone(), rec.id.clone());
+                    s.agents.insert(rec.id.clone(), rec.clone());
+                }
+                RegistryEventKind::AgentRetire { id } => {
+                    let resolved = AgentId(s.resolve(id.iri()));
+                    if let Some(mut rec) = s.agents.get(&resolved).cloned() {
+                        rec.status = AgentStatus::Retired;
+                        rec.updated_at = ev.at.clone();
+                        rec.by = ev.by.clone();
+                        s.agents.insert(resolved, rec);
+                    }
+                }
+            }
+            s.append_registry_event(ev.clone());
+        }
+        Ok(())
+    }
+}
+
+impl StateStore for MemStore {
+    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError> {
+        let slug =
+            validate_slug(&args.slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let concern = args.payload.concern();
+        let key = (
+            args.scope.as_wire(),
+            concern.as_wire().to_string(),
+            slug.clone(),
+        );
+
+        let mut s = self.inner.borrow_mut();
+        let existing = s
+            .state_by_key
+            .get(&key)
+            .cloned()
+            .and_then(|id| s.state_entries.get(&id).cloned());
+
+        if let Some(ref ex) = existing
+            && let Some(conflict) = s.state_conflicts.get(&ex.id)
+        {
+            return Err(StoreError::StateConflict {
+                entry_id: ex.id.clone(),
+                local_head: conflict.local_head.clone(),
+                remote_head: conflict.remote_head.clone(),
+            });
+        }
+
+        let entry_id = match existing {
+            Some(ref ex) => ex.id.clone(),
+            None => StateId(s.mint(Kind::State)),
+        };
+
+        args.payload
+            .validate(&entry_id)
+            .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+
+        if let StatePayload::Memory(ref m) = args.payload
+            && let Some(ref target_id) = m.superseded_by
+        {
+            let resolved_target = StateId(s.resolve(target_id.iri()));
+            match s.state_entries.get(&resolved_target) {
+                Some(target) if target.concern == StateConcern::Memory => {}
+                _ => {
+                    return Err(StoreError::InvalidState(format!(
+                        "superseded_by target `{target_id}` does not exist as a Memory entry"
+                    )));
+                }
+            }
+        }
+
+        let (sensitive, ever_sensitive, parent_revisions) = match existing {
+            Some(ref ex) => {
+                let sens = match args.sensitivity {
+                    SensitivityPatch::Inherit => ex.sensitive,
+                    SensitivityPatch::SetSensitive => true,
+                    SensitivityPatch::ClearSensitive => false,
+                };
+                let ever = ex.ever_sensitive || sens;
+                (sens, ever, vec![ex.head_revision.clone()])
+            }
+            None => {
+                let sens = matches!(args.sensitivity, SensitivityPatch::SetSensitive);
+                (sens, sens, Vec::new())
+            }
+        };
+
+        let rev_id = RevisionId(s.mint_unindexed());
+        let rev = StateRevision {
+            revision_id: rev_id.clone(),
+            entry_id: entry_id.clone(),
+            parent_revisions,
+            scope: args.scope.clone(),
+            concern,
+            slug: slug.clone(),
+            sensitive,
+            ever_sensitive,
+            payload: args.payload.clone(),
+            at: args.at.clone(),
+            by: args.by.trim().to_string(),
+        };
+        let entry = StateEntry {
+            id: entry_id.clone(),
+            scope: args.scope,
+            concern,
+            slug,
+            sensitive,
+            ever_sensitive,
+            payload: args.payload,
+            head_revision: rev_id,
+            updated_at: args.at,
+            by: args.by.trim().to_string(),
+        };
+        s.append_state_revision(rev);
+        s.state_by_key.insert(key, entry_id.clone());
+        s.state_entries.insert(entry_id, entry.clone());
+        Ok(entry)
+    }
+
+    fn retire_memory(
+        &self,
+        scope: &StateScope,
+        slug: &str,
+        lifecycle: MemoryLifecycle,
+        superseded_by: Option<StateId>,
+        at: At,
+        by: &str,
+    ) -> Result<StateEntry, StoreError> {
+        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        if matches!(lifecycle, MemoryLifecycle::Active) {
+            return Err(StoreError::InvalidState(
+                "retire_memory requires `retired` or `superseded` lifecycle".into(),
+            ));
+        }
+        let current = self
+            .get_state_by_key(scope, StateConcern::Memory, &slug)?
+            .ok_or_else(|| StoreError::NoSuchState(format!("{}:memory:{slug}", scope.as_wire())))?;
+        let StatePayload::Memory(mut mem) = current.payload else {
+            return Err(StoreError::InvalidState(format!(
+                "state entry `{}` is not a Memory entry",
+                current.id
+            )));
+        };
+        mem.lifecycle = lifecycle;
+        mem.superseded_by = superseded_by;
+        self.upsert_state(UpsertStateArgs {
+            scope: scope.clone(),
+            slug,
+            sensitivity: SensitivityPatch::Inherit,
+            payload: StatePayload::Memory(mem),
+            at,
+            by: by.to_string(),
+        })
+    }
+
+    fn get_state(&self, id: &StateId) -> Result<Option<StateEntry>, StoreError> {
+        let s = self.inner.borrow();
+        s.check(id.iri())?;
+        let resolved = StateId(s.resolve(id.iri()));
+        Ok(s.state_entries.get(&resolved).cloned())
+    }
+
+    fn get_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<Option<StateEntry>, StoreError> {
+        let slug = validate_slug(slug).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let key = (scope.as_wire(), concern.as_wire().to_string(), slug);
+        let s = self.inner.borrow();
+        let Some(id) = s.state_by_key.get(&key).cloned() else {
+            return Ok(None);
+        };
+        let resolved = StateId(s.resolve(id.iri()));
+        Ok(s.state_entries.get(&resolved).cloned())
+    }
+
+    fn list_state(
+        &self,
+        scope: Option<&StateScope>,
+        concern: Option<StateConcern>,
+    ) -> Result<Vec<StateEntry>, StoreError> {
+        let s = self.inner.borrow();
+        let mut out: Vec<StateEntry> = s
+            .state_entries
+            .values()
+            .filter(|e| scope.is_none_or(|sc| &e.scope == sc))
+            .filter(|e| concern.is_none_or(|c| e.concern == c))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (&a.scope, a.concern, &a.slug).cmp(&(&b.scope, b.concern, &b.slug)));
+        Ok(out)
+    }
+
+    fn state_revisions(&self, id: &StateId) -> Result<Vec<StateRevision>, StoreError> {
+        let s = self.inner.borrow();
+        s.check_kind(id.iri(), Kind::State)?;
+        let resolved = StateId(s.resolve(id.iri()));
+        Ok(s.state_revisions
+            .values()
+            .filter(|r| r.entry_id == resolved)
+            .cloned()
+            .collect())
+    }
+
+    fn list_conflicts(&self) -> Result<Vec<StateConflict>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.state_conflicts.values().cloned().collect())
+    }
+
+    fn resolve_conflict(
+        &self,
+        id: &StateId,
+        keep: &RevisionId,
+        at: At,
+        by: &str,
+    ) -> Result<StateEntry, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(id.iri(), Kind::State)?;
+        let resolved = StateId(s.resolve(id.iri()));
+        let Some(conflict) = s.state_conflicts.get(&resolved).cloned() else {
+            return Err(StoreError::InvalidState(format!(
+                "state entry `{resolved}` has no active conflict"
+            )));
+        };
+        if keep != &conflict.local_head && keep != &conflict.remote_head {
+            return Err(StoreError::InvalidState(format!(
+                "`--keep {keep}` must match either local head `{}` or remote head `{}`",
+                conflict.local_head, conflict.remote_head
+            )));
+        }
+        let Some(&seq) = s.state_revision_ids.get(keep) else {
+            return Err(StoreError::InvalidState(format!(
+                "unknown revision `{keep}`"
+            )));
+        };
+        let chosen_rev = s.state_revisions.get(&seq).cloned().unwrap();
+        let local_rev = s
+            .state_revision_ids
+            .get(&conflict.local_head)
+            .and_then(|seq| s.state_revisions.get(seq))
+            .cloned()
+            .ok_or_else(|| StoreError::InvalidState("missing local_head revision".into()))?;
+        let remote_rev = s
+            .state_revision_ids
+            .get(&conflict.remote_head)
+            .and_then(|seq| s.state_revisions.get(seq))
+            .cloned()
+            .ok_or_else(|| StoreError::InvalidState("missing remote_head revision".into()))?;
+        let existing = s
+            .state_entries
+            .get(&resolved)
+            .cloned()
+            .ok_or_else(|| StoreError::NoSuchState(resolved.to_string()))?;
+
+        let merge_rev_id = RevisionId(s.mint_unindexed());
+        let sensitive = local_rev.sensitive || remote_rev.sensitive;
+        let ever_sensitive = existing.ever_sensitive
+            || local_rev.ever_sensitive
+            || remote_rev.ever_sensitive
+            || sensitive;
+        let merge_rev = StateRevision {
+            revision_id: merge_rev_id.clone(),
+            entry_id: resolved.clone(),
+            parent_revisions: sorted_parents(conflict.local_head, conflict.remote_head),
+            scope: existing.scope.clone(),
+            concern: existing.concern,
+            slug: existing.slug.clone(),
+            sensitive,
+            ever_sensitive,
+            payload: chosen_rev.payload.clone(),
+            at: at.clone(),
+            by: by.trim().to_string(),
+        };
+        s.append_state_revision(merge_rev);
+        s.state_conflicts.remove(&resolved);
+        let updated = StateEntry {
+            id: resolved.clone(),
+            scope: existing.scope,
+            concern: existing.concern,
+            slug: existing.slug,
+            sensitive,
+            ever_sensitive,
+            payload: chosen_rev.payload,
+            head_revision: merge_rev_id,
+            updated_at: at,
+            by: by.trim().to_string(),
+        };
+        s.state_entries.insert(resolved, updated.clone());
+        Ok(updated)
+    }
+
+    fn state_revisions_after(&self, seq: u64) -> Result<Vec<(u64, StateRevision)>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.state_revisions
+            .range((seq + 1)..)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect())
+    }
+
+    fn import_state_revisions(
+        &self,
+        revs: &[StateRevision],
+        merge_at: At,
+    ) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        for rev in revs {
+            if let Some(&seq) = s.state_revision_ids.get(&rev.revision_id) {
+                let existing = s.state_revisions.get(&seq).unwrap();
+                let mut normalized_rev = rev.clone();
+                normalized_rev.entry_id = StateId(s.resolve(rev.entry_id.iri()));
+                if existing != &normalized_rev {
+                    return Err(StoreError::Tampered {
+                        id: rev.revision_id.0.clone(),
+                        detail: "state revision payload differs from stored copy".into(),
+                    });
+                }
+                continue;
+            }
+            s.apply_imported_state_revision(rev.clone(), merge_at.clone())?;
+        }
+        Ok(())
+    }
+
+    fn sync_cursor(&self, remote: &str) -> Result<Option<StateSyncCursor>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.sync_cursors.get(remote).cloned())
+    }
+
+    fn set_sync_cursor(&self, cursor: StateSyncCursor) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.sync_cursors.insert(cursor.remote.clone(), cursor);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,6 +1674,8 @@ mod tests {
         crate::conformance::all_roles(|| Single(MemStore::default(), ()));
         crate::conformance::local_handles(|| (MemStore::default(), ()));
         crate::conformance::ledger_cache(|| (MemStore::default(), ()));
+        crate::conformance::agent_registry(|| (MemStore::default(), ()));
+        crate::conformance::state_store(|| (MemStore::default(), ()));
     }
 
     #[test]
