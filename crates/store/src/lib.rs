@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 pub mod manifest;
+pub mod state;
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 
@@ -24,16 +25,16 @@ pub const FORMAT_VERSION: u64 = 2;
 pub const CHANGE_ROUTING: &str = "change the routing map of";
 const FORMAT_KEY: &str = "format_version";
 
-const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+pub(crate) const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 /// Every id this store ever minted → its kind's wire name, OR the literal
 /// `"alias"` for an id minted by `add_alias`. `"alias"` is not a `Kind`: it
 /// is an index marker, so `check` must handle it before `Kind::from_wire`.
-const IDS: TableDefinition<&str, &str> = TableDefinition::new("ids");
+pub(crate) const IDS: TableDefinition<&str, &str> = TableDefinition::new("ids");
 /// alias → primary, for every id `add_alias` minted. Never chains: `primary`
 /// is always resolved to a true primary before it is written here.
-const ALIASES: TableDefinition<&str, &str> = TableDefinition::new("aliases");
-const HANDLES: TableDefinition<(&str, u64), &str> = TableDefinition::new("handles");
-const HANDLE_OF: TableDefinition<&str, u64> = TableDefinition::new("handle_of");
+pub(crate) const ALIASES: TableDefinition<&str, &str> = TableDefinition::new("aliases");
+pub(crate) const HANDLES: TableDefinition<(&str, u64), &str> = TableDefinition::new("handles");
+pub(crate) const HANDLE_OF: TableDefinition<&str, u64> = TableDefinition::new("handle_of");
 const PROJECTS: TableDefinition<&str, &str> = TableDefinition::new("projects");
 const GATES: TableDefinition<&str, &str> = TableDefinition::new("gates");
 const TRANSITIONS: TableDefinition<(&str, &str), &str> = TableDefinition::new("transitions");
@@ -93,6 +94,12 @@ pub const FORMAT_WITH_LEDGER_ROOT: u64 = 4;
 /// build opens 2 to 5. A store that never routes stays where it was.
 pub const FORMAT_WITH_ROUTING: u64 = 5;
 
+/// ⚠ The format of a store that holds state entries or agent registry rows.
+/// The first state or agent write raises the store to 6 in the same
+/// transaction, so an older fl refuses the store with `FormatVersion` rather
+/// than ignoring its state or agent tables. This build opens 2 to 6.
+pub const FORMAT_WITH_STATE: u64 = 6;
+
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
 const LEDGER_ROOTS: TableDefinition<&str, &str> = TableDefinition::new("ledger_roots");
@@ -123,8 +130,8 @@ const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
 
 pub struct RedbStore {
-    db: Database,
-    label: String,
+    pub(crate) db: Database,
+    pub(crate) label: String,
 }
 
 /// What an import did, for the person who ran it.
@@ -145,14 +152,14 @@ pub struct ImportReport {
     pub areas: Option<usize>,
 }
 
-fn backend(e: impl std::fmt::Display) -> StoreError {
+pub(crate) fn backend(e: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(e.to_string())
 }
 
 /// Reading a stored value back into its type. Separate from [`backend`]
 /// because the remedy is different: a decode failure is a version mismatch,
 /// not a broken database.
-fn decode(e: impl std::fmt::Display) -> StoreError {
+pub(crate) fn decode(e: impl std::fmt::Display) -> StoreError {
     StoreError::Decode(e.to_string())
 }
 
@@ -189,7 +196,7 @@ fn alias_primary(
 /// any transaction — following one alias hop through the `ALIASES` table
 /// `aliases` opens in the same one. `"alias"` is an index marker in `IDS`,
 /// not a `Kind`, so it is handled here before `Kind::from_wire` sees it.
-fn locate_in<A: ReadableTable<&'static str, &'static str>>(
+pub(crate) fn locate_in<A: ReadableTable<&'static str, &'static str>>(
     label: &str,
     id: &Iri,
     ids: &impl ReadableTable<&'static str, &'static str>,
@@ -224,7 +231,7 @@ fn json_at<T: serde::de::DeserializeOwned>(
 
 /// The JSON row `key` names in an additive `table`, read inside `tx`. A
 /// table no write has created yet holds nothing.
-fn additive<T: serde::de::DeserializeOwned>(
+pub(crate) fn additive<T: serde::de::DeserializeOwned>(
     tx: &redb::ReadTransaction,
     table: TableDefinition<&str, &str>,
     key: &Iri,
@@ -287,7 +294,7 @@ fn refuse_unwritable(
 }
 
 /// A new item's id.
-fn mint() -> Result<Iri, StoreError> {
+pub(crate) fn mint() -> Result<Iri, StoreError> {
     Iri::parse(&format!("urn:uuid:{}", uuid::Uuid::now_v7())).map_err(backend)
 }
 
@@ -296,7 +303,11 @@ fn mint() -> Result<Iri, StoreError> {
 /// indexed: an insert never overwrites. Shared by `insert_new_with_id` and
 /// `import_manifest`, so a minted id and an imported id are indexed the same
 /// way.
-fn index_new(tx: &redb::WriteTransaction, id: &Iri, kind: Kind) -> Result<(), StoreError> {
+pub(crate) fn index_new(
+    tx: &redb::WriteTransaction,
+    id: &Iri,
+    kind: Kind,
+) -> Result<(), StoreError> {
     let mut ids = tx.open_table(IDS).map_err(backend)?;
     if ids.get(id.as_str()).map_err(backend)?.is_some() {
         return Err(StoreError::AlreadyExists(id.clone()));
@@ -326,7 +337,7 @@ fn index_new(tx: &redb::WriteTransaction, id: &Iri, kind: Kind) -> Result<(), St
 
 /// Raise the store's format to at least `to`, inside `tx`. Never lowers it:
 /// an import into a store that records a ledger root must leave it at 4.
-fn raise_format(tx: &redb::WriteTransaction, to: u64) -> Result<(), StoreError> {
+pub(crate) fn raise_format(tx: &redb::WriteTransaction, to: u64) -> Result<(), StoreError> {
     let mut meta = tx.open_table(META).map_err(backend)?;
     let now = meta
         .get(FORMAT_KEY)
@@ -461,12 +472,13 @@ impl RedbStore {
                 if v == FORMAT_VERSION
                     || v == FORMAT_WITH_IMPORTS
                     || v == FORMAT_WITH_LEDGER_ROOT
-                    || v == FORMAT_WITH_ROUTING => {}
+                    || v == FORMAT_WITH_ROUTING
+                    || v == FORMAT_WITH_STATE => {}
             Some(v) => {
                 return Err(StoreError::FormatVersion {
                     found: v,
                     oldest: FORMAT_VERSION,
-                    newest: FORMAT_WITH_ROUTING,
+                    newest: FORMAT_WITH_STATE,
                 });
             }
         }
@@ -578,7 +590,7 @@ impl RedbStore {
     /// directly) first — list methods too. A list over a project this store
     /// never held is "didn't look", and an empty list would say "looked,
     /// found nothing".
-    fn locate(&self, id: &Iri) -> Result<(Iri, Kind), StoreError> {
+    pub(crate) fn locate(&self, id: &Iri) -> Result<(Iri, Kind), StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let ids = tx.open_table(IDS).map_err(backend)?;
         locate_in(&self.label, id, &ids, || {
@@ -588,7 +600,7 @@ impl RedbStore {
 
     /// [`Self::locate`], inside the write transaction `tx` that is about to
     /// write: a check made here holds when the write lands.
-    fn locate_for_write(
+    pub(crate) fn locate_for_write(
         &self,
         tx: &redb::WriteTransaction,
         id: &Iri,
@@ -1985,7 +1997,7 @@ mod tests {
                 StoreError::FormatVersion {
                     found: Some(1),
                     oldest: 2,
-                    newest: FORMAT_WITH_ROUTING
+                    newest: FORMAT_WITH_STATE
                 }
             ),
             "{err:?}"
@@ -2418,6 +2430,8 @@ mod tests {
         fl_core::conformance::all_roles(single);
         fl_core::conformance::local_handles(fresh);
         fl_core::conformance::ledger_cache(fresh);
+        fl_core::conformance::agent_registry(fresh);
+        fl_core::conformance::state_store(fresh);
     }
 
     #[test]
@@ -3042,7 +3056,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             tx.open_table(META)
                 .unwrap()
-                .insert(FORMAT_KEY, FORMAT_WITH_ROUTING + 1)
+                .insert(FORMAT_KEY, FORMAT_WITH_STATE + 1)
                 .unwrap();
             tx.commit().unwrap();
         }
@@ -3478,5 +3492,49 @@ mod tests {
         assert_eq!(s.handle_of(Kind::Record, r.iri()).unwrap(), Some(1));
         assert!(s.owns(r.iri()).unwrap());
         assert_eq!(s.kind_of(r.iri()).unwrap(), Kind::Record);
+    }
+
+    #[test]
+    fn redb_store_meets_the_agent_registry_contract() {
+        fl_core::conformance::agent_registry(fresh);
+    }
+
+    #[test]
+    fn redb_store_meets_the_state_store_contract() {
+        fl_core::conformance::state_store(fresh);
+    }
+
+    #[test]
+    fn state_or_agent_write_raises_the_store_to_format_6() {
+        use fl_core::at::At;
+        use fl_core::state::{
+            HandoffEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let st = {
+            let s = RedbStore::open(&path).unwrap();
+            s.upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "rule".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Handoff(HandoffEntry {
+                    summary: "v6".into(),
+                    shipped: vec![],
+                    in_flight: vec![],
+                    blockers: vec![],
+                    next_steps: vec![],
+                    notes: None,
+                }),
+                at: At::from_unix_millis(10),
+                by: "jarvis".into(),
+            })
+            .unwrap()
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_STATE));
+        let reopened = RedbStore::open(&path).unwrap();
+        assert_eq!(reopened.get_state(&st.id).unwrap(), Some(st));
     }
 }

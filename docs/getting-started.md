@@ -65,6 +65,8 @@ Commands:
   github      GitHub tracker: who fl writes as, and repair of a diverged issue
   routing     Route a project's new items between its local store and GitHub
   mcp         A project's MCP servers: one committed catalog, written into each agent CLI's file
+  agent       Manage the workspace agent and coverage-area registry
+  state       Manage durable memories, handoffs, runtime state, and git state sync
   help        Print this message or the help of the given subcommand(s)
 
 Options:

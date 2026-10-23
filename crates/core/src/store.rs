@@ -1,12 +1,18 @@
+use crate::agent::{AgentRecord, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent};
+use crate::at::At;
 use crate::decision::{Decision, Flushed};
 use crate::escalation::EscalationFault;
 use crate::fault::LedgerFault;
 use crate::finding::Finding;
-use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId};
+use crate::ids::{AgentId, FindingId, GateId, Kind, ProjectId, RecordId, RevisionId, StateId};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
 use crate::routing::{ForeignRecord, RoutingFault};
+use crate::state::{
+    MemoryLifecycle, StateConcern, StateConflict, StateEntry, StateRevision, StateScope,
+    StateSyncCursor, UpsertStateArgs,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -225,6 +231,48 @@ pub enum StoreError {
          so fl's own append did not. Nothing was lost; retry"
     )]
     Contended { store: String, tries: u32 },
+    #[error(
+        "agent `{name_key}` is already registered as {existing_id} (status: {}); \
+         confirm with the owner whether you are resuming/replacing that agent before passing `--replace`",
+        status.as_wire()
+    )]
+    AgentCollision {
+        name_key: String,
+        existing_id: AgentId,
+        status: AgentStatus,
+    },
+    #[error(
+        "project `{project}` already has an active lead (`{lead_name}`, {lead_id}); \
+         confirm with the owner before passing `--replace`"
+    )]
+    LeadTaken {
+        project: String,
+        lead_name: String,
+        lead_id: AgentId,
+    },
+    #[error(
+        "no such area `{0}` in registry (pass `--create-area` or run `fl agent area set` first)"
+    )]
+    NoSuchArea(String),
+    #[error("no such agent: {0}")]
+    NoSuchAgent(String),
+    #[error("no such state entry: {0}")]
+    NoSuchState(String),
+    #[error(
+        "state entry {entry_id} has an unresolved conflict between local revision {local_head} and remote revision {remote_head}; \
+         run `fl state resolve {entry_id} --keep <revision-id> --by <author>` first"
+    )]
+    StateConflict {
+        entry_id: StateId,
+        local_head: RevisionId,
+        remote_head: RevisionId,
+    },
+    #[error(
+        "refused: state entry {0} carries sensitive history and cannot be synced to a non-private state target (`private = true` is required in config.toml)"
+    )]
+    SensitiveDisclosure(StateId),
+    #[error("invalid state operation: {0}")]
+    InvalidState(String),
 }
 
 /// Follow a stored reference. `Ok(None)` from the owning store means the
@@ -552,7 +600,7 @@ impl KindRouted<'_> {
     fn owner(&self, kind: Kind) -> &dyn Handles {
         // Every kind by name: a new kind must be routed on purpose.
         match kind {
-            Kind::Project | Kind::Gate => self.catalog,
+            Kind::Project | Kind::Gate | Kind::State | Kind::Agent => self.catalog,
             Kind::Record | Kind::Finding => self.tracker,
         }
     }
@@ -565,6 +613,85 @@ impl Handles for KindRouted<'_> {
     fn resolve_handle(&self, kind: Kind, handle: u64) -> Result<Option<Iri>, StoreError> {
         self.owner(kind).resolve_handle(kind, handle)
     }
+}
+
+/// Centralized agent and coverage-area registry (spec §2, identity spec §6a).
+pub trait AgentRegistry {
+    fn upsert_area(&self, area: AreaRecord) -> Result<AreaRecord, StoreError>;
+    fn get_area(&self, area_key: &str) -> Result<Option<AreaRecord>, StoreError>;
+    fn list_areas(&self) -> Result<Vec<AreaRecord>, StoreError>;
+
+    fn register_agent(&self, args: RegisterAgentArgs) -> Result<AgentRecord, StoreError>;
+    fn retire_agent(&self, id: &AgentId, at: At, by: &str) -> Result<AgentRecord, StoreError>;
+    fn get_agent(&self, id: &AgentId) -> Result<Option<AgentRecord>, StoreError>;
+    fn agent_by_name(&self, name_key: &str) -> Result<Option<AgentRecord>, StoreError>;
+    fn list_agents(
+        &self,
+        project: Option<&str>,
+        include_retired: bool,
+    ) -> Result<Vec<AgentRecord>, StoreError>;
+
+    /// Append-only `(sequence, RegistryEvent)` log after `after_seq` for `fl/state` sync.
+    fn registry_events_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, RegistryEvent)>, StoreError>;
+    /// Import remote `RegistryEvent`s during `fl state sync`, deduplicating by `event_id`
+    /// with byte-for-byte tamper verification and resolving offline `name_key` collisions.
+    fn import_registry_events(&self, events: &[RegistryEvent]) -> Result<(), StoreError>;
+}
+
+/// Durable project/agent memory, handoff snapshots, and workflow runtime state (spec §1, §3).
+pub trait StateStore {
+    fn upsert_state(&self, args: UpsertStateArgs) -> Result<StateEntry, StoreError>;
+    fn retire_memory(
+        &self,
+        scope: &StateScope,
+        slug: &str,
+        lifecycle: MemoryLifecycle,
+        superseded_by: Option<StateId>,
+        at: At,
+        by: &str,
+    ) -> Result<StateEntry, StoreError>;
+    fn get_state(&self, id: &StateId) -> Result<Option<StateEntry>, StoreError>;
+    fn get_state_by_key(
+        &self,
+        scope: &StateScope,
+        concern: StateConcern,
+        slug: &str,
+    ) -> Result<Option<StateEntry>, StoreError>;
+    fn list_state(
+        &self,
+        scope: Option<&StateScope>,
+        concern: Option<StateConcern>,
+    ) -> Result<Vec<StateEntry>, StoreError>;
+    fn state_revisions(&self, id: &StateId) -> Result<Vec<StateRevision>, StoreError>;
+    fn list_conflicts(&self) -> Result<Vec<StateConflict>, StoreError>;
+    fn resolve_conflict(
+        &self,
+        id: &StateId,
+        keep: &RevisionId,
+        at: At,
+        by: &str,
+    ) -> Result<StateEntry, StoreError>;
+
+    /// Append-only `(sequence, StateRevision)` log after `after_seq` for `fl/state` sync.
+    fn state_revisions_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, StateRevision)>, StoreError>;
+    /// Import remote `StateRevision`s during `fl state sync`, deduplicating by `RevisionId`
+    /// with byte-for-byte tamper verification, aliasing unpublished local same-key collisions
+    /// (`S_local -> S_remote`), and computing fast-forward, conflict, `append`, or `last_writer`
+    /// merges using `merge_at`.
+    fn import_state_revisions(
+        &self,
+        revisions: &[StateRevision],
+        merge_at: At,
+    ) -> Result<(), StoreError>;
+
+    fn sync_cursor(&self, remote: &str) -> Result<Option<StateSyncCursor>, StoreError>;
+    fn set_sync_cursor(&self, cursor: StateSyncCursor) -> Result<(), StoreError>;
 }
 
 /// What a local store remembers about the GitHub repositories a tracker is

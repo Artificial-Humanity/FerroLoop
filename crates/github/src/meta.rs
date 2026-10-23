@@ -50,7 +50,7 @@ impl ItemKind {
         match kind {
             Kind::Record => Some(ItemKind::Record),
             Kind::Finding => Some(ItemKind::Finding),
-            Kind::Project | Kind::Gate => None,
+            Kind::Project | Kind::Gate | Kind::State | Kind::Agent => None,
         }
     }
 

@@ -23,7 +23,7 @@ use crate::model::{
     CommandSpec, GateDef, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
 use crate::split::{Batch, CachedSegment, LedgerCache, Outbox, RemoteLedger, SplitLedger};
-use crate::store::{Catalog, Handles, Ledger, StoreError, Tracker};
+use crate::store::{AgentRegistry, Catalog, Handles, Ledger, StateStore, StoreError, Tracker};
 use crate::verdict::Verdict;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -60,6 +60,8 @@ pub struct Bound<'a> {
     pub tracker: &'a dyn Tracker,
     pub ledger: &'a dyn Ledger,
     pub handles: &'a dyn Handles,
+    pub state: &'a dyn StateStore,
+    pub agents: &'a dyn AgentRegistry,
 }
 
 /// Hands one case its `Bound`. A callback rather than a return value, so a
@@ -72,13 +74,17 @@ pub trait Fixture {
 /// One store backing every role, plus a guard to keep alive.
 pub struct Single<S, G>(pub S, pub G);
 
-impl<S: Catalog + Tracker + Ledger + Handles, G> Fixture for Single<S, G> {
+impl<S: Catalog + Tracker + Ledger + Handles + StateStore + AgentRegistry, G> Fixture
+    for Single<S, G>
+{
     fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
         f(&Bound {
             catalog: &self.0,
             tracker: &self.0,
             ledger: &self.0,
             handles: &self.0,
+            state: &self.0,
+            agents: &self.0,
         });
     }
 }
@@ -94,7 +100,9 @@ pub trait SplitFixture {
 /// fixture swaps `MemRemote` for `GithubLedger` over the fake GitHub.
 pub struct SplitOver<S, G>(pub S, pub G);
 
-impl<S: Catalog + Tracker + Ledger + Handles + Outbox, G> SplitFixture for SplitOver<S, G> {
+impl<S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegistry, G> SplitFixture
+    for SplitOver<S, G>
+{
     fn with_split(&self, f: &mut dyn FnMut(&Bound<'_>, &dyn RemoteControl)) {
         self.0
             .set_cutover("R_1", &entry_iri(0))
@@ -110,13 +118,17 @@ impl<S: Catalog + Tracker + Ledger + Handles + Outbox, G> SplitFixture for Split
                 tracker: &self.0,
                 ledger: &split,
                 handles: &self.0,
+                state: &self.0,
+                agents: &self.0,
             },
             &remote,
         );
     }
 }
 
-impl<S: Catalog + Tracker + Ledger + Handles + Outbox, G> Fixture for SplitOver<S, G> {
+impl<S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegistry, G> Fixture
+    for SplitOver<S, G>
+{
     fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
         self.with_split(&mut |b, _| f(b));
     }
@@ -251,7 +263,9 @@ pub fn all_roles<F: Fixture>(make: impl Fn() -> F) {
 /// are numbered per kind from one. A GitHub tracker's handles are issue
 /// numbers shared by records and findings (spec §2.1), so this case is not
 /// part of the shared contract (spec §8.1 item 3).
-pub fn local_handles<S: Catalog + Tracker + Ledger + Handles, G>(make: impl Fn() -> (S, G)) {
+pub fn local_handles<S: Catalog + Tracker + Ledger + Handles + StateStore + AgentRegistry, G>(
+    make: impl Fn() -> (S, G),
+) {
     let cases: &[fn(&S)] = &[handles_are_per_kind_and_start_at_one::<S>];
     run_suite("local-handles", LOCAL_HANDLES_CASES, cases, make);
 }
@@ -1561,7 +1575,11 @@ fn an_id_of_another_kind_where_a_project_or_record_is_needed_is_refused_as_the_w
     assert!(roles.catalog.list_transitions(&p).unwrap().is_empty());
 }
 
-fn handles_are_per_kind_and_start_at_one<S: Catalog + Tracker + Ledger + Handles>(s: &S) {
+fn handles_are_per_kind_and_start_at_one<
+    S: Catalog + Tracker + Ledger + Handles + StateStore + AgentRegistry,
+>(
+    s: &S,
+) {
     let p = s.add_project("/p").unwrap();
     let g = s
         .add_gate(&p, "g", sample_kind(), sample_selector(), 1, "abc", "o")
@@ -1570,13 +1588,53 @@ fn handles_are_per_kind_and_start_at_one<S: Catalog + Tracker + Ledger + Handles
     let f = s
         .add_finding(Finding::raise(p.clone(), r.clone(), "a", "c"))
         .unwrap();
+    let st = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "rule".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Handoff(crate::state::HandoffEntry {
+                summary: "ok".into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(1),
+            by: "o".into(),
+        })
+        .unwrap();
+    let ag = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(1),
+            by: "o".into(),
+        })
+        .unwrap();
     assert_eq!(s.handle_of(Kind::Finding, f.iri()).unwrap(), Some(1));
     assert_eq!(s.handle_of(Kind::Project, p.iri()).unwrap(), Some(1));
     assert_eq!(s.handle_of(Kind::Gate, g.iri()).unwrap(), Some(1));
     assert_eq!(s.handle_of(Kind::Record, r.iri()).unwrap(), Some(1));
+    assert_eq!(s.handle_of(Kind::State, st.id.iri()).unwrap(), Some(1));
+    assert_eq!(s.handle_of(Kind::Agent, ag.id.iri()).unwrap(), Some(1));
     assert_eq!(
         s.resolve_handle(Kind::Gate, 1).unwrap().as_ref(),
         Some(g.iri())
+    );
+    assert_eq!(
+        s.resolve_handle(Kind::State, 1).unwrap().as_ref(),
+        Some(st.id.iri())
+    );
+    assert_eq!(
+        s.resolve_handle(Kind::Agent, 1).unwrap().as_ref(),
+        Some(ag.id.iri())
     );
     assert_eq!(s.resolve_handle(Kind::Gate, 2).unwrap(), None);
     assert_eq!(s.resolve_handle(Kind::Finding, 0).unwrap(), None);
@@ -1597,11 +1655,45 @@ fn an_id_has_no_handle_under_any_kind_but_its_own(roles: &Bound<'_>) {
         .tracker
         .add_finding(Finding::raise(p.clone(), r.clone(), "a", "c"))
         .unwrap();
+    let st = roles
+        .state
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "rule".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Handoff(crate::state::HandoffEntry {
+                summary: "ok".into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(1),
+            by: "o".into(),
+        })
+        .unwrap();
+    let ag = roles
+        .agents
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(1),
+            by: "o".into(),
+        })
+        .unwrap();
     let held = [
         (Kind::Project, p.0),
         (Kind::Gate, g.0),
         (Kind::Record, r.0),
         (Kind::Finding, f.0),
+        (Kind::State, st.id.0),
+        (Kind::Agent, ag.id.0),
     ];
     for own in Kind::ALL {
         assert!(
@@ -2354,4 +2446,962 @@ impl RemoteControl for MemRemote {
     fn batches(&self) -> Vec<Batch> {
         self.inner.borrow().batches.clone()
     }
+}
+
+/// How many cases [`agent_registry`] runs. Update deliberately — see [`run_suite`].
+const AGENT_REGISTRY_CASES: usize = 7;
+/// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
+const STATE_STORE_CASES: usize = 10;
+
+pub fn agent_registry<S: AgentRegistry + Catalog + Handles, G>(make: impl Fn() -> (S, G)) {
+    let cases: &[fn(&S)] = &[
+        area_round_trips_and_normalizes_key::<S>,
+        register_agent_requires_existing_area_unless_create_area_is_set::<S>,
+        agent_resolves_by_case_insensitive_name_and_numeric_handle::<S>,
+        agent_collision_refuses_active_and_retired_without_replace_and_preserves_iri_on_replace::<S>,
+        one_lead_per_project_refuses_second_lead_and_retires_previous_on_replace::<S>,
+        reports_to_tracks_active_project_lead_or_owner::<S>,
+        registry_event_import_deduplicates_detects_tamper_and_aliases_offline_collision::<S>,
+    ];
+    run_suite("agent-registry", AGENT_REGISTRY_CASES, cases, make);
+}
+
+pub fn state_store<S: StateStore + Catalog + Handles, G>(make: impl Fn() -> (S, G)) {
+    let cases: &[fn(&S)] = &[
+        memory_handoff_and_runtime_crud_and_key_lookup::<S>,
+        sensitive_flag_is_sticky_until_explicitly_cleared_and_ever_sensitive_persists::<S>,
+        memory_superseded_validates_target_exists_and_is_memory::<S>,
+        runtime_append_requires_array_and_rejects_scalar::<S>,
+        scope_concern_and_slug_are_immutable_for_an_entry_id::<S>,
+        fast_forward_and_already_ahead_revision_imports_converge::<S>,
+        true_divergence_creates_conflict_blocks_writes_and_resolves_cleanly::<S>,
+        mismatched_runtime_merge_modes_fail_closed_to_conflict::<S>,
+        runtime_append_and_last_writer_auto_merge_without_conflict::<S>,
+        offline_same_key_collision_aliases_unpublished_local_id_to_remote::<S>,
+    ];
+    run_suite("state-store", STATE_STORE_CASES, cases, make);
+}
+
+fn area_round_trips_and_normalizes_key<S: AgentRegistry>(s: &S) {
+    let a = s
+        .upsert_area(crate::agent::AreaRecord {
+            area_key: " Ferro_Loop ".into(),
+            name: "FerroLoop".into(),
+            path: Some("FerroLoop/".into()),
+            purpose: "Agent orchestration".into(),
+            updated_at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    assert_eq!(a.area_key, "ferro_loop");
+    assert_eq!(s.get_area("FERRO_LOOP").unwrap(), Some(a.clone()));
+    assert_eq!(s.list_areas().unwrap(), vec![a]);
+}
+
+fn register_agent_requires_existing_area_unless_create_area_is_set<S: AgentRegistry>(s: &S) {
+    let err = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(10),
+            by: "owner".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::NoSuchArea(ref k) if k == "ferroloop"));
+
+    let rec = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec!["notes".into()],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(11),
+            by: "owner".into(),
+        })
+        .unwrap();
+    assert_eq!(rec.name_key, "ferris");
+    assert_eq!(rec.email, "ferris@artificialhumanity.io");
+    assert!(s.get_area("ferroloop").unwrap().is_some());
+    assert!(s.get_area("notes").unwrap().is_some());
+}
+
+fn agent_resolves_by_case_insensitive_name_and_numeric_handle<S: AgentRegistry + Handles>(s: &S) {
+    let rec = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(10),
+            by: "owner".into(),
+        })
+        .unwrap();
+    assert_eq!(s.agent_by_name("FERRIS").unwrap(), Some(rec.clone()));
+    assert_eq!(s.get_agent(&rec.id).unwrap(), Some(rec.clone()));
+    let h = s.handle_of(Kind::Agent, rec.id.iri()).unwrap().unwrap();
+    assert_eq!(s.resolve_handle(Kind::Agent, h).unwrap(), Some(rec.id.0));
+}
+
+fn agent_collision_refuses_active_and_retired_without_replace_and_preserves_iri_on_replace<
+    S: AgentRegistry,
+>(
+    s: &S,
+) {
+    let first = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Assistant,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(10),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let err = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Assistant,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(11),
+            by: "owner".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::AgentCollision {
+            status: crate::agent::AgentStatus::Active,
+            ..
+        }
+    ));
+
+    s.retire_agent(&first.id, At::from_unix_millis(12), "owner")
+        .unwrap();
+    let err_retired = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Assistant,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(13),
+            by: "owner".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        err_retired,
+        StoreError::AgentCollision {
+            status: crate::agent::AgentStatus::Retired,
+            ..
+        }
+    ));
+
+    let resumed = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: false,
+            replace: true,
+            at: At::from_unix_millis(14),
+            by: "owner".into(),
+        })
+        .unwrap();
+    assert_eq!(resumed.id, first.id);
+    assert_eq!(resumed.status, crate::agent::AgentStatus::Active);
+    assert_eq!(resumed.role, crate::agent::AgentRole::Lead);
+}
+
+fn one_lead_per_project_refuses_second_lead_and_retires_previous_on_replace<S: AgentRegistry>(
+    s: &S,
+) {
+    let first = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(10),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let err = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Cogs".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(11),
+            by: "owner".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::LeadTaken { .. }));
+
+    let second = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Cogs".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: false,
+            replace: true,
+            at: At::from_unix_millis(12),
+            by: "owner".into(),
+        })
+        .unwrap();
+    assert_eq!(second.status, crate::agent::AgentStatus::Active);
+    assert_eq!(
+        s.get_agent(&first.id).unwrap().unwrap().status,
+        crate::agent::AgentStatus::Retired
+    );
+}
+
+fn reports_to_tracks_active_project_lead_or_owner<S: AgentRegistry>(s: &S) {
+    let lead = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(10),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let assistant = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Cogs".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Assistant,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(11),
+            by: "ferris".into(),
+        })
+        .unwrap();
+    let active = s.list_agents(None, false).unwrap();
+    assert_eq!(crate::agent::reports_to(&lead, &active), "Owner");
+    assert_eq!(crate::agent::reports_to(&assistant, &active), "Ferris");
+}
+
+fn registry_event_import_deduplicates_detects_tamper_and_aliases_offline_collision<
+    S: AgentRegistry + Handles,
+>(
+    s: &S,
+) {
+    let local = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(10),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let events: Vec<_> = s
+        .registry_events_after(0)
+        .unwrap()
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
+    // Deduplicate identical re-import.
+    s.import_registry_events(&events).unwrap();
+
+    // Tamper check on identical event_id with altered payload.
+    let mut tampered = events.last().unwrap().clone();
+    tampered.by = "mallory".into();
+    assert!(matches!(
+        s.import_registry_events(&[tampered]),
+        Err(StoreError::Tampered { .. })
+    ));
+
+    // Offline collision: remote event has a different AgentId for "ferris".
+    let remote_id = crate::ids::AgentId(crate::ids::seq_iri(999));
+    let mut remote_rec = local.clone();
+    remote_rec.id = remote_id.clone();
+    remote_rec.display_name = "Ferris Remote".into();
+    let collision_ev = crate::agent::RegistryEvent {
+        event_id: crate::ids::seq_iri(998),
+        at: At::from_unix_millis(20),
+        by: "owner".into(),
+        kind: crate::agent::RegistryEventKind::AgentUpsert(remote_rec),
+    };
+    s.import_registry_events(&[collision_ev]).unwrap();
+    let resolved = s.get_agent(&local.id).unwrap().unwrap();
+    assert_eq!(resolved.id, remote_id);
+    assert_eq!(resolved.display_name, "Ferris Remote");
+}
+
+fn memory_handoff_and_runtime_crud_and_key_lookup<S: StateStore>(s: &S) {
+    let mem = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "ste-rule".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Memory(crate::state::MemoryEntry {
+                category: crate::state::MemoryCategory::Rule,
+                basis: crate::state::MemoryBasis::Ruling,
+                lifecycle: crate::state::MemoryLifecycle::Active,
+                superseded_by: None,
+                pinned: true,
+                summary: "Use STE for owner prose".into(),
+                body: "Body".into(),
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    assert_eq!(mem.concern, crate::state::StateConcern::Memory);
+    assert_eq!(
+        s.get_state_by_key(
+            &crate::state::StateScope::Workspace,
+            crate::state::StateConcern::Memory,
+            "ste-rule",
+        )
+        .unwrap(),
+        Some(mem.clone())
+    );
+    assert_eq!(s.state_revisions(&mem.id).unwrap().len(), 1);
+
+    let handoff = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Project("ferroloop".into()),
+            slug: "current".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Handoff(crate::state::HandoffEntry {
+                summary: "Task 1 green".into(),
+                shipped: vec!["types".into()],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec!["Task 2".into()],
+                notes: None,
+            }),
+            at: At::from_unix_millis(11),
+            by: "ferris".into(),
+        })
+        .unwrap();
+    assert_eq!(handoff.concern, crate::state::StateConcern::Handoff);
+
+    let runtime = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Project("ferroloop".into()),
+            slug: "gpu_lease".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!({"holder": "ferris"}),
+                merge_mode: crate::state::MergeMode::LastWriter,
+            }),
+            at: At::from_unix_millis(12),
+            by: "ferris".into(),
+        })
+        .unwrap();
+    assert_eq!(runtime.concern, crate::state::StateConcern::Runtime);
+    assert_eq!(
+        s.list_state(
+            Some(&crate::state::StateScope::Project("ferroloop".into())),
+            None
+        )
+        .unwrap()
+        .len(),
+        2
+    );
+}
+
+fn sensitive_flag_is_sticky_until_explicitly_cleared_and_ever_sensitive_persists<S: StateStore>(
+    s: &S,
+) {
+    let created = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "token_hint".into(),
+            sensitivity: crate::state::SensitivityPatch::SetSensitive,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!({"v": 1}),
+                merge_mode: crate::state::MergeMode::Conflict,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    assert!(created.sensitive);
+    assert!(created.ever_sensitive);
+
+    // Omitting sensitivity flag (Inherit) preserves `sensitive == true`.
+    let updated = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "token_hint".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!({"v": 2}),
+                merge_mode: crate::state::MergeMode::Conflict,
+            }),
+            at: At::from_unix_millis(11),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    assert!(updated.sensitive);
+    assert!(updated.ever_sensitive);
+
+    // Explicit ClearSensitive sets `sensitive = false` while `ever_sensitive` remains true.
+    let cleared = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "token_hint".into(),
+            sensitivity: crate::state::SensitivityPatch::ClearSensitive,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!({"v": 3}),
+                merge_mode: crate::state::MergeMode::Conflict,
+            }),
+            at: At::from_unix_millis(12),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    assert!(!cleared.sensitive);
+    assert!(cleared.ever_sensitive);
+}
+
+fn memory_superseded_validates_target_exists_and_is_memory<S: StateStore>(s: &S) {
+    let old = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "old_rule".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Memory(crate::state::MemoryEntry {
+                category: crate::state::MemoryCategory::Rule,
+                basis: crate::state::MemoryBasis::Ruling,
+                lifecycle: crate::state::MemoryLifecycle::Active,
+                superseded_by: None,
+                pinned: false,
+                summary: "Old rule".into(),
+                body: "Old".into(),
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+
+    // Superseding by self is rejected.
+    let self_err = s
+        .retire_memory(
+            &crate::state::StateScope::Workspace,
+            "old_rule",
+            crate::state::MemoryLifecycle::Superseded,
+            Some(old.id.clone()),
+            At::from_unix_millis(11),
+            "jarvis",
+        )
+        .unwrap_err();
+    assert!(matches!(self_err, StoreError::InvalidState(_)));
+
+    // Superseding by a non-Memory entry is rejected.
+    let handoff = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "current".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Handoff(crate::state::HandoffEntry {
+                summary: "Handoff".into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(12),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let wrong_concern = s
+        .retire_memory(
+            &crate::state::StateScope::Workspace,
+            "old_rule",
+            crate::state::MemoryLifecycle::Superseded,
+            Some(handoff.id),
+            At::from_unix_millis(13),
+            "jarvis",
+        )
+        .unwrap_err();
+    assert!(matches!(wrong_concern, StoreError::InvalidState(_)));
+
+    // Superseding by a valid Memory entry succeeds.
+    let new_mem = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "new_rule".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Memory(crate::state::MemoryEntry {
+                category: crate::state::MemoryCategory::Rule,
+                basis: crate::state::MemoryBasis::Ruling,
+                lifecycle: crate::state::MemoryLifecycle::Active,
+                superseded_by: None,
+                pinned: false,
+                summary: "New rule".into(),
+                body: "New".into(),
+            }),
+            at: At::from_unix_millis(14),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let retired = s
+        .retire_memory(
+            &crate::state::StateScope::Workspace,
+            "old_rule",
+            crate::state::MemoryLifecycle::Superseded,
+            Some(new_mem.id.clone()),
+            At::from_unix_millis(15),
+            "jarvis",
+        )
+        .unwrap();
+    match retired.payload {
+        crate::state::StatePayload::Memory(m) => {
+            assert_eq!(m.lifecycle, crate::state::MemoryLifecycle::Superseded);
+            assert_eq!(m.superseded_by, Some(new_mem.id));
+        }
+        other => panic!("expected Memory payload, got {other:?}"),
+    }
+}
+
+fn runtime_append_requires_array_and_rejects_scalar<S: StateStore>(s: &S) {
+    let err = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "events".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!({"not": "an array"}),
+                merge_mode: crate::state::MergeMode::Append,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidState(_)));
+}
+
+fn scope_concern_and_slug_are_immutable_for_an_entry_id<S: StateStore>(s: &S) {
+    let entry = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "immutable".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!(1),
+                merge_mode: crate::state::MergeMode::Conflict,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let bad_rev = crate::state::StateRevision {
+        revision_id: crate::ids::RevisionId(crate::ids::seq_iri(900)),
+        entry_id: entry.id.clone(),
+        parent_revisions: vec![entry.head_revision.clone()],
+        scope: crate::state::StateScope::Workspace,
+        concern: crate::state::StateConcern::Runtime,
+        slug: "renamed".into(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+            value: serde_json::json!(2),
+            merge_mode: crate::state::MergeMode::Conflict,
+        }),
+        at: At::from_unix_millis(11),
+        by: "jarvis".into(),
+    };
+    let err = s
+        .import_state_revisions(&[bad_rev], At::from_unix_millis(12))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Tampered { .. }));
+}
+
+fn fast_forward_and_already_ahead_revision_imports_converge<S: StateStore>(s: &S) {
+    let v1 = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "ff".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!(1),
+                merge_mode: crate::state::MergeMode::Conflict,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let r2_id = crate::ids::RevisionId(crate::ids::seq_iri(901));
+    let r2 = crate::state::StateRevision {
+        revision_id: r2_id.clone(),
+        entry_id: v1.id.clone(),
+        parent_revisions: vec![v1.head_revision.clone()],
+        scope: v1.scope.clone(),
+        concern: v1.concern,
+        slug: v1.slug.clone(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+            value: serde_json::json!(2),
+            merge_mode: crate::state::MergeMode::Conflict,
+        }),
+        at: At::from_unix_millis(20),
+        by: "ferris".into(),
+    };
+    // Remote is descendant of local -> fast-forward.
+    s.import_state_revisions(std::slice::from_ref(&r2), At::from_unix_millis(21))
+        .unwrap();
+    let after_ff = s.get_state(&v1.id).unwrap().unwrap();
+    assert_eq!(after_ff.head_revision, r2_id);
+    assert!(s.list_conflicts().unwrap().is_empty());
+
+    // Re-importing the ancestor revision when local is already ahead is a no-op.
+    let r1 = s
+        .state_revisions(&v1.id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.revision_id == v1.head_revision)
+        .unwrap();
+    s.import_state_revisions(&[r1], At::from_unix_millis(22))
+        .unwrap();
+    assert_eq!(s.get_state(&v1.id).unwrap().unwrap().head_revision, r2_id);
+}
+
+fn true_divergence_creates_conflict_blocks_writes_and_resolves_cleanly<S: StateStore>(s: &S) {
+    let base = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "handoff".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Handoff(crate::state::HandoffEntry {
+                summary: "base".into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let local = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "handoff".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Handoff(crate::state::HandoffEntry {
+                summary: "local".into(),
+                shipped: vec!["a".into()],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(20),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let remote_rev_id = crate::ids::RevisionId(crate::ids::seq_iri(902));
+    let remote_rev = crate::state::StateRevision {
+        revision_id: remote_rev_id.clone(),
+        entry_id: base.id.clone(),
+        parent_revisions: vec![base.head_revision.clone()],
+        scope: base.scope.clone(),
+        concern: base.concern,
+        slug: base.slug.clone(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: crate::state::StatePayload::Handoff(crate::state::HandoffEntry {
+            summary: "remote".into(),
+            shipped: vec!["b".into()],
+            in_flight: vec![],
+            blockers: vec![],
+            next_steps: vec![],
+            notes: None,
+        }),
+        at: At::from_unix_millis(25),
+        by: "ferris".into(),
+    };
+    s.import_state_revisions(&[remote_rev], At::from_unix_millis(30))
+        .unwrap();
+
+    let conflicts = s.list_conflicts().unwrap();
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].entry_id, base.id);
+    assert_eq!(conflicts[0].local_head, local.head_revision);
+    assert_eq!(conflicts[0].remote_head, remote_rev_id);
+
+    // Regular writes are blocked while conflicted.
+    let blocked = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "handoff".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Handoff(crate::state::HandoffEntry {
+                summary: "blocked".into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(31),
+            by: "jarvis".into(),
+        })
+        .unwrap_err();
+    assert!(matches!(blocked, StoreError::StateConflict { .. }));
+
+    // Resolve keeping remote_rev_id produces a 2-parent merge revision.
+    let resolved = s
+        .resolve_conflict(&base.id, &remote_rev_id, At::from_unix_millis(40), "jarvis")
+        .unwrap();
+    assert!(s.list_conflicts().unwrap().is_empty());
+    let revs = s.state_revisions(&base.id).unwrap();
+    let merge_rev = revs
+        .iter()
+        .find(|r| r.revision_id == resolved.head_revision)
+        .unwrap();
+    assert_eq!(merge_rev.parent_revisions.len(), 2);
+}
+
+fn mismatched_runtime_merge_modes_fail_closed_to_conflict<S: StateStore>(s: &S) {
+    let base = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "mode_mismatch".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!([1]),
+                merge_mode: crate::state::MergeMode::Append,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let _local = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "mode_mismatch".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!([1, 2]),
+                merge_mode: crate::state::MergeMode::Append,
+            }),
+            at: At::from_unix_millis(20),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let remote = crate::state::StateRevision {
+        revision_id: crate::ids::RevisionId(crate::ids::seq_iri(903)),
+        entry_id: base.id.clone(),
+        parent_revisions: vec![base.head_revision.clone()],
+        scope: base.scope.clone(),
+        concern: base.concern,
+        slug: base.slug.clone(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+            value: serde_json::json!([1, 3]),
+            merge_mode: crate::state::MergeMode::LastWriter,
+        }),
+        at: At::from_unix_millis(25),
+        by: "ferris".into(),
+    };
+    s.import_state_revisions(&[remote], At::from_unix_millis(30))
+        .unwrap();
+    assert_eq!(s.list_conflicts().unwrap().len(), 1);
+}
+
+fn runtime_append_and_last_writer_auto_merge_without_conflict<S: StateStore>(s: &S) {
+    // 1. Append auto-merge.
+    let base = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "log".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!(["a"]),
+                merge_mode: crate::state::MergeMode::Append,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let _local = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "log".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!(["a", "b"]),
+                merge_mode: crate::state::MergeMode::Append,
+            }),
+            at: At::from_unix_millis(20),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let remote = crate::state::StateRevision {
+        revision_id: crate::ids::RevisionId(crate::ids::seq_iri(904)),
+        entry_id: base.id.clone(),
+        parent_revisions: vec![base.head_revision.clone()],
+        scope: base.scope.clone(),
+        concern: base.concern,
+        slug: base.slug.clone(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+            value: serde_json::json!(["a", "c"]),
+            merge_mode: crate::state::MergeMode::Append,
+        }),
+        at: At::from_unix_millis(25),
+        by: "ferris".into(),
+    };
+    s.import_state_revisions(&[remote], At::from_unix_millis(30))
+        .unwrap();
+    assert!(s.list_conflicts().unwrap().is_empty());
+    let merged = s.get_state(&base.id).unwrap().unwrap();
+    assert_eq!(merged.by, "fl");
+    match merged.payload {
+        crate::state::StatePayload::Runtime(rt) => {
+            assert_eq!(rt.value, serde_json::json!(["a", "b", "c"]));
+        }
+        other => panic!("expected Runtime, got {other:?}"),
+    }
+
+    // 2. LastWriter auto-merge.
+    let lw_base = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "cursor".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!(1),
+                merge_mode: crate::state::MergeMode::LastWriter,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let _lw_local = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "cursor".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!(2),
+                merge_mode: crate::state::MergeMode::LastWriter,
+            }),
+            at: At::from_unix_millis(20),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let lw_remote = crate::state::StateRevision {
+        revision_id: crate::ids::RevisionId(crate::ids::seq_iri(905)),
+        entry_id: lw_base.id.clone(),
+        parent_revisions: vec![lw_base.head_revision.clone()],
+        scope: lw_base.scope.clone(),
+        concern: lw_base.concern,
+        slug: lw_base.slug.clone(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+            value: serde_json::json!(3),
+            merge_mode: crate::state::MergeMode::LastWriter,
+        }),
+        at: At::from_unix_millis(25),
+        by: "ferris".into(),
+    };
+    s.import_state_revisions(&[lw_remote], At::from_unix_millis(30))
+        .unwrap();
+    assert!(s.list_conflicts().unwrap().is_empty());
+    let lw_merged = s.get_state(&lw_base.id).unwrap().unwrap();
+    assert_eq!(lw_merged.by, "fl");
+    match lw_merged.payload {
+        crate::state::StatePayload::Runtime(rt) => {
+            assert_eq!(rt.value, serde_json::json!(3));
+        }
+        other => panic!("expected Runtime, got {other:?}"),
+    }
+}
+
+fn offline_same_key_collision_aliases_unpublished_local_id_to_remote<S: StateStore + Handles>(
+    s: &S,
+) {
+    let local = s
+        .upsert_state(crate::state::UpsertStateArgs {
+            scope: crate::state::StateScope::Workspace,
+            slug: "shared_slug".into(),
+            sensitivity: crate::state::SensitivityPatch::Inherit,
+            payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+                value: serde_json::json!({"side": "local"}),
+                merge_mode: crate::state::MergeMode::LastWriter,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let local_handle = s.handle_of(Kind::State, local.id.iri()).unwrap().unwrap();
+
+    let remote_id = crate::ids::StateId(crate::ids::seq_iri(950));
+    let remote_rev = crate::state::StateRevision {
+        revision_id: crate::ids::RevisionId(crate::ids::seq_iri(951)),
+        entry_id: remote_id.clone(),
+        parent_revisions: vec![],
+        scope: crate::state::StateScope::Workspace,
+        concern: crate::state::StateConcern::Runtime,
+        slug: "shared_slug".into(),
+        sensitive: false,
+        ever_sensitive: false,
+        payload: crate::state::StatePayload::Runtime(crate::state::RuntimeEntry {
+            value: serde_json::json!({"side": "remote"}),
+            merge_mode: crate::state::MergeMode::LastWriter,
+        }),
+        at: At::from_unix_millis(20),
+        by: "ferris".into(),
+    };
+    s.import_state_revisions(&[remote_rev], At::from_unix_millis(25))
+        .unwrap();
+
+    // `local.id` now resolves via `aliases` to `remote_id`, and numeric handle is preserved.
+    let by_old_id = s.get_state(&local.id).unwrap().unwrap();
+    assert_eq!(by_old_id.id, remote_id);
+    assert_eq!(
+        s.resolve_handle(Kind::State, local_handle).unwrap(),
+        Some(remote_id.0)
+    );
 }
