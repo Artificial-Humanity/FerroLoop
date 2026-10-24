@@ -5,9 +5,11 @@ use std::path::PathBuf;
 
 use fl_core::agent::RegistryEvent;
 use fl_core::at::At;
-use fl_core::ids::StateId;
+use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
+use fl_core::ids::{MessageId, StateId};
+use fl_core::iri::Iri;
 use fl_core::state::{StateRevision, StateScope, StateSyncCursor};
-use fl_core::store::{AgentRegistry, StateStore, StoreError};
+use fl_core::store::{AgentRegistry, MessageStore, StateStore, StoreError};
 use sha2::{Digest, Sha256};
 
 use crate::git::{Git, GitTreeEntry, PushCasOutcome};
@@ -32,6 +34,7 @@ pub struct StateSyncTarget {
     pub branch: String,
     pub private: bool,
     pub sync_registry: bool,
+    pub sync_wire: bool,
     pub scope_filter: Option<StateScope>,
     pub by: String,
 }
@@ -52,8 +55,12 @@ pub struct StateSyncReport {
     pub committed_oid: Option<String>,
     pub imported_registry_events: usize,
     pub imported_revisions: usize,
+    pub imported_wire_messages: usize,
+    pub imported_wire_receipts: usize,
     pub published_registry_events: usize,
     pub published_revisions: usize,
+    pub published_wire_messages: usize,
+    pub published_wire_receipts: usize,
     pub active_conflicts: usize,
 }
 
@@ -67,6 +74,8 @@ pub struct StateVerifyReport {
     pub verified_commits: usize,
     pub verified_revisions: usize,
     pub verified_registry_events: usize,
+    pub verified_wire_messages: usize,
+    pub verified_wire_receipts: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +131,41 @@ struct BranchSnapshot {
     /// `revisions/<hash>/<seg>.jsonl` -> raw bytes
     segments: BTreeMap<(String, u32), Vec<u8>>,
     revisions: Vec<StateRevision>,
+    /// `wire/messages/<prefix2>/<filename>.json` (`<prefix2>/<filename>.json`) -> raw bytes
+    wire_messages_raw: BTreeMap<String, Vec<u8>>,
+    wire_messages: Vec<WireMessage>,
+    /// `wire/receipts/<seg>.jsonl` -> raw bytes
+    wire_receipt_segments: BTreeMap<u32, Vec<u8>>,
+    wire_receipts: Vec<DeliveryReceipt>,
+}
+
+fn wire_message_rel_path(id: &MessageId) -> String {
+    let fname = id.as_str().replace(':', "_");
+    let hex_tail: String = id
+        .as_str()
+        .chars()
+        .rev()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(2)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let prefix = if hex_tail.len() == 2 {
+        hex_tail.to_ascii_lowercase()
+    } else {
+        "00".to_string()
+    };
+    format!("{prefix}/{fname}.json")
+}
+
+fn parse_wire_receipt_segment_path(path: &str) -> Option<u32> {
+    let rest = path.strip_prefix("wire/receipts/")?;
+    let stem = rest.strip_suffix(".jsonl")?;
+    if stem.len() != 4 || !stem.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    stem.parse().ok()
 }
 
 fn parse_segment_path(path: &str) -> Option<(String, u32)> {
@@ -246,6 +290,68 @@ fn load_snapshot(
                         });
                     }
                     snap.segments.insert((hash, seg), raw);
+                } else if let Some(rel) = other.strip_prefix("wire/messages/") {
+                    let text = String::from_utf8(raw.clone()).map_err(|e| {
+                        StateSyncError::CorruptJsonl {
+                            path: other.to_owned(),
+                            line: 1,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let msg: WireMessage = serde_json::from_str(&text).map_err(|e| {
+                        StateSyncError::CorruptJsonl {
+                            path: other.to_owned(),
+                            line: 1,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let expected_rel = wire_message_rel_path(&msg.id);
+                    if rel != expected_rel {
+                        return Err(StateSyncError::HistoryTampered {
+                            commit: commit.to_owned(),
+                            path: other.to_owned(),
+                            reason: format!(
+                                "wire message `{}` belongs at `wire/messages/{expected_rel}`, not `{other}`",
+                                msg.id
+                            ),
+                        });
+                    }
+                    snap.wire_messages.push(msg);
+                    snap.wire_messages_raw.insert(rel.to_owned(), raw);
+                } else if let Some(seg) = parse_wire_receipt_segment_path(other) {
+                    let text = String::from_utf8(raw.clone()).map_err(|e| {
+                        StateSyncError::CorruptJsonl {
+                            path: other.to_owned(),
+                            line: 1,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let mut line_count = 0usize;
+                    for (idx, line) in text.lines().enumerate() {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        line_count += 1;
+                        let rcpt: DeliveryReceipt = serde_json::from_str(line).map_err(|e| {
+                            StateSyncError::CorruptJsonl {
+                                path: other.to_owned(),
+                                line: idx + 1,
+                                reason: e.to_string(),
+                            }
+                        })?;
+                        snap.wire_receipts.push(rcpt);
+                    }
+                    if line_count > 1 && raw.len() > MAX_SEGMENT_BYTES {
+                        return Err(StateSyncError::HistoryTampered {
+                            commit: commit.to_owned(),
+                            path: other.to_owned(),
+                            reason: format!(
+                                "multi-line receipt segment size {} exceeds MAX_SEGMENT_BYTES ({MAX_SEGMENT_BYTES})",
+                                raw.len()
+                            ),
+                        });
+                    }
+                    snap.wire_receipt_segments.insert(seg, raw);
                 }
             }
         }
@@ -253,8 +359,9 @@ fn load_snapshot(
     Ok(snap)
 }
 
-/// Verify that every append-only file (`areas.jsonl`, `agents.jsonl`, and `revisions/<hash>/<n>.jsonl`)
-/// in `next` is a byte-for-byte prefix extension of `prev`.
+/// Verify that every append-only file (`areas.jsonl`, `agents.jsonl`, `revisions/<hash>/<n>.jsonl`,
+/// `wire/receipts/<n>.jsonl`) in `next` is a byte-for-byte prefix extension of `prev`, and every
+/// `wire/messages/<prefix2>/<file>.json` in `prev` is present in `next` with identical bytes.
 fn verify_append_only_step(
     commit: &str,
     prev: &BranchSnapshot,
@@ -294,6 +401,40 @@ fn verify_append_only_step(
                 commit: commit.to_owned(),
                 path,
                 reason: "segment file was modified or truncated".into(),
+            });
+        }
+    }
+    for (rel_path, prev_bytes) in &prev.wire_messages_raw {
+        let path = format!("wire/messages/{rel_path}");
+        let Some(next_bytes) = next.wire_messages_raw.get(rel_path) else {
+            return Err(StateSyncError::HistoryTampered {
+                commit: commit.to_owned(),
+                path,
+                reason: "wire message file was deleted".into(),
+            });
+        };
+        if next_bytes != prev_bytes {
+            return Err(StateSyncError::HistoryTampered {
+                commit: commit.to_owned(),
+                path,
+                reason: "wire message file was modified".into(),
+            });
+        }
+    }
+    for (seg, prev_bytes) in &prev.wire_receipt_segments {
+        let path = format!("wire/receipts/{seg:04}.jsonl");
+        let Some(next_bytes) = next.wire_receipt_segments.get(seg) else {
+            return Err(StateSyncError::HistoryTampered {
+                commit: commit.to_owned(),
+                path,
+                reason: "wire receipt segment file was deleted".into(),
+            });
+        };
+        if !next_bytes.starts_with(prev_bytes) {
+            return Err(StateSyncError::HistoryTampered {
+                commit: commit.to_owned(),
+                path,
+                reason: "wire receipt segment file was modified or truncated".into(),
             });
         }
     }
@@ -408,6 +549,70 @@ fn write_snapshot_tree(
         });
     }
 
+    if !snap.wire_messages_raw.is_empty() || !snap.wire_receipt_segments.is_empty() {
+        let mut wire_entries = Vec::new();
+        if !snap.wire_messages_raw.is_empty() {
+            let mut by_prefix: BTreeMap<String, Vec<GitTreeEntry>> = BTreeMap::new();
+            for (rel_path, bytes) in &snap.wire_messages_raw {
+                if let Some((prefix, file)) = rel_path.split_once('/') {
+                    let oid = Git::hash_object(repo_dir, bytes)?;
+                    by_prefix
+                        .entry(prefix.to_owned())
+                        .or_default()
+                        .push(GitTreeEntry {
+                            mode: "100644".into(),
+                            kind: "blob".into(),
+                            oid,
+                            path: file.to_owned(),
+                        });
+                }
+            }
+            let mut prefix_trees = Vec::new();
+            for (prefix, entries) in by_prefix {
+                let subtree_oid = Git::mktree(repo_dir, &entries)?;
+                prefix_trees.push(GitTreeEntry {
+                    mode: "040000".into(),
+                    kind: "tree".into(),
+                    oid: subtree_oid,
+                    path: prefix,
+                });
+            }
+            let messages_tree_oid = Git::mktree(repo_dir, &prefix_trees)?;
+            wire_entries.push(GitTreeEntry {
+                mode: "040000".into(),
+                kind: "tree".into(),
+                oid: messages_tree_oid,
+                path: "messages".into(),
+            });
+        }
+        if !snap.wire_receipt_segments.is_empty() {
+            let mut rcpt_entries = Vec::new();
+            for (seg, bytes) in &snap.wire_receipt_segments {
+                let oid = Git::hash_object(repo_dir, bytes)?;
+                rcpt_entries.push(GitTreeEntry {
+                    mode: "100644".into(),
+                    kind: "blob".into(),
+                    oid,
+                    path: format!("{seg:04}.jsonl"),
+                });
+            }
+            let receipts_tree_oid = Git::mktree(repo_dir, &rcpt_entries)?;
+            wire_entries.push(GitTreeEntry {
+                mode: "040000".into(),
+                kind: "tree".into(),
+                oid: receipts_tree_oid,
+                path: "receipts".into(),
+            });
+        }
+        let wire_tree_oid = Git::mktree(repo_dir, &wire_entries)?;
+        root_entries.push(GitTreeEntry {
+            mode: "040000".into(),
+            kind: "tree".into(),
+            oid: wire_tree_oid,
+            path: "wire".into(),
+        });
+    }
+
     Ok(Git::mktree(repo_dir, &root_entries)?)
 }
 
@@ -440,6 +645,25 @@ fn append_revision_to_segments(
         .extend_from_slice(line_bytes);
 }
 
+fn append_receipt_to_segments(segments: &mut BTreeMap<u32, Vec<u8>>, rcpt: &DeliveryReceipt) {
+    let mut line = serde_json::to_string(rcpt).expect("DeliveryReceipt serializes");
+    line.push('\n');
+    let line_bytes = line.as_bytes();
+
+    let latest_seg = segments.keys().next_back().copied().unwrap_or(0);
+    let current_len = segments.get(&latest_seg).map_or(0, Vec::len);
+    let target_seg =
+        if current_len > 0 && current_len + line_bytes.len() > MAX_SEGMENT_BYTES {
+            latest_seg + 1
+        } else {
+            latest_seg
+        };
+    segments
+        .entry(target_seg)
+        .or_default()
+        .extend_from_slice(line_bytes);
+}
+
 /// Synchronize `store` with the `<remote>/<branch>` orphan branch in `target.repo_dir`
 /// using the 5-step compare-and-swap protocol (spec §4.2).
 pub fn sync_state<S>(
@@ -448,7 +672,7 @@ pub fn sync_state<S>(
     now: At,
 ) -> Result<StateSyncReport, StateSyncError>
 where
-    S: StateStore + AgentRegistry,
+    S: StateStore + AgentRegistry + MessageStore,
 {
     let local_tracking_ref = format!("refs/fl-sync/{}/{}", target.remote, target.branch);
     let cursor_key = target.cursor_key();
@@ -462,6 +686,8 @@ where
                 last_pushed_commit: None,
                 last_revision_seq: 0,
                 last_registry_seq: 0,
+                last_wire_msg_seq: 0,
+                last_wire_rcpt_seq: 0,
             });
 
         // Step 1: Fetch remote tip into isolated tracking ref.
@@ -518,7 +744,7 @@ where
             base_snapshot = prev_snap;
         }
 
-        // Step 3: Import unseen remote registry events and state revisions.
+        // Step 3: Import unseen remote registry events, state revisions, and wire records.
         let imported_registry_events = if target.sync_registry {
             store.import_registry_events(&base_snapshot.registry_events)?;
             base_snapshot.registry_events.len()
@@ -538,7 +764,17 @@ where
         store.import_state_revisions(&ordered_remote_revs, now.clone())?;
         let imported_revisions = ordered_remote_revs.len();
 
-        // Step 4: Collect unpublished local events/revisions and enforce sensitivity guard.
+        let (imported_wire_messages, imported_wire_receipts) = if target.sync_wire {
+            store.import_wire_batch(&base_snapshot.wire_messages, &base_snapshot.wire_receipts)?;
+            (
+                base_snapshot.wire_messages.len(),
+                base_snapshot.wire_receipts.len(),
+            )
+        } else {
+            (0, 0)
+        };
+
+        // Step 4: Collect unpublished local events/revisions/wire records and enforce sensitivity guard.
         if !target.private {
             for entry in store.list_state(target.scope_filter.as_ref(), None)? {
                 if entry.sensitive || entry.ever_sensitive {
@@ -591,13 +827,99 @@ where
             (Vec::new(), cursor.last_registry_seq)
         };
 
-        if unpublished_revs.is_empty() && unpublished_reg_events.is_empty() {
+        let (unpublished_wire_msgs, unpublished_wire_rcpts, max_wire_msg_seq, max_wire_rcpt_seq) =
+            if target.sync_wire {
+                let local_msgs = store.wire_messages_after(cursor.last_wire_msg_seq)?;
+                let max_msg_seq = local_msgs
+                    .last()
+                    .map(|(seq, _)| *seq)
+                    .unwrap_or(cursor.last_wire_msg_seq);
+                let remote_msg_ids: BTreeSet<MessageId> = base_snapshot
+                    .wire_messages
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect();
+                let mut unpublished_msgs = Vec::new();
+                for (_, msg) in local_msgs {
+                    if remote_msg_ids.contains(&msg.id) {
+                        continue;
+                    }
+                    if msg.durable {
+                        unpublished_msgs.push(msg);
+                    } else {
+                        let not_expired = msg.deadline_at.as_ref().is_none_or(|exp| exp > &now);
+                        if not_expired {
+                            let rcpts = store.list_wire_receipts(&msg.id)?;
+                            if rcpts.iter().any(|r| {
+                                matches!(
+                                    r.status,
+                                    DeliveryStatus::Pending | DeliveryStatus::Delivered
+                                )
+                            }) {
+                                unpublished_msgs.push(msg);
+                            }
+                        }
+                    }
+                }
+
+                let mut exported_msg_ids = remote_msg_ids;
+                for m in &unpublished_msgs {
+                    exported_msg_ids.insert(m.id.clone());
+                }
+
+                let mut remote_rcpt_states: BTreeMap<(MessageId, Iri), DeliveryStatus> =
+                    BTreeMap::new();
+                for r in &base_snapshot.wire_receipts {
+                    let key = (r.message_id.clone(), r.recipient_id.clone());
+                    let entry = remote_rcpt_states.entry(key).or_insert(r.status);
+                    if r.status.rank() > entry.rank() {
+                        *entry = r.status;
+                    }
+                }
+
+                let local_rcpts = store.wire_receipts_after(cursor.last_wire_rcpt_seq)?;
+                let max_rcpt_seq = local_rcpts
+                    .last()
+                    .map(|(seq, _)| *seq)
+                    .unwrap_or(cursor.last_wire_rcpt_seq);
+                let mut unpublished_rcpts = Vec::new();
+                for (_, rcpt) in local_rcpts {
+                    if !exported_msg_ids.contains(&rcpt.message_id) {
+                        continue;
+                    }
+                    let key = (rcpt.message_id.clone(), rcpt.recipient_id.clone());
+                    if remote_rcpt_states
+                        .get(&key)
+                        .is_none_or(|rem_state| rcpt.status.rank() > rem_state.rank())
+                    {
+                        remote_rcpt_states.insert(key, rcpt.status);
+                        unpublished_rcpts.push(rcpt);
+                    }
+                }
+
+                (unpublished_msgs, unpublished_rcpts, max_msg_seq, max_rcpt_seq)
+            } else {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    cursor.last_wire_msg_seq,
+                    cursor.last_wire_rcpt_seq,
+                )
+            };
+
+        if unpublished_revs.is_empty()
+            && unpublished_reg_events.is_empty()
+            && unpublished_wire_msgs.is_empty()
+            && unpublished_wire_rcpts.is_empty()
+        {
             let new_cursor = StateSyncCursor {
                 remote: cursor_key,
                 branch: target.branch.clone(),
                 last_pushed_commit: remote_tip.clone(),
                 last_revision_seq: max_rev_seq,
                 last_registry_seq: max_reg_seq,
+                last_wire_msg_seq: max_wire_msg_seq,
+                last_wire_rcpt_seq: max_wire_rcpt_seq,
             };
             store.set_sync_cursor(new_cursor)?;
             let active_conflicts = store.list_conflicts()?.len();
@@ -608,8 +930,12 @@ where
                 committed_oid: remote_tip,
                 imported_registry_events,
                 imported_revisions,
+                imported_wire_messages,
+                imported_wire_receipts,
                 published_registry_events: 0,
                 published_revisions: 0,
+                published_wire_messages: 0,
+                published_wire_receipts: 0,
                 active_conflicts,
             });
         }
@@ -636,6 +962,17 @@ where
         }
         for rev in &unpublished_revs {
             append_revision_to_segments(&mut next_snapshot.segments, rev);
+        }
+        if target.sync_wire {
+            for msg in &unpublished_wire_msgs {
+                let rel_path = wire_message_rel_path(&msg.id);
+                let mut raw = serde_json::to_vec(msg).unwrap();
+                raw.push(b'\n');
+                next_snapshot.wire_messages_raw.insert(rel_path, raw);
+            }
+            for rcpt in &unpublished_wire_rcpts {
+                append_receipt_to_segments(&mut next_snapshot.wire_receipt_segments, rcpt);
+            }
         }
 
         let tree_oid = write_snapshot_tree(&target.repo_dir, &next_snapshot)?;
@@ -668,6 +1005,8 @@ where
                     last_pushed_commit: Some(commit_oid.clone()),
                     last_revision_seq: max_rev_seq,
                     last_registry_seq: max_reg_seq,
+                    last_wire_msg_seq: max_wire_msg_seq,
+                    last_wire_rcpt_seq: max_wire_rcpt_seq,
                 };
                 store.set_sync_cursor(new_cursor)?;
                 let active_conflicts = store.list_conflicts()?.len();
@@ -678,8 +1017,12 @@ where
                     committed_oid: Some(commit_oid),
                     imported_registry_events,
                     imported_revisions,
+                    imported_wire_messages,
+                    imported_wire_receipts,
                     published_registry_events: unpublished_reg_events.len(),
                     published_revisions: unpublished_revs.len(),
+                    published_wire_messages: unpublished_wire_msgs.len(),
+                    published_wire_receipts: unpublished_wire_rcpts.len(),
                     active_conflicts,
                 });
             }
@@ -699,7 +1042,7 @@ pub fn verify_state<S>(
     target: &StateSyncTarget,
 ) -> Result<StateVerifyReport, StateSyncError>
 where
-    S: StateStore + AgentRegistry,
+    S: StateStore + AgentRegistry + MessageStore,
 {
     let local_tracking_ref = format!("refs/fl-sync/{}/{}", target.remote, target.branch);
     let cursor_key = target.cursor_key();
@@ -723,6 +1066,8 @@ where
             verified_commits: 0,
             verified_revisions: 0,
             verified_registry_events: 0,
+            verified_wire_messages: 0,
+            verified_wire_receipts: 0,
         });
     };
 
@@ -807,6 +1152,19 @@ where
         }
     }
 
+    if target.sync_wire {
+        for msg in &prev.wire_messages {
+            if let Some(local) = store.get_wire_message(&msg.id)?
+                && &local != msg
+            {
+                return Err(StateSyncError::Store(StoreError::WireMessageTampered {
+                    id: msg.id.clone(),
+                    detail: "remote wire message differs from local stored copy".into(),
+                }));
+            }
+        }
+    }
+
     // Verify every local state entry's head_revision exists in its revision history.
     for entry in store.list_state(target.scope_filter.as_ref(), None)? {
         let revs = store.state_revisions(&entry.id)?;
@@ -828,6 +1186,8 @@ where
         verified_commits: commits.len(),
         verified_revisions: prev.revisions.len(),
         verified_registry_events: prev.registry_events.len(),
+        verified_wire_messages: prev.wire_messages.len(),
+        verified_wire_receipts: prev.wire_receipts.len(),
     })
 }
 
@@ -920,6 +1280,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: true,
+            sync_wire: true,
             scope_filter: None,
             by: "ferris".into(),
         };
@@ -933,6 +1294,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: true,
+            sync_wire: true,
             scope_filter: None,
             by: "ferris".into(),
         };
@@ -977,6 +1339,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: false,
+            sync_wire: false,
             scope_filter: None,
             by: "ferris".into(),
         };
@@ -1029,6 +1392,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: false,
+            sync_wire: false,
             scope_filter: None,
             by: "jarvis".into(),
         };
@@ -1045,6 +1409,7 @@ mod tests {
             branch: "fl/state".into(),
             private: true,
             sync_registry: false,
+            sync_wire: false,
             scope_filter: None,
             by: "jarvis".into(),
         };
@@ -1082,6 +1447,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: false,
+            sync_wire: false,
             scope_filter: None,
             by: "agent_a".into(),
         };
@@ -1114,6 +1480,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: false,
+            sync_wire: false,
             scope_filter: None,
             by: "agent_b".into(),
         };
@@ -1158,6 +1525,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: false,
+            sync_wire: false,
             scope_filter: None,
             by: "agent_a".into(),
         };
@@ -1207,6 +1575,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: false,
+            sync_wire: false,
             scope_filter: None,
             by: "agent_a".into(),
         };
@@ -1305,6 +1674,7 @@ mod tests {
             branch: "fl/state".into(),
             private: false,
             sync_registry: false,
+            sync_wire: false,
             scope_filter: None,
             by: "agent_a".into(),
         };
@@ -1343,5 +1713,245 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome, PushCasOutcome::Rejected);
+    }
+
+    #[test]
+    fn selective_wire_export_and_offline_store_and_forward_round_trip() {
+        use fl_core::ferrowire::{
+            MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter,
+        };
+
+        let (_tmp, clone_a, clone_b) = setup_two_clones();
+        let store_a = MemStore::default();
+        let store_b = MemStore::default();
+
+        // 1. Locally acked transient message on Store A -> skipped by selective export policy.
+        let (acked_transient, _) = store_a
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kayla".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: false,
+                subject: "local ping".into(),
+                body: "already acked locally".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(10),
+            })
+            .unwrap();
+        store_a
+            .update_wire_receipt(
+                &acked_transient.id,
+                "kayla",
+                DeliveryStatus::Acked,
+                false,
+                At::from_unix_millis(11),
+            )
+            .unwrap();
+
+        // 2. Expired transient message on Store A -> skipped by selective export policy.
+        let (_expired_transient, _) = store_a
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kayla".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: false,
+                subject: "expired ping".into(),
+                body: "expired before sync".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: Some(At::from_unix_millis(15)),
+                at: At::from_unix_millis(12),
+            })
+            .unwrap();
+
+        // 3. Unacknowledged non-expired transient message -> exported.
+        let (pending_transient, _) = store_a
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kayla".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: false,
+                subject: "offline ping".into(),
+                body: "deliver via git".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: Some(At::from_unix_millis(500)),
+                at: At::from_unix_millis(13),
+            })
+            .unwrap();
+
+        // 4. Durable message (even if already acked) -> exported.
+        let (durable_msg, _) = store_a
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kayla".into()),
+                kind: MessageKind::Handoff,
+                urgency: MessageUrgency::Urgent,
+                durable: true,
+                subject: "durable handoff".into(),
+                body: "permanent record".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(14),
+            })
+            .unwrap();
+
+        let target_a = StateSyncTarget {
+            repo_dir: clone_a.clone(),
+            remote: "origin".into(),
+            branch: "fl/state".into(),
+            private: false,
+            sync_registry: true,
+            sync_wire: true,
+            scope_filter: None,
+            by: "jarvis".into(),
+        };
+        let rep_a = sync_state(&store_a, &target_a, At::from_unix_millis(20)).unwrap();
+        assert_eq!(rep_a.published_wire_messages, 2);
+        assert_eq!(rep_a.published_wire_receipts, 2);
+
+        // Store B syncs from origin and receives only the 2 exported messages.
+        let target_b = StateSyncTarget {
+            repo_dir: clone_b,
+            remote: "origin".into(),
+            branch: "fl/state".into(),
+            private: false,
+            sync_registry: true,
+            sync_wire: true,
+            scope_filter: None,
+            by: "kayla".into(),
+        };
+        let rep_b = sync_state(&store_b, &target_b, At::from_unix_millis(25)).unwrap();
+        assert_eq!(rep_b.imported_wire_messages, 2);
+        assert_eq!(rep_b.imported_wire_receipts, 2);
+        assert_eq!(rep_b.published_wire_messages, 0);
+        assert_eq!(rep_b.published_wire_receipts, 0);
+        assert!(store_b.get_wire_message(&acked_transient.id).unwrap().is_none());
+        assert!(store_b.get_wire_message(&pending_transient.id).unwrap().is_some());
+        assert!(store_b.get_wire_message(&durable_msg.id).unwrap().is_some());
+
+        let inbox = store_b
+            .list_wire_inbox(&WireFilter {
+                recipient: Some("kayla".into()),
+                unread_only: true,
+                thread_id: None,
+                correlation_id: None,
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(inbox.len(), 2);
+
+        // Kayla acknowledges `pending_transient` on Store B and syncs back to origin.
+        store_b
+            .update_wire_receipt(
+                &pending_transient.id,
+                "kayla",
+                DeliveryStatus::Acked,
+                false,
+                At::from_unix_millis(35),
+            )
+            .unwrap();
+        let rep_b2 = sync_state(&store_b, &target_b, At::from_unix_millis(40)).unwrap();
+        assert_eq!(rep_b2.published_wire_messages, 0);
+        assert_eq!(rep_b2.published_wire_receipts, 1);
+
+        // Store A syncs and observes Kayla's Acked receipt.
+        let rep_a2 = sync_state(&store_a, &target_a, At::from_unix_millis(45)).unwrap();
+        assert_eq!(rep_a2.imported_wire_receipts, 3);
+        let rcpts_a = store_a.list_wire_receipts(&pending_transient.id).unwrap();
+        assert_eq!(rcpts_a[0].status, DeliveryStatus::Acked);
+
+        let ver = verify_state(&store_a, &target_a).unwrap();
+        assert_eq!(ver.verified_commits, 2);
+        assert_eq!(ver.verified_wire_messages, 2);
+        assert_eq!(ver.verified_wire_receipts, 3);
+    }
+
+    #[test]
+    fn wire_message_tamper_on_branch_is_detected() {
+        use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+
+        let (_tmp, clone_a, _clone_b) = setup_two_clones();
+        let store = MemStore::default();
+        let (msg, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("kayla".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: true,
+                subject: "immutable".into(),
+                body: "original body".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(10),
+            })
+            .unwrap();
+
+        let target = StateSyncTarget {
+            repo_dir: clone_a.clone(),
+            remote: "origin".into(),
+            branch: "fl/state".into(),
+            private: false,
+            sync_registry: false,
+            sync_wire: true,
+            scope_filter: None,
+            by: "jarvis".into(),
+        };
+        let rep = sync_state(&store, &target, At::from_unix_millis(15)).unwrap();
+        let parent_commit = rep.committed_oid.unwrap();
+
+        // Craft a commit on origin that deletes `wire/messages/...`
+        let bare = clone_a.parent().unwrap().join("remote.git");
+        let format_oid = Git::hash_object(&bare, b"1\n").unwrap();
+        let root_tree = Git::mktree(
+            &bare,
+            &[GitTreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                oid: format_oid,
+                path: "format".into(),
+            }],
+        )
+        .unwrap();
+        let tampered_commit = Git::commit_tree(
+            &bare,
+            &root_tree,
+            Some(&parent_commit),
+            "deleted wire message",
+            "attacker",
+        )
+        .unwrap();
+        Command::new("git")
+            .current_dir(&bare)
+            .args(["update-ref", "refs/heads/fl/state", &tampered_commit])
+            .status()
+            .unwrap();
+
+        let err = verify_state(&store, &target).unwrap_err();
+        assert!(matches!(err, StateSyncError::HistoryTampered { .. }));
+        let _ = msg;
     }
 }
