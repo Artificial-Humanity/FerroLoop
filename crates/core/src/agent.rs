@@ -156,6 +156,10 @@ impl AgentRecord {
     pub fn co_author_trailer(&self) -> String {
         format!("Co-authored-by: {} <{}>", self.display_name, self.email)
     }
+
+    pub fn covers_area(&self, slug: &str) -> bool {
+        self.project == slug || self.extra_areas.iter().any(|a| a == slug)
+    }
 }
 
 #[derive(Debug, Clone)]

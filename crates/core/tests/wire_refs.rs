@@ -231,4 +231,33 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
     assert_every_reference_refuses_a_handle("StateRevision", &state_revision, 4);
     assert_every_reference_refuses_a_handle("AgentRecord", &agent_record, 1);
     assert_every_reference_refuses_a_handle("RegistryEvent", &registry_event, 2);
+
+    let wire_message = WireMessage {
+        id: MessageId(iri(17)),
+        thread_id: MessageId(iri(18)),
+        reply_to: Some(MessageId(iri(19))),
+        correlation_id: Some(MessageId(iri(20))),
+        sender_id: Some(AgentId(iri(21))),
+        sender_name: "ferris".into(),
+        sender_host: Some("ai-lab-0".into()),
+        to: WireAddress::AgentId(AgentId(iri(22))),
+        kind: MessageKind::Reply,
+        urgency: MessageUrgency::Urgent,
+        durable: true,
+        subject: "Re: check".into(),
+        body: "All green".into(),
+        created_at: At::from_unix_millis(7),
+        deadline_at: Some(At::from_unix_millis(8)),
+    };
+    let delivery_receipt = DeliveryReceipt {
+        message_id: MessageId(iri(17)),
+        recipient_id: iri(22),
+        recipient_name: "jarvis".into(),
+        status: DeliveryStatus::Acked,
+        attempts: 1,
+        updated_at: At::from_unix_millis(8),
+        acked_at: Some(At::from_unix_millis(8)),
+    };
+    assert_every_reference_refuses_a_handle("WireMessage", &wire_message, 6);
+    assert_every_reference_refuses_a_handle("DeliveryReceipt", &delivery_receipt, 2);
 }

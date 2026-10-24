@@ -3,8 +3,13 @@ use crate::at::At;
 use crate::decision::{Decision, Flushed};
 use crate::escalation::EscalationFault;
 use crate::fault::LedgerFault;
+use crate::ferrowire::{
+    DeliveryReceipt, DeliveryStatus, SendWireArgs, ThreadId, WireFilter, WireInboxItem, WireMessage,
+};
 use crate::finding::Finding;
-use crate::ids::{AgentId, FindingId, GateId, Kind, ProjectId, RecordId, RevisionId, StateId};
+use crate::ids::{
+    AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId,
+};
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
 use crate::model::{GateDef, GateKind, Project, Record, Selector, State, Transition};
@@ -273,6 +278,13 @@ pub enum StoreError {
     SensitiveDisclosure(StateId),
     #[error("invalid state operation: {0}")]
     InvalidState(String),
+    #[error("no such wire message: {0}")]
+    MessageNotFound(MessageId),
+    #[error(
+        "wire message {id} is recorded differently on this machine and in the incoming batch: {detail}. \
+         A wire message never changes once sent."
+    )]
+    WireMessageTampered { id: MessageId, detail: String },
 }
 
 /// Follow a stored reference. `Ok(None)` from the owning store means the
@@ -600,7 +612,7 @@ impl KindRouted<'_> {
     fn owner(&self, kind: Kind) -> &dyn Handles {
         // Every kind by name: a new kind must be routed on purpose.
         match kind {
-            Kind::Project | Kind::Gate | Kind::State | Kind::Agent => self.catalog,
+            Kind::Project | Kind::Gate | Kind::State | Kind::Agent | Kind::Message => self.catalog,
             Kind::Record | Kind::Finding => self.tracker,
         }
     }
@@ -692,6 +704,67 @@ pub trait StateStore {
 
     fn sync_cursor(&self, remote: &str) -> Result<Option<StateSyncCursor>, StoreError>;
     fn set_sync_cursor(&self, cursor: StateSyncCursor) -> Result<(), StoreError>;
+}
+
+/// Durable agent-to-agent and human-to-agent messaging store (FerroWire spec §1.4).
+pub trait MessageStore {
+    /// Record a new message and create initial `Pending` receipts for all resolved recipients.
+    fn send_wire(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError>;
+
+    /// Look up a single message by `MessageId`.
+    fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError>;
+
+    /// Query inbox items for a recipient (`name_key` or `AgentId` URN), ordered by `MessageId`.
+    fn list_wire_inbox(&self, filter: &WireFilter) -> Result<Vec<WireInboxItem>, StoreError>;
+
+    /// List all messages in a thread (`thread_id`) in chronological `MessageId` order.
+    fn list_wire_thread(&self, thread_id: &ThreadId) -> Result<Vec<WireMessage>, StoreError>;
+
+    /// List replies correlated to an `Ask` message (`correlation_id`).
+    fn list_wire_replies(&self, correlation_id: &MessageId) -> Result<Vec<WireMessage>, StoreError>;
+
+    /// List all receipts for a given `MessageId`.
+    fn list_wire_receipts(
+        &self,
+        message_id: &MessageId,
+    ) -> Result<Vec<DeliveryReceipt>, StoreError>;
+
+    /// Transition a recipient's receipt (`Delivered`, `Acked`, or failed attempt increment).
+    fn update_wire_receipt(
+        &self,
+        message_id: &MessageId,
+        recipient: &str,
+        status: DeliveryStatus,
+        increment_attempts: bool,
+        at: At,
+    ) -> Result<Option<DeliveryReceipt>, StoreError>;
+
+    /// Export messages after `after_seq` for peer catch-up and `fl/state` sync.
+    fn wire_messages_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, WireMessage)>, StoreError>;
+
+    /// Export receipt events after `after_seq` for peer catch-up and `fl/state` sync.
+    fn wire_receipts_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, DeliveryReceipt)>, StoreError>;
+
+    /// Import messages and receipts from a remote peer or `fl/state` branch, enforcing
+    /// byte-for-byte immutability on `WireMessage` and monotonic convergence on `DeliveryReceipt`.
+    fn import_wire_batch(
+        &self,
+        messages: &[WireMessage],
+        receipts: &[DeliveryReceipt],
+    ) -> Result<(), StoreError>;
+
+    /// Delete transient (`durable == false`) messages whose receipts are all `Acked` or
+    /// `Expired` and whose `created_at < before`. Returns the count of pruned messages.
+    fn prune_wire(&self, before: At) -> Result<usize, StoreError>;
 }
 
 /// What a local store remembers about the GitHub repositories a tracker is

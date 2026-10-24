@@ -12,6 +12,7 @@ pub enum Kind {
     Finding,
     State,
     Agent,
+    Message,
 }
 
 crate::wire::wire_names!(Kind as kind_wire {
@@ -21,6 +22,7 @@ crate::wire::wire_names!(Kind as kind_wire {
     Finding => "finding",
     State => "state",
     Agent => "agent",
+    Message => "message",
 });
 crate::wire::wire_parse!(Kind as kind_parse);
 
@@ -61,6 +63,7 @@ id_type!(RecordId, Kind::Record);
 id_type!(FindingId, Kind::Finding);
 id_type!(StateId, Kind::State);
 id_type!(AgentId, Kind::Agent);
+id_type!(MessageId, Kind::Message);
 
 /// An immutable revision identifier (`urn:uuid:` v7) naming one revision in
 /// `state_revisions` and on `fl/state`. Like ledger entry IDs, `RevisionId` is

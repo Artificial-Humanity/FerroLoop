@@ -43,6 +43,16 @@ pub enum StateError {
     UnexpectedSupersededBy(String),
     #[error("memory `{0}` cannot supersede itself")]
     SelfSupersede(StateId),
+    #[error(
+        "invalid wire address `{0}`: expected `<agent>`, `urn:uuid:...`, `@all`, `@area:<slug>`, `@role:<role>`, or `@area:<slug>/<role>`"
+    )]
+    InvalidAddress(String),
+    #[error("message subject must be a single non-empty line of at most 512 bytes")]
+    InvalidMessageSubject,
+    #[error("message body must be non-empty and at most 262144 bytes (got {0} bytes)")]
+    InvalidMessageBody(usize),
+    #[error("reply message requires both `reply_to` and `correlation_id`")]
+    ReplyRequiresParent,
 }
 
 /// Normalize to ASCII lowercase and validate `^[a-z][a-z0-9_-]{0,63}$`.
@@ -415,6 +425,10 @@ pub struct StateSyncCursor {
     pub last_pushed_commit: Option<String>,
     pub last_revision_seq: u64,
     pub last_registry_seq: u64,
+    #[serde(default)]
+    pub last_wire_msg_seq: u64,
+    #[serde(default)]
+    pub last_wire_rcpt_seq: u64,
 }
 
 #[derive(Debug, Clone)]
