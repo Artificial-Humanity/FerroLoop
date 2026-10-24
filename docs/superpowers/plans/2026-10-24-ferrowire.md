@@ -4617,6 +4617,16 @@ pub enum VendorRoute {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
     },
+    Muse {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+    },
+    Grok {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<PathBuf>,
+    },
     /// Used by deterministic integration tests to capture pushed deliveries without vendor binaries.
     Webhook { socket_path: PathBuf },
 }
@@ -4756,7 +4766,7 @@ impl RouteTable {
         self.entries.get(&norm)
     }
 
-    /// Passively discover Claude, Antigravity, and Codex routes from vendor session files.
+    /// Passively discover Claude, Antigravity, Codex, Meta Muse, and xAI Grok routes from vendor session files.
     pub fn discover_routes(&mut self, home_override: Option<&Path>, at: At) {
         let home = home_override
             .map(Path::to_path_buf)
@@ -4768,6 +4778,8 @@ impl RouteTable {
         self.discover_claude_routes(&home, check_proc, &at);
         self.discover_agy_routes(&home, &at);
         self.discover_codex_routes(&home, &at);
+        self.discover_muse_routes(&home, home_override.is_some(), &at);
+        self.discover_grok_routes(&home, &at);
     }
 
     fn discover_claude_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
@@ -5000,6 +5012,99 @@ impl RouteTable {
             );
         }
     }
+
+    fn discover_muse_routes(&mut self, home: &Path, has_home_override: bool, at: &At) {
+        let mut dirs = vec![
+            home.join(".local")
+                .join("share")
+                .join("muse")
+                .join("sessions"),
+        ];
+        if !has_home_override
+            && let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
+        {
+            let xdg_dir = PathBuf::from(xdg).join("muse").join("sessions");
+            if !dirs.contains(&xdg_dir) {
+                dirs.push(xdg_dir);
+            }
+        }
+        for sessions_dir in dirs {
+            let Ok(read_dir) = fs::read_dir(&sessions_dir) else {
+                continue;
+            };
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Some(persona) = scan_transcript_for_persona(&path, 50) else {
+                    continue;
+                };
+                let (session_id, cwd) = extract_session_id_and_cwd(&path, stem);
+                self.upsert(
+                    &persona,
+                    VendorRoute::Muse { session_id, cwd },
+                    at.clone(),
+                );
+            }
+        }
+    }
+
+    fn discover_grok_routes(&mut self, home: &Path, at: &At) {
+        let sessions_dir = home.join(".grok").join("sessions");
+        let Ok(read_dir) = fs::read_dir(&sessions_dir) else {
+            return;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            let ext = path.extension().and_then(|s| s.to_str());
+            if !matches!(ext, Some("json") | Some("jsonl")) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some(persona) = scan_transcript_for_persona(&path, 50) else {
+                continue;
+            };
+            let (session_id, cwd) = extract_session_id_and_cwd(&path, stem);
+            self.upsert(
+                &persona,
+                VendorRoute::Grok { session_id, cwd },
+                at.clone(),
+            );
+        }
+    }
+}
+
+fn extract_session_id_and_cwd(path: &Path, fallback_stem: &str) -> (String, Option<PathBuf>) {
+    let mut session_id = fallback_stem.to_string();
+    let mut cwd = None;
+    if let Ok(text) = fs::read_to_string(path) {
+        for line in text.lines().take(20) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(sid) = val
+                    .get("session_id")
+                    .or_else(|| val.get("sessionId"))
+                    .or_else(|| val.get("id"))
+                    .and_then(|v| v.as_str())
+                    && !sid.is_empty()
+                {
+                    session_id = sid.to_string();
+                }
+                if cwd.is_none()
+                    && let Some(dir) = val.get("cwd").and_then(|v| v.as_str())
+                    && !dir.is_empty()
+                {
+                    cwd = Some(PathBuf::from(dir));
+                }
+            }
+        }
+    }
+    (session_id, cwd)
 }
 
 fn parse_legacy_route_item(item: &serde_json::Value) -> Option<VendorRoute> {
@@ -5057,6 +5162,24 @@ fn parse_legacy_route_item(item: &serde_json::Value) -> Option<VendorRoute> {
             let thread_id = item.get("thread_id")?.as_str()?.to_string();
             let cwd = item.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
             Some(VendorRoute::Codex { thread_id, cwd })
+        }
+        "muse" => {
+            let session_id = item
+                .get("session_id")
+                .or_else(|| item.get("sessionId"))?
+                .as_str()?
+                .to_string();
+            let cwd = item.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+            Some(VendorRoute::Muse { session_id, cwd })
+        }
+        "grok" => {
+            let session_id = item
+                .get("session_id")
+                .or_else(|| item.get("sessionId"))?
+                .as_str()?
+                .to_string();
+            let cwd = item.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+            Some(VendorRoute::Grok { session_id, cwd })
         }
         "webhook" => {
             let socket_path = PathBuf::from(item.get("socket_path")?.as_str()?);
@@ -5189,7 +5312,27 @@ pub fn capture_current_env_route() -> Option<VendorRoute> {
             cwd: std::env::current_dir().ok(),
         });
     }
+    if let Ok(session_id) = std::env::var("MUSE_SESSION_ID")
+        && !session_id.trim().is_empty()
+    {
+        return Some(VendorRoute::Muse {
+            session_id,
+            cwd: std::env::current_dir().ok(),
+        });
+    }
+    if let Ok(session_id) = std::env::var("GROK_SESSION_ID")
+        && !session_id.trim().is_empty()
+    {
+        return Some(VendorRoute::Grok {
+            session_id,
+            cwd: std::env::current_dir().ok(),
+        });
+    }
     None
+}
+
+pub fn detect_current_route() -> Option<VendorRoute> {
+    capture_current_env_route()
 }
 
 /// Resolve the caller's persona name in strict priority order (spec §3.1):
@@ -5270,6 +5413,28 @@ pub fn resolve_persona(
         for entry in routes.entries.values() {
             if let VendorRoute::Codex { thread_id, .. } = &entry.route
                 && thread_id == &codex_tid
+            {
+                return entry.persona.clone();
+            }
+        }
+    }
+    if let Ok(muse_sid) = std::env::var("MUSE_SESSION_ID")
+        && !muse_sid.is_empty()
+    {
+        for entry in routes.entries.values() {
+            if let VendorRoute::Muse { session_id, .. } = &entry.route
+                && session_id == &muse_sid
+            {
+                return entry.persona.clone();
+            }
+        }
+    }
+    if let Ok(grok_sid) = std::env::var("GROK_SESSION_ID")
+        && !grok_sid.is_empty()
+    {
+        for entry in routes.entries.values() {
+            if let VendorRoute::Grok { session_id, .. } = &entry.route
+                && session_id == &grok_sid
             {
                 return entry.persona.clone();
             }
@@ -5536,6 +5701,24 @@ mod tests {
         )
         .unwrap();
 
+        // Create mock Meta Muse session file
+        let muse_dir = home.join(".local").join("share").join("muse").join("sessions");
+        fs::create_dir_all(&muse_dir).unwrap();
+        fs::write(
+            muse_dir.join("muse-sess-1.jsonl"),
+            "{\"session_id\":\"muse-sess-1\",\"agentName\":\"Mira\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+
+        // Create mock xAI Grok session file
+        let grok_dir = home.join(".grok").join("sessions");
+        fs::create_dir_all(&grok_dir).unwrap();
+        fs::write(
+            grok_dir.join("grok-sess-1.jsonl"),
+            "{\"sessionId\":\"grok-sess-1\",\"agentName\":\"Gideon\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+
         let mut table = RouteTable::default();
         table.discover_routes(Some(home), At::from_unix_millis(100));
 
@@ -5555,6 +5738,14 @@ mod tests {
         assert!(matches!(
             table.get("kage").map(|e| &e.route),
             Some(VendorRoute::Codex { thread_id, .. }) if thread_id == "thread-99"
+        ));
+        assert!(matches!(
+            table.get("mira").map(|e| &e.route),
+            Some(VendorRoute::Muse { session_id, .. }) if session_id == "muse-sess-1"
+        ));
+        assert!(matches!(
+            table.get("gideon").map(|e| &e.route),
+            Some(VendorRoute::Grok { session_id, .. }) if session_id == "grok-sess-1"
         ));
     }
 }
@@ -5725,6 +5916,55 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 .map_err(|e| format!("failed to spawn codex queue: {e}"))?;
             if !status.success() {
                 return Err(format!("codex queue exited with {status}"));
+            }
+            Ok(())
+        }
+        VendorRoute::Muse { session_id, cwd } => {
+            let bin = std::env::var_os("FL_WIRE_MUSE_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("muse"));
+            let formatted = format_push_message(msg);
+            let mut cmd = Command::new(&bin);
+            cmd.env("MUSE_NO_AUTO_UPDATE", "1");
+            cmd.args(["exec", "--session-id", session_id, "--json", &formatted]);
+            if let Some(dir) = cwd
+                && dir.exists()
+            {
+                cmd.current_dir(dir);
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
+            if !status.success() {
+                return Err(format!("muse exec exited with {status}"));
+            }
+            Ok(())
+        }
+        VendorRoute::Grok { session_id, cwd } => {
+            let bin = std::env::var_os("FL_WIRE_GROK_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("grok"));
+            let formatted = format_push_message(msg);
+            let mut cmd = Command::new(&bin);
+            cmd.args([
+                "--no-auto-update",
+                "--no-alt-screen",
+                "--always-approve",
+                "-s",
+                session_id,
+                "-p",
+                &formatted,
+            ]);
+            if let Some(dir) = cwd
+                && dir.exists()
+            {
+                cmd.current_dir(dir);
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
+            if !status.success() {
+                return Err(format!("grok exited with {status}"));
             }
             Ok(())
         }
@@ -5915,6 +6155,100 @@ mod tests {
         let rcpts = store.list_wire_receipts(&msg.id).unwrap();
         assert_eq!(rcpts[0].status, DeliveryStatus::Pending);
         assert_eq!(rcpts[0].attempts, MAX_DELIVER);
+    }
+
+    #[test]
+    fn muse_and_grok_dispatch_invokes_configured_binaries_with_expected_args() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let muse_out = tmp.path().join("muse-args.txt");
+        let muse_bin = tmp.path().join("mock-muse.sh");
+        fs::write(
+            &muse_bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$MUSE_NO_AUTO_UPDATE\" \"$@\" > \"{}\"\n",
+                muse_out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&muse_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let grok_out = tmp.path().join("grok-args.txt");
+        let grok_bin = tmp.path().join("mock-grok.sh");
+        fs::write(
+            &grok_bin,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n", grok_out.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&grok_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // SAFETY: only this test in fl-wire reads or writes FL_WIRE_MUSE_BIN / FL_WIRE_GROK_BIN.
+        unsafe {
+            std::env::set_var("FL_WIRE_MUSE_BIN", &muse_bin);
+            std::env::set_var("FL_WIRE_GROK_BIN", &grok_bin);
+        }
+
+        let store = MemStore::default();
+        let (msg, _) = store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "jarvis".into(),
+                sender_host: None,
+                to: WireAddress::AgentName("mira".into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: false,
+                subject: "muse check".into(),
+                body: "hello muse and grok".into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(10),
+            })
+            .unwrap();
+
+        dispatch_to_route(
+            &VendorRoute::Muse {
+                session_id: "ms-42".into(),
+                cwd: Some(tmp.path().to_path_buf()),
+            },
+            &msg,
+        )
+        .unwrap();
+        let muse_lines: Vec<String> = fs::read_to_string(&muse_out)
+            .unwrap()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+        assert_eq!(muse_lines[0], "1");
+        assert_eq!(muse_lines[1], "exec");
+        assert_eq!(muse_lines[2], "--session-id");
+        assert_eq!(muse_lines[3], "ms-42");
+        assert_eq!(muse_lines[4], "--json");
+        assert!(muse_lines[5].contains("muse check"));
+
+        dispatch_to_route(
+            &VendorRoute::Grok {
+                session_id: "gs-99".into(),
+                cwd: Some(tmp.path().to_path_buf()),
+            },
+            &msg,
+        )
+        .unwrap();
+        let grok_lines: Vec<String> = fs::read_to_string(&grok_out)
+            .unwrap()
+            .lines()
+            .map(ToOwned::to_owned)
+            .collect();
+        assert_eq!(grok_lines[0], "--no-auto-update");
+        assert_eq!(grok_lines[1], "--no-alt-screen");
+        assert_eq!(grok_lines[2], "--always-approve");
+        assert_eq!(grok_lines[3], "-s");
+        assert_eq!(grok_lines[4], "gs-99");
+        assert_eq!(grok_lines[5], "-p");
+        assert!(grok_lines[6].contains("muse check"));
     }
 }
 ```
@@ -8149,7 +8483,7 @@ pub enum WireCmd {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
-    /// Vendor lifecycle hooks (`fl wire hook claude`).
+    /// Vendor lifecycle hooks (`fl wire hook claude|muse|grok`).
     Hook {
         #[command(subcommand)]
         cmd: HookCmd,
@@ -8162,6 +8496,10 @@ pub enum WireCmd {
 pub enum HookCmd {
     /// Handle Claude Code / Codex lifecycle hook (`Stop`, `SessionStart`, `UserPromptSubmit`, `PostToolUse`).
     Claude,
+    /// Handle Meta Muse lifecycle hook (`Stop`, `SessionStart`, `UserPromptSubmit`, `PostToolUse`).
+    Muse,
+    /// Handle xAI Grok lifecycle hook (`Stop`, `SessionStart`, `UserPromptSubmit`, `PostToolUse`).
+    Grok,
 }
 
 /// CLI parser matching `AI-Lab-AMD/scripts/agent-bus/agent_bus/cli.py` for `agent-msg`.
@@ -8934,7 +9272,9 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             Ok(0)
         }
         WireCmd::Hook { cmd } => match cmd {
-            HookCmd::Claude => run_claude_hook(env),
+            HookCmd::Claude => run_vendor_hook(env, Some("claude")),
+            HookCmd::Muse => run_vendor_hook(env, Some("muse")),
+            HookCmd::Grok => run_vendor_hook(env, Some("grok")),
         },
         WireCmd::Mcp => crate::cmd::state_mcp::run(env)
             .map(|()| 0)
@@ -8943,6 +9283,13 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
 }
 
 pub fn run_claude_hook(env: &StateEnv<'_>) -> Result<i32, (i32, String)> {
+    run_vendor_hook(env, None)
+}
+
+pub fn run_vendor_hook(
+    env: &StateEnv<'_>,
+    explicit_vendor: Option<&str>,
+) -> Result<i32, (i32, String)> {
     let mut raw = String::new();
     std::io::stdin()
         .read_to_string(&mut raw)
@@ -8960,9 +9307,13 @@ pub fn run_claude_hook(env: &StateEnv<'_>) -> Result<i32, (i32, String)> {
         println!("{{}}");
         return Ok(0);
     }
+    let env_grok_event = std::env::var("GROK_HOOK_EVENT").ok();
     let event_name = payload
         .get("hook_event_name")
+        .or_else(|| payload.get("hookEventName"))
+        .or_else(|| payload.get("event"))
         .and_then(Value::as_str)
+        .or(env_grok_event.as_deref())
         .unwrap_or("Stop");
     let transcript_path = payload
         .get("transcript_path")
@@ -8975,6 +9326,7 @@ pub fn run_claude_hook(env: &StateEnv<'_>) -> Result<i32, (i32, String)> {
         .unwrap_or_else(|| env.cwd.to_path_buf());
     let session_id = payload
         .get("session_id")
+        .or_else(|| payload.get("sessionId"))
         .or_else(|| payload.get("thread_id"))
         .and_then(Value::as_str)
         .unwrap_or("")
@@ -8993,11 +9345,41 @@ pub fn run_claude_hook(env: &StateEnv<'_>) -> Result<i32, (i32, String)> {
         return Ok(0);
     }
 
-    // Register route for Codex or Claude
-    let is_codex = transcript_path
+    // Register route for Muse, Grok, Codex, or Claude
+    let vendor_str = explicit_vendor.or_else(|| payload.get("vendor").and_then(Value::as_str));
+    let tp_str = transcript_path
         .as_ref()
-        .is_some_and(|p| p.to_string_lossy().contains(".codex"));
-    if is_codex && !session_id.is_empty() {
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let is_muse = vendor_str == Some("muse")
+        || tp_str.contains(".muse")
+        || tp_str.contains("/muse/")
+        || payload.get("event").is_some();
+    let is_grok = vendor_str == Some("grok")
+        || tp_str.contains(".grok")
+        || std::env::var_os("GROK_HOOK_EVENT").is_some()
+        || payload.get("hookEventName").is_some();
+    let is_codex = vendor_str == Some("codex") || tp_str.contains(".codex");
+
+    if is_muse && !session_id.is_empty() {
+        record_caller_route(
+            &hook_env,
+            &persona,
+            VendorRoute::Muse {
+                session_id,
+                cwd: Some(hook_cwd.clone()),
+            },
+        );
+    } else if is_grok && !session_id.is_empty() {
+        record_caller_route(
+            &hook_env,
+            &persona,
+            VendorRoute::Grok {
+                session_id,
+                cwd: Some(hook_cwd.clone()),
+            },
+        );
+    } else if is_codex && !session_id.is_empty() {
         record_caller_route(
             &hook_env,
             &persona,
@@ -10037,7 +10419,11 @@ impl TestEnv {
             .env_remove("FL_DB")
             .env_remove("AGENT_PERSONA")
             .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
-            .env_remove("ANTIGRAVITY_CONVERSATION_ID");
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("CODEX_THREAD_ID")
+            .env_remove("MUSE_SESSION_ID")
+            .env_remove("GROK_SESSION_ID")
+            .env_remove("GROK_HOOK_EVENT");
         c
     }
 
@@ -10345,6 +10731,101 @@ fn claude_and_codex_hook_delivers_and_acks_unread_messages() {
             .as_str()
             .unwrap()
             .contains("Codex startup")
+    );
+
+    // Send a message to mira (Meta Muse) and test `fl wire hook muse` with `"event": "SessionStart"`
+    let mut send_muse = env.fl();
+    send_muse.args([
+        "wire",
+        "send",
+        "mira",
+        "Muse hook check",
+        "Muse session active.",
+        "--from",
+        "ferris",
+    ]);
+    assert!(send_muse.status().unwrap().success());
+
+    let mut muse_child = env
+        .fl()
+        .args(["wire", "hook", "muse"])
+        .env("AGENT_PERSONA", "mira")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    muse_child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            serde_json::to_vec(&json!({
+                "event": "SessionStart",
+                "session_id": "muse-sess-77",
+                "cwd": env.work_dir,
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+    let muse_out = muse_child.wait_with_output().unwrap();
+    assert!(muse_out.status.success());
+    let muse_resp: Value = serde_json::from_slice(&muse_out.stdout).unwrap();
+    assert_eq!(
+        muse_resp["hookSpecificOutput"]["hookEventName"],
+        "SessionStart"
+    );
+    assert!(
+        muse_resp["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("Muse hook check")
+    );
+
+    // Send a message to gideon (xAI Grok) and test `fl wire hook grok` with `"hookEventName": "Stop"` and `"sessionId"`
+    let mut send_grok = env.fl();
+    send_grok.args([
+        "wire",
+        "send",
+        "gideon",
+        "Grok hook check",
+        "Grok stop hook active.",
+        "--from",
+        "ferris",
+    ]);
+    assert!(send_grok.status().unwrap().success());
+
+    let mut grok_child = env
+        .fl()
+        .args(["wire", "hook", "grok"])
+        .env("AGENT_PERSONA", "gideon")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    grok_child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            serde_json::to_vec(&json!({
+                "hookEventName": "Stop",
+                "sessionId": "grok-sess-88",
+                "cwd": env.work_dir,
+            }))
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+    let grok_out = grok_child.wait_with_output().unwrap();
+    assert!(grok_out.status.success());
+    let grok_resp: Value = serde_json::from_slice(&grok_out.stdout).unwrap();
+    assert_eq!(grok_resp["decision"], "block");
+    assert!(
+        grok_resp["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Grok hook check")
     );
 }
 

@@ -489,7 +489,8 @@ Resolved in strict priority order:
      `"agentName"` or `"customTitle"`.
    * Checks `$XDG_RUNTIME_DIR/fl-wire-routes.json`, `~/.cache/fl/wire-routes.json`, and legacy
      `~/.cache/agent-bus/routes.json` for a route matching `CLAUDE_SESSION_ID`,
-     `ANTIGRAVITY_CONVERSATION_ID`, or `CODEX_THREAD_ID`.
+     `ANTIGRAVITY_CONVERSATION_ID`, `CODEX_THREAD_ID`, `MUSE_SESSION_ID`, or
+     `GROK_SESSION_ID`.
    * Walks ancestor directories from `cwd` looking for a registered project lead in
      `AgentRegistry` (or legacy `PERSONA.md`).
 4. Falls back to `"unknown"`.
@@ -520,6 +521,14 @@ pub enum VendorRoute {
         thread_id: String,
         cwd: Option<PathBuf>,
     },
+    Muse {
+        session_id: String,
+        cwd: Option<PathBuf>,
+    },
+    Grok {
+        session_id: String,
+        cwd: Option<PathBuf>,
+    },
     /// Used by deterministic integration tests to capture pushed deliveries without vendor binaries.
     Webhook {
         socket_path: PathBuf,
@@ -541,6 +550,10 @@ performs **passive route discovery** before dispatching to a persona (matching
    `Language server listening on random port at (\d+) for HTTP`, sharing the discovered
    host-level `ls_address` and `csrf_token` across active Antigravity routes).
 3. `discover_codex_routes`: scans `~/.codex/session_index.jsonl` for active Codex threads.
+4. `discover_muse_routes`: scans `~/.local/share/muse/sessions/` (or `$XDG_DATA_HOME/muse/sessions/`)
+   `.jsonl` files for active Meta Muse sessions.
+5. `discover_grok_routes`: scans `~/.grok/sessions/` `.json` and `.jsonl` files for active xAI Grok
+   sessions.
 
 ### 3.2 Native vendor push dispatcher (`crates/wire/src/dispatcher.rs`)
 
@@ -577,7 +590,15 @@ over WebSocket from a remote peer), the dispatcher attempts immediate push deliv
      with all four `ANTIGRAVITY_*` environment variables set.
 3. **Codex (`VendorRoute::Codex`):**
    * Executes `codex queue --thread <thread_id> --message <formatted_message>`.
-4. **Test / Custom Unix Socket (`VendorRoute::Webhook`):**
+4. **Meta Muse (`VendorRoute::Muse`):**
+   * Executes `muse` (or `$FL_WIRE_MUSE_BIN` override) with `MUSE_NO_AUTO_UPDATE=1` and
+     arguments `["exec", "--session-id", <session_id>, "--json", <formatted_message>]`, setting
+     `current_dir(dir)` if `cwd` exists.
+5. **xAI Grok (`VendorRoute::Grok`):**
+   * Executes `grok` (or `$FL_WIRE_GROK_BIN` override) with arguments
+     `["--no-auto-update", "--no-alt-screen", "--always-approve", "-s", <session_id>, "-p", <formatted_message>]`,
+     setting `current_dir(dir)` if `cwd` exists.
+6. **Test / Custom Unix Socket (`VendorRoute::Webhook`):**
    * Connects to `socket_path` and writes a single JSON line containing the `WireMessage`.
 
 **Invariant (Ack only on verified push).**
@@ -783,7 +804,7 @@ standalone project stores that do not host the workspace wire tables.
     marks each returned receipt as `Acked`.
 * `fl wire ack <message_id>... [--for <name>] [--json]`
 * `fl wire wait [--ack] [--block] [--timeout <secs>] [--for <name>] [--json]`
-  * Registers the caller's vendor route (`Claude`, `Agy`, or `Codex`).
+  * Registers the caller's vendor route (`Claude`, `Agy`, `Codex`, `Muse`, or `Grok`).
   * If `--block` or `--timeout` is given, waits for the next unread message (exiting `0` when a
     message arrives or `2` on timeout, matching `agent-msg wait` in `cli.py:237`).
   * Otherwise drains any immediately unread messages and exits `0` with the status line:
@@ -791,13 +812,15 @@ standalone project stores that do not host the workspace wire tables.
 * `fl wire prune [--older-than-days <days>] [--json]`
 * `fl wire status [--json]`
 * `fl wire daemon [--listen <addr>] [--peer <url>...] [--socket <path>] [--token-file <path>]`
-* `fl wire hook claude`
-  * Reads the Claude Code / Codex JSON hook payload from `stdin` (`hook_event_name`, `cwd`,
-    `transcript_path`, `session_id` or `thread_id`, `stop_hook_active`).
-  * Resolves the persona. If `transcript_path` contains `".codex"`, registers a
-    `VendorRoute::Codex { thread_id, cwd }`; otherwise registers the caller's `Claude` route.
-  * Reads and acknowledges any pending unread messages, and prints the exact Claude/Codex hook
-    JSON response (`{"decision": "block", "reason": ...}` on `"Stop"`, or
+* `fl wire hook claude|muse|grok`
+  * Reads the Claude Code / Codex / Meta Muse / xAI Grok JSON hook payload from `stdin`
+    (`hook_event_name` / `hookEventName` / `event` or `$GROK_HOOK_EVENT`, `cwd`,
+    `transcript_path`, `session_id` / `sessionId` / `thread_id`, `stop_hook_active`).
+  * Resolves the persona. Registers `VendorRoute::Muse { session_id, cwd }`,
+    `VendorRoute::Grok { session_id, cwd }`, `VendorRoute::Codex { thread_id, cwd }`, or
+    `VendorRoute::Claude` according to the invoked hook subcommand, environment, or payload.
+  * Reads and acknowledges any pending unread messages, and prints the hook JSON response
+    (`{"decision": "block", "reason": ...}` on `"Stop"`, or
     `{"hookSpecificOutput": ...}` on `"UserPromptSubmit" | "PostToolUse" | "SessionStart"`, or
     `{}` when no unread messages exist).
 
