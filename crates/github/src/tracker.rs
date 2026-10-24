@@ -5239,6 +5239,7 @@ mod tests {
                     handles: &handles,
                     state: &self.catalog,
                     agents: &self.catalog,
+                    wire: &self.catalog,
                 });
             }
         }
