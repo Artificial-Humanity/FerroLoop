@@ -724,7 +724,8 @@ pub trait MessageStore {
     fn list_wire_thread(&self, thread_id: &ThreadId) -> Result<Vec<WireMessage>, StoreError>;
 
     /// List replies correlated to an `Ask` message (`correlation_id`).
-    fn list_wire_replies(&self, correlation_id: &MessageId) -> Result<Vec<WireMessage>, StoreError>;
+    fn list_wire_replies(&self, correlation_id: &MessageId)
+    -> Result<Vec<WireMessage>, StoreError>;
 
     /// List all receipts for a given `MessageId`.
     fn list_wire_receipts(
@@ -743,10 +744,7 @@ pub trait MessageStore {
     ) -> Result<Option<DeliveryReceipt>, StoreError>;
 
     /// Export messages after `after_seq` for peer catch-up and `fl/state` sync.
-    fn wire_messages_after(
-        &self,
-        after_seq: u64,
-    ) -> Result<Vec<(u64, WireMessage)>, StoreError>;
+    fn wire_messages_after(&self, after_seq: u64) -> Result<Vec<(u64, WireMessage)>, StoreError>;
 
     /// Export receipt events after `after_seq` for peer catch-up and `fl/state` sync.
     fn wire_receipts_after(

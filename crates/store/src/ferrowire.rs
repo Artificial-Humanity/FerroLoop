@@ -15,8 +15,7 @@ use redb::{ReadableDatabase, ReadableTable, TableDefinition, TableHandle};
 
 use crate::state::{AGENT_BY_NAME, AGENTS};
 use crate::{
-    ALIASES, FORMAT_WITH_WIRE, IDS, META, RedbStore, backend, decode, locate_in, mint,
-    raise_format,
+    ALIASES, FORMAT_WITH_WIRE, IDS, META, RedbStore, backend, decode, locate_in, mint, raise_format,
 };
 
 pub(crate) const WIRE_MESSAGES: TableDefinition<&str, &str> = TableDefinition::new("wire_messages");
@@ -35,17 +34,10 @@ const NEXT_WIRE_RCPT_SEQ: &str = "next_wire_rcpt_seq";
 
 impl RedbStore {
     fn wtx_has_table(tx: &redb::WriteTransaction, name: &str) -> Result<bool, StoreError> {
-        Ok(tx
-            .list_tables()
-            .map_err(backend)?
-            .any(|h| h.name() == name))
+        Ok(tx.list_tables().map_err(backend)?.any(|h| h.name() == name))
     }
 
-    fn index_message_id_in(
-        &self,
-        tx: &redb::WriteTransaction,
-        id: &Iri,
-    ) -> Result<(), StoreError> {
+    fn index_message_id_in(&self, tx: &redb::WriteTransaction, id: &Iri) -> Result<(), StoreError> {
         let already = {
             let ids = tx.open_table(IDS).map_err(backend)?;
             ids.get(id.as_str())
@@ -152,7 +144,10 @@ impl RedbStore {
         Ok(())
     }
 
-    fn all_agents_in_wtx(&self, tx: &redb::WriteTransaction) -> Result<Vec<AgentRecord>, StoreError> {
+    fn all_agents_in_wtx(
+        &self,
+        tx: &redb::WriteTransaction,
+    ) -> Result<Vec<AgentRecord>, StoreError> {
         if !Self::wtx_has_table(tx, AGENTS.name())? {
             return Ok(Vec::new());
         }
@@ -177,11 +172,7 @@ impl RedbStore {
         }
     }
 
-    fn resolve_iri_in_wtx(
-        &self,
-        tx: &redb::WriteTransaction,
-        id: &Iri,
-    ) -> Result<Iri, StoreError> {
+    fn resolve_iri_in_wtx(&self, tx: &redb::WriteTransaction, id: &Iri) -> Result<Iri, StoreError> {
         let ids = tx.open_table(IDS).map_err(backend)?;
         match locate_in(&self.label, id, &ids, || {
             tx.open_table(ALIASES).map_err(backend)
@@ -597,10 +588,7 @@ impl MessageStore for RedbStore {
                 }
             }
             if filter.unread_only
-                && matches!(
-                    rcpt.status,
-                    DeliveryStatus::Acked | DeliveryStatus::Expired
-                )
+                && matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
             {
                 continue;
             }
@@ -625,8 +613,7 @@ impl MessageStore for RedbStore {
         }
 
         items.sort_by(|a, b| {
-            (&a.message.id, &a.receipt.recipient_id)
-                .cmp(&(&b.message.id, &b.receipt.recipient_id))
+            (&a.message.id, &a.receipt.recipient_id).cmp(&(&b.message.id, &b.receipt.recipient_id))
         });
         if let Some(limit) = filter.limit
             && items.len() > limit
@@ -665,7 +652,10 @@ impl MessageStore for RedbStore {
         Ok(out)
     }
 
-    fn list_wire_replies(&self, correlation_id: &MessageId) -> Result<Vec<WireMessage>, StoreError> {
+    fn list_wire_replies(
+        &self,
+        correlation_id: &MessageId,
+    ) -> Result<Vec<WireMessage>, StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let replies = match tx.open_table(WIRE_REPLIES) {
             Ok(t) => t,
@@ -709,7 +699,11 @@ impl MessageStore for RedbStore {
             }
             Err(e) => return Err(backend(e)),
         };
-        if messages.get(message_id.as_str()).map_err(backend)?.is_none() {
+        if messages
+            .get(message_id.as_str())
+            .map_err(backend)?
+            .is_none()
+        {
             return Err(StoreError::MessageNotFound(message_id.clone()));
         }
         let inbox = match tx.open_table(WIRE_INBOX) {
@@ -813,10 +807,7 @@ impl MessageStore for RedbStore {
         Ok(Some(merged))
     }
 
-    fn wire_messages_after(
-        &self,
-        after_seq: u64,
-    ) -> Result<Vec<(u64, WireMessage)>, StoreError> {
+    fn wire_messages_after(&self, after_seq: u64) -> Result<Vec<(u64, WireMessage)>, StoreError> {
         let tx = self.db.begin_read().map_err(backend)?;
         let log = match tx.open_table(WIRE_MSG_LOG) {
             Ok(t) => t,
@@ -858,7 +849,11 @@ impl MessageStore for RedbStore {
         for row in log.range((after_seq + 1)..).map_err(backend)? {
             let (k, v) = row.map_err(backend)?;
             let rcpt: DeliveryReceipt = serde_json::from_str(v.value()).map_err(decode)?;
-            if messages.get(rcpt.message_id.as_str()).map_err(backend)?.is_some() {
+            if messages
+                .get(rcpt.message_id.as_str())
+                .map_err(backend)?
+                .is_some()
+            {
                 out.push((k.value(), rcpt));
             }
         }

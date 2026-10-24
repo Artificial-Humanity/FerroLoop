@@ -213,7 +213,11 @@ fn fl_wire_cli_send_broadcast_ask_reply_read_ack_wait_status_and_prune() {
         "--json",
     ]);
     let ask_sent = run_json(ask_cmd);
-    let ask_id = ask_sent["id"].as_str().or_else(|| ask_sent["message"]["id"].as_str()).unwrap().to_string();
+    let ask_id = ask_sent["id"]
+        .as_str()
+        .or_else(|| ask_sent["message"]["id"].as_str())
+        .unwrap()
+        .to_string();
 
     let mut reply_cmd = env.fl();
     reply_cmd.args([
@@ -369,10 +373,7 @@ fn claude_and_codex_hook_delivers_and_acks_unread_messages() {
         .unwrap();
     let out3 = child3.wait_with_output().unwrap();
     let resp3: Value = serde_json::from_slice(&out3.stdout).unwrap();
-    assert_eq!(
-        resp3["hookSpecificOutput"]["hookEventName"],
-        "SessionStart"
-    );
+    assert_eq!(resp3["hookSpecificOutput"]["hookEventName"], "SessionStart");
     assert!(
         resp3["hookSpecificOutput"]["additionalContext"]
             .as_str()

@@ -7,9 +7,7 @@ use std::io::{BufRead, Write};
 
 use fl_core::agent::{AgentRole, RegisterAgentArgs, reports_to};
 use fl_core::at::At;
-use fl_core::ferrowire::{
-    MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter,
-};
+use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter};
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
@@ -637,8 +635,7 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
             let sender_name = resolve_caller(env, from_agent, None);
             let now_ms = now_millis();
             let now = At::from_unix_millis(now_ms);
-            let deadline_at =
-                timeout_secs.map(|s| At::from_unix_millis(now_ms + s * 1000));
+            let deadline_at = timeout_secs.map(|s| At::from_unix_millis(now_ms + s * 1000));
             let (ask_msg, receipts) = execute_send(
                 env,
                 SendWireArgs {

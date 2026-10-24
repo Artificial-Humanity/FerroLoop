@@ -452,9 +452,7 @@ impl RouteTable {
                 .join("muse")
                 .join("sessions"),
         ];
-        if !has_home_override
-            && let Some(xdg) = std::env::var_os("XDG_DATA_HOME")
-        {
+        if !has_home_override && let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
             let xdg_dir = PathBuf::from(xdg).join("muse").join("sessions");
             if !dirs.contains(&xdg_dir) {
                 dirs.push(xdg_dir);
@@ -476,11 +474,7 @@ impl RouteTable {
                     continue;
                 };
                 let (session_id, cwd) = extract_session_id_and_cwd(&path, stem);
-                self.upsert(
-                    &persona,
-                    VendorRoute::Muse { session_id, cwd },
-                    at.clone(),
-                );
+                self.upsert(&persona, VendorRoute::Muse { session_id, cwd }, at.clone());
             }
         }
     }
@@ -503,11 +497,7 @@ impl RouteTable {
                 continue;
             };
             let (session_id, cwd) = extract_session_id_and_cwd(&path, stem);
-            self.upsert(
-                &persona,
-                VendorRoute::Grok { session_id, cwd },
-                at.clone(),
-            );
+            self.upsert(&persona, VendorRoute::Grok { session_id, cwd }, at.clone());
         }
     }
 }
@@ -715,9 +705,9 @@ pub fn capture_current_env_route() -> Option<VendorRoute> {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or_else(std::process::id);
         let session_id = std::env::var("CLAUDE_SESSION_ID").unwrap_or_default();
-        let key_path = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .and_then(|h| resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, &socket_path));
+        let key_path = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+            resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, &socket_path)
+        });
         return Some(VendorRoute::Claude {
             pid,
             session_id,
@@ -1039,11 +1029,7 @@ mod tests {
 
         // 2. Transcript scan works when explicit is None
         let transcript = tmp.path().join("transcript.jsonl");
-        fs::write(
-            &transcript,
-            "{\"type\":\"meta\",\"agentName\":\"Kayla\"}\n",
-        )
-        .unwrap();
+        fs::write(&transcript, "{\"type\":\"meta\",\"agentName\":\"Kayla\"}\n").unwrap();
         assert_eq!(
             resolve_persona(
                 None,
@@ -1134,7 +1120,11 @@ mod tests {
         .unwrap();
 
         // Create mock Meta Muse session file
-        let muse_dir = home.join(".local").join("share").join("muse").join("sessions");
+        let muse_dir = home
+            .join(".local")
+            .join("share")
+            .join("muse")
+            .join("sessions");
         fs::create_dir_all(&muse_dir).unwrap();
         fs::write(
             muse_dir.join("muse-sess-1.jsonl"),
@@ -1156,7 +1146,11 @@ mod tests {
 
         assert!(matches!(
             table.get("sonya").map(|e| &e.route),
-            Some(VendorRoute::Claude { pid: 4242, key_path: Some(_), .. })
+            Some(VendorRoute::Claude {
+                pid: 4242,
+                key_path: Some(_),
+                ..
+            })
         ));
         assert!(table.get("artificial-humanity-1234").is_none());
         assert!(matches!(

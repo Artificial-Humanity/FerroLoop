@@ -3592,7 +3592,10 @@ mod tests {
         assert_eq!(format_at(&path), Some(FORMAT_WITH_WIRE));
         let reopened = RedbStore::open(&path).unwrap();
         reopened.verify_wire_invariants().unwrap();
-        assert_eq!(reopened.get_wire_message(&msg.id).unwrap(), Some(msg.clone()));
+        assert_eq!(
+            reopened.get_wire_message(&msg.id).unwrap(),
+            Some(msg.clone())
+        );
 
         reopened
             .update_wire_receipt(

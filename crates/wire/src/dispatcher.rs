@@ -44,15 +44,9 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 return Err(format!("claude pid {pid} is no longer running"));
             }
             let resolved_key = key_path.clone().or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .and_then(|h| {
-                        resolve_claude_key_path(
-                            &h.join(".claude").join("sessions"),
-                            *pid,
-                            socket_path,
-                        )
-                    })
+                std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+                    resolve_claude_key_path(&h.join(".claude").join("sessions"), *pid, socket_path)
+                })
             });
             let Some(kpath) = resolved_key else {
                 return Err(format!(
@@ -124,9 +118,15 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
 
             let title = format!("--title={}", format_push_header(msg));
             let mut cmd = Command::new(&exe);
-            cmd.args(["agentapi", "send-message", &title, conversation_id, &msg.body])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
+            cmd.args([
+                "agentapi",
+                "send-message",
+                &title,
+                conversation_id,
+                &msg.body,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
             cmd.env("ANTIGRAVITY_CONVERSATION_ID", conversation_id);
             cmd.env("ANTIGRAVITY_AGENTAPI_EXE", &exe);
             if !addr.is_empty() {
@@ -339,8 +339,13 @@ mod tests {
             At::from_unix_millis(10),
         );
 
-        let updated =
-            dispatch_message_for_store(&store, &mut routes, Some(tmp.path()), &msg, At::from_unix_millis(20));
+        let updated = dispatch_message_for_store(
+            &store,
+            &mut routes,
+            Some(tmp.path()),
+            &msg,
+            At::from_unix_millis(20),
+        );
         assert_eq!(updated.len(), 1);
         assert_eq!(updated[0].status, DeliveryStatus::Acked);
         assert_eq!(updated[0].attempts, 1);
@@ -352,10 +357,12 @@ mod tests {
         let user: serde_json::Value = serde_json::from_str(&lines[1]).unwrap();
         assert_eq!(user["type"], "user");
         assert_eq!(user["from"], "jarvis");
-        assert!(user["message"]["content"]
-            .as_str()
-            .unwrap()
-            .contains("hello sonya"));
+        assert!(
+            user["message"]["content"]
+                .as_str()
+                .unwrap()
+                .contains("hello sonya")
+        );
     }
 
     #[test]
@@ -428,7 +435,10 @@ mod tests {
         let grok_bin = tmp.path().join("mock-grok.sh");
         fs::write(
             &grok_bin,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n", grok_out.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\n",
+                grok_out.display()
+            ),
         )
         .unwrap();
         fs::set_permissions(&grok_bin, fs::Permissions::from_mode(0o755)).unwrap();

@@ -289,15 +289,14 @@ impl DeliveryReceipt {
         } else {
             None
         };
-        let recipient_name = if !self.recipient_name.is_empty()
-            && !self.recipient_name.starts_with("urn:")
-        {
-            self.recipient_name.clone()
-        } else if !incoming.recipient_name.is_empty() {
-            incoming.recipient_name.clone()
-        } else {
-            self.recipient_name.clone()
-        };
+        let recipient_name =
+            if !self.recipient_name.is_empty() && !self.recipient_name.starts_with("urn:") {
+                self.recipient_name.clone()
+            } else if !incoming.recipient_name.is_empty() {
+                incoming.recipient_name.clone()
+            } else {
+                self.recipient_name.clone()
+            };
         DeliveryReceipt {
             message_id: self.message_id.clone(),
             recipient_id: self.recipient_id.clone(),
@@ -541,10 +540,7 @@ mod tests {
             acked_at: Some(At::from_unix_millis(25)),
         };
 
-        assert_eq!(
-            r_pending.merge(&r_delivered),
-            r_delivered.merge(&r_pending)
-        );
+        assert_eq!(r_pending.merge(&r_delivered), r_delivered.merge(&r_pending));
         let merged_ack_exp = r_expired.merge(&r_acked);
         assert_eq!(merged_ack_exp, r_acked.merge(&r_expired));
         assert_eq!(merged_ack_exp.status, DeliveryStatus::Acked);

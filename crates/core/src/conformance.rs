@@ -3950,11 +3950,7 @@ fn offline_agent_id_collision_alias_preserves_wire_inbox_and_ack<
     s.import_registry_events(&[ev]).unwrap();
 
     // Querying inbox by the new canonical `remote_id` or old `local_ferris.id` or `"ferris"` finds `msg`.
-    for query in [
-        remote_id.as_str(),
-        local_ferris.id.as_str(),
-        "ferris",
-    ] {
+    for query in [remote_id.as_str(), local_ferris.id.as_str(), "ferris"] {
         let inbox = s
             .list_wire_inbox(&WireFilter {
                 recipient: Some(query.to_string()),

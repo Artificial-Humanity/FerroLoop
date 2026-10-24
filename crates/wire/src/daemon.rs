@@ -150,8 +150,8 @@ impl LocalClient {
         if n == 0 {
             return Err("unexpected EOF from fl-wire daemon".into());
         }
-        let resp: LocalResponse =
-            serde_json::from_str(&resp_line).map_err(|e| format!("invalid daemon response: {e}"))?;
+        let resp: LocalResponse = serde_json::from_str(&resp_line)
+            .map_err(|e| format!("invalid daemon response: {e}"))?;
         if let LocalResponse::Error { message } = resp {
             return Err(message);
         }
@@ -348,10 +348,8 @@ where
                             },
                         );
                         self.dispatch_and_propagate(&msg, now);
-                        let latest_receipts = self
-                            .store
-                            .list_wire_receipts(&msg.id)
-                            .unwrap_or(receipts);
+                        let latest_receipts =
+                            self.store.list_wire_receipts(&msg.id).unwrap_or(receipts);
                         (
                             LocalResponse::Sent {
                                 message: msg,
@@ -370,9 +368,7 @@ where
             }
             LocalRequest::Read { filter, ack } => match self.store.list_wire_inbox(&filter) {
                 Ok(mut items) => {
-                    if ack
-                        && let Some(ref rec) = filter.recipient
-                    {
+                    if ack && let Some(ref rec) = filter.recipient {
                         for item in &mut items {
                             if item.receipt.status != DeliveryStatus::Acked
                                 && let Ok(Some(updated)) = self.store.update_wire_receipt(

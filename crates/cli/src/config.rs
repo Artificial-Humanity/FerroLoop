@@ -246,11 +246,7 @@ impl Config {
     ) -> StateSyncTarget {
         let ws = self.state.as_ref();
         let ws_store = self.workspace_state_store(default_store);
-        let cfg_sync_wire = self
-            .wire
-            .as_ref()
-            .and_then(|w| w.sync_wire)
-            .unwrap_or(true);
+        let cfg_sync_wire = self.wire.as_ref().and_then(|w| w.sync_wire).unwrap_or(true);
         if let Some(StateScope::Project(slug)) = scope
             && let Some(entry) = self.find_project_entry(slug)
         {

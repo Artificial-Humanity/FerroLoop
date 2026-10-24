@@ -1885,10 +1885,7 @@ impl MessageStore for MemStore {
                 continue;
             }
             if filter.unread_only
-                && matches!(
-                    rcpt.status,
-                    DeliveryStatus::Acked | DeliveryStatus::Expired
-                )
+                && matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
             {
                 continue;
             }
@@ -1911,8 +1908,7 @@ impl MessageStore for MemStore {
             });
         }
         items.sort_by(|a, b| {
-            (&a.message.id, &a.receipt.recipient_id)
-                .cmp(&(&b.message.id, &b.receipt.recipient_id))
+            (&a.message.id, &a.receipt.recipient_id).cmp(&(&b.message.id, &b.receipt.recipient_id))
         });
         if let Some(limit) = filter.limit
             && items.len() > limit
@@ -1936,7 +1932,10 @@ impl MessageStore for MemStore {
         Ok(out)
     }
 
-    fn list_wire_replies(&self, correlation_id: &MessageId) -> Result<Vec<WireMessage>, StoreError> {
+    fn list_wire_replies(
+        &self,
+        correlation_id: &MessageId,
+    ) -> Result<Vec<WireMessage>, StoreError> {
         let s = self.inner.borrow();
         let mut out = Vec::new();
         for (cid, mid) in &s.wire_replies {
@@ -2013,10 +2012,7 @@ impl MessageStore for MemStore {
         Ok(Some(merged))
     }
 
-    fn wire_messages_after(
-        &self,
-        after_seq: u64,
-    ) -> Result<Vec<(u64, WireMessage)>, StoreError> {
+    fn wire_messages_after(&self, after_seq: u64) -> Result<Vec<(u64, WireMessage)>, StoreError> {
         let s = self.inner.borrow();
         let mut out = Vec::new();
         for (&seq, mid) in s.wire_msg_log.range((after_seq + 1)..) {

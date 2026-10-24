@@ -680,10 +680,7 @@ fn main() {
     std::process::exit(code);
 }
 
-fn run_agent_msg_entry(
-    flag_db: Option<PathBuf>,
-    cli: cmd::wire::AgentMsgCli,
-) -> Result<i32> {
+fn run_agent_msg_entry(flag_db: Option<PathBuf>, cli: cmd::wire::AgentMsgCli) -> Result<i32> {
     let cwd = std::env::current_dir().context("could not determine the current directory")?;
     let cfg = config::load(config::path().as_deref())?;
     let explicit = explicit_db(flag_db);
@@ -1133,10 +1130,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
         Command::Routing(c) => cmd::routing::run(&ctx, c, here_for_store.map(|b| b.is_some())),
-        Command::Mcp(_)
-        | Command::Agent { .. }
-        | Command::State { .. }
-        | Command::Wire { .. } => {
+        Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } | Command::Wire { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };

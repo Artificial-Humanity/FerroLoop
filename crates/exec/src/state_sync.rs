@@ -298,13 +298,12 @@ fn load_snapshot(
                             reason: e.to_string(),
                         }
                     })?;
-                    let msg: WireMessage = serde_json::from_str(&text).map_err(|e| {
-                        StateSyncError::CorruptJsonl {
+                    let msg: WireMessage =
+                        serde_json::from_str(&text).map_err(|e| StateSyncError::CorruptJsonl {
                             path: other.to_owned(),
                             line: 1,
                             reason: e.to_string(),
-                        }
-                    })?;
+                        })?;
                     let expected_rel = wire_message_rel_path(&msg.id);
                     if rel != expected_rel {
                         return Err(StateSyncError::HistoryTampered {
@@ -652,12 +651,11 @@ fn append_receipt_to_segments(segments: &mut BTreeMap<u32, Vec<u8>>, rcpt: &Deli
 
     let latest_seg = segments.keys().next_back().copied().unwrap_or(0);
     let current_len = segments.get(&latest_seg).map_or(0, Vec::len);
-    let target_seg =
-        if current_len > 0 && current_len + line_bytes.len() > MAX_SEGMENT_BYTES {
-            latest_seg + 1
-        } else {
-            latest_seg
-        };
+    let target_seg = if current_len > 0 && current_len + line_bytes.len() > MAX_SEGMENT_BYTES {
+        latest_seg + 1
+    } else {
+        latest_seg
+    };
     segments
         .entry(target_seg)
         .or_default()
@@ -897,7 +895,12 @@ where
                     }
                 }
 
-                (unpublished_msgs, unpublished_rcpts, max_msg_seq, max_rcpt_seq)
+                (
+                    unpublished_msgs,
+                    unpublished_rcpts,
+                    max_msg_seq,
+                    max_rcpt_seq,
+                )
             } else {
                 (
                     Vec::new(),
@@ -1844,8 +1847,18 @@ mod tests {
         assert_eq!(rep_b.imported_wire_receipts, 2);
         assert_eq!(rep_b.published_wire_messages, 0);
         assert_eq!(rep_b.published_wire_receipts, 0);
-        assert!(store_b.get_wire_message(&acked_transient.id).unwrap().is_none());
-        assert!(store_b.get_wire_message(&pending_transient.id).unwrap().is_some());
+        assert!(
+            store_b
+                .get_wire_message(&acked_transient.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store_b
+                .get_wire_message(&pending_transient.id)
+                .unwrap()
+                .is_some()
+        );
         assert!(store_b.get_wire_message(&durable_msg.id).unwrap().is_some());
 
         let inbox = store_b

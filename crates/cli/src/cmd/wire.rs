@@ -26,7 +26,9 @@ use fl_wire::identity::{
 };
 use serde_json::{Value, json};
 
-use crate::cmd::agent::{now_at, render_registry_markdown, resolve_agent, write_atomic_non_symlink};
+use crate::cmd::agent::{
+    now_at, render_registry_markdown, resolve_agent, write_atomic_non_symlink,
+};
 use crate::cmd::state::StateEnv;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
@@ -260,7 +262,11 @@ pub fn resolve_routes_path() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
-pub fn resolve_caller(env: &StateEnv<'_>, explicit: Option<&str>, transcript: Option<&Path>) -> String {
+pub fn resolve_caller(
+    env: &StateEnv<'_>,
+    explicit: Option<&str>,
+    transcript: Option<&Path>,
+) -> String {
     let store = env.open_for_scope(Some(&StateScope::Workspace)).ok();
     let reg = store.as_ref().map(|s| s as &dyn AgentRegistry);
     let rpath = resolve_routes_path();
@@ -295,7 +301,8 @@ pub fn parse_message_id(raw: &str) -> Result<MessageId, String> {
         Ok(MessageId(iri))
     } else {
         let with_prefix = format!("urn:uuid:{trimmed}");
-        let iri = Iri::parse(&with_prefix).map_err(|e| format!("invalid message ID `{raw}`: {e}"))?;
+        let iri =
+            Iri::parse(&with_prefix).map_err(|e| format!("invalid message ID `{raw}`: {e}"))?;
         Ok(MessageId(iri))
     }
 }
@@ -334,9 +341,7 @@ pub fn execute_read(
     }
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
     let mut items = store.list_wire_inbox(&filter).map_err(|e| e.to_string())?;
-    if ack
-        && let Some(ref rec) = filter.recipient
-    {
+    if ack && let Some(ref rec) = filter.recipient {
         let now = now_at();
         for item in &mut items {
             if item.receipt.status != DeliveryStatus::Acked
@@ -479,9 +484,7 @@ fn poll_store_for_reply(
     ask_id: &MessageId,
 ) -> Result<Option<WireMessage>, String> {
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
-    let mut replies = store
-        .list_wire_replies(ask_id)
-        .map_err(|e| e.to_string())?;
+    let mut replies = store.list_wire_replies(ask_id).map_err(|e| e.to_string())?;
     Ok(replies.pop())
 }
 
@@ -663,8 +666,8 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
         } => {
             let parent_id = parse_message_id(&message_id).map_err(|e| (1, e))?;
             let sender_name = resolve_caller(env, from.as_deref(), None);
-            let (msg, receipts) = execute_reply(env, &parent_id, subject, body, sender_name)
-                .map_err(|e| (1, e))?;
+            let (msg, receipts) =
+                execute_reply(env, &parent_id, subject, body, sender_name).map_err(|e| (1, e))?;
             print_sent(&msg, &receipts, json);
             Ok(0)
         }
@@ -891,16 +894,16 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             token_file,
         } => {
             let sock = resolve_socket_path(env, socket.as_deref());
-            let listen_addr = listen
-                .or_else(|| env.cfg.wire.as_ref().and_then(|w| w.listen.clone()));
+            let listen_addr =
+                listen.or_else(|| env.cfg.wire.as_ref().and_then(|w| w.listen.clone()));
             let mut peer_list = peers;
             if peer_list.is_empty()
                 && let Some(cfg_peers) = env.cfg.wire.as_ref().map(|w| &w.peers)
             {
                 peer_list = cfg_peers.clone();
             }
-            let tfile = token_file
-                .or_else(|| env.cfg.wire.as_ref().and_then(|w| w.token_file.clone()));
+            let tfile =
+                token_file.or_else(|| env.cfg.wire.as_ref().and_then(|w| w.token_file.clone()));
             let psk = if let Some(tf) = tfile {
                 std::fs::read_to_string(&tf)
                     .map_err(|e| (1, format!("could not read {}: {e}", tf.display())))?
@@ -917,9 +920,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                 .open_for_scope(Some(&StateScope::Workspace))
                 .map_err(|e| (1, e))?;
             let host = std::env::var("HOSTNAME")
-                .or_else(|_| {
-                    std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string())
-                })
+                .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
                 .unwrap_or_else(|_| "localhost".into());
             let handle = spawn_daemon(
                 Arc::new(store),
@@ -1066,11 +1067,9 @@ pub fn run_vendor_hook(
             .and_then(|s| s.to_str())
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or_else(std::process::id);
-        let key_path = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .and_then(|h| {
-                resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, &socket_path)
-            });
+        let key_path = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+            resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, &socket_path)
+        });
         record_caller_route(
             &hook_env,
             &persona,
@@ -1545,4 +1544,3 @@ mod tests {
         assert!(unread_kacey.is_empty());
     }
 }
-
