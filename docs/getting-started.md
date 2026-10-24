@@ -67,6 +67,7 @@ Commands:
   mcp         A project's MCP servers: one committed catalog, written into each agent CLI's file
   agent       Manage the workspace agent and coverage-area registry
   state       Manage durable memories, handoffs, runtime state, and git state sync
+  wire        Send, read, acknowledge, and relay FerroWire agent messages
   help        Print this message or the help of the given subcommand(s)
 
 Options:

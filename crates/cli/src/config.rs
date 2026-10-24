@@ -176,9 +176,34 @@ pub struct McpEntry {
     pub enable: Vec<String>,
 }
 
+/// Workspace-level `[wire]` configuration (FerroWire spec §5.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WireConfig {
+    /// Optional Unix domain socket path for local daemon IPC.
+    #[serde(default)]
+    pub socket: Option<PathBuf>,
+    /// Optional TCP address for accepting incoming WebSocket peer connections.
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// Optional outbound WebSocket peer/hub URLs (`ws://` or `wss://`).
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// Optional path to file containing the pre-shared bearer token (falls back to `$FL_WIRE_TOKEN`).
+    #[serde(default)]
+    pub token_file: Option<PathBuf>,
+    /// Retention window in days for acknowledged transient messages (default: 30).
+    #[serde(default)]
+    pub retention_days: Option<u64>,
+    /// Whether `fl state sync` exports unacknowledged and durable wire messages (default: true).
+    #[serde(default)]
+    pub sync_wire: Option<bool>,
+}
+
 #[derive(Debug, Default)]
 pub struct Config {
     pub state: Option<StateConfig>,
+    pub wire: Option<WireConfig>,
     pub projects: Vec<Entry>,
     pub github: Option<GithubApp>,
     pub mcp: Vec<McpEntry>,
@@ -211,7 +236,7 @@ impl Config {
         self.workspace_state_store(default_store)
     }
 
-    /// Resolve the `StateSyncTarget` for `fl state sync` / `fl state verify` (spec §4.3).
+    /// Resolve the `StateSyncTarget` for `fl state sync` / `fl state verify` (spec §4.3, FerroWire §5.1).
     pub fn sync_target_for_scope(
         &self,
         scope: Option<&StateScope>,
@@ -221,6 +246,11 @@ impl Config {
     ) -> StateSyncTarget {
         let ws = self.state.as_ref();
         let ws_store = self.workspace_state_store(default_store);
+        let cfg_sync_wire = self
+            .wire
+            .as_ref()
+            .and_then(|w| w.sync_wire)
+            .unwrap_or(true);
         if let Some(StateScope::Project(slug)) = scope
             && let Some(entry) = self.find_project_entry(slug)
         {
@@ -241,13 +271,14 @@ impl Config {
                 .and_then(|s| s.private)
                 .or_else(|| ws.map(|s| s.private))
                 .unwrap_or(false);
-            let sync_registry = entry.store == ws_store;
+            let shares_ws_store = entry.store == ws_store;
             return StateSyncTarget {
                 repo_dir,
                 remote,
                 branch,
                 private,
-                sync_registry,
+                sync_registry: shares_ws_store,
+                sync_wire: shares_ws_store && cfg_sync_wire,
                 scope_filter: Some(StateScope::Project(slug.clone())),
                 by: by.to_string(),
             };
@@ -273,6 +304,7 @@ impl Config {
             branch,
             private,
             sync_registry: true,
+            sync_wire: cfg_sync_wire,
             scope_filter,
             by: by.to_string(),
         }
@@ -284,6 +316,8 @@ impl Config {
 struct File {
     #[serde(default)]
     state: Option<StateConfig>,
+    #[serde(default)]
+    wire: Option<WireConfig>,
     #[serde(default)]
     project: Vec<Entry>,
     #[serde(default)]
@@ -444,8 +478,29 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
             );
         }
     }
+    if let Some(w) = &file.wire {
+        if let Some(s) = &w.socket
+            && !s.is_absolute()
+        {
+            bail!(
+                "{}: `wire.socket` must be an absolute path (got `{}`)",
+                path.display(),
+                s.display()
+            );
+        }
+        if let Some(tf) = &w.token_file
+            && !tf.is_absolute()
+        {
+            bail!(
+                "{}: `wire.token_file` must be an absolute path (got `{}`)",
+                path.display(),
+                tf.display()
+            );
+        }
+    }
     Ok(Config {
         state: file.state,
+        wire: file.wire,
         projects: file.project,
         github: file.github,
         mcp: file.mcp,
@@ -1173,5 +1228,45 @@ mod tests {
             format!("{err:#}").contains("must be an absolute path"),
             "got: {err:#}"
         );
+    }
+
+    #[test]
+    fn parses_wire_config_and_rejects_relative_paths() {
+        let err = load_text("[wire]\nsocket = \"relative/wire.sock\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`wire.socket` must be an absolute path"),
+            "got: {err:#}"
+        );
+        let err2 = load_text("[wire]\ntoken_file = \"relative/token\"\n").unwrap_err();
+        assert!(
+            format!("{err2:#}").contains("`wire.token_file` must be an absolute path"),
+            "got: {err2:#}"
+        );
+
+        let cfg = load_text(
+            "[wire]\n\
+             socket = \"/run/fl/wire.sock\"\n\
+             listen = \"127.0.0.1:4222\"\n\
+             peers = [\"ws://10.0.0.2:4222\"]\n\
+             token_file = \"/etc/fl/token\"\n\
+             retention_days = 14\n\
+             sync_wire = false\n",
+        )
+        .unwrap();
+        let w = cfg.wire.as_ref().unwrap();
+        assert_eq!(w.socket, Some(PathBuf::from("/run/fl/wire.sock")));
+        assert_eq!(w.listen.as_deref(), Some("127.0.0.1:4222"));
+        assert_eq!(w.peers, vec!["ws://10.0.0.2:4222".to_string()]);
+        assert_eq!(w.token_file, Some(PathBuf::from("/etc/fl/token")));
+        assert_eq!(w.retention_days, Some(14));
+        assert_eq!(w.sync_wire, Some(false));
+
+        let target = cfg.sync_target_for_scope(
+            Some(&StateScope::Workspace),
+            Path::new("/tmp"),
+            Path::new("/tmp/default.redb"),
+            "ferris",
+        );
+        assert!(!target.sync_wire);
     }
 }

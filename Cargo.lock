@@ -357,6 +357,7 @@ dependencies = [
  "fl-github",
  "fl-mcp",
  "fl-store",
+ "fl-wire",
  "predicates",
  "serde",
  "serde_json",
@@ -437,6 +438,25 @@ dependencies = [
  "tempfile",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "fl-wire"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "fl-core",
+ "fl-store",
+ "ring",
+ "rustls",
+ "rustls-pki-types",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "webpki-roots",
 ]
 
 [[package]]
