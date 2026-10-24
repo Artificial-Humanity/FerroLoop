@@ -465,10 +465,11 @@ from the private single-IRI `fn check(&self, id: &Iri)` helper in `crates/store/
 
 ## 3. Local daemon, vendor push dispatcher, and cross-boundary relay (`crates/wire`)
 
-A new workspace crate `crates/wire` (`package.name = "fl-wire"`) depends on `fl-core`,
-`fl-store`, `tokio` (`net`, `io-util`, `sync`, `time`, `process`, `signal`),
-`tokio-tungstenite` (with `rustls-tls-webpki-roots`), `ring`, `base64`, `serde`, and
-`serde_json`.
+A new workspace crate `crates/wire` (`package.name = "fl-wire"`) depends only on crates already
+locked in the workspace `Cargo.lock`: `fl-core`, `fl-store`, `rustls`, `rustls-pki-types`,
+`webpki-roots`, `ring`, `base64`, `sha2`, `serde`, and `serde_json`, implementing RFC 6455
+WebSocket framing (`ws://` and `wss://` over `rustls`) and Unix domain socket IPC directly
+without adding external broker or third-party WebSocket dependencies.
 
 ### 3.1 Identity and route resolution (`crates/wire/src/identity.rs`)
 
