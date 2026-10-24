@@ -124,7 +124,9 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
 
             let title = format!("--title={}", format_push_header(msg));
             let mut cmd = Command::new(&exe);
-            cmd.args(["agentapi", "send-message", &title, conversation_id, &msg.body]);
+            cmd.args(["agentapi", "send-message", &title, conversation_id, &msg.body])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             cmd.env("ANTIGRAVITY_CONVERSATION_ID", conversation_id);
             cmd.env("ANTIGRAVITY_AGENTAPI_EXE", &exe);
             if !addr.is_empty() {
@@ -149,7 +151,9 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 thread_id,
                 "--message",
                 &format_push_message(msg),
-            ]);
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
             if let Some(dir) = cwd {
                 cmd.current_dir(dir);
             }
@@ -168,7 +172,9 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             let formatted = format_push_message(msg);
             let mut cmd = Command::new(&bin);
             cmd.env("MUSE_NO_AUTO_UPDATE", "1");
-            cmd.args(["exec", "--session-id", session_id, "--json", &formatted]);
+            cmd.args(["exec", "--session-id", session_id, "--json", &formatted])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
             if let Some(dir) = cwd
                 && dir.exists()
             {
@@ -196,7 +202,9 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 session_id,
                 "-p",
                 &formatted,
-            ]);
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
             if let Some(dir) = cwd
                 && dir.exists()
             {

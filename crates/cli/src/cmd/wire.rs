@@ -1412,6 +1412,11 @@ mod tests {
     #[test]
     fn test_wire_cli_send_read_ack_reply_and_agent_msg_compat() {
         let dir = tempfile::tempdir().unwrap();
+        // SAFETY: isolates test from discovering host agent routes.
+        unsafe {
+            std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+            std::env::set_var("FL_WIRE_ROUTES", dir.path().join("routes.json"));
+        }
         let db = dir.path().join("fl.redb");
         let sock = dir.path().join("wire.sock");
         let cfg = Config {

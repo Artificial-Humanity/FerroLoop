@@ -97,6 +97,7 @@ impl RouteTable {
             .unwrap_or_else(default_routes_path);
         let mut table = Self::load_file(&primary).unwrap_or_default();
         if custom_path.is_none()
+            && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
             && let Some(legacy) = legacy_routes_path()
             && let Some(legacy_table) = Self::load_file(&legacy)
         {
@@ -189,15 +190,21 @@ impl RouteTable {
 
     /// Passively discover Claude, Antigravity, Codex, Meta Muse, and xAI Grok routes from vendor session files.
     pub fn discover_routes(&mut self, home_override: Option<&Path>, at: At) {
+        if home_override.is_none()
+            && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() == Ok("1")
+        {
+            return;
+        }
         let home = home_override
             .map(Path::to_path_buf)
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
         let Some(home) = home else {
             return;
         };
-        let check_proc = home_override.is_none();
+        let check_proc = home_override.is_none()
+            && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1");
         self.discover_claude_routes(&home, check_proc, &at);
-        self.discover_agy_routes(&home, &at);
+        self.discover_agy_routes(&home, check_proc, &at);
         self.discover_codex_routes(&home, &at);
         self.discover_muse_routes(&home, home_override.is_some(), &at);
         self.discover_grok_routes(&home, &at);
@@ -257,8 +264,12 @@ impl RouteTable {
         }
     }
 
-    fn discover_agy_routes(&mut self, home: &Path, at: &At) {
+    fn discover_agy_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
         let agy_dir = home.join(".gemini").join("antigravity-cli");
+        let brain_dir = agy_dir.join("brain");
+        if !brain_dir.is_dir() {
+            return;
+        }
         let mut shared_ls_addr: Option<String> = None;
         let mut shared_csrf: Option<String> = None;
         let mut shared_exe: Option<PathBuf> = None;
@@ -298,7 +309,8 @@ impl RouteTable {
             }
         }
 
-        if (shared_csrf.is_none() || shared_ls_addr.is_none())
+        if check_proc
+            && (shared_csrf.is_none() || shared_ls_addr.is_none())
             && let Ok(proc_dir) = fs::read_dir("/proc")
         {
             for entry in proc_dir.flatten() {
@@ -360,7 +372,6 @@ impl RouteTable {
         }
 
         // Scan brain/*/transcript.jsonl for persona registrations
-        let brain_dir = agy_dir.join("brain");
         let Ok(read_dir) = fs::read_dir(&brain_dir) else {
             return;
         };

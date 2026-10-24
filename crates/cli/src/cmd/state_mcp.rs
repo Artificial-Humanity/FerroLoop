@@ -6,6 +6,10 @@
 use std::io::{BufRead, Write};
 
 use fl_core::agent::{AgentRole, RegisterAgentArgs, reports_to};
+use fl_core::at::At;
+use fl_core::ferrowire::{
+    MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter,
+};
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
@@ -13,11 +17,16 @@ use fl_core::state::{
 };
 use fl_core::store::{AgentRegistry, StateStore};
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use crate::cmd::agent::now_at;
 use crate::cmd::state::{
     DEFAULT_RENDER_MAX_BYTES, StateEnv, parse_concern, parse_memory_basis, parse_memory_category,
     parse_merge_mode, render_state_markdown, resolve_state_in_store,
+};
+use crate::cmd::wire::{
+    execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
+    parse_message_id, resolve_caller, wait_for_reply,
 };
 
 fn parse_memory_lifecycle(s: &str) -> Result<MemoryLifecycle, String> {
@@ -517,6 +526,210 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 .map_err(|e| e.to_string())?;
             Ok(serde_json::to_string_pretty(&entry).unwrap())
         }
+        "send_message" => {
+            let to_raw = args
+                .get("to")
+                .or_else(|| args.get("recipient"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| "missing required string argument `to`".to_string())?;
+            let to = WireAddress::parse(to_raw).map_err(|e| e.to_string())?;
+            let subject = req_str(args, "subject")?.to_string();
+            let body = req_str(args, "body")?.to_string();
+            let kind = match args.get("kind").and_then(Value::as_str) {
+                Some(k) => MessageKind::from_wire(k).ok_or_else(|| {
+                    format!(
+                        "unknown message kind `{k}`; expected one of: {}",
+                        MessageKind::wire_values()
+                    )
+                })?,
+                None => MessageKind::Mail,
+            };
+            let urgent = args.get("urgent").and_then(Value::as_bool).unwrap_or(false);
+            let durable = args
+                .get("durable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let thread_id = args
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .map(parse_message_id)
+                .transpose()?;
+            let from_agent = args.get("from_agent").and_then(Value::as_str);
+            let sender_name = resolve_caller(env, from_agent, None);
+            let urgency = if urgent {
+                MessageUrgency::Urgent
+            } else {
+                MessageUrgency::Normal
+            };
+            let (msg, receipts) = execute_send(
+                env,
+                SendWireArgs {
+                    id: None,
+                    sender_id: None,
+                    sender_name,
+                    sender_host: None,
+                    to,
+                    kind,
+                    urgency,
+                    durable,
+                    subject,
+                    body,
+                    reply_to: None,
+                    thread_id,
+                    deadline_at: None,
+                    at: now_at(),
+                },
+            )?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "sent",
+                "message": msg,
+                "receipts": receipts,
+            }))
+            .unwrap())
+        }
+        "broadcast_message" => {
+            let subject = req_str(args, "subject")?.to_string();
+            let body = req_str(args, "body")?.to_string();
+            let urgent = args.get("urgent").and_then(Value::as_bool).unwrap_or(false);
+            let durable = args
+                .get("durable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let from_agent = args.get("from_agent").and_then(Value::as_str);
+            let sender_name = resolve_caller(env, from_agent, None);
+            let urgency = if urgent {
+                MessageUrgency::Urgent
+            } else {
+                MessageUrgency::Normal
+            };
+            let (msg, receipts) = execute_send(
+                env,
+                SendWireArgs {
+                    id: None,
+                    sender_id: None,
+                    sender_name,
+                    sender_host: None,
+                    to: WireAddress::All,
+                    kind: MessageKind::Mail,
+                    urgency,
+                    durable,
+                    subject,
+                    body,
+                    reply_to: None,
+                    thread_id: None,
+                    deadline_at: None,
+                    at: now_at(),
+                },
+            )?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "broadcast",
+                "message": msg,
+                "receipts": receipts,
+            }))
+            .unwrap())
+        }
+        "ask_message" => {
+            let to = WireAddress::parse(req_str(args, "to")?).map_err(|e| e.to_string())?;
+            let subject = req_str(args, "subject")?.to_string();
+            let body = req_str(args, "body")?.to_string();
+            let timeout_secs = args.get("timeout_secs").and_then(Value::as_u64);
+            let from_agent = args.get("from_agent").and_then(Value::as_str);
+            let sender_name = resolve_caller(env, from_agent, None);
+            let now_ms = now_millis();
+            let now = At::from_unix_millis(now_ms);
+            let deadline_at =
+                timeout_secs.map(|s| At::from_unix_millis(now_ms + s * 1000));
+            let (ask_msg, receipts) = execute_send(
+                env,
+                SendWireArgs {
+                    id: None,
+                    sender_id: None,
+                    sender_name: sender_name.clone(),
+                    sender_host: None,
+                    to,
+                    kind: MessageKind::Ask,
+                    urgency: MessageUrgency::Normal,
+                    durable: true,
+                    subject,
+                    body,
+                    reply_to: None,
+                    thread_id: None,
+                    deadline_at,
+                    at: now,
+                },
+            )?;
+            if let Some(secs) = timeout_secs {
+                let reply =
+                    wait_for_reply(env, &ask_msg.id, &sender_name, Duration::from_secs(secs))?;
+                Ok(serde_json::to_string_pretty(&json!({
+                    "ask": ask_msg,
+                    "receipts": receipts,
+                    "reply": reply,
+                }))
+                .unwrap())
+            } else {
+                Ok(serde_json::to_string_pretty(&json!({
+                    "ask": ask_msg,
+                    "receipts": receipts,
+                }))
+                .unwrap())
+            }
+        }
+        "reply_message" => {
+            let parent_id = parse_message_id(req_str(args, "message_id")?)?;
+            let body = req_str(args, "body")?.to_string();
+            let subject = args
+                .get("subject")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let from_agent = args.get("from_agent").and_then(Value::as_str);
+            let sender_name = resolve_caller(env, from_agent, None);
+            let (msg, receipts) = execute_reply(env, &parent_id, subject, body, sender_name)?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "replied",
+                "message": msg,
+                "receipts": receipts,
+            }))
+            .unwrap())
+        }
+        "get_messages" => {
+            let unread_only = args
+                .get("unread_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let ack = args.get("ack").and_then(Value::as_bool).unwrap_or(false);
+            let agent = args.get("agent").and_then(Value::as_str);
+            let recipient = resolve_caller(env, agent, None);
+            let thread_id = args
+                .get("thread_id")
+                .and_then(Value::as_str)
+                .map(parse_message_id)
+                .transpose()?;
+            let items = execute_read(
+                env,
+                WireFilter {
+                    recipient: Some(recipient),
+                    unread_only,
+                    thread_id,
+                    correlation_id: None,
+                    limit: None,
+                },
+                ack,
+            )?;
+            let out: Vec<Value> = items.iter().map(inbox_item_to_json).collect();
+            Ok(serde_json::to_string_pretty(&out).unwrap())
+        }
+        "ack_message" => {
+            let mid = parse_message_id(req_str(args, "message_id")?)?;
+            let agent = args.get("agent").and_then(Value::as_str);
+            let recipient = resolve_caller(env, agent, None);
+            let receipts = execute_ack(env, vec![mid], recipient)?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": "acknowledged",
+                "receipts": receipts,
+            }))
+            .unwrap())
+        }
         other => Err(format!("unknown tool `{other}`")),
     }
 }
@@ -648,6 +861,94 @@ fn tool_definitions() -> Value {
                     "sensitive": { "type": "boolean" },
                     "clear_sensitive": { "type": "boolean" },
                     "by": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "send_message",
+            "description": "Send a FerroWire message to an agent persona, AgentId URN, or group selector (@all, @area:<slug>, @role:<role>, @area:<slug>/<role>).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["to", "subject", "body"],
+                "properties": {
+                    "to": { "type": "string" },
+                    "recipient": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "urgent": { "type": "boolean" },
+                    "durable": { "type": "boolean" },
+                    "thread_id": { "type": "string" },
+                    "from_agent": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "broadcast_message",
+            "description": "Broadcast a FerroWire message to all active agents (@all), excluding the sender.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["subject", "body"],
+                "properties": {
+                    "subject": { "type": "string" },
+                    "body": { "type": "string" },
+                    "urgent": { "type": "boolean" },
+                    "durable": { "type": "boolean" },
+                    "from_agent": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "ask_message",
+            "description": "Send a durable Ask message and optionally wait for a correlated Reply.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["to", "subject", "body"],
+                "properties": {
+                    "to": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "body": { "type": "string" },
+                    "timeout_secs": { "type": "integer" },
+                    "from_agent": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "reply_message",
+            "description": "Reply to a FerroWire message by MessageId, inheriting its thread and correlation ID.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["message_id", "body"],
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "body": { "type": "string" },
+                    "subject": { "type": "string" },
+                    "from_agent": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "get_messages",
+            "description": "Read FerroWire inbox messages for the caller or specified agent.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "unread_only": { "type": "boolean", "default": true },
+                    "ack": { "type": "boolean", "default": false },
+                    "agent": { "type": "string" },
+                    "thread_id": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "ack_message",
+            "description": "Acknowledge a FerroWire message by MessageId.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["message_id"],
+                "properties": {
+                    "message_id": { "type": "string" },
+                    "agent": { "type": "string" }
                 }
             }
         }
