@@ -575,8 +575,17 @@ In `crates/mcp/src/sync.rs`:
       }
   }
   ```
-- Update any unit tests in `crates/mcp/src/sync.rs` and `crates/cli/tests/mcp.rs` that assert 3 vendor targets/records (`IGNORED` in `crates/cli/tests/mcp.rs` adds `/.muse/settings.json\n/.grok/config.toml\n`, `MUSE = ".muse/settings.json"`, `GROK = ".grok/config.toml"` added to `Secrets::texts()` and the project directory allowlist, and vendor record counts updated from `3` to `5`).
-- Update `docs/mcp.md` to list `.muse/settings.json` and `.grok/config.toml` alongside `.mcp.json`, `.codex/config.toml`, and `.agents/mcp_config.json`.
+- Update existing unit and black-box tests that assert the 3-vendor `VendorName::ALL` list:
+  - `crates/mcp/src/catalog.rs`:
+    - Line 976: update `assert_eq!(VendorName::ALL.map(VendorName::as_str), ["claude", "codex", "antigravity", "muse", "grok"]);`.
+    - Line 1358: update the serde unknown-variant expectation to ``expected one of `claude`, `codex`, `antigravity`, `muse`, `grok` ``.
+  - `crates/mcp/src/sync.rs`:
+    - `the_plan_prints_each_target_its_actions_and_each_refusal` (lines 1849–1877): include the rendered `Muse` and `Grok` global/project target blocks and the `Grok cannot run server \`events\`: ...` refusal line.
+    - `a_vendor_that_cannot_run_a_server_skips_it_and_the_others_still_get_it` (lines 1904–1915): include `(VendorName::Grok, "events")` in `plan.skipped()` and update the record directory entry count from `3` to `4` (`Claude`, `Muse`, `Grok` does not write when skipped, plus `sync.lock` / active vendor records).
+    - `a_record_holds_each_entry_s_name_root_and_hash_only` (line 1940): update `assert_eq!(names.len(), 6)` (5 vendor records + `sync.lock`).
+  - `crates/cli/tests/mcp.rs`:
+    - Add `/.muse/settings.json\n/.grok/config.toml\n` to `IGNORED`, define `MUSE = ".muse/settings.json"` and `GROK = ".grok/config.toml"`, include them in `Secrets::texts()` and the project directory allowlist, and update default-target tests (`status_reports_drift...`, `offline_keeps_every_target_steady...`, etc.) to account for 5 vendors.
+- Update `docs/mcp.md` to list `.muse/settings.json` (`` `muse` ``) and `.grok/config.toml` (`` `grok` ``) with backticked vendor names so `the_docs_name_every_fl_mcp_command_and_every_catalog_field` in `crates/cli/tests/mcp.rs` passes.
 
 - [ ] **Step 5: Run tests and commit Task 1**
 
@@ -1072,6 +1081,7 @@ In `crates/core/tests/wire_refs.rs`, add `AttemptHeartbeat` with `floor = 3` ins
 
 ```rust
     assert_every_reference_refuses_a_handle(
+        "AttemptHeartbeat",
         &fl_core::telemetry::AttemptHeartbeat {
             attempt_id: seq_iri(1),
             project: ProjectId(seq_iri(2)),
@@ -1144,7 +1154,7 @@ use uuid::Uuid;
 pub const EXCERPT_LIMIT: usize = 8192;
 const SPAWN_RETRY_LIMIT: u32 = 20;
 const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(2);
-const HEARTBEAT_TICK: Duration = Duration::from_secs(2);
+const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedOutput {
@@ -1168,9 +1178,11 @@ pub struct ProcessHarness<D: CliDialect> {
     pub dialect: D,
     pub rate_card: Option<RateCard>,
     pub liveness_sink: Option<LivenessSink>,
+    pub attempt_id: Option<Iri>,
     pub project: Option<ProjectId>,
     pub agent: Option<String>,
     pub host: String,
+    pub heartbeat_interval: Duration,
 }
 
 impl<D: CliDialect> ProcessHarness<D> {
@@ -1180,9 +1192,11 @@ impl<D: CliDialect> ProcessHarness<D> {
             dialect,
             rate_card: None,
             liveness_sink: None,
+            attempt_id: None,
             project: None,
             agent: None,
             host: detect_host(),
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
         }
     }
 
@@ -1191,12 +1205,19 @@ impl<D: CliDialect> ProcessHarness<D> {
         self
     }
 
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+
     pub fn with_liveness(
         mut self,
+        attempt_id: Iri,
         project: ProjectId,
         agent: Option<String>,
         sink: LivenessSink,
     ) -> Self {
+        self.attempt_id = Some(attempt_id);
         self.project = Some(project);
         self.agent = agent;
         self.liveness_sink = Some(sink);
@@ -1204,14 +1225,55 @@ impl<D: CliDialect> ProcessHarness<D> {
     }
 
     pub async fn run(&self, spec: AttemptSpec) -> AttemptOutcome {
+        let attempt_id = self.attempt_id.clone().unwrap_or_else(|| {
+            Iri::parse(format!("urn:uuid:{}", Uuid::new_v4()))
+                .expect("uuid v4 forms a valid urn:uuid IRI")
+        });
+        let fallback_project = ProjectId(
+            Iri::parse("urn:uuid:00000000-0000-4000-8000-000000000000")
+                .expect("static urn is valid"),
+        );
+        let project = self.project.clone().unwrap_or(fallback_project);
+
+        let emit = |hb: &AttemptHeartbeat| {
+            if let Some(sink) = &self.liveness_sink {
+                sink(hb);
+            }
+        };
+
+        let started_wall = now_at();
+        let mut hb = AttemptHeartbeat {
+            attempt_id,
+            project,
+            record: spec.record.clone(),
+            adapter: self.dialect.kind().as_wire().to_owned(),
+            agent: self.agent.clone(),
+            host: self.host.clone(),
+            pid: 0,
+            started_at: started_wall.clone(),
+            heartbeat_at: started_wall,
+            status: LivenessStatus::Live,
+            outcome: None,
+            exit_at: None,
+            duration_ms: 0,
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_usd_micros: 0,
+        };
+
         if spec.budget_usd_micros == 0 {
+            let now = now_at();
+            hb.heartbeat_at = now.clone();
+            hb.exit_at = Some(now);
+            hb.status = LivenessStatus::Exited;
+            hb.outcome = Some(AttemptStatus::Refused);
+            emit(&hb);
             return AttemptOutcome::refused(
                 "the attempt's spend ceiling is zero, so nothing was started",
             );
         }
 
         let snap_before = GitSnapshot::capture(&spec.project_root).await;
-        let started_wall = now_at();
         let started = Instant::now();
 
         let mut cmd = Command::new(&self.binary);
@@ -1233,6 +1295,12 @@ impl<D: CliDialect> ProcessHarness<D> {
                     tokio::time::sleep(SPAWN_RETRY_DELAY).await;
                 }
                 Err(e) => {
+                    let now = now_at();
+                    hb.heartbeat_at = now.clone();
+                    hb.exit_at = Some(now);
+                    hb.status = LivenessStatus::Exited;
+                    hb.outcome = Some(AttemptStatus::Refused);
+                    emit(&hb);
                     return AttemptOutcome::refused(format!(
                         "could not start `{}`: {e}",
                         self.binary
@@ -1241,58 +1309,49 @@ impl<D: CliDialect> ProcessHarness<D> {
             }
         };
 
-        let pid = child.id().unwrap_or(0);
-        let attempt_id = Iri::parse(format!("urn:uuid:{}", Uuid::new_v4()))
-            .expect("uuid v4 forms a valid urn:uuid IRI");
-        let fallback_project = ProjectId(
-            Iri::parse("urn:uuid:00000000-0000-4000-8000-000000000000")
-                .expect("static urn is valid"),
-        );
-        let project = self.project.clone().unwrap_or(fallback_project);
-
-        let emit = |hb: &AttemptHeartbeat| {
-            if let Some(sink) = &self.liveness_sink {
-                sink(hb);
-            }
-        };
-
-        let mut hb = AttemptHeartbeat {
-            attempt_id,
-            project,
-            record: spec.record.clone(),
-            adapter: self.dialect.kind().as_wire().to_owned(),
-            agent: self.agent.clone(),
-            host: self.host.clone(),
-            pid,
-            started_at: started_wall,
-            heartbeat_at: now_at(),
-            status: LivenessStatus::Live,
-            outcome: None,
-            exit_at: None,
-            duration_ms: 0,
-            tokens_in: 0,
-            tokens_out: 0,
-            cost_usd_micros: 0,
-        };
+        hb.pid = child.id().unwrap_or(0);
+        hb.heartbeat_at = now_at();
         emit(&hb);
 
         let mut stdout_pipe = child.stdout.take().expect("stdout piped");
         let mut stderr_pipe = child.stderr.take().expect("stderr piped");
 
+        let stdout_buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let stderr_buf = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+
+        let stdout_buf_writer = Arc::clone(&stdout_buf);
         let stdout_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stdout_pipe.read_to_end(&mut buf).await;
-            buf
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stdout_pipe.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut guard) = stdout_buf_writer.lock() {
+                            guard.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+            }
         });
+
+        let stderr_buf_writer = Arc::clone(&stderr_buf);
         let stderr_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let _ = stderr_pipe.read_to_end(&mut buf).await;
-            buf
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stderr_pipe.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut guard) = stderr_buf_writer.lock() {
+                            guard.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+            }
         });
 
         let limit = Duration::from_secs(spec.timeout_secs.max(1));
         let deadline = tokio::time::Instant::now() + limit;
-        let mut interval = tokio::time::interval(HEARTBEAT_TICK);
+        let mut interval = tokio::time::interval(self.heartbeat_interval);
         interval.tick().await; // consume immediate first tick
 
         let wait_result = loop {
@@ -1304,8 +1363,21 @@ impl<D: CliDialect> ProcessHarness<D> {
                     break None;
                 }
                 _ = interval.tick() => {
+                    let (so, se) = (
+                        stdout_buf.lock().map(|g| g.clone()).unwrap_or_default(),
+                        stderr_buf.lock().map(|g| g.clone()).unwrap_or_default(),
+                    );
+                    let partial = self.dialect.parse_output(&so, &se);
+                    let partial_cost = self.rate_card.unwrap_or_default().resolve_cost(
+                        partial.tokens_in,
+                        partial.tokens_out,
+                        partial.vendor_cost_usd_micros,
+                    );
                     hb.heartbeat_at = now_at();
                     hb.duration_ms = started.elapsed().as_millis() as u64;
+                    hb.tokens_in = partial.tokens_in;
+                    hb.tokens_out = partial.tokens_out;
+                    hb.cost_usd_micros = partial_cost;
                     emit(&hb);
                 }
             }
@@ -1317,23 +1389,17 @@ impl<D: CliDialect> ProcessHarness<D> {
         }
 
         let duration_ms = started.elapsed().as_millis() as u64;
-        let stdout_bytes = timeout(Duration::from_millis(200), stdout_task)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
-        let stderr_bytes = timeout(Duration::from_millis(200), stderr_task)
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or_default();
+        let _ = timeout(Duration::from_millis(200), stdout_task).await;
+        let _ = timeout(Duration::from_millis(200), stderr_task).await;
+
+        let stdout_bytes = stdout_buf.lock().map(|g| g.clone()).unwrap_or_default();
+        let stderr_bytes = stderr_buf.lock().map(|g| g.clone()).unwrap_or_default();
 
         let parsed = self.dialect.parse_output(&stdout_bytes, &stderr_bytes);
-        let cost_usd_micros = RateCard::resolve_cost(
-            parsed.vendor_cost_usd_micros,
+        let cost_usd_micros = self.rate_card.unwrap_or_default().resolve_cost(
             parsed.tokens_in,
             parsed.tokens_out,
-            self.rate_card.as_ref(),
+            parsed.vendor_cost_usd_micros,
         );
         let paths_touched = match snap_before {
             Some(before) => before.diff_after(&spec.project_root).await,
@@ -1436,14 +1502,28 @@ pub fn extract_usage_from_value(
     tokens_in: &mut u64,
     tokens_out: &mut u64,
     vendor_cost_micros: &mut Option<u64>,
-     accumulate_tokens: bool,
+    accumulate_tokens: bool,
 ) {
     if let Some(usage) = v.get("usage").or_else(|| v.get("stats")) {
-        let in_tok = usage
+        let base_in = usage
             .get("input_tokens")
             .or_else(|| usage.get("prompt_tokens"))
             .or_else(|| usage.get("tokens_in"))
             .and_then(|n| n.as_u64());
+        let cache_create = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0);
+        let in_tok = base_in
+            .map(|b| b.saturating_add(cache_create).saturating_add(cache_read))
+            .or_else(|| {
+                (cache_create > 0 || cache_read > 0)
+                    .then(|| cache_create.saturating_add(cache_read))
+            });
         let out_tok = usage
             .get("output_tokens")
             .or_else(|| usage.get("completion_tokens"))
@@ -1578,11 +1658,32 @@ pub fn parse_json_or_jsonl_envelope(
     }
 }
 
-fn extract_text_from_object(val: &serde_json::Value) -> Option<String> {
+pub fn extract_text_from_object(val: &serde_json::Value) -> Option<String> {
     for key in ["result", "response", "output", "text", "content", "message"] {
         if let Some(s) = val.get(key).and_then(|v| v.as_str()) {
             return Some(s.to_owned());
         }
+    }
+    if let Some(msg) = val.get("message") {
+        if let Some(s) = msg.get("content").and_then(|v| v.as_str()) {
+            return Some(s.to_owned());
+        }
+        if let Some(arr) = msg.get("content").and_then(|v| v.as_array()) {
+            let parts: Vec<&str> = arr
+                .iter()
+                .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                .collect();
+            if !parts.is_empty() {
+                return Some(parts.join("\n"));
+            }
+        }
+    }
+    if let Some(choices) = val.get("choices").and_then(|v| v.as_array())
+        && let Some(first) = choices.first()
+        && let Some(msg) = first.get("message")
+        && let Some(s) = msg.get("content").and_then(|v| v.as_str())
+    {
+        return Some(s.to_owned());
     }
     if let Some(item) = val.get("item") {
         if let Some(s) = item.get("text").and_then(|v| v.as_str()) {
@@ -1600,6 +1701,10 @@ fn append_stderr(mut base: String, stderr: &str) -> String {
         base.push_str(stderr);
     }
     base
+}
+
+fn is_ignored_fl_path(path: &str) -> bool {
+    path == ".fl" || path.starts_with(".fl/")
 }
 
 #[derive(Debug, Clone)]
@@ -1641,6 +1746,9 @@ impl GitSnapshot {
         let mut touched = BTreeSet::new();
 
         for (path, after_digest) in &after.dirty {
+            if is_ignored_fl_path(path) {
+                continue;
+            }
             match self.dirty.get(path) {
                 None => {
                     touched.insert(path.clone());
@@ -1663,7 +1771,10 @@ impl GitSnapshot {
         {
             for entry in diff_out.stdout.split(|b| *b == 0) {
                 if !entry.is_empty() {
-                    touched.insert(String::from_utf8_lossy(entry).into_owned());
+                    let p = String::from_utf8_lossy(entry).into_owned();
+                    if !is_ignored_fl_path(&p) {
+                        touched.insert(p);
+                    }
                 }
             }
         } else if self.head.is_none()
@@ -1677,12 +1788,18 @@ impl GitSnapshot {
         {
             for entry in tree_out.stdout.split(|b| *b == 0) {
                 if !entry.is_empty() {
-                    touched.insert(String::from_utf8_lossy(entry).into_owned());
+                    let p = String::from_utf8_lossy(entry).into_owned();
+                    if !is_ignored_fl_path(&p) {
+                        touched.insert(p);
+                    }
                 }
             }
         }
 
         for (path, before_digest) in &self.dirty {
+            if is_ignored_fl_path(path) {
+                continue;
+            }
             if !after.dirty.contains_key(path) {
                 let current_digest = hash_worktree_path(&root.join(path));
                 if &current_digest != before_digest {
@@ -1708,15 +1825,19 @@ fn parse_porcelain_z_and_hash(
         let xy = &field[0..2];
         let path_bytes = &field[3..];
         let path = String::from_utf8_lossy(path_bytes).into_owned();
-        let digest = hash_worktree_path(&root.join(&path));
-        map.insert(path, digest);
+        if !is_ignored_fl_path(&path) {
+            let digest = hash_worktree_path(&root.join(&path));
+            map.insert(path, digest);
+        }
         if xy[0] == b'R' || xy[0] == b'C' || xy[1] == b'R' || xy[1] == b'C' {
             if let Some(orig_bytes) = fields.next()
                 && !orig_bytes.is_empty()
             {
                 let orig_path = String::from_utf8_lossy(orig_bytes).into_owned();
-                let orig_digest = hash_worktree_path(&root.join(&orig_path));
-                map.insert(orig_path, orig_digest);
+                if !is_ignored_fl_path(&orig_path) {
+                    let orig_digest = hash_worktree_path(&root.join(&orig_path));
+                    map.insert(orig_path, orig_digest);
+                }
             }
         }
     }
@@ -1763,11 +1884,11 @@ Update `crates/exec/src/adapters/claude.rs` so `ClaudeAdapter` wraps `ProcessHar
   ]
   ```
 - `ClaudeDialect::parse_output(stdout, stderr)` calls `parse_json_or_jsonl_envelope(stdout, stderr, false)`.
-- `ClaudeAdapter` provides `new(binary: String)`, `with_rate_card(mut self, rate_card: Option<RateCard>) -> Self`, and `with_liveness(mut self, project: ProjectId, agent: Option<String>, sink: LivenessSink) -> Self`.
+- `ClaudeAdapter` provides `new(binary: String)`, `with_rate_card(mut self, rate_card: Option<RateCard>) -> Self`, `with_heartbeat_interval(mut self, interval: Duration) -> Self`, and `with_liveness(mut self, attempt_id: Iri, project: ProjectId, agent: Option<String>, sink: LivenessSink) -> Self`.
 - Keep all 6 existing tests in `crates/exec/src/adapters/claude.rs` and add unit tests for:
-  1. Parsing a real Claude JSON result (`{"type":"result","result":"done","total_cost_usd":0.012345,"usage":{"input_tokens":120,"output_tokens":45}}`) into `tokens_in = 120`, `tokens_out = 45`, `cost_usd_micros = 12_345`, `output_excerpt = "done"`.
+  1. Parsing a real Claude JSON result (`{"type":"result","result":"done","total_cost_usd":0.012345,"usage":{"input_tokens":120,"cache_creation_input_tokens":30,"cache_read_input_tokens":10,"output_tokens":45}}`) into `tokens_in = 160`, `tokens_out = 45`, `cost_usd_micros = 12_345`, `output_excerpt = "done"`.
   2. Falling back to `RateCard` when `total_cost_usd` is absent.
-  3. Recording `paths_touched` when the stub script modifies a file inside a temporary git repo.
+  3. Recording `paths_touched` when the stub script modifies a file inside a temporary git repo (while ignoring `.fl/` paths).
 
 - [ ] **Step 3: Run tests and commit Task 3**
 
@@ -1811,27 +1932,24 @@ Create `crates/exec/src/adapters/codex.rs`:
   ]
   ```
 - `CodexDialect::parse_output(&self, stdout: &[u8], stderr: &[u8]) -> ParsedOutput`:
-  - Iterates JSONL lines in `stdout`.
-  - When a line is JSON with `"type": "turn.completed"` and `"usage"`, adds `usage.input_tokens` to `tokens_in` and `usage.output_tokens` to `tokens_out`, plus optional `cost_usd` / `cost_usd_micros`.
-  - Also supports generic `extract_usage_from_value` if `"type"` is not `"turn.completed"`.
-  - Collects text from `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}` or top-level `"result"` / `"message"` / `"text"`.
-  - Falls back to `parse_json_or_jsonl_envelope(stdout, stderr, true)` when no Codex-specific events are present.
+  - Iterates JSONL lines in `stdout` using `extract_usage_from_value(&val, &mut tokens_in, &mut tokens_out, &mut vendor_cost, true)` and `extract_text_from_object(&val)`, which accumulates `usage.input_tokens` and `usage.output_tokens` across `turn.completed` events and extracts `item.text` from `item.completed` events.
+- `CodexAdapter` wraps `ProcessHarness<CodexDialect>` with `new(binary: String)`, `with_rate_card`, `with_heartbeat_interval`, and `with_liveness(mut self, attempt_id: Iri, project: ProjectId, agent: Option<String>, sink: LivenessSink) -> Self`.
 - Include unit tests in `crates/exec/src/adapters/codex.rs` testing `turn.completed` + `item.completed` JSONL parsing, `RateCard` cost calculation, missing binary refusal, zero budget refusal, and timeout handling.
 
 - [ ] **Step 2: Implement `crates/exec/src/adapters/antigravity.rs`, `muse.rs`, and `grok.rs`**
 
 1. Create `crates/exec/src/adapters/antigravity.rs`:
    - `AntigravityDialect`: `AdapterKind::Antigravity`, default binary `"agy"`, `argv`: `vec!["-p".into(), spec.instruction.clone(), "--output-format".into(), "json".into()]`, `parse_output`: `parse_json_or_jsonl_envelope(stdout, stderr, false)`.
-   - `AntigravityAdapter` wrapping `ProcessHarness<AntigravityDialect>`, implementing `Runner` (`id() -> "antigravity"`).
+   - `AntigravityAdapter` wrapping `ProcessHarness<AntigravityDialect>`, with `new`, `with_rate_card`, `with_heartbeat_interval`, `with_liveness(attempt_id, project, agent, sink)`, and implementing `Runner` (`id() -> "antigravity"`).
    - Unit tests for JSON output parsing, `RateCard` fallback, zero budget refusal, and missing binary refusal.
 2. Create `crates/exec/src/adapters/muse.rs`:
    - `MuseDialect`: `AdapterKind::Muse`, default binary `"muse"`, `argv`: `vec!["exec".into(), "--json".into(), spec.instruction.clone()]`, `parse_output`: `parse_json_or_jsonl_envelope(stdout, stderr, true)`.
-   - `MuseAdapter` wrapping `ProcessHarness<MuseDialect>`, implementing `Runner` (`id() -> "muse"`).
+   - `MuseAdapter` wrapping `ProcessHarness<MuseDialect>`, with `new`, `with_rate_card`, `with_heartbeat_interval`, `with_liveness(attempt_id, project, agent, sink)`, and implementing `Runner` (`id() -> "muse"`).
    - Unit tests for JSON/JSONL output parsing, `RateCard` fallback, zero budget refusal, and missing binary refusal.
 3. Create `crates/exec/src/adapters/grok.rs`:
    - `GrokDialect`: `AdapterKind::Grok`, default binary `"grok"`, `argv`: `vec!["-p".into(), spec.instruction.clone(), "--output-format".into(), "json".into()]`, `parse_output`: `parse_json_or_jsonl_envelope(stdout, stderr, false)`.
-   - `GrokAdapter` wrapping `ProcessHarness<GrokDialect>`, implementing `Runner` (`id() -> "grok"`).
-   - Unit tests for JSON output parsing, `RateCard` fallback, zero budget refusal, and missing binary refusal.
+   - `GrokAdapter` wrapping `ProcessHarness<GrokDialect>`, with `new`, `with_rate_card`, `with_heartbeat_interval`, `with_liveness(attempt_id, project, agent, sink)`, and implementing `Runner` (`id() -> "grok"`).
+   - Unit tests for JSON output parsing (including OpenAI-compatible `choices[0].message.content`), `RateCard` fallback, zero budget refusal, and missing binary refusal.
 
 - [ ] **Step 3: Implement `AnyAdapter` in `crates/exec/src/adapters/mod.rs` and re-export in `crates/exec/src/lib.rs`**
 
@@ -1853,7 +1971,7 @@ pub use harness::{CliDialect, GitSnapshot, LivenessSink, ParsedOutput, ProcessHa
 pub use muse::MuseAdapter;
 
 use crate::runner::{AttemptError, AttemptOutcome, AttemptSpec, Runner};
-use fl_core::ids::ProjectId;
+use fl_core::ids::{Iri, ProjectId};
 use fl_core::telemetry::{AdapterKind, RateCard};
 
 pub enum AnyAdapter {
@@ -1884,16 +2002,19 @@ impl AnyAdapter {
 
     pub fn with_liveness(
         self,
+        attempt_id: Iri,
         project: ProjectId,
         agent: Option<String>,
         sink: LivenessSink,
     ) -> Self {
         match self {
-            Self::Claude(a) => Self::Claude(a.with_liveness(project, agent, sink)),
-            Self::Codex(a) => Self::Codex(a.with_liveness(project, agent, sink)),
-            Self::Antigravity(a) => Self::Antigravity(a.with_liveness(project, agent, sink)),
-            Self::Muse(a) => Self::Muse(a.with_liveness(project, agent, sink)),
-            Self::Grok(a) => Self::Grok(a.with_liveness(project, agent, sink)),
+            Self::Claude(a) => Self::Claude(a.with_liveness(attempt_id, project, agent, sink)),
+            Self::Codex(a) => Self::Codex(a.with_liveness(attempt_id, project, agent, sink)),
+            Self::Antigravity(a) => {
+                Self::Antigravity(a.with_liveness(attempt_id, project, agent, sink))
+            }
+            Self::Muse(a) => Self::Muse(a.with_liveness(attempt_id, project, agent, sink)),
+            Self::Grok(a) => Self::Grok(a.with_liveness(attempt_id, project, agent, sink)),
         }
     }
 }
@@ -2022,7 +2143,7 @@ In `crates/cli/src/config.rs`:
 In `crates/cli/src/cmd/attempt.rs`:
 1. Change `Cmd::binary` from `pub binary: String` (`default_value = "claude"`) to `#[arg(long)] pub binary: Option<String>`.
 2. Update `run(ctx: &Ctx<'_>, adapters: &BTreeMap<AdapterKind, crate::config::AdapterConfig>, cmd: Cmd) -> Result<i32>`:
-   - First check in `run`:
+   - First check in `run` (before `ctx.resolve_item` so unknown adapters are refused immediately):
      ```rust
      let store = ctx.store;
      let Ok(kind) = AdapterKind::from_wire(&cmd.adapter) else {
@@ -2038,14 +2159,51 @@ In `crates/cli/src/cmd/attempt.rs`:
      };
      ```
    - Resolve `record`, `project`, and call `crate::preflight::check(ctx, &record.project)?`.
+   - Mint `let entry = stamp::entry_id();` before running the adapter so `AttemptHeartbeat.attempt_id` and `Attempt.id` are identical.
    - Resolve `binary_override`: `cmd.binary.clone().or_else(|| adapters.get(&kind).and_then(|c| c.binary.clone()))`.
    - Resolve `rate_card`: `adapters.get(&kind).and_then(|c| c.rate_card())`.
    - Resolve optional agent persona from `std::env::var("AGENT_PERSONA").ok().map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty())`.
-   - Construct a `LivenessSink` that writes `StateEntry` (`StatePayload::Runtime(RuntimeEntry { status: hb.status.as_wire().to_owned(), details: serde_json::to_value(hb).unwrap() })`, `MergeMode::LastWriter`, `sensitive: false`) into `ctx.store`:
-     - Under `StateScope::Project(project_slug)` with key `liveness_record_slug(&hb.record)` (where `project_slug` is derived from `project.name` or lowercase basename of `project.root` validated via `validate_slug`, falling back to `"default"`).
-     - And if `hb.agent` is `Some(ref persona)` and `validate_slug(persona).is_ok()`, also under `StateScope::Agent(persona.clone())` with key `liveness_agent_slug(persona)`.
-   - Instantiate `AnyAdapter::new(kind, binary_override, rate_card).with_liveness(record.project.clone(), agent_persona, sink)`.
-   - Run `adapter.attempt(spec)` and record `Attempt { adapter: kind.as_wire().to_owned(), .. }`.
+   - Construct a `LivenessSink` that writes `StateEntry` into `ctx.store` using `fl_core::store::StateStore::set_state`:
+     ```rust
+     let sink_store = ctx.store;
+     let sink: LivenessSink = std::sync::Arc::new(move |hb| {
+         let Ok(val) = serde_json::to_value(hb) else {
+             return;
+         };
+         let payload = fl_core::state::StatePayload::Runtime(fl_core::state::RuntimeEntry {
+             value: val,
+             merge_mode: fl_core::state::MergeMode::LastWriteWins,
+         });
+         let by = hb.agent.clone().unwrap_or_else(|| hb.adapter.clone());
+         let rec_slug = fl_core::telemetry::liveness_record_slug(&hb.record);
+         let _ = fl_core::store::StateStore::set_state(
+             sink_store,
+             fl_core::state::SetStateArgs {
+                 scope: fl_core::state::StateScope::Workspace,
+                 slug: rec_slug,
+                 payload: payload.clone(),
+                 by: by.clone(),
+                 at: hb.heartbeat_at.clone(),
+             },
+         );
+         if let Some(ref persona) = hb.agent {
+             let ag_slug = fl_core::telemetry::liveness_agent_slug(persona);
+             let _ = fl_core::store::StateStore::set_state(
+                 sink_store,
+                 fl_core::state::SetStateArgs {
+                     scope: fl_core::state::StateScope::Workspace,
+                     slug: ag_slug,
+                     payload,
+                     by,
+                     at: hb.heartbeat_at.clone(),
+                 },
+             );
+         }
+     });
+     ```
+     Note: Because `LivenessSink` is `Arc<dyn Fn(&AttemptHeartbeat) + Send + Sync>` and `ctx.store` is `&RedbStore` (`RedbStore` is `Sync`, or open a second `RedbStore` handle or pass a `PathBuf` / `Mutex` if needed across threads inside `block_on`), if `ctx.store` is a borrowed `&RedbStore` with non-`'static` lifetime, open or clone the store path or wrap a `std::sync::Mutex<&RedbStore>` / `RedbStore::open` inside the closure so `LivenessSink` satisfies `'static + Send + Sync` cleanly.
+   - Instantiate `AnyAdapter::new(kind, binary_override, rate_card).with_liveness(entry.clone(), record.project.clone(), agent_persona, sink)`.
+   - Run `adapter.attempt(spec)` and record `Attempt { id: Some(entry.clone()), adapter: kind.as_wire().to_owned(), .. }`.
 3. In `crates/cli/src/main.rs`, pass `&cfg.adapters` to `cmd::attempt::run(&ctx, &cfg.adapters, c)`.
 
 - [ ] **Step 3: Add `Liveness` subcommand to `crates/cli/src/cmd/agent.rs`**
@@ -2058,33 +2216,36 @@ In `crates/cli/src/cmd/agent.rs`:
        /// Optional agent persona (`ferris`) or record handle/IRI (`1`, `urn:uuid:...`).
        target: Option<String>,
        /// Maximum heartbeat age in milliseconds before a `live` status becomes `unverifiable (stale_status)`.
-       #[arg(long, default_value_t = fl_core::telemetry::DEFAULT_LIVENESS_STALE_MS)]
+       #[arg(long, default_value_t = fl_core::telemetry::DEFAULT_STALE_AFTER_MS)]
        stale_after_ms: u64,
        #[arg(long)]
        json: bool,
    },
    ```
-2. Update `pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(store: &S, cmd: AgentCmd) -> Result<(), (i32, String)>`:
-   - Implement a helper `pid_is_alive(pid: u32) -> bool`:
-     - On Unix (`#[cfg(unix)]`), check `/proc/{pid}/stat` first if `/proc` exists (verifying state is not `'Z'`), otherwise call `std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())` so no `unsafe` block is required (respecting `#![forbid(unsafe_code)]` if set or avoiding raw libc FFI).
-   - Look up `RuntimeEntry` heartbeats across `store.list_state(None, Some("liveness-"), true)`:
-     - Parse `AttemptHeartbeat` from `StatePayload::Runtime(rt) => serde_json::from_value::<AttemptHeartbeat>(rt.details)`.
-     - If `target` is `Some(t)`:
-       - Try resolving `t` as a `Kind::Record` handle/IRI in `store`; if found, match `hb.record == RecordId(iri)` (deduplicating by latest `heartbeat_at`).
-       - Otherwise match `hb.agent.as_deref() == Some(t.to_ascii_lowercase().as_str())` or `hb.record.iri().as_str() == t`.
-       - If no heartbeat matches `target`, evaluate `evaluate_liveness(None, &now, stale_after_ms, &local_host, pid_is_alive)` which returns `LivenessVerdict::Unverifiable { reason: MissingStatus, .. }`.
+2. Update `pub fn run<S: AgentRegistry + Handles + fl_core::store::StateStore + fl_core::store::Catalog>(store: &S, cmd: AgentCmd) -> Result<(), (i32, String)>`:
+   - Implement `pid_is_alive(pid: u32) -> bool`:
+     - On Unix (`#[cfg(unix)]`), check `/proc/{pid}/stat` first if `/proc` exists (verifying process state after `") "` is not `'Z'`), otherwise call `std::process::Command::new("kill").args(["-0", &pid.to_string()]).status().is_ok_and(|s| s.success())`.
+   - Query `store.list_state(Some(&fl_core::state::StateScope::Workspace), Some(fl_core::state::StateConcern::Runtime))` and filter entries where `entry.slug.as_str().starts_with("liveness-")`, deserializing `StatePayload::Runtime(rt) => serde_json::from_value::<AttemptHeartbeat>(rt.value)`.
+   - If `target` is `Some(t)`:
+     - Look up by record handle/IRI (`store.resolve_handle(Kind::Record, h)` or `Iri::parse(&t)`) -> `liveness_record_slug(&RecordId(iri))`, or by agent persona -> `liveness_agent_slug(&t)`.
+     - Evaluate `evaluate_liveness(matched_hb.as_ref(), &now_at(), stale_after_ms, &fl_exec::adapters::harness::detect_host(), pid_is_alive)`.
      - Format output in plain text (`<target>\t<status>\t...`) or `--json` (`serde_json::to_string_pretty`).
+   - If `target` is `None`:
+     - Deduplicate heartbeats by `attempt_id` (keeping the entry with the latest `heartbeat_at`), evaluate each with `evaluate_liveness`, and print one line per entry (or a JSON array with `--json`).
 3. In `crates/cli/src/main.rs`, when dispatching `Command::Agent { cmd }`, if `explicit` is `None` and `matches!(cmd, cmd::agent::AgentCmd::Liveness { .. })`, check `config::bound_entry(&cfg.projects, &cwd)` and if `Some(entry)` has `entry.store.exists()`, open `entry.store` so `fl agent liveness` inside a bound project inspects that project's store by default.
 
 - [ ] **Step 4: Extend `crates/cli/src/cmd/stats.rs` with tokens, per-adapter breakdown, `--json`, and Decision 21 regret audit**
 
 In `crates/cli/src/cmd/stats.rs`:
 1. Add `#[arg(long)] pub json: bool` to `Cmd`.
-2. Query `transitions = store.transitions(&project)?` and `gate_runs = store.gate_runs(&project)?` (Note: `Catalog` provides `transitions(&project)` and `Ledger` provides `gate_runs(&project)`).
-3. Update `report(attempts: &[Attempt], coverage: &Coverage, transitions: &[Transition], gate_runs: &[GateRun]) -> Vec<String>`:
-   - Keep `attempts: 0` and `Coverage::LocalOnly` note unchanged when `attempts.is_empty()` (and still append regret audit challenges if any exist).
+2. In `run(store: &RedbStore, cmd: Cmd, source: Source<'_>) -> Result<i32>`:
+   - Query `let transitions = fl_core::store::Catalog::list_transitions(store, &project)?;`.
+   - Collect unique `GateId`s referenced across `transitions` and query `fl_core::store::Ledger::gate_runs(store, &gate_id)?` for each gate into `let mut gate_runs = Vec::new();`.
+3. Keep `fn report(attempts: &[Attempt], coverage: &Coverage) -> Vec<String>` as a wrapper calling `report_with_audit(attempts, coverage, &[], &[])` so existing unit tests in `crates/cli/src/cmd/stats.rs` continue to compile and pass unchanged.
+4. Implement `report_with_audit(attempts: &[Attempt], coverage: &Coverage, transitions: &[Transition], gate_runs: &[GateRun]) -> Vec<String>` matching Spec §5.4:
+   - Keep `attempts: 0` and `Coverage::LocalOnly` note unchanged when `attempts.is_empty()` (and append regret audit challenges if any exist).
    - When `attempts` is non-empty:
-     - Compute `by_status`, `total_ms`, `total_tokens_in`, `total_tokens_out`, `total_cost`, `non_refused_count`, `zero_cost_non_refused_count`, and `by_adapter: BTreeMap<String, AdapterStats>`.
+     - Compute `by_status`, `total_ms`, `total_tokens_in`, `total_tokens_out`, `total_cost`, `non_refused_count` (`a.status != AttemptStatus::Refused`), `zero_cost_attempts` (`a.status != AttemptStatus::Refused && a.cost_usd_micros == 0`), and `by_adapter: BTreeMap<String, AdapterStats>`.
      - Emit:
        ```text
        attempts: <N>
@@ -2094,22 +2255,20 @@ In `crates/cli/src/cmd/stats.rs`:
        tokens out: <total_tokens_out>
        cost: <total_cost> micro-USD
        ```
-     - Floor notes:
+     - Floor notes (Spec §5.4):
        - If `total_cost == 0 && non_refused_count > 0`:
          `"note: no adapter reported a cost, so the figure above is a floor and not a total"`
-       - Else if `total_cost > 0 && zero_cost_non_refused_count > 0`:
-         `format!("note: {zero_cost_non_refused_count} of {non_refused_count} non-refused attempts reported 0 cost, so the figure above is a floor and not a total")`
-     - Emit `by adapter:`:
+       - Else if `total_cost > 0 && zero_cost_attempts > 0`:
+         `format!("note: {zero_cost_attempts} of {non_refused_count} attempts reported no cost, so the figure above is a floor and not a total")`
+     - Emit `by adapter:` (Spec §5.4):
        ```text
        by adapter:
-         <adapter>: <attempts> attempts, <duration_ms>ms, <tokens_in> in, <tokens_out> out, <cost_usd_micros> micro-USD
+         <adapter>: <count> attempts (<completed> completed), <ms>ms, <tokens_in> in / <tokens_out> out, <cost> micro-USD
        ```
-   - Call `let challenges = fl_core::telemetry::audit_transition_regret(transitions, gate_runs);` and for each challenge emit:
-     - For `RegretMetric::CostUsdMicros`:
-       `format!("regret audit: transition `{}` ({} -> {}) declares regret = low, but its gates average {} micro-USD ({}x the project median of {} micro-USD)", c.name, c.from.as_wire(), c.to.as_wire(), c.measured_mean, c.ratio, c.project_median)`
-     - For `RegretMetric::DurationMs`:
-       `format!("regret audit: transition `{}` ({} -> {}) declares regret = low, but its gates average {}ms ({}x the project median of {}ms)", c.name, c.from.as_wire(), c.to.as_wire(), c.measured_mean, c.ratio, c.project_median)`
-4. When `cmd.json` is true, serialize a `StatsJson` struct with `attempts`, `coverage`, `by_status`, `duration_ms`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `cost_is_floor`, `by_adapter`, and `regret_challenges` via `serde_json::to_string_pretty`.
+   - Call `let challenges = fl_core::telemetry::audit_transition_regret(transitions, gate_runs);` and for each challenge `c` emit (Spec §5.4):
+     - Let `unit = match c.metric { RegretMetric::CostUsdMicros => " micro-USD", RegretMetric::DurationMs => "ms" };`
+     - `format!("regret audit: transition {} -> {} ({}) is declared low regret, but its measured mean ({}{unit}) is {}x the project median ({}{unit})", c.from.as_wire(), c.to.as_wire(), c.name, c.measured_mean, c.ratio, c.project_median)`
+5. When `cmd.json` is true, serialize a `StatsJson` struct with `attempts`, `coverage`, `by_status`, `wall_clock_ms`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `zero_cost_attempts`, `by_adapter`, and `regret_audit` via `serde_json::to_string_pretty`.
 
 - [ ] **Step 5: Add black-box CLI integration tests in `crates/cli/tests/attempt.rs`**
 
@@ -2120,7 +2279,7 @@ In `crates/cli/tests/attempt.rs`, keep the 3 existing tests and add:
    - Runs `fl stats --project 1` and verifies `attempts: 5`, `tokens in: 500`, `tokens out: 125`, `cost: 25000 micro-USD`, and all 5 lines under `by adapter:`.
    - Runs `fl agent liveness 1 --json` and verifies `"status": "exited"` and `"outcome": "completed"`.
 2. `stats_reports_partial_cost_floor_and_regret_audit_challenge`:
-   - Runs one attempt with cost > 0 and one completed attempt with cost = 0, verifying `fl stats --project 1` prints `1 of 2 non-refused attempts reported 0 cost, so the figure above is a floor and not a total`.
+   - Runs one attempt with cost > 0 and one completed attempt with cost = 0, verifying `fl stats --project 1` prints `1 of 2 attempts reported no cost, so the figure above is a floor and not a total`.
 
 - [ ] **Step 6: Run full workspace verification and commit Task 5**
 
