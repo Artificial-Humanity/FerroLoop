@@ -1,7 +1,7 @@
 # Sub-Project 3: Adapters and Telemetry — Design Specification
 
 **Date:** 2026-10-25  
-**Status:** Draft (awaiting owner review)  
+**Status:** Draft (reviewed, awaiting owner approval)  
 **Author:** Ferris (`ferris@artificialhumanity.io`)  
 **Scope:** Five-vendor execution adapters and MCP catalog writers (`claude`, `codex`, `antigravity`, `muse`, `grok`), shared `ProcessHarness` with streaming telemetry and rate-card cost fallback, vendor-agnostic `paths_touched` git snapshot delta, wrapper-driven `RuntimeEntry` liveness heartbeats (`live` / `unverifiable` / `exited`), and `fl stats` telemetry breakdown with Decision 21 regret declaration auditing.
 
@@ -34,13 +34,13 @@ Today on `main`:
    * Drain `stdout` and `stderr` incrementally via async tasks so that even when an attempt ends in `Timeout` or `Crashed`, any JSONL token or cost usage emitted before termination is preserved on `AttemptOutcome`.
    * Support optional per-adapter rate cards (`input_usd_micros_per_mtok`, `output_usd_micros_per_mtok`) in `config.toml` (`[adapters.<name>]`) to compute `cost_usd_micros` when a subscription CLI reports token counts without dollar cost, while keeping `cost_usd_micros = 0` when neither vendor cost nor rate card is present.
 3. **Vendor-agnostic `paths_touched` capture:**
-   * Capture a pre-attempt git snapshot (`HEAD` + `git status --porcelain=v1 -z -uall` with content hashes for dirty/untracked non-ignored files) and compute the post-attempt delta across both new commits (`git diff --name-only <head_before> <head_after>`) and working-tree/index changes, returning sorted project-relative paths on `AttemptOutcome::paths_touched`.
+   * Capture a pre-attempt git snapshot (`HEAD` + `git status --porcelain=v1 -z -uall` with in-memory SHA-256 content hashes for dirty/untracked non-ignored files) and compute the post-attempt delta across both new commits (`git diff --name-only <head_before> <head_after>`) and working-tree/index changes, returning sorted project-relative paths on `AttemptOutcome::paths_touched`.
 4. **Wrapper-driven liveness reporting (`live` / `unverifiable` / `exited`):**
    * Have `ProcessHarness` emit `AttemptHeartbeat` records into `StateStore` (`StatePayload::Runtime` with `MergeMode::LastWriter`) on spawn, periodic tick / stream progress, and exit — without asking the LLM to send heartbeats.
-   * Provide deterministic liveness evaluation (`evaluate_liveness`) using the three-state vocabulary `live`, `unverifiable` (`missing_status`, `stale_status`, `host_unavailable`), and `exited`, combining writer-clock timestamp freshness with local OS PID probing (`kill(pid, 0)` on Unix).
+   * Provide deterministic liveness evaluation (`evaluate_liveness`) using the three-state vocabulary `live`, `unverifiable` (`missing_status`, `stale_status`, `host_unavailable`), and `exited`, combining writer-clock timestamp freshness (`At::unix_millis()`) with local OS PID probing (`kill(pid, 0)` on Unix).
    * Expose `fl agent liveness [<persona_or_record>] [--json]` in `fl-cli`.
 5. **Rich `fl stats` reporting and Decision 21 regret audit:**
-   * Extend `fl stats --project <project> [--json]` with `tokens in`, `tokens out`, a partial-cost floor note when some attempts report zero cost, a deterministic `by adapter:` breakdown, and Decision 21's advisory transition regret audit (`audit_transition_regret`).
+   * Extend `fl stats --project <project> [--json]` with `tokens in`, `tokens out`, a partial-cost floor note when some non-refused attempts report zero cost, a deterministic `by adapter:` breakdown, and Decision 21's advisory transition regret audit (`audit_transition_regret`).
 6. **Zero store format bump (`FORMAT_WITH_WIRE = 7` unchanged):**
    * Reuse the existing `Attempt`, `GateRun`, and `RuntimeEntry` schemas in `fl-core` and `fl-store`.
 
@@ -60,7 +60,7 @@ Today on `main`:
 Expand `VendorName` from three variants to five, preserving `#[serde(rename_all = "lowercase")]`:
 
 ```rust
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VendorName {
     Claude,
@@ -94,10 +94,10 @@ impl VendorName {
 ### 2.2 Parameterized `JsonFile` and `TomlFile` (`crates/mcp/src/vendor/`)
 
 1. **`crates/mcp/src/vendor/json.rs`:**
-   * Parameterize `JsonFile` with:
-     * `servers_key: &'static str` (`"mcpServers"` for `Claude` and `Antigravity`; `"mcp_servers"` for `Muse`).
-     * `default_top: &'static [(&'static str, &'static str)]` (`&[]` for `Claude` and `Antigravity`; `&[("schema_version", "1")]` for `Muse`).
-   * When `json::open_with(path, bytes, servers_key, default_top)` opens a non-existent file (`bytes == None`), it populates `top` with `default_top` (for `Muse`, `"schema_version": 1` appears before `"mcp_servers"`). When opening an existing file (`bytes == Some(_)`), it preserves all existing top-level keys and ordering byte-for-byte via `IndexMap<String, Box<RawValue>>`, validating that `servers_key` (when present) is a strict JSON object without duplicate keys.
+   * Store `servers_key: &'static str` on `JsonFile` (`"mcpServers"` for `Claude` and `Antigravity`; `"mcp_servers"` for `Muse`) and replace all uses of the hardcoded `SERVERS` constant in `open_with`, `servers_mut`, and `to_bytes` with `self.servers_key`.
+   * Add `pub(super) fn open_with(path: &Path, bytes: Option<&[u8]>, servers_key: &'static str, default_top: &[(&'static str, &'static str)]) -> Result<JsonFile, FileRefusal>` (while keeping `open(path, bytes)` as `open_with(path, bytes, "mcpServers", &[])`).
+   * When `bytes == None`, `open_with` inserts each `(k, raw_json)` from `default_top` into `file.top` *before* calling `file.servers_mut()`, so `"schema_version": 1` appears above `"mcp_servers"` in newly created `.muse/settings.json` files. When `file.is_empty()` is checked after removing all servers from an unbacked file, `is_empty()` continues to check `self.servers.as_ref().is_none_or(IndexMap::is_empty)` so an empty unbacked file is not left as a stub.
+   * When `bytes == Some(_)`, `open_with` preserves all existing top-level keys and ordering byte-for-byte via `IndexMap<String, Box<RawValue>>`, validating that `servers_key` (when present) is a strict JSON object without duplicate keys.
 2. **`crates/mcp/src/vendor/muse.rs` (`Muse`):**
    * `name() -> VendorName::Muse`, `title() -> "Muse"`, `target() -> ".muse/settings.json"`.
    * `render(&self, _name: &str, server: &Server) -> Result<Rendered, VendorRefusal>`:
@@ -106,23 +106,39 @@ impl VendorName {
    * `open(&self, path: &Path, bytes: Option<&[u8]>) -> Result<VendorFile, FileRefusal>`: delegates to `json::open_with(path, bytes, "mcp_servers", &[("schema_version", "1")])`.
 3. **`crates/mcp/src/vendor/grok.rs` (`Grok`):**
    * `name() -> VendorName::Grok`, `title() -> "Grok"`, `target() -> ".grok/config.toml"`.
-   * Reuses `TomlFile` and `alone(name, &Item::Table(table))` from `codex.rs` (`[mcp_servers.<name>]`).
+   * Reuses `TomlFile`, `open`, and `alone(name, &Item::Table(table))` from `codex.rs` (`[mcp_servers.<name>]`).
    * `render(&self, name: &str, server: &Server) -> Result<Rendered, VendorRefusal>`:
      * `Transport::Stdio`: writes `command`, `args`, `env` (literals), and `env_vars` (forwarded secret environment variable names). If a secret variable is renamed (`var != key`), returns `VendorRefusal` with reason: `` `env.<key>` reads the variable `<var>`, and Grok forwards a secret variable under its own name ``.
      * `Transport::Sse`: returns `VendorRefusal` with reason: `"Grok connects to streamable HTTP servers only, not SSE"`.
      * `Transport::Http`: writes `url`, `bearer_token_env_var` (for `Authorization: Bearer` secret header), `http_headers` (literal headers), and `env_http_headers` (whole-value secret headers). Refuses non-Bearer secret header schemes with: `` the secret header `<header>` has the scheme `<scheme>`, and Grok sends a secret header either whole or as `Authorization: Bearer` ``.
-4. **`crates/mcp/src/sync.rs`:**
-   * Update `value(vendor, name, bytes)` so `VendorName::Codex | VendorName::Grok` parses TOML `[mcp_servers.<name>]` and `VendorName::Claude | VendorName::Antigravity | VendorName::Muse` parses JSON `serde_json::from_slice(bytes)`.
+4. **`crates/mcp/src/vendor/mod.rs` and `crates/mcp/src/sync.rs`:**
+   * Register `Muse` and `Grok` in `vendor(name: VendorName)` in `crates/mcp/src/vendor/mod.rs`.
+   * Update `value(vendor, name, bytes)` in `crates/mcp/src/sync.rs` so `VendorName::Codex | VendorName::Grok` parses TOML `[mcp_servers.<name>]` and `VendorName::Claude | VendorName::Antigravity | VendorName::Muse` parses JSON `serde_json::from_slice(bytes)`.
+   * Note: `codex_trust` in `crates/cli/src/cmd/mcp.rs` remains specific to `VendorName::Codex` because Grok does not gate `.grok/config.toml` on `~/.codex/config.toml` project trust.
+   * Update the vendor test suite in `crates/mcp/src/vendor/mod.rs` (`each_vendor_writes_its_own_project_file`, `an_entry_fl_writes_reads_back_as_the_bytes_it_rendered`, `removing_what_was_added_leaves_the_file_as_it_was`, and `a_secret_value_in_the_environment_reaches_no_rendered_entry`) and the black-box test fixtures in `crates/cli/tests/mcp.rs` (`IGNORED`, `MUSE = ".muse/settings.json"`, `GROK = ".grok/config.toml"`, `Secrets::texts()`, and record-count assertions) for the 5-element `VendorName::ALL`.
 5. **`docs/mcp.md`:**
    * Document `.muse/settings.json` and `.grok/config.toml` alongside `.mcp.json`, `.codex/config.toml`, and `.agents/mcp_config.json`, including the five `.gitignore` lines (`/.mcp.json`, `/.codex/config.toml`, `/.agents/mcp_config.json`, `/.muse/settings.json`, `/.grok/config.toml`).
 
 ---
 
-## 3. Pure Telemetry, Rate Card, Liveness, and Regret Audit (`crates/core/src/telemetry.rs`)
+## 3. Pure Telemetry, Rate Card, Liveness, and Regret Audit (`crates/core`)
 
-Create a new module `crates/core/src/telemetry.rs` (re-exported from `crates/core/src/lib.rs` and guarded in `crates/github/src/lib.rs` and `crates/core/tests/wire_refs.rs`).
+### 3.1 `At::unix_millis()` (`crates/core/src/at.rs`)
 
-### 3.1 Adapter Names and Rate Card (`AdapterKind`, `RateCard`)
+Extract the RFC 3339 millisecond computation in `At::parse` (`crates/core/src/at.rs` lines 66–74) into a shared helper and add:
+
+```rust
+impl At {
+    /// Milliseconds after the Unix epoch for this timestamp.
+    pub fn unix_millis(&self) -> u64 { ... }
+}
+```
+
+Include a round-trip unit test in `crates/core/src/at.rs` verifying `At::from_unix_millis(ms).unix_millis() == ms`.
+
+### 3.2 Adapter Names and Rate Card (`crates/core/src/telemetry.rs`)
+
+Create `crates/core/src/telemetry.rs` (re-exported from `crates/core/src/lib.rs`) and add `AttemptHeartbeat` (which holds 3 IRI fields: `attempt_id: Iri`, `project: ProjectId`, `record: RecordId`) to `every_reference_field_on_the_wire_is_a_full_iri` in `crates/core/tests/wire_refs.rs` with `floor = 3`.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -194,7 +210,7 @@ impl RateCard {
 }
 ```
 
-### 3.2 Liveness Vocabulary and `AttemptHeartbeat`
+### 3.3 Liveness Vocabulary, State Slugs, and `AttemptHeartbeat` (`crates/core/src/telemetry.rs`)
 
 ```rust
 pub const DEFAULT_STALE_AFTER_MS: u64 = 30_000;
@@ -284,6 +300,15 @@ pub enum LivenessVerdict {
 }
 ```
 
+#### Deterministic State Slug Helpers (`liveness_record_slug`, `liveness_agent_slug`)
+
+Because `StateStore` validates that every `StateEntry.key` matches `^[a-z][a-z0-9_-]{0,63}$` (`validate_slug` in `crates/core/src/state.rs`), while `RecordId` is an `Iri` (`urn:uuid:...` or `https://github.com/...`), `crates/core/src/telemetry.rs` provides two deterministic helpers guaranteed to pass `validate_slug`:
+
+* `pub fn liveness_record_slug(record: &RecordId) -> String`:
+  * Strips a leading `"urn:uuid:"` prefix if present, lowercases ASCII, replaces any byte outside `[a-z0-9_-]` with `'-'`, and collapses consecutive `'-'`. If the resulting suffix fits in `48` bytes, returns `format!("liveness-record-{suffix}")`; otherwise returns `format!("liveness-record-{}", &sha256_hex(record.iri().as_str())[..36])` (always `<= 52` bytes and matching `^[a-z][a-z0-9_-]{0,63}$`).
+* `pub fn liveness_agent_slug(persona: &str) -> String`:
+  * Normalizes `persona` (lowercase ASCII, replacing bytes outside `[a-z0-9_-]` with `'-'`, truncated to `48` bytes) and returns `format!("liveness-agent-{sanitized}")`.
+
 #### Deterministic `evaluate_liveness` Rules
 
 `pub fn evaluate_liveness<F>(hb: Option<&AttemptHeartbeat>, now: &At, stale_after_ms: u64, local_host: &str, pid_is_alive: F) -> LivenessVerdict where F: Fn(u32) -> bool`:
@@ -297,7 +322,7 @@ pub enum LivenessVerdict {
 5. **`hb.status == LivenessStatus::Live` on a remote host (`hb.host != local_host`):**
    * Compute `age_ms = now.unix_millis().saturating_sub(hb.heartbeat_at.unix_millis())`. If `age_ms <= stale_after_ms`, returns `LivenessVerdict::Live { ... }`; else returns `LivenessVerdict::Unverifiable { reason: UnverifiableReason::HostUnavailable, host: Some(hb.host.clone()), heartbeat_at: Some(hb.heartbeat_at.clone()) }`.
 
-### 3.3 Decision 21 Regret Declaration Audit (`audit_transition_regret`)
+### 3.4 Decision 21 Regret Declaration Audit (`audit_transition_regret`)
 
 In `crates/core/src/telemetry.rs`, define:
 
@@ -315,6 +340,7 @@ pub enum RegretMetric {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegretChallenge {
+    pub name: String,
     pub from: State,
     pub to: State,
     pub metric: RegretMetric,
@@ -337,8 +363,8 @@ pub struct RegretChallenge {
 4. Compute `project_median`: sort the measured transition means ascending; for odd `N`, take `sorted[N / 2]`; for even `N`, take `(sorted[N / 2 - 1] + sorted[N / 2]) / 2`. If `project_median == 0`, return `vec![]`.
 5. For each transition with `t.regret == Regret::Low`:
    * If `measured_mean >= floor` and `measured_mean >= project_median.saturating_mul(REGRET_AUDIT_MULTIPLIER)`:
-     * Record a `RegretChallenge` with `ratio = measured_mean / project_median`.
-6. Sort challenges deterministically by `(from.as_wire(), to.as_wire())`.
+     * Record a `RegretChallenge` with `name: t.name.clone()`, `from: t.from`, `to: t.to`, `ratio = measured_mean / project_median`.
+6. Sort challenges deterministically by `(c.from.as_wire(), c.to.as_wire(), c.name.as_str())`.
 
 ---
 
@@ -425,7 +451,7 @@ pub trait CliDialect: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PathState {
     status: String,
-    blob_oid: Option<String>,
+    content_hash: Option<[u8; 32]>,
 }
 
 pub struct GitSnapshot {
@@ -438,7 +464,11 @@ pub struct GitSnapshot {
    * Runs `git status --porcelain=v1 -z -uall` in `root`. If `git` fails (e.g., `root` is not a git repository), returns `None`.
    * Records `head = Git::head(root).ok()`.
    * Parses NUL-delimited porcelain entries (`XY PATH`, skipping the source path of `R`/`C` rename/copy pairs). Ignores paths starting with `.fl/`.
-   * For each path `rel`, if `root.join(&rel)` is a regular file or symlink, computes `blob_oid = Git::hash_object(root, &fs::read(root.join(&rel))?).ok()`; if deleted or directory, `blob_oid = None`. Inserts `PathState { status, blob_oid }` into `dirty`.
+   * For each path `rel`, inspects `fs::symlink_metadata(root.join(&rel))` in memory using `sha2::Sha256` (avoiding subprocess spawns and never writing loose objects to `.git/objects`):
+     * If symlink: hashes the link target bytes from `fs::read_link`.
+     * If regular file: hashes the file bytes from `fs::read`.
+     * If deleted, directory, or unreadable: `content_hash = None`.
+   * Inserts `PathState { status, content_hash }` into `dirty`.
 2. **`GitSnapshot::diff_after(&self, root: &Path) -> Vec<String>`:**
    * Captures `after = GitSnapshot::capture(root)`. If `None`, returns `vec![]`.
    * Initializes `touched = BTreeSet::new()`.
@@ -465,10 +495,10 @@ Constructors on each adapter (`ClaudeAdapter`, `CodexAdapter`, `AntigravityAdapt
 * `pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self`
 
 During `attempt(spec: AttemptSpec)`:
-1. If `spec.budget_usd_micros == 0`, emits a terminal `Refused` heartbeat (if `liveness_sink` is attached) and returns `Ok(AttemptOutcome::refused("the attempt's spend ceiling is zero, so nothing was started"))`.
+1. If `spec.budget_usd_micros == 0`, emits a terminal `Exited` (`outcome: Some(AttemptStatus::Refused)`) heartbeat (if `liveness_sink` is attached) and returns `Ok(AttemptOutcome::refused("the attempt's spend ceiling is zero, so nothing was started"))`.
 2. Captures `pre_git = GitSnapshot::capture(&spec.project_root)`.
 3. Builds `tokio::process::Command::new(&self.binary)` with `dialect.build_args(&spec)`, `current_dir(&spec.project_root)`, `stdout(Stdio::piped())`, `stderr(Stdio::piped())`, and `kill_on_drop(true)`.
-4. Spawns the child with `SPAWN_RETRY_LIMIT` (`20` retries × `2ms`) on `ErrorKind::ExecutableFileBusy`. On other spawn error, emits a terminal `Refused` heartbeat and returns `Ok(AttemptOutcome::refused(format!("could not start `{}`: {e}", self.binary)))`.
+4. Spawns the child with `SPAWN_RETRY_LIMIT` (`20` retries × `2ms`) on `ErrorKind::ExecutableFileBusy`. On other spawn error, emits a terminal `Exited` (`outcome: Some(AttemptStatus::Refused)`) heartbeat and returns `Ok(AttemptOutcome::refused(format!("could not start `{}`: {e}", self.binary)))`.
 5. Records `pid = child.id().unwrap_or(0)` and emits the initial `Live` heartbeat to `liveness_sink`.
 6. Spawns two reader tasks (`tokio::spawn`) that read `child.stdout` and `child.stderr` chunk-by-chunk into `Arc<Mutex<Vec<u8>>>` buffers (`stdout_buf`, `stderr_buf`).
 7. Runs a `tokio::select!` loop awaiting `child.wait()`, the timeout timer (`Duration::from_secs(spec.timeout_secs.max(1))`), and a periodic `tokio::time::interval(self.heartbeat_interval)` tick:
@@ -507,29 +537,31 @@ pub struct AdapterConfig {
 * Because the map key is `AdapterKind` (`claude`, `codex`, `antigravity`, `muse`, `grok`), any unknown adapter key in `[adapters.<unknown>]` fails config loading with a clear message naming the valid adapters (`claude, codex, antigravity, muse, grok`).
 * If `binary` is `Some("")` (empty or whitespace-only), config validation refuses it with a clear message.
 
-### 5.2 `fl attempt` (`crates/cli/src/cmd/attempt.rs`)
+### 5.2 `fl attempt` (`crates/cli/src/cmd/attempt.rs` and `crates/cli/src/main.rs`)
 
-1. **Arguments:**
-   * `--adapter <ADAPTER>` (default `"claude"`): parsed via `AdapterKind::from_wire(&cmd.adapter)`. On unknown adapter, bail with:
+1. **Arguments and adapter validation (first check in `run`):**
+   * `--adapter <ADAPTER>` (default `"claude"`): parsed as the **very first check** in `cmd::attempt::run` via `AdapterKind::from_wire(&cmd.adapter)` (before resolving `cmd.record`, preserving `an_unknown_adapter_is_refused_and_names_the_ones_that_exist` in `crates/cli/tests/attempt.rs`). On unknown adapter, bail with:
      `` `{}` is not a known adapter. Known adapters: claude, codex, antigravity, muse, grok. ``
    * `--binary <BINARY>`: `Option<String>` (no longer hardcoded `default_value = "claude"`). Resolved as:
      `cmd.binary.or_else(|| cfg_adapter.and_then(|a| a.binary.clone())).unwrap_or_else(|| kind.default_binary().to_string())`.
-2. **Pre-minted attempt IRI and LivenessSink:**
+2. **Plumbing from `main.rs` and `LivenessSink`:**
+   * Update `Command::Attempt(c)` in `crates/cli/src/main.rs` to pass `&ctx`, `&store`, and `&cfg.adapters` into `cmd::attempt::run`.
    * Mint `let entry = stamp::entry_id();` before running the adapter so the `AttemptHeartbeat` carries the exact `attempt_id` that will be appended to the ledger.
-   * Open the workspace `StateStore` (best-effort via `StateEnv`) and construct a `LivenessSink` that writes `StatePayload::Runtime(RuntimeEntry { value: serde_json::to_value(hb), merge_mode: MergeMode::LastWriter })` under `StateScope::Workspace` with key `format!("liveness-record-{}", record_slug_or_uuid)` (and `format!("liveness-agent-{persona}")` when a caller persona resolves).
+   * Construct a `LivenessSink` that writes `StatePayload::Runtime(RuntimeEntry { value: serde_json::to_value(hb), merge_mode: MergeMode::LastWriter })` into `store` (which implements `StateStore`) under `StateScope::Workspace` with key `liveness_record_slug(&record.id)` (and `liveness_agent_slug(&persona)` when `AGENT_PERSONA` or a registered workspace agent resolves).
 3. **Ledger append:**
    * Set `attempt.adapter = kind.as_wire().to_string()`.
    * Keep `settle(...)` and `conclude(...)` behavior and exit-code rules (Decisions 14 and 15) unchanged.
 
 ### 5.3 `fl agent liveness` (`crates/cli/src/cmd/agent.rs`)
 
-Add subcommand `Liveness` to `fl agent`:
+Update `cmd::agent::run`'s trait bound from `S: AgentRegistry + Handles` to `S: AgentRegistry + StateStore + Handles` and add subcommand `Liveness` to `fl agent`:
 
 ```console
 fl agent liveness [<target>] [--stale-after-ms <ms>] [--json]
 ```
 
-* Reads `RuntimeEntry` items in `StateScope::Workspace` whose key starts with `liveness-agent-` or `liveness-record-` (filtering by `<target>` when given, matching either agent persona or record handle/UUID).
+* Reads `RuntimeEntry` items in `StateScope::Workspace` whose key starts with `liveness-agent-` or `liveness-record-`.
+* When `<target>` is provided, matches entries where `<target>` equals `entry.key`, `hb.agent.as_deref()`, `hb.record.iri().as_str()`, `liveness_agent_slug(target)`, `liveness_record_slug(&RecordId(resolved_iri))`, or a record handle resolved via `store.resolve_handle(Kind::Record, ...)`.
 * Deserializes each value as `AttemptHeartbeat` and evaluates `evaluate_liveness(Some(&hb), &now_at(), stale_after_ms, &local_hostname(), unix_pid_is_alive)`.
 * If `<target>` is specified and no matching heartbeat entry exists, evaluates `evaluate_liveness(None, ...)` and prints `unverifiable (missing_status)`.
 * Prints human-readable lines (`<key>\t<verdict>\tadapter=<adapter>\tduration=<ms>ms\ttokens=<in>/<out>\tcost=<cost> micro-USD`) or structured JSON when `--json` is passed.
@@ -552,15 +584,18 @@ fl stats --project <project> [--json]
      * `tokens out: <total_tokens_out>`
      * `cost: <total_cost> micro-USD`
      * **Cost floor notes:**
-       * When `total_cost == 0`: `note: no adapter reported a cost, so the figure above is a floor and not a total`
-       * When `total_cost > 0` and `zero_cost_attempts > 0`: `note: <zero_cost_attempts> of <N> attempts reported no cost, so the figure above is a floor and not a total`
+       * Count `zero_cost_attempts = attempts.iter().filter(|a| a.status != AttemptStatus::Refused && a.cost_usd_micros == 0).count()`.
+       * When `total_cost == 0`: `note: no adapter reported a cost, so the figure above is a floor and not a total` (preserving existing tests when all attempts are zero-cost).
+       * When `total_cost > 0` and `zero_cost_attempts > 0`: `note: <zero_cost_attempts> of <N> attempts reported no cost, so the figure above is a floor and not a total`.
      * **Per-adapter section (`by adapter:`):**
        * For each adapter in `BTreeMap` order:
          `  <adapter>: <count> attempts (<completed> completed), <ms>ms, <tokens_in> in / <tokens_out> out, <cost> micro-USD`
    * **Regret audit section:**
-     * Runs `audit_transition_regret(&transitions, &gate_runs)` using the project's transitions and `store.gate_runs_for_project(&project)` (or matching gate runs for the project's gates).
+     * Queries `transitions = store.list_transitions(&project)?`.
+     * Only when `transitions` has at least 2 transitions with non-empty `gates` and at least one of them is `Regret::Low` (avoiding unnecessary gate-run queries on projects with fewer than 2 gated transitions), collects unique `GateId`s across `transitions` and reads their `GateRun` logs from `store.gate_runs(&gate_id)?` (or `split.gate_runs(&gate_id)` when `source` is `Source::Split(split)` and `coverage == Coverage::Complete`, falling back to `store.gate_runs(&gate_id)?` on transient error).
+     * Runs `audit_transition_regret(&transitions, &gate_runs)`.
      * For each `RegretChallenge`, prints:
-       * `regret audit: transition <from> -> <to> is declared low regret, but its measured mean (<measured_mean><unit>) is <ratio>x the project median (<project_median><unit>)` (where `<unit>` is ` micro-USD` for `CostUsdMicros` and `ms` for `DurationMs`).
+       * `regret audit: transition <from> -> <to> (<name>) is declared low regret, but its measured mean (<measured_mean><unit>) is <ratio>x the project median (<project_median><unit>)` (where `<from>` and `<to>` use `as_wire()`, and `<unit>` is ` micro-USD` for `CostUsdMicros` and `ms` for `DurationMs`).
 2. **JSON output (`--json`):**
    * Prints a single JSON object containing `attempts`, `coverage`, `by_status`, `wall_clock_ms`, `tokens_in`, `tokens_out`, `cost_usd_micros`, `zero_cost_attempts`, `by_adapter`, and `regret_audit`.
 
@@ -568,18 +603,20 @@ fl stats --project <project> [--json]
 
 ## 6. Verification and Testing Plan
 
-1. **Unit tests in `fl-mcp`:**
+1. **Unit tests in `fl-mcp` and black-box `crates/cli/tests/mcp.rs`:**
    * `vendor/muse.rs`: stdio server with secret `${VAR}`, renamed secret variable, HTTP/SSE remote server with Bearer and whole-secret headers, and preservation of `"schema_version": 1` and user keys in `.muse/settings.json`.
    * `vendor/grok.rs`: stdio server with `env` and `env_vars`, refusal of renamed secret variable, streamable HTTP with `bearer_token_env_var` and `env_http_headers`, refusal of SSE and non-Bearer secret header schemes, and preservation of TOML comments in `.grok/config.toml`.
-   * `sync.rs` and `crates/cli/tests/mcp.rs`: 5-vendor sync, check, adopt, and `.gitignore` verification.
-2. **Unit tests in `fl-core` (`telemetry.rs`):**
+   * Update `vendor/mod.rs`, `sync.rs`, and `crates/cli/tests/mcp.rs` for 5-vendor sync, check, adopt, and `.gitignore` verification.
+2. **Unit tests in `fl-core` (`at.rs`, `telemetry.rs`, `tests/wire_refs.rs`):**
+   * `At::unix_millis()` round-trip test.
    * `RateCard::resolve_cost`: vendor cost priority over rate card, rate-card calculation without overflow, zero floor when neither is present.
+   * `liveness_record_slug` and `liveness_agent_slug`: verify `validate_slug` succeeds for UUID URNs, long GitHub Issue URLs, and mixed-case personas.
    * `evaluate_liveness`: `missing_status`, `live` on local host with live PID, `exited (crashed)` when local PID is dead (`ESRCH`), `unverifiable (stale_status)` when local heartbeat is stale, `live` vs `unverifiable (host_unavailable)` for remote host, and `exited` with recorded outcome.
    * `audit_transition_regret`: flags `low`-regret transition `>= 10x` project median, ignores `high`-regret transitions, ignores sub-threshold noise (`< 1_000`), and never mutates transition definitions.
-   * Wire guards (`crates/github` and `crates/core/tests/wire_refs.rs`): verify internal telemetry types stay local.
+   * `crates/core/tests/wire_refs.rs`: add `AttemptHeartbeat` (`floor = 3`) to `every_reference_field_on_the_wire_is_a_full_iri`.
 3. **Unit and integration tests in `fl-exec` (`adapters/`):**
    * Dialect parser unit tests for `claude`, `codex`, `antigravity`, `muse`, and `grok` over single-JSON, streaming-JSONL, partial stream before timeout/crash, and plain-text fallback.
-   * `GitSnapshot` unit tests: modified tracked file, new untracked file, deleted file, committed change during attempt, and pre-existing dirty file left untouched (excluded from `paths_touched`).
+   * `GitSnapshot` unit tests: modified tracked file, new untracked file, deleted file, committed change during attempt, dangling symlink, and pre-existing dirty file left untouched (excluded from `paths_touched`).
    * `ProcessHarness` tests: zero-budget refusal, missing binary refusal, timeout with partial JSONL token capture, multibyte UTF-8 truncation, and `LivenessSink` heartbeat sequence (`Live` -> tick `Live` -> `Exited`).
 4. **Black-box CLI tests in `fl-cli`:**
    * `config.rs`: `[adapters.<name>]` parsing and refusal of unknown adapter names.
