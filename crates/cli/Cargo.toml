@@ -15,6 +15,7 @@ fl-store = { path = "../store" }
 fl-exec = { path = "../exec" }
 fl-github = { path = "../github" }
 fl-mcp = { path = "../mcp" }
+fl-wire = { path = "../wire" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

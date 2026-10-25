@@ -11,6 +11,7 @@ pub mod decision;
 pub mod escalate;
 pub mod escalation;
 pub mod fault;
+pub mod ferrowire;
 pub mod finding;
 pub mod ids;
 pub mod iri;
@@ -37,8 +38,16 @@ pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, Transiti
 pub use escalate::Prepared;
 pub use escalation::{EscalationFault, Escalations, Mark, Outgoing, Provenance, Tombstone};
 pub use fault::LedgerFault;
+pub use ferrowire::{
+    DeliveryReceipt, DeliveryStatus, MAX_SUBJECT_BYTES, MAX_WIRE_BODY_BYTES, MessageKind,
+    MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter, WireInboxItem, WireMessage,
+    fallback_agent_iri, parse_role_selector, resolve_recipients, validate_sender_name,
+    validate_subject, validate_wire_body,
+};
 pub use finding::{Finding, FindingError, FindingState};
-pub use ids::{AgentId, FindingId, GateId, Kind, ProjectId, RecordId, RevisionId, StateId};
+pub use ids::{
+    AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId,
+};
 pub use iri::{Iri, IriError};
 pub use log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 pub use mem::MemStore;
@@ -59,8 +68,8 @@ pub use state::{
     validate_summary,
 };
 pub use store::{
-    AgentRegistry, Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, Roles,
-    StateStore, StoreError, Tracker, as_clause, follow, ledger_root_shape, node_id_shape,
+    AgentRegistry, Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, MessageStore,
+    Roles, StateStore, StoreError, Tracker, as_clause, follow, ledger_root_shape, node_id_shape,
 };
 pub use tiered::{FindingPlacement, Placement, RecordSeen, TieredTracker};
 pub use verdict::{FailReason, Population, Verdict};

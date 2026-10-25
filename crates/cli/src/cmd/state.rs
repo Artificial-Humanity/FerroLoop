@@ -970,18 +970,23 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
                     "committed_oid": report.committed_oid,
                     "imported_registry_events": report.imported_registry_events,
                     "imported_revisions": report.imported_revisions,
+                    "imported_wire_messages": report.imported_wire_messages,
+                    "imported_wire_receipts": report.imported_wire_receipts,
                     "published_registry_events": report.published_registry_events,
                     "published_revisions": report.published_revisions,
+                    "published_wire_messages": report.published_wire_messages,
+                    "published_wire_receipts": report.published_wire_receipts,
                     "active_conflicts": report.active_conflicts,
                 });
                 println!("{}", serde_json::to_string_pretty(&val).unwrap());
             } else {
                 println!(
-                    "synced {}/{}: imported_revs={} published_revs={} conflicts={}",
+                    "synced {}/{}: imported_revs={} published_revs={} wire_msgs={} conflicts={}",
                     report.remote,
                     report.branch,
                     report.imported_revisions,
                     report.published_revisions,
+                    report.published_wire_messages,
                     report.active_conflicts
                 );
             }
@@ -1009,16 +1014,19 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
                     "verified_commits": report.verified_commits,
                     "verified_revisions": report.verified_revisions,
                     "verified_registry_events": report.verified_registry_events,
+                    "verified_wire_messages": report.verified_wire_messages,
+                    "verified_wire_receipts": report.verified_wire_receipts,
                 });
                 println!("{}", serde_json::to_string_pretty(&val).unwrap());
             } else {
                 println!(
-                    "verified {}/{}: commits={} revisions={} registry_events={}",
+                    "verified {}/{}: commits={} revisions={} registry_events={} wire_messages={}",
                     report.remote,
                     report.branch,
                     report.verified_commits,
                     report.verified_revisions,
-                    report.verified_registry_events
+                    report.verified_registry_events,
+                    report.verified_wire_messages
                 );
             }
             Ok(())

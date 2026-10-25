@@ -69,6 +69,11 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::state::StateCmd,
     },
+    /// Send, read, acknowledge, and relay FerroWire agent messages.
+    Wire {
+        #[command(subcommand)]
+        cmd: cmd::wire::WireCmd,
+    },
 }
 
 impl Command {
@@ -87,7 +92,10 @@ impl Command {
             Command::Manifest(c) => c.iris(),
             Command::Github(c) => c.iris(),
             Command::Routing(c) => c.iris(),
-            Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } => Vec::new(),
+            Command::Mcp(_)
+            | Command::Agent { .. }
+            | Command::State { .. }
+            | Command::Wire { .. } => Vec::new(),
         }
     }
 
@@ -118,7 +126,10 @@ impl Command {
             Command::Manifest(c) => c.has_handle(),
             Command::Github(c) => c.has_handle(),
             Command::Routing(c) => c.has_handle(),
-            Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } => false,
+            Command::Mcp(_)
+            | Command::Agent { .. }
+            | Command::State { .. }
+            | Command::Wire { .. } => false,
         }
     }
 
@@ -145,7 +156,8 @@ impl Command {
             | Command::Manifest(_)
             | Command::Mcp(_)
             | Command::Agent { .. }
-            | Command::State { .. } => false,
+            | Command::State { .. }
+            | Command::Wire { .. } => false,
         }
     }
 }
@@ -606,15 +618,126 @@ fn tracker_for(
 }
 
 fn main() {
-    let cli = Cli::parse();
-    let code = match run(cli) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            2
+    let argv0_stem = std::env::args_os()
+        .next()
+        .and_then(|s| PathBuf::from(s).file_stem().map(ToOwned::to_owned));
+    let argv0_str = argv0_stem.as_deref().and_then(|s| s.to_str());
+
+    let code = match argv0_str {
+        Some("agent-msg") => {
+            let cli = cmd::wire::AgentMsgCli::parse();
+            match run_agent_msg_entry(cli.db.clone(), cli) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("error: {e:#}");
+                    2
+                }
+            }
+        }
+        Some("agent-bus-claude-hook") => match run_claude_hook_entry() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
+        Some("agent-bus-mcp") => match run_mcp_entry() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                2
+            }
+        },
+        _ => {
+            if std::env::args_os()
+                .nth(1)
+                .and_then(|s| s.to_str().map(ToOwned::to_owned))
+                .as_deref()
+                == Some("agent-msg")
+            {
+                let shifted = std::iter::once(std::ffi::OsString::from("agent-msg"))
+                    .chain(std::env::args_os().skip(2));
+                let cli = cmd::wire::AgentMsgCli::parse_from(shifted);
+                match run_agent_msg_entry(cli.db.clone(), cli) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        2
+                    }
+                }
+            } else {
+                let cli = Cli::parse();
+                match run(cli) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("error: {e:#}");
+                        2
+                    }
+                }
+            }
         }
     };
     std::process::exit(code);
+}
+
+fn run_agent_msg_entry(flag_db: Option<PathBuf>, cli: cmd::wire::AgentMsgCli) -> Result<i32> {
+    let cwd = std::env::current_dir().context("could not determine the current directory")?;
+    let cfg = config::load(config::path().as_deref())?;
+    let explicit = explicit_db(flag_db);
+    let default_store = default_state_store_path()?;
+    let state_env = cmd::state::StateEnv {
+        explicit_db: explicit.as_deref(),
+        default_store: &default_store,
+        cfg: &cfg,
+        cwd: &cwd,
+    };
+    match cmd::wire::run_agent_msg(&state_env, cli) {
+        Ok(code) => Ok(code),
+        Err((code, msg)) => {
+            eprintln!("error: {msg}");
+            Ok(code)
+        }
+    }
+}
+
+fn run_claude_hook_entry() -> Result<i32> {
+    let cwd = std::env::current_dir().context("could not determine the current directory")?;
+    let cfg = config::load(config::path().as_deref())?;
+    let explicit = explicit_db(None);
+    let default_store = default_state_store_path()?;
+    let state_env = cmd::state::StateEnv {
+        explicit_db: explicit.as_deref(),
+        default_store: &default_store,
+        cfg: &cfg,
+        cwd: &cwd,
+    };
+    match cmd::wire::run_claude_hook(&state_env) {
+        Ok(code) => Ok(code),
+        Err((code, msg)) => {
+            eprintln!("error: {msg}");
+            Ok(code)
+        }
+    }
+}
+
+fn run_mcp_entry() -> Result<i32> {
+    let cwd = std::env::current_dir().context("could not determine the current directory")?;
+    let cfg = config::load(config::path().as_deref())?;
+    let explicit = explicit_db(None);
+    let default_store = default_state_store_path()?;
+    let state_env = cmd::state::StateEnv {
+        explicit_db: explicit.as_deref(),
+        default_store: &default_store,
+        cfg: &cfg,
+        cwd: &cwd,
+    };
+    match cmd::state_mcp::run(&state_env) {
+        Ok(()) => Ok(0),
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            Ok(1)
+        }
+    }
 }
 
 fn run(cli: Cli) -> Result<i32> {
@@ -680,6 +803,26 @@ fn run(cli: Cli) -> Result<i32> {
                 Err(msg) => {
                     eprintln!("error: {msg}");
                     Ok(1)
+                }
+            };
+        }
+        Cli {
+            db,
+            command: Command::Wire { cmd },
+        } => {
+            let explicit = explicit_db(db);
+            let default_store = default_state_store_path()?;
+            let state_env = cmd::state::StateEnv {
+                explicit_db: explicit.as_deref(),
+                default_store: &default_store,
+                cfg: &cfg,
+                cwd: &cwd,
+            };
+            return match cmd::wire::run(&state_env, cmd) {
+                Ok(code) => Ok(code),
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
                 }
             };
         }
@@ -987,7 +1130,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
         Command::Routing(c) => cmd::routing::run(&ctx, c, here_for_store.map(|b| b.is_some())),
-        Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } => {
+        Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } | Command::Wire { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };

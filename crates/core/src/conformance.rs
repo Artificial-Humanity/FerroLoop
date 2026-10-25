@@ -23,7 +23,9 @@ use crate::model::{
     CommandSpec, GateDef, GateKind, PopulationDelivery, Regret, Selector, State, Transition,
 };
 use crate::split::{Batch, CachedSegment, LedgerCache, Outbox, RemoteLedger, SplitLedger};
-use crate::store::{AgentRegistry, Catalog, Handles, Ledger, StateStore, StoreError, Tracker};
+use crate::store::{
+    AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, StoreError, Tracker,
+};
 use crate::verdict::Verdict;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -62,6 +64,7 @@ pub struct Bound<'a> {
     pub handles: &'a dyn Handles,
     pub state: &'a dyn StateStore,
     pub agents: &'a dyn AgentRegistry,
+    pub wire: &'a dyn MessageStore,
 }
 
 /// Hands one case its `Bound`. A callback rather than a return value, so a
@@ -74,7 +77,7 @@ pub trait Fixture {
 /// One store backing every role, plus a guard to keep alive.
 pub struct Single<S, G>(pub S, pub G);
 
-impl<S: Catalog + Tracker + Ledger + Handles + StateStore + AgentRegistry, G> Fixture
+impl<S: Catalog + Tracker + Ledger + Handles + StateStore + AgentRegistry + MessageStore, G> Fixture
     for Single<S, G>
 {
     fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
@@ -85,6 +88,7 @@ impl<S: Catalog + Tracker + Ledger + Handles + StateStore + AgentRegistry, G> Fi
             handles: &self.0,
             state: &self.0,
             agents: &self.0,
+            wire: &self.0,
         });
     }
 }
@@ -100,8 +104,10 @@ pub trait SplitFixture {
 /// fixture swaps `MemRemote` for `GithubLedger` over the fake GitHub.
 pub struct SplitOver<S, G>(pub S, pub G);
 
-impl<S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegistry, G> SplitFixture
-    for SplitOver<S, G>
+impl<
+    S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegistry + MessageStore,
+    G,
+> SplitFixture for SplitOver<S, G>
 {
     fn with_split(&self, f: &mut dyn FnMut(&Bound<'_>, &dyn RemoteControl)) {
         self.0
@@ -120,14 +126,17 @@ impl<S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegist
                 handles: &self.0,
                 state: &self.0,
                 agents: &self.0,
+                wire: &self.0,
             },
             &remote,
         );
     }
 }
 
-impl<S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegistry, G> Fixture
-    for SplitOver<S, G>
+impl<
+    S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegistry + MessageStore,
+    G,
+> Fixture for SplitOver<S, G>
 {
     fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
         self.with_split(&mut |b, _| f(b));
@@ -1687,6 +1696,26 @@ fn an_id_has_no_handle_under_any_kind_but_its_own(roles: &Bound<'_>) {
             by: "o".into(),
         })
         .unwrap();
+    let msg = roles
+        .wire
+        .send_wire(crate::ferrowire::SendWireArgs {
+            id: None,
+            sender_id: Some(ag.id.clone()),
+            sender_name: "ferris".into(),
+            sender_host: None,
+            to: crate::ferrowire::WireAddress::All,
+            kind: crate::ferrowire::MessageKind::Mail,
+            urgency: crate::ferrowire::MessageUrgency::Normal,
+            durable: false,
+            subject: "ping".into(),
+            body: "pong".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(1),
+        })
+        .unwrap()
+        .0;
     let held = [
         (Kind::Project, p.0),
         (Kind::Gate, g.0),
@@ -1694,6 +1723,7 @@ fn an_id_has_no_handle_under_any_kind_but_its_own(roles: &Bound<'_>) {
         (Kind::Finding, f.0),
         (Kind::State, st.id.0),
         (Kind::Agent, ag.id.0),
+        (Kind::Message, msg.id.0),
     ];
     for own in Kind::ALL {
         assert!(
@@ -1703,16 +1733,24 @@ fn an_id_has_no_handle_under_any_kind_but_its_own(roles: &Bound<'_>) {
         );
     }
     for (own, id) in &held {
-        let h = roles
-            .handles
-            .handle_of(*own, id)
-            .unwrap()
-            .unwrap_or_else(|| panic!("{id} has no handle as its own kind"));
-        assert_eq!(
-            roles.handles.resolve_handle(*own, h).unwrap().as_ref(),
-            Some(id),
-            "{id}'s handle resolves back to it"
-        );
+        if *own == Kind::Message {
+            assert_eq!(
+                roles.handles.handle_of(*own, id).unwrap(),
+                None,
+                "messages do not consume sequential numeric handles"
+            );
+        } else {
+            let h = roles
+                .handles
+                .handle_of(*own, id)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{id} has no handle as its own kind"));
+            assert_eq!(
+                roles.handles.resolve_handle(*own, h).unwrap().as_ref(),
+                Some(id),
+                "{id}'s handle resolves back to it"
+            );
+        }
         for other in Kind::ALL.iter().filter(|k| *k != own) {
             assert_eq!(
                 roles.handles.handle_of(*other, id).unwrap(),
@@ -2452,6 +2490,8 @@ impl RemoteControl for MemRemote {
 const AGENT_REGISTRY_CASES: usize = 7;
 /// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
 const STATE_STORE_CASES: usize = 10;
+/// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
+const MESSAGE_STORE_CASES: usize = 7;
 
 pub fn agent_registry<S: AgentRegistry + Catalog + Handles, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -2480,6 +2520,21 @@ pub fn state_store<S: StateStore + Catalog + Handles, G>(make: impl Fn() -> (S, 
         offline_same_key_collision_aliases_unpublished_local_id_to_remote::<S>,
     ];
     run_suite("state-store", STATE_STORE_CASES, cases, make);
+}
+
+pub fn message_store<S: MessageStore + AgentRegistry + Catalog + Handles, G>(
+    make: impl Fn() -> (S, G),
+) {
+    let cases: &[fn(&S)] = &[
+        direct_and_unregistered_persona_addressing_round_trips_across_registration::<S>,
+        group_selectors_expand_active_agents_and_exclude_sender::<S>,
+        ask_reply_and_thread_indexing_validate_and_correlate::<S>,
+        receipt_transitions_and_batch_imports_converge_monotonically::<S>,
+        wire_import_deduplicates_and_refuses_tampered_message::<S>,
+        offline_agent_id_collision_alias_preserves_wire_inbox_and_ack::<S>,
+        prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff::<S>,
+    ];
+    run_suite("message-store", MESSAGE_STORE_CASES, cases, make);
 }
 
 fn area_round_trips_and_normalizes_key<S: AgentRegistry>(s: &S) {
@@ -3404,4 +3459,609 @@ fn offline_same_key_collision_aliases_unpublished_local_id_to_remote<S: StateSto
         s.resolve_handle(Kind::State, local_handle).unwrap(),
         Some(remote_id.0)
     );
+}
+
+fn direct_and_unregistered_persona_addressing_round_trips_across_registration<
+    S: MessageStore + AgentRegistry + Catalog + Handles,
+>(
+    s: &S,
+) {
+    use crate::ferrowire::{
+        DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter,
+        fallback_agent_iri,
+    };
+
+    // 1. Send to an unregistered persona "ferris" -> uses fallback urn:fl:agent:ferris.
+    let (msg1, rcpts1) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: Some("ai-lab-0".into()),
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Welcome".into(),
+            body: "Cold roster mail".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+    assert_eq!(s.kind_of(msg1.id.iri()).unwrap(), Kind::Message);
+    assert_eq!(s.handle_of(Kind::Message, msg1.id.iri()).unwrap(), None);
+    assert_eq!(rcpts1.len(), 1);
+    assert_eq!(rcpts1[0].recipient_id, fallback_agent_iri("ferris"));
+    assert_eq!(rcpts1[0].recipient_name, "ferris");
+
+    // 2. Register Ferris in the AgentRegistry.
+    let ferris = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(15),
+            by: "owner".into(),
+        })
+        .unwrap();
+
+    // 3. Send a second message to Ferris now that Ferris is registered.
+    let (msg2, rcpts2) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Urgent,
+            durable: false,
+            subject: "Registered mail".into(),
+            body: "Warm roster mail".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(20),
+        })
+        .unwrap();
+    assert_eq!(rcpts2[0].recipient_id, ferris.id.0);
+
+    // 4. Querying inbox by name ("Ferris") or by AgentId URN returns BOTH messages.
+    let by_name = s
+        .list_wire_inbox(&WireFilter {
+            recipient: Some("Ferris".into()),
+            unread_only: true,
+            ..WireFilter::default()
+        })
+        .unwrap();
+    assert_eq!(by_name.len(), 2);
+    assert_eq!(by_name[0].message.id, msg1.id);
+    assert_eq!(by_name[1].message.id, msg2.id);
+
+    let by_id = s
+        .list_wire_inbox(&WireFilter {
+            recipient: Some(ferris.id.to_string()),
+            unread_only: true,
+            ..WireFilter::default()
+        })
+        .unwrap();
+    assert_eq!(by_id.len(), 2);
+
+    // 5. Acking msg1 by Ferris's AgentId URN transitions the pre-registration receipt.
+    let acked = s
+        .update_wire_receipt(
+            &msg1.id,
+            ferris.id.as_str(),
+            DeliveryStatus::Acked,
+            false,
+            At::from_unix_millis(25),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(acked.status, DeliveryStatus::Acked);
+    assert_eq!(acked.acked_at, Some(At::from_unix_millis(25)));
+}
+
+fn group_selectors_expand_active_agents_and_exclude_sender<
+    S: MessageStore + AgentRegistry + Catalog + Handles,
+>(
+    s: &S,
+) {
+    use crate::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+
+    let jarvis = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Jarvis".into(),
+            email: None,
+            project: "ai-lab-amd".into(),
+            role: crate::agent::AgentRole::LabManager,
+            extra_areas: vec!["ferroloop".into()],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(10),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let ferris = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(11),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let cogs = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Cogs".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Assistant,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(12),
+            by: "ferris".into(),
+        })
+        .unwrap();
+    let retired = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "OldBot".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Assistant,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(13),
+            by: "ferris".into(),
+        })
+        .unwrap();
+    s.retire_agent(&retired.id, At::from_unix_millis(14), "ferris")
+        .unwrap();
+
+    // @all from ferris -> jarvis and cogs (excludes sender ferris and retired oldbot).
+    let (_, all_rcpts) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: Some(ferris.id.clone()),
+            sender_name: "ferris".into(),
+            sender_host: None,
+            to: WireAddress::All,
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Broadcast".into(),
+            body: "Hello all".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(20),
+        })
+        .unwrap();
+    let names: Vec<_> = all_rcpts
+        .iter()
+        .map(|r| r.recipient_name.as_str())
+        .collect();
+    assert_eq!(names, vec!["cogs", "jarvis"]);
+
+    // @area:ferroloop from jarvis -> cogs and ferris.
+    let (_, area_rcpts) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: Some(jarvis.id.clone()),
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::Area("ferroloop".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Area".into(),
+            body: "FerroLoop team".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(21),
+        })
+        .unwrap();
+    let area_names: Vec<_> = area_rcpts
+        .iter()
+        .map(|r| r.recipient_name.as_str())
+        .collect();
+    assert_eq!(area_names, vec!["cogs", "ferris"]);
+
+    // @area:ferroloop/lead from cogs -> ferris only.
+    let (_, role_rcpts) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: Some(cogs.id),
+            sender_name: "cogs".into(),
+            sender_host: None,
+            to: WireAddress::AreaRole {
+                area: "ferroloop".into(),
+                role: crate::agent::AgentRole::Lead,
+            },
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Lead only".into(),
+            body: "PR ready".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(22),
+        })
+        .unwrap();
+    assert_eq!(role_rcpts.len(), 1);
+    assert_eq!(role_rcpts[0].recipient_name, "ferris");
+}
+
+fn ask_reply_and_thread_indexing_validate_and_correlate<S: MessageStore>(s: &S) {
+    use crate::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+
+    // Reply without parent is refused.
+    let err = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "ferris".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("jarvis".into()),
+            kind: MessageKind::Reply,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Re: orphan".into(),
+            body: "No parent".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::InvalidState(_)));
+
+    // Ask forces durable = true and sets thread_id == id.
+    let (ask, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "ferris".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("jarvis".into()),
+            kind: MessageKind::Ask,
+            urgency: MessageUrgency::Urgent,
+            durable: false,
+            subject: "GPU lease?".into(),
+            body: "May we run benchmarks?".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: Some(At::from_unix_millis(60_000)),
+            at: At::from_unix_millis(11),
+        })
+        .unwrap();
+    assert!(ask.durable);
+    assert_eq!(ask.thread_id, ask.id);
+
+    // Reply inherits thread_id and sets correlation_id = Some(ask.id).
+    let (reply, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Reply,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Re: GPU lease?".into(),
+            body: "Approved".into(),
+            reply_to: Some(ask.id.clone()),
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(12),
+        })
+        .unwrap();
+    assert_eq!(reply.thread_id, ask.id);
+    assert_eq!(reply.correlation_id, Some(ask.id.clone()));
+
+    let thread = s.list_wire_thread(&ask.thread_id).unwrap();
+    assert_eq!(thread, vec![ask.clone(), reply.clone()]);
+
+    let replies = s.list_wire_replies(&ask.id).unwrap();
+    assert_eq!(replies, vec![reply]);
+}
+
+fn receipt_transitions_and_batch_imports_converge_monotonically<S: MessageStore>(s: &S) {
+    use crate::ferrowire::{
+        DeliveryReceipt, DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, WireAddress,
+    };
+
+    let (msg, rcpts) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: "Status".into(),
+            body: "Check in".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+    let r0 = &rcpts[0];
+    assert_eq!(r0.status, DeliveryStatus::Pending);
+    assert_eq!(r0.attempts, 0);
+
+    // Failed push increments attempts while staying Pending.
+    let r1 = s
+        .update_wire_receipt(
+            &msg.id,
+            "ferris",
+            DeliveryStatus::Pending,
+            true,
+            At::from_unix_millis(15),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r1.status, DeliveryStatus::Pending);
+    assert_eq!(r1.attempts, 1);
+
+    // Ack transitions to Acked.
+    let r2 = s
+        .update_wire_receipt(
+            &msg.id,
+            "ferris",
+            DeliveryStatus::Acked,
+            false,
+            At::from_unix_millis(20),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r2.status, DeliveryStatus::Acked);
+    assert_eq!(r2.acked_at, Some(At::from_unix_millis(20)));
+
+    // Out-of-order Delivered receipt with higher attempts merges without downgrading Acked.
+    let late_delivered = DeliveryReceipt {
+        message_id: msg.id.clone(),
+        recipient_id: r0.recipient_id.clone(),
+        recipient_name: "ferris".into(),
+        status: DeliveryStatus::Delivered,
+        attempts: 4,
+        updated_at: At::from_unix_millis(25),
+        acked_at: None,
+    };
+    s.import_wire_batch(&[], &[late_delivered]).unwrap();
+    let final_rcpts = s.list_wire_receipts(&msg.id).unwrap();
+    assert_eq!(final_rcpts.len(), 1);
+    assert_eq!(final_rcpts[0].status, DeliveryStatus::Acked);
+    assert_eq!(final_rcpts[0].attempts, 4);
+    assert_eq!(final_rcpts[0].updated_at, At::from_unix_millis(25));
+    assert_eq!(final_rcpts[0].acked_at, Some(At::from_unix_millis(20)));
+}
+
+fn wire_import_deduplicates_and_refuses_tampered_message<S: MessageStore>(s: &S) {
+    use crate::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+
+    let (msg, rcpts) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Handoff,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Handoff".into(),
+            body: "Original body".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+    assert!(msg.durable, "Handoff forces durable = true");
+
+    let msg_log_len = s.wire_messages_after(0).unwrap().len();
+    let rcpt_log_len = s.wire_receipts_after(0).unwrap().len();
+
+    // Re-importing identical message and receipt is a no-op.
+    s.import_wire_batch(std::slice::from_ref(&msg), &rcpts)
+        .unwrap();
+    assert_eq!(s.wire_messages_after(0).unwrap().len(), msg_log_len);
+    assert_eq!(s.wire_receipts_after(0).unwrap().len(), rcpt_log_len);
+
+    // Tampering with an existing message ID is refused.
+    let mut tampered = msg.clone();
+    tampered.body = "Tampered body".into();
+    let err = s.import_wire_batch(&[tampered], &[]).unwrap_err();
+    assert!(matches!(err, StoreError::WireMessageTampered { .. }));
+}
+
+fn offline_agent_id_collision_alias_preserves_wire_inbox_and_ack<
+    S: MessageStore + AgentRegistry + Handles,
+>(
+    s: &S,
+) {
+    use crate::ferrowire::{
+        DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter,
+    };
+
+    let local_ferris = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(10),
+            by: "owner".into(),
+        })
+        .unwrap();
+
+    // Send a message to Ferris while Ferris has `local_ferris.id`.
+    let (msg, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: "Before alias".into(),
+            body: "Sent to local AgentId".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(12),
+        })
+        .unwrap();
+
+    // Import a remote RegistryEvent that aliases `local_ferris.id` -> `remote_id`.
+    let remote_id = crate::ids::AgentId(crate::ids::seq_iri(999));
+    let mut remote_rec = local_ferris.clone();
+    remote_rec.id = remote_id.clone();
+    let ev = crate::agent::RegistryEvent {
+        event_id: crate::ids::seq_iri(998),
+        at: At::from_unix_millis(20),
+        by: "owner".into(),
+        kind: crate::agent::RegistryEventKind::AgentUpsert(remote_rec),
+    };
+    s.import_registry_events(&[ev]).unwrap();
+
+    // Querying inbox by the new canonical `remote_id` or old `local_ferris.id` or `"ferris"` finds `msg`.
+    for query in [remote_id.as_str(), local_ferris.id.as_str(), "ferris"] {
+        let inbox = s
+            .list_wire_inbox(&WireFilter {
+                recipient: Some(query.to_string()),
+                unread_only: true,
+                ..WireFilter::default()
+            })
+            .unwrap();
+        assert_eq!(inbox.len(), 1, "query {query} should find the message");
+        assert_eq!(inbox[0].message.id, msg.id);
+    }
+
+    // Acking via the new canonical `remote_id` succeeds.
+    let acked = s
+        .update_wire_receipt(
+            &msg.id,
+            remote_id.as_str(),
+            DeliveryStatus::Acked,
+            false,
+            At::from_unix_millis(30),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(acked.status, DeliveryStatus::Acked);
+}
+
+fn prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff<S: MessageStore>(
+    s: &S,
+) {
+    use crate::ferrowire::{
+        DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, WireAddress,
+    };
+
+    // 1. Acked transient message before cutoff -> pruned.
+    let (m_acked, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Transient acked".into(),
+            body: "Prune me".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+    s.update_wire_receipt(
+        &m_acked.id,
+        "ferris",
+        DeliveryStatus::Acked,
+        false,
+        At::from_unix_millis(11),
+    )
+    .unwrap();
+
+    // 2. Pending transient message before cutoff -> kept.
+    let (m_pending, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Transient pending".into(),
+            body: "Keep me".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(12),
+        })
+        .unwrap();
+
+    // 3. Acked durable message before cutoff -> kept.
+    let (m_durable, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: "Durable acked".into(),
+            body: "Keep durable".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(13),
+        })
+        .unwrap();
+    s.update_wire_receipt(
+        &m_durable.id,
+        "ferris",
+        DeliveryStatus::Acked,
+        false,
+        At::from_unix_millis(14),
+    )
+    .unwrap();
+
+    let pruned = s.prune_wire(At::from_unix_millis(20)).unwrap();
+    assert_eq!(pruned, 1);
+    assert!(s.get_wire_message(&m_acked.id).unwrap().is_none());
+    assert!(s.get_wire_message(&m_pending.id).unwrap().is_some());
+    assert!(s.get_wire_message(&m_durable.id).unwrap().is_some());
 }

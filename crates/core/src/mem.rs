@@ -4,9 +4,14 @@ use crate::agent::{
 };
 use crate::at::At;
 use crate::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
+use crate::ferrowire::{
+    DeliveryReceipt, DeliveryStatus, MessageKind, SendWireArgs, ThreadId, WireFilter,
+    WireInboxItem, WireMessage, resolve_recipients, validate_sender_name, validate_subject,
+    validate_wire_body,
+};
 use crate::finding::{Finding, FindingState};
 use crate::ids::{
-    AgentId, FindingId, GateId, Kind, ProjectId, RecordId, RevisionId, StateId, seq_iri,
+    AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId, seq_iri,
 };
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
@@ -15,11 +20,13 @@ use crate::routing::{ForeignRecord, Routes, RoutingMap, check_foreign_for_local}
 use crate::split::{CachedSegment, LedgerCache, Outbox, Pending};
 use crate::state::{
     MemoryLifecycle, MergeMode, SensitivityPatch, StateConcern, StateConflict, StateEntry,
-    StatePayload, StateRevision, StateScope, StateSyncCursor, UpsertStateArgs,
+    StateError, StatePayload, StateRevision, StateScope, StateSyncCursor, UpsertStateArgs,
     compute_append_merge, compute_last_writer_merge, is_ancestor_in_dag,
     lowest_common_ancestor_in_dag, sorted_parents, validate_slug,
 };
-use crate::store::{AgentRegistry, Catalog, Handles, Ledger, StateStore, StoreError, Tracker};
+use crate::store::{
+    AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, StoreError, Tracker,
+};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -92,6 +99,16 @@ struct Inner {
     next_state_rev_seq: u64,
     state_conflicts: BTreeMap<StateId, StateConflict>,
     sync_cursors: BTreeMap<String, StateSyncCursor>,
+
+    wire_messages: BTreeMap<MessageId, WireMessage>,
+    wire_msg_log: BTreeMap<u64, MessageId>,
+    wire_msg_seq: BTreeMap<MessageId, u64>,
+    next_wire_msg_seq: u64,
+    wire_inbox: BTreeMap<(Iri, MessageId), DeliveryReceipt>,
+    wire_rcpt_log: BTreeMap<u64, DeliveryReceipt>,
+    next_wire_rcpt_seq: u64,
+    wire_threads: BTreeSet<(ThreadId, MessageId)>,
+    wire_replies: BTreeSet<(MessageId, MessageId)>,
 }
 
 impl Inner {
@@ -103,6 +120,13 @@ impl Inner {
         *n += 1;
         self.handles.insert((kind, *n), id.clone());
         self.handle_of.insert(id.clone(), *n);
+        id
+    }
+
+    fn mint_unhanded(&mut self, kind: Kind) -> Iri {
+        self.next_id += 1;
+        let id = seq_iri(self.next_id);
+        self.owned.insert(id.clone(), kind);
         id
     }
 
@@ -130,6 +154,80 @@ impl Inner {
         self.handles.insert((kind, *n), canonical.clone());
         self.handle_of.insert(canonical, *n);
         Ok(())
+    }
+
+    /// Register an imported `Kind::Message` IRI in `owned` without allocating a numeric handle.
+    fn index_imported_unhanded(&mut self, kind: Kind, id: &Iri) -> Result<(), StoreError> {
+        let canonical = self.resolve(id);
+        if let Some(&existing) = self.owned.get(&canonical) {
+            if existing == kind {
+                return Ok(());
+            }
+            return Err(StoreError::WrongKind {
+                id: canonical,
+                expected: kind,
+                found: existing,
+            });
+        }
+        self.owned.insert(canonical, kind);
+        Ok(())
+    }
+
+    fn append_wire_message(&mut self, msg: WireMessage) {
+        if !self.wire_msg_seq.contains_key(&msg.id) {
+            self.next_wire_msg_seq += 1;
+            let seq = self.next_wire_msg_seq;
+            self.wire_msg_seq.insert(msg.id.clone(), seq);
+            self.wire_msg_log.insert(seq, msg.id.clone());
+        }
+        self.wire_threads
+            .insert((msg.thread_id.clone(), msg.id.clone()));
+        if let Some(ref corr) = msg.correlation_id {
+            self.wire_replies.insert((corr.clone(), msg.id.clone()));
+        }
+        self.wire_messages.insert(msg.id.clone(), msg);
+    }
+
+    fn append_wire_receipt(&mut self, rcpt: DeliveryReceipt) {
+        self.next_wire_rcpt_seq += 1;
+        let seq = self.next_wire_rcpt_seq;
+        self.wire_rcpt_log.insert(seq, rcpt);
+    }
+
+    fn recipient_matches(&self, rcpt: &DeliveryReceipt, query: &str) -> bool {
+        let trimmed = query.trim();
+        let (agent_id, name_key) = if let Ok(iri) = Iri::parse(trimmed) {
+            let resolved_iri = self.resolve(&iri);
+            if let Some(agent) = self.agents.get(&AgentId(resolved_iri.clone())) {
+                (Some(resolved_iri), Some(agent.name_key.clone()))
+            } else if let Some(rest) = trimmed.strip_prefix("urn:fl:agent:")
+                && let Ok(k) = validate_slug(rest)
+            {
+                let aid = self.agent_by_name.get(&k).map(|id| self.resolve(id.iri()));
+                (aid, Some(k))
+            } else {
+                (Some(resolved_iri), None)
+            }
+        } else if let Ok(k) = validate_slug(trimmed) {
+            let aid = self.agent_by_name.get(&k).map(|id| self.resolve(id.iri()));
+            (aid, Some(k))
+        } else {
+            (None, None)
+        };
+
+        let rcpt_resolved = self.resolve(&rcpt.recipient_id);
+        if let Some(ref aid) = agent_id
+            && &rcpt_resolved == aid
+        {
+            return true;
+        }
+        if let Some(ref nk) = name_key
+            && (&rcpt.recipient_name == nk
+                || rcpt.recipient_id.as_str() == format!("urn:fl:agent:{nk}"))
+        {
+            return true;
+        }
+        rcpt.recipient_id.as_str() == trimmed || rcpt.recipient_name.eq_ignore_ascii_case(trimmed)
     }
 
     /// Re-point an unpublished local `old_id` to `new_id` of the same `kind`,
@@ -1661,6 +1759,388 @@ impl StateStore for MemStore {
     }
 }
 
+impl MessageStore for MemStore {
+    fn send_wire(
+        &self,
+        args: SendWireArgs,
+    ) -> Result<(WireMessage, Vec<DeliveryReceipt>), StoreError> {
+        let subject =
+            validate_subject(&args.subject).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let body =
+            validate_wire_body(&args.body).map_err(|e| StoreError::InvalidState(e.to_string()))?;
+        let sender_name = validate_sender_name(&args.sender_name)
+            .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+
+        let mut s = self.inner.borrow_mut();
+
+        let (parent_thread, correlation_id) = match &args.reply_to {
+            Some(parent_id) => {
+                let Some(parent) = s.wire_messages.get(parent_id).cloned() else {
+                    return Err(StoreError::MessageNotFound(parent_id.clone()));
+                };
+                let corr = if parent.kind == MessageKind::Ask {
+                    Some(parent.id.clone())
+                } else if parent.correlation_id.is_some() {
+                    parent.correlation_id.clone()
+                } else if args.kind == MessageKind::Reply {
+                    Some(parent.id.clone())
+                } else {
+                    None
+                };
+                (Some(parent.thread_id), corr)
+            }
+            None => {
+                if args.kind == MessageKind::Reply {
+                    return Err(StoreError::InvalidState(
+                        StateError::ReplyRequiresParent.to_string(),
+                    ));
+                }
+                (None, None)
+            }
+        };
+
+        let msg_id = match args.id {
+            Some(id) => {
+                s.index_imported_unhanded(Kind::Message, id.iri())?;
+                id
+            }
+            None => MessageId(s.mint_unhanded(Kind::Message)),
+        };
+
+        let thread_id = args
+            .thread_id
+            .or(parent_thread)
+            .unwrap_or_else(|| msg_id.clone());
+        let durable = args.durable || matches!(args.kind, MessageKind::Ask | MessageKind::Handoff);
+
+        let all_agents: Vec<AgentRecord> = s.agents.values().cloned().collect();
+        let sender_id = args.sender_id.or_else(|| {
+            all_agents
+                .iter()
+                .find(|a| a.status == AgentStatus::Active && a.name_key == sender_name)
+                .map(|a| a.id.clone())
+        });
+
+        let msg = WireMessage {
+            id: msg_id.clone(),
+            thread_id,
+            reply_to: args.reply_to,
+            correlation_id,
+            sender_id,
+            sender_name,
+            sender_host: args.sender_host,
+            to: args.to,
+            kind: args.kind,
+            urgency: args.urgency,
+            durable,
+            subject,
+            body,
+            created_at: args.at.clone(),
+            deadline_at: args.deadline_at,
+        };
+        msg.validate()
+            .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+
+        let recipients = resolve_recipients(
+            &msg.to,
+            msg.sender_id.as_ref(),
+            &msg.sender_name,
+            &all_agents,
+        );
+
+        s.append_wire_message(msg.clone());
+
+        let mut receipts = Vec::with_capacity(recipients.len());
+        for (recipient_id, recipient_name) in recipients {
+            let rcpt = DeliveryReceipt {
+                message_id: msg.id.clone(),
+                recipient_id: recipient_id.clone(),
+                recipient_name,
+                status: DeliveryStatus::Pending,
+                attempts: 0,
+                updated_at: args.at.clone(),
+                acked_at: None,
+            };
+            s.wire_inbox
+                .insert((recipient_id, msg.id.clone()), rcpt.clone());
+            s.append_wire_receipt(rcpt.clone());
+            receipts.push(rcpt);
+        }
+
+        Ok((msg, receipts))
+    }
+
+    fn get_wire_message(&self, id: &MessageId) -> Result<Option<WireMessage>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.wire_messages.get(id).cloned())
+    }
+
+    fn list_wire_inbox(&self, filter: &WireFilter) -> Result<Vec<WireInboxItem>, StoreError> {
+        let s = self.inner.borrow();
+        let mut items = Vec::new();
+        for rcpt in s.wire_inbox.values() {
+            if let Some(ref rec_query) = filter.recipient
+                && !s.recipient_matches(rcpt, rec_query)
+            {
+                continue;
+            }
+            if filter.unread_only
+                && matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
+            {
+                continue;
+            }
+            let Some(msg) = s.wire_messages.get(&rcpt.message_id).cloned() else {
+                continue;
+            };
+            if let Some(ref tid) = filter.thread_id
+                && &msg.thread_id != tid
+            {
+                continue;
+            }
+            if let Some(ref cid) = filter.correlation_id
+                && msg.correlation_id.as_ref() != Some(cid)
+            {
+                continue;
+            }
+            items.push(WireInboxItem {
+                message: msg,
+                receipt: rcpt.clone(),
+            });
+        }
+        items.sort_by(|a, b| {
+            (&a.message.id, &a.receipt.recipient_id).cmp(&(&b.message.id, &b.receipt.recipient_id))
+        });
+        if let Some(limit) = filter.limit
+            && items.len() > limit
+        {
+            items.truncate(limit);
+        }
+        Ok(items)
+    }
+
+    fn list_wire_thread(&self, thread_id: &ThreadId) -> Result<Vec<WireMessage>, StoreError> {
+        let s = self.inner.borrow();
+        let mut out = Vec::new();
+        for (tid, mid) in &s.wire_threads {
+            if tid == thread_id
+                && let Some(msg) = s.wire_messages.get(mid)
+            {
+                out.push(msg.clone());
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    fn list_wire_replies(
+        &self,
+        correlation_id: &MessageId,
+    ) -> Result<Vec<WireMessage>, StoreError> {
+        let s = self.inner.borrow();
+        let mut out = Vec::new();
+        for (cid, mid) in &s.wire_replies {
+            if cid == correlation_id
+                && let Some(msg) = s.wire_messages.get(mid)
+            {
+                out.push(msg.clone());
+            }
+        }
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    fn list_wire_receipts(
+        &self,
+        message_id: &MessageId,
+    ) -> Result<Vec<DeliveryReceipt>, StoreError> {
+        let s = self.inner.borrow();
+        if !s.wire_messages.contains_key(message_id) {
+            return Err(StoreError::MessageNotFound(message_id.clone()));
+        }
+        let mut out: Vec<DeliveryReceipt> = s
+            .wire_inbox
+            .values()
+            .filter(|r| &r.message_id == message_id)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.recipient_id.cmp(&b.recipient_id));
+        Ok(out)
+    }
+
+    fn update_wire_receipt(
+        &self,
+        message_id: &MessageId,
+        recipient: &str,
+        status: DeliveryStatus,
+        increment_attempts: bool,
+        at: At,
+    ) -> Result<Option<DeliveryReceipt>, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        if !s.wire_messages.contains_key(message_id) {
+            return Err(StoreError::MessageNotFound(message_id.clone()));
+        }
+        let matching_key = s
+            .wire_inbox
+            .iter()
+            .find(|((_, mid), rcpt)| mid == message_id && s.recipient_matches(rcpt, recipient))
+            .map(|(k, _)| k.clone());
+        let Some(key) = matching_key else {
+            return Ok(None);
+        };
+        let existing = s.wire_inbox.get(&key).cloned().unwrap();
+        let attempts = if increment_attempts {
+            existing.attempts.saturating_add(1)
+        } else {
+            existing.attempts
+        };
+        let incoming = DeliveryReceipt {
+            message_id: existing.message_id.clone(),
+            recipient_id: existing.recipient_id.clone(),
+            recipient_name: existing.recipient_name.clone(),
+            status,
+            attempts,
+            updated_at: at.clone(),
+            acked_at: if status == DeliveryStatus::Acked {
+                Some(at)
+            } else {
+                None
+            },
+        };
+        let merged = existing.merge(&incoming);
+        s.wire_inbox.insert(key, merged.clone());
+        s.append_wire_receipt(merged.clone());
+        Ok(Some(merged))
+    }
+
+    fn wire_messages_after(&self, after_seq: u64) -> Result<Vec<(u64, WireMessage)>, StoreError> {
+        let s = self.inner.borrow();
+        let mut out = Vec::new();
+        for (&seq, mid) in s.wire_msg_log.range((after_seq + 1)..) {
+            if let Some(msg) = s.wire_messages.get(mid) {
+                out.push((seq, msg.clone()));
+            }
+        }
+        Ok(out)
+    }
+
+    fn wire_receipts_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<(u64, DeliveryReceipt)>, StoreError> {
+        let s = self.inner.borrow();
+        Ok(s.wire_rcpt_log
+            .range((after_seq + 1)..)
+            .filter(|(_, rcpt)| s.wire_messages.contains_key(&rcpt.message_id))
+            .map(|(&seq, rcpt)| (seq, rcpt.clone()))
+            .collect())
+    }
+
+    fn import_wire_batch(
+        &self,
+        messages: &[WireMessage],
+        receipts: &[DeliveryReceipt],
+    ) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        let all_agents: Vec<AgentRecord> = s.agents.values().cloned().collect();
+
+        for msg in messages {
+            msg.validate()
+                .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+            if let Some(existing) = s.wire_messages.get(&msg.id) {
+                if existing != msg {
+                    return Err(StoreError::WireMessageTampered {
+                        id: msg.id.clone(),
+                        detail: "imported wire message differs from stored copy".into(),
+                    });
+                }
+                continue;
+            }
+            s.index_imported_unhanded(Kind::Message, msg.id.iri())?;
+            s.append_wire_message(msg.clone());
+
+            let resolved = resolve_recipients(
+                &msg.to,
+                msg.sender_id.as_ref(),
+                &msg.sender_name,
+                &all_agents,
+            );
+            for (rec_id, rec_name) in resolved {
+                let in_incoming = receipts.iter().any(|r| {
+                    r.message_id == msg.id
+                        && (r.recipient_id == rec_id || r.recipient_name == rec_name)
+                });
+                if !in_incoming && !s.wire_inbox.contains_key(&(rec_id.clone(), msg.id.clone())) {
+                    let rcpt = DeliveryReceipt {
+                        message_id: msg.id.clone(),
+                        recipient_id: rec_id.clone(),
+                        recipient_name: rec_name,
+                        status: DeliveryStatus::Pending,
+                        attempts: 0,
+                        updated_at: msg.created_at.clone(),
+                        acked_at: None,
+                    };
+                    s.wire_inbox.insert((rec_id, msg.id.clone()), rcpt.clone());
+                    s.append_wire_receipt(rcpt);
+                }
+            }
+        }
+
+        for rcpt in receipts {
+            if !s.wire_messages.contains_key(&rcpt.message_id) {
+                return Err(StoreError::MessageNotFound(rcpt.message_id.clone()));
+            }
+            let key = (rcpt.recipient_id.clone(), rcpt.message_id.clone());
+            match s.wire_inbox.get(&key).cloned() {
+                Some(existing) => {
+                    let merged = existing.merge(rcpt);
+                    if merged != existing {
+                        s.wire_inbox.insert(key, merged.clone());
+                        s.append_wire_receipt(merged);
+                    }
+                }
+                None => {
+                    s.wire_inbox.insert(key, rcpt.clone());
+                    s.append_wire_receipt(rcpt.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prune_wire(&self, before: At) -> Result<usize, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        let to_prune: Vec<MessageId> = s
+            .wire_messages
+            .values()
+            .filter(|msg| !msg.durable && msg.created_at < before)
+            .filter(|msg| {
+                s.wire_inbox
+                    .values()
+                    .filter(|r| r.message_id == msg.id)
+                    .all(|r| matches!(r.status, DeliveryStatus::Acked | DeliveryStatus::Expired))
+            })
+            .map(|msg| msg.id.clone())
+            .collect();
+
+        let count = to_prune.len();
+        for mid in to_prune {
+            if let Some(msg) = s.wire_messages.remove(&mid) {
+                s.owned.remove(msg.id.iri());
+                s.wire_threads.remove(&(msg.thread_id, msg.id.clone()));
+                if let Some(corr) = msg.correlation_id {
+                    s.wire_replies.remove(&(corr, msg.id.clone()));
+                }
+                if let Some(seq) = s.wire_msg_seq.remove(&msg.id) {
+                    s.wire_msg_log.remove(&seq);
+                }
+                s.wire_inbox.retain(|(_, m), _| m != &mid);
+                s.wire_rcpt_log.retain(|_, r| r.message_id != mid);
+            }
+        }
+        Ok(count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1676,6 +2156,7 @@ mod tests {
         crate::conformance::ledger_cache(|| (MemStore::default(), ()));
         crate::conformance::agent_registry(|| (MemStore::default(), ()));
         crate::conformance::state_store(|| (MemStore::default(), ()));
+        crate::conformance::message_store(|| (MemStore::default(), ()));
     }
 
     #[test]

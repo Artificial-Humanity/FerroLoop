@@ -124,6 +124,7 @@ impl SplitFixture for OverFake {
                 handles: &routed,
                 state: &local,
                 agents: &local,
+                wire: &local,
             },
             &Controls {
                 fake: &fake,

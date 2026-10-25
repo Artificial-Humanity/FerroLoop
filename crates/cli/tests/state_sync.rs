@@ -916,7 +916,7 @@ fn mcp_stdio_round_trip_and_releases_redb_lock_between_calls() {
         "method": "tools/list",
         "params": {}
     }));
-    assert_eq!(list_resp["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(list_resp["result"]["tools"].as_array().unwrap().len(), 14);
 
     let reg_resp = rpc(serde_json::json!({
         "jsonrpc": "2.0",

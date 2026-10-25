@@ -1887,6 +1887,7 @@ mod tests {
                 handles: &self.local,
                 state: &self.local,
                 agents: &self.local,
+                wire: &self.local,
             });
         }
     }

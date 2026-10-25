@@ -13,6 +13,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHand
 use std::collections::BTreeSet;
 use std::path::Path;
 
+pub mod ferrowire;
 pub mod manifest;
 pub mod state;
 
@@ -99,6 +100,12 @@ pub const FORMAT_WITH_ROUTING: u64 = 5;
 /// transaction, so an older fl refuses the store with `FormatVersion` rather
 /// than ignoring its state or agent tables. This build opens 2 to 6.
 pub const FORMAT_WITH_STATE: u64 = 6;
+
+/// ⚠ The format of a store that holds FerroWire messages or delivery receipts.
+/// The first FerroWire write raises the store to 7 in the same transaction, so
+/// an older fl refuses the store with `FormatVersion` rather than ignoring its
+/// FerroWire tables. This build opens 2 to 7.
+pub const FORMAT_WITH_WIRE: u64 = 7;
 
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
@@ -473,12 +480,13 @@ impl RedbStore {
                     || v == FORMAT_WITH_IMPORTS
                     || v == FORMAT_WITH_LEDGER_ROOT
                     || v == FORMAT_WITH_ROUTING
-                    || v == FORMAT_WITH_STATE => {}
+                    || v == FORMAT_WITH_STATE
+                    || v == FORMAT_WITH_WIRE => {}
             Some(v) => {
                 return Err(StoreError::FormatVersion {
                     found: v,
                     oldest: FORMAT_VERSION,
-                    newest: FORMAT_WITH_STATE,
+                    newest: FORMAT_WITH_WIRE,
                 });
             }
         }
@@ -1997,7 +2005,7 @@ mod tests {
                 StoreError::FormatVersion {
                     found: Some(1),
                     oldest: 2,
-                    newest: FORMAT_WITH_STATE
+                    newest: FORMAT_WITH_WIRE
                 }
             ),
             "{err:?}"
@@ -2432,6 +2440,7 @@ mod tests {
         fl_core::conformance::ledger_cache(fresh);
         fl_core::conformance::agent_registry(fresh);
         fl_core::conformance::state_store(fresh);
+        fl_core::conformance::message_store(fresh);
     }
 
     #[test]
@@ -3056,7 +3065,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             tx.open_table(META)
                 .unwrap()
-                .insert(FORMAT_KEY, FORMAT_WITH_STATE + 1)
+                .insert(FORMAT_KEY, FORMAT_WITH_WIRE + 1)
                 .unwrap();
             tx.commit().unwrap();
         }
@@ -3536,5 +3545,68 @@ mod tests {
         assert_eq!(format_at(&path), Some(FORMAT_WITH_STATE));
         let reopened = RedbStore::open(&path).unwrap();
         assert_eq!(reopened.get_state(&st.id).unwrap(), Some(st));
+    }
+
+    #[test]
+    fn redb_store_meets_the_message_store_contract() {
+        fl_core::conformance::message_store(fresh);
+    }
+
+    #[test]
+    fn wire_write_raises_the_store_to_format_7_and_verifies_invariants() {
+        use fl_core::at::At;
+        use fl_core::ferrowire::{
+            DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, WireAddress,
+        };
+        use fl_core::store::MessageStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wire.redb");
+        {
+            let _s = RedbStore::open(&path).unwrap();
+        }
+        assert_eq!(format_at(&path), Some(FORMAT_VERSION));
+        let msg = {
+            let s = RedbStore::open(&path).unwrap();
+            let (msg, _) = s
+                .send_wire(SendWireArgs {
+                    id: None,
+                    sender_id: None,
+                    sender_name: "jarvis".into(),
+                    sender_host: Some("ai-lab-0".into()),
+                    to: WireAddress::AgentName("ferris".into()),
+                    kind: MessageKind::Mail,
+                    urgency: MessageUrgency::Normal,
+                    durable: false,
+                    subject: "Format 7 test".into(),
+                    body: "Raise to 7".into(),
+                    reply_to: None,
+                    thread_id: None,
+                    deadline_at: None,
+                    at: At::from_unix_millis(10),
+                })
+                .unwrap();
+            s.verify_wire_invariants().unwrap();
+            msg
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_WIRE));
+        let reopened = RedbStore::open(&path).unwrap();
+        reopened.verify_wire_invariants().unwrap();
+        assert_eq!(
+            reopened.get_wire_message(&msg.id).unwrap(),
+            Some(msg.clone())
+        );
+
+        reopened
+            .update_wire_receipt(
+                &msg.id,
+                "ferris",
+                DeliveryStatus::Acked,
+                false,
+                At::from_unix_millis(15),
+            )
+            .unwrap();
+        assert_eq!(reopened.prune_wire(At::from_unix_millis(20)).unwrap(), 1);
+        reopened.verify_wire_invariants().unwrap();
     }
 }
