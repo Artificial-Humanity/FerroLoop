@@ -7,11 +7,15 @@
 mod antigravity;
 mod claude;
 mod codex;
+mod grok;
 mod json;
+mod muse;
 
 pub use antigravity::Antigravity;
 pub use claude::Claude;
 pub use codex::Codex;
+pub use grok::Grok;
+pub use muse::Muse;
 
 use crate::catalog::{EnvValue, HeaderValue, Server, VendorName};
 use std::fmt;
@@ -39,6 +43,8 @@ pub fn vendor(name: VendorName) -> &'static dyn Vendor {
         VendorName::Claude => &Claude,
         VendorName::Codex => &Codex,
         VendorName::Antigravity => &Antigravity,
+        VendorName::Muse => &Muse,
+        VendorName::Grok => &Grok,
     }
 }
 
@@ -325,6 +331,8 @@ mod tests {
                     "Antigravity",
                     ".agents/mcp_config.json"
                 ),
+                (VendorName::Muse, "Muse", ".muse/settings.json"),
+                (VendorName::Grok, "Grok", ".grok/config.toml"),
             ]
         );
     }
@@ -334,8 +342,15 @@ mod tests {
         for v in VendorName::ALL {
             let v = vendor(v);
             let foreign = match v.name() {
-                VendorName::Codex => "[mcp_servers.theirs]\ncommand = \"their-tool\"\n",
-                _ => "{\"mcpServers\": {\"theirs\": {\"command\": \"their-tool\"}}}",
+                VendorName::Codex | VendorName::Grok => {
+                    "[mcp_servers.theirs]\ncommand = \"their-tool\"\n"
+                }
+                VendorName::Muse => {
+                    "{\"mcp_servers\": {\"theirs\": {\"command\": \"their-tool\"}}}"
+                }
+                VendorName::Claude | VendorName::Antigravity => {
+                    "{\"mcpServers\": {\"theirs\": {\"command\": \"their-tool\"}}}"
+                }
             };
             for start in [None, Some(foreign.as_bytes())] {
                 let mut file = v.open(Path::new("f"), start).unwrap();
@@ -374,8 +389,15 @@ mod tests {
         for v in VendorName::ALL {
             let v = vendor(v);
             let text = match v.name() {
-                VendorName::Codex => "model = \"o3\"\n\n[mcp_servers.theirs]\ncommand = \"t\"\n",
-                _ => "{\n  \"mcpServers\": {\n    \"theirs\": {\"command\": \"t\"}\n  }\n}\n",
+                VendorName::Codex | VendorName::Grok => {
+                    "model = \"o3\"\n\n[mcp_servers.theirs]\ncommand = \"t\"\n"
+                }
+                VendorName::Muse => {
+                    "{\n  \"mcp_servers\": {\n    \"theirs\": {\"command\": \"t\"}\n  }\n}\n"
+                }
+                VendorName::Claude | VendorName::Antigravity => {
+                    "{\n  \"mcpServers\": {\n    \"theirs\": {\"command\": \"t\"}\n  }\n}\n"
+                }
             };
             let mut file = v.open(Path::new("f"), Some(text.as_bytes())).unwrap();
             file.set("files", &v.render("files", &server(STDIO)).unwrap());
@@ -414,8 +436,8 @@ mod tests {
                 }
             }
         }
-        // Antigravity refuses the secret header; the other five are written.
-        assert_eq!(written.len(), 5);
+        // Antigravity refuses the secret header; the other nine are written.
+        assert_eq!(written.len(), 9);
         assert!(written[0].contains("\"CARGO_MANIFEST_DIR\": \"${CARGO_MANIFEST_DIR}\""));
         assert!(written[1].contains("\"Authorization\": \"${CARGO_MANIFEST_DIR}\""));
         let code = include_str!("mod.rs");
@@ -426,6 +448,8 @@ mod tests {
             include_str!("claude.rs"),
             include_str!("codex.rs"),
             include_str!("antigravity.rs"),
+            include_str!("muse.rs"),
+            include_str!("grok.rs"),
         ] {
             for read in ["env::var", "var_os"] {
                 assert!(

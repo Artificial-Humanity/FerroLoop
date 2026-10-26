@@ -83,17 +83,33 @@ impl<'de> Visitor<'de> for MembersVisitor {
 
 #[derive(Debug, Clone)]
 pub(super) struct JsonFile {
-    /// The top level; `mcpServers`, when present, holds its old bytes, and
+    servers_key: &'static str,
+    /// The top level; `servers_key`, when present, holds its old bytes, and
     /// `servers` stands in for it.
     top: IndexMap<String, Box<RawValue>>,
-    /// `None` when the file has no `mcpServers` and fl has written nothing.
+    /// `None` when the file has no `servers_key` and fl has written nothing.
     servers: Option<IndexMap<String, Box<RawValue>>>,
 }
 
 pub(super) fn open(path: &Path, bytes: Option<&[u8]>) -> Result<JsonFile, FileRefusal> {
+    open_with(path, bytes, SERVERS, &[])
+}
+
+pub(super) fn open_with(
+    path: &Path,
+    bytes: Option<&[u8]>,
+    servers_key: &'static str,
+    default_top: &[(&'static str, &'static str)],
+) -> Result<JsonFile, FileRefusal> {
     let Some(bytes) = bytes else {
+        let mut top = IndexMap::new();
+        for &(k, raw_json) in default_top {
+            let raw = RawValue::from_string(raw_json.to_string()).expect("valid default JSON");
+            top.insert(k.to_string(), raw);
+        }
         let mut file = JsonFile {
-            top: IndexMap::new(),
+            servers_key,
+            top,
             servers: None,
         };
         file.servers_mut();
@@ -126,35 +142,36 @@ pub(super) fn open(path: &Path, bytes: Option<&[u8]>) -> Result<JsonFile, FileRe
         let problem = format!("the key `{key}` appears twice at the top level");
         return Err(refuse(problem, FIX_BY_HAND));
     }
-    let servers = match top.members.get(SERVERS) {
+    let servers = match top.members.get(servers_key) {
         None => None,
         Some(raw) if !raw.get().starts_with('{') => {
             return Err(refuse(
-                format!("`{SERVERS}` is not a JSON object"),
+                format!("`{servers_key}` is not a JSON object"),
                 FIX_BY_HAND,
             ));
         }
         Some(raw) => {
             let servers: Members = serde_json::from_str(raw.get()).expect("a strict JSON object");
             if let Some(name) = servers.twice {
-                let problem = format!("the server `{name}` appears twice in `{SERVERS}`");
+                let problem = format!("the server `{name}` appears twice in `{servers_key}`");
                 return Err(refuse(problem, FIX_BY_HAND));
             }
             Some(servers.members)
         }
     };
     Ok(JsonFile {
+        servers_key,
         top: top.members,
         servers,
     })
 }
 
 impl JsonFile {
-    /// `mcpServers`, added last when the file has none.
+    /// `servers_key`, added last when the file has none.
     fn servers_mut(&mut self) -> &mut IndexMap<String, Box<RawValue>> {
         if self.servers.is_none() {
             let empty = RawValue::from_string("{}".into()).expect("valid JSON");
-            self.top.insert(SERVERS.into(), empty);
+            self.top.insert(self.servers_key.into(), empty);
         }
         self.servers.get_or_insert_default()
     }
@@ -184,7 +201,7 @@ impl JsonFile {
 
     pub(super) fn to_bytes(&self) -> Vec<u8> {
         let top = self.top.iter().map(|(key, raw)| match &self.servers {
-            Some(servers) if key == SERVERS => {
+            Some(servers) if key == self.servers_key => {
                 let servers = servers.iter().map(|(k, v)| (k, v.get().to_string()));
                 (key, object(servers, ENTRY_INDENT))
             }

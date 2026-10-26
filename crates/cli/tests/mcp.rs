@@ -40,11 +40,13 @@ fn repo_at(dir: &Path, files: &[(&str, &str)]) {
 }
 
 /// The `.gitignore` lines a project that uses `fl mcp` commits.
-const IGNORED: &str = "/.mcp.json\n/.codex/config.toml\n/.agents/mcp_config.json\n";
+const IGNORED: &str = "/.mcp.json\n/.codex/config.toml\n/.agents/mcp_config.json\n/.muse/settings.json\n/.grok/config.toml\n";
 
 const CLAUDE: &str = ".mcp.json";
 const CODEX: &str = ".codex/config.toml";
 const AGY: &str = ".agents/mcp_config.json";
+const MUSE: &str = ".muse/settings.json";
+const GROK: &str = ".grok/config.toml";
 const CATALOG: &str = ".fl/mcp.toml";
 
 /// One machine: a temporary home holding the repository `app`, and the fake
@@ -287,6 +289,18 @@ fn registry_and_add_from_it_then_sync_write_every_vendor_file() {
         assert!(agy.contains(&format!("\"{name}\": {{")), "{name}: {agy}");
     }
     assert!(!agy.contains("\"docs\""), "{agy}");
+    let muse = w.read(MUSE);
+    assert!(muse.contains("\"schema_version\": 1"), "{muse}");
+    for name in ["notes", "tracker", "multi", "docs"] {
+        assert!(muse.contains(&format!("\"{name}\": {{")), "{name}: {muse}");
+    }
+    let grok = w.read(GROK);
+    for name in ["notes", "tracker", "multi", "docs"] {
+        assert!(
+            grok.contains(&format!("[mcp_servers.{name}]")),
+            "{name}: {grok}"
+        );
+    }
 }
 
 #[test]
@@ -382,7 +396,7 @@ fn disable_then_sync_removes_the_server_from_every_file_and_enable_brings_it_bac
     assert!(out.contains("`notes` is now off for the team"), "{out}");
     assert!(w.read(CATALOG).contains("enabled = false"));
     w.ok(&["sync"]);
-    for rel in [CLAUDE, CODEX, AGY] {
+    for rel in [CLAUDE, CODEX, AGY, MUSE, GROK] {
         let text = w.read(rel);
         assert!(!text.contains("notes"), "{rel}: {text}");
         assert!(text.contains("weather"), "{rel}: {text}");
@@ -390,7 +404,7 @@ fn disable_then_sync_removes_the_server_from_every_file_and_enable_brings_it_bac
     let (out, _) = w.ok(&["enable", "notes"]);
     assert!(out.contains("`notes` is now on for the team"), "{out}");
     w.ok(&["sync"]);
-    for rel in [CLAUDE, CODEX, AGY] {
+    for rel in [CLAUDE, CODEX, AGY, MUSE, GROK] {
         assert!(w.read(rel).contains("notes"), "{rel}");
     }
 }
@@ -409,7 +423,7 @@ fn a_machine_switch_turns_a_server_off_on_this_machine_only() {
     ));
     let (out, _) = w.ok(&["sync"]);
     assert!(out.contains("  remove notes"), "{out}");
-    for rel in [CLAUDE, CODEX, AGY] {
+    for rel in [CLAUDE, CODEX, AGY, MUSE, GROK] {
         let text = w.read(rel);
         assert!(!text.contains("notes"), "{rel}: {text}");
         assert!(text.contains("weather"), "{rel}: {text}");
@@ -453,7 +467,7 @@ fn remove_takes_the_server_out_of_the_catalog_and_sync_out_of_every_file() {
     let (code, _, _) = w.run(&["check"]);
     assert_eq!(code, 1, "remove does not sync");
     w.ok(&["sync"]);
-    for rel in [CLAUDE, CODEX, AGY] {
+    for rel in [CLAUDE, CODEX, AGY, MUSE, GROK] {
         assert!(!w.read(rel).contains("notes"), "{rel}");
     }
     let (_, err) = w.refused(&["remove", "notes"]);
@@ -829,7 +843,9 @@ fn sync_and_check_make_no_request_and_need_no_registry() {
 
 #[test]
 fn a_vendor_file_git_does_not_ignore_is_refused_printing_the_lines_to_add() {
-    let w = World::ignoring("/.mcp.json\n/.agents/mcp_config.json\n");
+    let w = World::ignoring(
+        "/.mcp.json\n/.agents/mcp_config.json\n/.muse/settings.json\n/.grok/config.toml\n",
+    );
     let narrow = "[server.local]\nvendors = [\"claude\", \"antigravity\"]\n\
                   transport = \"stdio\"\ncommand = \"node\"\n";
     fs::create_dir_all(w.app().join(".fl")).unwrap();
@@ -887,7 +903,7 @@ fn a_vendor_file_fl_no_longer_has_an_entry_in_need_not_be_ignored() {
     .unwrap();
     fs::write(
         w.app().join(".gitignore"),
-        "/.mcp.json\n/.agents/mcp_config.json\n",
+        "/.mcp.json\n/.agents/mcp_config.json\n/.muse/settings.json\n/.grok/config.toml\n",
     )
     .unwrap();
     let (out, _) = w.ok(&["sync"]);
@@ -1581,7 +1597,7 @@ impl<'w> Secrets<'w> {
     /// Every file fl writes — the catalog, the vendor files, the records —
     /// git's arguments, and every message: their contents.
     fn texts(&self) -> Vec<(String, String)> {
-        let mut paths: Vec<PathBuf> = [CATALOG, CLAUDE, CODEX, AGY]
+        let mut paths: Vec<PathBuf> = [CATALOG, CLAUDE, CODEX, AGY, MUSE, GROK]
             .iter()
             .filter(|rel| !(self.pasted && **rel == CLAUDE))
             .filter(|rel| !(self.malformed && **rel == CATALOG))
@@ -1759,7 +1775,7 @@ fn no_secret_value_reaches_any_file_fl_writes_or_any_message() {
     let records = (texts.iter())
         .filter(|(what, _)| what.contains("/state/fl/mcp/") && what.ends_with(".json"))
         .count();
-    assert_eq!(records, 3, "a record for each vendor file");
+    assert_eq!(records, 5, "a record for each vendor file");
     let argv = fs::read_to_string(&s.log).unwrap();
     assert!(
         argv.contains("ls-files") && argv.contains("check-ignore"),
@@ -1846,7 +1862,8 @@ fn every_fl_mcp_command_reads_and_writes_only_in_its_home_and_its_project() {
     // What fl may write: its records, and the project's catalog and vendor
     // files (each with the directories above it).
     let records = Path::new("state/fl/mcp");
-    let project = [CATALOG, CLAUDE, CODEX, AGY].map(|rel| Path::new("widgets").join(rel));
+    let project =
+        [CATALOG, CLAUDE, CODEX, AGY, MUSE, GROK].map(|rel| Path::new("widgets").join(rel));
     // The `.gitignore` lines a refusal prints, which are not paths.
     let anchors: Vec<PathBuf> = IGNORED.lines().map(PathBuf::from).collect();
     let path = std::env::var_os("PATH").expect("PATH is set");
@@ -1960,7 +1977,7 @@ fn every_fl_mcp_command_reads_and_writes_only_in_its_home_and_its_project() {
         .map(|e| e.unwrap().path())
         .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
-    assert_eq!(kept.len(), 3, "{kept:?}");
+    assert_eq!(kept.len(), 5, "{kept:?}");
     let canonical = app.canonicalize().unwrap().display().to_string();
     for record in &kept {
         let text = fs::read_to_string(record).unwrap();
