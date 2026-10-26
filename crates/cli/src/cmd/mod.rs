@@ -8,6 +8,7 @@ pub mod github;
 pub mod ledger;
 pub mod manifest;
 pub mod mcp;
+pub mod pr;
 pub mod project;
 pub mod record;
 pub mod routing;

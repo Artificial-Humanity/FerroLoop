@@ -93,6 +93,32 @@ pub struct Issue {
     pub held_copies: Vec<Event>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct FakeBranchSeed {
+    pub head_sha: String,
+    pub commits: Vec<fl_core::pr_policy::PrCommitSummary>,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FakePull {
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub state: String,
+    pub head_ref: String,
+    pub head_sha: String,
+    pub base_ref: String,
+    pub user_login: String,
+    pub merged: bool,
+    pub merge_sha: Option<String>,
+    pub merge_method: Option<String>,
+    pub requested_reviewers: Vec<String>,
+    pub commits: Vec<fl_core::pr_policy::PrCommitSummary>,
+    pub files: Vec<String>,
+    pub reviews: Vec<fl_core::pr_policy::PrReviewSummary>,
+}
+
 /// Everything the fake holds, and the knobs a test turns. Every knob is
 /// one-shot or explicit; none is on by default.
 #[derive(Debug, Default)]
@@ -103,6 +129,8 @@ pub struct State {
     pub redirects: BTreeMap<String, u64>,
     pub labels: BTreeSet<String>,
     pub issues: BTreeMap<u64, Issue>,
+    pub pulls: BTreeMap<u64, FakePull>,
+    pub branch_seeds: BTreeMap<String, FakeBranchSeed>,
     pub next_number: u64,
     pub next_event: u64,
     pub installations: BTreeMap<String, u64>,
@@ -723,6 +751,67 @@ impl FakeGithub {
             .filter_map(|id| s.git.commits.get(id).map(|c| c.message.clone()))
             .collect()
     }
+
+    /// Seed a branch's head SHA, commits, and changed files so a subsequent
+    /// `POST /repos/{o}/{r}/pulls` with `head = branch` inherits them.
+    pub fn seed_branch(
+        &self,
+        branch: &str,
+        head_sha: &str,
+        commits: Vec<fl_core::pr_policy::PrCommitSummary>,
+        files: Vec<String>,
+    ) {
+        self.state().branch_seeds.insert(
+            branch.to_string(),
+            FakeBranchSeed {
+                head_sha: head_sha.to_string(),
+                commits,
+                files,
+            },
+        );
+    }
+
+    pub fn set_pull_commits(
+        &self,
+        number: u64,
+        head_sha: &str,
+        commits: Vec<fl_core::pr_policy::PrCommitSummary>,
+    ) {
+        let mut s = self.state();
+        let pull = s.pulls.get_mut(&number).expect("a pull request to update");
+        pull.head_sha = head_sha.to_string();
+        pull.commits = commits;
+    }
+
+    pub fn set_pull_files(&self, number: u64, files: Vec<String>) {
+        let mut s = self.state();
+        let pull = s.pulls.get_mut(&number).expect("a pull request to update");
+        pull.files = files;
+    }
+
+    pub fn add_pull_review(
+        &self,
+        number: u64,
+        author_login: &str,
+        state: &str,
+        body: &str,
+        commit_id: &str,
+    ) {
+        let mut s = self.state();
+        let id = s.tick();
+        let pull = s.pulls.get_mut(&number).expect("a pull request to review");
+        pull.reviews.push(fl_core::pr_policy::PrReviewSummary {
+            id,
+            author_login: author_login.to_string(),
+            state: state.to_string(),
+            body: body.to_string(),
+            commit_id: Some(commit_id.to_string()),
+        });
+    }
+
+    pub fn pull(&self, number: u64) -> FakePull {
+        self.state().pulls[&number].clone()
+    }
 }
 
 impl Drop for FakeGithub {
@@ -850,6 +939,28 @@ impl State {
             v["pull_request"] = json!({"url": "pull"});
         }
         v
+    }
+
+    fn pull_json(&self, p: &FakePull) -> Value {
+        json!({
+            "number": p.number,
+            "html_url": format!("https://github.com/{}/pull/{}", self.bound().full_name, p.number),
+            "state": p.state,
+            "title": p.title,
+            "body": p.body,
+            "head": {
+                "ref": p.head_ref,
+                "sha": p.head_sha,
+            },
+            "base": {
+                "ref": p.base_ref,
+            },
+            "user": {
+                "login": p.user_login,
+            },
+            "merged": p.merged,
+            "requested_reviewers": p.requested_reviewers.iter().map(|r| json!({"login": r})).collect::<Vec<_>>(),
+        })
     }
 
     fn repo_named(&self, name: &str) -> Option<&Repo> {
@@ -1795,6 +1906,207 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
                 return raw_answer(200, "not json at all");
             }
             answer(200, s.issue_json(&s.issues[&n]))
+        }
+        ("POST", ["repos", o, r, "pulls"]) if s.is_bound(o, r) => {
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let n = s.next_number;
+            s.next_number += 1;
+            let head_ref = v["head"].as_str().unwrap_or("head").to_string();
+            let base_ref = v["base"].as_str().unwrap_or("main").to_string();
+            let (head_sha, commits, files) = match s.branch_seeds.get(&head_ref) {
+                Some(seed) => (
+                    seed.head_sha.clone(),
+                    seed.commits.clone(),
+                    seed.files.clone(),
+                ),
+                None => (
+                    s.git.head(&head_ref).unwrap_or_else(|| format!("sha-{n}")),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            };
+            let pull = FakePull {
+                number: n,
+                title: v["title"].as_str().unwrap_or("").to_string(),
+                body: v["body"].as_str().unwrap_or("").to_string(),
+                state: "open".to_string(),
+                head_ref,
+                head_sha,
+                base_ref,
+                user_login: author(auth),
+                merged: false,
+                merge_sha: None,
+                merge_method: None,
+                requested_reviewers: Vec::new(),
+                commits,
+                files,
+                reviews: Vec::new(),
+            };
+            s.pulls.insert(n, pull);
+            answer(201, s.pull_json(&s.pulls[&n]))
+        }
+        ("GET", ["repos", o, r, "pulls", n]) if s.is_bound(o, r) => {
+            match n.parse::<u64>().ok().and_then(|n| s.pulls.get(&n)) {
+                None => answer(404, json!({"message": "Not Found"})),
+                Some(p) => answer(200, s.pull_json(p)),
+            }
+        }
+        ("GET", ["repos", o, r, "pulls", n, "commits"]) if s.is_bound(o, r) => {
+            let items = match n.parse::<u64>().ok().and_then(|n| s.pulls.get(&n)) {
+                None => return answer(404, json!({"message": "Not Found"})),
+                Some(p) => p
+                    .commits
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "sha": c.sha,
+                            "author": c
+                                .author_login
+                                .as_ref()
+                                .map(|login| json!({"login": login}))
+                                .unwrap_or(Value::Null),
+                            "commit": {
+                                "message": c.message,
+                            },
+                        })
+                    })
+                    .collect(),
+            };
+            s.page(&path, &q, items)
+        }
+        ("GET", ["repos", o, r, "pulls", n, "files"]) if s.is_bound(o, r) => {
+            let items = match n.parse::<u64>().ok().and_then(|n| s.pulls.get(&n)) {
+                None => return answer(404, json!({"message": "Not Found"})),
+                Some(p) => p.files.iter().map(|f| json!({"filename": f})).collect(),
+            };
+            s.page(&path, &q, items)
+        }
+        ("GET", ["repos", o, r, "pulls", n, "reviews"]) if s.is_bound(o, r) => {
+            let items = match n.parse::<u64>().ok().and_then(|n| s.pulls.get(&n)) {
+                None => return answer(404, json!({"message": "Not Found"})),
+                Some(p) => p
+                    .reviews
+                    .iter()
+                    .map(|rv| {
+                        json!({
+                            "id": rv.id,
+                            "user": {"login": rv.author_login},
+                            "state": rv.state,
+                            "body": rv.body,
+                            "commit_id": rv.commit_id,
+                        })
+                    })
+                    .collect(),
+            };
+            s.page(&path, &q, items)
+        }
+        ("POST", ["repos", o, r, "pulls", n, "requested_reviewers"]) if s.is_bound(o, r) => {
+            let Some(n) = n.parse::<u64>().ok().filter(|n| s.pulls.contains_key(n)) else {
+                return answer(404, json!({"message": "Not Found"}));
+            };
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let p = s.pulls.get_mut(&n).unwrap();
+            for rev in str_list(&v["reviewers"]) {
+                if !p.requested_reviewers.contains(&rev) {
+                    p.requested_reviewers.push(rev);
+                }
+            }
+            answer(201, s.pull_json(&s.pulls[&n]))
+        }
+        ("POST", ["repos", o, r, "pulls", n, "reviews"]) if s.is_bound(o, r) => {
+            let Some(n) = n.parse::<u64>().ok().filter(|n| s.pulls.contains_key(n)) else {
+                return answer(404, json!({"message": "Not Found"}));
+            };
+            let by = author(auth);
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let event = v
+                .get("event")
+                .and_then(Value::as_str)
+                .unwrap_or("COMMENT")
+                .to_ascii_uppercase();
+            if matches!(event.as_str(), "APPROVE" | "REQUEST_CHANGES")
+                && by == s.pulls[&n].user_login
+            {
+                return answer(
+                    422,
+                    json!({
+                        "message": "Unprocessable Entity: Cannot approve or request changes on your own pull request"
+                    }),
+                );
+            }
+            let state = match event.as_str() {
+                "APPROVE" => "APPROVED",
+                "REQUEST_CHANGES" => "CHANGES_REQUESTED",
+                "COMMENT" => "COMMENTED",
+                other => other,
+            }
+            .to_string();
+            let commit_id = v
+                .get("commit_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| Some(s.pulls[&n].head_sha.clone()));
+            let review_body = v
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let id = s.tick();
+            s.pulls
+                .get_mut(&n)
+                .unwrap()
+                .reviews
+                .push(fl_core::pr_policy::PrReviewSummary {
+                    id,
+                    author_login: by.clone(),
+                    state: state.clone(),
+                    body: review_body.clone(),
+                    commit_id: commit_id.clone(),
+                });
+            answer(
+                200,
+                json!({
+                    "id": id,
+                    "user": {"login": by},
+                    "state": state,
+                    "body": review_body,
+                    "commit_id": commit_id,
+                }),
+            )
+        }
+        ("PUT", ["repos", o, r, "pulls", n, "merge"]) if s.is_bound(o, r) => {
+            let Some(n) = n.parse::<u64>().ok().filter(|n| s.pulls.contains_key(n)) else {
+                return answer(404, json!({"message": "Not Found"}));
+            };
+            let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let p = s.pulls.get_mut(&n).unwrap();
+            if p.merged {
+                return answer(405, json!({"message": "Pull Request is already merged"}));
+            }
+            if let Some(sha) = v.get("sha").and_then(Value::as_str)
+                && sha != p.head_sha
+            {
+                return answer(
+                    409,
+                    json!({"message": "Head branch was modified. Review and try the merge again."}),
+                );
+            }
+            let merge_sha = format!("merge-sha-{}", p.number);
+            p.merged = true;
+            p.state = "closed".to_string();
+            p.merge_sha = Some(merge_sha.clone());
+            p.merge_method = v
+                .get("merge_method")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            answer(
+                200,
+                json!({
+                    "sha": merge_sha,
+                    "merged": true,
+                    "message": "Pull Request successfully merged",
+                }),
+            )
         }
         // A node lookup by id (Task 5): the fake's issues all belong to its
         // one bound repository, so a match is answered under that

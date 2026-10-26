@@ -284,3 +284,86 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
         3,
     );
 }
+
+#[test]
+fn pr_policy_wire_types_round_trip_cleanly() {
+    for tier in [
+        RequiredTier::Lead {
+            project: "ferroloop".into(),
+        },
+        RequiredTier::LabManager,
+        RequiredTier::Owner,
+    ] {
+        let json = serde_json::to_string(&tier).unwrap();
+        let back: RequiredTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, tier);
+    }
+
+    for verdict in ReviewVerdict::ALL {
+        let json = serde_json::to_string(verdict).unwrap();
+        let back: ReviewVerdict = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *verdict);
+    }
+
+    let marker = FlReviewMarker {
+        reviewer: "ferris".into(),
+        role: AgentRole::Lead,
+        project: "ferroloop".into(),
+        head_sha: "abc1234".into(),
+        verdict: ReviewVerdict::Approved,
+        at: At::from_unix_millis(1_000),
+    };
+    let marker_json = serde_json::to_string(&marker).unwrap();
+    let marker_back: FlReviewMarker = serde_json::from_str(&marker_json).unwrap();
+    assert_eq!(marker_back, marker);
+
+    let eval = PrPolicyEvaluation {
+        project: "ferroloop".into(),
+        co_authors: vec!["felicia".into()],
+        unattributed_commits: vec![],
+        unknown_co_authors: vec![],
+        protected_files: vec![],
+        required_tier: RequiredTier::Lead {
+            project: "ferroloop".into(),
+        },
+        target_reviewer: "ferris".into(),
+        escalation_reasons: vec![],
+    };
+    let eval_json = serde_json::to_string(&eval).unwrap();
+    let eval_back: PrPolicyEvaluation = serde_json::from_str(&eval_json).unwrap();
+    assert_eq!(eval_back, eval);
+
+    for refusal in [
+        PolicyRefusal::UnknownOrInactiveAgent {
+            agent: "ghost".into(),
+        },
+        PolicyRefusal::SelfReviewForbidden {
+            agent: "felicia".into(),
+        },
+        PolicyRefusal::ProtectedPathRequiresOwner {
+            agent: "ferris".into(),
+            files: vec![".github/workflows/ci.yml".into()],
+        },
+        PolicyRefusal::UnattributedCommitsRequireOwner {
+            commits: vec!["deadbeef".into()],
+        },
+        PolicyRefusal::UnknownCoAuthorsRequireOwner {
+            co_authors: vec!["stranger".into()],
+        },
+        PolicyRefusal::InsufficientRole {
+            agent: "felicia".into(),
+            role: AgentRole::Assistant,
+            required: RequiredTier::Lead {
+                project: "ferroloop".into(),
+            },
+        },
+        PolicyRefusal::MissingValidApproval {
+            head_sha: "abc1234".into(),
+        },
+    ] {
+        let json = serde_json::to_string(&refusal).unwrap();
+        let back: PolicyRefusal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, refusal);
+        assert!(!refusal.to_string().is_empty());
+    }
+}

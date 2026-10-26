@@ -21,6 +21,7 @@ pub mod mem;
 #[doc(hidden)]
 pub mod mem_issues;
 pub mod model;
+pub mod pr_policy;
 pub mod routing;
 pub mod split;
 pub mod stale;
@@ -55,6 +56,12 @@ pub use mem::MemStore;
 pub use model::{
     AgentSpec, CommandSpec, GateDef, GateKind, PopulationDelivery, Project, Record, Regret,
     Selector, State, Transition,
+};
+pub use pr_policy::{
+    CommitTrailerAuthor, DEFAULT_OWNER_LOGIN, DEFAULT_PROTECTED_PATTERNS, FlReviewMarker,
+    PolicyRefusal, PrCommitSummary, PrPolicyEvaluation, PrReviewSummary, RequiredTier,
+    ReviewVerdict, authorize_agent_action, evaluate_pr_policy, extract_review_marker,
+    format_review_body, is_protected_path, parse_co_authors, verify_merge_approvals,
 };
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use split::{

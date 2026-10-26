@@ -1134,7 +1134,38 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Attempt(c) => cmd::attempt::run(&ctx, &cfg.adapters, c),
         Command::Stats(c) => cmd::stats::run(&store, c, stats_source),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
-        Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),
+        Command::Github(c) => {
+            let separate_ws_store = if matches!(c, cmd::github::Cmd::Pr(_)) {
+                let default_ws_store = default_state_store_path()?;
+                let ws_store_path = cfg.workspace_state_store(&default_ws_store);
+                if same_store(&path, &ws_store_path) {
+                    None
+                } else {
+                    if let Some(dir) = ws_store_path.parent()
+                        && !dir.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(dir)
+                            .with_context(|| format!("could not create {}", dir.display()))?;
+                    }
+                    Some(RedbStore::open(&ws_store_path).with_context(|| {
+                        format!("could not open the store at {}", ws_store_path.display())
+                    })?)
+                }
+            } else {
+                None
+            };
+            let ws_store = separate_ws_store.as_ref().unwrap_or(&store);
+            let default_project = entry.as_ref().and_then(|e| e.inferred_slug());
+            cmd::github::run(
+                &ctx,
+                c,
+                entry.as_ref().map(|e| e.root.as_path()),
+                ws_store,
+                binding.as_ref(),
+                cfg.github.as_ref(),
+                default_project.as_deref(),
+            )
+        }
         Command::Routing(c) => cmd::routing::run(&ctx, c, here_for_store.map(|b| b.is_some())),
         Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } | Command::Wire { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")

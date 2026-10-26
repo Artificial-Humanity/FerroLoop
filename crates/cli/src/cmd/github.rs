@@ -1,10 +1,12 @@
 //! `fl github` (GitHub tracker spec §3.4, §5.4; GitHub ledger spec §6).
 
+use crate::config;
 use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Subcommand;
 use fl_core::Iri;
+use fl_store::RedbStore;
 use std::path::Path;
 
 #[derive(Subcommand)]
@@ -25,12 +27,15 @@ pub enum Cmd {
     /// post the decision comments an issue is missing.
     #[command(subcommand)]
     Ledger(crate::cmd::ledger::Cmd),
+    /// Tier-aware pull-request creation, policy inspection, App-brokered review, merge, and CI checks.
+    #[command(subcommand)]
+    Pr(crate::cmd::pr::PrCmd),
 }
 
 impl Cmd {
     fn refs(&self) -> Vec<&Ref> {
         match self {
-            Cmd::Whoami => vec![],
+            Cmd::Whoami | Cmd::Pr(_) => vec![],
             Cmd::Ledger(c) => c.refs(),
             Cmd::Repair { id, .. } => vec![id],
         }
@@ -45,7 +50,15 @@ impl Cmd {
 
 /// `root` is the project's root from its config entry: `ledger init` reads
 /// the committed manifest there.
-pub fn run(ctx: &Ctx<'_>, cmd: Cmd, root: Option<&Path>) -> Result<i32> {
+pub fn run(
+    ctx: &Ctx<'_>,
+    cmd: Cmd,
+    root: Option<&Path>,
+    ws_store: &RedbStore,
+    binding: Option<&config::TrackerBinding>,
+    github_app: Option<&config::GithubApp>,
+    default_project: Option<&str>,
+) -> Result<i32> {
     let Some(gh) = ctx.github else {
         bail!("`fl github` needs the project to be bound to a GitHub repository");
     };
@@ -78,6 +91,9 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd, root: Option<&Path>) -> Result<i32> {
             println!("{word}\t{}\t{}", done.number, done.state);
         }
         Cmd::Ledger(c) => return crate::cmd::ledger::run(ctx, c, root),
+        Cmd::Pr(c) => {
+            return crate::cmd::pr::run(ctx, gh, ws_store, binding, github_app, default_project, c);
+        }
     }
     Ok(0)
 }
