@@ -18,8 +18,8 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
    `fl github pr create`. It reports the required reviewer tier and the target reviewer,
    and that report decides. For the Lead or Lab Manager tier it queues a FerroWire notice
    to the target reviewer; for the Owner tier it requests the owner's review on GitHub.
-   Then ask an agent reviewer for a review over `agent-msg`; the owner is reached through
-   the GitHub review request. In summary:
+   If the target reviewer is an agent, ask it for a review over `agent-msg`; the owner is
+   reached through the GitHub review request. In summary:
    * A pull request co-authored by an assisting agent is reviewed by the project Lead.
    * A pull request co-authored by the Lead is reviewed by the Lab Manager (`jarvis`).
      The Lab Manager may also approve a Lead-tier pull request.
@@ -36,10 +36,11 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
    machine account cannot approve a pull request it opened. The command needs the App's
    credentials: `[github]` `app_id` and `private_key` in the fl `config.toml`, or
    `$FL_GITHUB_APP_ID` and `$FL_GITHUB_PRIVATE_KEY_PATH`.
-6. Once the target reviewer that `fl github pr create` reported (or the owner) has
-   approved and the checks pass, the agent who opened the pull request merges it through
-   the pull request with `gh pr merge`, which does not check the tier. This applies to every
-   tier: after the owner approves an Owner-tier pull request, the author merges it too.
+6. Once the target reviewer that `fl github pr create` reported, or a higher tier (the Lab
+   Manager for a Lead-tier pull request, or the owner), has approved and the checks pass,
+   the agent who opened the pull request merges it through the pull request with
+   `gh pr merge`, which does not check the tier. This applies to every tier: after the
+   owner approves an Owner-tier pull request, the author merges it too.
    A reviewer never merges another agent's pull request: the author resolves conflicts
    and keeps the branch current. A direct push to `main` is not the route, and the
    ruleset refuses one.
