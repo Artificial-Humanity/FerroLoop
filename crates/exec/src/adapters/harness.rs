@@ -474,8 +474,15 @@ pub fn parse_json_or_jsonl_envelope(
         let mut tokens_in = 0u64;
         let mut tokens_out = 0u64;
         let mut vendor_cost = None;
-        extract_usage_from_value(&val, &mut tokens_in, &mut tokens_out, &mut vendor_cost, false);
-        let text = extract_text_from_object(&val).unwrap_or_else(|| stdout_str.clone().into_owned());
+        extract_usage_from_value(
+            &val,
+            &mut tokens_in,
+            &mut tokens_out,
+            &mut vendor_cost,
+            false,
+        );
+        let text =
+            extract_text_from_object(&val).unwrap_or_else(|| stdout_str.clone().into_owned());
         let excerpt_text = append_stderr(text, &stderr_str);
         return ParsedOutput {
             excerpt_text,
@@ -693,10 +700,7 @@ impl GitSnapshot {
     }
 }
 
-fn parse_porcelain_z_and_hash(
-    root: &Path,
-    bytes: &[u8],
-) -> BTreeMap<String, Option<[u8; 32]>> {
+fn parse_porcelain_z_and_hash(root: &Path, bytes: &[u8]) -> BTreeMap<String, Option<[u8; 32]>> {
     let mut map = BTreeMap::new();
     let mut fields = bytes.split(|b| *b == 0);
     while let Some(field) = fields.next() {
@@ -850,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_harness_emits_live_and_exited_heartbeats_and_preserves_partial_tokens_on_timeout()
-    {
+     {
         let tmp = tempfile::tempdir().unwrap();
         let script = tmp.path().join("emit_then_hang.sh");
         std::fs::write(

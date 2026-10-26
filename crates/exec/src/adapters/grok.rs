@@ -119,12 +119,11 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
         std::fs::set_permissions(&stub, perms).unwrap();
 
-        let a = GrokAdapter::new(stub.to_string_lossy().into_owned()).with_rate_card(Some(
-            RateCard {
+        let a =
+            GrokAdapter::new(stub.to_string_lossy().into_owned()).with_rate_card(Some(RateCard {
                 input_usd_micros_per_mtok: 2_000_000,
                 output_usd_micros_per_mtok: 10_000_000,
-            },
-        ));
+            }));
         let out = a.attempt(spec(d.path(), 5)).await.unwrap();
         assert_eq!(out.status, AttemptStatus::Completed);
         assert_eq!(out.output_excerpt, "grok reply");

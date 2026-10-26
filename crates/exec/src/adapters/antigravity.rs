@@ -112,7 +112,8 @@ mod tests {
     async fn parses_json_output_and_applies_rate_card_fallback() {
         let d = tempfile::tempdir().unwrap();
         let stub = d.path().join("agy-json.sh");
-        let payload = r#"{"response":"agy finished","usage":{"input_tokens":2000,"output_tokens":500}}"#;
+        let payload =
+            r#"{"response":"agy finished","usage":{"input_tokens":2000,"output_tokens":500}}"#;
         let script = format!("#!/bin/sh\nprintf '%s\\n' '{payload}'\n");
         std::fs::write(&stub, script).unwrap();
         let mut perms = std::fs::metadata(&stub).unwrap().permissions();

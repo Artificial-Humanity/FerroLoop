@@ -1,16 +1,22 @@
+use crate::config::AdapterConfig;
 use crate::ctx::Ctx;
 use crate::refs::{self, Ref};
 use anyhow::{Result, bail};
 use clap::Args;
 use fl_core::ids::RecordId;
 use fl_core::log::{Attempt, AttemptStatus, PathsTouched};
-use fl_core::store::{Catalog, Ledger, StoreError};
+use fl_core::state::{
+    MergeMode, RuntimeEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+};
+use fl_core::store::{Catalog, Ledger, StateStore, StoreError};
+use fl_core::telemetry::{
+    AdapterKind, AttemptHeartbeat, liveness_agent_slug, liveness_record_slug,
+};
 use fl_core::{Iri, Kind};
-use fl_exec::adapters::ClaudeAdapter;
+use fl_exec::adapters::{AnyAdapter, LivenessSink};
 use fl_exec::runner::{AttemptSpec, Runner};
 use fl_exec::stamp;
-
-const KNOWN_ADAPTERS: &str = "claude";
+use std::collections::BTreeMap;
 
 /// How many lines of an attempt's excerpt the command prints. The local
 /// store keeps the whole excerpt.
@@ -27,9 +33,9 @@ pub struct Cmd {
     pub timeout_secs: u64,
     #[arg(long, default_value_t = 1_000_000)]
     pub budget_usd_micros: u64,
-    /// The binary to invoke. Override when it is not on PATH under this name.
-    #[arg(long, default_value = "claude")]
-    pub binary: String,
+    /// The binary to invoke. Override when it is not on PATH under its default name.
+    #[arg(long)]
+    pub binary: Option<String>,
 }
 
 impl Cmd {
@@ -49,14 +55,60 @@ impl Cmd {
     }
 }
 
-pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
-    let store = ctx.store;
-    if cmd.adapter != "claude" {
-        bail!(
-            "`{}` is not a known adapter. Milestone 1 ships: {KNOWN_ADAPTERS}.",
-            cmd.adapter
+fn write_heartbeat(store: &fl_store::RedbStore, hb: &AttemptHeartbeat) {
+    let Ok(val) = serde_json::to_value(hb) else {
+        return;
+    };
+    let payload = StatePayload::Runtime(RuntimeEntry {
+        value: val,
+        merge_mode: MergeMode::LastWriter,
+    });
+    let by = hb.agent.clone().unwrap_or_else(|| hb.adapter.clone());
+    let rec_slug = liveness_record_slug(&hb.record);
+    let _ = StateStore::upsert_state(
+        store,
+        UpsertStateArgs {
+            scope: StateScope::Workspace,
+            slug: rec_slug,
+            sensitivity: SensitivityPatch::Inherit,
+            payload: payload.clone(),
+            at: hb.heartbeat_at.clone(),
+            by: by.clone(),
+        },
+    );
+    if let Some(ref persona) = hb.agent {
+        let ag_slug = liveness_agent_slug(persona);
+        let _ = StateStore::upsert_state(
+            store,
+            UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: ag_slug,
+                sensitivity: SensitivityPatch::Inherit,
+                payload,
+                at: hb.heartbeat_at.clone(),
+                by,
+            },
         );
     }
+}
+
+pub fn run(
+    ctx: &Ctx<'_>,
+    adapters: &BTreeMap<AdapterKind, AdapterConfig>,
+    cmd: Cmd,
+) -> Result<i32> {
+    let store = ctx.store;
+    let Some(kind) = AdapterKind::from_wire(&cmd.adapter) else {
+        let known = AdapterKind::ALL
+            .iter()
+            .map(|k| k.as_wire())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "`{}` is not a known adapter. Known adapters: {known}.",
+            cmd.adapter
+        );
+    };
     let id = RecordId(ctx.resolve_item(Kind::Record, &cmd.record)?);
     let Some(record) = ctx.tracker.get_record(&id)? else {
         bail!(
@@ -76,7 +128,17 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     // ⚠ Decision 8: GitHub is checked before the adapter spends anything.
     crate::preflight::check(ctx, &record.project)?;
 
-    let adapter = ClaudeAdapter::new(cmd.binary);
+    let entry = stamp::entry_id();
+    let binary_override = cmd
+        .binary
+        .clone()
+        .or_else(|| adapters.get(&kind).and_then(|c| c.binary.clone()));
+    let rate_card = adapters.get(&kind).and_then(|c| c.rate_card());
+    let agent_persona = std::env::var("AGENT_PERSONA")
+        .ok()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
     let spec = AttemptSpec {
         project_root: std::path::PathBuf::from(&project.root),
         // The record's PRIMARY id, never the alias the person typed: every
@@ -88,20 +150,41 @@ pub fn run(ctx: &Ctx<'_>, cmd: Cmd) -> Result<i32> {
     };
 
     let rt = tokio::runtime::Runtime::new()?;
-    let outcome = rt
-        .block_on(adapter.attempt(spec))
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let outcome = std::thread::scope(|s| {
+        let (tx, rx) = std::sync::mpsc::channel::<AttemptHeartbeat>();
+        let writer = s.spawn(move || {
+            while let Ok(hb) = rx.recv() {
+                write_heartbeat(store, &hb);
+            }
+        });
+        let tx = std::sync::Mutex::new(tx);
+        let sink: LivenessSink = std::sync::Arc::new(move |hb| {
+            if let Ok(guard) = tx.lock() {
+                let _ = guard.send(hb.clone());
+            }
+        });
+        let adapter = AnyAdapter::new(kind, binary_override, rate_card).with_liveness(
+            entry.clone(),
+            record.project.clone(),
+            agent_persona,
+            sink,
+        );
+        let res = rt.block_on(adapter.attempt(spec));
+        drop(adapter);
+        let _ = writer.join();
+        res
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let project_id = record.project.clone();
     // ⚠ Recorded whatever the outcome. A crash, a timeout and a refusal all
     // cost something, even when that something is only the wall clock.
-    let entry = stamp::entry_id();
     let attempt = Attempt {
         id: Some(entry.clone()),
         at: Some(stamp::now()),
         project: record.project,
         record: record.id,
-        adapter: "claude".into(),
+        adapter: kind.as_wire().to_owned(),
         status: outcome.status,
         duration_ms: outcome.duration_ms,
         tokens_in: outcome.tokens_in,

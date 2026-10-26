@@ -9,8 +9,10 @@
 
 use anyhow::{Context, Result, bail};
 use fl_core::state::{StateScope, validate_slug};
+use fl_core::telemetry::{AdapterKind, RateCard};
 use fl_exec::state_sync::StateSyncTarget;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Default branch name for git-backed state synchronization.
@@ -200,6 +202,31 @@ pub struct WireConfig {
     pub sync_wire: Option<bool>,
 }
 
+/// Per-adapter `[adapters.<name>]` configuration (Adapters & Telemetry spec §1.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterConfig {
+    #[serde(default)]
+    pub binary: Option<String>,
+    #[serde(default)]
+    pub input_usd_micros_per_mtok: Option<u64>,
+    #[serde(default)]
+    pub output_usd_micros_per_mtok: Option<u64>,
+}
+
+impl AdapterConfig {
+    pub fn rate_card(&self) -> Option<RateCard> {
+        if self.input_usd_micros_per_mtok.is_none() && self.output_usd_micros_per_mtok.is_none() {
+            None
+        } else {
+            Some(RateCard {
+                input_usd_micros_per_mtok: self.input_usd_micros_per_mtok.unwrap_or(0),
+                output_usd_micros_per_mtok: self.output_usd_micros_per_mtok.unwrap_or(0),
+            })
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Config {
     pub state: Option<StateConfig>,
@@ -207,6 +234,7 @@ pub struct Config {
     pub projects: Vec<Entry>,
     pub github: Option<GithubApp>,
     pub mcp: Vec<McpEntry>,
+    pub adapters: BTreeMap<AdapterKind, AdapterConfig>,
 }
 
 impl Config {
@@ -324,6 +352,8 @@ struct File {
     /// the remedy (MCP spec §2.2, release scope).
     #[serde(default)]
     mcp: Vec<McpEntry>,
+    #[serde(default)]
+    adapters: BTreeMap<String, AdapterConfig>,
 }
 
 /// The XDG config base directory: `xdg_config_home` if it is a non-empty,
@@ -494,12 +524,36 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
             );
         }
     }
+    let mut adapters = BTreeMap::new();
+    for (raw_key, adapter_cfg) in file.adapters {
+        let kind = AdapterKind::from_wire(&raw_key).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: unknown adapter `{raw_key}` in `[adapters]`; known adapters are: {}",
+                path.display(),
+                AdapterKind::ALL
+                    .iter()
+                    .map(|k| k.as_wire())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        if let Some(bin) = &adapter_cfg.binary
+            && bin.trim().is_empty()
+        {
+            bail!(
+                "{}: `adapters.{raw_key}.binary` must not be empty",
+                path.display()
+            );
+        }
+        adapters.insert(kind, adapter_cfg);
+    }
     Ok(Config {
         state: file.state,
         wire: file.wire,
         projects: file.project,
         github: file.github,
         mcp: file.mcp,
+        adapters,
     })
 }
 
@@ -1264,5 +1318,44 @@ mod tests {
             "ferris",
         );
         assert!(!target.sync_wire);
+    }
+
+    #[test]
+    fn parses_adapter_rate_cards_and_refuses_unknown_adapters_or_empty_binary() {
+        let cfg = load_text(
+            "[adapters.codex]\n\
+             binary = \"/opt/bin/codex\"\n\
+             input_usd_micros_per_mtok = 2500000\n\
+             output_usd_micros_per_mtok = 10000000\n\n\
+             [adapters.claude]\n\
+             binary = \"claude-custom\"\n",
+        )
+        .unwrap();
+        let codex = cfg.adapters.get(&AdapterKind::Codex).unwrap();
+        assert_eq!(codex.binary.as_deref(), Some("/opt/bin/codex"));
+        assert_eq!(
+            codex.rate_card(),
+            Some(RateCard {
+                input_usd_micros_per_mtok: 2_500_000,
+                output_usd_micros_per_mtok: 10_000_000,
+            })
+        );
+        let claude = cfg.adapters.get(&AdapterKind::Claude).unwrap();
+        assert_eq!(claude.binary.as_deref(), Some("claude-custom"));
+        assert_eq!(claude.rate_card(), None);
+
+        let err = load_text("[adapters.telepathy]\nbinary = \"mind\"\n").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown adapter `telepathy`"), "{msg}");
+        assert!(
+            msg.contains("claude, codex, antigravity, muse, grok"),
+            "{msg}"
+        );
+
+        let empty_bin = load_text("[adapters.muse]\nbinary = \"   \"\n").unwrap_err();
+        assert!(
+            format!("{empty_bin:#}").contains("`adapters.muse.binary` must not be empty"),
+            "{empty_bin:#}"
+        );
     }
 }
