@@ -11,64 +11,83 @@
 //! - `-p, --print` — "Print response and exit (useful for pipes)"; without
 //!   it the CLI "starts an interactive session by default", which is not
 //!   usable from a piped, non-tty child process.
+//! - `--output-format json` — structured JSON output envelope containing
+//!   `result`, `total_cost_usd`, and `usage` fields.
 //! - `--max-budget-usd <amount>` — "Maximum dollar amount to spend on API
 //!   calls (only works with --print)". This adapter derives it from
 //!   `AttemptSpec::budget_usd_micros` and passes it through so the vendor
 //!   binary enforces the same ceiling this adapter already refuses on at
 //!   zero — defense in depth, not a substitute for the pre-flight check.
-//!
-//! This module does **not** parse `claude`'s cost or token output. That is
-//! Task 19's open decision (parse the vendor's local usage logs, or take
-//! only what the CLI reports); `AttemptOutcome::tokens_in`,
-//! `tokens_out`, and `cost_usd_micros` stay `0` here deliberately. A
-//! fabricated number would be worse than a missing one.
 
+use crate::adapters::harness::{
+    CliDialect, LivenessSink, ParsedOutput, ProcessHarness, parse_json_or_jsonl_envelope,
+};
 use crate::runner::{AttemptError, AttemptOutcome, AttemptSpec, Runner};
-use fl_core::log::AttemptStatus;
-use std::io::ErrorKind;
-use std::process::Stdio;
-use std::time::Instant;
-use tokio::process::Command;
-use tokio::time::{Duration, timeout};
+use fl_core::ids::ProjectId;
+use fl_core::iri::Iri;
+use fl_core::telemetry::{AdapterKind, RateCard};
+use tokio::time::Duration;
 
-/// Output beyond this many bytes is dropped rather than stored. An attempt
-/// record is a note for a human and a later gate, not a full transcript.
-const EXCERPT_LIMIT: usize = 8192;
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClaudeDialect;
 
-/// How many times a spawn is retried after `ETXTBSY`
-/// (`ErrorKind::ExecutableFileBusy`) before it is reported as a refusal.
-///
-/// `ETXTBSY` means the kernel currently has the target file open for
-/// writing — anywhere, by any process — at the moment of `execve`. On Linux
-/// that state is guaranteed transient: it clears as soon as the writer
-/// closes its file descriptor, which is microseconds away, not seconds. A
-/// `fork()` occurring on another thread of this same process while this
-/// thread is between writing out a freshly-created executable and exec'ing
-/// it duplicates the still-open write fd into the forked child, which then
-/// holds the target file busy until that child's own `execve` closes it
-/// (`O_CLOEXEC` only fires on exec, not on fork). That race is real in
-/// production too, not just in tests: nothing here promises the `claude`
-/// binary is never mid-replacement (package manager, deploy tool) at the
-/// instant of spawn. Retrying a handful of times with a short backoff turns
-/// a spurious, purely environmental "could not start" into a normal spawn,
-/// which is the honest outcome for a condition proven to self-clear. Any
-/// other spawn error is refused immediately, unretried, as before.
-const SPAWN_RETRY_LIMIT: u32 = 20;
+impl CliDialect for ClaudeDialect {
+    fn kind(&self) -> AdapterKind {
+        AdapterKind::Claude
+    }
 
-/// Backoff between spawn retries. `ETXTBSY`'s window is microseconds wide,
-/// so this only needs to be small; it is not tuned against a measured
-/// worst case, just kept well under a human-noticeable delay even at the
-/// retry ceiling (20 × 2ms = 40ms).
-const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(2);
+    fn default_binary(&self) -> &'static str {
+        AdapterKind::Claude.default_binary()
+    }
+
+    fn argv(&self, spec: &AttemptSpec) -> Vec<String> {
+        let budget_usd = spec.budget_usd_micros as f64 / 1_000_000.0;
+        vec![
+            "-p".into(),
+            spec.instruction.clone(),
+            "--output-format".into(),
+            "json".into(),
+            "--max-budget-usd".into(),
+            format!("{budget_usd:.6}"),
+        ]
+    }
+
+    fn parse_output(&self, stdout: &[u8], stderr: &[u8]) -> ParsedOutput {
+        parse_json_or_jsonl_envelope(stdout, stderr, false)
+    }
+}
 
 /// Drives the real `claude` CLI as a [`Runner`].
 pub struct ClaudeAdapter {
-    binary: String,
+    harness: ProcessHarness<ClaudeDialect>,
 }
 
 impl ClaudeAdapter {
     pub fn new(binary: String) -> Self {
-        Self { binary }
+        Self {
+            harness: ProcessHarness::new(binary, ClaudeDialect),
+        }
+    }
+
+    pub fn with_rate_card(mut self, rate_card: Option<RateCard>) -> Self {
+        self.harness = self.harness.with_rate_card(rate_card);
+        self
+    }
+
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.harness = self.harness.with_heartbeat_interval(interval);
+        self
+    }
+
+    pub fn with_liveness(
+        mut self,
+        attempt_id: Iri,
+        project: ProjectId,
+        agent: Option<String>,
+        sink: LivenessSink,
+    ) -> Self {
+        self.harness = self.harness.with_liveness(attempt_id, project, agent, sink);
+        self
     }
 }
 
@@ -78,118 +97,16 @@ impl Runner for ClaudeAdapter {
     }
 
     async fn attempt(&self, spec: AttemptSpec) -> Result<AttemptOutcome, AttemptError> {
-        // A zero ceiling is refused before anything is spawned. Pre-flight
-        // fails fast on budget exhaustion rather than letting a process run
-        // that this side has already decided not to pay for.
-        if spec.budget_usd_micros == 0 {
-            return Ok(AttemptOutcome::refused(
-                "the attempt's spend ceiling is zero, so nothing was started",
-            ));
-        }
-
-        let budget_usd = spec.budget_usd_micros as f64 / 1_000_000.0;
-
-        let started = Instant::now();
-        let mut cmd = Command::new(&self.binary);
-        cmd.arg("-p")
-            .arg(&spec.instruction)
-            .arg("--max-budget-usd")
-            .arg(format!("{budget_usd:.6}"))
-            .current_dir(&spec.project_root)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
-        let mut retries = 0u32;
-        let child = loop {
-            match cmd.spawn() {
-                Ok(c) => break c,
-                Err(e)
-                    if e.kind() == ErrorKind::ExecutableFileBusy && retries < SPAWN_RETRY_LIMIT =>
-                {
-                    // See `SPAWN_RETRY_LIMIT`'s doc comment: this is a
-                    // known-transient race, not a real refusal.
-                    retries += 1;
-                    tokio::time::sleep(SPAWN_RETRY_DELAY).await;
-                }
-                Err(e) => {
-                    // A spawn failure is not a pre-flight error: the caller
-                    // asked for an attempt, and "the binary is missing" is
-                    // an answer about that attempt, not a reason to never
-                    // have tried. It costs nothing and took no time, so it
-                    // is reported the same way a zero-budget refusal is.
-                    return Ok(AttemptOutcome::refused(format!(
-                        "could not start `{}`: {e}",
-                        self.binary
-                    )));
-                }
-            }
-        };
-
-        let limit = Duration::from_secs(spec.timeout_secs.max(1));
-        let waited = timeout(limit, child.wait_with_output()).await;
-        let duration_ms = started.elapsed().as_millis() as u64;
-
-        match waited {
-            Err(_elapsed) => Ok(AttemptOutcome {
-                status: AttemptStatus::Timeout,
-                output_excerpt: format!(
-                    "`{}` exceeded its {}s timeout",
-                    self.binary, spec.timeout_secs
-                ),
-                duration_ms,
-                tokens_in: 0,
-                tokens_out: 0,
-                cost_usd_micros: 0,
-                paths_touched: vec![],
-            }),
-            Ok(Err(e)) => Ok(AttemptOutcome {
-                status: AttemptStatus::Crashed,
-                output_excerpt: e.to_string(),
-                duration_ms,
-                tokens_in: 0,
-                tokens_out: 0,
-                cost_usd_micros: 0,
-                paths_touched: vec![],
-            }),
-            Ok(Ok(out)) => {
-                let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-                text.push_str(&String::from_utf8_lossy(&out.stderr));
-                // Truncate on a `char` boundary, not a raw byte offset:
-                // `String::truncate` panics if the cut point lands inside a
-                // multi-byte UTF-8 sequence, and `String::from_utf8_lossy`
-                // gives no guarantee that EXCERPT_LIMIT falls on one. Same
-                // rule as `command.rs`'s `excerpt()`.
-                if text.len() > EXCERPT_LIMIT {
-                    let mut end = EXCERPT_LIMIT;
-                    while end > 0 && !text.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    text.truncate(end);
-                }
-                let status = if out.status.success() {
-                    AttemptStatus::Completed
-                } else {
-                    AttemptStatus::Crashed
-                };
-                Ok(AttemptOutcome {
-                    status,
-                    output_excerpt: text,
-                    duration_ms,
-                    tokens_in: 0,
-                    tokens_out: 0,
-                    cost_usd_micros: 0,
-                    paths_touched: vec![],
-                })
-            }
-        }
+        Ok(self.harness.run(spec).await)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::harness::EXCERPT_LIMIT;
     use fl_core::ids::{RecordId, seq_iri};
+    use fl_core::log::AttemptStatus;
 
     fn spec(root: &std::path::Path, timeout: u64) -> AttemptSpec {
         AttemptSpec {
@@ -302,5 +219,75 @@ mod tests {
         let a = ClaudeAdapter::new("claude".into());
         let out = a.attempt(spec(d.path(), 120)).await.unwrap();
         assert_eq!(out.status, AttemptStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn parses_claude_json_envelope_usage_and_vendor_cost() {
+        let d = tempfile::tempdir().unwrap();
+        let stub = d.path().join("claude-json.sh");
+        let payload = r#"{"type":"result","result":"done","total_cost_usd":0.012345,"usage":{"input_tokens":120,"cache_creation_input_tokens":30,"cache_read_input_tokens":10,"output_tokens":45}}"#;
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{payload}'\n");
+        std::fs::write(&stub, script).unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let a = ClaudeAdapter::new(stub.to_string_lossy().into_owned());
+        let out = a.attempt(spec(d.path(), 5)).await.unwrap();
+        assert_eq!(out.status, AttemptStatus::Completed);
+        assert_eq!(out.output_excerpt, "done");
+        assert_eq!(out.tokens_in, 160);
+        assert_eq!(out.tokens_out, 45);
+        assert_eq!(out.cost_usd_micros, 12_345);
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_rate_card_when_total_cost_usd_is_absent() {
+        let d = tempfile::tempdir().unwrap();
+        let stub = d.path().join("claude-no-cost.sh");
+        let payload = r#"{"type":"result","result":"done","usage":{"input_tokens":1000,"output_tokens":500}}"#;
+        let script = format!("#!/bin/sh\nprintf '%s\\n' '{payload}'\n");
+        std::fs::write(&stub, script).unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let a = ClaudeAdapter::new(stub.to_string_lossy().into_owned()).with_rate_card(Some(
+            RateCard {
+                input_usd_micros_per_mtok: 3_000_000,
+                output_usd_micros_per_mtok: 15_000_000,
+            },
+        ));
+        let out = a.attempt(spec(d.path(), 5)).await.unwrap();
+        assert_eq!(out.status, AttemptStatus::Completed);
+        assert_eq!(out.tokens_in, 1000);
+        assert_eq!(out.tokens_out, 500);
+        // 1000 * 3 + 500 * 15 = 3000 + 7500 = 10_500 micro-USD
+        assert_eq!(out.cost_usd_micros, 10_500);
+    }
+
+    #[tokio::test]
+    async fn records_paths_touched_in_git_repo_and_ignores_fl_directory() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+
+        let bin_dir = tempfile::tempdir().unwrap();
+        let stub = bin_dir.path().join("claude-touch.sh");
+        let script = "#!/bin/sh\nmkdir -p .fl src\nprintf 'ok\\n' > src/lib.rs\nprintf 'ignored\\n' > .fl/live.json\nprintf '%s\\n' '{\"result\":\"touched\"}'\n";
+        std::fs::write(&stub, script).unwrap();
+        let mut perms = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&stub, perms).unwrap();
+
+        let a = ClaudeAdapter::new(stub.to_string_lossy().into_owned());
+        let out = a.attempt(spec(root, 5)).await.unwrap();
+        assert_eq!(out.status, AttemptStatus::Completed);
+        assert_eq!(out.output_excerpt, "touched");
+        assert_eq!(out.paths_touched, vec!["src/lib.rs".to_owned()]);
     }
 }
