@@ -522,6 +522,14 @@ Given a `WorkflowRun` and a ready `step_id` in `run.active_steps`:
 3. `workflow_handoff`: allows an agent executing a step to record a curated `HandoffEntry` (`summary`, `shipped`, `in_flight`, `blockers`, `next_steps`, `notes`) and optional declared runtime facts (`facts: { "<key>": <value> }`, validated against `def.declared_keys`).
 4. `workflow_step`: allows an agent or orchestrator to record a step completion or advance a ready step (`run_id`, `step_id`, `outcome`, `by`).
 
+### 4.3 Author-Owned PR Merge Authorization (`crates/core/src/pr_policy.rs`, `crates/cli/src/cmd/pr.rs`)
+
+To match the workspace Author-Owned Merge rule (`.agents` commit `6c0e738`), `crates/core/src/pr_policy.rs` adds `authorize_agent_merge(eval: &PrPolicyEvaluation, caller: &AgentRecord) -> Result<(), PolicyRefusal>`:
+1. Verifies `caller.status == AgentStatus::Active` (else `UnknownOrInactiveAgent`).
+2. Verifies `eval.protected_files.is_empty()`, `eval.unattributed_commits.is_empty()`, and `eval.unknown_co_authors.is_empty()`.
+3. Allows the merge when `caller` is a recorded commit co-author in `eval.co_authors` (author-owned merge after `verify_merge_approvals` confirms a valid approval from the required reviewer tier `Lead`, `LabManager`, or `Owner`), OR when `authorize_agent_action(eval, caller)` succeeds.
+4. `PrCmd::Merge` in `crates/cli/src/cmd/pr.rs` calls `authorize_agent_merge(&eval, &caller)` followed by `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN)`.
+
 ---
 
 ## 5. Testing Requirements
