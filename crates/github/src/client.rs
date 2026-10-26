@@ -17,6 +17,7 @@ pub enum Method {
     Get,
     Post,
     Patch,
+    Put,
 }
 
 /// An answer that is not a transport failure and not already an error:
@@ -32,6 +33,13 @@ pub struct Reply {
     /// needed (spec §6.3), when it says.
     pub accepted_permissions: Option<String>,
     link_next: Option<String>,
+}
+
+impl Reply {
+    /// The `rel="next"` pagination URL from GitHub's `Link` header, when present.
+    pub fn next_link(&self) -> Option<&str> {
+        self.link_next.as_deref()
+    }
 }
 
 /// A GraphQL answer for a caller that judges it itself (the ledger's
@@ -364,6 +372,8 @@ fn exchange(
         (Method::Post, None) => headers(agent.post(url), &auth).send_empty(),
         (Method::Patch, Some(b)) => headers(agent.patch(url), &auth).send_json(b),
         (Method::Patch, None) => headers(agent.patch(url), &auth).send_empty(),
+        (Method::Put, Some(b)) => headers(agent.put(url), &auth).send_json(b),
+        (Method::Put, None) => headers(agent.put(url), &auth).send_empty(),
     };
     let mut resp = result.map_err(unreachable)?;
     let status = resp.status().as_u16();
