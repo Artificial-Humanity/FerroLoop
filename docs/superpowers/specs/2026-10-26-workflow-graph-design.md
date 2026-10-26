@@ -524,11 +524,13 @@ Given a `WorkflowRun` and a ready `step_id` in `run.active_steps`:
 
 ### 4.3 Author-Owned PR Merge Authorization (`crates/core/src/pr_policy.rs`, `crates/cli/src/cmd/pr.rs`)
 
-To match the workspace Author-Owned Merge rule (`.agents` commit `6c0e738`), `crates/core/src/pr_policy.rs` adds `authorize_agent_merge(eval: &PrPolicyEvaluation, caller: &AgentRecord) -> Result<(), PolicyRefusal>`:
-1. Verifies `caller.status == AgentStatus::Active` (else `UnknownOrInactiveAgent`).
-2. Verifies `eval.protected_files.is_empty()`, `eval.unattributed_commits.is_empty()`, and `eval.unknown_co_authors.is_empty()`.
-3. Allows the merge when `caller` is a recorded commit co-author in `eval.co_authors` (author-owned merge after `verify_merge_approvals` confirms a valid approval from the required reviewer tier `Lead`, `LabManager`, or `Owner`), OR when `authorize_agent_action(eval, caller)` succeeds.
-4. `PrCmd::Merge` in `crates/cli/src/cmd/pr.rs` calls `authorize_agent_merge(&eval, &caller)` followed by `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN)`.
+To match the workspace Author-Owned Merge rule (`.agents` commit `6c0e738`), `crates/core/src/pr_policy.rs` separates review authorization (`authorize_agent_action`) from merge authorization (`authorize_agent_merge(eval: &PrPolicyEvaluation, caller: &AgentRecord) -> Result<(), PolicyRefusal>`):
+1. `authorize_agent_action` (used on `fl github pr review` and inside `verify_merge_approvals` when checking whether an agent's `FlReviewMarker` approval is valid) retains `SelfReviewForbidden` and tier checks so co-authors can never approve their own PRs.
+2. `authorize_agent_merge` verifies:
+   - `caller.status == AgentStatus::Active` (else `UnknownOrInactiveAgent`).
+   - `eval.unattributed_commits.is_empty()` and `eval.unknown_co_authors.is_empty()`.
+   - `caller` is a recorded commit co-author in `eval.co_authors` (author-owned merge across all tiers, including `Lead`, `LabManager`, and `Owner`-reviewed PRs touching protected paths once `lmcfarlin` approves on GitHub), OR `authorize_agent_action(eval, caller)` succeeds.
+3. `PrCmd::Merge` in `crates/cli/src/cmd/pr.rs` calls `authorize_agent_merge(&eval, &caller)` followed by `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN)`.
 
 ---
 
