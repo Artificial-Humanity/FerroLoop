@@ -16,8 +16,10 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
    Repeat until no Critical or Important finding is open.
 4. Push the branch and open a ready-for-review pull request against `main` with
    `fl github pr create`. It reports the required reviewer tier and the target reviewer,
-   and that report decides; it also queues a FerroWire notice to the target reviewer.
-   Then ask that reviewer for a review over `agent-msg`. In summary:
+   and that report decides. For the Lead or Lab Manager tier it queues a FerroWire notice
+   to the target reviewer; for the Owner tier it requests the owner's review on GitHub.
+   Then ask an agent reviewer for a review over `agent-msg`; the owner is reached through
+   the GitHub review request. In summary:
    * A pull request co-authored by an assisting agent is reviewed by the project Lead.
    * A pull request co-authored by the Lead is reviewed by the Lab Manager (`jarvis`).
      The Lab Manager may also approve a Lead-tier pull request.
@@ -25,16 +27,18 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
      `DEFAULT_PROTECTED_PATTERNS` in [crates/core/src/pr_policy.rs](crates/core/src/pr_policy.rs):
      instruction files, `.github/`, `.agents/`, `.fl/manifest.json`), carries a commit
      without a `Co-authored-by:` trailer, is co-authored by the Lab Manager, or has a
-     co-author who is not registered as an active agent. `fl github pr create` and
+     co-author who is not registered as an active agent.
      [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml)
-     both request the owner's review on GitHub in those cases.
+     also requests the owner's review for the protected-path, missing-trailer and Lab
+     Manager co-author cases; it cannot see the agent registry.
 5. An agent reviewer records its verdict with `fl github pr review`. The review is posted
    by the Reviewer GitHub App (`<slug>[bot]`) with an `fl-review` marker, because the
    machine account cannot approve a pull request it opened. The command needs the App's
    credentials: `[github]` `app_id` and `private_key` in the fl `config.toml`, or
    `$FL_GITHUB_APP_ID` and `$FL_GITHUB_PRIVATE_KEY_PATH`.
-6. Once the required approval is in and the checks pass, the agent who opened the pull
-   request merges it through the pull request with `gh pr merge`. This applies to every
+6. Once the target reviewer that `fl github pr create` reported (or the owner) has
+   approved and the checks pass, the agent who opened the pull request merges it through
+   the pull request with `gh pr merge`, which does not check the tier. This applies to every
    tier: after the owner approves an Owner-tier pull request, the author merges it too.
    A reviewer never merges another agent's pull request: the author resolves conflicts
    and keeps the branch current. A direct push to `main` is not the route, and the
