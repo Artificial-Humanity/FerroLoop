@@ -80,7 +80,8 @@ impl PrFixture {
 
     fn fl(&self) -> Command {
         let mut c = Command::cargo_bin("fl").unwrap();
-        c.env("XDG_CONFIG_HOME", self.home.path().join("config"))
+        c.env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
             .env("XDG_DATA_HOME", self.home.path().join("data"))
             .env("XDG_STATE_HOME", self.home.path().join("state"))
             .env("XDG_RUNTIME_DIR", self.home.path().join("run"))
@@ -93,6 +94,10 @@ impl PrFixture {
             .env_remove("FL_DB")
             .env_remove("FL_GITHUB_APP_ID")
             .env_remove("FL_GITHUB_PRIVATE_KEY_PATH")
+            .env_remove("AGENT_PERSONA")
+            .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("CODEX_THREAD_ID")
             .current_dir(self.repo.path());
         c
     }

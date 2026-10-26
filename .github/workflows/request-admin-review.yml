@@ -51,6 +51,13 @@ jobs:
             esac
           done <<< "$FILES"
 
+          COMMIT_COUNT=$(printf '%s\n' "$COMMITS_JSON" | jq 'length')
+          COAUTHOR_COMMIT_COUNT=$(printf '%s\n' "$COMMITS_JSON" | jq '[.[] | select(.commit.message | test("(?im)^co-authored-by:"))] | length')
+          if [ "$COMMIT_COUNT" -eq 0 ] || [ "$COAUTHOR_COMMIT_COUNT" -eq 0 ]; then
+            REQUIRE_OWNER=1
+            REASONS+=("no agent Co-authored-by trailers found across PR commits")
+          fi
+
           UNATTRIBUTED=$(printf '%s\n' "$COMMITS_JSON" | jq -r '
             .[]
             | select(((.author.login // "") | ascii_downcase) != "lmcfarlin")
