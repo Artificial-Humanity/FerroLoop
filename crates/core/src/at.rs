@@ -63,15 +63,7 @@ impl At {
                 return Err(refuse());
             }
         }
-        let n = |from: usize, to: usize| -> i64 {
-            s[from..to].parse().expect("checked above: ASCII digits")
-        };
-        let days = days_from_civil(n(0, 4), n(5, 7), n(8, 10));
-        let ms = days * 86_400_000
-            + n(11, 13) * 3_600_000
-            + n(14, 16) * 60_000
-            + n(17, 19) * 1000
-            + n(20, 23);
+        let ms = raw_millis(s);
         // An impossible date (February 30th), hour 24 or second 60 lands on
         // another instant, and that instant spells differently. A date
         // before 1970 is negative here, wraps to a huge `u64`, is held at
@@ -83,9 +75,24 @@ impl At {
         Ok(at)
     }
 
+    /// Milliseconds after the Unix epoch for this timestamp.
+    pub fn unix_millis(&self) -> u64 {
+        raw_millis(&self.0) as u64
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+fn raw_millis(s: &str) -> i64 {
+    let n = |from: usize, to: usize| -> i64 {
+        s[from..to]
+            .parse()
+            .expect("checked: 24-byte ASCII RFC 3339")
+    };
+    let days = days_from_civil(n(0, 4), n(5, 7), n(8, 10));
+    days * 86_400_000 + n(11, 13) * 3_600_000 + n(14, 16) * 60_000 + n(17, 19) * 1000 + n(20, 23)
 }
 
 /// Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's
@@ -213,5 +220,23 @@ mod tests {
         );
         assert!(serde_json::from_str::<At>("\"2026-09-30T12:34:56Z\"").is_err());
         assert!(serde_json::from_str::<At>("1727658123004").is_err());
+    }
+
+    #[test]
+    fn unix_millis_round_trips_with_from_unix_millis() {
+        for ms in [
+            0,
+            1,
+            999,
+            86_399_999,
+            86_400_000,
+            951_782_400_000,
+            1_727_658_123_004,
+            MAX_MILLIS,
+        ] {
+            let at = At::from_unix_millis(ms);
+            assert_eq!(at.unix_millis(), ms, "{at}");
+        }
+        assert_eq!(At::from_unix_millis(u64::MAX).unix_millis(), MAX_MILLIS);
     }
 }

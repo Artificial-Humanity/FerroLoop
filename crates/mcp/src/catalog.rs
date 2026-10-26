@@ -80,13 +80,17 @@ pub enum VendorName {
     Claude,
     Codex,
     Antigravity,
+    Muse,
+    Grok,
 }
 
 impl VendorName {
-    pub const ALL: [VendorName; 3] = [
+    pub const ALL: [VendorName; 5] = [
         VendorName::Claude,
         VendorName::Codex,
         VendorName::Antigravity,
+        VendorName::Muse,
+        VendorName::Grok,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -94,6 +98,8 @@ impl VendorName {
             VendorName::Claude => "claude",
             VendorName::Codex => "codex",
             VendorName::Antigravity => "antigravity",
+            VendorName::Muse => "muse",
+            VendorName::Grok => "grok",
         }
     }
 }
@@ -973,7 +979,7 @@ env.LOG_LEVEL = "info"
         assert!(!gh.is_for(VendorName::Antigravity));
         assert_eq!(
             VendorName::ALL.map(VendorName::as_str),
-            ["claude", "codex", "antigravity"]
+            ["claude", "codex", "antigravity", "muse", "grok"]
         );
     }
 
@@ -1355,7 +1361,7 @@ env.LOG_LEVEL = "info"
             (stdio("gh", "env.T = 3\n"), "a string, or a table"),
             (
                 stdio("gh", "vendors = [\"gemini\"]\n"),
-                "unknown variant <value>, expected one of `claude`, `codex`, `antigravity`",
+                "unknown variant <value>, expected one of `claude`, `codex`, `antigravity`, `muse`, `grok`",
             ),
             (
                 "[server.gh]\ntransport = \"websocket\"\nurl = \"https://x.example\"\n".into(),

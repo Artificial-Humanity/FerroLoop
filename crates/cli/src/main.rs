@@ -768,6 +768,12 @@ fn run(cli: Cli) -> Result<i32> {
             let default_store = default_state_store_path()?;
             let store_path = match explicit {
                 Some(p) => p,
+                None if matches!(cmd, cmd::agent::AgentCmd::Liveness { .. }) => {
+                    match config::bound_entry(&cfg.projects, &cwd)? {
+                        Some(entry) if entry.store.exists() => entry.store,
+                        _ => cfg.workspace_state_store(&default_store),
+                    }
+                }
                 None => cfg.workspace_state_store(&default_store),
             };
             if let Some(dir) = store_path.parent()
@@ -1125,7 +1131,7 @@ fn run(cli: Cli) -> Result<i32> {
         Command::Record(c) => cmd::record::run(&ctx, c),
         Command::Check(c) => cmd::check::run(&ctx, c),
         Command::Finding(c) => cmd::finding::run(&ctx, c),
-        Command::Attempt(c) => cmd::attempt::run(&ctx, c),
+        Command::Attempt(c) => cmd::attempt::run(&ctx, &cfg.adapters, c),
         Command::Stats(c) => cmd::stats::run(&store, c, stats_source),
         Command::Manifest(c) => cmd::manifest::run(&store, c, &manifest_binding),
         Command::Github(c) => cmd::github::run(&ctx, c, entry.as_ref().map(|e| e.root.as_path())),

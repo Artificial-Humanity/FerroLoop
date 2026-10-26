@@ -26,6 +26,7 @@ pub mod split;
 pub mod stale;
 pub mod state;
 pub mod store;
+pub mod telemetry;
 pub mod tiered;
 pub mod verdict;
 

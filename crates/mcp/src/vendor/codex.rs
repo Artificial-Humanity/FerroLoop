@@ -121,7 +121,7 @@ impl Vendor for Codex {
 /// One entry as a file of its own: `[mcp_servers.<name>]` and its body,
 /// without what stands above its header. This is both what fl writes and
 /// what it reads back, so the two can be compared.
-fn alone(name: &str, entry: &Item) -> String {
+pub(super) fn alone(name: &str, entry: &Item) -> String {
     let mut entry = entry.clone();
     if let Item::Table(t) = &mut entry {
         t.decor_mut().clear();
@@ -139,7 +139,7 @@ pub(super) struct TomlFile {
     doc: DocumentMut,
 }
 
-fn open(path: &Path, bytes: Option<&[u8]>) -> Result<TomlFile, FileRefusal> {
+pub(super) fn open(path: &Path, bytes: Option<&[u8]>) -> Result<TomlFile, FileRefusal> {
     let Some(bytes) = bytes else {
         return Ok(TomlFile {
             doc: DocumentMut::new(),

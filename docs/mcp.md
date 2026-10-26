@@ -1,7 +1,8 @@
 # A project's MCP servers
 
 Each agent CLI keeps its own list of MCP servers, in its own file and format: `.mcp.json` for
-Claude Code, `.codex/config.toml` for Codex, `.agents/mcp_config.json` for Antigravity. Kept by
+Claude Code, `.codex/config.toml` for Codex, `.agents/mcp_config.json` for Antigravity,
+`.muse/settings.json` for Muse, `.grok/config.toml` for Grok. Kept by
 hand, the copies drift. With `fl mcp`, a project has **one MCP catalog**, `.fl/mcp.toml`,
 committed with the code, and fl writes every agent CLI's file from it. Turn a server on once and
 every agent CLI in the project has it; turn it off once and all of them lose it.
@@ -62,7 +63,7 @@ server's table holds:
 | `from` | The registry's name for the server, such as `io.example/notes`. Absent for a server added by hand. |
 | `version` | The exact registry version the launch was frozen from. Present exactly when `from` is. |
 | `enabled` | The team default: `true` or `false`. Default `true`. |
-| `vendors` | The agent CLIs that get the server: any of `claude`, `codex` and `antigravity`. Default: all three. |
+| `vendors` | The agent CLIs that get the server: any of `claude`, `codex`, `antigravity`, `muse` and `grok`. Default: all five. |
 | `transport` | `stdio` (fl's vendor files start the server), `http` (streamable HTTP) or `sse` (the older HTTP with server-sent events). |
 | `command` | The program a `stdio` server runs. Required for `stdio`, refused otherwise. |
 | `args` | Its arguments, a list of strings. `stdio` only. |
@@ -117,6 +118,8 @@ An fl older than this one refuses a config that has an `[[mcp]]` table; upgrade 
 | Claude Code | `.mcp.json` | `mcpServers` |
 | Codex | `.codex/config.toml` | `[mcp_servers.<name>]` |
 | Antigravity | `.agents/mcp_config.json` | `mcpServers` |
+| Muse | `.muse/settings.json` | `mcp_servers` |
+| Grok | `.grok/config.toml` | `[mcp_servers.<name>]` |
 
 A server one agent CLI cannot run is left out of that file only, with a message naming the reason;
 the others still get it. To say so in the catalog, give the server a `vendors` list without that
@@ -151,6 +154,13 @@ environment: a secret variable is left out of the entry, and the server reads it
 environment under its own name, so a secret read from a variable of another name is refused for
 Antigravity. A server with a secret header is left out of Antigravity's file, since the header
 cannot reach the server. Antigravity has no SSE, so an `sse` server is left out too.
+
+**Muse** gets the same entry fields and `${NAME}` secret references as Claude Code, under
+`mcp_servers` in `.muse/settings.json` (with `"schema_version": 1` on a newly created file).
+
+**Grok** gets the same `[mcp_servers.<name>]` table as Codex (`command`, `args`, `env` and
+`env_vars` for `stdio`; `url`, `bearer_token_env_var`, `http_headers` and `env_http_headers` for
+`http`; no `sse`), in `.grok/config.toml`.
 
 ### What fl keeps
 
@@ -277,6 +287,8 @@ project's `.gitignore` holds:
 /.mcp.json
 /.codex/config.toml
 /.agents/mcp_config.json
+/.muse/settings.json
+/.grok/config.toml
 ```
 
 `sync` and `check` refuse a vendor file fl writes, or holds an entry in, that git tracks or would

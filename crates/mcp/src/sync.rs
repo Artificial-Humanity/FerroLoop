@@ -693,12 +693,14 @@ fn same_meaning(vendor: VendorName, name: &str, a: &[u8], b: &[u8]) -> bool {
 /// An entry as a value; `None` when it does not parse.
 fn value(vendor: VendorName, name: &str, bytes: &[u8]) -> Option<serde_json::Value> {
     match vendor {
-        VendorName::Codex => {
+        VendorName::Codex | VendorName::Grok => {
             let doc: toml::Table = toml::from_str(std::str::from_utf8(bytes).ok()?).ok()?;
             let entry = doc.get("mcp_servers")?.get(name)?;
             serde_json::to_value(entry).ok()
         }
-        VendorName::Claude | VendorName::Antigravity => serde_json::from_slice(bytes).ok(),
+        VendorName::Claude | VendorName::Antigravity | VendorName::Muse => {
+            serde_json::from_slice(bytes).ok()
+        }
     }
 }
 
@@ -1850,6 +1852,8 @@ env.NOTES_TOKEN = { secret = true }
             "Claude Code, {claude}:\n  remove docs\n  update notes\n  add events\n  add gone\n\
              Codex, {codex}:\n  remove docs\n  refused notes\n  add gone\n\
              Antigravity, {agy}:\n  remove docs\n  update notes\n  add gone\n\
+             Muse, {muse}:\n  remove docs\n  update notes\n  add events\n  add gone\n\
+             Grok, {grok}:\n  remove docs\n  update notes\n  add gone\n\
              Codex cannot run server `events`: Codex connects to streamable HTTP servers only, \
              not SSE. It is left out of .codex/config.toml; the other vendors still get it. To \
              say so in the catalog, give the server a `vendors` list without `codex`\n\
@@ -1857,22 +1861,30 @@ env.NOTES_TOKEN = { secret = true }
              SSE transport; only a streamable HTTP endpoint or a stdio server. It is left out \
              of .agents/mcp_config.json; the other vendors still get it. To say so in the \
              catalog, give the server a `vendors` list without `antigravity`\n\
+             Grok cannot run server `events`: Grok connects to streamable HTTP servers only, \
+             not SSE. It is left out of .grok/config.toml; the other vendors still get it. To \
+             say so in the catalog, give the server a `vendors` list without `grok`\n\
              {codex}: `notes` was changed by hand since fl wrote it (`args` differs). Restore \
              the entry, or run `fl mcp sync --replace notes`, which shows the difference and \
              overwrites it",
             claude = path(VendorName::Claude),
             codex = path(VendorName::Codex),
             agy = path(VendorName::Antigravity),
+            muse = path(VendorName::Muse),
+            grok = path(VendorName::Grok),
         );
         assert_eq!(plan.to_string(), expected);
         assert_eq!(plan.check(), Check::Refused);
         f.edit(VendorName::Codex, "@example/notes-mcp@1.2.1", PINNED);
         let plan = f.plan(CATALOG);
         let expected = format!(
-            "Claude Code, {}: no change\nCodex, {}: no change\nAntigravity, {}: no change",
+            "Claude Code, {}: no change\nCodex, {}: no change\nAntigravity, {}: no change\n\
+             Muse, {}: no change\nGrok, {}: no change",
             path(VendorName::Claude),
             path(VendorName::Codex),
-            path(VendorName::Antigravity)
+            path(VendorName::Antigravity),
+            path(VendorName::Muse),
+            path(VendorName::Grok),
         );
         assert_eq!(plan.to_string(), expected);
     }
@@ -1895,6 +1907,8 @@ command = "local-mcp"
         assert_eq!(actions(&plan, VendorName::Claude), add("events"));
         assert_eq!(actions(&plan, VendorName::Codex), add("local"));
         assert_eq!(actions(&plan, VendorName::Antigravity), vec![]);
+        assert_eq!(actions(&plan, VendorName::Muse), add("events"));
+        assert_eq!(actions(&plan, VendorName::Grok), vec![]);
         let skipped: Vec<_> = plan
             .skipped()
             .iter()
@@ -1904,14 +1918,16 @@ command = "local-mcp"
             skipped,
             [
                 (VendorName::Codex, "events"),
-                (VendorName::Antigravity, "events")
+                (VendorName::Antigravity, "events"),
+                (VendorName::Grok, "events"),
             ]
         );
         assert_eq!(plan.check(), Check::Changes);
         apply(&plan).unwrap();
         assert_eq!(f.read(VendorName::Antigravity), None);
-        // A record for Claude Code and Codex, none for an untouched target.
-        assert_eq!(fs::read_dir(&f.records).unwrap().count(), 3);
+        assert_eq!(f.read(VendorName::Grok), None);
+        // A record for Claude Code, Codex and Muse, none for an untouched target.
+        assert_eq!(fs::read_dir(&f.records).unwrap().count(), 4);
         assert_eq!(f.plan(text).check(), Check::Matches);
     }
 
@@ -1937,7 +1953,7 @@ command = "local-mcp"
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names.len(), 4, "{names:?}");
+        assert_eq!(names.len(), 6, "{names:?}");
         assert_eq!(names.last().unwrap(), LOCK);
     }
 

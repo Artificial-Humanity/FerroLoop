@@ -260,4 +260,27 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
     };
     assert_every_reference_refuses_a_handle("WireMessage", &wire_message, 6);
     assert_every_reference_refuses_a_handle("DeliveryReceipt", &delivery_receipt, 2);
+
+    assert_every_reference_refuses_a_handle(
+        "AttemptHeartbeat",
+        &fl_core::telemetry::AttemptHeartbeat {
+            attempt_id: fl_core::ids::seq_iri(1),
+            project: ProjectId(fl_core::ids::seq_iri(2)),
+            record: RecordId(fl_core::ids::seq_iri(3)),
+            adapter: "claude".into(),
+            agent: Some("ferris".into()),
+            host: "ai-lab-0".into(),
+            pid: 1234,
+            started_at: At::from_unix_millis(1_000),
+            heartbeat_at: At::from_unix_millis(2_000),
+            status: fl_core::telemetry::LivenessStatus::Live,
+            outcome: None,
+            exit_at: None,
+            duration_ms: 1_000,
+            tokens_in: 10,
+            tokens_out: 20,
+            cost_usd_micros: 50,
+        },
+        3,
+    );
 }

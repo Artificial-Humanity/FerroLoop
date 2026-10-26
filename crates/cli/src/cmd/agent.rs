@@ -1,14 +1,21 @@
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
+use fl_core::Iri;
 use fl_core::agent::{
     AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, reports_to,
 };
 use fl_core::at::At;
-use fl_core::ids::{AgentId, Kind};
-use fl_core::state::validate_slug;
-use fl_core::store::{AgentRegistry, Handles, StoreError};
+use fl_core::ids::{AgentId, Kind, RecordId};
+use fl_core::state::{StateConcern, StatePayload, StateScope, validate_slug};
+use fl_core::store::{AgentRegistry, Handles, StateStore, StoreError};
+use fl_core::telemetry::{
+    AttemptHeartbeat, DEFAULT_STALE_AFTER_MS, LivenessVerdict, evaluate_liveness,
+    liveness_agent_slug, liveness_record_slug,
+};
+use serde::Serialize;
 
 use crate::refs::Ref;
 
@@ -73,6 +80,16 @@ pub enum AgentCmd {
         /// Atomically write the two-table Markdown roster to `<path>`.
         #[arg(long)]
         render: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Report wrapper-observed liveness (`live`, `unverifiable`, or `exited`) for an agent or record.
+    Liveness {
+        /// Optional agent persona (`ferris`) or record handle/IRI (`1`, `urn:uuid:...`).
+        target: Option<String>,
+        /// Maximum heartbeat age in milliseconds before a `live` status becomes `unverifiable (stale_status)`.
+        #[arg(long, default_value_t = DEFAULT_STALE_AFTER_MS)]
+        stale_after_ms: u64,
         #[arg(long)]
         json: bool,
     },
@@ -247,7 +264,82 @@ pub fn render_registry_markdown(areas: &[AreaRecord], agents: &[AgentRecord]) ->
     out
 }
 
-pub fn run<S: AgentRegistry + Handles>(store: &S, cmd: AgentCmd) -> Result<(), (i32, String)> {
+#[derive(Debug, Clone, Serialize)]
+struct LivenessReportItem {
+    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt_id: Option<Iri>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    record: Option<RecordId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<String>,
+    #[serde(flatten)]
+    verdict: LivenessVerdict,
+}
+
+fn format_verdict_label(verdict: &LivenessVerdict) -> String {
+    match verdict {
+        LivenessVerdict::Live { .. } => "live".to_string(),
+        LivenessVerdict::Unverifiable { reason, .. } => {
+            format!("unverifiable ({})", reason.as_wire())
+        }
+        LivenessVerdict::Exited { outcome, .. } => {
+            format!("exited ({})", outcome.as_wire())
+        }
+    }
+}
+
+fn format_liveness_line(
+    target: &str,
+    hb: Option<&AttemptHeartbeat>,
+    verdict: &LivenessVerdict,
+) -> String {
+    let v = format_verdict_label(verdict);
+    match hb {
+        Some(hb) => format!(
+            "{target}\t{v}\tadapter={}\tduration={}ms\ttokens={}/{}\tcost={} micro-USD",
+            hb.adapter, hb.duration_ms, hb.tokens_in, hb.tokens_out, hb.cost_usd_micros
+        ),
+        None => format!("{target}\t{v}"),
+    }
+}
+
+pub fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        if Path::new("/proc").is_dir() {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return false;
+            };
+            if let Some(idx) = stat.rfind(") ") {
+                let state = stat[idx + 2..].chars().next();
+                return state.is_some_and(|c| c != 'Z');
+            }
+            return true;
+        }
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+pub fn run<S: AgentRegistry + Handles + StateStore>(
+    store: &S,
+    cmd: AgentCmd,
+) -> Result<(), (i32, String)> {
     match cmd {
         AgentCmd::Area { cmd } => match cmd {
             AreaCmd::Set {
@@ -413,6 +505,120 @@ pub fn run<S: AgentRegistry + Handles>(store: &S, cmd: AgentCmd) -> Result<(), (
                 }
             }
             Ok(())
+        }
+        AgentCmd::Liveness {
+            target,
+            stale_after_ms,
+            json,
+        } => {
+            let entries = store
+                .list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
+                .map_err(|e| (1, e.to_string()))?;
+            let mut heartbeats: Vec<(String, AttemptHeartbeat)> = Vec::new();
+            for entry in entries {
+                if !entry.slug.starts_with("liveness-") {
+                    continue;
+                }
+                if let StatePayload::Runtime(rt) = entry.payload
+                    && let Ok(hb) = serde_json::from_value::<AttemptHeartbeat>(rt.value)
+                {
+                    heartbeats.push((entry.slug, hb));
+                }
+            }
+            let now = now_at();
+            let host = fl_exec::adapters::harness::detect_host();
+
+            if let Some(t) = target {
+                let resolved_record_iri = if let Ok(h) = t.parse::<u64>() {
+                    store.resolve_handle(Kind::Record, h).ok().flatten()
+                } else {
+                    Iri::parse(&t).ok()
+                };
+                let target_rec_slug = resolved_record_iri
+                    .as_ref()
+                    .map(|iri| liveness_record_slug(&RecordId(iri.clone())));
+                let target_ag_slug = liveness_agent_slug(&t);
+
+                let matched_hb = heartbeats
+                    .into_iter()
+                    .filter(|(slug, hb)| {
+                        slug == &t
+                            || Some(slug.as_str()) == target_rec_slug.as_deref()
+                            || slug == &target_ag_slug
+                            || hb
+                                .agent
+                                .as_deref()
+                                .is_some_and(|a| a.eq_ignore_ascii_case(&t))
+                            || hb.record.iri().as_str() == t
+                            || resolved_record_iri
+                                .as_ref()
+                                .is_some_and(|iri| hb.record.iri() == iri)
+                    })
+                    .max_by(|(_, a), (_, b)| {
+                        (a.heartbeat_at.as_str(), a.attempt_id.as_str())
+                            .cmp(&(b.heartbeat_at.as_str(), b.attempt_id.as_str()))
+                    })
+                    .map(|(_, hb)| hb);
+
+                let verdict = evaluate_liveness(
+                    matched_hb.as_ref(),
+                    &now,
+                    stale_after_ms,
+                    &host,
+                    pid_is_alive,
+                );
+                if json {
+                    let item = LivenessReportItem {
+                        target: t,
+                        attempt_id: matched_hb.as_ref().map(|h| h.attempt_id.clone()),
+                        record: matched_hb.as_ref().map(|h| h.record.clone()),
+                        adapter: matched_hb.as_ref().map(|h| h.adapter.clone()),
+                        agent: matched_hb.as_ref().and_then(|h| h.agent.clone()),
+                        verdict,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&item).unwrap());
+                } else {
+                    println!(
+                        "{}",
+                        format_liveness_line(&t, matched_hb.as_ref(), &verdict)
+                    );
+                }
+                Ok(())
+            } else {
+                let mut dedup: BTreeMap<String, (String, AttemptHeartbeat)> = BTreeMap::new();
+                for (slug, hb) in heartbeats {
+                    let key = hb.attempt_id.as_str().to_string();
+                    match dedup.get(&key) {
+                        Some((_, prev))
+                            if prev.heartbeat_at.as_str() >= hb.heartbeat_at.as_str() => {}
+                        _ => {
+                            dedup.insert(key, (slug, hb));
+                        }
+                    }
+                }
+                let mut items = Vec::new();
+                for (_, (slug, hb)) in dedup {
+                    let verdict =
+                        evaluate_liveness(Some(&hb), &now, stale_after_ms, &host, pid_is_alive);
+                    let label = hb.agent.clone().unwrap_or(slug);
+                    if json {
+                        items.push(LivenessReportItem {
+                            target: label,
+                            attempt_id: Some(hb.attempt_id),
+                            record: Some(hb.record),
+                            adapter: Some(hb.adapter),
+                            agent: hb.agent,
+                            verdict,
+                        });
+                    } else {
+                        println!("{}", format_liveness_line(&label, Some(&hb), &verdict));
+                    }
+                }
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&items).unwrap());
+                }
+                Ok(())
+            }
         }
     }
 }
