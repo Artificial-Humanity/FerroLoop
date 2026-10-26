@@ -14,11 +14,25 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
 3. Evaluate the findings with `superpowers:receiving-code-review`. A subagent fixes
    them and commits the fixes; a fresh reviewer subagent then re-reviews the fix diff.
    Repeat until no Critical or Important finding is open.
-4. Push the branch and open a pull request against `main`. A pull request opened ready
-   for review (not a draft) is put in the owner's review queue and assigned to them by
-   [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml).
-5. The owner reviews, approves, and merges. Merging happens through the pull request. A
-   direct push to `main` is not the route, and the ruleset refuses one.
+4. Push the branch and open a ready-for-review pull request against `main` with
+   `fl github pr create`, which works out the required reviewer tier. Then ask that
+   reviewer for a review over `agent-msg`:
+   * A pull request from an assisting agent is reviewed by the project Lead.
+   * A pull request from the Lead is reviewed by the Lab Manager (`jarvis`).
+   * The owner reviews a pull request that touches a protected path (the
+     `DEFAULT_PROTECTED_PATTERNS` in [crates/core/src/pr_policy.rs](crates/core/src/pr_policy.rs):
+     instruction files, `.github/`, `.agents/`, `.fl/manifest.json`), carries a commit
+     without a `Co-authored-by:` trailer, or is co-authored by the Lab Manager.
+     [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml)
+     requests the owner's review on GitHub in those cases.
+5. An agent reviewer records its verdict with `fl github pr review`. The review is posted
+   by the Reviewer GitHub App (`<slug>[bot]`) with an `fl-review` marker, because the
+   machine account cannot approve a pull request it opened.
+6. Once the required approval is in and the checks pass, the agent who opened the pull
+   request merges it with `fl github pr merge`. A reviewer never merges another agent's
+   pull request: the author resolves conflicts and keeps the branch current. Merging
+   happens through the pull request. A direct push to `main` is not the route, and the
+   ruleset refuses one.
 
 ## Commit identity and safeguards
 
@@ -30,9 +44,9 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
 * `main` is protected by the repository ruleset "Main Protection". A pull request is
   required, with one approving review; a new push dismisses an earlier approval. The
   `test, clippy, fmt` check must pass, the branch must be current with `main`, and review
-  conversations must be resolved. The machine account cannot approve its own pull
-  request, so the owner approves every agent pull request. Force-pushes and deletions
-  are refused. There is no pre-push gate on the local side.
+  conversations must be resolved. The approval comes from the Reviewer GitHub App or
+  the owner, never from the machine account. Force-pushes and deletions are refused.
+  There is no pre-push gate on the local side.
 * **The rules bind everyone, the owner included.** The ruleset has no bypass list, so
   no account can push to `main` directly or merge with a red check. Changes to the
   ruleset belong to the owner.
