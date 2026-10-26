@@ -4,8 +4,7 @@
 //! and parses its JSONL event stream (`item.completed` and `turn.completed`).
 
 use crate::adapters::harness::{
-    CliDialect, LivenessSink, ParsedOutput, ProcessHarness, extract_text_from_object,
-    extract_usage_from_value,
+    CliDialect, LivenessSink, ParsedOutput, ProcessHarness, parse_json_or_jsonl_envelope,
 };
 use crate::runner::{AttemptError, AttemptOutcome, AttemptSpec, Runner};
 use fl_core::ids::ProjectId;
@@ -37,77 +36,7 @@ impl CliDialect for CodexDialect {
     }
 
     fn parse_output(&self, stdout: &[u8], stderr: &[u8]) -> ParsedOutput {
-        let stdout_str = String::from_utf8_lossy(stdout);
-        let stderr_str = String::from_utf8_lossy(stderr);
-        let trimmed = stdout_str.trim();
-
-        if trimmed.is_empty() {
-            return ParsedOutput {
-                excerpt_text: stderr_str.into_owned(),
-                tokens_in: 0,
-                tokens_out: 0,
-                vendor_cost_usd_micros: None,
-            };
-        }
-
-        let mut any_json_obj = false;
-        let mut tokens_in = 0u64;
-        let mut tokens_out = 0u64;
-        let mut vendor_cost = None;
-        let mut text_parts: Vec<String> = Vec::new();
-
-        for line in trimmed.lines() {
-            let line_trim = line.trim();
-            if line_trim.is_empty() {
-                continue;
-            }
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line_trim)
-                && val.is_object()
-            {
-                any_json_obj = true;
-                extract_usage_from_value(
-                    &val,
-                    &mut tokens_in,
-                    &mut tokens_out,
-                    &mut vendor_cost,
-                    true,
-                );
-                if let Some(t) = extract_text_from_object(&val)
-                    && !t.is_empty()
-                {
-                    text_parts.push(t);
-                }
-            }
-        }
-
-        if any_json_obj {
-            let mut excerpt_text = if text_parts.is_empty() {
-                stdout_str.into_owned()
-            } else {
-                text_parts.join("\n")
-            };
-            if !stderr_str.is_empty() {
-                if !excerpt_text.is_empty() && !excerpt_text.ends_with('\n') {
-                    excerpt_text.push('\n');
-                }
-                excerpt_text.push_str(&stderr_str);
-            }
-            return ParsedOutput {
-                excerpt_text,
-                tokens_in,
-                tokens_out,
-                vendor_cost_usd_micros: vendor_cost,
-            };
-        }
-
-        let mut raw = stdout_str.into_owned();
-        raw.push_str(&stderr_str);
-        ParsedOutput {
-            excerpt_text: raw,
-            tokens_in: 0,
-            tokens_out: 0,
-            vendor_cost_usd_micros: None,
-        }
+        parse_json_or_jsonl_envelope(stdout, stderr, true)
     }
 }
 

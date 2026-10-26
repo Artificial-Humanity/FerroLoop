@@ -10,7 +10,7 @@ use fl_core::agent::{
 use fl_core::at::At;
 use fl_core::ids::{AgentId, Kind, RecordId};
 use fl_core::state::{StateConcern, StatePayload, StateScope, validate_slug};
-use fl_core::store::{AgentRegistry, Catalog, Handles, StateStore, StoreError};
+use fl_core::store::{AgentRegistry, Handles, StateStore, StoreError};
 use fl_core::telemetry::{
     AttemptHeartbeat, DEFAULT_STALE_AFTER_MS, LivenessVerdict, evaluate_liveness,
     liveness_agent_slug, liveness_record_slug,
@@ -336,7 +336,7 @@ pub fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
-pub fn run<S: AgentRegistry + Handles + StateStore + Catalog>(
+pub fn run<S: AgentRegistry + Handles + StateStore>(
     store: &S,
     cmd: AgentCmd,
 ) -> Result<(), (i32, String)> {

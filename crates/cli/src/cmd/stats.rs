@@ -79,23 +79,42 @@ pub fn run(store: &RedbStore, cmd: Cmd, source: Source<'_>) -> Result<i32> {
         Kind::Project,
         &cmd.project,
     )?);
-    let (attempts, coverage) = match source {
+    let (attempts, coverage) = match &source {
         Source::Local => (store.attempts(&project)?, Coverage::Complete),
-        Source::LocalOnly(reason) => (store.attempts(&project)?, Coverage::LocalOnly { reason }),
+        Source::LocalOnly(reason) => (
+            store.attempts(&project)?,
+            Coverage::LocalOnly {
+                reason: reason.clone(),
+            },
+        ),
         // ⚠ Falls back to the local store only when GitHub could not be
         // read; a damaged or missing ledger is an error.
         Source::Split(split) => split.attempts_for_stats(&project)?,
     };
     let transitions = Catalog::list_transitions(store, &project)?;
-    let mut gate_ids: BTreeSet<GateId> = BTreeSet::new();
-    for t in &transitions {
-        for g in &t.gates {
-            gate_ids.insert(g.clone());
-        }
-    }
+    let should_audit = transitions.iter().filter(|t| !t.gates.is_empty()).count() >= 2
+        && transitions
+            .iter()
+            .any(|t| !t.gates.is_empty() && t.regret == fl_core::model::Regret::Low);
     let mut gate_runs = Vec::new();
-    for gate_id in gate_ids {
-        gate_runs.extend(Ledger::gate_runs(store, &gate_id)?);
+    if should_audit {
+        let mut gate_ids: BTreeSet<GateId> = BTreeSet::new();
+        for t in &transitions {
+            for g in &t.gates {
+                gate_ids.insert(g.clone());
+            }
+        }
+        for gate_id in gate_ids {
+            let runs = match (&source, &coverage) {
+                (Source::Split(split), Coverage::Complete) => match split.gate_runs(&gate_id) {
+                    Ok(r) => r,
+                    Err(e) if e.is_transient() => Ledger::gate_runs(store, &gate_id)?,
+                    Err(e) => return Err(e.into()),
+                },
+                _ => Ledger::gate_runs(store, &gate_id)?,
+            };
+            gate_runs.extend(runs);
+        }
     }
 
     if cmd.json {
