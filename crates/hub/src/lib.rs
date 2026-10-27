@@ -5,6 +5,8 @@
 pub mod api;
 pub mod auth;
 pub mod discovery;
+pub mod terminal;
+pub mod ws;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -32,6 +34,8 @@ pub use discovery::{
     read_session_transcript_with_home, read_worktree_diff, scan_cargo_architecture_conformance,
     scan_workspace_for_arch,
 };
+pub use terminal::{TerminalManager, TerminalSession};
+pub use ws::{HubServer, HubWsClient, compute_accept_key, try_parse_ws_frame};
 
 /// Default listen address for `fl hub serve` (`127.0.0.1:8420`, spec §2.1).
 pub const DEFAULT_HUB_LISTEN: &str = "127.0.0.1:8420";
@@ -530,5 +534,379 @@ mod tests {
                 "expected 400 for architecture path {bad_arch_path}"
             );
         }
+    }
+
+    fn send_http_over_tcp(addr: std::net::SocketAddr, req: &HttpRequest) -> HttpResponse {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+
+        let mut tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        tcp.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+
+        let mut raw = format!(
+            "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\nConnection: close\r\n",
+            req.method,
+            req.raw_target,
+            addr,
+            req.body.len()
+        );
+        for (k, v) in &req.headers {
+            raw.push_str(&format!("{k}: {v}\r\n"));
+        }
+        raw.push_str("\r\n");
+
+        tcp.write_all(raw.as_bytes()).unwrap();
+        if !req.body.is_empty() {
+            tcp.write_all(&req.body).unwrap();
+        }
+        tcp.flush().unwrap();
+
+        let mut resp_bytes = Vec::new();
+        tcp.read_to_end(&mut resp_bytes).unwrap();
+        let header_end = resp_bytes
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("HTTP response header terminator");
+        let head_str = String::from_utf8_lossy(&resp_bytes[..header_end]);
+        let mut lines = head_str.lines();
+        let status_line = lines.next().unwrap();
+        let status: u16 = status_line
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut headers = Vec::new();
+        let mut content_type = String::new();
+        for line in lines {
+            if let Some((k, v)) = line.split_once(':') {
+                let k_trim = k.trim().to_string();
+                let v_trim = v.trim().to_string();
+                if k_trim.eq_ignore_ascii_case("content-type") {
+                    content_type = v_trim.clone();
+                }
+                headers.push((k_trim, v_trim));
+            }
+        }
+        let body = resp_bytes[header_end + 4..].to_vec();
+        HttpResponse {
+            status,
+            status_text: "OK",
+            content_type,
+            headers,
+            body,
+        }
+    }
+
+    #[test]
+    fn pairing_cookie_tailscale_and_peer_authority_boundaries() {
+        rest_auth_pairing_session_and_authority_tiers_enforced();
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+
+        // Trusted Tailscale-User-Login grants Owner authority when trust_tailscale_headers == true:
+        let ts_req = HttpRequest::new("GET", "/api/v1/auth/session")
+            .with_header("Tailscale-User-Login", "lmcfarlin@tailnet.ts.net");
+        let ts_resp = handle_http_request(&state, &ts_req);
+        assert_eq!(ts_resp.status, 200);
+        let ts_json = ts_resp.json_value().unwrap();
+        assert_eq!(ts_json["authority"]["tier"], "owner");
+        assert_eq!(ts_json["authority"]["login"], "lmcfarlin@tailnet.ts.net");
+
+        // When trust_tailscale_headers == false, Tailscale-User-Login alone is rejected with 401:
+        let mut untrusted_cfg = state.config.clone();
+        untrusted_cfg.trust_tailscale_headers = false;
+        let untrusted_state = HubState::new(untrusted_cfg);
+        assert_eq!(handle_http_request(&untrusted_state, &ts_req).status, 401);
+    }
+
+    #[test]
+    fn static_ferrodeck_serving_spa_fallback_and_traversal_refusal() {
+        static_ferrodeck_serving_spa_fallback_and_traversal_rejection();
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+
+        let rooms_resp = handle_http_request(&state, &HttpRequest::new("GET", "/rooms/main"));
+        assert_eq!(rooms_resp.status, 200);
+        assert!(String::from_utf8_lossy(&rooms_resp.body).contains("FerroDeck SPA Root"));
+
+        let trav_resp = handle_http_request(&state, &HttpRequest::new("GET", "/..%2fsecret"));
+        assert_eq!(trav_resp.status, 400);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_broadcast_and_owner_only_terminal_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let server = HubServer::bind(state.config.clone()).await.unwrap();
+        let addr = server.local_addr();
+        let shutdown = server.shutdown_handle();
+        let server_task = tokio::spawn(server.serve());
+
+        let timeout = Duration::from_secs(3);
+
+        // 1. Unauthenticated WebSocket connection on /ws/v1 is rejected with 401 Unauthorized.
+        let unauth_err = HubWsClient::connect(&format!("ws://{addr}/ws/v1"), &[], timeout)
+            .err()
+            .expect("unauthenticated ws upgrade should fail");
+        assert!(
+            unauth_err.to_string().contains("401"),
+            "expected 401 on unauthenticated ws upgrade, got: {unauth_err}"
+        );
+
+        // 2. Exchange a pairing code over TCP HTTP and connect Owner WebSocket using `Cookie: fl_hub_session=...`.
+        let pair_info = {
+            let store = state.open_store().unwrap();
+            mint_pairing_code_in_store(&store, &format!("http://{addr}"), 600).unwrap()
+        };
+        let pair_http = HttpRequest::new("POST", "/api/v1/auth/pair")
+            .with_json_body(&json!({ "code": pair_info.code }));
+        let pair_resp = send_http_over_tcp(addr, &pair_http);
+        assert_eq!(pair_resp.status, 200);
+        let cookie_hdr = pair_resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .unwrap()
+            .1
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+
+        let mut owner_ws = HubWsClient::connect(
+            &format!("ws://{addr}/ws/v1"),
+            &[("Cookie", &cookie_hdr)],
+            timeout,
+        )
+        .unwrap();
+        let owner_connected = owner_ws.recv_frame().unwrap();
+        assert_eq!(owner_connected.channel, "system");
+        assert_eq!(owner_connected.event, "connected");
+        assert_eq!(owner_connected.data["authority"]["tier"], "owner");
+
+        // 3. Connect Peer WebSocket on `/api/v1/stream` using Peer token.
+        let mut peer_ws = HubWsClient::connect(
+            &format!("ws://{addr}/api/v1/stream?agent=ferris"),
+            &[("Authorization", "Bearer peer-tok-secret")],
+            timeout,
+        )
+        .unwrap();
+        let peer_connected = peer_ws.recv_frame().unwrap();
+        assert_eq!(peer_connected.channel, "system");
+        assert_eq!(peer_connected.event, "connected");
+        assert_eq!(peer_connected.data["authority"]["tier"], "peer");
+        assert_eq!(peer_connected.data["authority"]["agent"], "ferris");
+
+        // 4. Verify `system:ping` -> `system:pong`.
+        owner_ws
+            .send_frame(&HubWsFrame {
+                channel: "system".into(),
+                event: "ping".into(),
+                data: json!({ "seq": 42 }),
+            })
+            .unwrap();
+        let pong = owner_ws.recv_frame().unwrap();
+        assert_eq!(pong.channel, "system");
+        assert_eq!(pong.event, "pong");
+        assert_eq!(pong.data["seq"], 42);
+
+        // 5. Verify `POST /api/v1/wire/send` over TCP broadcasts `wire:message_sent` to both WebSocket clients.
+        let wire_req = HttpRequest::new("POST", "/api/v1/wire/send")
+            .with_header("Authorization", "Bearer peer-tok-secret")
+            .with_header("X-Fl-Agent", "ferris")
+            .with_json_body(&json!({
+                "from": "ferris",
+                "to": ["felicia"],
+                "subject": "WS broadcast check",
+                "body": "Hello over /ws/v1"
+            }));
+        let wire_resp = send_http_over_tcp(addr, &wire_req);
+        assert_eq!(wire_resp.status, 200);
+
+        let owner_bcast = owner_ws.recv_frame().unwrap();
+        assert_eq!(owner_bcast.channel, "wire");
+        assert_eq!(owner_bcast.event, "message_sent");
+        assert_eq!(owner_bcast.data["message"]["subject"], "WS broadcast check");
+
+        let peer_bcast = peer_ws.recv_frame().unwrap();
+        assert_eq!(peer_bcast.channel, "wire");
+        assert_eq!(peer_bcast.event, "message_sent");
+
+        // 6. Verify `Peer` receives 403 error frame on `terminal:open`.
+        peer_ws
+            .send_frame(&HubWsFrame {
+                channel: "terminal".into(),
+                event: "open".into(),
+                data: json!({ "session_id": "peer-term" }),
+            })
+            .unwrap();
+        let peer_term_err = peer_ws.recv_frame().unwrap();
+        assert_eq!(peer_term_err.channel, "terminal");
+        assert_eq!(peer_term_err.event, "error");
+        assert_eq!(peer_term_err.data["status"], 403);
+        assert!(
+            peer_term_err.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("owner authority required")
+        );
+
+        // 7. Verify `Owner` can open a terminal, resize it, send `echo hello_ferrodeck\n`,
+        // receive `hello_ferrodeck` in `terminal:output`, and close it.
+        owner_ws
+            .send_frame(&HubWsFrame {
+                channel: "terminal".into(),
+                event: "open".into(),
+                data: json!({
+                    "session_id": "term-1",
+                    "cols": 80,
+                    "rows": 24,
+                }),
+            })
+            .unwrap();
+        let opened = owner_ws.recv_frame().unwrap();
+        assert_eq!(opened.channel, "terminal");
+        assert_eq!(opened.event, "opened");
+        assert_eq!(opened.data["session_id"], "term-1");
+        assert!(opened.data["pid"].as_u64().unwrap() > 0);
+
+        owner_ws
+            .send_frame(&HubWsFrame {
+                channel: "terminal".into(),
+                event: "resize".into(),
+                data: json!({
+                    "session_id": "term-1",
+                    "cols": 132,
+                    "rows": 42,
+                }),
+            })
+            .unwrap();
+        let resized = owner_ws.recv_frame().unwrap();
+        assert_eq!(resized.channel, "terminal");
+        assert_eq!(resized.event, "resized");
+        assert_eq!(resized.data["cols"], 132);
+        assert_eq!(resized.data["rows"], 42);
+
+        owner_ws
+            .send_frame(&HubWsFrame {
+                channel: "terminal".into(),
+                event: "input".into(),
+                data: json!({
+                    "session_id": "term-1",
+                    "data": "echo hello_ferrodeck\n",
+                }),
+            })
+            .unwrap();
+
+        let mut collected_output = String::new();
+        for _ in 0..16 {
+            let frame = owner_ws.recv_frame().unwrap();
+            assert_eq!(frame.channel, "terminal");
+            if frame.event == "output" {
+                collected_output.push_str(frame.data["data"].as_str().unwrap_or_default());
+                if collected_output.contains("hello_ferrodeck") {
+                    break;
+                }
+            }
+        }
+        assert!(
+            collected_output.contains("hello_ferrodeck"),
+            "expected terminal output to contain hello_ferrodeck, got: {collected_output:?}"
+        );
+
+        owner_ws
+            .send_frame(&HubWsFrame {
+                channel: "terminal".into(),
+                event: "close".into(),
+                data: json!({ "session_id": "term-1" }),
+            })
+            .unwrap();
+        let mut saw_exited = false;
+        for _ in 0..8 {
+            let frame = owner_ws.recv_frame().unwrap();
+            if frame.channel == "terminal" && frame.event == "exited" {
+                assert_eq!(frame.data["session_id"], "term-1");
+                saw_exited = true;
+                break;
+            }
+        }
+        assert!(saw_exited, "expected terminal:exited after terminal:close");
+
+        // 8. Verify that disconnecting a WebSocket with an active terminal kills the spawned child process.
+        owner_ws
+            .send_frame(&HubWsFrame {
+                channel: "terminal".into(),
+                event: "open".into(),
+                data: json!({
+                    "session_id": "term-disconnect",
+                    "command": ["sleep", "60"],
+                }),
+            })
+            .unwrap();
+        let sleep_opened = owner_ws.recv_frame().unwrap();
+        assert_eq!(sleep_opened.channel, "terminal");
+        assert_eq!(sleep_opened.event, "opened");
+        let sleep_pid = sleep_opened.data["pid"].as_u64().unwrap();
+        let _ = owner_ws.close();
+        drop(owner_ws);
+
+        // Wait briefly for server disconnect cleanup to reap the sleep process.
+        let mut reaped = false;
+        for _ in 0..40 {
+            let status_path = format!("/proc/{sleep_pid}/status");
+            match fs::read_to_string(&status_path) {
+                Err(_) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(content) if content.contains("State:\tZ") => {
+                    reaped = true;
+                    break;
+                }
+                Ok(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        assert!(
+            reaped,
+            "expected terminal child process {sleep_pid} to be killed on WebSocket disconnect"
+        );
+
+        let _ = peer_ws.close();
+        let _ = shutdown.send(true);
+        let _ = server_task.await;
+
+        // 9. Verify `enable_terminal == false` rejects terminal frames even for Owner with 403.
+        let mut no_term_cfg = state.config.clone();
+        no_term_cfg.enable_terminal = false;
+        let no_term_srv = HubServer::bind(no_term_cfg).await.unwrap();
+        let no_term_addr = no_term_srv.local_addr();
+        let no_term_shutdown = no_term_srv.shutdown_handle();
+        let no_term_task = tokio::spawn(no_term_srv.serve());
+
+        let mut owner_no_term_ws = HubWsClient::connect(
+            &format!("ws://{no_term_addr}/ws/v1"),
+            &[("Authorization", "Bearer owner-tok-secret")],
+            timeout,
+        )
+        .unwrap();
+        let _ = owner_no_term_ws.recv_frame().unwrap(); // system:connected
+        owner_no_term_ws
+            .send_frame(&HubWsFrame {
+                channel: "terminal".into(),
+                event: "open".into(),
+                data: json!({ "session_id": "disabled-term" }),
+            })
+            .unwrap();
+        let disabled_err = owner_no_term_ws.recv_frame().unwrap();
+        assert_eq!(disabled_err.channel, "terminal");
+        assert_eq!(disabled_err.event, "error");
+        assert_eq!(disabled_err.data["status"], 403);
+        let _ = owner_no_term_ws.close();
+        let _ = no_term_shutdown.send(true);
+        let _ = no_term_task.await;
     }
 }

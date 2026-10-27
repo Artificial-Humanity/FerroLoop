@@ -1249,7 +1249,10 @@ fn handle_get_architecture(state: &HubState, req: &HttpRequest) -> HttpResponse 
         .map(String::as_str)
         .unwrap_or(DEFAULT_ARCH_MANIFEST_PATH);
     if Path::new(rel_path).is_absolute() || has_path_traversal(rel_path, rel_path) {
-        return HttpResponse::json(400, json!({ "error": "invalid architecture manifest path" }));
+        return HttpResponse::json(
+            400,
+            json!({ "error": "invalid architecture manifest path" }),
+        );
     }
     let manifest_path = state.config.repo_root.join(rel_path);
     if !manifest_path.is_file() {
