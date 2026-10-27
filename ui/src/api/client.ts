@@ -23,6 +23,11 @@ import type {
   WireInboxItem,
   WireSendRequest,
   WireSendResponse,
+  DeleteGateSecretResponse,
+  GateConnectorsResponse,
+  GateSecretResponse,
+  GateSecretsResponse,
+  SetVaultSecretInput,
   WorkflowDef,
   WorkflowRun,
   WorkflowRunDetailResponse,
@@ -452,5 +457,30 @@ export class HubApiClient {
   public async getArchitecture(path?: string): Promise<ArchitectureResponse> {
     const suffix = path ? `?path=${encodeURIComponent(path)}` : "";
     return this.request<ArchitectureResponse>(`/api/v1/architecture${suffix}`);
+  }
+
+  /** Metadata only; the hub never returns plaintext secret values. */
+  public async listGateSecrets(): Promise<GateSecretsResponse> {
+    return this.request<GateSecretsResponse>("/api/v1/gate/secrets");
+  }
+
+  /** Owner-only on the hub; a peer session gets `HubApiError` 403. */
+  public async setGateSecret(input: SetVaultSecretInput): Promise<GateSecretResponse> {
+    return this.request<GateSecretResponse>("/api/v1/gate/secrets", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  /** Owner-only on the hub; a peer session gets `HubApiError` 403. */
+  public async deleteGateSecret(name: string): Promise<DeleteGateSecretResponse> {
+    return this.request<DeleteGateSecretResponse>(
+      `/api/v1/gate/secrets/${encodeURIComponent(name)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  public async listGateConnectors(): Promise<GateConnectorsResponse> {
+    return this.request<GateConnectorsResponse>("/api/v1/gate/connectors");
   }
 }

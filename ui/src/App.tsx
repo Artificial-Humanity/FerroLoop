@@ -9,6 +9,7 @@ import { HubDrawer } from "./components/HubDrawer";
 import { PairingModal } from "./components/PairingModal";
 import { RosterSidebar } from "./components/RosterSidebar";
 import { TerminalPane } from "./components/TerminalPane";
+import { VaultGatePane } from "./components/VaultGatePane";
 import { WireMailPane } from "./components/WireMailPane";
 import {
   DEFAULT_WORKSPACE_AGENTS,
@@ -646,6 +647,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             apiClient={apiClient}
           />
         );
+      case "gate":
+        return <VaultGatePane authority={authority} apiClient={apiClient} />;
       case "chat":
       default:
         return (

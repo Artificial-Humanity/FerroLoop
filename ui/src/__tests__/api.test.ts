@@ -95,6 +95,111 @@ describe("HubApiClient", () => {
     });
   });
 
+  it("calls the FerroGate vault and connector endpoints with encoded secret names", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, body });
+
+      if (url.endsWith("/api/v1/gate/secrets") && method === "GET") {
+        return new Response(
+          JSON.stringify({
+            secrets: [
+              {
+                name: "DISCORD_BOT_TOKEN",
+                allowed_hosts: ["discord.com"],
+                allowed_methods: ["GET"],
+                allowed_agents: ["*"],
+                allow_private_network: false,
+                created_at: "2026-10-27T04:00:00Z",
+                updated_at: "2026-10-27T04:00:00Z",
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith("/api/v1/gate/secrets") && method === "POST") {
+        return new Response(
+          JSON.stringify({ secret: { name: body.name } }),
+          { status: 200 },
+        );
+      }
+      if (url.includes("/api/v1/gate/secrets/") && method === "DELETE") {
+        return new Response(
+          JSON.stringify({ removed: true, name: "DISCORD_BOT_TOKEN" }),
+          { status: 200 },
+        );
+      }
+      if (url.endsWith("/api/v1/gate/connectors")) {
+        return new Response(
+          JSON.stringify({
+            connectors: [
+              {
+                id: "discord",
+                title: "Discord",
+                version: "0.1.0",
+                description: "",
+                base_url: "https://discord.com/api/v10",
+                allowed_hosts: ["discord.com"],
+                enabled: true,
+                tools: [],
+                bridges: [],
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    });
+
+    const client = new HubApiClient({
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    const secrets = await client.listGateSecrets();
+    expect(secrets.secrets[0].name).toBe("DISCORD_BOT_TOKEN");
+    // Metadata payloads never carry a plaintext `value` field.
+    expect(secrets.secrets[0]).not.toHaveProperty("value");
+
+    await client.setGateSecret({
+      name: "DISCORD_BOT_TOKEN",
+      value: "tok",
+      allowed_hosts: ["discord.com"],
+      allowed_methods: ["GET", "POST"],
+      allowed_agents: ["*"],
+    });
+
+    const deleted = await client.deleteGateSecret("DISCORD_BOT_TOKEN");
+    expect(deleted).toEqual({ removed: true, name: "DISCORD_BOT_TOKEN" });
+
+    await client.deleteGateSecret("A/B C");
+
+    const connectors = await client.listGateConnectors();
+    expect(connectors.connectors[0].title).toBe("Discord");
+
+    expect(calls).toEqual([
+      { url: "/api/v1/gate/secrets", method: "GET", body: undefined },
+      {
+        url: "/api/v1/gate/secrets",
+        method: "POST",
+        body: {
+          name: "DISCORD_BOT_TOKEN",
+          value: "tok",
+          allowed_hosts: ["discord.com"],
+          allowed_methods: ["GET", "POST"],
+          allowed_agents: ["*"],
+        },
+      },
+      { url: "/api/v1/gate/secrets/DISCORD_BOT_TOKEN", method: "DELETE", body: undefined },
+      { url: "/api/v1/gate/secrets/A%2FB%20C", method: "DELETE", body: undefined },
+      { url: "/api/v1/gate/connectors", method: "GET", body: undefined },
+    ]);
+  });
+
   it("normalizes liveness verdicts across fl-core status and UI state strings", () => {
     expect(resolveLivenessState({ status: "live", pid: 1234 }, false)).toBe("alive");
     expect(resolveLivenessState({ state: "alive" }, false)).toBe("alive");
