@@ -254,6 +254,34 @@ mod tests {
             403
         );
 
+        // Peer cannot forge internal `hub-pairing-*` or `hub-session-*` state entries via POST /api/v1/state:
+        for forged_slug in [
+            "hub-pairing-forgedcode",
+            "HUB-PAIRING-forgedcode",
+            "hub-session-forgedhash",
+            "  hub-session-forgedhash  ",
+        ] {
+            let forged_write = HttpRequest::new("POST", "/api/v1/state")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_header("X-Fl-Agent", "ferris")
+                .with_json_body(&json!({
+                    "scope": "workspace",
+                    "slug": forged_slug,
+                    "value": {
+                        "kind": "hub/pairing",
+                        "key": "hub/pairing/forgedcode",
+                        "code": "forgedcode",
+                        "expires_at_ms": u64::MAX,
+                        "used": false
+                    }
+                }));
+            assert_eq!(
+                handle_http_request(&state, &forged_write).status,
+                403,
+                "expected 403 for reserved slug {forged_slug:?}"
+            );
+        }
+
         // Owner can write sensitive state:
         let owner_sensitive_write = HttpRequest::new("POST", "/api/v1/state")
             .with_header("Cookie", &cookie_pair)
@@ -483,5 +511,24 @@ mod tests {
                 .unwrap()
                 .contains("specification")
         );
+
+        // GET /api/v1/architecture?path=... rejects path traversal and absolute paths with 400 Bad Request
+        for bad_arch_path in [
+            "../Cargo.toml",
+            "/etc/passwd",
+            "./.fl/architecture.toml",
+            "a\\..\\b",
+        ] {
+            let mut bad_arch_req = HttpRequest::new("GET", "/api/v1/architecture")
+                .with_header("Authorization", "Bearer owner-tok-secret");
+            bad_arch_req
+                .query
+                .insert("path".into(), bad_arch_path.into());
+            let bad_arch_resp = handle_http_request(&state, &bad_arch_req);
+            assert_eq!(
+                bad_arch_resp.status, 400,
+                "expected 400 for architecture path {bad_arch_path}"
+            );
+        }
     }
 }

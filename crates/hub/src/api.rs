@@ -12,7 +12,7 @@ use fl_core::ferrowire::{
     DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter,
     validate_sender_name,
 };
-use fl_core::ids::{GateId, Kind, MessageId, RecordId, WorkflowId, WorkflowRunId};
+use fl_core::ids::{GateId, Kind, MessageId, WorkflowId, WorkflowRunId};
 use fl_core::iri::Iri;
 use fl_core::log::{AttemptStatus, GateRun};
 use fl_core::pr_policy::{
@@ -1016,6 +1016,14 @@ fn handle_post_state(
         return HttpResponse::json(400, json!({ "error": "missing `slug` or `key`" }));
     };
 
+    let normalized_slug = slug.trim().to_ascii_lowercase();
+    if normalized_slug.starts_with("hub-pairing-") || normalized_slug.starts_with("hub-session-") {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "reserved internal hub authentication slug prefix" }),
+        );
+    }
+
     let sensitive_flag = obj.get("sensitive").and_then(Value::as_bool);
     if sensitive_flag == Some(true) && !authority.is_owner() {
         return HttpResponse::json(
@@ -1240,6 +1248,9 @@ fn handle_get_architecture(state: &HubState, req: &HttpRequest) -> HttpResponse 
         .get("path")
         .map(String::as_str)
         .unwrap_or(DEFAULT_ARCH_MANIFEST_PATH);
+    if Path::new(rel_path).is_absolute() || has_path_traversal(rel_path, rel_path) {
+        return HttpResponse::json(400, json!({ "error": "invalid architecture manifest path" }));
+    }
     let manifest_path = state.config.repo_root.join(rel_path);
     if !manifest_path.is_file() {
         return HttpResponse::json(
@@ -2069,6 +2080,3 @@ fn handle_post_workflow_abort(
         Err(e) => HttpResponse::json(400, json!({ "error": e.to_string() })),
     }
 }
-
-#[allow(dead_code)]
-fn _keep_record_id_import(_: RecordId) {}

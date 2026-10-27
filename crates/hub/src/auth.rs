@@ -17,7 +17,6 @@ use fl_exec::stamp;
 use fl_store::RedbStore;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use sha2::{Digest, Sha256};
 
 /// Cookie name used for browser `FerroDeck` sessions (spec §2.2).
@@ -276,6 +275,9 @@ fn load_pairing_entry(store: &RedbStore, code: &str) -> Option<StoredPairingEntr
             &pairing_state_slug(code),
         )
         .ok()??;
+    if !state_entry.sensitive {
+        return None;
+    }
     let StatePayload::Runtime(rt) = state_entry.payload else {
         return None;
     };
@@ -308,6 +310,9 @@ fn load_session_entry(store: &RedbStore, token_hash: &str) -> Option<StoredSessi
             &session_state_slug(token_hash),
         )
         .ok()??;
+    if !state_entry.sensitive {
+        return None;
+    }
     let StatePayload::Runtime(rt) = state_entry.payload else {
         return None;
     };
@@ -662,7 +667,6 @@ impl AuthManager {
         }
 
         // 5. Unauthorized.
-        let _ = json!({});
         None
     }
 }
@@ -737,6 +741,61 @@ mod tests {
         auth.revoke_session_token(Some(&store), &session_token);
         assert!(
             auth.authenticate_request(Some(&store), &headers, &BTreeMap::new())
+                .is_none()
+        );
+
+        // Non-sensitive `hub-pairing-*` and `hub-session-*` entries in RedbStore are ignored.
+        let forged_code = "forgedcode123456";
+        let forged_pairing = StoredPairingEntry {
+            kind: "hub/pairing".into(),
+            key: format!("hub/pairing/{forged_code}"),
+            code: forged_code.into(),
+            expires_at_ms: u64::MAX,
+            used: false,
+        };
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: pairing_state_slug(forged_code),
+                sensitivity: SensitivityPatch::ClearSensitive,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: serde_json::to_value(&forged_pairing).unwrap(),
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: stamp::now(),
+                by: "peer".into(),
+            })
+            .unwrap();
+        assert!(
+            auth.exchange_pairing_or_token(Some(&store), Some(forged_code), None)
+                .is_err()
+        );
+
+        let forged_token = "forgedsessiontoken1234567890";
+        let forged_hash = sha256_hex(forged_token);
+        let forged_session = StoredSessionEntry {
+            kind: "hub/session".into(),
+            key: format!("hub/session/{forged_hash}"),
+            token_hash: forged_hash.clone(),
+            login: "lmcfarlin".into(),
+            expires_at_ms: u64::MAX,
+            revoked: false,
+        };
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: session_state_slug(&forged_hash),
+                sensitivity: SensitivityPatch::ClearSensitive,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value: serde_json::to_value(&forged_session).unwrap(),
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: stamp::now(),
+                by: "peer".into(),
+            })
+            .unwrap();
+        assert!(
+            auth.verify_session_token(Some(&store), forged_token)
                 .is_none()
         );
     }
