@@ -33,9 +33,10 @@ fn text_field(v: &Value, k: &str, what: &str) -> Result<String, StoreError> {
 /// The environment variables `credential = "env"` reads, in order.
 pub const ENV_VARS: [&str; 2] = ["FL_GITHUB_TOKEN", "GITHUB_TOKEN"];
 
-/// A token from the environment (spec §5.3).
+/// A token from the environment (spec §5.3), or one already resolved by
+/// the caller (for example `gh auth token` output).
 pub struct EnvToken {
-    var: &'static str,
+    source: String,
     token: String,
 }
 
@@ -47,16 +48,22 @@ impl EnvToken {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, StoreError> {
         for var in ENV_VARS {
             if let Some(t) = get(var).filter(|t| !t.trim().is_empty()) {
-                return Ok(Self {
-                    var,
-                    token: t.trim().to_string(),
-                });
+                return Ok(Self::from_token(format!("${var}"), t));
             }
         }
         Err(StoreError::Credential(format!(
             "`credential = \"env\"` reads {} from the environment, and neither is set",
             ENV_VARS.join(" or ")
         )))
+    }
+
+    /// Wrap a token the caller already resolved. `source` names where it
+    /// came from for `describe` (never the secret itself).
+    pub fn from_token(source: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            token: token.into().trim().to_string(),
+        }
     }
 }
 
@@ -65,7 +72,7 @@ impl Credentials for EnvToken {
         Ok(self.token.clone())
     }
     fn describe(&self) -> String {
-        format!("the token in ${}", self.var)
+        format!("the token in {}", self.source)
     }
     fn identity(&self, api: &str) -> Result<String, StoreError> {
         let r = send(
@@ -79,8 +86,8 @@ impl Credentials for EnvToken {
         )?;
         if r.status != 200 {
             return Err(StoreError::Credential(format!(
-                "GitHub answered {} when fl asked whose token ${} is",
-                r.status, self.var
+                "GitHub answered {} when fl asked whose token ({}) is",
+                r.status, self.source
             )));
         }
         text_field(&r.body, "login", "the token's user")

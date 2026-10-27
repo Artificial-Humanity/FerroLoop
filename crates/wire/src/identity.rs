@@ -825,6 +825,33 @@ pub fn resolve_persona(
     registry: Option<&dyn AgentRegistry>,
     custom_routes_path: Option<&Path>,
 ) -> String {
+    resolve_persona_with_sources(
+        explicit,
+        transcript_path,
+        cwd,
+        registry,
+        || RouteTable::load(custom_routes_path),
+        &|k| std::env::var_os(k),
+    )
+}
+
+/// [`resolve_persona`] with its ambient sources injected: `load_routes`
+/// loads the route table (invoked only at the vendor route-matching
+/// stage, so earlier hits never touch disk) and `get_env` supplies every
+/// environment lookup (`AGENT_PERSONA`, vendor session ids, and the
+/// `HOME` + socket pair behind the Claude pid/process-tree probe). Tests
+/// pass a loader returning an empty table and a `get_env` that answers
+/// `None`, so a live agent session on the host can never leak into the
+/// result.
+fn resolve_persona_with_sources(
+    explicit: Option<&str>,
+    transcript_path: Option<&Path>,
+    cwd: &Path,
+    registry: Option<&dyn AgentRegistry>,
+    load_routes: impl FnOnce() -> RouteTable,
+    get_env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> String {
+    let get_str = |k: &str| get_env(k).and_then(|v| v.into_string().ok());
     if let Some(exp) = explicit
         && let Some(norm) = normalize_persona(exp)
     {
@@ -832,7 +859,7 @@ pub fn resolve_persona(
     }
 
     for var in ["AGENT_PERSONA", "AGENT_NAME"] {
-        if let Ok(val) = std::env::var(var)
+        if let Some(val) = get_str(var)
             && let Some(norm) = normalize_persona(&val)
         {
             return norm;
@@ -845,8 +872,8 @@ pub fn resolve_persona(
         return norm;
     }
 
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
-        && let Some(sock) = std::env::var_os("CLAUDE_CODE_MESSAGING_SOCKET")
+    if let Some(home) = get_env("HOME").map(PathBuf::from)
+        && let Some(sock) = get_env("CLAUDE_CODE_MESSAGING_SOCKET")
     {
         let sock_path = PathBuf::from(sock);
         if let Some(pid) = sock_path
@@ -859,8 +886,8 @@ pub fn resolve_persona(
         }
     }
 
-    let routes = RouteTable::load(custom_routes_path);
-    if let Ok(claude_sid) = std::env::var("CLAUDE_SESSION_ID")
+    let routes = load_routes();
+    if let Some(claude_sid) = get_str("CLAUDE_SESSION_ID")
         && !claude_sid.is_empty()
     {
         for entry in routes.entries.values() {
@@ -871,7 +898,7 @@ pub fn resolve_persona(
             }
         }
     }
-    if let Ok(agy_cid) = std::env::var("ANTIGRAVITY_CONVERSATION_ID")
+    if let Some(agy_cid) = get_str("ANTIGRAVITY_CONVERSATION_ID")
         && !agy_cid.is_empty()
     {
         for entry in routes.entries.values() {
@@ -884,7 +911,7 @@ pub fn resolve_persona(
             }
         }
     }
-    if let Ok(codex_tid) = std::env::var("CODEX_THREAD_ID")
+    if let Some(codex_tid) = get_str("CODEX_THREAD_ID")
         && !codex_tid.is_empty()
     {
         for entry in routes.entries.values() {
@@ -895,7 +922,7 @@ pub fn resolve_persona(
             }
         }
     }
-    if let Ok(muse_sid) = std::env::var("MUSE_SESSION_ID")
+    if let Some(muse_sid) = get_str("MUSE_SESSION_ID")
         && !muse_sid.is_empty()
     {
         for entry in routes.entries.values() {
@@ -906,7 +933,7 @@ pub fn resolve_persona(
             }
         }
     }
-    if let Ok(grok_sid) = std::env::var("GROK_SESSION_ID")
+    if let Some(grok_sid) = get_str("GROK_SESSION_ID")
         && !grok_sid.is_empty()
     {
         for entry in routes.entries.values() {
@@ -1076,34 +1103,64 @@ mod tests {
         let proj_dir = tmp.path().join("FerroLoop").join("crates");
         fs::create_dir_all(&proj_dir).unwrap();
 
+        // Isolated sources: no env, no host `HOME`/process probe, no routes.
+        // A live agent session on the test host (its `AGENT_PERSONA`, vendor
+        // session ids, or route cache) must never change these results.
+        let no_env = |_: &str| -> Option<std::ffi::OsString> { None };
+
         // 1. Explicit flag wins
         assert_eq!(
-            resolve_persona(Some("Jarvis"), None, &proj_dir, Some(&store), None),
+            resolve_persona_with_sources(
+                Some("Jarvis"),
+                None,
+                &proj_dir,
+                Some(&store),
+                RouteTable::default,
+                &no_env,
+            ),
             "jarvis"
         );
 
-        // 2. Transcript scan works when explicit is None
+        // 2. An injected `AGENT_PERSONA` outranks the transcript and CWD lead
+        let persona_env = |k: &str| -> Option<std::ffi::OsString> {
+            (k == "AGENT_PERSONA").then(|| "Felix".into())
+        };
+        assert_eq!(
+            resolve_persona_with_sources(
+                None,
+                None,
+                &proj_dir,
+                Some(&store),
+                RouteTable::default,
+                &persona_env,
+            ),
+            "felix"
+        );
+
+        // 3. Transcript scan works when explicit is None
         let transcript = tmp.path().join("transcript.jsonl");
         fs::write(&transcript, "{\"type\":\"meta\",\"agentName\":\"Kayla\"}\n").unwrap();
         assert_eq!(
-            resolve_persona(
+            resolve_persona_with_sources(
                 None,
                 Some(&transcript),
                 &proj_dir,
                 Some(&store),
-                Some(&tmp.path().join("routes.json")),
+                RouteTable::default,
+                &no_env,
             ),
             "kayla"
         );
 
-        // 3. CWD project lead fallback works when neither explicit nor transcript matches
+        // 4. CWD project lead fallback works when neither explicit nor transcript matches
         assert_eq!(
-            resolve_persona(
+            resolve_persona_with_sources(
                 None,
                 None,
                 &proj_dir,
                 Some(&store),
-                Some(&tmp.path().join("routes.json")),
+                RouteTable::default,
+                &no_env,
             ),
             "ferris"
         );
