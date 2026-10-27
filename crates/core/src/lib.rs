@@ -30,6 +30,7 @@ pub mod store;
 pub mod telemetry;
 pub mod tiered;
 pub mod verdict;
+pub mod workflow;
 
 pub use agent::{
     AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
@@ -49,6 +50,7 @@ pub use ferrowire::{
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{
     AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId,
+    WorkflowId, WorkflowRunId,
 };
 pub use iri::{Iri, IriError};
 pub use log::{Attempt, AttemptStatus, GateRun, PathsTouched};
@@ -60,8 +62,9 @@ pub use model::{
 pub use pr_policy::{
     CommitTrailerAuthor, DEFAULT_OWNER_LOGIN, DEFAULT_PROTECTED_PATTERNS, FlReviewMarker,
     PolicyRefusal, PrCommitSummary, PrPolicyEvaluation, PrReviewSummary, RequiredTier,
-    ReviewVerdict, authorize_agent_action, evaluate_pr_policy, extract_review_marker,
-    format_review_body, is_protected_path, parse_co_authors, verify_merge_approvals,
+    ReviewVerdict, authorize_agent_action, authorize_agent_merge, evaluate_pr_policy,
+    extract_review_marker, format_review_body, is_protected_path, parse_co_authors,
+    verify_merge_approvals,
 };
 pub use routing::{AreaRoute, ForeignRecord, GithubTier, Routes, RoutingFault, RoutingMap, Tier};
 pub use split::{
@@ -77,10 +80,19 @@ pub use state::{
 };
 pub use store::{
     AgentRegistry, Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, MessageStore,
-    Roles, StateStore, StoreError, Tracker, as_clause, follow, ledger_root_shape, node_id_shape,
+    Roles, StateStore, StoreError, Tracker, WorkflowStore, as_clause, follow, ledger_root_shape,
+    node_id_shape,
 };
 pub use tiered::{FindingPlacement, Placement, RecordSeen, TieredTracker};
 pub use verdict::{FailReason, Population, Verdict};
+pub use workflow::{
+    ApprovalTier, AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS,
+    DEFAULT_STEP_MAX_VISITS, END_STEP, EdgeCondition, EdgeDef, JoinPolicy,
+    ReviewIndependenceViolation, SelectedStepAgent, StepAttemptReport, StepCompletion, StepDef,
+    StepInstance, StepOutcome, WorkflowDef, WorkflowError, WorkflowRun, WorkflowRunStatus,
+    advance_workflow, authorize_step_sign_off, select_step_agent, validate_reviewer_independence,
+    validate_workflow_def,
+};
 
 /// Where a project's committed manifest lives, relative to the project root
 /// (GitHub tracker spec §4.1). Here rather than in `fl-store` because the

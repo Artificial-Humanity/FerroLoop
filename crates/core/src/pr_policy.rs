@@ -559,6 +559,43 @@ pub fn authorize_agent_action(
     Ok(())
 }
 
+/// Verify whether `caller` is authorized to merge a pull request with policy `eval`
+/// once required approvals (`verify_merge_approvals`) are satisfied.
+///
+/// Under the Author-Owned Merge rule (spec §4.3), a registered active co-author in
+/// `eval.co_authors` may merge their own pull request across all tiers (`Lead`,
+/// `LabManager`, and `Owner`-reviewed PRs) once the required reviewer tier has
+/// approved `head_sha`. Non-co-author reviewers meeting `authorize_agent_action`
+/// are also accepted.
+pub fn authorize_agent_merge(
+    eval: &PrPolicyEvaluation,
+    caller: &AgentRecord,
+) -> Result<(), PolicyRefusal> {
+    if caller.status != AgentStatus::Active {
+        return Err(PolicyRefusal::UnknownOrInactiveAgent {
+            agent: caller.name_key.clone(),
+        });
+    }
+    if !eval.unattributed_commits.is_empty() {
+        return Err(PolicyRefusal::UnattributedCommitsRequireOwner {
+            commits: eval.unattributed_commits.clone(),
+        });
+    }
+    if !eval.unknown_co_authors.is_empty() {
+        return Err(PolicyRefusal::UnknownCoAuthorsRequireOwner {
+            co_authors: eval.unknown_co_authors.clone(),
+        });
+    }
+    if eval
+        .co_authors
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&caller.name_key))
+    {
+        return Ok(());
+    }
+    authorize_agent_action(eval, caller)
+}
+
 #[derive(Debug, Clone)]
 struct FoldedReviewState {
     label: String,
@@ -1103,6 +1140,97 @@ Signed-off-by: Someone <someone@example.com>
             ),
             Err(PolicyRefusal::MissingValidApproval {
                 head_sha: "head-1".into()
+            })
+        );
+    }
+
+    #[test]
+    fn author_owned_merge_allows_co_author_across_tiers_while_forbidding_self_review() {
+        let agents = sample_roster();
+        let jarvis = &agents[0];
+        let ferris = &agents[1];
+        let felicia = &agents[2];
+        let kacey = &agents[3];
+        let sonya = &agents[4];
+
+        // 1. Assistant PR (`felicia` co-author, required_tier = Lead(ferroloop))
+        let eval_assistant = evaluate_pr_policy(
+            "ferroloop",
+            &[PrCommitSummary {
+                sha: "sha1".into(),
+                author_login: Some("artificially-human".into()),
+                message: "feat: task\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
+                    .into(),
+            }],
+            &["crates/core/src/lib.rs".into()],
+            &[],
+            &agents,
+            DEFAULT_OWNER_LOGIN,
+        );
+        // `felicia` cannot self-review, but IS authorized to merge her own PR once approved.
+        assert_eq!(
+            authorize_agent_action(&eval_assistant, felicia),
+            Err(PolicyRefusal::SelfReviewForbidden {
+                agent: "felicia".into()
+            })
+        );
+        assert_eq!(authorize_agent_merge(&eval_assistant, felicia), Ok(()));
+        // Non-co-author subordinate `kacey` or foreign lead `sonya` cannot merge.
+        assert!(matches!(
+            authorize_agent_merge(&eval_assistant, kacey),
+            Err(PolicyRefusal::InsufficientRole { .. })
+        ));
+        assert!(matches!(
+            authorize_agent_merge(&eval_assistant, sonya),
+            Err(PolicyRefusal::InsufficientRole { .. })
+        ));
+        // Authorized reviewers (`ferris`, `jarvis`) can also merge.
+        assert_eq!(authorize_agent_merge(&eval_assistant, ferris), Ok(()));
+        assert_eq!(authorize_agent_merge(&eval_assistant, jarvis), Ok(()));
+
+        // 2. Lead PR (`ferris` co-author, required_tier = LabManager)
+        let eval_lead = evaluate_pr_policy(
+            "ferroloop",
+            &[PrCommitSummary {
+                sha: "sha2".into(),
+                author_login: Some("artificially-human".into()),
+                message: "feat: lead work\n\nCo-authored-by: Ferris <ferris@artificialhumanity.io>"
+                    .into(),
+            }],
+            &["crates/core/src/lib.rs".into()],
+            &[],
+            &agents,
+            DEFAULT_OWNER_LOGIN,
+        );
+        assert_eq!(
+            authorize_agent_action(&eval_lead, ferris),
+            Err(PolicyRefusal::SelfReviewForbidden {
+                agent: "ferris".into()
+            })
+        );
+        assert_eq!(authorize_agent_merge(&eval_lead, ferris), Ok(()));
+
+        // 3. Protected-path / Owner-tier PR (`felicia` co-author, required_tier = Owner)
+        // Once `lmcfarlin` approves on GitHub (`verify_merge_approvals`), co-author `felicia` can merge.
+        let eval_protected = evaluate_pr_policy(
+            "ferroloop",
+            &[PrCommitSummary {
+                sha: "sha3".into(),
+                author_login: Some("artificially-human".into()),
+                message: "ci: update\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
+                    .into(),
+            }],
+            &[".github/workflows/ci.yml".into()],
+            &[],
+            &agents,
+            DEFAULT_OWNER_LOGIN,
+        );
+        assert_eq!(authorize_agent_merge(&eval_protected, felicia), Ok(()));
+        assert_eq!(
+            authorize_agent_merge(&eval_protected, ferris),
+            Err(PolicyRefusal::ProtectedPathRequiresOwner {
+                agent: "ferris".into(),
+                files: vec![".github/workflows/ci.yml".into()],
             })
         );
     }

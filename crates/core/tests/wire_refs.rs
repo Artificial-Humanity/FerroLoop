@@ -283,6 +283,79 @@ fn every_reference_field_on_the_wire_is_a_full_iri() {
         },
         3,
     );
+
+    let workflow_def = WorkflowDef {
+        id: WorkflowId(iri(23)),
+        project: p.clone(),
+        slug: "review-loop".into(),
+        title: "Review Loop".into(),
+        start_step: "implement".into(),
+        steps: vec![StepDef {
+            step_id: "implement".into(),
+            title: "Implement".into(),
+            prompt: "Do work".into(),
+            assignee: AssigneeRule::Agent {
+                name: "felicia".into(),
+            },
+            reviews_step: None,
+            require_different_vendor: false,
+            completion: StepCompletion::Gated {
+                gates: vec![g.clone()],
+                regret: Regret::Low,
+            },
+            join_policy: JoinPolicy::All,
+            max_attempts: 2,
+            max_visits: 3,
+            budget_usd_micros: Some(1_000_000),
+            max_tokens: Some(50_000),
+            isolate_worktree: true,
+        }],
+        edges: vec![EdgeDef {
+            from_step: "implement".into(),
+            to_step: END_STEP.into(),
+            on: EdgeCondition::Pass,
+        }],
+        max_total_steps: 16,
+        budget_usd_micros: Some(5_000_000),
+        max_tokens: Some(200_000),
+        declared_keys: std::collections::BTreeMap::from([("branch".into(), MergeMode::LastWriter)]),
+        authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        authored_by: "ferris".into(),
+    };
+    let workflow_run = WorkflowRun {
+        id: WorkflowRunId(iri(24)),
+        workflow_id: WorkflowId(iri(23)),
+        project: p.clone(),
+        title: "Run 1".into(),
+        status: WorkflowRunStatus::Running,
+        active_steps: vec!["implement".into()],
+        steps: std::collections::BTreeMap::from([(
+            "implement".into(),
+            StepInstance {
+                step_id: "implement".into(),
+                visit_count: 1,
+                attempt_count: 1,
+                state: State::Doing,
+                assigned_agent: Some("felicia".into()),
+                adapter_used: Some("claude".into()),
+                record_id: Some(r.clone()),
+                latest_attempt: Some(iri(25)),
+                last_outcome: Some(StepOutcome::Pass),
+                tokens_used: 100,
+                cost_usd_micros: 500,
+                worktree_branch: Some("fl/flow/1/implement".into()),
+                needs_human_reason: None,
+            },
+        )]),
+        total_steps_executed: 1,
+        total_tokens: 100,
+        total_cost_usd_micros: 500,
+        created_at: At::from_unix_millis(10),
+        updated_at: At::from_unix_millis(11),
+        by: "ferris".into(),
+    };
+    assert_every_reference_refuses_a_handle("WorkflowDef", &workflow_def, 3);
+    assert_every_reference_refuses_a_handle("WorkflowRun", &workflow_run, 5);
 }
 
 #[test]
@@ -365,5 +438,73 @@ fn pr_policy_wire_types_round_trip_cleanly() {
         let back: PolicyRefusal = serde_json::from_str(&json).unwrap();
         assert_eq!(back, refusal);
         assert!(!refusal.to_string().is_empty());
+    }
+}
+
+#[test]
+fn workflow_wire_types_round_trip_cleanly() {
+    for tier in ApprovalTier::ALL {
+        let json = serde_json::to_string(tier).unwrap();
+        let back: ApprovalTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *tier);
+    }
+
+    for cond in EdgeCondition::ALL {
+        let json = serde_json::to_string(cond).unwrap();
+        let back: EdgeCondition = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *cond);
+    }
+
+    for status in WorkflowRunStatus::ALL {
+        let json = serde_json::to_string(status).unwrap();
+        let back: WorkflowRunStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *status);
+    }
+
+    for outcome in StepOutcome::ALL {
+        let json = serde_json::to_string(outcome).unwrap();
+        let back: StepOutcome = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *outcome);
+    }
+
+    for assignee in [
+        AssigneeRule::Manual,
+        AssigneeRule::Agent {
+            name: "felicia".into(),
+        },
+        AssigneeRule::Selector {
+            role: Some(AgentRole::Lead),
+            area: Some("ferroloop".into()),
+            adapter: Some("codex".into()),
+        },
+    ] {
+        let json = serde_json::to_string(&assignee).unwrap();
+        let back: AssigneeRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, assignee);
+    }
+
+    for completion in [
+        StepCompletion::Ungated,
+        StepCompletion::HumanSignOff {
+            approval_tier: ApprovalTier::Lead,
+        },
+        StepCompletion::Gated {
+            gates: vec![GateId(iri(2))],
+            regret: Regret::High,
+        },
+    ] {
+        let json = serde_json::to_string(&completion).unwrap();
+        let back: StepCompletion = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, completion);
+    }
+
+    for join in [
+        JoinPolicy::All,
+        JoinPolicy::Any,
+        JoinPolicy::NOfM { required: 2 },
+    ] {
+        let json = serde_json::to_string(&join).unwrap();
+        let back: JoinPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, join);
     }
 }
