@@ -17,6 +17,7 @@ fl-github = { path = "../github" }
 fl-mcp = { path = "../mcp" }
 fl-wire = { path = "../wire" }
 fl-hub = { path = "../hub" }
+fl-gate = { path = "../gate" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

@@ -1,0 +1,60 @@
+id = "discord"
+title = "Discord API & Bot Gateway"
+version = "0.1.0"
+description = "Outbound Discord REST tools and inbound channel/thread bridge via FerroGate"
+base_url = "https://discord.com/api/v10"
+allowed_hosts = ["discord.com"]
+default_headers = { Authorization = "Bot {{FERROGATE:DISCORD_BOT_TOKEN}}", "Content-Type" = "application/json" }
+enabled = true
+
+[[tools]]
+name = "discord_send_message"
+description = "Post a message to a Discord channel or thread"
+method = "POST"
+path = "/channels/{channel_id}/messages"
+path_params = ["channel_id"]
+body_params = ["content"]
+response_fields = ["id", "channel_id", "content", "timestamp"]
+
+[tools.input_schema]
+type = "object"
+required = ["channel_id", "content"]
+[tools.input_schema.properties.channel_id]
+type = "string"
+description = "Target Discord channel or thread snowflake ID"
+[tools.input_schema.properties.content]
+type = "string"
+description = "Message content to post"
+
+[[tools]]
+name = "discord_list_messages"
+description = "Fetch recent messages from a Discord channel or thread"
+method = "GET"
+path = "/channels/{channel_id}/messages"
+path_params = ["channel_id"]
+query_params = ["limit", "after", "before"]
+response_fields = ["id", "channel_id", "author", "content", "timestamp"]
+
+[tools.input_schema]
+type = "object"
+required = ["channel_id"]
+[tools.input_schema.properties.channel_id]
+type = "string"
+description = "Target Discord channel or thread snowflake ID"
+[tools.input_schema.properties.limit]
+type = "integer"
+description = "Max messages to return (1-100)"
+
+[[bridges]]
+id = "discord-workspace"
+kind = "discord"
+enabled = true
+verify_secret = "DISCORD_PUBLIC_KEY"
+bot_token_secret = "DISCORD_BOT_TOKEN"
+allowed_user_ids = ["lmcfarlin"]
+allowed_guild_ids = []
+default_target = "wire:ferris"
+
+[bridges.channel_routes]
+"ferroloop" = "wire:ferris"
+"lab" = "wire:jarvis"
