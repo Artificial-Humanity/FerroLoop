@@ -7,13 +7,17 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
 1. Branch off local `main`. All work happens on a branch.
 2. Review and remediation are subagent-driven. The working session coordinates: it
    dispatches the work, rules on findings, and does not fix findings itself.
-   * A written plan is executed with `superpowers:subagent-driven-development`: a fresh
-     implementer and a fresh reviewer for each task, then a whole-branch review.
-   * Other work is reviewed by a fresh reviewer subagent, dispatched with
-     `superpowers:requesting-code-review`.
-3. Evaluate the findings with `superpowers:receiving-code-review`. A subagent fixes
-   them and commits the fixes; a fresh reviewer subagent then re-reviews the fix diff.
-   Repeat until no Critical or Important finding is open.
+   * A written plan is executed with the `subagent-dev` skill: a fresh implementer
+     subagent for each task, then the `code-review` loop on that task, then a final
+     whole-branch review.
+   * Other work is reviewed with the `code-review` skill, by a fresh read-only reviewer
+     subagent.
+3. Evaluate the findings with the `code-review` skill, both a reviewer subagent's and a
+   pull-request reviewer's. The working session checks each finding against the code
+   before it rules. A fresh fixer subagent commits the accepted fixes; a fresh scoped
+   re-reviewer subagent then reviews the fix diff. The loop runs at most 3 rounds. A
+   Critical or Important finding still open after 3 rounds is escalated to the project
+   Lead or the owner.
 4. Push the branch and open a ready-for-review pull request against `main` with
    `fl github pr create`. It reports the required reviewer tier and the target reviewer,
    and that report decides. For the Lead or Lab Manager tier it queues a FerroWire notice
