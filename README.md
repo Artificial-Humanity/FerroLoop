@@ -30,18 +30,27 @@ deliberately — the same split as Claude Code and `claude`.
   finding only when the reproduction now passes and every other gate that passed before still
   passes. A claim that cannot be reproduced is withdrawn, and the withdrawal is counted against
   whoever raised it.
-* **Attempts.** `fl attempt <record>` runs the Claude Code CLI (`claude`) once against a
-  record, under a time limit and a spend ceiling, and stores the outcome (`completed`, `timeout`,
-  `crashed` or `refused`), its duration and an excerpt of its output. The adapter does not yet
-  capture which paths an attempt touched. Claude Code is the only adapter. The adapter does not read token counts or cost from `claude`,
-  so `fl stats` reports attempts, outcomes and wall-clock time, and its cost figure is a floor
-  until an adapter reports one.
-* **The GitHub tracker.** A project can keep its records and findings as the Issues of one
-  GitHub repository, with a personal token or a GitHub App as the credential
-  ([docs/github-tracker.md](docs/github-tracker.md)).
-* **The git ledger.** With the tracker, each decision can also publish its evidence to an
-  append-only `fl/ledger` branch of that repository and comment on its issue
-  ([docs/github-ledger.md](docs/github-ledger.md)).
+* **Attempts and telemetry.** `fl attempt <record>` runs an execution adapter (`claude`,
+  `codex`, `antigravity`, `muse`, or `grok`) against a record under a time limit and spend
+  ceiling, recording the outcome (`completed`, `timeout`, `crashed` or `refused`), duration,
+  output excerpt, token counts (`tokens_in`, `tokens_out`), cost in micro-USD, and
+  `paths_touched`. `fl stats` aggregates attempt outcomes, wall-clock time, token usage, cost,
+  and transition regret audits; `fl agent liveness` reports heartbeat health across active
+  runs.
+* **Agent registry and unified state.** `fl agent` registers project leads, assistants, and
+  lab managers, manages coverage areas, and renders `REGISTRY.md`. `fl state` stores scoped
+  (`workspace`, `project`, `agent`, `workflow-run`) memory, handoffs, and runtime state with
+  owner sensitivity redaction and `MEMORY.md` / `STATE.md` rendering.
+* **FerroWire (`fl wire`).** Agent-to-agent messaging across local and remote hosts with
+  durable store receipts, native vendor push dispatch (Claude Code Unix socket, Antigravity
+  `agentapi`, Codex queue, Muse, Grok, and webhooks), and optional `fl-wire` HTTP/WebSocket
+  relay.
+* **The GitHub tracker, git ledger, and PR policy (`fl github pr`).** A project can keep its
+  records and findings in GitHub Issues ([docs/github-tracker.md](docs/github-tracker.md)) and
+  publish decision evidence to an append-only `fl/ledger` branch
+  ([docs/github-ledger.md](docs/github-ledger.md)). `fl github pr` evaluates pull-request
+  review and merge policy by project and author role, posts structured review verdicts, and
+  gates merges on verified approvals.
 * **Two-tier routing and escalation.** A routing map sends each new record and finding by its
   area to the local store or to GitHub. `fl record escalate` and `fl finding escalate` move a
   local item to GitHub; a move to `needs_human` escalates a local record
@@ -50,9 +59,19 @@ deliberately — the same split as Claude Code and `claude`.
   `.fl/manifest.json`, to commit with the code; `fl manifest import` reads it on another
   machine ([docs/sharing-gates.md](docs/sharing-gates.md)).
 * **An MCP catalog.** `fl mcp` keeps one committed catalog of a project's MCP servers,
-  `.fl/mcp.toml`, and writes it into the files that Claude Code, Codex and Antigravity read
-  their MCP servers from. `fl mcp` only writes their configuration; it starts neither the CLIs
-  nor the MCP servers ([docs/mcp.md](docs/mcp.md)).
+  `.fl/mcp.toml`, and writes it into the files that Claude Code, Codex, Antigravity, Muse, and
+  Grok read their MCP servers from (`fl mcp` also exposes `fl mcp serve` so agents can call
+  FerroLoop tools over stdio MCP) ([docs/mcp.md](docs/mcp.md)).
+* **Workflows (`fl flow`) and architecture conformance (`fl arch`).** `fl flow` validates,
+  imports, and executes multi-step DAG workflows (`.fl/workflows/*.toml`) with automated gate
+  checks, review loops, worktree isolation, and human sign-off tiers. `fl arch` validates
+  `.fl/architecture.toml`, checks Cargo workspace dependency and source-import conformance, and
+  exports LikeC4 DSL.
+* **FerroLoop Hub (`fl hub`) and FerroDeck (`ui/`).** `fl hub serve` runs the HTTP/1.1 and
+  `/ws/v1` WebSocket daemon with two-tier authentication (`Owner` pairing/session cookies and
+  Tailscale header trust vs. `Peer` bearer tokens), host session and transcript discovery,
+  git worktree diff inspection, PTY terminal streaming, and static serving for **FerroDeck**,
+  the desktop and iPad command-center web application in `ui/`.
 
 fl is self-hosted. Its store is a file on your machine, and the GitHub tracker and ledger are
 options you turn on per project.
@@ -71,8 +90,10 @@ Today the only route is building from source, below.
 * Rust 1.98+ (edition 2024) and Cargo
 * git: `fl project add` refuses a directory that is not a git working tree with at least one
   commit
-* Optional: the `claude` CLI, for `fl attempt`
-* Optional: a GitHub repository and a token or App, for the tracker and the ledger
+* Optional: an execution CLI (`claude`, `codex`, `agy`, `muse`, or `grok`), for `fl attempt`
+  and `fl flow`
+* Optional: Node.js 24+ and npm, for building the **FerroDeck** frontend bundle in `ui/`
+* Optional: a GitHub repository and a token or App, for the tracker, ledger, and `fl github pr`
 
 ### Building from source
 
@@ -83,9 +104,12 @@ cd FerroLoop
 
 # Build the release binary
 cargo build --release
+
+# (Optional) Build the FerroDeck web UI bundle served by `fl hub serve`
+cd ui && npm install && npm run build
 ```
 
-The compiled binary is `target/release/fl`.
+The compiled binary is `target/release/fl`, and the compiled FerroDeck bundle is `ui/dist/`.
 
 ---
 
@@ -137,17 +161,14 @@ that store does not hold is refused, not looked for elsewhere.
 
 ---
 
-## Direction
+## Next horizon
 
-These are plans. None of them is in the code today.
-
-* **Agent-to-agent messaging** across machines and the cloud, with a lasting address for each
-  agent, for agents from any vendor. *Planned.*
-* **Committed workflow graphs.** *Planned.*
-* **A command-center app** on every platform. *Planned.*
-* **Architecture views.** *Planned.*
-* **More execution adapters,** beyond Claude Code. *Planned.*
-* **Token and cost telemetry** for attempts. *Planned.*
+* **Native desktop and mobile packaging** for FerroDeck (`Tauri 2`) alongside the browser and
+  iPad PWA served by `fl hub serve`.
+* **Cross-tailnet multi-hub federation** for `fl wire` and `fl hub` across distributed lab
+  hosts.
+* **Cherry-pick binary installer** for installing `fl` and optional components without building
+  from source.
 
 ---
 

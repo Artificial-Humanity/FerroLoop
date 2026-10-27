@@ -364,10 +364,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       if (explicit) return explicit;
     }
     const key = (selectedAgent?.name_key ?? "").toLowerCase();
+    if (!key) {
+      return null;
+    }
     return (
       sessions.find((s) => (s.persona ?? "").toLowerCase() === key) ??
       routes.find((r) => (r.persona ?? "").toLowerCase() === key) ??
-      sessions[0] ??
       null
     );
   }, [sessions, routes, selectedSessionId, selectedAgent]);
@@ -401,8 +403,15 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const unreadByAgent = useMemo<Record<string, number>>(() => {
     const counts: Record<string, number> = {};
     for (const item of wireMessages) {
-      const receipt = item.receipt;
-      const isAcked = Boolean(receipt?.acked_at || receipt?.status === "acked");
+      const receipt =
+        item.receipt ??
+        (item.receipts && item.receipts.length > 0 ? item.receipts[0] : undefined);
+      const allReceiptsAcked =
+        Boolean(item.receipts && item.receipts.length > 0) &&
+        item.receipts!.every((r) => Boolean(r.acked_at || r.status === "acked"));
+      const isAcked = Boolean(
+        receipt?.acked_at || receipt?.status === "acked" || allReceiptsAcked,
+      );
       if (!isAcked) {
         const toKey = (item.message.to ?? "").trim().toLowerCase();
         if (toKey && toKey !== "all" && toKey !== "agents.all") {
@@ -550,6 +559,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             sessionId={activeSession?.id ?? null}
             turns={transcriptTurns}
             loading={loading}
+            wsConnected={wsConnected}
             onRefresh={() => void refreshSessionsAndTranscript()}
             onSendPrompt={handleSendPrompt}
             apiClient={apiClient}
@@ -607,6 +617,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 sessionId={activeSession?.id ?? null}
                 turns={transcriptTurns}
                 loading={loading}
+                wsConnected={wsConnected}
                 onRefresh={() => void refreshSessionsAndTranscript()}
                 onSendPrompt={handleSendPrompt}
                 apiClient={apiClient}

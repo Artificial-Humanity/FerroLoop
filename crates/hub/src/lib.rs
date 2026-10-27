@@ -909,4 +909,51 @@ mod tests {
         let _ = no_term_shutdown.send(true);
         let _ = no_term_task.await;
     }
+
+    #[test]
+    fn session_prompt_saves_base64_attachments_and_serves_them_over_http() {
+        use base64::Engine;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+
+        let png_bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+        let b64 = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png_bytes)
+        );
+
+        let prompt_req = HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+            .with_header("Authorization", "Bearer owner-tok-secret")
+            .with_json_body(&json!({
+                "prompt": "Check this screenshot",
+                "attachments": [
+                    {
+                        "name": "ipad screenshot.png",
+                        "media_type": "image/png",
+                        "data_base64": b64
+                    }
+                ]
+            }));
+        let prompt_resp = handle_http_request(&state, &prompt_req);
+        assert_eq!(prompt_resp.status, 200);
+        let body_json = prompt_resp.json_value().unwrap();
+
+        let attachments = body_json["attachments"].as_array().unwrap();
+        assert_eq!(attachments.len(), 1);
+        let att_url = attachments[0]["url"].as_str().unwrap();
+        assert!(att_url.starts_with("/api/v1/attachments/"));
+        assert!(att_url.ends_with("-ipad_screenshot.png"));
+
+        let wire_body = body_json["message"]["body"].as_str().unwrap();
+        assert!(wire_body.contains("Check this screenshot"));
+        assert!(wire_body.contains(&format!("({att_url})]")));
+
+        let get_att_req = HttpRequest::new("GET", att_url)
+            .with_header("Authorization", "Bearer owner-tok-secret");
+        let get_att_resp = handle_http_request(&state, &get_att_req);
+        assert_eq!(get_att_resp.status, 200);
+        assert_eq!(get_att_resp.content_type, "image/png");
+        assert_eq!(get_att_resp.body, png_bytes);
+    }
 }

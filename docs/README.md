@@ -21,8 +21,21 @@ File naming in this directory follows
 * [routing.md](routing.md) — keep developer-level items in the local store and human-level
   items in GitHub: areas, the routing map, handles, lists and their limits.
 * [mcp.md](mcp.md) — one committed catalog of a project's MCP servers, written into Claude
-  Code's, Codex's and Antigravity's own files: the catalog, secrets, each machine's switches, the
-  commands, what fl refuses and why.
+  Code's, Codex's, Antigravity's, Muse's and Grok's own files (plus `fl mcp serve` stdio MCP
+  exposure): the catalog, secrets, each machine's switches, the commands, what fl refuses and
+  why.
+
+## CLI & Hub capabilities overview
+
+In addition to the guides above, `fl --help` documents the full command surface:
+
+* `fl agent` — agent identity registry, coverage areas, heartbeat liveness, and `REGISTRY.md` rendering.
+* `fl state` — scoped memory, handoffs, and runtime state with owner sensitivity redaction and `MEMORY.md` / `STATE.md` rendering.
+* `fl wire` — FerroWire agent-to-agent messaging, receipts, native vendor push dispatch, and WebSocket relay.
+* `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
+* `fl flow` — DAG workflow validation, import, step execution, review loops, and human approval sign-off.
+* `fl arch` — `.fl/architecture.toml` validation, Cargo workspace dependency/source conformance checks, and LikeC4 export.
+* `fl hub` — HTTP/1.1 + `/ws/v1` WebSocket daemon (`fl hub serve`), one-time QR/code pairing (`fl hub pair`), PTY terminal streaming, and static serving for **FerroDeck** (`ui/`).
 
 ## Root documents
 

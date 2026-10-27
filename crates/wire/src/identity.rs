@@ -386,6 +386,15 @@ impl RouteTable {
                 .join("transcript.jsonl");
             if let Some(persona) = scan_transcript_for_persona(&transcript, 50)
                 && !self.entries.contains_key(&persona)
+                && !self.entries.values().any(|existing| {
+                    matches!(
+                        &existing.route,
+                        VendorRoute::Agy {
+                            conversation_id: existing_id,
+                            ..
+                        } if existing_id == conv_id
+                    )
+                })
             {
                 self.upsert(
                     &persona,
@@ -677,7 +686,7 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
             }
         }
         let lower = line.to_ascii_lowercase();
-        for marker in ["take the name of ", "you will be ", "take up residence in "] {
+        for marker in ["take the name of ", "you will be "] {
             if let Some(idx) = lower.find(marker) {
                 let after = &line[idx + marker.len()..];
                 let token: String = after
@@ -1106,7 +1115,7 @@ mod tests {
         .unwrap();
         fs::write(
             conv_logs.join("transcript.jsonl"),
-            "{\"customTitle\":\"Kacey\"}\n",
+            "{\"type\":\"USER_INPUT\",\"content\":\"You will take up residence in ArtificialHumanity.io. You will take the name of Kacey.\"}\n",
         )
         .unwrap();
 

@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use base64::Engine;
 
 use fl_core::agent::AgentStatus;
 use fl_core::arch::{
@@ -457,12 +459,14 @@ fn mime_type_for_path(path: &Path) -> &'static str {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("pdf") => "application/pdf",
         Some("ico") => "image/x-icon",
         Some("woff2") => "font/woff2",
         Some("woff") => "font/woff",
         Some("ttf") => "font/ttf",
         Some("wasm") => "application/wasm",
-        Some("txt" | "c4") => "text/plain; charset=utf-8",
+        Some("txt" | "c4" | "md" | "log") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }
@@ -742,7 +746,12 @@ fn handle_post_wire_send(
         Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
     };
 
-    let mut routes = RouteTable::load(None);
+    let route_override = state
+        .config
+        .home_override
+        .as_ref()
+        .map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
+    let mut routes = RouteTable::load(route_override.as_deref());
     let updated = dispatch_message_for_store(
         store,
         &mut routes,
@@ -1300,6 +1309,15 @@ fn handle_get_architecture(state: &HubState, req: &HttpRequest) -> HttpResponse 
     )
 }
 
+fn attachments_dir(state: &HubState) -> PathBuf {
+    state
+        .config
+        .store_path
+        .parent()
+        .unwrap_or_else(|| Path::new("/tmp"))
+        .join("attachments")
+}
+
 fn handle_dynamic_api_routes(
     state: &HubState,
     store: &RedbStore,
@@ -1313,6 +1331,30 @@ fn handle_dynamic_api_routes(
         .split('/')
         .filter(|s| !s.is_empty())
         .collect();
+
+    // /api/v1/attachments/:filename
+    if segments.len() == 4
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "attachments"
+        && (method == "GET" || method == "HEAD")
+    {
+        let filename = percent_decode(segments[3]);
+        if filename.is_empty()
+            || has_path_traversal(segments[3], &filename)
+            || filename.contains('/')
+            || filename.contains('\\')
+        {
+            return HttpResponse::json(400, json!({ "error": "invalid attachment filename" }));
+        }
+        let path = attachments_dir(state).join(&filename);
+        if path.is_file()
+            && let Ok(bytes) = fs::read(&path)
+        {
+            return HttpResponse::bytes(200, mime_type_for_path(&path), bytes);
+        }
+        return HttpResponse::json(404, json!({ "error": "attachment not found" }));
+    }
 
     // /api/v1/sessions/:id/transcript or /api/v1/sessions/:id/prompt
     if segments.len() == 5
@@ -1445,7 +1487,24 @@ fn handle_post_session_prompt(
     req: &HttpRequest,
 ) -> HttpResponse {
     #[derive(Deserialize)]
+    struct PromptAttachmentInput {
+        name: String,
+        #[serde(default, alias = "mime_type")]
+        media_type: String,
+        data_base64: String,
+    }
+
+    #[derive(Serialize)]
+    struct SavedAttachment {
+        name: String,
+        media_type: String,
+        path: String,
+        url: String,
+    }
+
+    #[derive(Deserialize)]
     struct PromptPayload {
+        #[serde(default)]
         prompt: String,
         #[serde(default)]
         by: Option<String>,
@@ -1453,12 +1512,96 @@ fn handle_post_session_prompt(
         urgency: Option<MessageUrgency>,
         #[serde(default)]
         subject: Option<String>,
+        #[serde(default)]
+        attachments: Vec<PromptAttachmentInput>,
     }
 
     let payload: PromptPayload = match req.json() {
         Ok(p) => p,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
     };
+
+    if payload.prompt.trim().is_empty() && payload.attachments.is_empty() {
+        return HttpResponse::json(
+            400,
+            json!({ "error": "prompt or attachments must not be empty" }),
+        );
+    }
+
+    let mut saved_attachments = Vec::with_capacity(payload.attachments.len());
+    if !payload.attachments.is_empty() {
+        let dir = attachments_dir(state);
+        if let Err(e) = fs::create_dir_all(&dir) {
+            return HttpResponse::json(
+                500,
+                json!({ "error": format!("failed to create attachments dir: {e}") }),
+            );
+        }
+        let now_ms = stamp::now().unix_millis();
+        for (idx, att) in payload.attachments.iter().enumerate() {
+            let raw_b64 = match att.data_base64.find(";base64,") {
+                Some(pos) if att.data_base64.trim_start().starts_with("data:") => {
+                    &att.data_base64[pos + ";base64,".len()..]
+                }
+                _ => att.data_base64.as_str(),
+            };
+            let decoded = match base64::engine::general_purpose::STANDARD.decode(raw_b64.trim()) {
+                Ok(b) => b,
+                Err(e) => {
+                    return HttpResponse::json(
+                        400,
+                        json!({ "error": format!("invalid base64 in attachment `{}`: {e}", att.name) }),
+                    );
+                }
+            };
+            let mut sanitized: String = att
+                .name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            sanitized = sanitized.trim_start_matches('.').to_string();
+            if sanitized.is_empty() {
+                sanitized = "attachment.bin".to_string();
+            }
+            let saved_name = format!("{now_ms}-{idx}-{sanitized}");
+            let saved_path = dir.join(&saved_name);
+            if let Err(e) = fs::write(&saved_path, &decoded) {
+                return HttpResponse::json(
+                    500,
+                    json!({ "error": format!("failed to write attachment: {e}") }),
+                );
+            }
+            let media_type = if att.media_type.trim().is_empty() {
+                mime_type_for_path(&saved_path).to_string()
+            } else {
+                att.media_type.trim().to_string()
+            };
+            saved_attachments.push(SavedAttachment {
+                name: sanitized,
+                media_type,
+                path: saved_path.display().to_string(),
+                url: format!("/api/v1/attachments/{saved_name}"),
+            });
+        }
+    }
+
+    let mut effective_body = if payload.prompt.trim().is_empty() {
+        "Attached file(s).".to_string()
+    } else {
+        payload.prompt.trim().to_string()
+    };
+    for saved in &saved_attachments {
+        effective_body.push_str(&format!(
+            "\n\n[Attached file: {} ({})]",
+            saved.path, saved.url
+        ));
+    }
 
     let sessions = discover_sessions_with_home(store, state.config.home_override.as_deref());
     let target_persona = sessions
@@ -1496,7 +1639,7 @@ fn handle_post_session_prompt(
         subject: payload
             .subject
             .unwrap_or_else(|| format!("Prompt for {target_persona}")),
-        body: payload.prompt,
+        body: effective_body,
         reply_to: None,
         thread_id: None,
         deadline_at: None,
@@ -1508,7 +1651,12 @@ fn handle_post_session_prompt(
         Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
     };
 
-    let mut routes = RouteTable::load(None);
+    let route_override = state
+        .config
+        .home_override
+        .as_ref()
+        .map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
+    let mut routes = RouteTable::load(route_override.as_deref());
     let updated = dispatch_message_for_store(
         store,
         &mut routes,
@@ -1526,6 +1674,7 @@ fn handle_post_session_prompt(
         "session_id": session_id,
         "message": msg,
         "receipts": receipts,
+        "attachments": saved_attachments,
     });
     state.broadcast("session", "prompt_sent", data.clone());
     state.broadcast(

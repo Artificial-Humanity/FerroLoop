@@ -10,7 +10,7 @@ use fl_core::arch::{
     ArchConformanceReport, ArchitectureModel, PackageDep, SourceReference,
     check_architecture_conformance,
 };
-use fl_core::store::{Catalog, Ledger};
+use fl_core::store::{AgentRegistry, Catalog, Ledger};
 use fl_exec::stamp;
 use fl_store::RedbStore;
 use fl_wire::identity::{RouteTable, VendorRoute};
@@ -113,14 +113,29 @@ pub fn discover_sessions_with_home(
     let mut out = Vec::new();
     let mut seen_ids = BTreeSet::new();
 
-    let mut routes = RouteTable::load(None);
+    let route_override =
+        home_override.map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
+    let mut routes = RouteTable::load(route_override.as_deref());
     routes.discover_routes(home_override, stamp::now());
 
     let home = home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
 
-    for (persona, entry) in &routes.entries {
+    let registered_names: BTreeSet<String> = store
+        .list_agents(None, true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.name_key.to_ascii_lowercase())
+        .collect();
+
+    let mut ordered_routes: Vec<_> = routes.entries.iter().collect();
+    ordered_routes.sort_by_key(|(persona, _)| {
+        let is_registered = registered_names.contains(&persona.to_ascii_lowercase());
+        (!is_registered, *persona)
+    });
+
+    for (persona, entry) in ordered_routes {
         let (adapter, raw_id, cwd, transcript_path) = match &entry.route {
             VendorRoute::Claude {
                 pid, session_id, ..
@@ -379,7 +394,8 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             match t {
                 "USER_INPUT" | "user" | "human" => "user".to_string(),
                 "PLANNER_RESPONSE" | "assistant" | "model" | "result" => "assistant".to_string(),
-                "SYSTEM" | "system" => "system".to_string(),
+                "GENERIC" | "TOOL_RESULT" | "tool_result" | "tool" => "tool".to_string(),
+                "SYSTEM" | "SYSTEM_MESSAGE" | "system" => "system".to_string(),
                 _ => {
                     if let Some(src) = obj.get("source").and_then(Value::as_str) {
                         normalize_role(src)
@@ -434,11 +450,20 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         }
 
         let content = content_parts.join("\n");
+        let (mut role, content) = normalize_system_turn(&role, &content);
         let thinking = if thinking_parts.is_empty() {
             None
         } else {
             Some(thinking_parts.join("\n"))
         };
+
+        if role == "assistant"
+            && content.trim_start().starts_with("Created At:")
+            && thinking.is_none()
+            && tool_calls.is_empty()
+        {
+            role = "tool".to_string();
+        }
 
         if content.is_empty() && thinking.is_none() && tool_calls.is_empty() {
             continue;
@@ -461,9 +486,133 @@ fn normalize_role(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "user" | "user_explicit" | "human" => "user".to_string(),
         "assistant" | "model" | "planner_response" => "assistant".to_string(),
-        "system" => "system".to_string(),
+        "system" | "system_message" => "system".to_string(),
         other => other.to_string(),
     }
+}
+
+fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
+    if role != "system" && !content.contains("<SYSTEM_MESSAGE>") {
+        return (role.to_string(), content.to_string());
+    }
+
+    let mut inner = content.trim();
+    if content.contains("<SYSTEM_MESSAGE>") {
+        let before_close = match content.rfind("</SYSTEM_MESSAGE>") {
+            Some(close_idx) => &content[..close_idx],
+            None => content,
+        };
+        if let Some(rest) = before_close.trim_start().strip_prefix("<SYSTEM_MESSAGE>") {
+            inner = rest.trim();
+        } else if let Some(idx) = before_close.find("\n<SYSTEM_MESSAGE>") {
+            inner = before_close[idx + "\n<SYSTEM_MESSAGE>".len()..].trim();
+        } else if let Some(idx) = before_close.find("<SYSTEM_MESSAGE>") {
+            inner = before_close[idx + "<SYSTEM_MESSAGE>".len()..].trim();
+        }
+    }
+
+    if inner.starts_with("[Message]") {
+        let first_line_end = inner.find('\n').unwrap_or(inner.len());
+        if let Some(pos) = inner[..first_line_end].find(" content=") {
+            inner = inner[pos + " content=".len()..].trim();
+        }
+    }
+
+    if inner.starts_with("[Operator Prompt via FerroDeck") {
+        let cleaned = match inner.find('\n') {
+            Some(nl) => inner[nl + 1..].trim(),
+            None => inner,
+        };
+        return ("user".to_string(), cleaned.to_string());
+    }
+
+    if inner.starts_with("[Incoming NATS Message") {
+        let mut sender = String::new();
+        let mut subject = String::new();
+        let mut body_lines = Vec::new();
+        let mut in_headers = true;
+        for (i, line) in inner.lines().enumerate() {
+            if i == 0 && line.starts_with("[Incoming NATS Message") {
+                continue;
+            }
+            if in_headers {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    in_headers = false;
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once(':') {
+                    let key_lower = k.trim().to_ascii_lowercase();
+                    if matches!(
+                        key_lower.as_str(),
+                        "from" | "subject" | "timestamp" | "message id"
+                    ) {
+                        if key_lower == "from" {
+                            sender = v.trim().to_string();
+                        } else if key_lower == "subject" {
+                            subject = v.trim().to_string();
+                        }
+                        continue;
+                    }
+                }
+                in_headers = false;
+            }
+            body_lines.push(line);
+        }
+        let mut cleaned = body_lines.join("\n").trim().to_string();
+        if cleaned.is_empty() && !subject.is_empty() {
+            cleaned = subject;
+        }
+        if sender.eq_ignore_ascii_case("owner") || sender.eq_ignore_ascii_case("lmcfarlin") {
+            return ("user".to_string(), cleaned);
+        }
+        if !sender.is_empty() {
+            return (format!("wire:{}", sender.to_ascii_lowercase()), cleaned);
+        }
+        return ("system".to_string(), cleaned);
+    }
+
+    if inner.starts_with("[fl-wire ") {
+        let first_line_end = inner.find('\n').unwrap_or(inner.len());
+        let first_line = &inner[..first_line_end];
+        let mut sender = String::new();
+        if let Some(from_idx) = first_line.find("] from ") {
+            let after_from = &first_line[from_idx + "] from ".len()..];
+            let end_idx = after_from
+                .find(" (")
+                .or_else(|| after_from.find(':'))
+                .unwrap_or(after_from.len());
+            sender = after_from[..end_idx].trim().to_string();
+        }
+        let body = if let Some(blank_idx) = inner.find("\n\n") {
+            inner[blank_idx + 2..].trim().to_string()
+        } else if first_line_end < inner.len() {
+            inner[first_line_end + 1..].trim().to_string()
+        } else {
+            first_line
+                .split_once("): ")
+                .map(|(_, subj)| subj.trim().to_string())
+                .unwrap_or_else(|| inner.to_string())
+        };
+        if sender.eq_ignore_ascii_case("owner") || sender.eq_ignore_ascii_case("lmcfarlin") {
+            return ("user".to_string(), body);
+        }
+        if !sender.is_empty() {
+            return (format!("wire:{}", sender.to_ascii_lowercase()), body);
+        }
+        return ("system".to_string(), body);
+    }
+
+    if content.contains("<SYSTEM_MESSAGE>")
+        && !inner.starts_with("[Incoming NATS Message")
+        && !inner.starts_with("[fl-wire ")
+        && !inner.starts_with("[Subagent ")
+        && !inner.starts_with("[Task ")
+    {
+        return ("user".to_string(), inner.to_string());
+    }
+
+    ("system".to_string(), inner.to_string())
 }
 
 fn extract_content_and_tools(
@@ -934,6 +1083,92 @@ mod tests {
         assert_eq!(turns[2].thinking.as_deref(), Some("Checking files"));
         assert_eq!(turns[2].tool_calls.len(), 1);
         assert_eq!(turns[2].tool_calls[0].name, "read_file");
+    }
+
+    #[test]
+    fn parse_jsonl_transcript_normalizes_antigravity_system_message_prompts_and_wire() {
+        let jsonl = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "content": "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=system priority=MESSAGE_PRIORITY_HIGH content=[Operator Prompt via FerroDeck — from owner]\n\nPlease inspect the iPad layout.\n</SYSTEM_MESSAGE>",
+                "created_at": "2026-10-27T15:35:06Z"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "content": "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:10Z sender=system priority=MESSAGE_PRIORITY_HIGH content=Direct prompt without prefix\n</SYSTEM_MESSAGE>",
+                "created_at": "2026-10-27T15:35:10Z"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 2,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "content": "The following is a <SYSTEM_MESSAGE> not actually sent by the user. It is provided by the system as important information to pay attention to.\n\n<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:20Z sender=system priority=MESSAGE_PRIORITY_HIGH content=[Incoming NATS Message — pushed automatically]\nFrom: jarvis\nSubject: PR #16 review\nTimestamp: 2026-10-27T15:35:20Z\nMessage ID: msg-1\n\nApproved and ready to merge.\n</SYSTEM_MESSAGE>",
+                "created_at": "2026-10-27T15:35:20Z"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 3,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:30Z sender=system priority=MESSAGE_PRIORITY_HIGH content=[fl-wire mail/normal] from jarvis (id: urn:uuid:11111111-1111-1111-1111-111111111111, thread: urn:uuid:11111111-1111-1111-1111-111111111111): Status check\n\nAll systems nominal.\n</SYSTEM_MESSAGE>",
+                "created_at": "2026-10-27T15:35:30Z"
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 4);
+
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "Please inspect the iPad layout.");
+        assert!(!turns[0].content.contains("<SYSTEM_MESSAGE>"));
+
+        assert_eq!(turns[1].role, "user");
+        assert_eq!(turns[1].content, "Direct prompt without prefix");
+        assert!(!turns[1].content.contains("<SYSTEM_MESSAGE>"));
+
+        assert_eq!(turns[2].role, "wire:jarvis");
+        assert_eq!(turns[2].content, "Approved and ready to merge.");
+        assert!(!turns[2].content.contains("<SYSTEM_MESSAGE>"));
+
+        assert_eq!(turns[3].role, "wire:jarvis");
+        assert_eq!(turns[3].content, "All systems nominal.");
+        assert!(!turns[3].content.contains("<SYSTEM_MESSAGE>"));
+    }
+
+    #[test]
+    fn parse_jsonl_transcript_normalizes_antigravity_generic_tool_output_as_tool_role() {
+        let jsonl = [
+            serde_json::json!({
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "content": "Created At: 2026-10-27T15:38:05Z\nCompleted At: 2026-10-27T15:38:06Z\nExit Code: 0\n\ntest result: ok.",
+                "created_at": "2026-10-27T15:38:06Z"
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "content": "Created At: 2026-10-27T15:38:07Z\nCompleted At: 2026-10-27T15:38:08Z\nShowing lines 1-10",
+                "created_at": "2026-10-27T15:38:08Z"
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "tool");
+        assert!(turns[0].content.contains("test result: ok."));
+        assert_eq!(turns[1].role, "tool");
     }
 
     #[test]
