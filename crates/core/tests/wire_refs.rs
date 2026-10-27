@@ -508,3 +508,78 @@ fn workflow_wire_types_round_trip_cleanly() {
         assert_eq!(back, join);
     }
 }
+
+#[test]
+fn arch_wire_types_round_trip_cleanly() {
+    for kind in ArchComponentKind::ALL {
+        let json = serde_json::to_string(kind).unwrap();
+        let back: ArchComponentKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, *kind);
+        assert_eq!(ArchComponentKind::from_wire(kind.as_wire()), Some(*kind));
+    }
+
+    let model = ArchitectureModel {
+        system_id: "ferroloop".into(),
+        title: "FerroLoop".into(),
+        strict_coverage: true,
+        components: vec![
+            ArchComponent {
+                id: "fl_core".into(),
+                title: "Core Domain".into(),
+                kind: ArchComponentKind::Crate,
+                description: "Pure domain model".into(),
+                package: Some("fl-core".into()),
+                paths: vec!["crates/core/**".into()],
+            },
+            ArchComponent {
+                id: "ferrodeck_ui".into(),
+                title: "FerroDeck UI".into(),
+                kind: ArchComponentKind::Ui,
+                description: "Web UI".into(),
+                package: None,
+                paths: vec!["ui/**".into()],
+            },
+        ],
+        edges: vec![ArchEdge {
+            from: "ferrodeck_ui".into(),
+            to: "fl_core".into(),
+            label: "consumes wire types".into(),
+        }],
+    };
+    let model_json = serde_json::to_string(&model).unwrap();
+    let model_back: ArchitectureModel = serde_json::from_str(&model_json).unwrap();
+    assert_eq!(model_back, model);
+
+    for violation in [
+        ArchViolation::UndeclaredDependency {
+            from_component: "fl_core".into(),
+            to_component: "fl_store".into(),
+            evidence: "Cargo.toml".into(),
+        },
+        ArchViolation::UnmappedPackage {
+            package: "fl-rogue".into(),
+            manifest_path: "crates/rogue/Cargo.toml".into(),
+        },
+        ArchViolation::UnmappedFile {
+            path: "stray.rs".into(),
+        },
+    ] {
+        let json = serde_json::to_string(&violation).unwrap();
+        let back: ArchViolation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, violation);
+        assert!(!violation.to_string().is_empty());
+    }
+
+    let report = ArchConformanceReport {
+        system_id: "ferroloop".into(),
+        passed: false,
+        checked_packages: 2,
+        checked_files: 10,
+        violations: vec![ArchViolation::UnmappedFile {
+            path: "stray.rs".into(),
+        }],
+    };
+    let report_json = serde_json::to_string(&report).unwrap();
+    let report_back: ArchConformanceReport = serde_json::from_str(&report_json).unwrap();
+    assert_eq!(report_back, report);
+}
