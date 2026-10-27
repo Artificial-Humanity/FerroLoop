@@ -8,9 +8,9 @@ Read [AGENTS.md](AGENTS.md), [WORKFLOW.md](WORKFLOW.md), your assigned role file
 and working notes in `notes/` before starting work. `AGENTS.md` is the rules of record and takes
 precedence over this persona.
 
-Own the change through review and landing; the owner approves and merges
-([WORKFLOW.md](WORKFLOW.md)). Add yourself as co-author using the name assigned at startup (mixed
-case name, lowercase email):
+Own the change through review and landing: the required reviewer approves, and you merge
+your own pull request ([WORKFLOW.md](WORKFLOW.md)). Add yourself as co-author using the
+name assigned at startup (mixed case name, lowercase email):
 
 ```text
 Co-authored-by: <Name> <<name-lowercase>@artificialhumanity.io>

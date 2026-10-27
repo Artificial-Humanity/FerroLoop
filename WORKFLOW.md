@@ -14,11 +14,36 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
 3. Evaluate the findings with `superpowers:receiving-code-review`. A subagent fixes
    them and commits the fixes; a fresh reviewer subagent then re-reviews the fix diff.
    Repeat until no Critical or Important finding is open.
-4. Push the branch and open a pull request against `main`. A pull request opened ready
-   for review (not a draft) is put in the owner's review queue and assigned to them by
-   [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml).
-5. The owner reviews, approves, and merges. Merging happens through the pull request. A
-   direct push to `main` is not the route, and the ruleset refuses one.
+4. Push the branch and open a ready-for-review pull request against `main` with
+   `fl github pr create`. It reports the required reviewer tier and the target reviewer,
+   and that report decides. For the Lead or Lab Manager tier it queues a FerroWire notice
+   to the target reviewer; for the Owner tier it requests the owner's review on GitHub.
+   If the target reviewer is an agent, ask it for a review over `agent-msg`; the owner is
+   reached through the GitHub review request. In summary:
+   * A pull request co-authored by an assisting agent is reviewed by the project Lead.
+   * A pull request co-authored by the Lead is reviewed by the Lab Manager (`jarvis`).
+     The Lab Manager may also approve a Lead-tier pull request.
+   * The owner reviews a pull request that touches a protected path (the
+     `DEFAULT_PROTECTED_PATTERNS` in [crates/core/src/pr_policy.rs](crates/core/src/pr_policy.rs):
+     instruction files, `.github/`, `.agents/`, `.fl/manifest.json`), carries a commit
+     without a `Co-authored-by:` trailer, is co-authored by the Lab Manager, or has a
+     co-author who is not registered as an active agent.
+     [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml)
+     also requests the owner's review for the protected-path, missing-trailer and Lab
+     Manager co-author cases; it cannot see the agent registry.
+5. An agent reviewer records its verdict with `fl github pr review`. The review is posted
+   by the Reviewer GitHub App (`<slug>[bot]`) with an `fl-review` marker, because the
+   machine account cannot approve a pull request it opened. The command needs the App's
+   credentials: `[github]` `app_id` and `private_key` in the fl `config.toml`, or
+   `$FL_GITHUB_APP_ID` and `$FL_GITHUB_PRIVATE_KEY_PATH`.
+6. Once the target reviewer that `fl github pr create` reported, or a higher tier (the Lab
+   Manager for a Lead-tier pull request, or the owner), has approved and the checks pass,
+   the agent who opened the pull request merges it through the pull request with
+   `gh pr merge`, which does not check the tier. This applies to every tier: after the
+   owner approves an Owner-tier pull request, the author merges it too.
+   A reviewer never merges another agent's pull request: the author resolves conflicts
+   and keeps the branch current. A direct push to `main` is not the route, and the
+   ruleset refuses one.
 
 ## Commit identity and safeguards
 
@@ -30,9 +55,9 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
 * `main` is protected by the repository ruleset "Main Protection". A pull request is
   required, with one approving review; a new push dismisses an earlier approval. The
   `test, clippy, fmt` check must pass, the branch must be current with `main`, and review
-  conversations must be resolved. The machine account cannot approve its own pull
-  request, so the owner approves every agent pull request. Force-pushes and deletions
-  are refused. There is no pre-push gate on the local side.
+  conversations must be resolved. The approval comes from the Reviewer GitHub App or
+  the owner, never from the machine account. Force-pushes and deletions are refused.
+  There is no pre-push gate on the local side.
 * **The rules bind everyone, the owner included.** The ruleset has no bypass list, so
   no account can push to `main` directly or merge with a red check. Changes to the
   ruleset belong to the owner.
@@ -43,7 +68,7 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
 * The machine account's token cannot read check runs or commit statuses, so
   `gh pr checks` can fail. Read the check's result on the pull request page instead.
 * Use the workflow stated here. Do not reconstruct additional rules from git history;
-  changes to the workflow belong to the owner.
+  changes to the workflow need the owner's review.
 
 ## Design records
 
