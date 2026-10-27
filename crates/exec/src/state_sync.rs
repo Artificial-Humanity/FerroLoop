@@ -9,7 +9,8 @@ use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::ids::{MessageId, StateId};
 use fl_core::iri::Iri;
 use fl_core::state::{StateRevision, StateScope, StateSyncCursor};
-use fl_core::store::{AgentRegistry, MessageStore, StateStore, StoreError};
+use fl_core::store::{AgentRegistry, MessageStore, StateStore, StoreError, WorkflowStore};
+use fl_core::workflow::{WorkflowDef, WorkflowRun};
 use sha2::{Digest, Sha256};
 
 use crate::git::{Git, GitTreeEntry, PushCasOutcome};
@@ -57,10 +58,16 @@ pub struct StateSyncReport {
     pub imported_revisions: usize,
     pub imported_wire_messages: usize,
     pub imported_wire_receipts: usize,
+    pub imported_workflows: usize,
+    pub imported_workflow_runs: usize,
+    pub workflows_imported: usize,
+    pub workflow_runs_imported: usize,
     pub published_registry_events: usize,
     pub published_revisions: usize,
     pub published_wire_messages: usize,
     pub published_wire_receipts: usize,
+    pub published_workflows: usize,
+    pub published_workflow_runs: usize,
     pub active_conflicts: usize,
 }
 
@@ -76,6 +83,8 @@ pub struct StateVerifyReport {
     pub verified_registry_events: usize,
     pub verified_wire_messages: usize,
     pub verified_wire_receipts: usize,
+    pub verified_workflows: usize,
+    pub verified_workflow_runs: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -111,6 +120,11 @@ pub enum StateSyncError {
 
 /// First 32 lowercase hex chars of SHA-256 of the canonical `StateId` IRI string (spec §4.1).
 pub fn entry_id_hash(id: &StateId) -> String {
+    workflow_id_hash(&id.0)
+}
+
+/// First 32 lowercase hex chars of SHA-256 of a canonical workflow or workflow run IRI string.
+pub fn workflow_id_hash(id: &Iri) -> String {
     let mut hasher = Sha256::new();
     hasher.update(id.as_str().as_bytes());
     let digest = hasher.finalize();
@@ -137,6 +151,12 @@ struct BranchSnapshot {
     /// `wire/receipts/<seg>.jsonl` -> raw bytes
     wire_receipt_segments: BTreeMap<u32, Vec<u8>>,
     wire_receipts: Vec<DeliveryReceipt>,
+    /// `workflows/<hash>.json` (`<hash>.json`) -> raw bytes
+    workflows_raw: BTreeMap<String, Vec<u8>>,
+    workflows: Vec<WorkflowDef>,
+    /// `workflow_runs/<hash>.json` (`<hash>.json`) -> raw bytes
+    workflow_runs_raw: BTreeMap<String, Vec<u8>>,
+    workflow_runs: Vec<WorkflowRun>,
 }
 
 fn wire_message_rel_path(id: &MessageId) -> String {
@@ -351,6 +371,60 @@ fn load_snapshot(
                         });
                     }
                     snap.wire_receipt_segments.insert(seg, raw);
+                } else if let Some(fname) = other.strip_prefix("workflows/") {
+                    let text = String::from_utf8(raw.clone()).map_err(|e| {
+                        StateSyncError::CorruptJsonl {
+                            path: other.to_owned(),
+                            line: 1,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let def: WorkflowDef =
+                        serde_json::from_str(&text).map_err(|e| StateSyncError::CorruptJsonl {
+                            path: other.to_owned(),
+                            line: 1,
+                            reason: e.to_string(),
+                        })?;
+                    let expected_fname = format!("{}.json", workflow_id_hash(&def.id.0));
+                    if fname != expected_fname {
+                        return Err(StateSyncError::HistoryTampered {
+                            commit: commit.to_owned(),
+                            path: other.to_owned(),
+                            reason: format!(
+                                "workflow `{}` belongs at `workflows/{expected_fname}`, not `{other}`",
+                                def.id
+                            ),
+                        });
+                    }
+                    snap.workflows.push(def);
+                    snap.workflows_raw.insert(fname.to_owned(), raw);
+                } else if let Some(fname) = other.strip_prefix("workflow_runs/") {
+                    let text = String::from_utf8(raw.clone()).map_err(|e| {
+                        StateSyncError::CorruptJsonl {
+                            path: other.to_owned(),
+                            line: 1,
+                            reason: e.to_string(),
+                        }
+                    })?;
+                    let run: WorkflowRun =
+                        serde_json::from_str(&text).map_err(|e| StateSyncError::CorruptJsonl {
+                            path: other.to_owned(),
+                            line: 1,
+                            reason: e.to_string(),
+                        })?;
+                    let expected_fname = format!("{}.json", workflow_id_hash(&run.id.0));
+                    if fname != expected_fname {
+                        return Err(StateSyncError::HistoryTampered {
+                            commit: commit.to_owned(),
+                            path: other.to_owned(),
+                            reason: format!(
+                                "workflow run `{}` belongs at `workflow_runs/{expected_fname}`, not `{other}`",
+                                run.id
+                            ),
+                        });
+                    }
+                    snap.workflow_runs.push(run);
+                    snap.workflow_runs_raw.insert(fname.to_owned(), raw);
                 }
             }
         }
@@ -434,6 +508,26 @@ fn verify_append_only_step(
                 commit: commit.to_owned(),
                 path,
                 reason: "wire receipt segment file was modified or truncated".into(),
+            });
+        }
+    }
+    for fname in prev.workflows_raw.keys() {
+        let path = format!("workflows/{fname}");
+        if !next.workflows_raw.contains_key(fname) {
+            return Err(StateSyncError::HistoryTampered {
+                commit: commit.to_owned(),
+                path,
+                reason: "workflow file was deleted".into(),
+            });
+        }
+    }
+    for fname in prev.workflow_runs_raw.keys() {
+        let path = format!("workflow_runs/{fname}");
+        if !next.workflow_runs_raw.contains_key(fname) {
+            return Err(StateSyncError::HistoryTampered {
+                commit: commit.to_owned(),
+                path,
+                reason: "workflow run file was deleted".into(),
             });
         }
     }
@@ -612,6 +706,46 @@ fn write_snapshot_tree(
         });
     }
 
+    if !snap.workflows_raw.is_empty() {
+        let mut wf_entries = Vec::new();
+        for (fname, bytes) in &snap.workflows_raw {
+            let oid = Git::hash_object(repo_dir, bytes)?;
+            wf_entries.push(GitTreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                oid,
+                path: fname.clone(),
+            });
+        }
+        let wf_tree_oid = Git::mktree(repo_dir, &wf_entries)?;
+        root_entries.push(GitTreeEntry {
+            mode: "040000".into(),
+            kind: "tree".into(),
+            oid: wf_tree_oid,
+            path: "workflows".into(),
+        });
+    }
+
+    if !snap.workflow_runs_raw.is_empty() {
+        let mut run_entries = Vec::new();
+        for (fname, bytes) in &snap.workflow_runs_raw {
+            let oid = Git::hash_object(repo_dir, bytes)?;
+            run_entries.push(GitTreeEntry {
+                mode: "100644".into(),
+                kind: "blob".into(),
+                oid,
+                path: fname.clone(),
+            });
+        }
+        let runs_tree_oid = Git::mktree(repo_dir, &run_entries)?;
+        root_entries.push(GitTreeEntry {
+            mode: "040000".into(),
+            kind: "tree".into(),
+            oid: runs_tree_oid,
+            path: "workflow_runs".into(),
+        });
+    }
+
     Ok(Git::mktree(repo_dir, &root_entries)?)
 }
 
@@ -670,7 +804,7 @@ pub fn sync_state<S>(
     now: At,
 ) -> Result<StateSyncReport, StateSyncError>
 where
-    S: StateStore + AgentRegistry + MessageStore,
+    S: StateStore + AgentRegistry + MessageStore + WorkflowStore,
 {
     let local_tracking_ref = format!("refs/fl-sync/{}/{}", target.remote, target.branch);
     let cursor_key = target.cursor_key();
@@ -771,6 +905,34 @@ where
         } else {
             (0, 0)
         };
+
+        let mut imported_workflows = 0usize;
+        for def in &base_snapshot.workflows {
+            let should_import = match store.get_workflow_def(&def.id)? {
+                None => true,
+                Some(local) => &local != def,
+            };
+            if should_import {
+                store.import_workflow_def(def.clone())?;
+                imported_workflows += 1;
+            }
+        }
+
+        let mut imported_workflow_runs = 0usize;
+        for run in &base_snapshot.workflow_runs {
+            let should_import = match store.get_workflow_run(&run.id)? {
+                None => true,
+                Some(local) => {
+                    &local != run
+                        && (run.total_steps_executed, &run.updated_at)
+                            > (local.total_steps_executed, &local.updated_at)
+                }
+            };
+            if should_import {
+                store.import_workflow_run(run.clone())?;
+                imported_workflow_runs += 1;
+            }
+        }
 
         // Step 4: Collect unpublished local events/revisions/wire records and enforce sensitivity guard.
         if !target.private {
@@ -910,10 +1072,36 @@ where
                 )
             };
 
+        let mut desired_workflows_raw = base_snapshot.workflows_raw.clone();
+        let mut published_workflows = 0usize;
+        for def in store.list_workflow_defs(None)? {
+            let fname = format!("{}.json", workflow_id_hash(&def.id.0));
+            let mut raw = serde_json::to_vec_pretty(&def).expect("WorkflowDef serializes");
+            raw.push(b'\n');
+            if desired_workflows_raw.get(&fname) != Some(&raw) {
+                desired_workflows_raw.insert(fname, raw);
+                published_workflows += 1;
+            }
+        }
+
+        let mut desired_workflow_runs_raw = base_snapshot.workflow_runs_raw.clone();
+        let mut published_workflow_runs = 0usize;
+        for run in store.list_workflow_runs(None, None)? {
+            let fname = format!("{}.json", workflow_id_hash(&run.id.0));
+            let mut raw = serde_json::to_vec_pretty(&run).expect("WorkflowRun serializes");
+            raw.push(b'\n');
+            if desired_workflow_runs_raw.get(&fname) != Some(&raw) {
+                desired_workflow_runs_raw.insert(fname, raw);
+                published_workflow_runs += 1;
+            }
+        }
+
         if unpublished_revs.is_empty()
             && unpublished_reg_events.is_empty()
             && unpublished_wire_msgs.is_empty()
             && unpublished_wire_rcpts.is_empty()
+            && published_workflows == 0
+            && published_workflow_runs == 0
         {
             let new_cursor = StateSyncCursor {
                 remote: cursor_key,
@@ -935,15 +1123,23 @@ where
                 imported_revisions,
                 imported_wire_messages,
                 imported_wire_receipts,
+                imported_workflows,
+                imported_workflow_runs,
+                workflows_imported: imported_workflows,
+                workflow_runs_imported: imported_workflow_runs,
                 published_registry_events: 0,
                 published_revisions: 0,
                 published_wire_messages: 0,
                 published_wire_receipts: 0,
+                published_workflows: 0,
+                published_workflow_runs: 0,
                 active_conflicts,
             });
         }
 
         let mut next_snapshot = base_snapshot.clone();
+        next_snapshot.workflows_raw = desired_workflows_raw;
+        next_snapshot.workflow_runs_raw = desired_workflow_runs_raw;
         if target.sync_registry {
             for ev in &unpublished_reg_events {
                 let mut line = serde_json::to_string(ev).unwrap();
@@ -1022,10 +1218,16 @@ where
                     imported_revisions,
                     imported_wire_messages,
                     imported_wire_receipts,
+                    imported_workflows,
+                    imported_workflow_runs,
+                    workflows_imported: imported_workflows,
+                    workflow_runs_imported: imported_workflow_runs,
                     published_registry_events: unpublished_reg_events.len(),
                     published_revisions: unpublished_revs.len(),
                     published_wire_messages: unpublished_wire_msgs.len(),
                     published_wire_receipts: unpublished_wire_rcpts.len(),
+                    published_workflows,
+                    published_workflow_runs,
                     active_conflicts,
                 });
             }
@@ -1045,7 +1247,7 @@ pub fn verify_state<S>(
     target: &StateSyncTarget,
 ) -> Result<StateVerifyReport, StateSyncError>
 where
-    S: StateStore + AgentRegistry + MessageStore,
+    S: StateStore + AgentRegistry + MessageStore + WorkflowStore,
 {
     let local_tracking_ref = format!("refs/fl-sync/{}/{}", target.remote, target.branch);
     let cursor_key = target.cursor_key();
@@ -1071,6 +1273,8 @@ where
             verified_registry_events: 0,
             verified_wire_messages: 0,
             verified_wire_receipts: 0,
+            verified_workflows: 0,
+            verified_workflow_runs: 0,
         });
     };
 
@@ -1191,6 +1395,8 @@ where
         verified_registry_events: prev.registry_events.len(),
         verified_wire_messages: prev.wire_messages.len(),
         verified_wire_receipts: prev.wire_receipts.len(),
+        verified_workflows: prev.workflows.len(),
+        verified_workflow_runs: prev.workflow_runs.len(),
     })
 }
 
@@ -1966,5 +2172,179 @@ mod tests {
         let err = verify_state(&store, &target).unwrap_err();
         assert!(matches!(err, StateSyncError::HistoryTampered { .. }));
         let _ = msg;
+    }
+
+    #[test]
+    fn two_stores_sync_workflows_and_workflow_runs_over_fl_state() {
+        use fl_core::ids::{WorkflowId, WorkflowRunId};
+        use fl_core::store::Catalog;
+        use fl_core::workflow::{
+            AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS,
+            DEFAULT_STEP_MAX_VISITS, END_STEP, EdgeCondition, EdgeDef, JoinPolicy,
+            StepAttemptReport, StepCompletion, StepDef, StepOutcome, WorkflowDef, WorkflowRun,
+            WorkflowRunStatus, advance_workflow,
+        };
+
+        let (_tmp, clone_a, clone_b) = setup_two_clones();
+        let store_a = MemStore::default();
+        let store_b = MemStore::default();
+
+        let proj_id = store_a
+            .add_project(&clone_a.display().to_string())
+            .unwrap();
+
+        let wf_def = store_a
+            .upsert_workflow_def(WorkflowDef {
+                id: WorkflowId(Iri::parse("fl:workflow:placeholder").unwrap()),
+                project: proj_id,
+                slug: "feature-dev".into(),
+                title: "Feature Development".into(),
+                start_step: "implement".into(),
+                steps: vec![
+                    StepDef {
+                        step_id: "implement".into(),
+                        title: "Implement".into(),
+                        prompt: "Build feature".into(),
+                        assignee: AssigneeRule::Manual,
+                        reviews_step: None,
+                        require_different_vendor: false,
+                        completion: StepCompletion::Ungated,
+                        join_policy: JoinPolicy::All,
+                        max_attempts: DEFAULT_STEP_MAX_ATTEMPTS,
+                        max_visits: DEFAULT_STEP_MAX_VISITS,
+                        budget_usd_micros: None,
+                        max_tokens: None,
+                        isolate_worktree: false,
+                    },
+                    StepDef {
+                        step_id: "review".into(),
+                        title: "Review".into(),
+                        prompt: "Review feature".into(),
+                        assignee: AssigneeRule::Manual,
+                        reviews_step: None,
+                        require_different_vendor: false,
+                        completion: StepCompletion::Ungated,
+                        join_policy: JoinPolicy::All,
+                        max_attempts: DEFAULT_STEP_MAX_ATTEMPTS,
+                        max_visits: DEFAULT_STEP_MAX_VISITS,
+                        budget_usd_micros: None,
+                        max_tokens: None,
+                        isolate_worktree: false,
+                    },
+                ],
+                edges: vec![
+                    EdgeDef {
+                        from_step: "implement".into(),
+                        to_step: "review".into(),
+                        on: EdgeCondition::Pass,
+                    },
+                    EdgeDef {
+                        from_step: "review".into(),
+                        to_step: END_STEP.into(),
+                        on: EdgeCondition::Pass,
+                    },
+                ],
+                max_total_steps: DEFAULT_MAX_TOTAL_STEPS,
+                budget_usd_micros: None,
+                max_tokens: None,
+                declared_keys: BTreeMap::new(),
+                authored_at_commit: "deadbeef".into(),
+                authored_by: "jarvis".into(),
+            })
+            .unwrap();
+
+        let wf_run = store_a
+            .create_workflow_run(
+                WorkflowRun::new(
+                    WorkflowRunId(Iri::parse("fl:workflow-run:run1").unwrap()),
+                    &wf_def,
+                    "Ship workflow sync",
+                    At::from_unix_millis(110),
+                    "jarvis",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let target_a = StateSyncTarget {
+            repo_dir: clone_a.clone(),
+            remote: "origin".into(),
+            branch: "fl/state".into(),
+            private: false,
+            sync_registry: false,
+            sync_wire: false,
+            scope_filter: None,
+            by: "jarvis".into(),
+        };
+        let target_b = StateSyncTarget {
+            repo_dir: clone_b.clone(),
+            remote: "origin".into(),
+            branch: "fl/state".into(),
+            private: false,
+            sync_registry: false,
+            sync_wire: false,
+            scope_filter: None,
+            by: "kayla".into(),
+        };
+
+        let rep_a1 = sync_state(&store_a, &target_a, At::from_unix_millis(120)).unwrap();
+        assert_eq!(rep_a1.published_workflows, 1);
+        assert_eq!(rep_a1.published_workflow_runs, 1);
+
+        // Store B syncs and imports the workflow definition and active run.
+        let rep_b1 = sync_state(&store_b, &target_b, At::from_unix_millis(130)).unwrap();
+        assert_eq!(rep_b1.imported_workflows, 1);
+        assert_eq!(rep_b1.imported_workflow_runs, 1);
+        assert_eq!(rep_b1.workflows_imported, 1);
+        assert_eq!(rep_b1.workflow_runs_imported, 1);
+
+        let def_b = store_b
+            .get_workflow_def(&wf_def.id)
+            .unwrap()
+            .expect("workflow def synced to store B");
+        assert_eq!(def_b.slug, "feature-dev");
+
+        let mut run_b = store_b
+            .get_workflow_run(&wf_run.id)
+            .unwrap()
+            .expect("workflow run synced to store B");
+        assert_eq!(run_b.active_steps, vec!["implement".to_string()]);
+
+        // Advance `implement` -> `review` on Store B and sync back to `fl/state`.
+        advance_workflow(
+            &def_b,
+            &mut run_b,
+            StepAttemptReport {
+                step_id: "implement".into(),
+                outcome: StepOutcome::Pass,
+                attempt_iri: None,
+                tokens_used: 0,
+                cost_usd_micros: 0,
+                reason: None,
+            },
+            At::from_unix_millis(140),
+        )
+        .unwrap();
+        store_b.update_workflow_run(run_b).unwrap();
+
+        let rep_b2 = sync_state(&store_b, &target_b, At::from_unix_millis(150)).unwrap();
+        assert_eq!(rep_b2.published_workflows, 0);
+        assert_eq!(rep_b2.published_workflow_runs, 1);
+
+        // Store A syncs and observes the advanced run state (`review` active).
+        let rep_a2 = sync_state(&store_a, &target_a, At::from_unix_millis(160)).unwrap();
+        assert_eq!(rep_a2.imported_workflow_runs, 1);
+
+        let run_a = store_a
+            .get_workflow_run(&wf_run.id)
+            .unwrap()
+            .expect("updated workflow run on store A");
+        assert_eq!(run_a.status, WorkflowRunStatus::Running);
+        assert_eq!(run_a.active_steps, vec!["review".to_string()]);
+        assert_eq!(run_a.total_steps_executed, 1);
+
+        let ver = verify_state(&store_a, &target_a).unwrap();
+        assert_eq!(ver.verified_workflows, 1);
+        assert_eq!(ver.verified_workflow_runs, 1);
     }
 }

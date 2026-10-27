@@ -475,7 +475,14 @@ impl MessageStore for RedbStore {
             .thread_id
             .or(parent_thread)
             .unwrap_or_else(|| msg_id.clone());
-        let durable = args.durable || matches!(args.kind, MessageKind::Ask | MessageKind::Handoff);
+        let durable = args.durable
+            || matches!(
+                args.kind,
+                MessageKind::Ask
+                    | MessageKind::Handoff
+                    | MessageKind::TaskOffer
+                    | MessageKind::ApprovalRequest
+            );
 
         let all_agents = self.all_agents_in_wtx(&tx)?;
         let sender_id = args.sender_id.or_else(|| {

@@ -134,6 +134,8 @@ pub enum MessageKind {
     Ask,
     Reply,
     Handoff,
+    TaskOffer,
+    ApprovalRequest,
     System,
 }
 
@@ -142,6 +144,8 @@ crate::wire::wire_names!(MessageKind as message_kind_wire {
     Ask => "ask",
     Reply => "reply",
     Handoff => "handoff",
+    TaskOffer => "task_offer",
+    ApprovalRequest => "approval_request",
     System => "system",
 });
 crate::wire::wire_parse!(MessageKind as message_kind_parse);
