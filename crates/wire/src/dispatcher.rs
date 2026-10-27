@@ -117,13 +117,27 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 .unwrap_or_default();
 
             let title = format!("--title={}", format_push_header(msg));
+            let delivered_body = if msg.sender_name.eq_ignore_ascii_case("owner")
+                || msg.sender_name.eq_ignore_ascii_case("lmcfarlin")
+            {
+                if msg.body.starts_with("[Operator Prompt via FerroDeck") {
+                    msg.body.clone()
+                } else {
+                    format!(
+                        "[Operator Prompt via FerroDeck — from {}]\n\n{}",
+                        msg.sender_name, msg.body
+                    )
+                }
+            } else {
+                format_push_message(msg)
+            };
             let mut cmd = Command::new(&exe);
             cmd.args([
                 "agentapi",
                 "send-message",
                 &title,
                 conversation_id,
-                &msg.body,
+                &delivered_body,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());

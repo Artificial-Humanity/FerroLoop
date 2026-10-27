@@ -177,8 +177,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
     }
   };
 
-  const handleComposeSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const submitCompose = async () => {
     const targetTo = (customRecipient.trim() || toRecipient.trim()).toLowerCase();
     const trimmedSubject = subject.trim();
     const trimmedBody = body.trim();
@@ -265,6 +264,14 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           <input
             type="search"
+            name="fd-wire-search"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            data-1p-ignore="true"
+            data-lpignore="true"
+            data-form-type="other"
             className="fd-input"
             placeholder="Search subject, body, sender..."
             aria-label="Search FerroWire messages"
@@ -471,8 +478,9 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
         </div>
 
         {/* Right Column: Compose FerroWire Message Panel */}
-        <form
-          onSubmit={handleComposeSubmit}
+        <div
+          role="region"
+          aria-label="Compose FerroWire Message"
           className="fd-card"
           data-testid="wire-compose-form"
           style={{
@@ -516,6 +524,14 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
             </span>
             <input
               type="text"
+              name="fd-wire-custom-recipient"
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-form-type="other"
               aria-label="Custom Address Override"
               className="fd-input fd-mono"
               placeholder="e.g. kacey or agents.all"
@@ -541,6 +557,13 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
             <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Message Subject</span>
             <input
               type="text"
+              name="fd-wire-subject"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-form-type="other"
               aria-label="Message Subject"
               className="fd-input"
               placeholder="Subject line"
@@ -553,6 +576,13 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
             <span style={{ color: "var(--text-muted)", fontWeight: 600 }}>Message Body</span>
             <textarea
               rows={4}
+              name="fd-wire-body"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+              data-1p-ignore="true"
+              data-lpignore="true"
+              data-form-type="other"
               aria-label="Message Body"
               className="fd-textarea"
               placeholder="Write your FerroWire message..."
@@ -563,13 +593,14 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
           </label>
 
           <button
-            type="submit"
+            type="button"
             className="fd-btn fd-btn-primary"
+            onClick={() => void submitCompose()}
             disabled={sending || !subject.trim() || !body.trim()}
           >
             {sending ? "Sending..." : "Send Message"}
           </button>
-        </form>
+        </div>
       </div>
     </section>
   );

@@ -27,6 +27,7 @@ export interface AgentRecord {
   project: string;
   role: string;
   status: string;
+  reports_to?: string | null;
   extra_areas?: string[];
   covered_areas?: string[];
   updated_at?: string;
@@ -129,17 +130,32 @@ export interface SessionTranscriptResponse {
   turns: TranscriptTurn[];
 }
 
+export interface PromptAttachment {
+  name: string;
+  media_type: string;
+  data_base64: string;
+}
+
+export interface SavedPromptAttachment {
+  name: string;
+  media_type: string;
+  path: string;
+  url: string;
+}
+
 export interface PromptRequest {
   prompt: string;
   by?: string;
   urgency?: "normal" | "urgent";
   subject?: string;
+  attachments?: PromptAttachment[];
 }
 
 export interface PromptResponse {
   session_id: string;
   message: WireMessage;
   receipts: WireReceipt[];
+  attachments?: SavedPromptAttachment[];
 }
 
 export interface WorktreeSummary {
@@ -577,6 +593,17 @@ export const DEFAULT_WORKSPACE_AGENTS: AgentRecord[] = [
     covered_areas: ["FerroLoop"],
   },
   {
+    id: "urn:fl:agent:felicia",
+    name_key: "felicia",
+    display_name: "Felicia",
+    email: "felicia@artificialhumanity.io",
+    project: "FerroLoop",
+    role: "assistant",
+    status: "active",
+    reports_to: "ferris",
+    covered_areas: ["FerroLoop"],
+  },
+  {
     id: "urn:fl:agent:kayla",
     name_key: "kayla",
     display_name: "Kayla",
@@ -584,6 +611,17 @@ export const DEFAULT_WORKSPACE_AGENTS: AgentRecord[] = [
     project: "Kaggle-Gemma4",
     role: "lead",
     status: "active",
+    covered_areas: ["Kaggle-Gemma4"],
+  },
+  {
+    id: "urn:fl:agent:kacey",
+    name_key: "kacey",
+    display_name: "Kacey",
+    email: "kacey@artificialhumanity.io",
+    project: "Kaggle-Gemma4",
+    role: "assistant",
+    status: "active",
+    reports_to: "kayla",
     covered_areas: ["Kaggle-Gemma4"],
   },
   {

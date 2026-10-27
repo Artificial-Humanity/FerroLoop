@@ -1,9 +1,12 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
-import { ChatPane } from "../components/ChatPane";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ChatPane, sessionScrollMemory } from "../components/ChatPane";
 import type { TranscriptTurn } from "../types/api";
 
 describe("ChatPane", () => {
+  beforeEach(() => {
+    sessionScrollMemory.clear();
+  });
   const sampleTurns: TranscriptTurn[] = [
     {
       index: 0,
@@ -175,5 +178,236 @@ describe("ChatPane", () => {
         subject: undefined,
       });
     });
+  });
+
+  it("auto-scrolls scrollTop to scrollHeight when turns load or sessionId changes, and remembers scroll position per session", () => {
+    const { container, rerender } = render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-1"
+        turns={[]}
+        wsConnected={true}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const scrollDiv = container.querySelector(".fd-scroll") as HTMLDivElement;
+    expect(scrollDiv).toBeTruthy();
+
+    Object.defineProperty(scrollDiv, "scrollHeight", {
+      configurable: true,
+      value: 920,
+    });
+    Object.defineProperty(scrollDiv, "clientHeight", {
+      configurable: true,
+      value: 300,
+    });
+    scrollDiv.scrollTop = 0;
+
+    // Initial load of turns should auto-scroll to bottom
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-1"
+        turns={sampleTurns}
+        wsConnected={true}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+    expect(scrollDiv.scrollTop).toBe(920);
+
+    // Simulate user scrolling up in sess-1 (not pinned to bottom)
+    scrollDiv.scrollTop = 180;
+    fireEvent.scroll(scrollDiv);
+
+    // Switch to sess-2 (first visit -> should jump to bottom)
+    Object.defineProperty(scrollDiv, "scrollHeight", {
+      configurable: true,
+      value: 1450,
+    });
+
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-2"
+        turns={sampleTurns}
+        wsConnected={true}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+    expect(scrollDiv.scrollTop).toBe(1450);
+
+    // Switch back to sess-1 -> should restore saved scrollTop (180)
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-1"
+        turns={sampleTurns}
+        wsConnected={true}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+    expect(scrollDiv.scrollTop).toBe(180);
+  });
+
+  it("applies anti-autofill attributes and renders composer as non-form region", () => {
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={sampleTurns}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const composer = screen.getByTestId("prompt-composer");
+    expect(composer.tagName.toLowerCase()).toBe("div");
+    expect(composer).toHaveAttribute("role", "region");
+
+    const filterInput = screen.getByLabelText("Filter transcript");
+    const subjectInput = screen.getByLabelText("Prompt Subject");
+    const promptTextarea = screen.getByLabelText("Prompt Message");
+
+    for (const el of [filterInput, subjectInput, promptTextarea]) {
+      expect(el).toHaveAttribute("autocomplete", "off");
+      expect(el).toHaveAttribute("data-1p-ignore", "true");
+      expect(el).toHaveAttribute("data-lpignore", "true");
+      expect(el).toHaveAttribute("data-form-type", "other");
+    }
+  });
+
+  it("attaches a file via prompt-file-input, shows attachment chip, and submits attachments in PromptRequest", async () => {
+    const onSendPrompt = vi.fn(async () => {});
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={[]}
+        onSendPrompt={onSendPrompt}
+      />,
+    );
+
+    const fileInput = screen.getByTestId("prompt-file-input") as HTMLInputElement;
+    const file = new File(["PNGDATA"], "screenshot.png", { type: "image/png" });
+
+    fireEvent.change(fileInput, { target: { files: [file] } });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("attachment-chip-list")).toBeInTheDocument();
+      expect(screen.getByText("screenshot.png")).toBeInTheDocument();
+    });
+
+    const sendButton = screen.getByRole("button", { name: /Send Prompt/i });
+    expect(sendButton).not.toBeDisabled();
+    fireEvent.click(sendButton);
+
+    await waitFor(() => {
+      expect(onSendPrompt).toHaveBeenCalledWith(
+        "sess-ferris-01",
+        expect.objectContaining({
+          prompt: "Attached file(s).",
+          urgency: "normal",
+          attachments: [
+            expect.objectContaining({
+              name: "screenshot.png",
+              media_type: "image/png",
+              data_base64: btoa("PNGDATA"),
+            }),
+          ],
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("attachment-chip-list")).toBeNull();
+    });
+  });
+
+  it("renders Operator for user turns, Wire · sender for wire turns, and inline attachment image previews", () => {
+    const turnsWithWireAndAttachment: TranscriptTurn[] = [
+      {
+        index: 0,
+        role: "user",
+        content: "Here is the iPad screenshot.\n[Attached file: /tmp/shot.png (/api/v1/attachments/shot.png)]",
+        thinking: null,
+        tool_calls: [],
+      },
+      {
+        index: 1,
+        role: "wire:jarvis",
+        content: "Lab Manager review complete.",
+        thinking: null,
+        tool_calls: [],
+      },
+    ];
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={turnsWithWireAndAttachment}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Operator")).toBeInTheDocument();
+    expect(screen.getByText("Wire · jarvis")).toBeInTheDocument();
+
+    const attachmentsBlock = screen.getByTestId("turn-attachments-0");
+    expect(attachmentsBlock).toBeInTheDocument();
+    const img = attachmentsBlock.querySelector("img") as HTMLImageElement;
+    expect(img).toBeTruthy();
+    expect(img.getAttribute("src")).toBe("/api/v1/attachments/shot.png");
+    expect(img.getAttribute("alt")).toBe("shot.png");
+  });
+
+  it("renders tool/terminal output turns collapsed by default with ▶ and expands when clicked", () => {
+    const toolTurns: TranscriptTurn[] = [
+      {
+        index: 0,
+        role: "tool",
+        content:
+          "Created At: 2026-10-27T15:30:00Z\nCommand exited with code 0.\n\nCommand output:\ncargo test passed 42 tests",
+        thinking: null,
+        tool_calls: [],
+      },
+    ];
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={toolTurns}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Tool Output")).toBeInTheDocument();
+    const toggleBtn = screen.getByTestId("turn-tool-output-toggle-0");
+    expect(toggleBtn).toHaveAttribute("aria-expanded", "false");
+    expect(toggleBtn.textContent).toContain("▶");
+    expect(screen.queryByText(/cargo test passed 42 tests/i)).toBeNull();
+
+    fireEvent.click(toggleBtn);
+    expect(toggleBtn).toHaveAttribute("aria-expanded", "true");
+    expect(toggleBtn.textContent).toContain("▼");
+    expect(screen.getByText(/cargo test passed 42 tests/i)).toBeInTheDocument();
   });
 });

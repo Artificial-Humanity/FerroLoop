@@ -21,7 +21,7 @@ use crate::terminal::TerminalManager;
 use crate::{HubServerConfig, HubState, HubWsFrame};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const MAX_HTTP_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HTTP_REQUEST_BYTES: usize = 24 * 1024 * 1024;
 const MAX_WS_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 

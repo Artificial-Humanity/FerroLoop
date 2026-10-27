@@ -1,7 +1,14 @@
 import React from "react";
 import type { HubApiClient } from "../api/client";
-import type { PromptRequest, TranscriptTurn } from "../types/api";
+import type { PromptAttachment, PromptRequest, TranscriptTurn } from "../types/api";
 import { TurnCard } from "./TurnCard";
+
+export interface SessionScrollState {
+  scrollTop: number;
+  pinnedToBottom: boolean;
+}
+
+export const sessionScrollMemory = new Map<string, SessionScrollState>();
 
 export interface ChatPaneProps {
   agentName?: string | null;
@@ -11,12 +18,33 @@ export interface ChatPaneProps {
   turns?: TranscriptTurn[];
   loading?: boolean;
   error?: string | null;
+  wsConnected?: boolean;
   onRefresh?: () => void;
   onSendPrompt?: (
     targetSessionOrAgentId: string,
     payload: PromptRequest,
   ) => Promise<unknown> | void;
   apiClient?: HubApiClient;
+}
+
+function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const commaIdx = result.indexOf(",");
+      const data_base64 = commaIdx >= 0 ? result.slice(commaIdx + 1) : result;
+      resolve({
+        name: file.name || "attachment",
+        media_type: file.type || "application/octet-stream",
+        data_base64,
+      });
+    };
+    reader.onerror = () => {
+      reject(new Error(`Failed to read file ${file.name}`));
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 export const ChatPane: React.FC<ChatPaneProps> = ({
@@ -27,6 +55,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   turns,
   loading = false,
   error = null,
+  wsConnected = false,
   onRefresh,
   onSendPrompt,
   apiClient,
@@ -39,14 +68,76 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [promptText, setPromptText] = React.useState<string>("");
   const [urgency, setUrgency] = React.useState<"normal" | "urgent">("normal");
   const [subject, setSubject] = React.useState<string>("");
+  const [attachments, setAttachments] = React.useState<PromptAttachment[]>([]);
   const [submitting, setSubmitting] = React.useState<boolean>(false);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
 
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null);
+  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const prevTargetRef = React.useRef<string>("");
+  const prevWsConnectedRef = React.useRef<boolean>(Boolean(wsConnected));
+  const prevTurnCountRef = React.useRef<number>(0);
+  const isNearBottomRef = React.useRef<boolean>(true);
 
   const effectiveTurns = turns ?? internalTurns;
   const effectiveLoading = loading || internalLoading;
   const effectiveError = error ?? internalError;
+
+  const targetSessionOrAgent = sessionId || agentName || "";
+  const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
+
+  const scrollToBottom = React.useCallback(
+    (behavior: ScrollBehavior = "auto") => {
+      const el = scrollContainerRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+      if (typeof el.scrollTo === "function") {
+        el.scrollTo({ top: el.scrollHeight, behavior });
+      }
+      isNearBottomRef.current = true;
+      if (targetSessionOrAgent) {
+        sessionScrollMemory.set(targetSessionOrAgent, {
+          scrollTop: el.scrollHeight,
+          pinnedToBottom: true,
+        });
+      }
+    },
+    [targetSessionOrAgent],
+  );
+
+  const restoreOrScrollSession = React.useCallback(
+    (behavior: ScrollBehavior = "auto") => {
+      const el = scrollContainerRef.current;
+      if (!el) return;
+      const saved = targetSessionOrAgent
+        ? sessionScrollMemory.get(targetSessionOrAgent)
+        : undefined;
+      if (saved && !saved.pinnedToBottom) {
+        el.scrollTop = saved.scrollTop;
+        if (typeof el.scrollTo === "function") {
+          el.scrollTo({ top: saved.scrollTop, behavior: "auto" });
+        }
+        isNearBottomRef.current = false;
+      } else {
+        scrollToBottom(behavior);
+      }
+    },
+    [targetSessionOrAgent, scrollToBottom],
+  );
+
+  const handleScroll = () => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const pinnedToBottom = distanceFromBottom <= 120;
+    isNearBottomRef.current = pinnedToBottom;
+    if (targetSessionOrAgent) {
+      sessionScrollMemory.set(targetSessionOrAgent, {
+        scrollTop: el.scrollTop,
+        pinnedToBottom,
+      });
+    }
+  };
 
   const fetchTranscript = React.useCallback(async () => {
     if (!apiClient || turns !== undefined) {
@@ -90,27 +181,84 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     });
   }, [effectiveTurns, filterQuery]);
 
+  React.useEffect(() => {
+    const targetChanged = prevTargetRef.current !== targetSessionOrAgent;
+    const reconnected = !prevWsConnectedRef.current && Boolean(wsConnected);
+    const initialLoad = prevTurnCountRef.current === 0 && filteredTurns.length > 0;
+    const newTurnsArrived = filteredTurns.length > prevTurnCountRef.current;
+
+    if (targetChanged) {
+      prevTargetRef.current = targetSessionOrAgent;
+      if (filteredTurns.length > 0) {
+        restoreOrScrollSession("auto");
+      } else {
+        const saved = targetSessionOrAgent
+          ? sessionScrollMemory.get(targetSessionOrAgent)
+          : undefined;
+        isNearBottomRef.current = saved ? saved.pinnedToBottom : true;
+      }
+    } else if (reconnected || initialLoad) {
+      restoreOrScrollSession("auto");
+    } else if (newTurnsArrived && isNearBottomRef.current) {
+      scrollToBottom("auto");
+    }
+
+    prevWsConnectedRef.current = Boolean(wsConnected);
+    prevTurnCountRef.current = filteredTurns.length;
+  }, [
+    targetSessionOrAgent,
+    filteredTurns.length,
+    wsConnected,
+    scrollToBottom,
+    restoreOrScrollSession,
+  ]);
+
   const handleJumpToBottom = () => {
-    const el = scrollContainerRef.current;
-    if (el && typeof el.scrollTo === "function") {
-      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    scrollToBottom("smooth");
+  };
+
+  const readFilesAsAttachments = React.useCallback(async (files: FileList | File[]) => {
+    const fileArray = Array.from(files);
+    if (fileArray.length === 0) return;
+    try {
+      const loaded = await Promise.all(fileArray.map((f) => fileToPromptAttachment(f)));
+      setAttachments((prev) => [...prev, ...loaded]);
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to read attachment");
+    }
+  }, []);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (e.target.files && e.target.files.length > 0) {
+      void readFilesAsAttachments(e.target.files);
+      e.target.value = "";
     }
   };
 
-  const targetSessionOrAgent = sessionId || agentName || "";
-  const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
+  const handlePaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (e.clipboardData?.files && e.clipboardData.files.length > 0) {
+      e.preventDefault();
+      void readFilesAsAttachments(e.clipboardData.files);
+    }
+  };
+
+  const canSend =
+    (promptText.trim().length > 0 || attachments.length > 0) &&
+    !submitting &&
+    Boolean(targetSessionOrAgent);
 
   const submitPrompt = async () => {
     const trimmedPrompt = promptText.trim();
-    if (!trimmedPrompt || submitting || !targetSessionOrAgent) {
+    if ((!trimmedPrompt && attachments.length === 0) || submitting || !targetSessionOrAgent) {
       return;
     }
 
     const trimmedSubject = subject.trim();
     const payload: PromptRequest = {
-      prompt: trimmedPrompt,
+      prompt: trimmedPrompt || "Attached file(s).",
       urgency,
       subject: trimmedSubject.length > 0 ? trimmedSubject : undefined,
+      ...(attachments.length > 0 ? { attachments } : {}),
     };
 
     setSubmitting(true);
@@ -124,6 +272,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       setPromptText("");
       setSubject("");
+      setAttachments([]);
+      scrollToBottom("smooth");
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : "Failed to send prompt");
     } finally {
@@ -136,11 +286,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       e.preventDefault();
       void submitPrompt();
     }
-  };
-
-  const handleFormSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    void submitPrompt();
   };
 
   return (
@@ -161,6 +306,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
           <input
             type="search"
+            name="fd-transcript-filter"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            data-1p-ignore="true"
+            data-lpignore="true"
+            data-form-type="other"
             className="fd-input"
             placeholder="Filter transcript turns, tools, or reasoning..."
             aria-label="Filter transcript"
@@ -204,6 +357,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       {/* Transcript Stream */}
       <div
         ref={scrollContainerRef}
+        onScroll={handleScroll}
         className="fd-scroll"
         style={{
           display: "flex",
@@ -269,9 +423,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       </div>
 
       {/* Unified Prompt Composer */}
-      <form
-        onSubmit={handleFormSubmit}
+      <div
+        role="region"
+        aria-label="Prompt Composer"
         data-testid="prompt-composer"
+        onDragOver={(e) => e.preventDefault()}
+        onDrop={(e) => {
+          if (e.dataTransfer?.files?.length) {
+            e.preventDefault();
+            void readFilesAsAttachments(e.dataTransfer.files);
+          }
+        }}
         style={{
           borderTop: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
@@ -318,24 +480,124 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
           <input
             type="text"
+            name="fd-dispatch-tag"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+            data-1p-ignore="true"
+            data-lpignore="true"
+            data-form-type="other"
             aria-label="Prompt Subject"
             placeholder="Optional subject (defaults to cockpit prompt)"
             className="fd-input"
             value={subject}
             onChange={(e) => setSubject(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void submitPrompt();
+              }
+            }}
             style={{ flex: 1, minWidth: "180px", fontSize: "12px", padding: "5px 9px" }}
           />
+
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.json,.log"
+            multiple
+            style={{ display: "none" }}
+            data-testid="prompt-file-input"
+            onChange={handleFileChange}
+          />
+          <button
+            type="button"
+            className="fd-btn"
+            data-testid="prompt-attach-btn"
+            onClick={() => fileInputRef.current?.click()}
+            style={{ fontSize: "12px", padding: "5px 10px" }}
+          >
+            + Attach
+          </button>
         </div>
+
+        {attachments.length > 0 && (
+          <div
+            data-testid="attachment-chip-list"
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              gap: "6px",
+              alignItems: "center",
+            }}
+          >
+            {attachments.map((att, idx) => (
+              <div
+                key={`${att.name}-${idx}`}
+                className="fd-badge"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  padding: "4px 8px",
+                }}
+              >
+                {att.media_type.startsWith("image/") && (
+                  <img
+                    src={`data:${att.media_type};base64,${att.data_base64}`}
+                    alt={att.name}
+                    style={{
+                      width: "20px",
+                      height: "20px",
+                      objectFit: "cover",
+                      borderRadius: "2px",
+                    }}
+                  />
+                )}
+                <span>{att.name}</span>
+                <button
+                  type="button"
+                  data-testid={`remove-attachment-${idx}`}
+                  aria-label={`Remove ${att.name}`}
+                  onClick={() =>
+                    setAttachments((prev) => prev.filter((_, i) => i !== idx))
+                  }
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color: "var(--text-muted)",
+                    cursor: "pointer",
+                    padding: 0,
+                    fontSize: "11px",
+                  }}
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
 
         <div style={{ display: "flex", gap: "8px", alignItems: "flex-end" }}>
           <textarea
             rows={2}
+            name="fd-dispatch-command"
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="sentences"
+            spellCheck={false}
+            enterKeyHint="send"
+            data-1p-ignore="true"
+            data-lpignore="true"
+            data-form-type="other"
             aria-label="Prompt Message"
             placeholder={`Send a prompt to ${displayTarget}... (Ctrl+Enter to send)`}
             className="fd-textarea"
             value={promptText}
             onChange={(e) => setPromptText(e.target.value)}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             style={{
               flex: 1,
               resize: "vertical",
@@ -346,15 +608,16 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           />
 
           <button
-            type="submit"
+            type="button"
             className="fd-btn fd-btn-primary"
-            disabled={submitting || !promptText.trim() || !targetSessionOrAgent}
+            disabled={!canSend}
+            onClick={() => void submitPrompt()}
             style={{ height: "38px", padding: "0 16px" }}
           >
             {submitting ? "Sending..." : "Send Prompt"}
           </button>
         </div>
-      </form>
+      </div>
     </section>
   );
 };
