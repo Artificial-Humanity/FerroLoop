@@ -253,6 +253,13 @@ pub fn resolve_socket_path(env: &StateEnv<'_>, explicit: Option<&Path>) -> PathB
     if let Some(p) = env.cfg.wire.as_ref().and_then(|w| w.socket.clone()) {
         return p;
     }
+    if let Some(dir) = env
+        .explicit_db
+        .and_then(|p| p.parent())
+        .filter(|d| !d.as_os_str().is_empty())
+    {
+        return dir.join("fl-wire.sock");
+    }
     default_socket_path()
 }
 
@@ -280,7 +287,12 @@ pub fn resolve_caller(
     let reg = store.as_ref().map(|s| s as &dyn AgentRegistry);
     let rpath = resolve_routes_path_for(env);
     let persona = resolve_persona(explicit, transcript, env.cwd, reg, rpath.as_deref());
+    let has_env_persona_override =
+        std::env::var_os("AGENT_PERSONA").is_some() || std::env::var_os("AGENT_NAME").is_some();
+    let allow_route_capture = env.explicit_db.is_none() || resolve_routes_path().is_some();
     if explicit.is_none()
+        && !has_env_persona_override
+        && allow_route_capture
         && persona != "unknown"
         && let Some(route) = capture_current_env_route()
     {
