@@ -41,6 +41,10 @@ struct PrFixture {
 
 impl PrFixture {
     fn new(shared_store: bool) -> Self {
+        Self::with_credential(shared_store, "env")
+    }
+
+    fn with_credential(shared_store: bool, credential: &str) -> Self {
         let home = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
         git(repo.path(), &["init", "-q"]);
@@ -66,11 +70,12 @@ impl PrFixture {
             "[state]\nstore = \"{}\"\n\n\
              [github]\napp_id = 42\nprivate_key = \"{}\"\n\n\
              [[project]]\nname = \"ferroloop\"\nroot = \"{}\"\nstore = \"{}\"\n\
-             tracker = {{ github = \"Artificial-Humanity/FerroLoop\", credential = \"env\" }}\n",
+             tracker = {{ github = \"Artificial-Humanity/FerroLoop\", credential = \"{}\" }}\n",
             state_store.display(),
             key_path.display(),
             repo.path().canonicalize().unwrap().display(),
             project_store.display(),
+            credential,
         );
         fs::create_dir_all(home.path().join("config/fl")).unwrap();
         fs::write(home.path().join("config/fl/config.toml"), cfg).unwrap();
@@ -91,6 +96,7 @@ impl PrFixture {
             .env("FL_GITHUB_TOKEN", "user-token")
             .env("FL_GITHUB_API_URL", self.fake.url())
             .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_TOKEN")
             .env_remove("FL_DB")
             .env_remove("FL_GITHUB_APP_ID")
             .env_remove("FL_GITHUB_PRIVATE_KEY_PATH")
@@ -616,4 +622,69 @@ fn separate_workspace_state_store_and_env_app_credentials_work() {
         .assert()
         .success();
     assert!(f.fake.pull(1).merged);
+}
+
+#[test]
+fn pr_create_with_app_credential_authors_as_user_so_app_can_approve() {
+    // With `credential = "app"`, `pr create` must author as the user token
+    // (`FL_GITHUB_TOKEN` here), not the Reviewer App bot: GitHub refuses an
+    // APPROVE from the PR's own author with 422.
+    let f = PrFixture::with_credential(true, "app");
+    f.seed_roster();
+    f.fake.seed_branch(
+        "felicia/feat-app-create",
+        "sha-app-create",
+        vec![PrCommitSummary {
+            sha: "sha-app-create".into(),
+            author_login: Some(USER_LOGIN.into()),
+            message:
+                "feat(cli): author as user\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
+                    .into(),
+        }],
+        vec!["crates/cli/src/cmd/pr.rs".into()],
+    );
+
+    let create_out = f
+        .fl()
+        .args([
+            "github",
+            "pr",
+            "create",
+            "--title",
+            "Author as user",
+            "--body",
+            "Created under app credential.",
+            "--head",
+            "felicia/feat-app-create",
+            "--by",
+            "felicia",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create_out.status.success(),
+        "create stderr: {}",
+        String::from_utf8_lossy(&create_out.stderr)
+    );
+    assert_eq!(f.fake.pull(1).user_login, USER_LOGIN);
+
+    f.fl()
+        .args([
+            "github",
+            "pr",
+            "review",
+            "1",
+            "--approve",
+            "--body",
+            "LGTM.",
+            "--by",
+            "ferris",
+        ])
+        .assert()
+        .success();
+    assert_eq!(
+        f.fake.pull(1).reviews[0].author_login,
+        format!("{APP_SLUG}[bot]")
+    );
 }

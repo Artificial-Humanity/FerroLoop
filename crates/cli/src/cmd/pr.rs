@@ -14,8 +14,9 @@ use fl_core::pr_policy::{
 };
 use fl_core::store::{AgentRegistry, MessageStore};
 use fl_github::{
-    AppCredentials, Client, GithubTracker, MergeMethod, create_pr, get_pr, list_pr_commits,
-    list_pr_files, list_pr_reviews, merge_pr, request_pr_reviewers, submit_pr_review,
+    AppCredentials, Client, EnvToken, GithubTracker, MergeMethod, create_pr, get_pr,
+    list_pr_commits, list_pr_files, list_pr_reviews, merge_pr, request_pr_reviewers,
+    submit_pr_review,
 };
 use fl_store::RedbStore;
 use serde_json::json;
@@ -146,6 +147,78 @@ fn reviewer_client(
     Ok(Some(Client::new(&api, Box::new(creds))))
 }
 
+/// Environment variables that carry an author/user token for `pr create`,
+/// in order. `FL_GITHUB_TOKEN` leads to match `credential = "env"`
+/// (`fl_github::creds::ENV_VARS`); `GH_TOKEN` is `gh`'s own variable.
+const AUTHOR_TOKEN_ENV_VARS: [&str; 3] = ["FL_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN"];
+
+/// Resolve an author/user token for `pr create`: the first non-blank
+/// [`AUTHOR_TOKEN_ENV_VARS`] value, else `gh auth token` output, else
+/// `None` (the caller then falls back to the configured tracker client).
+fn resolve_author_token_with(
+    get_env: impl Fn(&str) -> Option<String>,
+    gh_token: impl Fn() -> Option<String>,
+) -> Option<(String, String)> {
+    for var in AUTHOR_TOKEN_ENV_VARS {
+        if let Some(t) = get_env(var).filter(|t| !t.trim().is_empty()) {
+            return Some((format!("${var}"), t.trim().to_string()));
+        }
+    }
+    gh_token()
+        .filter(|t| !t.trim().is_empty())
+        .map(|t| ("`gh auth token`".to_string(), t.trim().to_string()))
+}
+
+fn gh_auth_token() -> Option<String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("gh")
+        .args(["auth", "token"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Err(_) => return None,
+        }
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout)
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// Construct the author/user `Client` for `pr create` only, or return
+/// `Ok(None)` when no user token resolves (so `gh.client()` is reused).
+/// Review and merge stay on the configured Reviewer App credential:
+/// GitHub refuses an `APPROVE` from the PR's own author account, so a PR
+/// opened by the App bot could never be approved through it.
+fn author_client() -> Result<Option<Client>> {
+    let Some((source, token)) = resolve_author_token_with(|k| std::env::var(k).ok(), gh_auth_token)
+    else {
+        return Ok(None);
+    };
+    let api = resolve_api_url()?;
+    Ok(Some(Client::new(
+        &api,
+        Box::new(EnvToken::from_token(source, token)),
+    )))
+}
+
 fn resolve_project_slug(
     explicit: Option<&str>,
     default_project: Option<&str>,
@@ -224,7 +297,9 @@ pub fn run(
             json,
         } => {
             let project_slug = resolve_project_slug(project.as_deref(), default_project, repo);
-            let mut pr = create_pr(gh.client(), repo, &title, &body, &head, &base)?;
+            let owned_author = author_client()?;
+            let client = owned_author.as_ref().unwrap_or_else(|| gh.client());
+            let mut pr = create_pr(client, repo, &title, &body, &head, &base)?;
             let commits = list_pr_commits(gh.client(), repo, pr.number)?;
             let files = list_pr_files(gh.client(), repo, pr.number)?;
             let agents = ws_store.list_agents(None, true)?;
@@ -734,5 +809,60 @@ pub fn run(
             }
             Ok(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn author_token_prefers_env_then_gh_then_none() {
+        // `FL_GITHUB_TOKEN` wins, and `gh` is never consulted.
+        let gh_calls = Cell::new(0);
+        let got = resolve_author_token_with(
+            |k| match k {
+                "FL_GITHUB_TOKEN" => Some(" fl-token ".into()),
+                "GITHUB_TOKEN" => Some("github-token".into()),
+                "GH_TOKEN" => Some("gh-token".into()),
+                _ => None,
+            },
+            || {
+                gh_calls.set(gh_calls.get() + 1);
+                Some("gh-cli-token".into())
+            },
+        );
+        assert_eq!(
+            got,
+            Some(("$FL_GITHUB_TOKEN".to_string(), "fl-token".to_string()))
+        );
+        assert_eq!(gh_calls.get(), 0);
+
+        // Blank values are skipped, in `GITHUB_TOKEN` then `GH_TOKEN` order.
+        let got = resolve_author_token_with(
+            |k| match k {
+                "GITHUB_TOKEN" => Some("  ".into()),
+                "GH_TOKEN" => Some("gh-token".into()),
+                _ => None,
+            },
+            || Some("gh-cli-token".into()),
+        );
+        assert_eq!(got, Some(("$GH_TOKEN".to_string(), "gh-token".to_string())));
+
+        // With no env token, `gh auth token` output is used (trimmed).
+        let got = resolve_author_token_with(|_| None, || Some(" gh-cli-token\n".into()));
+        assert_eq!(
+            got,
+            Some(("`gh auth token`".to_string(), "gh-cli-token".to_string()))
+        );
+
+        // With neither, resolution is `None`: `pr create` falls back to
+        // the configured tracker client.
+        assert_eq!(resolve_author_token_with(|_| None, || None), None);
+        assert_eq!(
+            resolve_author_token_with(|_| Some(" ".into()), || Some("\n".into())),
+            None
+        );
     }
 }
