@@ -5240,6 +5240,7 @@ mod tests {
                     state: &self.catalog,
                     agents: &self.catalog,
                     wire: &self.catalog,
+                    workflows: &self.catalog,
                 });
             }
         }

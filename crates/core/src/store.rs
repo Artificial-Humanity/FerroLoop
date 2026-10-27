@@ -801,6 +801,14 @@ pub trait WorkflowStore {
         project: Option<&ProjectId>,
         workflow_id: Option<&WorkflowId>,
     ) -> Result<Vec<WorkflowRun>, StoreError>;
+
+    /// Import a replicated `WorkflowDef` during `fl state sync`, preserving its canonical
+    /// `WorkflowId` and registering it in `IDS` and `HANDLES`.
+    fn import_workflow_def(&self, def: WorkflowDef) -> Result<(), StoreError>;
+
+    /// Import a replicated `WorkflowRun` during `fl state sync`, preserving its canonical
+    /// `WorkflowRunId` and registering it in `IDS` and `HANDLES`.
+    fn import_workflow_run(&self, run: WorkflowRun) -> Result<(), StoreError>;
 }
 
 /// What a local store remembers about the GitHub repositories a tracker is

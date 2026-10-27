@@ -16,7 +16,9 @@ use crate::decision::{Decision, LeftLocal, Outcome, TransitionOutcome};
 use crate::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
 use crate::fault::LedgerFault;
 use crate::finding::{Finding, FindingState};
-use crate::ids::{FindingId, GateId, Kind, ProjectId, RecordId, seq_iri};
+use crate::ids::{
+    FindingId, GateId, Kind, ProjectId, RecordId, WorkflowId, WorkflowRunId, seq_iri,
+};
 use crate::iri::Iri;
 use crate::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 use crate::model::{
@@ -25,6 +27,7 @@ use crate::model::{
 use crate::split::{Batch, CachedSegment, LedgerCache, Outbox, RemoteLedger, SplitLedger};
 use crate::store::{
     AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, StoreError, Tracker,
+    WorkflowStore,
 };
 use crate::verdict::Verdict;
 use std::cell::RefCell;
@@ -65,6 +68,7 @@ pub struct Bound<'a> {
     pub state: &'a dyn StateStore,
     pub agents: &'a dyn AgentRegistry,
     pub wire: &'a dyn MessageStore,
+    pub workflows: &'a dyn WorkflowStore,
 }
 
 /// Hands one case its `Bound`. A callback rather than a return value, so a
@@ -77,8 +81,17 @@ pub trait Fixture {
 /// One store backing every role, plus a guard to keep alive.
 pub struct Single<S, G>(pub S, pub G);
 
-impl<S: Catalog + Tracker + Ledger + Handles + StateStore + AgentRegistry + MessageStore, G> Fixture
-    for Single<S, G>
+impl<
+    S: Catalog
+        + Tracker
+        + Ledger
+        + Handles
+        + StateStore
+        + AgentRegistry
+        + MessageStore
+        + WorkflowStore,
+    G,
+> Fixture for Single<S, G>
 {
     fn with(&self, f: &mut dyn FnMut(&Bound<'_>)) {
         f(&Bound {
@@ -89,6 +102,7 @@ impl<S: Catalog + Tracker + Ledger + Handles + StateStore + AgentRegistry + Mess
             state: &self.0,
             agents: &self.0,
             wire: &self.0,
+            workflows: &self.0,
         });
     }
 }
@@ -105,7 +119,15 @@ pub trait SplitFixture {
 pub struct SplitOver<S, G>(pub S, pub G);
 
 impl<
-    S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegistry + MessageStore,
+    S: Catalog
+        + Tracker
+        + Ledger
+        + Handles
+        + Outbox
+        + StateStore
+        + AgentRegistry
+        + MessageStore
+        + WorkflowStore,
     G,
 > SplitFixture for SplitOver<S, G>
 {
@@ -127,6 +149,7 @@ impl<
                 state: &self.0,
                 agents: &self.0,
                 wire: &self.0,
+                workflows: &self.0,
             },
             &remote,
         );
@@ -134,7 +157,15 @@ impl<
 }
 
 impl<
-    S: Catalog + Tracker + Ledger + Handles + Outbox + StateStore + AgentRegistry + MessageStore,
+    S: Catalog
+        + Tracker
+        + Ledger
+        + Handles
+        + Outbox
+        + StateStore
+        + AgentRegistry
+        + MessageStore
+        + WorkflowStore,
     G,
 > Fixture for SplitOver<S, G>
 {
@@ -1716,6 +1747,27 @@ fn an_id_has_no_handle_under_any_kind_but_its_own(roles: &Bound<'_>) {
         })
         .unwrap()
         .0;
+    let wf = roles
+        .workflows
+        .upsert_workflow_def(sample_workflow_def(
+            WorkflowId(seq_iri(9001)),
+            p.clone(),
+            "flow-a",
+        ))
+        .unwrap();
+    let wfr = roles
+        .workflows
+        .create_workflow_run(
+            crate::workflow::WorkflowRun::new(
+                WorkflowRunId(seq_iri(9002)),
+                &wf,
+                "Run 1",
+                At::from_unix_millis(1),
+                "o",
+            )
+            .unwrap(),
+        )
+        .unwrap();
     let held = [
         (Kind::Project, p.0),
         (Kind::Gate, g.0),
@@ -1724,11 +1776,10 @@ fn an_id_has_no_handle_under_any_kind_but_its_own(roles: &Bound<'_>) {
         (Kind::State, st.id.0),
         (Kind::Agent, ag.id.0),
         (Kind::Message, msg.id.0),
+        (Kind::Workflow, wf.id.0),
+        (Kind::WorkflowRun, wfr.id.0),
     ];
-    for own in Kind::ALL
-        .iter()
-        .filter(|k| !matches!(k, Kind::Workflow | Kind::WorkflowRun))
-    {
+    for own in Kind::ALL {
         assert!(
             held.iter().any(|(k, _)| k == own),
             "no id of kind {} was minted, so its row was never checked",
@@ -2495,6 +2546,8 @@ const AGENT_REGISTRY_CASES: usize = 7;
 const STATE_STORE_CASES: usize = 10;
 /// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
 const MESSAGE_STORE_CASES: usize = 7;
+/// How many cases [`workflow_store`] runs. Update deliberately — see [`run_suite`].
+const WORKFLOW_STORE_CASES: usize = 3;
 
 pub fn agent_registry<S: AgentRegistry + Catalog + Handles, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
@@ -2538,6 +2591,15 @@ pub fn message_store<S: MessageStore + AgentRegistry + Catalog + Handles, G>(
         prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff::<S>,
     ];
     run_suite("message-store", MESSAGE_STORE_CASES, cases, make);
+}
+
+pub fn workflow_store<S: WorkflowStore + Catalog + Handles, G>(make: impl Fn() -> (S, G)) {
+    let cases: &[fn(&S)] = &[
+        workflow_def_upserts_resolves_by_slug_and_handle_and_validates_graph::<S>,
+        workflow_run_lifecycle_persists_and_filters_by_project_and_workflow::<S>,
+        workflow_methods_refuse_wrong_kind_ids::<S>,
+    ];
+    run_suite("workflow-store", WORKFLOW_STORE_CASES, cases, make);
 }
 
 fn area_round_trips_and_normalizes_key<S: AgentRegistry>(s: &S) {
@@ -4067,4 +4129,330 @@ fn prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff<S: 
     assert!(s.get_wire_message(&m_acked.id).unwrap().is_none());
     assert!(s.get_wire_message(&m_pending.id).unwrap().is_some());
     assert!(s.get_wire_message(&m_durable.id).unwrap().is_some());
+}
+
+fn sample_workflow_def(
+    id: WorkflowId,
+    project: ProjectId,
+    slug: &str,
+) -> crate::workflow::WorkflowDef {
+    use crate::workflow::{
+        AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS, DEFAULT_STEP_MAX_VISITS,
+         END_STEP, EdgeCondition, EdgeDef, JoinPolicy, StepCompletion, StepDef, WorkflowDef,
+    };
+    use std::collections::BTreeMap;
+
+    WorkflowDef {
+        id,
+        project,
+        slug: slug.to_string(),
+        title: format!("Workflow {slug}"),
+        start_step: "implement".to_string(),
+        steps: vec![
+            StepDef {
+                step_id: "implement".to_string(),
+                title: "Implement".to_string(),
+                prompt: "Write the code.".to_string(),
+                assignee: AssigneeRule::Agent {
+                    name: "felicia".to_string(),
+                },
+                reviews_step: None,
+                require_different_vendor: false,
+                completion: StepCompletion::Ungated,
+                join_policy: JoinPolicy::All,
+                max_attempts: DEFAULT_STEP_MAX_ATTEMPTS,
+                max_visits: DEFAULT_STEP_MAX_VISITS,
+                budget_usd_micros: None,
+                max_tokens: None,
+                isolate_worktree: false,
+            },
+            StepDef {
+                step_id: "review".to_string(),
+                title: "Review".to_string(),
+                prompt: "Review the code.".to_string(),
+                assignee: AssigneeRule::Agent {
+                    name: "ferris".to_string(),
+                },
+                reviews_step: Some("implement".to_string()),
+                require_different_vendor: false,
+                completion: StepCompletion::Ungated,
+                join_policy: JoinPolicy::All,
+                max_attempts: DEFAULT_STEP_MAX_ATTEMPTS,
+                max_visits: DEFAULT_STEP_MAX_VISITS,
+                budget_usd_micros: None,
+                max_tokens: None,
+                isolate_worktree: false,
+            },
+        ],
+        edges: vec![
+            EdgeDef {
+                from_step: "implement".to_string(),
+                to_step: "review".to_string(),
+                on: EdgeCondition::Pass,
+            },
+            EdgeDef {
+                from_step: "review".to_string(),
+                to_step: "implement".to_string(),
+                on: EdgeCondition::Fail,
+            },
+            EdgeDef {
+                from_step: "review".to_string(),
+                to_step: END_STEP.to_string(),
+                on: EdgeCondition::Pass,
+            },
+        ],
+        max_total_steps: DEFAULT_MAX_TOTAL_STEPS,
+        budget_usd_micros: Some(5_000_000),
+        max_tokens: Some(100_000),
+        declared_keys: BTreeMap::new(),
+        authored_at_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+        authored_by: "ferris".to_string(),
+    }
+}
+
+fn workflow_def_upserts_resolves_by_slug_and_handle_and_validates_graph<
+    S: WorkflowStore + Catalog + Handles,
+>(
+    s: &S,
+) {
+    let p = s.add_project("/p").unwrap();
+    let def1 = sample_workflow_def(WorkflowId(seq_iri(801)), p.clone(), "review-loop");
+    let stored = s.upsert_workflow_def(def1.clone()).unwrap();
+    assert_eq!(stored, def1);
+
+    // Handle 1 is assigned to the first workflow definition.
+    assert_eq!(s.handle_of(Kind::Workflow, stored.id.iri()).unwrap(), Some(1));
+    assert_eq!(
+        s.resolve_handle(Kind::Workflow, 1).unwrap().as_ref(),
+        Some(stored.id.iri())
+    );
+    assert_eq!(
+        s.get_workflow_def(&stored.id).unwrap(),
+        Some(stored.clone())
+    );
+    assert_eq!(
+        s.get_workflow_def_by_slug(&p, "review-loop").unwrap(),
+        Some(stored.clone())
+    );
+    assert_eq!(s.list_workflow_defs(Some(&p)).unwrap(), vec![stored.clone()]);
+    assert_eq!(s.list_workflow_defs(None).unwrap(), vec![stored.clone()]);
+
+    // Re-upserting with a different WorkflowId under the same (project, slug) preserves
+    // the original WorkflowId and numeric handle 1 while updating the definition.
+    let mut updated_input = sample_workflow_def(WorkflowId(seq_iri(802)), p.clone(), "review-loop");
+    updated_input.title = "Updated Review Loop".to_string();
+    let re_upserted = s.upsert_workflow_def(updated_input).unwrap();
+    assert_eq!(re_upserted.id, stored.id);
+    assert_eq!(re_upserted.title, "Updated Review Loop");
+    assert_eq!(s.handle_of(Kind::Workflow, re_upserted.id.iri()).unwrap(), Some(1));
+    assert_eq!(s.resolve_handle(Kind::Workflow, 2).unwrap(), None);
+    assert_eq!(
+        s.get_workflow_def_by_slug(&p, "review-loop").unwrap(),
+        Some(re_upserted)
+    );
+
+    // Invalid workflow definition (missing END path) is refused with StoreError::InvalidWorkflow.
+    let mut bad = sample_workflow_def(WorkflowId(seq_iri(803)), p, "bad-flow");
+    bad.edges.clear();
+    let err = s.upsert_workflow_def(bad).unwrap_err();
+    assert!(matches!(err, StoreError::InvalidWorkflow(_)), "{err:?}");
+}
+
+fn workflow_run_lifecycle_persists_and_filters_by_project_and_workflow<
+    S: WorkflowStore + Catalog + Handles,
+>(
+    s: &S,
+) {
+    use crate::workflow::{
+        StepAttemptReport, StepOutcome, WorkflowRun, WorkflowRunStatus, advance_workflow,
+    };
+
+    let p1 = s.add_project("/p1").unwrap();
+    let p2 = s.add_project("/p2").unwrap();
+    let wf1 = s
+        .upsert_workflow_def(sample_workflow_def(
+            WorkflowId(seq_iri(810)),
+            p1.clone(),
+            "flow-one",
+        ))
+        .unwrap();
+    let wf2 = s
+        .upsert_workflow_def(sample_workflow_def(
+            WorkflowId(seq_iri(811)),
+            p2.clone(),
+            "flow-two",
+        ))
+        .unwrap();
+
+    let run1 = WorkflowRun::new(
+        WorkflowRunId(seq_iri(820)),
+        &wf1,
+        "Run One",
+        At::from_unix_millis(10),
+        "ferris",
+    )
+    .unwrap();
+    let created1 = s.create_workflow_run(run1.clone()).unwrap();
+    assert_eq!(created1, run1);
+    assert_eq!(
+        s.handle_of(Kind::WorkflowRun, created1.id.iri()).unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        s.resolve_handle(Kind::WorkflowRun, 1).unwrap().as_ref(),
+        Some(created1.id.iri())
+    );
+
+    // Duplicate create_workflow_run with the same ID is refused.
+    let dup_err = s.create_workflow_run(run1).unwrap_err();
+    assert!(matches!(dup_err, StoreError::AlreadyExists(_)), "{dup_err:?}");
+
+    let run2 = WorkflowRun::new(
+        WorkflowRunId(seq_iri(821)),
+        &wf2,
+        "Run Two",
+        At::from_unix_millis(11),
+        "ferris",
+    )
+    .unwrap();
+    let created2 = s.create_workflow_run(run2).unwrap();
+    assert_eq!(
+        s.handle_of(Kind::WorkflowRun, created2.id.iri()).unwrap(),
+        Some(2)
+    );
+
+    // Advance run1 through implement -> review -> END and persist via update_workflow_run.
+    let mut advancing = s.get_workflow_run(&created1.id).unwrap().unwrap();
+    advance_workflow(
+        &wf1,
+        &mut advancing,
+        StepAttemptReport {
+            step_id: "implement".to_string(),
+            outcome: StepOutcome::Pass,
+            attempt_iri: Some(seq_iri(830)),
+            tokens_used: 1200,
+            cost_usd_micros: 45_000,
+            reason: None,
+        },
+        At::from_unix_millis(20),
+    )
+    .unwrap();
+    assert_eq!(advancing.active_steps, vec!["review".to_string()]);
+    s.update_workflow_run(advancing.clone()).unwrap();
+
+    advance_workflow(
+        &wf1,
+        &mut advancing,
+        StepAttemptReport {
+            step_id: "review".to_string(),
+            outcome: StepOutcome::Pass,
+            attempt_iri: Some(seq_iri(831)),
+            tokens_used: 800,
+            cost_usd_micros: 30_000,
+            reason: None,
+        },
+        At::from_unix_millis(30),
+    )
+    .unwrap();
+    assert_eq!(advancing.status, WorkflowRunStatus::Completed);
+    let saved = s.update_workflow_run(advancing.clone()).unwrap();
+    assert_eq!(s.get_workflow_run(&created1.id).unwrap(), Some(saved.clone()));
+
+    assert_eq!(
+        s.list_workflow_runs(Some(&p1), None).unwrap(),
+        vec![saved.clone()]
+    );
+    assert_eq!(
+        s.list_workflow_runs(None, Some(&wf2.id)).unwrap(),
+        vec![created2.clone()]
+    );
+    assert_eq!(
+        s.list_workflow_runs(None, None).unwrap(),
+        vec![saved, created2]
+    );
+
+    // Also verify import_workflow_def and import_workflow_run preserve exact IRIs.
+    let imported_wf = sample_workflow_def(WorkflowId(seq_iri(840)), p1.clone(), "imported-flow");
+    s.import_workflow_def(imported_wf.clone()).unwrap();
+    assert_eq!(
+        s.get_workflow_def(&imported_wf.id).unwrap(),
+        Some(imported_wf.clone())
+    );
+    assert_eq!(
+        s.handle_of(Kind::Workflow, imported_wf.id.iri()).unwrap(),
+        Some(3)
+    );
+    let imported_run = WorkflowRun::new(
+        WorkflowRunId(seq_iri(841)),
+        &imported_wf,
+        "Imported Run",
+        At::from_unix_millis(40),
+        "ferris",
+    )
+    .unwrap();
+    s.import_workflow_run(imported_run.clone()).unwrap();
+    assert_eq!(
+        s.get_workflow_run(&imported_run.id).unwrap(),
+        Some(imported_run)
+    );
+    assert_eq!(
+        s.handle_of(Kind::WorkflowRun, &seq_iri(841)).unwrap(),
+        Some(3)
+    );
+}
+
+fn workflow_methods_refuse_wrong_kind_ids<S: WorkflowStore + Catalog + Handles>(s: &S) {
+    let p = s.add_project("/p").unwrap();
+    let wf = s
+        .upsert_workflow_def(sample_workflow_def(
+            WorkflowId(seq_iri(850)),
+            p.clone(),
+            "flow",
+        ))
+        .unwrap();
+
+    // Passing a ProjectId IRI as a WorkflowId or WorkflowRunId returns WrongKind.
+    let wrong_wf = s.get_workflow_def(&WorkflowId(p.0.clone())).unwrap_err();
+    assert!(
+        matches!(
+            wrong_wf,
+            StoreError::WrongKind {
+                expected: Kind::Workflow,
+                found: Kind::Project,
+                ..
+            }
+        ),
+        "{wrong_wf:?}"
+    );
+
+    let wrong_run = s
+        .get_workflow_run(&WorkflowRunId(p.0.clone()))
+        .unwrap_err();
+    assert!(
+        matches!(
+            wrong_run,
+            StoreError::WrongKind {
+                expected: Kind::WorkflowRun,
+                found: Kind::Project,
+                ..
+            }
+        ),
+        "{wrong_run:?}"
+    );
+
+    // Passing a WorkflowId IRI where a ProjectId is expected returns WrongKind.
+    let wrong_proj = s
+        .list_workflow_defs(Some(&ProjectId(wf.id.0.clone())))
+        .unwrap_err();
+    assert!(
+        matches!(
+            wrong_proj,
+            StoreError::WrongKind {
+                expected: Kind::Project,
+                found: Kind::Workflow,
+                ..
+            }
+        ),
+        "{wrong_proj:?}"
+    );
 }

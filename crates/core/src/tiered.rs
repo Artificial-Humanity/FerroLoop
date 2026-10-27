@@ -1888,6 +1888,7 @@ mod tests {
                 state: &self.local,
                 agents: &self.local,
                 wire: &self.local,
+                workflows: &self.local,
             });
         }
     }

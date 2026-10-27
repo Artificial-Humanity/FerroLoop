@@ -16,6 +16,7 @@ use std::path::Path;
 pub mod ferrowire;
 pub mod manifest;
 pub mod state;
+pub mod workflow;
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 
@@ -106,6 +107,12 @@ pub const FORMAT_WITH_STATE: u64 = 6;
 /// an older fl refuses the store with `FormatVersion` rather than ignoring its
 /// FerroWire tables. This build opens 2 to 7.
 pub const FORMAT_WITH_WIRE: u64 = 7;
+
+/// ⚠ The format of a store that holds workflow definitions or workflow runs.
+/// The first workflow write raises the store to 8 in the same transaction, so
+/// an older fl refuses the store with `FormatVersion` rather than ignoring its
+/// workflow tables. This build opens 2 to 8.
+pub const FORMAT_WITH_WORKFLOW: u64 = 8;
 
 /// repository `node_id` → the first commit of its `fl/ledger` branch
 /// (GitHub ledger spec §6.1 step 4). Created by the first root recorded.
@@ -481,12 +488,13 @@ impl RedbStore {
                     || v == FORMAT_WITH_LEDGER_ROOT
                     || v == FORMAT_WITH_ROUTING
                     || v == FORMAT_WITH_STATE
-                    || v == FORMAT_WITH_WIRE => {}
+                    || v == FORMAT_WITH_WIRE
+                    || v == FORMAT_WITH_WORKFLOW => {}
             Some(v) => {
                 return Err(StoreError::FormatVersion {
                     found: v,
                     oldest: FORMAT_VERSION,
-                    newest: FORMAT_WITH_WIRE,
+                    newest: FORMAT_WITH_WORKFLOW,
                 });
             }
         }
@@ -2005,7 +2013,7 @@ mod tests {
                 StoreError::FormatVersion {
                     found: Some(1),
                     oldest: 2,
-                    newest: FORMAT_WITH_WIRE
+                    newest: FORMAT_WITH_WORKFLOW
                 }
             ),
             "{err:?}"
@@ -3065,7 +3073,7 @@ mod tests {
             let tx = db.begin_write().unwrap();
             tx.open_table(META)
                 .unwrap()
-                .insert(FORMAT_KEY, FORMAT_WITH_WIRE + 1)
+                .insert(FORMAT_KEY, FORMAT_WITH_WORKFLOW + 1)
                 .unwrap();
             tx.commit().unwrap();
         }
@@ -3608,5 +3616,98 @@ mod tests {
             .unwrap();
         assert_eq!(reopened.prune_wire(At::from_unix_millis(20)).unwrap(), 1);
         reopened.verify_wire_invariants().unwrap();
+    }
+
+    #[test]
+    fn redb_store_meets_the_workflow_store_contract() {
+        fl_core::conformance::workflow_store(fresh);
+    }
+
+    #[test]
+    fn workflow_write_raises_the_store_to_format_8_and_survives_reopen() {
+        use fl_core::at::At;
+        use fl_core::ids::{WorkflowId, WorkflowRunId, seq_iri};
+        use fl_core::store::WorkflowStore;
+        use fl_core::workflow::{
+            AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS,
+            DEFAULT_STEP_MAX_VISITS, END_STEP, EdgeCondition, EdgeDef, JoinPolicy,
+            StepCompletion, StepDef, WorkflowDef, WorkflowRun,
+        };
+        use std::collections::BTreeMap;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("workflow.redb");
+        let p = {
+            let s = RedbStore::open(&path).unwrap();
+            s.add_project("/p").unwrap()
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_VERSION));
+
+        let (wf, run) = {
+            let s = RedbStore::open(&path).unwrap();
+            let wf = s
+                .upsert_workflow_def(WorkflowDef {
+                    id: WorkflowId(seq_iri(801)),
+                    project: p,
+                    slug: "ci-flow".into(),
+                    title: "CI Flow".into(),
+                    start_step: "build".into(),
+                    steps: vec![StepDef {
+                        step_id: "build".into(),
+                        title: "Build".into(),
+                        prompt: "Run build.".into(),
+                        assignee: AssigneeRule::Agent {
+                            name: "felicia".into(),
+                        },
+                        reviews_step: None,
+                        require_different_vendor: false,
+                        completion: StepCompletion::Ungated,
+                        join_policy: JoinPolicy::All,
+                        max_attempts: DEFAULT_STEP_MAX_ATTEMPTS,
+                        max_visits: DEFAULT_STEP_MAX_VISITS,
+                        budget_usd_micros: None,
+                        max_tokens: None,
+                        isolate_worktree: false,
+                    }],
+                    edges: vec![EdgeDef {
+                        from_step: "build".into(),
+                        to_step: END_STEP.into(),
+                        on: EdgeCondition::Pass,
+                    }],
+                    max_total_steps: DEFAULT_MAX_TOTAL_STEPS,
+                    budget_usd_micros: None,
+                    max_tokens: None,
+                    declared_keys: BTreeMap::new(),
+                    authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+                    authored_by: "ferris".into(),
+                })
+                .unwrap();
+            let run = s
+                .create_workflow_run(
+                    WorkflowRun::new(
+                        WorkflowRunId(seq_iri(802)),
+                        &wf,
+                        "CI Run 1",
+                        At::from_unix_millis(100),
+                        "ferris",
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            (wf, run)
+        };
+        assert_eq!(format_at(&path), Some(FORMAT_WITH_WORKFLOW));
+
+        let reopened = RedbStore::open(&path).unwrap();
+        assert_eq!(reopened.get_workflow_def(&wf.id).unwrap(), Some(wf.clone()));
+        assert_eq!(reopened.get_workflow_run(&run.id).unwrap(), Some(run.clone()));
+        assert_eq!(
+            reopened.handle_of(Kind::Workflow, wf.id.iri()).unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            reopened.handle_of(Kind::WorkflowRun, run.id.iri()).unwrap(),
+            Some(1)
+        );
     }
 }

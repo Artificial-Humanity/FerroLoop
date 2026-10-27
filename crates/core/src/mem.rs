@@ -11,7 +11,8 @@ use crate::ferrowire::{
 };
 use crate::finding::{Finding, FindingState};
 use crate::ids::{
-    AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId, seq_iri,
+    AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId,
+    WorkflowId, WorkflowRunId, seq_iri,
 };
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
@@ -26,7 +27,9 @@ use crate::state::{
 };
 use crate::store::{
     AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, StoreError, Tracker,
+    WorkflowStore,
 };
+use crate::workflow::{WorkflowDef, WorkflowRun, validate_workflow_def};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -109,6 +112,10 @@ struct Inner {
     next_wire_rcpt_seq: u64,
     wire_threads: BTreeSet<(ThreadId, MessageId)>,
     wire_replies: BTreeSet<(MessageId, MessageId)>,
+
+    workflow_defs: BTreeMap<WorkflowId, WorkflowDef>,
+    workflow_by_slug: BTreeMap<(ProjectId, String), WorkflowId>,
+    workflow_runs: BTreeMap<WorkflowRunId, WorkflowRun>,
 }
 
 impl Inner {
@@ -553,6 +560,21 @@ impl Inner {
     /// ownership, not which key to read.
     fn resolve(&self, id: &Iri) -> Iri {
         self.aliases.get(id).cloned().unwrap_or_else(|| id.clone())
+    }
+
+    /// Resolve `id` to its primary IRI, returning `WrongKind` if `id` is owned
+    /// under any kind other than `expected`, or `Ok(id.clone())` if not owned.
+    fn resolve_if_kind(&self, id: &Iri, expected: Kind) -> Result<Iri, StoreError> {
+        match self.check(id) {
+            Ok(found) if found != expected => Err(StoreError::WrongKind {
+                id: id.clone(),
+                expected,
+                found,
+            }),
+            Ok(_) => Ok(self.resolve(id)),
+            Err(StoreError::NotOwned { .. }) => Ok(id.clone()),
+            Err(e) => Err(e),
+        }
     }
 
     /// `check`, then the primary `id` names and its kind — unless the item
@@ -2141,6 +2163,203 @@ impl MessageStore for MemStore {
     }
 }
 
+impl WorkflowStore for MemStore {
+    fn upsert_workflow_def(&self, mut def: WorkflowDef) -> Result<WorkflowDef, StoreError> {
+        validate_workflow_def(&def).map_err(|e| StoreError::InvalidWorkflow(e.to_string()))?;
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(def.project.iri(), Kind::Project)?;
+        let project = ProjectId(s.resolve(def.project.iri()));
+        let key = (project.clone(), def.slug.clone());
+
+        if let Some(existing_id) = s.workflow_by_slug.get(&key).cloned() {
+            let canonical_id = WorkflowId(s.resolve(existing_id.iri()));
+            def.id = canonical_id.clone();
+            def.project = project;
+            s.workflow_defs.insert(canonical_id, def.clone());
+            return Ok(def);
+        }
+
+        let canonical_id = WorkflowId(s.resolve_if_kind(def.id.iri(), Kind::Workflow)?);
+        s.index_imported(Kind::Workflow, canonical_id.iri())?;
+        if let Some(prev) = s.workflow_defs.get(&canonical_id) {
+            let prev_key = (prev.project.clone(), prev.slug.clone());
+            if prev_key != key {
+                s.workflow_by_slug.remove(&prev_key);
+            }
+        }
+        def.id = canonical_id.clone();
+        def.project = project;
+        s.workflow_by_slug.insert(key, canonical_id.clone());
+        s.workflow_defs.insert(canonical_id, def.clone());
+        Ok(def)
+    }
+
+    fn get_workflow_def(&self, id: &WorkflowId) -> Result<Option<WorkflowDef>, StoreError> {
+        let s = self.inner.borrow();
+        let canonical = WorkflowId(s.resolve_if_kind(id.iri(), Kind::Workflow)?);
+        Ok(s.workflow_defs.get(&canonical).cloned())
+    }
+
+    fn get_workflow_def_by_slug(
+        &self,
+        project: &ProjectId,
+        slug: &str,
+    ) -> Result<Option<WorkflowDef>, StoreError> {
+        let s = self.inner.borrow();
+        s.check_kind(project.iri(), Kind::Project)?;
+        let canonical_project = ProjectId(s.resolve(project.iri()));
+        let Some(id) = s
+            .workflow_by_slug
+            .get(&(canonical_project, slug.to_string()))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        let canonical_id = WorkflowId(s.resolve(id.iri()));
+        Ok(s.workflow_defs.get(&canonical_id).cloned())
+    }
+
+    fn list_workflow_defs(
+        &self,
+        project: Option<&ProjectId>,
+    ) -> Result<Vec<WorkflowDef>, StoreError> {
+        let s = self.inner.borrow();
+        let project_filter = match project {
+            Some(p) => {
+                s.check_kind(p.iri(), Kind::Project)?;
+                Some(ProjectId(s.resolve(p.iri())))
+            }
+            None => None,
+        };
+        let mut out: Vec<WorkflowDef> = s
+            .workflow_defs
+            .values()
+            .filter(|d| project_filter.as_ref().is_none_or(|p| &d.project == p))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| (&a.project, &a.slug).cmp(&(&b.project, &b.slug)));
+        Ok(out)
+    }
+
+    fn create_workflow_run(&self, mut run: WorkflowRun) -> Result<WorkflowRun, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        s.check_kind(run.project.iri(), Kind::Project)?;
+        let canonical_project = ProjectId(s.resolve(run.project.iri()));
+        let canonical_wf_id =
+            WorkflowId(s.resolve_if_kind(run.workflow_id.iri(), Kind::Workflow)?);
+        if !s.workflow_defs.contains_key(&canonical_wf_id) {
+            return Err(StoreError::NoSuchWorkflow(run.workflow_id.to_string()));
+        }
+        let canonical_run_id =
+            WorkflowRunId(s.resolve_if_kind(run.id.iri(), Kind::WorkflowRun)?);
+        if s.workflow_runs.contains_key(&canonical_run_id)
+            || s.owned.contains_key(canonical_run_id.iri())
+        {
+            return Err(StoreError::AlreadyExists(run.id.0));
+        }
+        s.index_imported(Kind::WorkflowRun, canonical_run_id.iri())?;
+        run.id = canonical_run_id.clone();
+        run.project = canonical_project;
+        run.workflow_id = canonical_wf_id;
+        s.workflow_runs.insert(canonical_run_id, run.clone());
+        Ok(run)
+    }
+
+    fn update_workflow_run(&self, mut run: WorkflowRun) -> Result<WorkflowRun, StoreError> {
+        let mut s = self.inner.borrow_mut();
+        let canonical_id = WorkflowRunId(s.resolve_if_kind(run.id.iri(), Kind::WorkflowRun)?);
+        if !s.workflow_runs.contains_key(&canonical_id) {
+            return Err(StoreError::NoSuchWorkflowRun(run.id.to_string()));
+        }
+        run.id = canonical_id.clone();
+        s.workflow_runs.insert(canonical_id, run.clone());
+        Ok(run)
+    }
+
+    fn get_workflow_run(&self, id: &WorkflowRunId) -> Result<Option<WorkflowRun>, StoreError> {
+        let s = self.inner.borrow();
+        let canonical = WorkflowRunId(s.resolve_if_kind(id.iri(), Kind::WorkflowRun)?);
+        Ok(s.workflow_runs.get(&canonical).cloned())
+    }
+
+    fn list_workflow_runs(
+        &self,
+        project: Option<&ProjectId>,
+        workflow_id: Option<&WorkflowId>,
+    ) -> Result<Vec<WorkflowRun>, StoreError> {
+        let s = self.inner.borrow();
+        let project_filter = match project {
+            Some(p) => {
+                s.check_kind(p.iri(), Kind::Project)?;
+                Some(ProjectId(s.resolve(p.iri())))
+            }
+            None => None,
+        };
+        let wf_filter = match workflow_id {
+            Some(w) => Some(WorkflowId(s.resolve_if_kind(w.iri(), Kind::Workflow)?)),
+            None => None,
+        };
+        let mut out: Vec<WorkflowRun> = s
+            .workflow_runs
+            .values()
+            .filter(|r| project_filter.as_ref().is_none_or(|p| &r.project == p))
+            .filter(|r| wf_filter.as_ref().is_none_or(|w| &r.workflow_id == w))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(out)
+    }
+
+    fn import_workflow_def(&self, mut def: WorkflowDef) -> Result<(), StoreError> {
+        validate_workflow_def(&def).map_err(|e| StoreError::InvalidWorkflow(e.to_string()))?;
+        let mut s = self.inner.borrow_mut();
+        let canonical_project = ProjectId(s.resolve_if_kind(def.project.iri(), Kind::Project)?);
+        let canonical_id = WorkflowId(s.resolve_if_kind(def.id.iri(), Kind::Workflow)?);
+        let key = (canonical_project.clone(), def.slug.clone());
+
+        if let Some(existing_id) = s.workflow_by_slug.get(&key).cloned()
+            && existing_id != canonical_id
+        {
+            s.alias_unpublished_id(Kind::Workflow, existing_id.iri(), canonical_id.iri())?;
+            s.workflow_defs.remove(&existing_id);
+            for r in s.workflow_runs.values_mut() {
+                if r.workflow_id == existing_id {
+                    r.workflow_id = canonical_id.clone();
+                }
+            }
+        }
+        if let Some(prev) = s.workflow_defs.get(&canonical_id) {
+            let prev_key = (prev.project.clone(), prev.slug.clone());
+            if prev_key != key {
+                s.workflow_by_slug.remove(&prev_key);
+            }
+        }
+        s.index_imported(Kind::Workflow, canonical_id.iri())?;
+        def.id = canonical_id.clone();
+        def.project = canonical_project;
+        s.workflow_by_slug.insert(key, canonical_id.clone());
+        s.workflow_defs.insert(canonical_id, def);
+        Ok(())
+    }
+
+    fn import_workflow_run(&self, mut run: WorkflowRun) -> Result<(), StoreError> {
+        let mut s = self.inner.borrow_mut();
+        let canonical_project = ProjectId(s.resolve_if_kind(run.project.iri(), Kind::Project)?);
+        let canonical_wf_id =
+            WorkflowId(s.resolve_if_kind(run.workflow_id.iri(), Kind::Workflow)?);
+        if !s.workflow_defs.contains_key(&canonical_wf_id) {
+            return Err(StoreError::NoSuchWorkflow(run.workflow_id.to_string()));
+        }
+        let canonical_id = WorkflowRunId(s.resolve_if_kind(run.id.iri(), Kind::WorkflowRun)?);
+        s.index_imported(Kind::WorkflowRun, canonical_id.iri())?;
+        run.id = canonical_id.clone();
+        run.project = canonical_project;
+        run.workflow_id = canonical_wf_id;
+        s.workflow_runs.insert(canonical_id, run);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2157,6 +2376,7 @@ mod tests {
         crate::conformance::agent_registry(|| (MemStore::default(), ()));
         crate::conformance::state_store(|| (MemStore::default(), ()));
         crate::conformance::message_store(|| (MemStore::default(), ()));
+        crate::conformance::workflow_store(|| (MemStore::default(), ()));
     }
 
     #[test]
