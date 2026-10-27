@@ -1,0 +1,20 @@
+services:
+  ferroloop-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ferroloop-hub
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8420:8420"
+    environment:
+      - FL_DB=/data/fl/fl.redb
+      - FL_HUB_OWNER_TOKEN=${FL_HUB_OWNER_TOKEN:-}
+      - FL_WIRE_TOKEN=${FL_WIRE_TOKEN:-}
+    volumes:
+      - ferroloop-data:/data/fl
+      - ./:/workspace:ro
+    command: ["hub", "serve", "--listen", "0.0.0.0:8420"]
+
+volumes:
+  ferroloop-data:

@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod arch;
 pub mod attempt;
 pub mod check;
 pub mod escalate;
@@ -6,6 +7,7 @@ pub mod finding;
 pub mod flow;
 pub mod gate;
 pub mod github;
+pub mod hub;
 pub mod ledger;
 pub mod manifest;
 pub mod mcp;

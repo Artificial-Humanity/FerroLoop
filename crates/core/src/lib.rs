@@ -3,6 +3,7 @@
 mod wire;
 
 pub mod agent;
+pub mod arch;
 pub mod at;
 #[cfg(any(test, feature = "conformance"))]
 #[doc(hidden)]
@@ -35,6 +36,11 @@ pub mod workflow;
 pub use agent::{
     AgentRecord, AgentRole, AgentStatus, AreaRecord, RegisterAgentArgs, RegistryEvent,
     RegistryEventKind, reports_to, validate_agent_identity,
+};
+pub use arch::{
+    ArchComponent, ArchComponentKind, ArchConformanceReport, ArchEdge, ArchError, ArchViolation,
+    ArchitectureModel, DEFAULT_ARCH_MANIFEST_PATH, PackageDep, SourceReference,
+    check_architecture_conformance, export_likec4_dsl, validate_architecture_model,
 };
 pub use at::{At, AtError};
 pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
