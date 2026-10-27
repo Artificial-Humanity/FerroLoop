@@ -355,6 +355,7 @@ dependencies = [
  "fl-core",
  "fl-exec",
  "fl-github",
+ "fl-hub",
  "fl-mcp",
  "fl-store",
  "fl-wire",
@@ -365,6 +366,7 @@ dependencies = [
  "tokio",
  "toml",
  "ureq",
+ "walkdir",
 ]
 
 [[package]]

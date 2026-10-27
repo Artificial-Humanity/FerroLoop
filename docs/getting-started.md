@@ -69,6 +69,8 @@ Commands:
   state       Manage durable memories, handoffs, runtime state, and git state sync
   wire        Send, read, acknowledge, and relay FerroWire agent messages
   flow        Author, inspect, and execute directed workflow graphs
+  arch        Initialize, inspect, check, and export the declarative architecture model
+  hub         Run and manage the FerroLoop Hub daemon and FerroDeck command center
   help        Print this message or the help of the given subcommand(s)
 
 Options:
