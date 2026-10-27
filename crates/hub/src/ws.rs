@@ -15,7 +15,9 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::api::{HttpRequest, HttpResponse, handle_http_request, parse_http_request};
+use crate::api::{
+    HttpRequest, HttpResponse, drain_ready_session_queues, handle_http_request, parse_http_request,
+};
 use crate::auth::HubAuthority;
 use crate::terminal::TerminalManager;
 use crate::{HubServerConfig, HubState, HubWsFrame};
@@ -86,6 +88,8 @@ impl HubServer {
 
     /// Run the accept loop until shutdown is signaled or an unrecoverable accept error occurs.
     pub async fn serve(mut self) -> io::Result<()> {
+        let mut drain_tick = tokio::time::interval(Duration::from_secs(1));
+        drain_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 accept_res = self.listener.accept() => {
@@ -97,6 +101,16 @@ impl HubServer {
                             });
                         }
                         Err(e) => return Err(e),
+                    }
+                }
+                _ = drain_tick.tick() => {
+                    if !self.state.queued_session_keys().is_empty() {
+                        let state = self.state.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            if let Ok(store) = state.open_store() {
+                                drain_ready_session_queues(&state, &store);
+                            }
+                        }).await;
                     }
                 }
                 changed = self.shutdown_rx.changed() => {

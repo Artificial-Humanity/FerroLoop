@@ -23,6 +23,7 @@ import {
   type PromptRequest,
   type PrReviewRequest,
   type PullRequestItem,
+  type QueuedOperatorPrompt,
   type TranscriptTurn,
   type WireInboxItem,
   type WireSendRequest,
@@ -70,6 +71,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [selectedAgentName, setSelectedAgentName] = useState<string>("ferris");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [transcriptTurns, setTranscriptTurns] = useState<TranscriptTurn[]>([]);
+  const [sessionQueue, setSessionQueue] = useState<QueuedOperatorPrompt[]>([]);
+  const [isSessionBusy, setIsSessionBusy] = useState<boolean>(false);
 
   const [worktrees, setWorktrees] = useState<WorktreeSummary[]>([]);
   const [selectedWorktreeId, setSelectedWorktreeId] = useState<string | null>(null);
@@ -129,8 +132,16 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         const targetId = sessionOverride ?? selectedSessionId ?? selectedAgentName;
         if (targetId) {
           const trRes = await apiClient.getSessionTranscript(targetId).catch(() => null);
-          if (trRes?.turns) {
-            setTranscriptTurns(trRes.turns);
+          if (trRes) {
+            if (trRes.turns) {
+              setTranscriptTurns(trRes.turns);
+            }
+            if (typeof trRes.is_busy === "boolean") {
+              setIsSessionBusy(trRes.is_busy);
+            }
+            if (Array.isArray(trRes.queue)) {
+              setSessionQueue(trRes.queue);
+            }
           }
         }
       } catch {
@@ -379,6 +390,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) {
       setTranscriptTurns([]);
+      setSessionQueue([]);
+      setIsSessionBusy(false);
       return;
     }
     let cancelled = false;
@@ -387,11 +400,15 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       .then((res) => {
         if (!cancelled) {
           setTranscriptTurns(res.turns ?? []);
+          setSessionQueue(res.queue ?? []);
+          setIsSessionBusy(Boolean(res.is_busy));
         }
       })
       .catch(() => {
         if (!cancelled) {
           setTranscriptTurns([]);
+          setSessionQueue([]);
+          setIsSessionBusy(false);
         }
       });
     return () => {
@@ -455,8 +472,68 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   };
 
   const handleSendPrompt = async (targetId: string, payload: PromptRequest) => {
-    await apiClient.sendSessionPrompt(targetId, payload);
+    const res = await apiClient.sendSessionPrompt(targetId, payload);
+    if (Array.isArray(res.queue)) {
+      setSessionQueue(res.queue);
+    }
+    if (typeof res.is_busy === "boolean") {
+      setIsSessionBusy(res.is_busy);
+    }
+    if (!res.queued && res.status !== "queued") {
+      const content = res.effective_body || payload.prompt;
+      setTranscriptTurns((prev) => [
+        ...prev,
+        {
+          index: prev.length,
+          role: "user",
+          content,
+          thinking: null,
+          tool_calls: [],
+          created_at: new Date().toISOString(),
+        },
+      ]);
+    }
     await refreshSessionsAndTranscript(targetId);
+    return res;
+  };
+
+  const handleSendQueuedNow = async (promptId: string) => {
+    const targetId = activeSession?.id || selectedAgent?.name_key;
+    if (!targetId) return;
+    const res = await apiClient.sendQueuedPromptNow(targetId, promptId);
+    if (Array.isArray(res.queue)) {
+      setSessionQueue(res.queue);
+    }
+    if (typeof res.is_busy === "boolean") {
+      setIsSessionBusy(res.is_busy);
+    }
+    const content = res.effective_body || res.prompt;
+    if (content) {
+      setTranscriptTurns((prev) => [
+        ...prev,
+        {
+          index: prev.length,
+          role: "user",
+          content,
+          thinking: null,
+          tool_calls: [],
+          created_at: new Date().toISOString(),
+        },
+      ]);
+    }
+    await refreshSessionsAndTranscript(targetId);
+  };
+
+  const handleCancelQueued = async (promptId: string) => {
+    const targetId = activeSession?.id || selectedAgent?.name_key;
+    if (!targetId) return;
+    const res = await apiClient.cancelQueuedPrompt(targetId, promptId);
+    if (Array.isArray(res.queue)) {
+      setSessionQueue(res.queue);
+    }
+    if (typeof res.is_busy === "boolean") {
+      setIsSessionBusy(res.is_busy);
+    }
   };
 
   const handleReviewPr = async (number: number, payload: PrReviewRequest) => {
@@ -558,10 +635,14 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             adapter={activeSession?.adapter ?? null}
             sessionId={activeSession?.id ?? null}
             turns={transcriptTurns}
+            isBusy={isSessionBusy}
+            queue={sessionQueue}
             loading={loading}
             wsConnected={wsConnected}
             onRefresh={() => void refreshSessionsAndTranscript()}
             onSendPrompt={handleSendPrompt}
+            onSendQueuedNow={handleSendQueuedNow}
+            onCancelQueued={handleCancelQueued}
             apiClient={apiClient}
           />
         );
@@ -616,10 +697,14 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 adapter={activeSession?.adapter ?? null}
                 sessionId={activeSession?.id ?? null}
                 turns={transcriptTurns}
+                isBusy={isSessionBusy}
+                queue={sessionQueue}
                 loading={loading}
                 wsConnected={wsConnected}
                 onRefresh={() => void refreshSessionsAndTranscript()}
                 onSendPrompt={handleSendPrompt}
+                onSendQueuedNow={handleSendQueuedNow}
+                onCancelQueued={handleCancelQueued}
                 apiClient={apiClient}
               />
               {renderSecondaryPane(rightSplitTab)}

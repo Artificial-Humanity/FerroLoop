@@ -42,12 +42,11 @@ use fl_exec::workflow::{
     reject_workflow_step, start_workflow_run,
 };
 use fl_store::RedbStore;
-use fl_wire::dispatcher::dispatch_message_for_store;
+use fl_wire::dispatcher::{dispatch_message_for_store, dispatch_operator_prompt_to_route};
 use fl_wire::identity::RouteTable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::HubState;
 use crate::auth::{
     HubAuthority, extract_bearer_token, extract_session_cookie, format_logout_set_cookie,
     format_session_set_cookie,
@@ -56,6 +55,7 @@ use crate::discovery::{
     discover_sessions_with_home, list_git_worktrees, read_session_transcript_with_home,
     read_worktree_diff, scan_cargo_architecture_conformance,
 };
+pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
 
 /// Parsed HTTP/1.1 request passed to [`handle_http_request`].
 #[derive(Debug, Clone)]
@@ -361,6 +361,7 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET", "/api/v1/agents") => handle_get_agents(state, &store, req),
         ("GET", "/api/v1/agents/liveness") => handle_get_agents_liveness(state, &store, req),
         ("GET", "/api/v1/sessions") => {
+            drain_ready_session_queues(state, &store);
             let sessions =
                 discover_sessions_with_home(&store, state.config.home_override.as_deref());
             HttpResponse::json(200, json!({ "sessions": sessions }))
@@ -1356,7 +1357,7 @@ fn handle_dynamic_api_routes(
         return HttpResponse::json(404, json!({ "error": "attachment not found" }));
     }
 
-    // /api/v1/sessions/:id/transcript or /api/v1/sessions/:id/prompt
+    // /api/v1/sessions/:id/transcript, /api/v1/sessions/:id/prompt, or /api/v1/sessions/:id/queue
     if segments.len() == 5
         && segments[0] == "api"
         && segments[1] == "v1"
@@ -1365,16 +1366,36 @@ fn handle_dynamic_api_routes(
         let session_id = percent_decode(segments[3]);
         match (method, segments[4]) {
             ("GET", "transcript") => {
+                drain_ready_session_queues(state, store);
+                let (canonical_id, _persona) = resolve_session_target(state, store, &session_id);
                 let turns = read_session_transcript_with_home(
                     &session_id,
                     store,
                     state.config.home_override.as_deref(),
                 );
+                let is_busy = state.is_session_busy(store, &canonical_id);
+                let queue = state.session_queue(&canonical_id);
                 return HttpResponse::json(
                     200,
                     json!({
                         "session_id": session_id,
                         "turns": turns,
+                        "is_busy": is_busy,
+                        "queue": queue,
+                    }),
+                );
+            }
+            ("GET", "queue") => {
+                drain_ready_session_queues(state, store);
+                let (canonical_id, _persona) = resolve_session_target(state, store, &session_id);
+                let is_busy = state.is_session_busy(store, &canonical_id);
+                let queue = state.session_queue(&canonical_id);
+                return HttpResponse::json(
+                    200,
+                    json!({
+                        "session_id": canonical_id,
+                        "is_busy": is_busy,
+                        "queue": queue,
                     }),
                 );
             }
@@ -1382,6 +1403,23 @@ fn handle_dynamic_api_routes(
                 return handle_post_session_prompt(state, store, authority, &session_id, req);
             }
             _ => {}
+        }
+    }
+
+    // /api/v1/sessions/:id/queue/:prompt_id or /api/v1/sessions/:id/queue/:prompt_id/send-now
+    if (segments.len() == 6 || segments.len() == 7)
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "sessions"
+        && segments[4] == "queue"
+    {
+        let session_id = percent_decode(segments[3]);
+        let prompt_id = percent_decode(segments[5]);
+        if segments.len() == 7 && segments[6] == "send-now" && method == "POST" {
+            return handle_post_queued_prompt_send_now(state, store, &session_id, &prompt_id);
+        }
+        if segments.len() == 6 && method == "DELETE" {
+            return handle_delete_queued_prompt(state, store, &session_id, &prompt_id);
         }
     }
 
@@ -1479,6 +1517,175 @@ fn handle_dynamic_api_routes(
     HttpResponse::json(404, json!({ "error": "not found" }))
 }
 
+fn resolve_session_target(
+    state: &HubState,
+    store: &RedbStore,
+    raw_session_id: &str,
+) -> (String, Option<String>) {
+    let trimmed = raw_session_id.trim();
+    let sessions = discover_sessions_with_home(store, state.config.home_override.as_deref());
+    if let Some(matched) = sessions
+        .iter()
+        .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
+    {
+        return (matched.id.clone(), matched.persona.clone());
+    }
+    (trimmed.to_string(), Some(trimmed.to_ascii_lowercase()))
+}
+
+fn dispatch_operator_prompt_for_session(
+    state: &HubState,
+    persona: Option<&str>,
+    fallback_session_id: &str,
+    sender_name: &str,
+    effective_body: &str,
+) -> Result<(), String> {
+    let route_override = state
+        .config
+        .home_override
+        .as_ref()
+        .map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
+    let mut routes = RouteTable::load(route_override.as_deref());
+    routes.discover_routes(state.config.home_override.as_deref(), stamp::now());
+    let lookup_key = persona.unwrap_or(fallback_session_id);
+    if let Some(entry) = routes.get(lookup_key) {
+        return dispatch_operator_prompt_to_route(&entry.route, sender_name, effective_body);
+    }
+    Err(format!("no active vendor route for `{lookup_key}`"))
+}
+
+/// Automatically drain and dispatch the next queued operator prompt for any session whose
+/// transcript/in-flight state has transitioned from busy to idle.
+pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
+    for session_id in state.queued_session_keys() {
+        if !state.is_session_busy(store, &session_id)
+            && let Some((item, queue)) = state.pop_next_queued_prompt(&session_id)
+        {
+            let delivery_res = dispatch_operator_prompt_for_session(
+                state,
+                item.persona.as_deref(),
+                &item.session_id,
+                &item.by,
+                &item.effective_body,
+            );
+            state.mark_session_in_flight(store, &session_id);
+            let sent_data = json!({
+                "session_id": item.session_id,
+                "persona": item.persona,
+                "status": "sent",
+                "queued": false,
+                "is_busy": true,
+                "delivered": delivery_res.is_ok(),
+                "prompt_id": item.id,
+                "prompt": item.prompt,
+                "effective_body": item.effective_body,
+                "by": item.by,
+                "queue": queue,
+                "attachments": item.attachments,
+            });
+            state.broadcast("session", "prompt_sent", sent_data);
+            state.broadcast(
+                "session",
+                "queue_updated",
+                json!({
+                    "session_id": item.session_id,
+                    "persona": item.persona,
+                    "is_busy": true,
+                    "queue": queue,
+                }),
+            );
+        }
+    }
+}
+
+fn handle_post_queued_prompt_send_now(
+    state: &HubState,
+    store: &RedbStore,
+    raw_session_id: &str,
+    prompt_id: &str,
+) -> HttpResponse {
+    let (canonical_id, target_persona) = resolve_session_target(state, store, raw_session_id);
+    let removed = state
+        .remove_queued_prompt(&canonical_id, prompt_id)
+        .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
+    let Some((item, queue)) = removed else {
+        return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
+    };
+
+    let delivery_res = dispatch_operator_prompt_for_session(
+        state,
+        item.persona.as_deref().or(target_persona.as_deref()),
+        &canonical_id,
+        &item.by,
+        &item.effective_body,
+    );
+    state.mark_session_in_flight(store, &canonical_id);
+
+    let data = json!({
+        "session_id": canonical_id,
+        "persona": item.persona.clone().or(target_persona.clone()),
+        "status": "sent",
+        "queued": false,
+        "is_busy": true,
+        "delivered": delivery_res.is_ok(),
+        "prompt_id": prompt_id,
+        "prompt": item.prompt,
+        "effective_body": item.effective_body,
+        "by": item.by,
+        "queue": queue,
+        "attachments": item.attachments,
+    });
+    state.broadcast("session", "prompt_sent", data.clone());
+    state.broadcast(
+        "session",
+        "queue_updated",
+        json!({
+            "session_id": canonical_id,
+            "persona": item.persona.or(target_persona),
+            "is_busy": true,
+            "queue": queue,
+        }),
+    );
+    HttpResponse::json(200, data)
+}
+
+fn handle_delete_queued_prompt(
+    state: &HubState,
+    store: &RedbStore,
+    raw_session_id: &str,
+    prompt_id: &str,
+) -> HttpResponse {
+    let (canonical_id, target_persona) = resolve_session_target(state, store, raw_session_id);
+    let removed = state
+        .remove_queued_prompt(&canonical_id, prompt_id)
+        .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
+    let Some((item, queue)) = removed else {
+        return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
+    };
+
+    let is_busy = state.is_session_busy(store, &canonical_id);
+    state.broadcast(
+        "session",
+        "queue_updated",
+        json!({
+            "session_id": canonical_id,
+            "persona": item.persona.or(target_persona),
+            "is_busy": is_busy,
+            "queue": queue,
+        }),
+    );
+    HttpResponse::json(
+        200,
+        json!({
+            "session_id": canonical_id,
+            "status": "cancelled",
+            "prompt_id": prompt_id,
+            "is_busy": is_busy,
+            "queue": queue,
+        }),
+    )
+}
+
 fn handle_post_session_prompt(
     state: &HubState,
     store: &RedbStore,
@@ -1494,14 +1701,6 @@ fn handle_post_session_prompt(
         data_base64: String,
     }
 
-    #[derive(Serialize)]
-    struct SavedAttachment {
-        name: String,
-        media_type: String,
-        path: String,
-        url: String,
-    }
-
     #[derive(Deserialize)]
     struct PromptPayload {
         #[serde(default)]
@@ -1509,9 +1708,7 @@ fn handle_post_session_prompt(
         #[serde(default)]
         by: Option<String>,
         #[serde(default)]
-        urgency: Option<MessageUrgency>,
-        #[serde(default)]
-        subject: Option<String>,
+        send_now: bool,
         #[serde(default)]
         attachments: Vec<PromptAttachmentInput>,
     }
@@ -1582,7 +1779,7 @@ fn handle_post_session_prompt(
             } else {
                 att.media_type.trim().to_string()
             };
-            saved_attachments.push(SavedAttachment {
+            saved_attachments.push(SavedPromptAttachment {
                 name: sanitized,
                 media_type,
                 path: saved_path.display().to_string(),
@@ -1591,11 +1788,12 @@ fn handle_post_session_prompt(
         }
     }
 
-    let mut effective_body = if payload.prompt.trim().is_empty() {
+    let prompt_text = if payload.prompt.trim().is_empty() {
         "Attached file(s).".to_string()
     } else {
         payload.prompt.trim().to_string()
     };
+    let mut effective_body = prompt_text.clone();
     for saved in &saved_attachments {
         effective_body.push_str(&format!(
             "\n\n[Attached file: {} ({})]",
@@ -1603,85 +1801,75 @@ fn handle_post_session_prompt(
         ));
     }
 
-    let sessions = discover_sessions_with_home(store, state.config.home_override.as_deref());
-    let target_persona = sessions
-        .iter()
-        .find(|s| s.id == session_id || s.persona.as_deref() == Some(session_id))
-        .and_then(|s| s.persona.clone())
-        .unwrap_or_else(|| session_id.to_ascii_lowercase());
-
-    let to = match WireAddress::parse(&target_persona) {
-        Ok(addr) => addr,
-        Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
-    };
-
     let sender_raw = payload
         .by
         .as_deref()
         .unwrap_or_else(|| authority.actor_name());
     let sender_name = validate_sender_name(sender_raw).unwrap_or_else(|_| "owner".to_string());
-    let sender_id = store
-        .agent_by_name(&sender_name)
-        .ok()
-        .flatten()
-        .map(|a| a.id);
-    let now = stamp::now();
 
-    let args = SendWireArgs {
-        id: None,
-        sender_id,
-        sender_name,
-        sender_host: None,
-        to,
-        kind: MessageKind::Mail,
-        urgency: payload.urgency.unwrap_or(MessageUrgency::Normal),
-        durable: true,
-        subject: payload
-            .subject
-            .unwrap_or_else(|| format!("Prompt for {target_persona}")),
-        body: effective_body,
-        reply_to: None,
-        thread_id: None,
-        deadline_at: None,
-        at: now.clone(),
-    };
+    drain_ready_session_queues(state, store);
+    let (canonical_session_id, target_persona) = resolve_session_target(state, store, session_id);
+    let busy = state.is_session_busy(store, &canonical_session_id);
+    let has_queued = !state.session_queue(&canonical_session_id).is_empty();
 
-    let (msg, mut receipts) = match store.send_wire(args) {
-        Ok(res) => res,
-        Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
-    };
-
-    let route_override = state
-        .config
-        .home_override
-        .as_ref()
-        .map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
-    let mut routes = RouteTable::load(route_override.as_deref());
-    let updated = dispatch_message_for_store(
-        store,
-        &mut routes,
-        state.config.home_override.as_deref(),
-        &msg,
-        now,
-    );
-    if !updated.is_empty()
-        && let Ok(fresh) = store.list_wire_receipts(&msg.id)
-    {
-        receipts = fresh;
+    if !payload.send_now && (busy || has_queued) {
+        let (item, queue) = state.enqueue_session_prompt(
+            &canonical_session_id,
+            target_persona.clone(),
+            prompt_text,
+            effective_body,
+            sender_name,
+            saved_attachments.clone(),
+        );
+        state.broadcast(
+            "session",
+            "queue_updated",
+            json!({
+                "session_id": canonical_session_id,
+                "persona": target_persona,
+                "is_busy": true,
+                "queue": queue,
+            }),
+        );
+        return HttpResponse::json(
+            200,
+            json!({
+                "session_id": canonical_session_id,
+                "persona": target_persona,
+                "status": "queued",
+                "queued": true,
+                "is_busy": true,
+                "queued_prompt": item,
+                "queue": queue,
+                "attachments": saved_attachments,
+            }),
+        );
     }
 
+    let delivery_res = dispatch_operator_prompt_for_session(
+        state,
+        target_persona.as_deref(),
+        &canonical_session_id,
+        &sender_name,
+        &effective_body,
+    );
+    state.mark_session_in_flight(store, &canonical_session_id);
+    let queue = state.session_queue(&canonical_session_id);
+
     let data = json!({
-        "session_id": session_id,
-        "message": msg,
-        "receipts": receipts,
+        "session_id": canonical_session_id,
+        "persona": target_persona,
+        "status": "sent",
+        "queued": false,
+        "is_busy": true,
+        "delivered": delivery_res.is_ok(),
+        "prompt": prompt_text,
+        "effective_body": effective_body,
+        "by": sender_name,
+        "queue": queue,
         "attachments": saved_attachments,
     });
     state.broadcast("session", "prompt_sent", data.clone());
-    state.broadcast(
-        "wire",
-        "message_sent",
-        json!({ "message": msg, "receipts": receipts }),
-    );
     HttpResponse::json(200, data)
 }
 

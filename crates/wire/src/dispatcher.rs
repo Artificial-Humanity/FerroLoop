@@ -252,6 +252,219 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
     }
 }
 
+/// Deliver a human operator chat prompt from FerroDeck directly to a live vendor session
+/// without creating a FerroWire `WireMessage` or inbox entry.
+pub fn dispatch_operator_prompt_to_route(
+    route: &VendorRoute,
+    sender_name: &str,
+    body: &str,
+) -> Result<(), String> {
+    match route {
+        VendorRoute::Claude {
+            pid,
+            socket_path,
+            key_path,
+            ..
+        } => {
+            if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
+                return Err(format!("claude pid {pid} is no longer running"));
+            }
+            let resolved_key = key_path.clone().or_else(|| {
+                std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+                    resolve_claude_key_path(&h.join(".claude").join("sessions"), *pid, socket_path)
+                })
+            });
+            let Some(kpath) = resolved_key else {
+                return Err(format!(
+                    "missing claude session key file for pid {pid} ({})",
+                    socket_path.display()
+                ));
+            };
+            let key_raw = fs::read_to_string(&kpath)
+                .map_err(|e| format!("failed to read {}: {e}", kpath.display()))?;
+            let key_json: serde_json::Value = serde_json::from_str(&key_raw)
+                .map_err(|e| format!("invalid JSON in {}: {e}", kpath.display()))?;
+            let peer_token = key_json
+                .get("peerToken")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
+
+            let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+                format!(
+                    "failed to connect to claude socket {}: {e}",
+                    socket_path.display()
+                )
+            })?;
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+            let auth_frame = serde_json::json!({
+                "type": "auth",
+                "token": peer_token,
+            });
+            let user_frame = serde_json::json!({
+                "type": "user",
+                "from": sender_name,
+                "priority": "next",
+                "message": {
+                    "role": "user",
+                    "content": body,
+                }
+            });
+            let payload = format!("{auth_frame}\n{user_frame}\n");
+            stream
+                .write_all(payload.as_bytes())
+                .and_then(|()| stream.flush())
+                .map_err(|e| format!("failed to write to claude socket: {e}"))?;
+            Ok(())
+        }
+        VendorRoute::Agy {
+            conversation_id,
+            ls_address,
+            csrf_token,
+            agentapi_exe,
+            ..
+        } => {
+            let exe = agentapi_exe
+                .clone()
+                .or_else(|| std::env::var_os("ANTIGRAVITY_AGENTAPI_EXE").map(PathBuf::from))
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .map(|h| h.join(".local").join("bin").join("agy"))
+                })
+                .unwrap_or_else(|| PathBuf::from("agy"));
+            let addr = ls_address
+                .clone()
+                .or_else(|| std::env::var("ANTIGRAVITY_LS_ADDRESS").ok())
+                .unwrap_or_default();
+            let csrf = csrf_token
+                .clone()
+                .or_else(|| std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok())
+                .unwrap_or_default();
+
+            let title = "--title=[Operator Prompt via FerroDeck]";
+            let delivered_body = if body.starts_with("[Operator Prompt via FerroDeck") {
+                body.to_string()
+            } else {
+                format!("[Operator Prompt via FerroDeck — from {sender_name}]\n\n{body}")
+            };
+            let mut cmd = Command::new(&exe);
+            cmd.args([
+                "agentapi",
+                "send-message",
+                title,
+                conversation_id,
+                &delivered_body,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            cmd.env("ANTIGRAVITY_CONVERSATION_ID", conversation_id);
+            cmd.env("ANTIGRAVITY_AGENTAPI_EXE", &exe);
+            if !addr.is_empty() {
+                cmd.env("ANTIGRAVITY_LS_ADDRESS", &addr);
+            }
+            if !csrf.is_empty() {
+                cmd.env("ANTIGRAVITY_CSRF_TOKEN", &csrf);
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
+            if !status.success() {
+                return Err(format!("agy send-message exited with {status}"));
+            }
+            Ok(())
+        }
+        VendorRoute::Codex { thread_id, cwd } => {
+            let mut cmd = Command::new("codex");
+            cmd.args(["queue", "--thread", thread_id, "--message", body])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(dir) = cwd {
+                cmd.current_dir(dir);
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| format!("failed to spawn codex queue: {e}"))?;
+            if !status.success() {
+                return Err(format!("codex queue exited with {status}"));
+            }
+            Ok(())
+        }
+        VendorRoute::Muse { session_id, cwd } => {
+            let bin = std::env::var_os("FL_WIRE_MUSE_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("muse"));
+            let mut cmd = Command::new(&bin);
+            cmd.env("MUSE_NO_AUTO_UPDATE", "1");
+            cmd.args(["exec", "--session-id", session_id, "--json", body])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if let Some(dir) = cwd
+                && dir.exists()
+            {
+                cmd.current_dir(dir);
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
+            if !status.success() {
+                return Err(format!("muse exec exited with {status}"));
+            }
+            Ok(())
+        }
+        VendorRoute::Grok { session_id, cwd } => {
+            let bin = std::env::var_os("FL_WIRE_GROK_BIN")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("grok"));
+            let mut cmd = Command::new(&bin);
+            cmd.args([
+                "--no-auto-update",
+                "--no-alt-screen",
+                "--always-approve",
+                "-s",
+                session_id,
+                "-p",
+                body,
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+            if let Some(dir) = cwd
+                && dir.exists()
+            {
+                cmd.current_dir(dir);
+            }
+            let status = cmd
+                .status()
+                .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
+            if !status.success() {
+                return Err(format!("grok exited with {status}"));
+            }
+            Ok(())
+        }
+        VendorRoute::Webhook { socket_path } => {
+            let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+                format!(
+                    "failed to connect to webhook socket {}: {e}",
+                    socket_path.display()
+                )
+            })?;
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+            let mut line = serde_json::to_string(&serde_json::json!({
+                "kind": "operator_prompt",
+                "sender_name": sender_name,
+                "body": body,
+            }))
+            .map_err(|e| format!("serialize operator prompt: {e}"))?;
+            line.push('\n');
+            stream
+                .write_all(line.as_bytes())
+                .and_then(|()| stream.flush())
+                .map_err(|e| format!("failed to write to webhook socket: {e}"))?;
+            Ok(())
+        }
+    }
+}
+
 /// Attempt push delivery for all pending recipients of `msg` on this host,
 /// updating `store` receipts (`Acked` on verified push, `Pending` with `attempts + 1` on failure)
 /// and returning any modified `DeliveryReceipt`s.
@@ -523,5 +736,70 @@ mod tests {
         assert_eq!(grok_lines[4], "gs-99");
         assert_eq!(grok_lines[5], "-p");
         assert!(grok_lines[6].contains("muse check"));
+    }
+
+    #[test]
+    fn operator_prompt_dispatch_sends_direct_frames_without_wire_headers() {
+        let tmp = TempDir::new().unwrap();
+        let claude_sock = tmp.path().join("claude-op.sock");
+        let key_path = tmp.path().join("0.key");
+        fs::write(&key_path, "{\"peerToken\":\"tok-op\"}").unwrap();
+
+        let claude_listener = UnixListener::bind(&claude_sock).unwrap();
+        let claude_handle = std::thread::spawn(move || {
+            let (stream, _) = claude_listener.accept().unwrap();
+            let reader = std::io::BufReader::new(stream);
+            reader
+                .lines()
+                .take(2)
+                .map(|l| l.unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        dispatch_operator_prompt_to_route(
+            &VendorRoute::Claude {
+                pid: 0,
+                session_id: "s-op".into(),
+                socket_path: claude_sock,
+                key_path: Some(key_path),
+            },
+            "owner",
+            "Check the queue status",
+        )
+        .unwrap();
+
+        let claude_lines = claude_handle.join().unwrap();
+        let auth: serde_json::Value = serde_json::from_str(&claude_lines[0]).unwrap();
+        assert_eq!(auth["type"], "auth");
+        assert_eq!(auth["token"], "tok-op");
+        let user: serde_json::Value = serde_json::from_str(&claude_lines[1]).unwrap();
+        assert_eq!(user["type"], "user");
+        assert_eq!(user["from"], "owner");
+        assert_eq!(user["priority"], "next");
+        assert_eq!(user["message"]["role"], "user");
+        assert_eq!(user["message"]["content"], "Check the queue status");
+
+        let webhook_sock = tmp.path().join("webhook-op.sock");
+        let webhook_listener = UnixListener::bind(&webhook_sock).unwrap();
+        let webhook_handle = std::thread::spawn(move || {
+            let (stream, _) = webhook_listener.accept().unwrap();
+            let reader = std::io::BufReader::new(stream);
+            reader.lines().next().unwrap().unwrap()
+        });
+
+        dispatch_operator_prompt_to_route(
+            &VendorRoute::Webhook {
+                socket_path: webhook_sock,
+            },
+            "lmcfarlin",
+            "Inspect the UI",
+        )
+        .unwrap();
+
+        let wh_line = webhook_handle.join().unwrap();
+        let wh_json: serde_json::Value = serde_json::from_str(&wh_line).unwrap();
+        assert_eq!(wh_json["kind"], "operator_prompt");
+        assert_eq!(wh_json["sender_name"], "lmcfarlin");
+        assert_eq!(wh_json["body"], "Inspect the UI");
     }
 }

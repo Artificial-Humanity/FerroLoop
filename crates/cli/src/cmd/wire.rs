@@ -262,6 +262,15 @@ pub fn resolve_routes_path() -> Option<PathBuf> {
         .filter(|p| p.is_absolute())
 }
 
+pub fn resolve_routes_path_for(env: &StateEnv<'_>) -> Option<PathBuf> {
+    resolve_routes_path().or_else(|| {
+        env.explicit_db
+            .and_then(|p| p.parent())
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(|d| d.join("fl-wire-routes.json"))
+    })
+}
+
 pub fn resolve_caller(
     env: &StateEnv<'_>,
     explicit: Option<&str>,
@@ -269,9 +278,10 @@ pub fn resolve_caller(
 ) -> String {
     let store = env.open_for_scope(Some(&StateScope::Workspace)).ok();
     let reg = store.as_ref().map(|s| s as &dyn AgentRegistry);
-    let rpath = resolve_routes_path();
+    let rpath = resolve_routes_path_for(env);
     let persona = resolve_persona(explicit, transcript, env.cwd, reg, rpath.as_deref());
-    if persona != "unknown"
+    if explicit.is_none()
+        && persona != "unknown"
         && let Some(route) = capture_current_env_route()
     {
         record_caller_route(env, &persona, route);
@@ -288,7 +298,7 @@ pub fn record_caller_route(env: &StateEnv<'_>, persona: &str, route: VendorRoute
         });
         return;
     }
-    let rpath = resolve_routes_path();
+    let rpath = resolve_routes_path_for(env);
     let mut table = RouteTable::load(rpath.as_deref());
     table.upsert(persona, route, now_at());
     let _ = table.save(rpath.as_deref());
@@ -320,7 +330,7 @@ pub fn execute_send(
     }
     let store = env.open_for_scope(Some(&StateScope::Workspace))?;
     let (msg, receipts) = store.send_wire(args).map_err(|e| e.to_string())?;
-    let rpath = resolve_routes_path();
+    let rpath = resolve_routes_path_for(env);
     let mut routes = RouteTable::load(rpath.as_deref());
     let _ = dispatch_message_for_store(&store, &mut routes, None, &msg, now_at());
     let latest_receipts = store.list_wire_receipts(&msg.id).unwrap_or(receipts);
@@ -866,7 +876,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                 }
                 return Ok(0);
             }
-            let rpath = resolve_routes_path();
+            let rpath = resolve_routes_path_for(env);
             let routes = RouteTable::load(rpath.as_deref());
             if json {
                 println!(
@@ -928,7 +938,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
                     node_id: host.clone(),
                     host,
                     socket_path: sock,
-                    routes_path: resolve_routes_path(),
+                    routes_path: resolve_routes_path_for(env),
                     home_override: None,
                     listen_addr,
                     peers: peer_list,

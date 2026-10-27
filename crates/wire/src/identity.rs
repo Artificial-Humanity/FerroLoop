@@ -101,11 +101,21 @@ impl RouteTable {
             && let Some(legacy) = legacy_routes_path()
             && let Some(legacy_table) = Self::load_file(&legacy)
         {
-            for (k, v) in legacy_table.entries {
-                table.entries.entry(k).or_insert(v);
-            }
+            table.merge_newer(legacy_table);
         }
         table
+    }
+
+    pub fn merge_newer(&mut self, other: Self) {
+        for (k, v) in other.entries {
+            match self.entries.get(&k) {
+                Some(existing)
+                    if existing.updated_at.unix_millis() >= v.updated_at.unix_millis() => {}
+                _ => {
+                    self.entries.insert(k, v);
+                }
+            }
+        }
     }
 
     fn load_file(path: &Path) -> Option<Self> {
@@ -126,12 +136,17 @@ impl RouteTable {
                     continue;
                 };
                 if let Some(route) = parse_legacy_route_item(item) {
+                    let updated_at = item
+                        .get("updated_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_flexible_at)
+                        .unwrap_or_else(|| At::from_unix_millis(0));
                     entries.insert(
                         norm.clone(),
                         RouteEntry {
                             persona: norm,
                             route,
-                            updated_at: At::from_unix_millis(0),
+                            updated_at,
                         },
                     );
                 }
@@ -536,6 +551,37 @@ fn extract_session_id_and_cwd(path: &Path, fallback_stem: &str) -> (String, Opti
         }
     }
     (session_id, cwd)
+}
+
+fn parse_flexible_at(raw: &str) -> Option<At> {
+    let trimmed = raw.trim();
+    if let Ok(at) = At::parse(trimmed) {
+        return Some(at);
+    }
+    let without_tz = trimmed
+        .strip_suffix('Z')
+        .or_else(|| trimmed.strip_suffix('z'))
+        .or_else(|| trimmed.strip_suffix("+00:00"))
+        .or_else(|| trimmed.strip_suffix("-00:00"))
+        .unwrap_or(trimmed);
+    if without_tz.len() < 19 {
+        return None;
+    }
+    let date_time = &without_tz[..19];
+    let rest = &without_tz[19..];
+    let millis_str = if rest.is_empty() {
+        "000".to_string()
+    } else {
+        let frac = rest.strip_prefix('.')?;
+        let digits: String = frac.chars().take_while(|c| c.is_ascii_digit()).collect();
+        match digits.len() {
+            0 => "000".to_string(),
+            1 => format!("{digits}00"),
+            2 => format!("{digits}0"),
+            _ => digits[..3].to_string(),
+        }
+    };
+    At::parse(&format!("{date_time}.{millis_str}Z")).ok()
 }
 
 fn parse_legacy_route_item(item: &serde_json::Value) -> Option<VendorRoute> {
@@ -1181,6 +1227,72 @@ mod tests {
         assert!(matches!(
             table.get("gideon").map(|e| &e.route),
             Some(VendorRoute::Grok { session_id, .. }) if session_id == "grok-sess-1"
+        ));
+    }
+
+    #[test]
+    fn legacy_routes_json_preserves_updated_at_and_newer_legacy_wins_over_older_primary() {
+        let tmp = TempDir::new().unwrap();
+        let legacy_path = tmp.path().join("legacy-routes.json");
+        fs::write(
+            &legacy_path,
+            serde_json::json!({
+                "ferris": {
+                    "vendor": "agy",
+                    "conversation_id": "conv-live-new",
+                    "updated_at": "2026-10-27T16:00:00Z"
+                },
+                "sonya": {
+                    "vendor": "claude",
+                    "pid": 1234,
+                    "session_id": "sess-old",
+                    "socket_path": "/tmp/sonya-old.sock",
+                    "updated_at": "2026-10-20T00:00:00Z"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let legacy_table = RouteTable::load_file(&legacy_path).expect("should parse legacy routes");
+        let ferris_legacy = legacy_table.get("ferris").unwrap();
+        assert_eq!(
+            ferris_legacy.updated_at,
+            At::parse("2026-10-27T16:00:00.000Z").unwrap()
+        );
+
+        let mut primary = RouteTable::default();
+        primary.upsert(
+            "ferris",
+            VendorRoute::Agy {
+                conversation_id: "conv-stale-subagent".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            At::parse("2026-10-25T12:00:00.000Z").unwrap(),
+        );
+        primary.upsert(
+            "sonya",
+            VendorRoute::Claude {
+                pid: 5678,
+                session_id: "sess-newer".into(),
+                socket_path: PathBuf::from("/tmp/sonya-newer.sock"),
+                key_path: None,
+            },
+            At::parse("2026-10-27T15:00:00.000Z").unwrap(),
+        );
+
+        primary.merge_newer(legacy_table);
+
+        assert!(matches!(
+            primary.get("ferris").map(|e| &e.route),
+            Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-live-new"
+        ));
+        assert!(matches!(
+            primary.get("sonya").map(|e| &e.route),
+            Some(VendorRoute::Claude { session_id, .. }) if session_id == "sess-newer"
         ));
     }
 }
