@@ -29,6 +29,7 @@ export const COCKPIT_TABS: Array<{ id: CockpitTab; label: string }> = [
   { id: "mail", label: "Wire Mail" },
   { id: "terminal", label: "Terminal" },
   { id: "hub", label: "Hub & Arch" },
+  { id: "gate", label: "Vault & Gate" },
 ];
 
 export const ContextHeader: React.FC<ContextHeaderProps> = ({

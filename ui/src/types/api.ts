@@ -2,7 +2,7 @@
  * Exact 1:1 TypeScript wire contract matching `crates/hub/src/{api,auth,discovery,terminal,ws}.rs`.
  */
 
-export type CockpitTab = "chat" | "git" | "mail" | "terminal" | "hub";
+export type CockpitTab = "chat" | "git" | "mail" | "terminal" | "hub" | "gate";
 
 export type HubAuthority =
   | { tier: "owner"; login: string }
@@ -551,6 +551,85 @@ export interface ArchitectureResponse {
   model: ArchitectureModel | null;
   likec4_dsl: string | null;
   conformance: ArchConformanceReport | null;
+}
+
+/**
+ * FerroGate (`/api/v1/gate/*`, `crates/gate/src/{vault,connector,bridge}.rs`).
+ * Secret metadata never carries plaintext values.
+ */
+export interface VaultSecretMetadata {
+  name: string;
+  description?: string;
+  allowed_hosts: string[];
+  allowed_methods: string[];
+  allowed_agents: string[];
+  allow_private_network: boolean;
+  created_at: string;
+  updated_at: string;
+  lease_ttl_secs?: number;
+  expires_at?: string;
+}
+
+export interface SetVaultSecretInput {
+  name: string;
+  value: string;
+  description?: string;
+  allowed_hosts: string[];
+  allowed_methods?: string[];
+  allowed_agents?: string[];
+  allow_private_network?: boolean;
+  lease_ttl_secs?: number;
+}
+
+export interface GateConnectorToolSummary {
+  name: string;
+  description: string;
+  method: string;
+  path: string;
+  path_params?: string[];
+  query_params?: string[];
+  body_params?: string[];
+  response_fields?: string[];
+}
+
+export interface GateBridgeSummary {
+  id: string;
+  kind: string;
+  enabled: boolean;
+  default_target?: string | null;
+  channel_routes: Record<string, string>;
+}
+
+export interface GateConnectorSummary {
+  id: string;
+  /** `ConnectorManifest.title` on the wire; `name` kept as an older alias. */
+  title: string;
+  name?: string;
+  version: string;
+  description: string;
+  base_url: string;
+  allowed_hosts: string[];
+  enabled?: boolean;
+  tools: GateConnectorToolSummary[];
+  bridges: GateBridgeSummary[];
+}
+
+export interface GateSecretsResponse {
+  secrets: VaultSecretMetadata[];
+}
+
+export interface GateSecretResponse {
+  secret: VaultSecretMetadata;
+}
+
+/** `handle_delete_gate_secret` in `crates/hub/src/api.rs` returns `removed`. */
+export interface DeleteGateSecretResponse {
+  removed: boolean;
+  name: string;
+}
+
+export interface GateConnectorsResponse {
+  connectors: GateConnectorSummary[];
 }
 
 export interface HubWsFrame<T = unknown> {
