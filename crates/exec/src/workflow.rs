@@ -22,15 +22,13 @@ use fl_core::store::{
     WorkflowStore,
 };
 use fl_core::telemetry::{AdapterKind, RateCard};
-pub use fl_core::workflow::{
-    SelectedStepAgent, select_step_agent, validate_reviewer_independence,
-};
 use fl_core::workflow::{
     ApprovalTier, AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS,
     DEFAULT_STEP_MAX_VISITS, EdgeDef, JoinPolicy, StepAttemptReport, StepCompletion, StepDef,
     StepOutcome, WorkflowDef, WorkflowError, WorkflowRun, WorkflowRunStatus, advance_workflow,
     authorize_step_sign_off, validate_workflow_def,
 };
+pub use fl_core::workflow::{SelectedStepAgent, select_step_agent, validate_reviewer_independence};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -208,10 +206,7 @@ pub fn export_workflow_manifest(
 }
 
 /// Serialize `def` to pretty-printed TOML for `.fl/flows/<slug>.toml` (spec §3.1).
-pub fn export_workflow_toml(
-    catalog: &dyn Catalog,
-    def: &WorkflowDef,
-) -> Result<String, ExecError> {
+pub fn export_workflow_toml(catalog: &dyn Catalog, def: &WorkflowDef) -> Result<String, ExecError> {
     let manifest = export_workflow_manifest(catalog, def)?;
     toml::to_string_pretty(&manifest)
         .map_err(|e| ExecError::Store(format!("failed to serialize workflow TOML: {e}")))
@@ -495,7 +490,9 @@ pub fn build_step_instruction(
         .steps
         .iter()
         .find(|s| s.step_id == step_id)
-        .ok_or_else(|| ExecError::Store(WorkflowError::UnknownStep(step_id.to_string()).to_string()))?;
+        .ok_or_else(|| {
+            ExecError::Store(WorkflowError::UnknownStep(step_id.to_string()).to_string())
+        })?;
 
     let mut out = step_def.prompt.clone();
 
@@ -790,8 +787,9 @@ fn ensure_isolated_worktree(
 
     if !wt_dir.exists() {
         if let Some(parent) = wt_dir.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| ExecError::Git(format!("could not create worktree parent dir: {e}")))?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ExecError::Git(format!("could not create worktree parent dir: {e}"))
+            })?;
         }
         let out = Command::new("git")
             .args([
@@ -956,11 +954,7 @@ pub fn execute_workflow_step(
     let raw_adapter = options
         .adapter_override
         .clone()
-        .or_else(|| {
-            run.steps
-                .get(&step_id)
-                .and_then(|s| s.adapter_used.clone())
-        })
+        .or_else(|| run.steps.get(&step_id).and_then(|s| s.adapter_used.clone()))
         .or_else(|| match &step_def.assignee {
             AssigneeRule::Selector { adapter, .. } => adapter.clone(),
             _ => None,
@@ -979,9 +973,7 @@ pub fn execute_workflow_step(
         .roles
         .catalog
         .get_project(&run.project)?
-        .ok_or_else(|| {
-            ExecError::BadSelector(format!("project {} does not exist", run.project))
-        })?;
+        .ok_or_else(|| ExecError::BadSelector(format!("project {} does not exist", run.project)))?;
     let project_root = PathBuf::from(&project.root);
 
     let record_id = match run.steps.get(&step_id).and_then(|s| s.record_id.clone()) {
@@ -1095,9 +1087,7 @@ pub fn execute_workflow_step(
                     ApprovalTier::LabManager => WireAddress::Role(AgentRole::LabManager),
                     ApprovalTier::Owner => WireAddress::AgentName("owner".to_string()),
                 };
-                let sender = assigned_agent
-                    .clone()
-                    .unwrap_or_else(|| options.by.clone());
+                let sender = assigned_agent.clone().unwrap_or_else(|| options.by.clone());
                 let body = if outcome.output_excerpt.trim().is_empty() {
                     format!(
                         "Workflow `{}` run `{}` step `{}` awaits `{}` sign-off.",
@@ -1195,11 +1185,8 @@ pub fn execute_workflow_step(
                             failed_names.push(gr.name.clone());
                             let excerpt = gr.output_excerpt.trim();
                             if excerpt.is_empty() {
-                                blockers.push(format!(
-                                    "gate `{}` failed ({:?})",
-                                    gr.name,
-                                    gr.verdict
-                                ));
+                                blockers
+                                    .push(format!("gate `{}` failed ({:?})", gr.name, gr.verdict));
                             } else {
                                 blockers.push(format!(
                                     "gate `{}` failed: {}",
@@ -1235,9 +1222,7 @@ pub fn execute_workflow_step(
         "gate_runs": gate_run_iris,
     });
 
-    let handoff_author = assigned_agent
-        .as_deref()
-        .unwrap_or(options.by.as_str());
+    let handoff_author = assigned_agent.as_deref().unwrap_or(options.by.as_str());
     let handoff_entry = record_step_handoff(
         env.state,
         &run.id,
@@ -1499,10 +1484,7 @@ pub fn reject_workflow_step(
 
     let now = stamp::now();
     let visit_count = step_instance.visit_count.max(1);
-    let summary = sanitize_handoff_summary(
-        reason,
-        &format!("Step `{step_id}` rejected by {by}"),
-    );
+    let summary = sanitize_handoff_summary(reason, &format!("Step `{step_id}` rejected by {by}"));
     record_step_handoff(
         env.state,
         &run.id,
@@ -1709,8 +1691,7 @@ to_step = "END"
 on = "pass"
 "#;
 
-        let imported =
-            import_workflow_toml(&store, &project, toml_text, &head, "ferris").unwrap();
+        let imported = import_workflow_toml(&store, &project, toml_text, &head, "ferris").unwrap();
         assert_eq!(imported.slug, "review-loop");
         assert_eq!(imported.authored_at_commit, head);
         assert_eq!(imported.authored_by, "ferris");
@@ -1906,7 +1887,11 @@ on = "pass"
         let prompt = build_step_instruction(&store, &def, &run, "review").unwrap();
         assert!(prompt.starts_with("Verify the implementation."));
         assert!(prompt.contains("## Predecessor Handoffs"));
-        assert!(prompt.contains("`implement` (`step-implement-v2`): Implemented workflow runner and tests"));
+        assert!(
+            prompt.contains(
+                "`implement` (`step-implement-v2`): Implemented workflow runner and tests"
+            )
+        );
         assert!(prompt.contains("- Shipped: crates/exec/src/workflow.rs"));
         assert!(prompt.contains("- In flight: fl/flow/123/implement"));
         assert!(prompt.contains("- Next steps: Run independent review"));
@@ -1922,7 +1907,8 @@ on = "pass"
     fn execute_approve_and_reject_workflow_steps_with_gates_wire_and_worktree_isolation() {
         let repo = git_repo();
         let head = crate::git::Git::head(repo.path()).unwrap();
-        let stub_bin = write_stub_adapter(repo.path(), "fake-claude.sh", "Implemented step cleanly", 0);
+        let stub_bin =
+            write_stub_adapter(repo.path(), "fake-claude.sh", "Implemented step cleanly", 0);
 
         let store = MemStore::default();
         let project = store

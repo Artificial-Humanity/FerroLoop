@@ -3630,8 +3630,8 @@ mod tests {
         use fl_core::store::WorkflowStore;
         use fl_core::workflow::{
             AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS,
-            DEFAULT_STEP_MAX_VISITS, END_STEP, EdgeCondition, EdgeDef, JoinPolicy,
-            StepCompletion, StepDef, WorkflowDef, WorkflowRun,
+            DEFAULT_STEP_MAX_VISITS, END_STEP, EdgeCondition, EdgeDef, JoinPolicy, StepCompletion,
+            StepDef, WorkflowDef, WorkflowRun,
         };
         use std::collections::BTreeMap;
 
@@ -3700,7 +3700,10 @@ mod tests {
 
         let reopened = RedbStore::open(&path).unwrap();
         assert_eq!(reopened.get_workflow_def(&wf.id).unwrap(), Some(wf.clone()));
-        assert_eq!(reopened.get_workflow_run(&run.id).unwrap(), Some(run.clone()));
+        assert_eq!(
+            reopened.get_workflow_run(&run.id).unwrap(),
+            Some(run.clone())
+        );
         assert_eq!(
             reopened.handle_of(Kind::Workflow, wf.id.iri()).unwrap(),
             Some(1)

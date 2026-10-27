@@ -263,6 +263,18 @@ fn full_pr_hierarchy_assistant_to_lead_to_lab_manager_to_owner() {
     assert_eq!(peer_rev_json["code"], "insufficient_role");
     assert_eq!(peer_rev_json["agent"], "alex");
 
+    // Before approval, `felicia` cannot merge her own PR #1 -> exits 2 (`missing_valid_approval`)
+    let unapproved_merge = f
+        .fl()
+        .args([
+            "github", "pr", "merge", "1", "--method", "squash", "--by", "felicia", "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(unapproved_merge.status.code(), Some(2));
+    let unapproved_merge_json: Value = serde_json::from_slice(&unapproved_merge.stdout).unwrap();
+    assert_eq!(unapproved_merge_json["code"], "missing_valid_approval");
+
     // Before approval, `verify-ci --require-approval` exits 2 (`missing_valid_approval`)
     let unapproved_ci = f
         .fl()
@@ -317,14 +329,27 @@ fn full_pr_hierarchy_assistant_to_lead_to_lab_manager_to_owner() {
         .success()
         .stdout(contains("verified\t1\tlead(ferroloop)\tsha-pr1"));
 
-    // 6. `ferris` merges PR #1 -> merges on FakeGithub and notifies `felicia` via FerroWire
+    // Non-co-author peer assistant `alex` is still refused when attempting to merge PR #1 (`insufficient_role`)
+    let peer_merge = f
+        .fl()
+        .args([
+            "github", "pr", "merge", "1", "--method", "squash", "--by", "alex", "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(peer_merge.status.code(), Some(2));
+    let peer_merge_json: Value = serde_json::from_slice(&peer_merge.stdout).unwrap();
+    assert_eq!(peer_merge_json["code"], "insufficient_role");
+    assert_eq!(peer_merge_json["agent"], "alex");
+
+    // 6. Author-owned merge: `felicia` (co-author) merges her own PR #1 once `ferris` has approved
     f.fl()
         .args([
-            "github", "pr", "merge", "1", "--method", "squash", "--by", "ferris",
+            "github", "pr", "merge", "1", "--method", "squash", "--by", "felicia",
         ])
         .assert()
         .success()
-        .stdout(contains("merged\t1\tsquash\tferris"));
+        .stdout(contains("merged\t1\tsquash\tfelicia"));
     assert!(f.fake.pull(1).merged);
 
     let felicia_inbox = f.read_inbox_json("felicia");
@@ -333,9 +358,9 @@ fn full_pr_hierarchy_assistant_to_lead_to_lab_manager_to_owner() {
             item["subject"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("PR #1 merged by ferris")
+                .contains("PR #1 reviewed by ferris")
         }),
-        "expected merge notification in felicia's inbox, got: {felicia_inbox:?}"
+        "expected review notification in felicia's inbox, got: {felicia_inbox:?}"
     );
 
     // -------------------------------------------------------------------------

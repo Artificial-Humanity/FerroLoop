@@ -4138,7 +4138,7 @@ fn sample_workflow_def(
 ) -> crate::workflow::WorkflowDef {
     use crate::workflow::{
         AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS, DEFAULT_STEP_MAX_VISITS,
-         END_STEP, EdgeCondition, EdgeDef, JoinPolicy, StepCompletion, StepDef, WorkflowDef,
+        END_STEP, EdgeCondition, EdgeDef, JoinPolicy, StepCompletion, StepDef, WorkflowDef,
     };
     use std::collections::BTreeMap;
 
@@ -4221,7 +4221,10 @@ fn workflow_def_upserts_resolves_by_slug_and_handle_and_validates_graph<
     assert_eq!(stored, def1);
 
     // Handle 1 is assigned to the first workflow definition.
-    assert_eq!(s.handle_of(Kind::Workflow, stored.id.iri()).unwrap(), Some(1));
+    assert_eq!(
+        s.handle_of(Kind::Workflow, stored.id.iri()).unwrap(),
+        Some(1)
+    );
     assert_eq!(
         s.resolve_handle(Kind::Workflow, 1).unwrap().as_ref(),
         Some(stored.id.iri())
@@ -4234,7 +4237,10 @@ fn workflow_def_upserts_resolves_by_slug_and_handle_and_validates_graph<
         s.get_workflow_def_by_slug(&p, "review-loop").unwrap(),
         Some(stored.clone())
     );
-    assert_eq!(s.list_workflow_defs(Some(&p)).unwrap(), vec![stored.clone()]);
+    assert_eq!(
+        s.list_workflow_defs(Some(&p)).unwrap(),
+        vec![stored.clone()]
+    );
     assert_eq!(s.list_workflow_defs(None).unwrap(), vec![stored.clone()]);
 
     // Re-upserting with a different WorkflowId under the same (project, slug) preserves
@@ -4244,7 +4250,10 @@ fn workflow_def_upserts_resolves_by_slug_and_handle_and_validates_graph<
     let re_upserted = s.upsert_workflow_def(updated_input).unwrap();
     assert_eq!(re_upserted.id, stored.id);
     assert_eq!(re_upserted.title, "Updated Review Loop");
-    assert_eq!(s.handle_of(Kind::Workflow, re_upserted.id.iri()).unwrap(), Some(1));
+    assert_eq!(
+        s.handle_of(Kind::Workflow, re_upserted.id.iri()).unwrap(),
+        Some(1)
+    );
     assert_eq!(s.resolve_handle(Kind::Workflow, 2).unwrap(), None);
     assert_eq!(
         s.get_workflow_def_by_slug(&p, "review-loop").unwrap(),
@@ -4305,7 +4314,10 @@ fn workflow_run_lifecycle_persists_and_filters_by_project_and_workflow<
 
     // Duplicate create_workflow_run with the same ID is refused.
     let dup_err = s.create_workflow_run(run1).unwrap_err();
-    assert!(matches!(dup_err, StoreError::AlreadyExists(_)), "{dup_err:?}");
+    assert!(
+        matches!(dup_err, StoreError::AlreadyExists(_)),
+        "{dup_err:?}"
+    );
 
     let run2 = WorkflowRun::new(
         WorkflowRunId(seq_iri(821)),
@@ -4356,7 +4368,10 @@ fn workflow_run_lifecycle_persists_and_filters_by_project_and_workflow<
     .unwrap();
     assert_eq!(advancing.status, WorkflowRunStatus::Completed);
     let saved = s.update_workflow_run(advancing.clone()).unwrap();
-    assert_eq!(s.get_workflow_run(&created1.id).unwrap(), Some(saved.clone()));
+    assert_eq!(
+        s.get_workflow_run(&created1.id).unwrap(),
+        Some(saved.clone())
+    );
 
     assert_eq!(
         s.list_workflow_runs(Some(&p1), None).unwrap(),
@@ -4425,9 +4440,7 @@ fn workflow_methods_refuse_wrong_kind_ids<S: WorkflowStore + Catalog + Handles>(
         "{wrong_wf:?}"
     );
 
-    let wrong_run = s
-        .get_workflow_run(&WorkflowRunId(p.0.clone()))
-        .unwrap_err();
+    let wrong_run = s.get_workflow_run(&WorkflowRunId(p.0.clone())).unwrap_err();
     assert!(
         matches!(
             wrong_run,

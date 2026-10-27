@@ -6,16 +6,12 @@ use fl_core::store::{StoreError, WorkflowStore};
 use fl_core::workflow::{WorkflowDef, WorkflowRun, validate_workflow_def};
 use redb::{ReadableDatabase, ReadableTable, TableDefinition};
 
-use crate::{
-    FORMAT_WITH_WORKFLOW, RedbStore, additive, backend, decode, index_new, raise_format,
-};
+use crate::{FORMAT_WITH_WORKFLOW, RedbStore, additive, backend, decode, index_new, raise_format};
 
-pub(crate) const WORKFLOW_DEFS: TableDefinition<&str, &str> =
-    TableDefinition::new("workflow_defs");
+pub(crate) const WORKFLOW_DEFS: TableDefinition<&str, &str> = TableDefinition::new("workflow_defs");
 pub(crate) const WORKFLOW_SLUGS: TableDefinition<(&str, &str), &str> =
     TableDefinition::new("workflow_slugs");
-pub(crate) const WORKFLOW_RUNS: TableDefinition<&str, &str> =
-    TableDefinition::new("workflow_runs");
+pub(crate) const WORKFLOW_RUNS: TableDefinition<&str, &str> = TableDefinition::new("workflow_runs");
 
 impl RedbStore {
     fn check_project(&self, project: &ProjectId) -> Result<ProjectId, StoreError> {
@@ -205,11 +201,8 @@ impl WorkflowStore for RedbStore {
     fn create_workflow_run(&self, mut run: WorkflowRun) -> Result<WorkflowRun, StoreError> {
         let tx = self.db.begin_write().map_err(backend)?;
         let canonical_project = self.check_project_in_wtx(&tx, &run.project)?;
-        let canonical_wf_id = WorkflowId(self.resolve_if_kind_in_wtx(
-            &tx,
-            run.workflow_id.iri(),
-            Kind::Workflow,
-        )?);
+        let canonical_wf_id =
+            WorkflowId(self.resolve_if_kind_in_wtx(&tx, run.workflow_id.iri(), Kind::Workflow)?);
         let wf_exists = tx
             .open_table(WORKFLOW_DEFS)
             .map_err(backend)?
@@ -220,11 +213,8 @@ impl WorkflowStore for RedbStore {
             return Err(StoreError::NoSuchWorkflow(run.workflow_id.to_string()));
         }
 
-        let canonical_run_id = WorkflowRunId(self.resolve_if_kind_in_wtx(
-            &tx,
-            run.id.iri(),
-            Kind::WorkflowRun,
-        )?);
+        let canonical_run_id =
+            WorkflowRunId(self.resolve_if_kind_in_wtx(&tx, run.id.iri(), Kind::WorkflowRun)?);
         index_new(&tx, canonical_run_id.iri(), Kind::WorkflowRun)?;
 
         run.id = canonical_run_id.clone();
@@ -242,11 +232,8 @@ impl WorkflowStore for RedbStore {
 
     fn update_workflow_run(&self, mut run: WorkflowRun) -> Result<WorkflowRun, StoreError> {
         let tx = self.db.begin_write().map_err(backend)?;
-        let canonical_id = WorkflowRunId(self.resolve_if_kind_in_wtx(
-            &tx,
-            run.id.iri(),
-            Kind::WorkflowRun,
-        )?);
+        let canonical_id =
+            WorkflowRunId(self.resolve_if_kind_in_wtx(&tx, run.id.iri(), Kind::WorkflowRun)?);
         {
             let mut runs = tx.open_table(WORKFLOW_RUNS).map_err(backend)?;
             if runs.get(canonical_id.as_str()).map_err(backend)?.is_none() {
@@ -304,11 +291,8 @@ impl WorkflowStore for RedbStore {
     fn import_workflow_def(&self, mut def: WorkflowDef) -> Result<(), StoreError> {
         validate_workflow_def(&def).map_err(|e| StoreError::InvalidWorkflow(e.to_string()))?;
         let tx = self.db.begin_write().map_err(backend)?;
-        let canonical_project = ProjectId(self.resolve_if_kind_in_wtx(
-            &tx,
-            def.project.iri(),
-            Kind::Project,
-        )?);
+        let canonical_project =
+            ProjectId(self.resolve_if_kind_in_wtx(&tx, def.project.iri(), Kind::Project)?);
         let canonical_id =
             WorkflowId(self.resolve_if_kind_in_wtx(&tx, def.id.iri(), Kind::Workflow)?);
 
@@ -389,16 +373,10 @@ impl WorkflowStore for RedbStore {
 
     fn import_workflow_run(&self, mut run: WorkflowRun) -> Result<(), StoreError> {
         let tx = self.db.begin_write().map_err(backend)?;
-        let canonical_project = ProjectId(self.resolve_if_kind_in_wtx(
-            &tx,
-            run.project.iri(),
-            Kind::Project,
-        )?);
-        let canonical_wf_id = WorkflowId(self.resolve_if_kind_in_wtx(
-            &tx,
-            run.workflow_id.iri(),
-            Kind::Workflow,
-        )?);
+        let canonical_project =
+            ProjectId(self.resolve_if_kind_in_wtx(&tx, run.project.iri(), Kind::Project)?);
+        let canonical_wf_id =
+            WorkflowId(self.resolve_if_kind_in_wtx(&tx, run.workflow_id.iri(), Kind::Workflow)?);
         let wf_exists = tx
             .open_table(WORKFLOW_DEFS)
             .map_err(backend)?
@@ -409,11 +387,8 @@ impl WorkflowStore for RedbStore {
             return Err(StoreError::NoSuchWorkflow(run.workflow_id.to_string()));
         }
 
-        let canonical_id = WorkflowRunId(self.resolve_if_kind_in_wtx(
-            &tx,
-            run.id.iri(),
-            Kind::WorkflowRun,
-        )?);
+        let canonical_id =
+            WorkflowRunId(self.resolve_if_kind_in_wtx(&tx, run.id.iri(), Kind::WorkflowRun)?);
         self.index_imported_in(&tx, Kind::WorkflowRun, canonical_id.iri())?;
         run.id = canonical_id.clone();
         run.project = canonical_project;

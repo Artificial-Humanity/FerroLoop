@@ -74,6 +74,9 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::wire::WireCmd,
     },
+    /// Author, inspect, and execute directed workflow graphs.
+    #[command(subcommand)]
+    Flow(cmd::flow::FlowCmd),
 }
 
 impl Command {
@@ -92,6 +95,7 @@ impl Command {
             Command::Manifest(c) => c.iris(),
             Command::Github(c) => c.iris(),
             Command::Routing(c) => c.iris(),
+            Command::Flow(c) => c.iris(),
             Command::Mcp(_)
             | Command::Agent { .. }
             | Command::State { .. }
@@ -126,6 +130,7 @@ impl Command {
             Command::Manifest(c) => c.has_handle(),
             Command::Github(c) => c.has_handle(),
             Command::Routing(c) => c.has_handle(),
+            Command::Flow(c) => c.has_handle(),
             Command::Mcp(_)
             | Command::Agent { .. }
             | Command::State { .. }
@@ -146,6 +151,7 @@ impl Command {
             Command::Record(_) | Command::Finding(_) | Command::Attempt(_) => true,
             Command::Github(_) => true,
             Command::Routing(c) => c.needs_tracker(),
+            Command::Flow(c) => c.needs_tracker(),
             // `check` is the CI gate: it touches the tracker only to resolve
             // `--record`, and must not need GitHub otherwise.
             Command::Check(c) => c.record.is_some(),
@@ -1167,6 +1173,29 @@ fn run(cli: Cli) -> Result<i32> {
             )
         }
         Command::Routing(c) => cmd::routing::run(&ctx, c, here_for_store.map(|b| b.is_some())),
+        Command::Flow(c) => {
+            let separate_ws_store = if explicit_given {
+                None
+            } else {
+                let default_ws_store = default_state_store_path()?;
+                let ws_store_path = cfg.workspace_state_store(&default_ws_store);
+                if same_store(&path, &ws_store_path) {
+                    None
+                } else {
+                    if let Some(dir) = ws_store_path.parent()
+                        && !dir.as_os_str().is_empty()
+                    {
+                        std::fs::create_dir_all(dir)
+                            .with_context(|| format!("could not create {}", dir.display()))?;
+                    }
+                    Some(RedbStore::open(&ws_store_path).with_context(|| {
+                        format!("could not open the store at {}", ws_store_path.display())
+                    })?)
+                }
+            };
+            let ws_store = separate_ws_store.as_ref().unwrap_or(&store);
+            cmd::flow::run(&ctx, &cfg.adapters, ws_store, &cwd, c)
+        }
         Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } | Command::Wire { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }

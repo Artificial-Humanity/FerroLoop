@@ -2252,13 +2252,11 @@ impl WorkflowStore for MemStore {
         let mut s = self.inner.borrow_mut();
         s.check_kind(run.project.iri(), Kind::Project)?;
         let canonical_project = ProjectId(s.resolve(run.project.iri()));
-        let canonical_wf_id =
-            WorkflowId(s.resolve_if_kind(run.workflow_id.iri(), Kind::Workflow)?);
+        let canonical_wf_id = WorkflowId(s.resolve_if_kind(run.workflow_id.iri(), Kind::Workflow)?);
         if !s.workflow_defs.contains_key(&canonical_wf_id) {
             return Err(StoreError::NoSuchWorkflow(run.workflow_id.to_string()));
         }
-        let canonical_run_id =
-            WorkflowRunId(s.resolve_if_kind(run.id.iri(), Kind::WorkflowRun)?);
+        let canonical_run_id = WorkflowRunId(s.resolve_if_kind(run.id.iri(), Kind::WorkflowRun)?);
         if s.workflow_runs.contains_key(&canonical_run_id)
             || s.owned.contains_key(canonical_run_id.iri())
         {
@@ -2352,8 +2350,7 @@ impl WorkflowStore for MemStore {
     fn import_workflow_run(&self, mut run: WorkflowRun) -> Result<(), StoreError> {
         let mut s = self.inner.borrow_mut();
         let canonical_project = ProjectId(s.resolve_if_kind(run.project.iri(), Kind::Project)?);
-        let canonical_wf_id =
-            WorkflowId(s.resolve_if_kind(run.workflow_id.iri(), Kind::Workflow)?);
+        let canonical_wf_id = WorkflowId(s.resolve_if_kind(run.workflow_id.iri(), Kind::Workflow)?);
         if !s.workflow_defs.contains_key(&canonical_wf_id) {
             return Err(StoreError::NoSuchWorkflow(run.workflow_id.to_string()));
         }

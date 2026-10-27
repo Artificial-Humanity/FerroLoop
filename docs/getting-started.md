@@ -68,6 +68,7 @@ Commands:
   agent       Manage the workspace agent and coverage-area registry
   state       Manage durable memories, handoffs, runtime state, and git state sync
   wire        Send, read, acknowledge, and relay FerroWire agent messages
+  flow        Author, inspect, and execute directed workflow graphs
   help        Print this message or the help of the given subcommand(s)
 
 Options:

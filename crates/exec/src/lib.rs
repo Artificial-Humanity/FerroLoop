@@ -20,8 +20,7 @@ pub use adapters::{
 };
 pub use command::{GateOutcome, run_command_gate};
 pub use evaluate::{
-    GateReport, TransitionReport, evaluate_transition, run_single_gate,
-    run_single_gate_with_regret,
+    GateReport, TransitionReport, evaluate_transition, run_single_gate, run_single_gate_with_regret,
 };
 pub use finding::{FindingExecError, FixReport, attach_reproduction, verify_finding};
 pub use git::Git;

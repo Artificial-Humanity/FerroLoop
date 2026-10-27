@@ -2189,9 +2189,7 @@ mod tests {
         let store_a = MemStore::default();
         let store_b = MemStore::default();
 
-        let proj_id = store_a
-            .add_project(&clone_a.display().to_string())
-            .unwrap();
+        let proj_id = store_a.add_project(&clone_a.display().to_string()).unwrap();
 
         let wf_def = store_a
             .upsert_workflow_def(WorkflowDef {

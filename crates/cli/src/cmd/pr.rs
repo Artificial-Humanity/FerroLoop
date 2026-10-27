@@ -9,8 +9,8 @@ use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress}
 use fl_core::ids::AgentId;
 use fl_core::pr_policy::{
     DEFAULT_OWNER_LOGIN, FlReviewMarker, PolicyRefusal, RequiredTier, ReviewVerdict,
-    authorize_agent_action, evaluate_pr_policy, extract_review_marker, format_review_body,
-    verify_merge_approvals,
+    authorize_agent_action, authorize_agent_merge, evaluate_pr_policy, extract_review_marker,
+    format_review_body, verify_merge_approvals,
 };
 use fl_core::store::{AgentRegistry, MessageStore};
 use fl_github::{
@@ -547,7 +547,7 @@ pub fn run(
                     json,
                 );
             };
-            if let Err(refusal) = authorize_agent_action(&eval, &caller) {
+            if let Err(refusal) = authorize_agent_merge(&eval, &caller) {
                 return emit_refusal(&refusal, json);
             }
             let approved_by = match verify_merge_approvals(
