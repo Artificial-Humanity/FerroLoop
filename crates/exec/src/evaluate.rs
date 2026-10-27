@@ -263,6 +263,19 @@ pub fn run_single_gate(
     gate: &GateId,
     record: Option<&RecordId>,
 ) -> Result<GateReport, ExecError> {
+    run_single_gate_with_regret(catalog, ledger, project, gate, Regret::Low, record)
+}
+
+/// Run one gate against the live working tree with an explicit [`Regret`]
+/// staleness policy and record the [`GateRun`] tagged with `record`.
+pub fn run_single_gate_with_regret(
+    catalog: &dyn Catalog,
+    ledger: &dyn Ledger,
+    project: &ProjectId,
+    gate: &GateId,
+    regret: Regret,
+    record: Option<&RecordId>,
+) -> Result<GateReport, ExecError> {
     let proj = project_of(catalog, project)?;
     let root = Path::new(&proj.root);
 
@@ -274,7 +287,7 @@ pub fn run_single_gate(
     };
 
     let head = Git::head(root)?;
-    run_gate(catalog, ledger, root, &head, &def, Regret::Low, record)
+    run_gate(catalog, ledger, root, &head, &def, regret, record)
 }
 
 pub fn evaluate_transition(

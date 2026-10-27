@@ -8,12 +8,20 @@ use std::io::{BufRead, Write};
 use fl_core::agent::{AgentRole, RegisterAgentArgs, reports_to};
 use fl_core::at::At;
 use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter};
+use fl_core::ids::{Kind, ProjectId, WorkflowRunId};
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
     UpsertStateArgs,
 };
-use fl_core::store::{AgentRegistry, StateStore};
+use fl_core::store::{AgentRegistry, Catalog, Handles, StateStore, WorkflowStore};
+use fl_core::workflow::{
+    StepAttemptReport, StepOutcome, WorkflowError, WorkflowRun, advance_workflow,
+};
+use fl_exec::workflow::{
+    list_workflow_facts, list_workflow_handoffs, record_step_handoff, write_workflow_fact,
+};
+use fl_store::RedbStore;
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -26,6 +34,7 @@ use crate::cmd::wire::{
     execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
     parse_message_id, resolve_caller, wait_for_reply,
 };
+use crate::refs::{self, Ref};
 
 fn parse_memory_lifecycle(s: &str) -> Result<MemoryLifecycle, String> {
     MemoryLifecycle::from_wire(s).ok_or_else(|| {
@@ -180,6 +189,100 @@ fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing required string argument `{key}`"))
+}
+
+fn open_workflow_store(
+    env: &StateEnv<'_>,
+    project_filter: Option<&str>,
+    run_id_hint: Option<&str>,
+) -> Result<RedbStore, String> {
+    if let Some(db) = env.explicit_db {
+        if let Some(dir) = db.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        return RedbStore::open(db).map_err(|e| format!("{}: {e}", db.display()));
+    }
+
+    let primary_path = if let Some(proj_slug) = project_filter
+        && let Some(entry) = env.cfg.find_project_entry(proj_slug)
+    {
+        entry.store.clone()
+    } else if let Ok(Some(entry)) = crate::config::bound_entry(&env.cfg.projects, env.cwd) {
+        entry.store
+    } else {
+        env.cfg.workspace_state_store(env.default_store)
+    };
+
+    if let Some(dir) = primary_path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let primary =
+        RedbStore::open(&primary_path).map_err(|e| format!("{}: {e}", primary_path.display()))?;
+
+    if let Some(raw_run) = run_id_hint
+        && let Ok(Ref::Iri(iri)) = raw_run.parse::<Ref>()
+    {
+        if primary.owns(&iri).map_err(|e| e.to_string())? {
+            return Ok(primary);
+        }
+        let ws_path = env.cfg.workspace_state_store(env.default_store);
+        if ws_path != primary_path && ws_path.exists() {
+            let other = RedbStore::open(&ws_path).map_err(|e| e.to_string())?;
+            if other.owns(&iri).map_err(|e| e.to_string())? {
+                return Ok(other);
+            }
+        }
+        for entry in &env.cfg.projects {
+            if entry.store == primary_path || !entry.store.exists() {
+                continue;
+            }
+            let other = RedbStore::open(&entry.store).map_err(|e| e.to_string())?;
+            if other.owns(&iri).map_err(|e| e.to_string())? {
+                return Ok(other);
+            }
+        }
+    }
+
+    Ok(primary)
+}
+
+fn resolve_workflow_run_in_store(store: &RedbStore, raw: &str) -> Result<WorkflowRun, String> {
+    let r = raw.parse::<Ref>()?;
+    let iri =
+        refs::resolve(store, store.label(), Kind::WorkflowRun, &r).map_err(|e| e.to_string())?;
+    store
+        .get_workflow_run(&WorkflowRunId(iri))
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("no workflow run matching `{raw}` in {}", store.label()))
+}
+
+fn resolve_optional_project_filter(
+    store: &RedbStore,
+    raw_project: Option<&str>,
+) -> Result<Option<ProjectId>, String> {
+    let Some(raw) = raw_project.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if let Ok(r) = raw.parse::<Ref>() {
+        let iri =
+            refs::resolve(store, store.label(), Kind::Project, &r).map_err(|e| e.to_string())?;
+        return Ok(Some(ProjectId(iri)));
+    }
+    let projects = store.list_projects().map_err(|e| e.to_string())?;
+    for p in projects {
+        let base_match = std::path::Path::new(&p.root)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .is_some_and(|b| b.eq_ignore_ascii_case(raw));
+        if base_match || p.root == raw {
+            return Ok(Some(p.id));
+        }
+    }
+    Ok(None)
 }
 
 fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String, String> {
@@ -727,6 +830,244 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
             }))
             .unwrap())
         }
+        "workflow_list" => {
+            let project_raw = args.get("project").and_then(Value::as_str);
+            let store = open_workflow_store(env, project_raw, None)?;
+            let proj_filter = resolve_optional_project_filter(&store, project_raw)?;
+            let defs = store
+                .list_workflow_defs(proj_filter.as_ref())
+                .map_err(|e| e.to_string())?;
+            let runs = store
+                .list_workflow_runs(proj_filter.as_ref(), None)
+                .map_err(|e| e.to_string())?;
+            let workflows_json: Vec<Value> = defs
+                .iter()
+                .map(|d| {
+                    let mut v = serde_json::to_value(d).unwrap();
+                    if let Ok(Some(h)) = store.handle_of(Kind::Workflow, d.id.iri())
+                        && let Some(obj) = v.as_object_mut()
+                    {
+                        obj.insert("handle".into(), Value::String(h.to_string()));
+                    }
+                    v
+                })
+                .collect();
+            let runs_json: Vec<Value> = runs
+                .iter()
+                .map(|r| {
+                    let mut v = serde_json::to_value(r).unwrap();
+                    if let Ok(Some(h)) = store.handle_of(Kind::WorkflowRun, r.id.iri())
+                        && let Some(obj) = v.as_object_mut()
+                    {
+                        obj.insert("handle".into(), Value::String(h.to_string()));
+                    }
+                    v
+                })
+                .collect();
+            Ok(serde_json::to_string_pretty(&json!({
+                "workflows": workflows_json,
+                "runs": runs_json,
+            }))
+            .unwrap())
+        }
+        "workflow_status" => {
+            let raw_run = req_str(args, "run_id")?;
+            let store = open_workflow_store(env, None, Some(raw_run))?;
+            let run = resolve_workflow_run_in_store(&store, raw_run)?;
+            let def = store
+                .get_workflow_def(&run.workflow_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("workflow `{}` not found", run.workflow_id))?;
+            let handoffs = list_workflow_handoffs(&store, &run.id).map_err(|e| e.to_string())?;
+            let facts = list_workflow_facts(&store, &run.id).map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "run": run,
+                "workflow": def,
+                "handoffs": handoffs,
+                "facts": facts,
+            }))
+            .unwrap())
+        }
+        "workflow_handoff" => {
+            let raw_run = req_str(args, "run_id")?;
+            let step_id = req_str(args, "step_id")?;
+            let summary = req_str(args, "summary")?.to_string();
+            let by = req_str(args, "by")?.to_string();
+            let store = open_workflow_store(env, None, Some(raw_run))?;
+            let run = resolve_workflow_run_in_store(&store, raw_run)?;
+            let def = store
+                .get_workflow_def(&run.workflow_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("workflow `{}` not found", run.workflow_id))?;
+            if !def.steps.iter().any(|s| s.step_id == step_id) {
+                return Err(WorkflowError::UnknownStep(step_id.to_string()).to_string());
+            }
+
+            let str_vec = |field: &str| -> Vec<String> {
+                args.get(field)
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let shipped = str_vec("shipped");
+            let in_flight = str_vec("in_flight");
+            let blockers = str_vec("blockers");
+            let next_steps = str_vec("next_steps");
+            let notes = args
+                .get("notes")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+
+            let now = now_at();
+            let mut written_facts = Vec::new();
+            if let Some(facts_val) = args.get("facts")
+                && !facts_val.is_null()
+            {
+                let Some(facts_obj) = facts_val.as_object() else {
+                    return Err(
+                        "`facts` must be a JSON object mapping declared keys to values".into(),
+                    );
+                };
+                for key in facts_obj.keys() {
+                    if !def.declared_keys.contains_key(key) {
+                        return Err(WorkflowError::UndeclaredWorkflowKey {
+                            workflow: def.slug.clone(),
+                            key: key.clone(),
+                        }
+                        .to_string());
+                    }
+                }
+                for (key, val) in facts_obj {
+                    let fact_entry =
+                        write_workflow_fact(&store, &def, &run, key, val.clone(), now.clone(), &by)
+                            .map_err(|e| e.to_string())?;
+                    written_facts.push(fact_entry);
+                }
+            }
+
+            let visit_count = run
+                .steps
+                .get(step_id)
+                .map(|s| s.visit_count.max(1))
+                .unwrap_or(1);
+            let handoff_entry = record_step_handoff(
+                &store,
+                &run.id,
+                step_id,
+                visit_count,
+                HandoffEntry {
+                    summary,
+                    shipped,
+                    in_flight,
+                    blockers,
+                    next_steps,
+                    notes,
+                },
+                now,
+                &by,
+            )
+            .map_err(|e| e.to_string())?;
+
+            Ok(serde_json::to_string_pretty(&json!({
+                "handoff": handoff_entry,
+                "facts": written_facts,
+            }))
+            .unwrap())
+        }
+        "workflow_step" => {
+            let raw_run = req_str(args, "run_id")?;
+            let step_id = req_str(args, "step_id")?.to_string();
+            let outcome_raw = req_str(args, "outcome")?;
+            let outcome = StepOutcome::from_wire(outcome_raw).ok_or_else(|| {
+                format!(
+                    "unknown step outcome `{outcome_raw}`; expected one of: {}",
+                    StepOutcome::wire_values()
+                )
+            })?;
+            let by = req_str(args, "by")?.to_string();
+            let summary = args
+                .get("summary")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let reason = args
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let tokens_used = args.get("tokens_used").and_then(Value::as_u64).unwrap_or(0);
+            let cost_usd_micros = args
+                .get("cost_usd_micros")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+
+            let store = open_workflow_store(env, None, Some(raw_run))?;
+            let mut run = resolve_workflow_run_in_store(&store, raw_run)?;
+            let def = store
+                .get_workflow_def(&run.workflow_id)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("workflow `{}` not found", run.workflow_id))?;
+
+            let now = now_at();
+            let visit_count = run
+                .steps
+                .get(&step_id)
+                .map(|s| s.visit_count.max(1))
+                .unwrap_or(1);
+
+            if summary.is_some() || reason.is_some() {
+                let handoff_summary = summary
+                    .clone()
+                    .or_else(|| reason.clone())
+                    .unwrap_or_else(|| format!("Step `{step_id}` {}", outcome.as_wire()));
+                let blockers = match (&reason, outcome) {
+                    (Some(r), StepOutcome::Fail | StepOutcome::NeedsHuman) => vec![r.clone()],
+                    _ => Vec::new(),
+                };
+                record_step_handoff(
+                    &store,
+                    &run.id,
+                    &step_id,
+                    visit_count,
+                    HandoffEntry {
+                        summary: handoff_summary,
+                        shipped: Vec::new(),
+                        in_flight: Vec::new(),
+                        blockers,
+                        next_steps: Vec::new(),
+                        notes: None,
+                    },
+                    now.clone(),
+                    &by,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+
+            advance_workflow(
+                &def,
+                &mut run,
+                StepAttemptReport {
+                    step_id,
+                    outcome,
+                    attempt_iri: None,
+                    tokens_used,
+                    cost_usd_micros,
+                    reason: reason.or(summary),
+                },
+                now,
+            )
+            .map_err(|e| e.to_string())?;
+            run.by = by;
+
+            let updated = store.update_workflow_run(run).map_err(|e| e.to_string())?;
+            Ok(serde_json::to_string_pretty(&json!({
+                "run": updated,
+            }))
+            .unwrap())
+        }
         other => Err(format!("unknown tool `{other}`")),
     }
 }
@@ -946,6 +1287,65 @@ fn tool_definitions() -> Value {
                 "properties": {
                     "message_id": { "type": "string" },
                     "agent": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "workflow_list",
+            "description": "List workflow definitions and workflow runs.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "workflow_status",
+            "description": "Return a WorkflowRun's full JSON state plus curated HandoffEntry and RuntimeEntry records.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["run_id"],
+                "properties": {
+                    "run_id": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "workflow_handoff",
+            "description": "Record a curated HandoffEntry and optional declared workflow runtime facts for a step.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["run_id", "step_id", "summary", "by"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "step_id": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "shipped": { "type": "array", "items": { "type": "string" } },
+                    "in_flight": { "type": "array", "items": { "type": "string" } },
+                    "blockers": { "type": "array", "items": { "type": "string" } },
+                    "next_steps": { "type": "array", "items": { "type": "string" } },
+                    "notes": { "type": "string" },
+                    "facts": { "type": "object" },
+                    "by": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "workflow_step",
+            "description": "Record a step completion outcome and advance a ready step in a WorkflowRun.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["run_id", "step_id", "outcome", "by"],
+                "properties": {
+                    "run_id": { "type": "string" },
+                    "step_id": { "type": "string" },
+                    "outcome": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "reason": { "type": "string" },
+                    "tokens_used": { "type": "integer" },
+                    "cost_usd_micros": { "type": "integer" },
+                    "by": { "type": "string" }
                 }
             }
         }

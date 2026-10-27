@@ -9,6 +9,7 @@ use crate::ferrowire::{
 use crate::finding::Finding;
 use crate::ids::{
     AgentId, FindingId, GateId, Kind, MessageId, ProjectId, RecordId, RevisionId, StateId,
+    WorkflowId, WorkflowRunId,
 };
 use crate::iri::Iri;
 use crate::log::{Attempt, GateRun};
@@ -18,6 +19,7 @@ use crate::state::{
     MemoryLifecycle, StateConcern, StateConflict, StateEntry, StateRevision, StateScope,
     StateSyncCursor, UpsertStateArgs,
 };
+use crate::workflow::{WorkflowDef, WorkflowRun};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -285,6 +287,12 @@ pub enum StoreError {
          A wire message never changes once sent."
     )]
     WireMessageTampered { id: MessageId, detail: String },
+    #[error("no such workflow: {0}")]
+    NoSuchWorkflow(String),
+    #[error("no such workflow run: {0}")]
+    NoSuchWorkflowRun(String),
+    #[error("invalid workflow operation: {0}")]
+    InvalidWorkflow(String),
 }
 
 /// Follow a stored reference. `Ok(None)` from the owning store means the
@@ -612,7 +620,13 @@ impl KindRouted<'_> {
     fn owner(&self, kind: Kind) -> &dyn Handles {
         // Every kind by name: a new kind must be routed on purpose.
         match kind {
-            Kind::Project | Kind::Gate | Kind::State | Kind::Agent | Kind::Message => self.catalog,
+            Kind::Project
+            | Kind::Gate
+            | Kind::State
+            | Kind::Agent
+            | Kind::Message
+            | Kind::Workflow
+            | Kind::WorkflowRun => self.catalog,
             Kind::Record | Kind::Finding => self.tracker,
         }
     }
@@ -763,6 +777,38 @@ pub trait MessageStore {
     /// Delete transient (`durable == false`) messages whose receipts are all `Acked` or
     /// `Expired` and whose `created_at < before`. Returns the count of pruned messages.
     fn prune_wire(&self, before: At) -> Result<usize, StoreError>;
+}
+
+/// Directed workflow definitions and stateful workflow runs (workflow spec §2.1).
+pub trait WorkflowStore {
+    fn upsert_workflow_def(&self, def: WorkflowDef) -> Result<WorkflowDef, StoreError>;
+    fn get_workflow_def(&self, id: &WorkflowId) -> Result<Option<WorkflowDef>, StoreError>;
+    fn get_workflow_def_by_slug(
+        &self,
+        project: &ProjectId,
+        slug: &str,
+    ) -> Result<Option<WorkflowDef>, StoreError>;
+    fn list_workflow_defs(
+        &self,
+        project: Option<&ProjectId>,
+    ) -> Result<Vec<WorkflowDef>, StoreError>;
+
+    fn create_workflow_run(&self, run: WorkflowRun) -> Result<WorkflowRun, StoreError>;
+    fn update_workflow_run(&self, run: WorkflowRun) -> Result<WorkflowRun, StoreError>;
+    fn get_workflow_run(&self, id: &WorkflowRunId) -> Result<Option<WorkflowRun>, StoreError>;
+    fn list_workflow_runs(
+        &self,
+        project: Option<&ProjectId>,
+        workflow_id: Option<&WorkflowId>,
+    ) -> Result<Vec<WorkflowRun>, StoreError>;
+
+    /// Import a replicated `WorkflowDef` during `fl state sync`, preserving its canonical
+    /// `WorkflowId` and registering it in `IDS` and `HANDLES`.
+    fn import_workflow_def(&self, def: WorkflowDef) -> Result<(), StoreError>;
+
+    /// Import a replicated `WorkflowRun` during `fl state sync`, preserving its canonical
+    /// `WorkflowRunId` and registering it in `IDS` and `HANDLES`.
+    fn import_workflow_run(&self, run: WorkflowRun) -> Result<(), StoreError>;
 }
 
 /// What a local store remembers about the GitHub repositories a tracker is

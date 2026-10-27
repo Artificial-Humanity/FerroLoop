@@ -45,7 +45,11 @@ const NEXT_STATE_REV: &str = "next_state_rev";
 const NEXT_AGENT_EVENT: &str = "next_agent_event";
 
 impl RedbStore {
-    fn resolve_in_wtx(&self, tx: &redb::WriteTransaction, id: &Iri) -> Result<Iri, StoreError> {
+    pub(crate) fn resolve_in_wtx(
+        &self,
+        tx: &redb::WriteTransaction,
+        id: &Iri,
+    ) -> Result<Iri, StoreError> {
         let ids = tx.open_table(IDS).map_err(backend)?;
         match locate_in(&self.label, id, &ids, || {
             tx.open_table(ALIASES).map_err(backend)
@@ -56,7 +60,7 @@ impl RedbStore {
         }
     }
 
-    fn index_imported_in(
+    pub(crate) fn index_imported_in(
         &self,
         tx: &redb::WriteTransaction,
         kind: Kind,
@@ -86,7 +90,7 @@ impl RedbStore {
         index_new(tx, id, kind)
     }
 
-    fn alias_unpublished_id_in(
+    pub(crate) fn alias_unpublished_id_in(
         &self,
         tx: &redb::WriteTransaction,
         kind: Kind,

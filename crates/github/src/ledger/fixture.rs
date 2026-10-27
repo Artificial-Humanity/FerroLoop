@@ -125,6 +125,7 @@ impl SplitFixture for OverFake {
                 state: &local,
                 agents: &local,
                 wire: &local,
+                workflows: &local,
             },
             &Controls {
                 fake: &fake,
