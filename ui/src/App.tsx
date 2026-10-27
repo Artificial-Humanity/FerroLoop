@@ -241,8 +241,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         if (pairCode && pairCode.trim()) {
           try {
             const pairRes = await apiClient.pair({ code: pairCode.trim() });
-            if (!cancelled && pairRes.authority) {
-              setAuthority(pairRes.authority);
+            if (!cancelled) {
+              if (pairRes.authority) {
+                setAuthority(pairRes.authority);
+              }
+              wsClient.setToken(apiClient.getToken());
+              wsClient.connect();
             }
           } catch (err) {
             if (!cancelled) {
@@ -288,7 +292,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     return () => {
       cancelled = true;
     };
-  }, [apiClient, loadAllInitialState]);
+  }, [apiClient, wsClient, loadAllInitialState]);
 
   // Connect WebSocket and subscribe to wire, session, and workflow channels
   useEffect(() => {
@@ -437,6 +441,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     await apiClient.logout().catch(() => {});
     setAuthority(null);
     wsClient.setToken(null);
+    wsClient.disconnect();
     setPairingOpen(true);
   };
 

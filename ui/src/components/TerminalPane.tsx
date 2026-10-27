@@ -196,7 +196,27 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     setShellStatus("connecting");
     emitTerminalEvent("open", openPayload);
 
+    const handleWindowResize = () => {
+      try {
+        fitAddonRef.current?.fit();
+      } catch {
+        // Ignore in jsdom.
+      }
+      const cols = termRef.current?.cols ?? 100;
+      const rows = termRef.current?.rows ?? 28;
+      setColsRows({ cols, rows });
+      const resizePayload: TerminalResizePayload = {
+        session_id: effectiveSessionId,
+        cols,
+        rows,
+      };
+      emitTerminalEvent("resize", resizePayload);
+    };
+
+    window.addEventListener("resize", handleWindowResize);
+
     return () => {
+      window.removeEventListener("resize", handleWindowResize);
       const closePayload: TerminalClosePayload = {
         session_id: effectiveSessionId,
       };
@@ -217,6 +237,10 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     if (!isOwner) {
       return;
     }
+    const closePayload: TerminalClosePayload = {
+      session_id: effectiveSessionId,
+    };
+    emitTerminalEvent("close", closePayload);
     const openPayload: TerminalOpenPayload = {
       session_id: effectiveSessionId,
       cwd: effectiveCwd,

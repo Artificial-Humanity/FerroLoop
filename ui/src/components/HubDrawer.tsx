@@ -275,7 +275,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                   <select
                     aria-label="Workflow Definition"
                     className="fd-select"
-                    value={selectedWorkflowSlug}
+                    value={selectedWorkflowSlug || workflows[0]?.slug || workflows[0]?.id || ""}
                     onChange={(e) => setSelectedWorkflowSlug(e.target.value)}
                   >
                     {workflows.map((wf) => (

@@ -101,7 +101,28 @@ describe("TerminalPane", () => {
       );
     });
 
-    // 4. Sends "close" event on unmount
+    // 4. Clicking Reconnect / New Shell emits "close" followed by "open"
+    onSendTerminalFrame.mockClear();
+    fireEvent.click(screen.getByRole("button", { name: /Reconnect \/ New Shell/i }));
+    expect(onSendTerminalFrame).toHaveBeenNthCalledWith(
+      1,
+      "close",
+      expect.objectContaining({
+        session_id: "term-owner-01",
+      }),
+    );
+    expect(onSendTerminalFrame).toHaveBeenNthCalledWith(
+      2,
+      "open",
+      expect.objectContaining({
+        session_id: "term-owner-01",
+        cwd: "/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop",
+        command: ["/bin/bash", "-i"],
+      }),
+    );
+
+    // 5. Sends "close" event on unmount
+    onSendTerminalFrame.mockClear();
     unmount();
     expect(onSendTerminalFrame).toHaveBeenCalledWith(
       "close",
