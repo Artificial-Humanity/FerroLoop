@@ -1,0 +1,15 @@
+[Unit]
+Description=FerroLoop Hub HTTP/1.1 & WebSocket Daemon (FerroDeck Command Center)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Projects/Artificial-Humanity/FerroLoop
+ExecStart=%h/.local/bin/fl hub serve --listen 127.0.0.1:8420
+Restart=on-failure
+RestartSec=3
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=default.target

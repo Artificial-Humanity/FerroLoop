@@ -202,6 +202,30 @@ pub struct WireConfig {
     pub sync_wire: Option<bool>,
 }
 
+/// Workspace-level `[hub]` configuration (Hub spec §2.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HubConfig {
+    /// Listen address for `fl hub serve` (defaults to `"127.0.0.1:8420"`).
+    #[serde(default)]
+    pub listen: Option<String>,
+    /// Static `FerroDeck` UI directory (defaults to `<repo_root>/ui/dist` when present).
+    #[serde(default)]
+    pub ui_dir: Option<PathBuf>,
+    /// Optional path to file containing the Hub owner token (falls back to `$FL_HUB_OWNER_TOKEN`).
+    #[serde(default)]
+    pub owner_token_file: Option<PathBuf>,
+    /// Whether to trust `Tailscale-User-Login` headers from `tailscale serve`.
+    #[serde(default)]
+    pub trust_tailscale_headers: bool,
+    /// Whether interactive Owner terminal streams on `/ws/v1` are enabled (defaults to `true`).
+    #[serde(default)]
+    pub enable_terminal: Option<bool>,
+    /// Browser session TTL in hours (defaults to `24`).
+    #[serde(default)]
+    pub session_ttl_hours: Option<u64>,
+}
+
 /// Per-adapter `[adapters.<name>]` configuration (Adapters & Telemetry spec §1.2).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -231,6 +255,7 @@ impl AdapterConfig {
 pub struct Config {
     pub state: Option<StateConfig>,
     pub wire: Option<WireConfig>,
+    pub hub: Option<HubConfig>,
     pub projects: Vec<Entry>,
     pub github: Option<GithubApp>,
     pub mcp: Vec<McpEntry>,
@@ -342,6 +367,8 @@ struct File {
     state: Option<StateConfig>,
     #[serde(default)]
     wire: Option<WireConfig>,
+    #[serde(default)]
+    hub: Option<HubConfig>,
     #[serde(default)]
     project: Vec<Entry>,
     #[serde(default)]
@@ -524,6 +551,26 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
             );
         }
     }
+    if let Some(h) = &file.hub {
+        if let Some(u) = &h.ui_dir
+            && !u.is_absolute()
+        {
+            bail!(
+                "{}: `hub.ui_dir` must be an absolute path (got `{}`)",
+                path.display(),
+                u.display()
+            );
+        }
+        if let Some(otf) = &h.owner_token_file
+            && !otf.is_absolute()
+        {
+            bail!(
+                "{}: `hub.owner_token_file` must be an absolute path (got `{}`)",
+                path.display(),
+                otf.display()
+            );
+        }
+    }
     let mut adapters = BTreeMap::new();
     for (raw_key, adapter_cfg) in file.adapters {
         let kind = AdapterKind::from_wire(&raw_key).ok_or_else(|| {
@@ -550,6 +597,7 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
     Ok(Config {
         state: file.state,
         wire: file.wire,
+        hub: file.hub,
         projects: file.project,
         github: file.github,
         mcp: file.mcp,
@@ -1357,5 +1405,40 @@ mod tests {
             format!("{empty_bin:#}").contains("`adapters.muse.binary` must not be empty"),
             "{empty_bin:#}"
         );
+    }
+
+    #[test]
+    fn parses_hub_config_and_rejects_relative_paths() {
+        let err = load_text("[hub]\nui_dir = \"relative/ui/dist\"\n").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("`hub.ui_dir` must be an absolute path"),
+            "got: {err:#}"
+        );
+        let err2 = load_text("[hub]\nowner_token_file = \"relative/owner.token\"\n").unwrap_err();
+        assert!(
+            format!("{err2:#}").contains("`hub.owner_token_file` must be an absolute path"),
+            "got: {err2:#}"
+        );
+
+        let cfg = load_text(
+            "[hub]\n\
+             listen = \"127.0.0.1:8420\"\n\
+             ui_dir = \"/srv/ferrodeck/dist\"\n\
+             owner_token_file = \"/etc/fl/owner.token\"\n\
+             trust_tailscale_headers = true\n\
+             enable_terminal = false\n\
+             session_ttl_hours = 48\n",
+        )
+        .unwrap();
+        let h = cfg.hub.as_ref().unwrap();
+        assert_eq!(h.listen.as_deref(), Some("127.0.0.1:8420"));
+        assert_eq!(h.ui_dir, Some(PathBuf::from("/srv/ferrodeck/dist")));
+        assert_eq!(
+            h.owner_token_file,
+            Some(PathBuf::from("/etc/fl/owner.token"))
+        );
+        assert!(h.trust_tailscale_headers);
+        assert_eq!(h.enable_terminal, Some(false));
+        assert_eq!(h.session_ttl_hours, Some(48));
     }
 }

@@ -16,6 +16,7 @@ fl-exec = { path = "../exec" }
 fl-github = { path = "../github" }
 fl-mcp = { path = "../mcp" }
 fl-wire = { path = "../wire" }
+fl-hub = { path = "../hub" }
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
@@ -24,6 +25,7 @@ serde_json.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 ureq.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 fl-github = { path = "../github", features = ["fake"] }

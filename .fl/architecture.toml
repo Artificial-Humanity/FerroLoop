@@ -1,0 +1,164 @@
+system_id = "ferroloop"
+title = "FerroLoop"
+strict_coverage = true
+
+[[components]]
+id = "fl_core"
+title = "Core Domain"
+kind = "crate"
+description = "Pure domain model, state, workflow, PR policy, FerroWire, and architecture conformance"
+package = "fl-core"
+paths = ["crates/core/**"]
+
+[[components]]
+id = "fl_store"
+title = "Redb Store"
+kind = "store"
+description = "Durable local redb persistence for catalog, ledger, state, wire, and workflows"
+package = "fl-store"
+paths = ["crates/store/**"]
+
+[[components]]
+id = "fl_github"
+title = "GitHub Tracker & Ledger"
+kind = "crate"
+description = "GitHub issue tracker, pull-request inspector, and append-only ledger client"
+package = "fl-github"
+paths = ["crates/github/**"]
+
+[[components]]
+id = "fl_mcp"
+title = "MCP Catalog"
+kind = "crate"
+description = "Committed MCP server catalog and vendor configuration writer"
+package = "fl-mcp"
+paths = ["crates/mcp/**"]
+
+[[components]]
+id = "fl_exec"
+title = "Execution & Workflow Engine"
+kind = "crate"
+description = "Gate runner, five-vendor CLI adapters, git state sync, and workflow step executor"
+package = "fl-exec"
+paths = ["crates/exec/**"]
+
+[[components]]
+id = "fl_wire"
+title = "FerroWire Bus"
+kind = "crate"
+description = "Agent identity resolution, Unix socket / WebSocket relay, and push delivery"
+package = "fl-wire"
+paths = ["crates/wire/**"]
+
+[[components]]
+id = "fl_hub"
+title = "FerroLoop Hub"
+kind = "service"
+description = "HTTP/1.1 & WebSocket daemon, two-tier auth, host discovery, and /api/v1 REST API"
+package = "fl-hub"
+paths = ["crates/hub/**"]
+
+[[components]]
+id = "fl_cli"
+title = "FerroLoop CLI"
+kind = "crate"
+description = "Unified fl command-line interface and agent-msg / MCP entrypoints"
+package = "fl-cli"
+paths = ["crates/cli/**"]
+
+[[components]]
+id = "ferrodeck_ui"
+title = "FerroDeck UI"
+kind = "ui"
+description = "Browser-based command center SPA served by fl-hub"
+paths = ["ui/**"]
+
+[[edges]]
+from = "fl_store"
+to = "fl_core"
+label = "persists domain types and implements store traits"
+
+[[edges]]
+from = "fl_github"
+to = "fl_core"
+label = "implements tracker, ledger, and PR policy traits"
+
+[[edges]]
+from = "fl_exec"
+to = "fl_core"
+label = "executes gates, adapters, state sync, and workflow graphs"
+
+[[edges]]
+from = "fl_wire"
+to = "fl_core"
+label = "uses FerroWire domain types and agent registry"
+
+[[edges]]
+from = "fl_wire"
+to = "fl_store"
+label = "persists and queries messages in RedbStore"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_core"
+label = "serves domain types and evaluates architecture conformance"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_store"
+label = "opens RedbStore for REST and WebSocket handlers"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_exec"
+label = "drives workflow runs and step transitions"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_github"
+label = "inspects and reviews GitHub pull requests"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_wire"
+label = "discovers agent routes and dispatches FerroWire messages"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_core"
+label = "dispatches CLI commands over core domain types"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_store"
+label = "opens local and workspace RedbStore databases"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_exec"
+label = "runs gates, adapters, state sync, and workflows"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_github"
+label = "connects to GitHub tracker, ledger, and PR endpoints"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_mcp"
+label = "manages project MCP server catalogs"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_wire"
+label = "runs FerroWire CLI and daemon subcommands"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_hub"
+label = "runs fl hub and fl arch subcommands"
+
+[[edges]]
+from = "ferrodeck_ui"
+to = "fl_hub"
+label = "consumes /api/v1 REST API and /ws/v1 WebSocket stream"

@@ -77,6 +77,16 @@ enum Command {
     /// Author, inspect, and execute directed workflow graphs.
     #[command(subcommand)]
     Flow(cmd::flow::FlowCmd),
+    /// Initialize, inspect, check, and export the declarative architecture model.
+    Arch {
+        #[command(subcommand)]
+        cmd: cmd::arch::ArchCmd,
+    },
+    /// Run and manage the FerroLoop Hub daemon and FerroDeck command center.
+    Hub {
+        #[command(subcommand)]
+        cmd: cmd::hub::HubCmd,
+    },
 }
 
 impl Command {
@@ -99,7 +109,9 @@ impl Command {
             Command::Mcp(_)
             | Command::Agent { .. }
             | Command::State { .. }
-            | Command::Wire { .. } => Vec::new(),
+            | Command::Wire { .. }
+            | Command::Arch { .. }
+            | Command::Hub { .. } => Vec::new(),
         }
     }
 
@@ -134,7 +146,9 @@ impl Command {
             Command::Mcp(_)
             | Command::Agent { .. }
             | Command::State { .. }
-            | Command::Wire { .. } => false,
+            | Command::Wire { .. }
+            | Command::Arch { .. }
+            | Command::Hub { .. } => false,
         }
     }
 
@@ -163,7 +177,9 @@ impl Command {
             | Command::Mcp(_)
             | Command::Agent { .. }
             | Command::State { .. }
-            | Command::Wire { .. } => false,
+            | Command::Wire { .. }
+            | Command::Arch { .. }
+            | Command::Hub { .. } => false,
         }
     }
 }
@@ -838,6 +854,38 @@ fn run(cli: Cli) -> Result<i32> {
                 }
             };
         }
+        Cli {
+            db: _,
+            command: Command::Arch { cmd },
+        } => {
+            return match cmd::arch::run(&cwd, cmd) {
+                Ok(code) => Ok(code),
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+            };
+        }
+        Cli {
+            db,
+            command: Command::Hub { cmd },
+        } => {
+            let explicit = explicit_db(db);
+            let default_store = default_state_store_path()?;
+            let state_env = cmd::state::StateEnv {
+                explicit_db: explicit.as_deref(),
+                default_store: &default_store,
+                cfg: &cfg,
+                cwd: &cwd,
+            };
+            return match cmd::hub::run(&state_env, cmd) {
+                Ok(code) => Ok(code),
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+            };
+        }
         cli => cli,
     };
     let entries = &cfg.projects;
@@ -1196,7 +1244,12 @@ fn run(cli: Cli) -> Result<i32> {
             let ws_store = separate_ws_store.as_ref().unwrap_or(&store);
             cmd::flow::run(&ctx, &cfg.adapters, ws_store, &cwd, c)
         }
-        Command::Mcp(_) | Command::Agent { .. } | Command::State { .. } | Command::Wire { .. } => {
+        Command::Mcp(_)
+        | Command::Agent { .. }
+        | Command::State { .. }
+        | Command::Wire { .. }
+        | Command::Arch { .. }
+        | Command::Hub { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };
