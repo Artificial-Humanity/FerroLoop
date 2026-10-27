@@ -366,6 +366,16 @@ pub fn prepare_proxied_request(
         final_headers.insert(hk.clone(), replace_all(hv));
     }
     let final_body = req.body.as_ref().map(|b| replace_all(b));
+    let injected_secrets: Vec<String> = referenced.into_iter().collect();
+    if !injected_secrets.is_empty() {
+        vault.append_audit_log(
+            req.caller_agent.as_deref(),
+            &injected_secrets,
+            &method,
+            &host,
+            "allowed",
+        );
+    }
 
     Ok(PreparedProxyRequest {
         method,
@@ -373,7 +383,7 @@ pub fn prepare_proxied_request(
         host,
         headers: final_headers,
         body: final_body,
-        injected_secrets: referenced.into_iter().collect(),
+        injected_secrets,
     })
 }
 

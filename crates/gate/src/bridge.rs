@@ -7,9 +7,64 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::GateError;
+use crate::vault::Vault;
 
 fn default_true() -> bool {
     true
+}
+
+/// Verify webhook caller authority and optional `verify_secret` header before evaluating an inbound bridge event.
+///
+/// - When `bridge.verify_secret` is configured, `provided_secret` must match the secret value stored in `vault`
+///   in constant time (unless the caller is `is_owner` and the secret has not been provisioned in `vault` yet).
+/// - Non-owner (`Peer`) callers are never allowed to invoke a bridge webhook unless `bridge.verify_secret` is
+///   configured and matched in constant time.
+pub fn verify_inbound_bridge_webhook(
+    bridge: &BridgeConfig,
+    vault: &Vault,
+    is_owner: bool,
+    provided_secret: Option<&str>,
+) -> Result<(), GateError> {
+    if let Some(ref secret_name) = bridge.verify_secret {
+        let trimmed_name = secret_name.trim();
+        if !trimmed_name.is_empty() {
+            let secret_exists = vault.get_metadata(trimmed_name).is_some();
+            if secret_exists || !is_owner {
+                let Some(candidate) = provided_secret.map(str::trim).filter(|s| !s.is_empty())
+                else {
+                    return Err(GateError::BridgeUnauthorized {
+                        bridge_id: bridge.id.clone(),
+                        sender_id: String::new(),
+                        reason: format!(
+                            "missing webhook verification header for secret `{trimmed_name}`"
+                        ),
+                    });
+                };
+                let matched = vault
+                    .verify_secret_constant_time(trimmed_name, candidate)
+                    .unwrap_or(false);
+                if !matched {
+                    return Err(GateError::BridgeUnauthorized {
+                        bridge_id: bridge.id.clone(),
+                        sender_id: String::new(),
+                        reason: format!("invalid webhook verification secret for `{trimmed_name}`"),
+                    });
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    if !is_owner {
+        return Err(GateError::BridgeUnauthorized {
+            bridge_id: bridge.id.clone(),
+            sender_id: String::new(),
+            reason: "peer callers cannot invoke bridge webhooks without a verified webhook secret"
+                .to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Declarative `[[bridges]]` configuration inside a [`crate::connector::ConnectorManifest`].

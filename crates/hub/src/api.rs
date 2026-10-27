@@ -44,7 +44,7 @@ use fl_exec::workflow::{
 use fl_gate::{
     BridgeTarget, InboundBridgeEvent, ProxyRequest, SetSecretArgs, Vault, discover_connectors,
     evaluate_inbound_bridge_event, execute_proxied_request, handle_mcp_jsonrpc_request,
-    handle_registry_v01_get,
+    handle_registry_v01_get, verify_inbound_bridge_webhook,
 };
 use fl_store::RedbStore;
 use fl_wire::dispatcher::{dispatch_message_for_store, dispatch_operator_prompt_to_route};
@@ -1564,7 +1564,7 @@ fn handle_dynamic_api_routes(
             && method == "POST"
         {
             let bridge_id = percent_decode(segments[4]);
-            return handle_post_gate_bridge_webhook(state, store, &bridge_id, req);
+            return handle_post_gate_bridge_webhook(state, store, authority, &bridge_id, req);
         }
     }
 
@@ -2632,6 +2632,7 @@ fn handle_post_gate_mcp(
 fn handle_post_gate_bridge_webhook(
     state: &HubState,
     store: &RedbStore,
+    authority: &HubAuthority,
     bridge_id: &str,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -2659,6 +2660,22 @@ fn handle_post_gate_bridge_webhook(
             json!({ "error": format!("bridge `{bridge_id}` not found") }),
         );
     };
+
+    let vault = match Vault::open_default(state.config.home_override.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    let provided_secret = req
+        .headers
+        .get("x-ferrogate-secret")
+        .or_else(|| req.headers.get("x-webhook-secret"))
+        .map(String::as_str);
+    if let Err(e) =
+        verify_inbound_bridge_webhook(bridge_cfg, &vault, authority.is_owner(), provided_secret)
+    {
+        return HttpResponse::json(403, json!({ "error": e.to_string() }));
+    }
 
     let plan = match evaluate_inbound_bridge_event(bridge_cfg, &event) {
         Ok(p) => p,

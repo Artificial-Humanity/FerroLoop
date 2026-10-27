@@ -337,6 +337,88 @@ impl Vault {
             })?;
         write_atomic_0600(&self.path, format!("{encoded}\n").as_bytes())
     }
+
+    /// Compare `candidate` against the decrypted value of `secret_name` in constant time.
+    pub fn verify_secret_constant_time(
+        &self,
+        secret_name: &str,
+        candidate: &str,
+    ) -> Result<bool, GateError> {
+        let (_meta, expected) = self.decrypt_raw(secret_name)?;
+        let a = expected.as_bytes();
+        let b = candidate.as_bytes();
+        if a.len() != b.len() {
+            return Ok(false);
+        }
+        let mut diff = 0u8;
+        for (&x, &y) in a.iter().zip(b.iter()) {
+            diff |= std::hint::black_box(x ^ y);
+        }
+        Ok(std::hint::black_box(diff) == 0)
+    }
+
+    /// Append a structured JSONL audit log entry next to `vault.enc` (`gate-audit.jsonl`).
+    pub fn append_audit_log(
+        &self,
+        caller: Option<&str>,
+        secrets: &[String],
+        method: &str,
+        host: &str,
+        outcome: &str,
+    ) {
+        let Some(parent) = self.path.parent() else {
+            return;
+        };
+        let audit_path = parent.join("gate-audit.jsonl");
+        if reject_if_symlink(&audit_path).is_err() {
+            return;
+        }
+        let ts = At::from_unix_millis(now_unix_millis()).to_string();
+        let entry = serde_json::json!({
+            "timestamp": ts,
+            "caller": caller.unwrap_or("anonymous"),
+            "secrets": secrets,
+            "method": method,
+            "host": host,
+            "outcome": outcome,
+        });
+        let Ok(line) = serde_json::to_string(&entry) else {
+            return;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&audit_path)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&audit_path)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    }
+}
+
+impl Drop for Vault {
+    fn drop(&mut self) {
+        for byte in &mut self.master_key {
+            unsafe {
+                std::ptr::write_volatile(byte, 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Build the canonical AEAD Additional Authenticated Data (AAD) string for `meta`.

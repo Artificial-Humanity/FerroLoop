@@ -13,7 +13,7 @@ pub mod vault;
 
 pub use bridge::{
     BridgeConfig, BridgeDispatchPlan, BridgeTarget, InboundBridgeEvent,
-    evaluate_inbound_bridge_event,
+    evaluate_inbound_bridge_event, verify_inbound_bridge_webhook,
 };
 pub use connector::{
     ConnectorManifest, ConnectorToolDef, discover_connectors, import_openapi_to_connector,
@@ -502,6 +502,46 @@ default_target = "wire:ferris"
                 connector_id: "claude".into(),
                 tool_name: None,
             }
+        );
+
+        // Verify `verify_inbound_bridge_webhook` enforces `verify_secret` and blocks unverified Peer callers
+        let tmp_vault_dir = tempfile::tempdir().unwrap();
+        let mut webhook_vault =
+            Vault::open(tmp_vault_dir.path().join("vault.enc"), [19u8; 32]).unwrap();
+        webhook_vault
+            .set(SetSecretArgs {
+                name: "DISCORD_WEBHOOK_SECRET".into(),
+                value: "whsec-correct-token-789".into(),
+                allowed_hosts: vec!["discord.com".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut secured_bridge = bridge.clone();
+        secured_bridge.verify_secret = Some("DISCORD_WEBHOOK_SECRET".into());
+
+        assert!(
+            verify_inbound_bridge_webhook(&secured_bridge, &webhook_vault, false, None).is_err(),
+            "Peer without webhook header must be rejected"
+        );
+        assert!(
+            verify_inbound_bridge_webhook(
+                &secured_bridge,
+                &webhook_vault,
+                true,
+                Some("wrong-token")
+            )
+            .is_err(),
+            "Wrong webhook secret must be rejected even for Owner"
+        );
+        assert!(
+            verify_inbound_bridge_webhook(
+                &secured_bridge,
+                &webhook_vault,
+                false,
+                Some("whsec-correct-token-789")
+            )
+            .is_ok(),
+            "Valid webhook secret in constant time must succeed"
         );
     }
 }
