@@ -628,4 +628,37 @@ describe("ChatPane", () => {
     expect(screen.getByText("bad-js").closest("a")).toBeNull();
     expect(screen.getByText("bad-data").closest("a")).toBeNull();
   });
+
+  it("windows transcripts with more than 100 turns and expands older turns on demand", () => {
+    const manyTurns: TranscriptTurn[] = Array.from({ length: 125 }, (_, i) => ({
+      index: i,
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: `Turn number ${i}`,
+      thinking: null,
+      tool_calls: [],
+    }));
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={manyTurns}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    // First 25 turns are hidden initially; latest 100 (25..124) are rendered
+    expect(screen.queryByTestId("turn-card-0")).toBeNull();
+    expect(screen.getByTestId("turn-card-25")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-card-124")).toBeInTheDocument();
+
+    const loadEarlierBtn = screen.getByTestId("load-earlier-turns-btn");
+    expect(loadEarlierBtn).toHaveTextContent("Show earlier turns (25 older)");
+
+    fireEvent.click(loadEarlierBtn);
+    expect(screen.getByTestId("turn-card-0")).toBeInTheDocument();
+    expect(screen.queryByTestId("load-earlier-turns-btn")).toBeNull();
+  });
 });

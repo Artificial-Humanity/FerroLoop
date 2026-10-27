@@ -274,15 +274,28 @@ fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String>
         if !sub.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&sub).max_depth(5).into_iter().flatten() {
+        for entry in WalkDir::new(&sub).max_depth(8).into_iter().flatten() {
             let p = entry.path();
             if !p.is_file() {
                 continue;
             }
-            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            let Some(ext) = p.extension().and_then(|s| s.to_str()) else {
                 continue;
             };
-            if stem == session_id {
+            if ext != "jsonl" {
+                continue;
+            }
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str())
+                && stem == session_id
+            {
+                return Some(p.display().to_string());
+            }
+            if p.file_name().and_then(|s| s.to_str()) == Some("session.jsonl")
+                && p.parent()
+                    .and_then(|parent| parent.file_name())
+                    .and_then(|s| s.to_str())
+                    == Some(session_id)
+            {
                 return Some(p.display().to_string());
             }
         }
@@ -383,7 +396,17 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             .get("created_at")
             .or_else(|| obj.get("timestamp"))
             .and_then(Value::as_str)
-            .map(ToOwned::to_owned);
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                obj.get("recorded_at")
+                    .and_then(Value::as_i64)
+                    .and_then(format_unix_micros_iso8601)
+            });
+
+        if let Some(muse_turn) = parse_muse_event_turn(&val, created_at.clone(), turns.len()) {
+            turns.push(muse_turn);
+            continue;
+        }
 
         // Determine role from Antigravity (`type` / `source`), Claude (`type` / `message.role`), or generic (`role`).
         let role = if let Some(r) = obj.get("role").and_then(Value::as_str) {
@@ -489,7 +512,9 @@ pub fn is_transcript_busy(turns: &[TranscriptTurn]) -> bool {
     let Some(last) = turns.last() else {
         return false;
     };
-    !(last.role == "assistant" && last.tool_calls.is_empty())
+    !(last.role == "assistant"
+        && last.tool_calls.is_empty()
+        && (!last.content.trim().is_empty() || last.thinking.is_none()))
 }
 
 fn normalize_role(raw: &str) -> String {
@@ -694,14 +719,164 @@ fn parse_tool_call_item(v: &Value) -> Option<TranscriptToolCall> {
         .or_else(|| v.pointer("/function/name"))
         .and_then(Value::as_str)?
         .to_string();
-    let arguments = obj
+    let raw_args = obj
         .get("arguments")
         .or_else(|| obj.get("input"))
         .or_else(|| obj.get("args"))
         .or_else(|| v.pointer("/function/arguments"))
         .cloned()
         .unwrap_or(Value::Null);
+    let arguments = match raw_args {
+        Value::String(ref s) => serde_json::from_str::<Value>(s).unwrap_or(raw_args),
+        other => other,
+    };
     Some(TranscriptToolCall { name, arguments })
+}
+
+fn format_unix_micros_iso8601(micros: i64) -> Option<String> {
+    if micros <= 0 {
+        return None;
+    }
+    let millis = u64::try_from(micros / 1_000).ok()?;
+    Some(fl_core::At::from_unix_millis(millis).to_string())
+}
+
+fn parse_muse_event_turn(
+    val: &Value,
+    created_at: Option<String>,
+    index: usize,
+) -> Option<TranscriptTurn> {
+    let pt = val.get("payload_type").and_then(Value::as_str)?;
+    match pt {
+        "runtime.user_intent.accepted" => {
+            let msgs = val.pointer("/payload/model_messages")?.as_array()?;
+            let mut parts = Vec::new();
+            for m in msgs {
+                if let Some(c) = m.get("content") {
+                    let mut th = Vec::new();
+                    let mut tc = Vec::new();
+                    extract_content_and_tools(c, &mut parts, &mut th, &mut tc);
+                }
+            }
+            let raw = parts.join("\n");
+            if raw.trim().is_empty() {
+                return None;
+            }
+            let (role, content) = normalize_system_turn("system", &raw);
+            let final_role = if role == "system" {
+                "user".to_string()
+            } else {
+                role
+            };
+            Some(TranscriptTurn {
+                index,
+                role: final_role,
+                content,
+                thinking: None,
+                tool_calls: Vec::new(),
+                created_at,
+            })
+        }
+        "peer_message.admission.requested" => {
+            let body = val.pointer("/payload/body").and_then(Value::as_str)?.trim();
+            if body.is_empty() {
+                return None;
+            }
+            let (role, content) = normalize_system_turn("system", body);
+            let final_role = if role == "system" {
+                "user".to_string()
+            } else {
+                role
+            };
+            Some(TranscriptTurn {
+                index,
+                role: final_role,
+                content,
+                thinking: None,
+                tool_calls: Vec::new(),
+                created_at,
+            })
+        }
+        "runtime.session" => {
+            if val.pointer("/payload/kind").and_then(Value::as_str) != Some("run") {
+                return None;
+            }
+            let ev = val.pointer("/payload/event")?;
+            let ev_kind = ev.get("kind").and_then(Value::as_str)?;
+            match ev_kind {
+                "assistant_message_committed" => {
+                    let text = ev.get("text").and_then(Value::as_str)?.trim();
+                    if text.is_empty()
+                        || text == "[Previous turn ended without an assistant reply.]"
+                    {
+                        return None;
+                    }
+                    Some(TranscriptTurn {
+                        index,
+                        role: "assistant".to_string(),
+                        content: text.to_string(),
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        created_at,
+                    })
+                }
+                "reasoning_summary_committed" => {
+                    let text = ev.get("text").and_then(Value::as_str)?.trim();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    Some(TranscriptTurn {
+                        index,
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                        thinking: Some(text.to_string()),
+                        tool_calls: Vec::new(),
+                        created_at,
+                    })
+                }
+                "assistant_tool_calls_committed" => {
+                    let arr = ev.get("tool_calls").and_then(Value::as_array)?;
+                    let tool_calls: Vec<TranscriptToolCall> =
+                        arr.iter().filter_map(parse_tool_call_item).collect();
+                    if tool_calls.is_empty() {
+                        return None;
+                    }
+                    Some(TranscriptTurn {
+                        index,
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                        thinking: None,
+                        tool_calls,
+                        created_at,
+                    })
+                }
+                "tool_result_batch_committed" => {
+                    let arr = ev.get("results").and_then(Value::as_array)?;
+                    let mut texts = Vec::new();
+                    for item in arr {
+                        if let Some(t) = item.get("text").and_then(Value::as_str)
+                            && !t.trim().is_empty()
+                        {
+                            texts.push(t.to_string());
+                        }
+                    }
+                    if texts.is_empty() {
+                        return None;
+                    }
+                    Some(TranscriptTurn {
+                        index,
+                        role: "tool".to_string(),
+                        content: texts.join("\n"),
+                        thinking: None,
+                        tool_calls: Vec::new(),
+                        created_at,
+                    })
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 fn slugify_worktree_path(path: &Path) -> String {
@@ -1267,11 +1442,113 @@ mod tests {
             tool_calls: Vec::new(),
             created_at: None,
         };
+        let thinking_only_assistant = TranscriptTurn {
+            index: 3,
+            role: "assistant".into(),
+            content: String::new(),
+            thinking: Some("Reasoning in progress...".into()),
+            tool_calls: Vec::new(),
+            created_at: None,
+        };
+        assert!(is_transcript_busy(&[
+            user_turn.clone(),
+            thinking_only_assistant
+        ]));
         assert!(!is_transcript_busy(&[
             user_turn,
             assistant_with_tools,
             tool_turn,
             final_assistant
         ]));
+    }
+
+    #[test]
+    fn find_transcript_file_and_parse_muse_session_jsonl() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let session_id = "01a17d5b-482d-7ec0-a974-eaa56ef667a7";
+
+        // Create a non-transcript `.json` runtime file that shares the session stem
+        let runtime_dir = home.join(".local/share/muse/runtime/muse/sessions");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        fs::write(
+            runtime_dir.join(format!("{session_id}.json")),
+            r#"{"status":"running"}"#,
+        )
+        .unwrap();
+
+        // Create the actual Muse `session.jsonl` inside the session directory
+        let session_dir = home
+            .join(".local/share/muse/sessions/2026/10/27")
+            .join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        let jsonl_path = session_dir.join("session.jsonl");
+        let jsonl = [
+            serde_json::json!({
+                "schema_version": 1,
+                "recorded_at": 1_793_104_670_899_152_i64,
+                "payload_type": "peer_message.admission.requested",
+                "payload": {
+                    "body": "Hello felicia"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "schema_version": 1,
+                "recorded_at": 1_793_104_845_773_692_i64,
+                "payload_type": "runtime.session",
+                "payload": {
+                    "kind": "run",
+                    "event": {
+                        "kind": "assistant_tool_calls_committed",
+                        "tool_calls": [
+                            {
+                                "name": "list_peer_sessions",
+                                "args": "{\"scope\":\"workspace\"}"
+                            }
+                        ]
+                    }
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "schema_version": 1,
+                "recorded_at": 1_793_104_889_531_568_i64,
+                "payload_type": "runtime.session",
+                "payload": {
+                    "kind": "run",
+                    "event": {
+                        "kind": "assistant_message_committed",
+                        "text": "Peer session greeted Felicia; I replied with a hello back."
+                    }
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&jsonl_path, &jsonl).unwrap();
+
+        let found =
+            find_transcript_file_in_home(home, session_id).expect("must find session.jsonl");
+        assert_eq!(found, jsonl_path.display().to_string());
+
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "Hello felicia");
+        assert!(turns[0].created_at.is_some());
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].tool_calls.len(), 1);
+        assert_eq!(turns[1].tool_calls[0].name, "list_peer_sessions");
+        assert_eq!(
+            turns[1].tool_calls[0].arguments,
+            serde_json::json!({"scope": "workspace"})
+        );
+        assert_eq!(turns[2].role, "assistant");
+        assert_eq!(
+            turns[2].content,
+            "Peer session greeted Felicia; I replied with a hello back."
+        );
+        assert!(!is_transcript_busy(&turns));
     }
 }

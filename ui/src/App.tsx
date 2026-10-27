@@ -70,6 +70,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [sessions, setSessions] = useState<DiscoveredSessionSummary[]>([]);
   const [selectedAgentName, setSelectedAgentName] = useState<string>("ferris");
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const selectedAgentNameRef = useRef<string>(selectedAgentName);
+  selectedAgentNameRef.current = selectedAgentName;
+  const selectedSessionIdRef = useRef<string | null>(selectedSessionId);
+  selectedSessionIdRef.current = selectedSessionId;
   const [transcriptTurns, setTranscriptTurns] = useState<TranscriptTurn[]>([]);
   const [sessionQueue, setSessionQueue] = useState<QueuedOperatorPrompt[]>([]);
   const [isSessionBusy, setIsSessionBusy] = useState<boolean>(false);
@@ -235,6 +239,22 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       }
       if (statsRes) {
         setStats(statsRes);
+      }
+
+      const initialAgentName = selectedAgentNameRef.current;
+      const initialKey = initialAgentName.trim().toLowerCase();
+      const matchedSessionId =
+        selectedSessionIdRef.current ??
+        sessionsRes?.sessions?.find((s) => (s.persona ?? "").toLowerCase() === initialKey)?.id ??
+        agentsRes?.routes?.find((r) => (r.persona ?? "").toLowerCase() === initialKey)?.id ??
+        initialAgentName;
+      if (matchedSessionId) {
+        const trRes = await apiClient.getSessionTranscript(matchedSessionId).catch(() => null);
+        if (trRes) {
+          setTranscriptTurns(trRes.turns ?? []);
+          setSessionQueue(trRes.queue ?? []);
+          setIsSessionBusy(Boolean(trRes.is_busy));
+        }
       }
     } finally {
       setLoading(false);
@@ -414,7 +434,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     return () => {
       cancelled = true;
     };
-  }, [apiClient, activeSession?.id, selectedAgent?.name_key]);
+  }, [apiClient, activeSession?.id, selectedAgent?.name_key, authority?.tier]);
 
   // Compute unread mail counts per agent
   const unreadByAgent = useMemo<Record<string, number>>(() => {

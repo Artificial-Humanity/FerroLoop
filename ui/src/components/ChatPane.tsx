@@ -94,6 +94,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [internalError, setInternalError] = React.useState<string | null>(null);
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
+  const [visibleTurnLimit, setVisibleTurnLimit] = React.useState<number>(100);
   const [promptText, setPromptText] = React.useState<string>("");
   const [alwaysSendNow, setAlwaysSendNow] = React.useState<boolean>(() =>
     readInitialAlwaysSendNow(),
@@ -214,6 +215,21 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       );
     });
   }, [effectiveTurns, filterQuery]);
+
+  const { displayedTurns, hiddenTurnCount } = React.useMemo(() => {
+    if (filterQuery.trim() || filteredTurns.length <= visibleTurnLimit) {
+      return { displayedTurns: filteredTurns, hiddenTurnCount: 0 };
+    }
+    const hidden = filteredTurns.length - visibleTurnLimit;
+    return {
+      displayedTurns: filteredTurns.slice(hidden),
+      hiddenTurnCount: hidden,
+    };
+  }, [filteredTurns, filterQuery, visibleTurnLimit]);
+
+  React.useEffect(() => {
+    setVisibleTurnLimit(100);
+  }, [targetSessionOrAgent]);
 
   React.useEffect(() => {
     const targetChanged = prevTargetRef.current !== targetSessionOrAgent;
@@ -554,13 +570,28 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             </div>
           </div>
         ) : (
-          filteredTurns.map((turn) => (
-            <TurnCard
-              key={`${turn.index}-${turn.created_at ?? ""}`}
-              turn={turn}
-              agentDisplayName={agentDisplayName ?? agentName ?? undefined}
-            />
-          ))
+          <>
+            {hiddenTurnCount > 0 && (
+              <div style={{ display: "flex", justifyContent: "center", padding: "4px 0" }}>
+                <button
+                  type="button"
+                  className="fd-btn"
+                  data-testid="load-earlier-turns-btn"
+                  onClick={() => setVisibleTurnLimit((prev) => prev + 100)}
+                  style={{ fontSize: "11px", padding: "4px 12px" }}
+                >
+                  Show earlier turns ({hiddenTurnCount} older)
+                </button>
+              </div>
+            )}
+            {displayedTurns.map((turn) => (
+              <TurnCard
+                key={`${turn.index}-${turn.created_at ?? ""}`}
+                turn={turn}
+                agentDisplayName={agentDisplayName ?? agentName ?? undefined}
+              />
+            ))}
+          </>
         )}
       </div>
 
