@@ -144,6 +144,7 @@ describe("HubApiClient", () => {
                 description: "",
                 base_url: "https://discord.com/api/v10",
                 allowed_hosts: ["discord.com"],
+                enabled: true,
                 tools: [],
                 bridges: [],
               },
@@ -175,6 +176,8 @@ describe("HubApiClient", () => {
     const deleted = await client.deleteGateSecret("DISCORD_BOT_TOKEN");
     expect(deleted).toEqual({ removed: true, name: "DISCORD_BOT_TOKEN" });
 
+    await client.deleteGateSecret("A/B C");
+
     const connectors = await client.listGateConnectors();
     expect(connectors.connectors[0].title).toBe("Discord");
 
@@ -192,6 +195,7 @@ describe("HubApiClient", () => {
         },
       },
       { url: "/api/v1/gate/secrets/DISCORD_BOT_TOKEN", method: "DELETE", body: undefined },
+      { url: "/api/v1/gate/secrets/A%2FB%20C", method: "DELETE", body: undefined },
       { url: "/api/v1/gate/connectors", method: "GET", body: undefined },
     ]);
   });

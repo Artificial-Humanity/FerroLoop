@@ -581,15 +581,18 @@ export interface SetVaultSecretInput {
   lease_ttl_secs?: number;
 }
 
+// Deliberately excluded from the UI types (secret-name references must never render):
+// connector `default_headers`, tool `headers`/`input_schema`, and bridge
+// `verify_secret`/`bot_token_secret`/`allowed_user_ids`/`allowed_guild_ids`.
 export interface GateConnectorToolSummary {
   name: string;
   description: string;
   method: string;
   path: string;
-  path_params?: string[];
-  query_params?: string[];
-  body_params?: string[];
-  response_fields?: string[];
+  path_params: string[];
+  query_params: string[];
+  body_params: string[];
+  response_fields: string[];
 }
 
 export interface GateBridgeSummary {
@@ -602,14 +605,12 @@ export interface GateBridgeSummary {
 
 export interface GateConnectorSummary {
   id: string;
-  /** `ConnectorManifest.title` on the wire; `name` kept as an older alias. */
   title: string;
-  name?: string;
   version: string;
   description: string;
   base_url: string;
   allowed_hosts: string[];
-  enabled?: boolean;
+  enabled: boolean;
   tools: GateConnectorToolSummary[];
   bridges: GateBridgeSummary[];
 }

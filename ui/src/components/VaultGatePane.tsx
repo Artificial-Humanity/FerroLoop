@@ -213,6 +213,12 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
           const rest = prev.filter((item) => item.name !== saved.name);
           return [...rest, saved].sort((a, b) => a.name.localeCompare(b.name));
         });
+      } else if (saved === undefined && secrets === undefined) {
+        if (apiClient) {
+          void fetchGateData(true);
+        } else {
+          onRefresh?.();
+        }
       } else if (secrets !== undefined && !onSetSecret) {
         onRefresh?.();
       }
@@ -315,6 +321,10 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
 
           {effectiveLoading && effectiveSecrets.length === 0 ? (
             <p style={{ margin: 0, color: "var(--text-muted)" }}>Loading secrets…</p>
+          ) : effectiveSecrets.length === 0 && effectiveError ? (
+            <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "13px" }}>
+              Failed to load secrets.
+            </p>
           ) : effectiveSecrets.length === 0 ? (
             <p
               data-testid="vault-secrets-empty"
@@ -591,6 +601,10 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
 
           {effectiveLoading && effectiveConnectors.length === 0 ? (
             <p style={{ margin: 0, color: "var(--text-muted)" }}>Loading connectors…</p>
+          ) : effectiveConnectors.length === 0 && effectiveError ? (
+            <p style={{ margin: 0, color: "var(--text-muted)", fontSize: "13px" }}>
+              Failed to load connectors.
+            </p>
           ) : effectiveConnectors.length === 0 ? (
             <p
               data-testid="gate-connectors-empty"
@@ -609,18 +623,16 @@ export const VaultGatePane: React.FC<VaultGatePaneProps> = ({
               >
                 <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                   <span style={{ fontWeight: 700, fontSize: "14px" }}>
-                    {connector.title || connector.name || connector.id}
+                    {connector.title || connector.id}
                   </span>
                   <span className="fd-badge fd-mono">{connector.id}</span>
                   <span className="fd-badge">v{connector.version}</span>
-                  {connector.enabled !== undefined && (
-                    <span className="fd-badge">
-                      <span
-                        className={`fd-dot ${connector.enabled ? "fd-dot-alive" : "fd-dot-dead"}`}
-                      />
-                      {connector.enabled ? "Enabled" : "Disabled"}
-                    </span>
-                  )}
+                  <span className="fd-badge">
+                    <span
+                      className={`fd-dot ${connector.enabled ? "fd-dot-alive" : "fd-dot-dead"}`}
+                    />
+                    {connector.enabled ? "Enabled" : "Disabled"}
+                  </span>
                 </div>
                 {connector.description && (
                   <p style={{ margin: 0, fontSize: "13px", color: "var(--text-secondary)" }}>
