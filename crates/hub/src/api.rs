@@ -41,6 +41,11 @@ use fl_exec::workflow::{
     execute_workflow_step, list_workflow_facts, list_workflow_handoffs, record_step_handoff,
     reject_workflow_step, start_workflow_run,
 };
+use fl_gate::{
+    BridgeTarget, InboundBridgeEvent, ProxyRequest, SetSecretArgs, Vault, discover_connectors,
+    evaluate_inbound_bridge_event, execute_proxied_request, handle_mcp_jsonrpc_request,
+    handle_registry_v01_get, verify_inbound_bridge_webhook,
+};
 use fl_store::RedbStore;
 use fl_wire::dispatcher::{dispatch_message_for_store, dispatch_operator_prompt_to_route};
 use fl_wire::identity::RouteTable;
@@ -311,6 +316,19 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         return handle_auth_pair(state, req);
     }
 
+    // 2b. Unauthenticated local MCP Registry v0.1 (`GET /api/v1/gate/registry/v0.1/...`).
+    if (method == "GET" || method == "HEAD") && path.starts_with("/api/v1/gate/registry/") {
+        let subpath = path.trim_start_matches("/api/v1/gate/registry");
+        let connectors = discover_connectors(
+            Some(&state.config.repo_root),
+            state.config.home_override.as_deref(),
+        )
+        .unwrap_or_default();
+        let hub_base = format!("http://{}", state.config.listen);
+        let (status, body) = handle_registry_v01_get(subpath, &req.query, &connectors, &hub_base);
+        return HttpResponse::json(status, body);
+    }
+
     // 3. Static `FerroDeck` asset & SPA serving outside `/api/*` and `/ws/*`.
     if !path.starts_with("/api/") && path != "/api" && !path.starts_with("/ws/") && path != "/ws" {
         return handle_static_request(state, req);
@@ -389,6 +407,11 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("POST", "/api/v1/state") => handle_post_state(&store, &authority, req),
         ("GET", "/api/v1/stats") => handle_get_stats(&store, req),
         ("GET", "/api/v1/architecture") => handle_get_architecture(state, req),
+        ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
+        ("POST", "/api/v1/gate/secrets") => handle_post_gate_secret(state, &authority, req),
+        ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
+        ("POST", "/api/v1/gate/call") => handle_post_gate_call(state, &authority, req),
+        ("POST", "/api/v1/gate/mcp") => handle_post_gate_mcp(state, &authority, None, req),
         _ => handle_dynamic_api_routes(state, &store, &authority, req),
     }
 }
@@ -1525,6 +1548,26 @@ fn handle_dynamic_api_routes(
         }
     }
 
+    // /api/v1/gate/secrets/:name, /api/v1/gate/mcp/:connector, or /api/v1/gate/bridges/:bridge_id/webhook
+    if segments.len() >= 4 && segments[0] == "api" && segments[1] == "v1" && segments[2] == "gate" {
+        if segments.len() == 5 && segments[3] == "secrets" && method == "DELETE" {
+            let secret_name = percent_decode(segments[4]);
+            return handle_delete_gate_secret(state, authority, &secret_name);
+        }
+        if segments.len() == 5 && segments[3] == "mcp" && method == "POST" {
+            let connector_id = percent_decode(segments[4]);
+            return handle_post_gate_mcp(state, authority, Some(&connector_id), req);
+        }
+        if segments.len() == 6
+            && segments[3] == "bridges"
+            && segments[5] == "webhook"
+            && method == "POST"
+        {
+            let bridge_id = percent_decode(segments[4]);
+            return handle_post_gate_bridge_webhook(state, store, authority, &bridge_id, req);
+        }
+    }
+
     HttpResponse::json(404, json!({ "error": "not found" }))
 }
 
@@ -2429,5 +2472,273 @@ fn handle_post_workflow_abort(
             HttpResponse::json(200, data)
         }
         Err(e) => HttpResponse::json(400, json!({ "error": e.to_string() })),
+    }
+}
+
+fn handle_get_gate_secrets(state: &HubState) -> HttpResponse {
+    match Vault::open_default(state.config.home_override.as_deref()) {
+        Ok(vault) => HttpResponse::json(200, json!({ "secrets": vault.list() })),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+fn handle_post_gate_secret(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may write secrets to the FerroGate vault" }),
+        );
+    }
+
+    #[derive(Deserialize)]
+    struct SetSecretPayload {
+        name: String,
+        value: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        allowed_hosts: Vec<String>,
+        #[serde(default)]
+        allowed_methods: Vec<String>,
+        #[serde(default)]
+        allowed_agents: Vec<String>,
+        #[serde(default)]
+        allow_private_network: bool,
+        #[serde(default)]
+        lease_ttl_secs: Option<u64>,
+    }
+
+    let payload: SetSecretPayload = match req.json() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+
+    let mut vault = match Vault::open_default(state.config.home_override.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    match vault.set(SetSecretArgs {
+        name: payload.name,
+        value: payload.value,
+        description: payload.description,
+        allowed_hosts: payload.allowed_hosts,
+        allowed_methods: payload.allowed_methods,
+        allowed_agents: payload.allowed_agents,
+        allow_private_network: payload.allow_private_network,
+        lease_ttl_secs: payload.lease_ttl_secs,
+    }) {
+        Ok(meta) => HttpResponse::json(200, json!({ "secret": meta })),
+        Err(e) => HttpResponse::json(400, json!({ "error": e.to_string() })),
+    }
+}
+
+fn handle_delete_gate_secret(
+    state: &HubState,
+    authority: &HubAuthority,
+    secret_name: &str,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may delete secrets from the FerroGate vault" }),
+        );
+    }
+
+    let mut vault = match Vault::open_default(state.config.home_override.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    match vault.remove(secret_name) {
+        Ok(true) => HttpResponse::json(200, json!({ "removed": true, "name": secret_name })),
+        Ok(false) => HttpResponse::json(404, json!({ "error": "secret not found" })),
+        Err(e) => HttpResponse::json(400, json!({ "error": e.to_string() })),
+    }
+}
+
+fn handle_get_gate_connectors(state: &HubState) -> HttpResponse {
+    match discover_connectors(
+        Some(&state.config.repo_root),
+        state.config.home_override.as_deref(),
+    ) {
+        Ok(connectors) => HttpResponse::json(200, json!({ "connectors": connectors })),
+        Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+    }
+}
+
+fn handle_post_gate_call(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let mut proxy_req: ProxyRequest = match req.json() {
+        Ok(r) => r,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    if !authority.is_owner() || proxy_req.caller_agent.is_none() {
+        proxy_req.caller_agent = Some(authority.actor_name().to_string());
+    }
+
+    let vault = match Vault::open_default(state.config.home_override.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    match execute_proxied_request(&vault, &proxy_req) {
+        Ok(resp) => HttpResponse::json(200, json!({ "response": resp })),
+        Err(e) => HttpResponse::json(403, json!({ "error": e.to_string() })),
+    }
+}
+
+fn handle_post_gate_mcp(
+    state: &HubState,
+    authority: &HubAuthority,
+    connector_filter: Option<&str>,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let rpc_req: Value = match req.json() {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+
+    let vault = match Vault::open_default(state.config.home_override.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    let connectors = discover_connectors(
+        Some(&state.config.repo_root),
+        state.config.home_override.as_deref(),
+    )
+    .unwrap_or_default();
+
+    match handle_mcp_jsonrpc_request(
+        &rpc_req,
+        &vault,
+        &connectors,
+        connector_filter,
+        Some(authority.actor_name().to_string()),
+    ) {
+        Some(reply) => HttpResponse::json(200, reply),
+        None => HttpResponse::json(202, json!({ "accepted": true })),
+    }
+}
+
+fn handle_post_gate_bridge_webhook(
+    state: &HubState,
+    store: &RedbStore,
+    authority: &HubAuthority,
+    bridge_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let mut event: InboundBridgeEvent = match req.json() {
+        Ok(ev) => ev,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    event.bridge_id = bridge_id.to_string();
+
+    let connectors = match discover_connectors(
+        Some(&state.config.repo_root),
+        state.config.home_override.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    let Some(bridge_cfg) = connectors
+        .iter()
+        .flat_map(|c| c.bridges.iter())
+        .find(|b| b.id == bridge_id)
+    else {
+        return HttpResponse::json(
+            404,
+            json!({ "error": format!("bridge `{bridge_id}` not found") }),
+        );
+    };
+
+    let vault = match Vault::open_default(state.config.home_override.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    let provided_secret = req
+        .headers
+        .get("x-ferrogate-secret")
+        .or_else(|| req.headers.get("x-webhook-secret"))
+        .map(String::as_str);
+    if let Err(e) =
+        verify_inbound_bridge_webhook(bridge_cfg, &vault, authority.is_owner(), provided_secret)
+    {
+        return HttpResponse::json(403, json!({ "error": e.to_string() }));
+    }
+
+    let plan = match evaluate_inbound_bridge_event(bridge_cfg, &event) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::json(403, json!({ "error": e.to_string() })),
+    };
+
+    match &plan.target {
+        BridgeTarget::WireAgent { persona } => {
+            let (canonical_id, target_persona) = resolve_session_target(state, store, persona);
+            let sender_label = event.sender_name.as_deref().unwrap_or(&event.sender_id);
+            let delivery_res = dispatch_operator_prompt_for_session(
+                state,
+                target_persona.as_deref(),
+                &canonical_id,
+                sender_label,
+                &plan.prompt_body,
+            );
+            state.mark_session_in_flight(store, &canonical_id);
+            HttpResponse::json(
+                200,
+                json!({
+                    "status": "dispatched",
+                    "delivered": delivery_res.is_ok(),
+                    "session_id": canonical_id,
+                    "plan": plan,
+                }),
+            )
+        }
+        BridgeTarget::Connector {
+            connector_id,
+            tool_name,
+        } => {
+            let Some(conn) = connectors.iter().find(|c| c.id == *connector_id) else {
+                return HttpResponse::json(
+                    404,
+                    json!({ "error": format!("target connector `{connector_id}` not found") }),
+                );
+            };
+            let resolved_tool = tool_name
+                .clone()
+                .or_else(|| conn.tools.first().map(|t| t.name.clone()))
+                .unwrap_or_default();
+            let vault = match Vault::open_default(state.config.home_override.as_deref()) {
+                Ok(v) => v,
+                Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+            };
+            let args = json!({
+                "prompt": plan.prompt_body,
+                "content": plan.prompt_body,
+                "channel_id": plan.channel_id,
+            });
+            match conn.execute_tool(&vault, &resolved_tool, &args, Some("bridge".to_string())) {
+                Ok((resp, projected)) => HttpResponse::json(
+                    200,
+                    json!({
+                        "status": "executed",
+                        "plan": plan,
+                        "upstream_status": resp.status,
+                        "result": projected,
+                    }),
+                ),
+                Err(e) => HttpResponse::json(502, json!({ "error": e.to_string(), "plan": plan })),
+            }
+        }
     }
 }

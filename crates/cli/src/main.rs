@@ -87,6 +87,12 @@ enum Command {
         #[command(subcommand)]
         cmd: cmd::hub::HubCmd,
     },
+    /// Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway.
+    #[command(visible_alias = "gateway")]
+    Vault {
+        #[command(subcommand)]
+        cmd: cmd::vault::VaultCmd,
+    },
 }
 
 impl Command {
@@ -111,7 +117,8 @@ impl Command {
             | Command::State { .. }
             | Command::Wire { .. }
             | Command::Arch { .. }
-            | Command::Hub { .. } => Vec::new(),
+            | Command::Hub { .. }
+            | Command::Vault { .. } => Vec::new(),
         }
     }
 
@@ -148,7 +155,8 @@ impl Command {
             | Command::State { .. }
             | Command::Wire { .. }
             | Command::Arch { .. }
-            | Command::Hub { .. } => false,
+            | Command::Hub { .. }
+            | Command::Vault { .. } => false,
         }
     }
 
@@ -179,7 +187,8 @@ impl Command {
             | Command::State { .. }
             | Command::Wire { .. }
             | Command::Arch { .. }
-            | Command::Hub { .. } => false,
+            | Command::Hub { .. }
+            | Command::Vault { .. } => false,
         }
     }
 }
@@ -886,6 +895,18 @@ fn run(cli: Cli) -> Result<i32> {
                 }
             };
         }
+        Cli {
+            db: _,
+            command: Command::Vault { cmd },
+        } => {
+            return match cmd::vault::run(&cwd, cmd) {
+                Ok(code) => Ok(code),
+                Err((code, msg)) => {
+                    eprintln!("error: {msg}");
+                    Ok(code)
+                }
+            };
+        }
         cli => cli,
     };
     let entries = &cfg.projects;
@@ -1249,7 +1270,8 @@ fn run(cli: Cli) -> Result<i32> {
         | Command::State { .. }
         | Command::Wire { .. }
         | Command::Arch { .. }
-        | Command::Hub { .. } => {
+        | Command::Hub { .. }
+        | Command::Vault { .. } => {
             unreachable!("dispatched before opening catalog/tracker store")
         }
     };

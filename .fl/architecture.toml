@@ -59,6 +59,14 @@ package = "fl-hub"
 paths = ["crates/hub/**"]
 
 [[components]]
+id = "fl_gate"
+title = "FerroGate Vault & MCP Gateway"
+kind = "crate"
+description = "Zero-knowledge AES-256-GCM secret vault, credential proxy, declarative API-to-MCP gateway, local MCP registry, and event bridge"
+package = "fl-gate"
+paths = ["crates/gate/**"]
+
+[[components]]
 id = "fl_cli"
 title = "FerroLoop CLI"
 kind = "crate"
@@ -97,6 +105,21 @@ label = "uses FerroWire domain types and agent registry"
 from = "fl_wire"
 to = "fl_store"
 label = "persists and queries messages in RedbStore"
+
+[[edges]]
+from = "fl_gate"
+to = "fl_core"
+label = "uses core timestamps, IRIs, and error primitives while remaining standalone"
+
+[[edges]]
+from = "fl_hub"
+to = "fl_gate"
+label = "exposes /api/v1/gate vault, connector, registry, and webhook bridge endpoints"
+
+[[edges]]
+from = "fl_cli"
+to = "fl_gate"
+label = "runs fl vault / fl gateway CLI subcommands and MCP server"
 
 [[edges]]
 from = "fl_hub"

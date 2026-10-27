@@ -354,6 +354,7 @@ dependencies = [
  "clap",
  "fl-core",
  "fl-exec",
+ "fl-gate",
  "fl-github",
  "fl-hub",
  "fl-mcp",
@@ -398,6 +399,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fl-gate"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "fl-core",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tiny_http",
+ "toml",
+ "ureq",
+]
+
+[[package]]
 name = "fl-github"
 version = "0.1.0"
 dependencies = [
@@ -422,6 +439,7 @@ dependencies = [
  "base64 0.22.1",
  "fl-core",
  "fl-exec",
+ "fl-gate",
  "fl-github",
  "fl-store",
  "fl-wire",

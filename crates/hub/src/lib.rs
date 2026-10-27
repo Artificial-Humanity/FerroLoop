@@ -1319,5 +1319,71 @@ mod tests {
         .unwrap();
         assert_eq!(tr_limit_all["total_turns"], 2);
         assert_eq!(tr_limit_all["turns"].as_array().unwrap().len(), 2);
+
+        // 8. Verify FerroGate `/api/v1/gate/*` endpoints (secrets ACL, connectors, registry v0.1, and caller_agent spoofing guard)
+        let peer_set_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/gate/secrets")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_json_body(&json!({
+                    "name": "DISCORD_BOT_TOKEN",
+                    "value": "secret-val",
+                    "allowed_hosts": ["discord.com"]
+                })),
+        );
+        assert_eq!(
+            peer_set_resp.status, 403,
+            "Peer authority must not be allowed to write vault secrets"
+        );
+
+        let owner_set_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/gate/secrets")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({
+                    "name": "DISCORD_BOT_TOKEN",
+                    "value": "secret-discord-value-12345",
+                    "allowed_hosts": ["discord.com"],
+                    "allowed_methods": ["POST"],
+                    "allowed_agents": ["ferris"]
+                })),
+        );
+        assert_eq!(owner_set_resp.status, 200);
+
+        let list_secrets_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/gate/secrets")
+                .with_header("Authorization", "Bearer peer-tok-secret"),
+        );
+        assert_eq!(list_secrets_resp.status, 200);
+        let secrets_body = String::from_utf8_lossy(&list_secrets_resp.body);
+        assert!(secrets_body.contains("DISCORD_BOT_TOKEN"));
+        assert!(!secrets_body.contains("secret-discord-value-12345"));
+
+        // Peer attempts to spoof `caller_agent: "ferris"` on `/api/v1/gate/call` -> rejected because Peer actor is `"peer"`
+        let spoof_call_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/gate/call")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_json_body(&json!({
+                    "method": "POST",
+                    "url": "https://discord.com/api/v10/channels/1/messages",
+                    "headers": {
+                        "Authorization": "Bot {{FERROGATE:DISCORD_BOT_TOKEN}}"
+                    },
+                    "caller_agent": "ferris"
+                })),
+        );
+        assert_eq!(
+            spoof_call_resp.status, 403,
+            "Peer must not be able to spoof caller_agent=ferris to bypass allowed_agents"
+        );
+
+        let del_secret_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("DELETE", "/api/v1/gate/secrets/DISCORD_BOT_TOKEN")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(del_secret_resp.status, 200);
     }
 }

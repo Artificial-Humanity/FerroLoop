@@ -71,6 +71,7 @@ Commands:
   flow        Author, inspect, and execute directed workflow graphs
   arch        Initialize, inspect, check, and export the declarative architecture model
   hub         Run and manage the FerroLoop Hub daemon and FerroDeck command center
+  vault       Manage FerroGate zero-knowledge secrets vault, credential proxy, and declarative MCP gateway [alias: gateway]
   help        Print this message or the help of the given subcommand(s)
 
 Options:
