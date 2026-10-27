@@ -1,5 +1,6 @@
 import React from "react";
 import type { TranscriptTurn } from "../types/api";
+import { RichMarkdown } from "./RichMarkdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallBlock } from "./ToolCallBlock";
 
@@ -376,11 +377,10 @@ export const TurnCard: React.FC<TurnCardProps> = ({ turn, agentDisplayName }) =>
                 <div
                   key={idx}
                   style={{
-                    whiteSpace: "pre-wrap",
                     wordBreak: "break-word",
                   }}
                 >
-                  {seg.text.trim()}
+                  <RichMarkdown text={seg.text.trim()} />
                 </div>
               );
             })}
