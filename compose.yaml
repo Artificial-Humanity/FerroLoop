@@ -14,7 +14,7 @@ services:
     volumes:
       - ferroloop-data:/data/fl
       - ./:/workspace:ro
-    command: ["hub", "serve", "--listen", "0.0.0.0:8420"]
+    command: ["hub", "serve", "--listen", "0.0.0.0:8420", "--ui-dir", "/usr/share/ferroloop/ui"]
 
 volumes:
   ferroloop-data:
