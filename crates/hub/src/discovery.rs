@@ -482,6 +482,16 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
     turns
 }
 
+/// Return `true` when the latest turn in `turns` indicates the agent session is actively working
+/// (e.g. a user/wire/tool/system turn is awaiting an assistant reply, or the latest assistant turn
+/// issued tool calls that have not yet produced a final text-only assistant turn).
+pub fn is_transcript_busy(turns: &[TranscriptTurn]) -> bool {
+    let Some(last) = turns.last() else {
+        return false;
+    };
+    !(last.role == "assistant" && last.tool_calls.is_empty())
+}
+
 fn normalize_role(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "user" | "user_explicit" | "human" => "user".to_string(),
@@ -1203,5 +1213,65 @@ mod tests {
         assert_eq!(diff.files.len(), 1);
         assert_eq!(diff.files[0].path, "README.md");
         assert!(diff.diff.contains("+hello world"));
+    }
+
+    #[test]
+    fn is_transcript_busy_detects_active_vs_idle_session_states() {
+        assert!(!is_transcript_busy(&[]));
+
+        let user_turn = TranscriptTurn {
+            index: 0,
+            role: "user".into(),
+            content: "Please run tests".into(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            created_at: None,
+        };
+        assert!(is_transcript_busy(std::slice::from_ref(&user_turn)));
+
+        let assistant_with_tools = TranscriptTurn {
+            index: 1,
+            role: "assistant".into(),
+            content: "Running cargo test".into(),
+            thinking: None,
+            tool_calls: vec![TranscriptToolCall {
+                name: "run_command".into(),
+                arguments: serde_json::json!({"cmd": "cargo test"}),
+            }],
+            created_at: None,
+        };
+        assert!(is_transcript_busy(&[
+            user_turn.clone(),
+            assistant_with_tools.clone()
+        ]));
+
+        let tool_turn = TranscriptTurn {
+            index: 2,
+            role: "tool".into(),
+            content: "test result: ok.".into(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            created_at: None,
+        };
+        assert!(is_transcript_busy(&[
+            user_turn.clone(),
+            assistant_with_tools.clone(),
+            tool_turn.clone()
+        ]));
+
+        let final_assistant = TranscriptTurn {
+            index: 3,
+            role: "assistant".into(),
+            content: "All tests passed.".into(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            created_at: None,
+        };
+        assert!(!is_transcript_busy(&[
+            user_turn,
+            assistant_with_tools,
+            tool_turn,
+            final_assistant
+        ]));
     }
 }

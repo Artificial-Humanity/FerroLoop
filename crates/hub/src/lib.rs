@@ -8,18 +8,23 @@ pub mod discovery;
 pub mod terminal;
 pub mod ws;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use fl_core::pr_policy::DEFAULT_OWNER_LOGIN;
 use fl_core::store::StoreError;
+use fl_exec::stamp;
 use fl_store::RedbStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-pub use api::{HttpRequest, HttpResponse, handle_http_request, parse_http_request, percent_decode};
+pub use api::{
+    HttpRequest, HttpResponse, drain_ready_session_queues, handle_http_request, parse_http_request,
+    percent_decode,
+};
 pub use auth::{
     AuthManager, DEFAULT_PAIRING_TTL_SECS, DEFAULT_SESSION_TTL_SECS, HubAuthority, PairingInfo,
     SESSION_COOKIE_NAME, constant_time_eq, extract_bearer_token, extract_session_cookie,
@@ -30,7 +35,7 @@ pub use auth::{
 pub use discovery::{
     DiscoveredSessionSummary, TranscriptToolCall, TranscriptTurn, WorkspaceArchScan, WorktreeDiff,
     WorktreeFileStatus, WorktreeSummary, discover_sessions, discover_sessions_with_home,
-    list_git_worktrees, parse_jsonl_transcript, read_session_transcript,
+    is_transcript_busy, list_git_worktrees, parse_jsonl_transcript, read_session_transcript,
     read_session_transcript_with_home, read_worktree_diff, scan_cargo_architecture_conformance,
     scan_workspace_for_arch,
 };
@@ -39,6 +44,44 @@ pub use ws::{HubServer, HubWsClient, compute_accept_key, try_parse_ws_frame};
 
 /// Default listen address for `fl hub serve` (`127.0.0.1:8420`, spec §2.1).
 pub const DEFAULT_HUB_LISTEN: &str = "127.0.0.1:8420";
+
+/// Saved file/image attachment metadata associated with an operator prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedPromptAttachment {
+    pub name: String,
+    pub media_type: String,
+    pub path: String,
+    pub url: String,
+}
+
+/// A queued operator chat prompt waiting for a busy session to become idle (or for "Send Now").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedOperatorPrompt {
+    pub id: String,
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<String>,
+    pub prompt: String,
+    pub effective_body: String,
+    pub by: String,
+    #[serde(default)]
+    pub attachments: Vec<SavedPromptAttachment>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct InFlightPrompt {
+    baseline_turn_count: usize,
+    baseline_busy: bool,
+    dispatched_at_ms: i64,
+}
+
+#[derive(Debug, Default)]
+struct PromptQueueState {
+    queues: BTreeMap<String, Vec<QueuedOperatorPrompt>>,
+    in_flight: BTreeMap<String, InFlightPrompt>,
+    next_seq: u64,
+}
 
 /// Multiplexed WebSocket frame envelope on `/ws/v1` and `/api/v1/stream` (spec §4.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +135,7 @@ pub struct HubState {
     pub auth: AuthManager,
     pub ws_tx: broadcast::Sender<HubWsFrame>,
     store_lock: Arc<Mutex<()>>,
+    prompt_queues: Arc<Mutex<PromptQueueState>>,
 }
 
 impl HubState {
@@ -109,7 +153,128 @@ impl HubState {
             auth,
             ws_tx,
             store_lock: Arc::new(Mutex::new(())),
+            prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
         }
+    }
+
+    pub fn session_queue(&self, session_key: &str) -> Vec<QueuedOperatorPrompt> {
+        let Ok(guard) = self.prompt_queues.lock() else {
+            return Vec::new();
+        };
+        guard.queues.get(session_key).cloned().unwrap_or_default()
+    }
+
+    pub fn queued_session_keys(&self) -> Vec<String> {
+        let Ok(guard) = self.prompt_queues.lock() else {
+            return Vec::new();
+        };
+        guard
+            .queues
+            .iter()
+            .filter_map(|(k, v)| (!v.is_empty()).then_some(k.clone()))
+            .collect()
+    }
+
+    pub fn enqueue_session_prompt(
+        &self,
+        session_key: &str,
+        persona: Option<String>,
+        prompt: String,
+        effective_body: String,
+        by: String,
+        attachments: Vec<SavedPromptAttachment>,
+    ) -> (QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>) {
+        let now = stamp::now();
+        let now_ms = now.unix_millis();
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard.next_seq += 1;
+        let seq = guard.next_seq;
+        let item = QueuedOperatorPrompt {
+            id: format!("qp-{now_ms}-{seq}"),
+            session_id: session_key.to_string(),
+            persona,
+            prompt,
+            effective_body,
+            by,
+            attachments,
+            created_at: now.to_string(),
+        };
+        let queue = guard.queues.entry(session_key.to_string()).or_default();
+        queue.push(item.clone());
+        let snapshot = queue.clone();
+        (item, snapshot)
+    }
+
+    pub fn pop_next_queued_prompt(
+        &self,
+        session_key: &str,
+    ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = guard.queues.get_mut(session_key)?;
+        if queue.is_empty() {
+            return None;
+        }
+        let item = queue.remove(0);
+        let snapshot = queue.clone();
+        Some((item, snapshot))
+    }
+
+    pub fn remove_queued_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+    ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = guard.queues.get_mut(session_key)?;
+        let pos = queue.iter().position(|item| item.id == prompt_id)?;
+        let item = queue.remove(pos);
+        let snapshot = queue.clone();
+        Some((item, snapshot))
+    }
+
+    pub fn is_session_busy(&self, store: &RedbStore, session_id: &str) -> bool {
+        let turns = read_session_transcript_with_home(
+            session_id,
+            store,
+            self.config.home_override.as_deref(),
+        );
+        let transcript_busy = is_transcript_busy(&turns);
+        let now_ms = stamp::now().unix_millis() as i64;
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let in_flight_active = if let Some(in_flight) = guard.in_flight.get(session_id) {
+            let expired = now_ms - in_flight.dispatched_at_ms > 300_000;
+            let completed = (turns.len() > in_flight.baseline_turn_count
+                || in_flight.baseline_busy)
+                && !transcript_busy;
+            if expired || completed {
+                guard.in_flight.remove(session_id);
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        in_flight_active || transcript_busy
+    }
+
+    pub fn mark_session_in_flight(&self, store: &RedbStore, session_key: &str) {
+        let turns = read_session_transcript_with_home(
+            session_key,
+            store,
+            self.config.home_override.as_deref(),
+        );
+        let baseline_busy = is_transcript_busy(&turns);
+        let now_ms = stamp::now().unix_millis() as i64;
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard.in_flight.insert(
+            session_key.to_string(),
+            InFlightPrompt {
+                baseline_turn_count: turns.len(),
+                baseline_busy,
+                dispatched_at_ms: now_ms,
+            },
+        );
     }
 
     /// Open the workspace `RedbStore` for the duration of a single operation, retrying
@@ -945,9 +1110,26 @@ mod tests {
         assert!(att_url.starts_with("/api/v1/attachments/"));
         assert!(att_url.ends_with("-ipad_screenshot.png"));
 
-        let wire_body = body_json["message"]["body"].as_str().unwrap();
-        assert!(wire_body.contains("Check this screenshot"));
-        assert!(wire_body.contains(&format!("({att_url})]")));
+        let effective_body = body_json["effective_body"].as_str().unwrap();
+        assert!(effective_body.contains("Check this screenshot"));
+        assert!(effective_body.contains(&format!("({att_url})]")));
+        assert_eq!(body_json["status"], "sent");
+        assert_eq!(body_json["queued"], false);
+
+        // Verify that operator prompts do NOT create FerroWire messages in GET /api/v1/wire/messages
+        let wire_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/wire/messages")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(wire_resp.status, 200);
+        assert!(
+            wire_resp.json_value().unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "operator prompt should not pollute FerroWire mail inbox"
+        );
 
         let get_att_req = HttpRequest::new("GET", att_url)
             .with_header("Authorization", "Bearer owner-tok-secret");
@@ -955,5 +1137,164 @@ mod tests {
         assert_eq!(get_att_resp.status, 200);
         assert_eq!(get_att_resp.content_type, "image/png");
         assert_eq!(get_att_resp.body, png_bytes);
+    }
+
+    #[test]
+    fn operator_prompt_queue_send_now_cancel_and_auto_drain_lifecycle() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+
+        // Create a mock Antigravity session transcript for `ferris` (`conv-ferris-1`)
+        let conv_id = "conv-ferris-1";
+        let logs_dir = tmp
+            .path()
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let transcript_path = logs_dir.join("transcript.jsonl");
+
+        // Start with a busy transcript (ends with a USER_INPUT turn)
+        let turn0 = json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "content": "You will take the name of Ferris. Run cargo test.",
+            "created_at": "2026-10-27T16:00:00Z"
+        })
+        .to_string();
+        fs::write(&transcript_path, format!("{turn0}\n")).unwrap();
+
+        // 1. Sending a prompt with send_now=false when session is busy queues it
+        let q1_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({
+                    "prompt": "First queued prompt",
+                    "send_now": false
+                })),
+        );
+        assert_eq!(q1_resp.status, 200);
+        let q1_json = q1_resp.json_value().unwrap();
+        assert_eq!(q1_json["status"], "queued");
+        assert_eq!(q1_json["queued"], true);
+        assert_eq!(q1_json["is_busy"], true);
+        let qp1_id = q1_json["queued_prompt"]["id"].as_str().unwrap().to_string();
+        assert_eq!(q1_json["queue"].as_array().unwrap().len(), 1);
+
+        // 2. Enqueue two more prompts (qp2 and qp3)
+        let q2_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({
+                    "prompt": "Second queued prompt"
+                })),
+        );
+        let qp2_id = q2_resp.json_value().unwrap()["queued_prompt"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let q3_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({
+                    "prompt": "Third queued prompt"
+                })),
+        );
+        let qp3_id = q3_resp.json_value().unwrap()["queued_prompt"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Verify GET /api/v1/sessions/ferris/queue returns all 3 items
+        let get_q_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/sessions/ferris/queue")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(get_q_resp.status, 200);
+        assert_eq!(
+            get_q_resp.json_value().unwrap()["queue"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        // 3. Cancel qp2 via DELETE /api/v1/sessions/ferris/queue/:prompt_id
+        let del_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("DELETE", format!("/api/v1/sessions/ferris/queue/{qp2_id}"))
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(del_resp.status, 200);
+        let del_json = del_resp.json_value().unwrap();
+        assert_eq!(del_json["status"], "cancelled");
+        assert_eq!(del_json["queue"].as_array().unwrap().len(), 2);
+
+        // 4. Send qp1 now via POST /api/v1/sessions/ferris/queue/:prompt_id/send-now
+        let send_now_resp = handle_http_request(
+            &state,
+            &HttpRequest::new(
+                "POST",
+                format!("/api/v1/sessions/ferris/queue/{qp1_id}/send-now"),
+            )
+            .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(send_now_resp.status, 200);
+        let sn_json = send_now_resp.json_value().unwrap();
+        assert_eq!(sn_json["status"], "sent");
+        assert_eq!(sn_json["prompt_id"], qp1_id);
+        assert_eq!(sn_json["queue"].as_array().unwrap().len(), 1);
+        assert_eq!(sn_json["queue"][0]["id"], qp3_id);
+
+        // 5. Direct POST with send_now=true bypasses the queue even while busy
+        let bypass_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/ferris/prompt")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({
+                    "prompt": "Urgent immediate override",
+                    "send_now": true
+                })),
+        );
+        assert_eq!(bypass_resp.status, 200);
+        let bypass_json = bypass_resp.json_value().unwrap();
+        assert_eq!(bypass_json["status"], "sent");
+        assert_eq!(bypass_json["queued"], false);
+        assert_eq!(bypass_json["queue"].as_array().unwrap().len(), 1);
+
+        // 6. Update transcript on disk to end with an assistant turn (no tool calls)
+        // and verify GET /api/v1/sessions/ferris/transcript auto-drains qp3!
+        let turn1 = json!({
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "content": "Completed initial task.",
+            "created_at": "2026-10-27T16:01:00Z"
+        })
+        .to_string();
+        fs::write(&transcript_path, format!("{turn0}\n{turn1}\n")).unwrap();
+
+        let tr_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/sessions/ferris/transcript")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(tr_resp.status, 200);
+        let tr_json = tr_resp.json_value().unwrap();
+        assert!(
+            tr_json["queue"].as_array().unwrap().is_empty(),
+            "expected qp3 to be automatically drained when session finished its turn"
+        );
+        assert_eq!(
+            tr_json["is_busy"], true,
+            "session should now be marked in_flight after draining qp3"
+        );
     }
 }

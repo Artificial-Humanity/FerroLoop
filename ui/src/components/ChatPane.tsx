@@ -1,7 +1,26 @@
 import React from "react";
 import type { HubApiClient } from "../api/client";
-import type { PromptAttachment, PromptRequest, TranscriptTurn } from "../types/api";
+import type {
+  PromptAttachment,
+  PromptRequest,
+  PromptResponse,
+  QueuedOperatorPrompt,
+  TranscriptTurn,
+} from "../types/api";
 import { TurnCard } from "./TurnCard";
+
+export const ALWAYS_SEND_NOW_STORAGE_KEY = "ferrodeck.always_send_now";
+
+function readInitialAlwaysSendNow(): boolean {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      return window.localStorage.getItem(ALWAYS_SEND_NOW_STORAGE_KEY) === "true";
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return false;
+}
 
 export interface SessionScrollState {
   scrollTop: number;
@@ -16,6 +35,8 @@ export interface ChatPaneProps {
   adapter?: string | null;
   sessionId?: string | null;
   turns?: TranscriptTurn[];
+  isBusy?: boolean;
+  queue?: QueuedOperatorPrompt[];
   loading?: boolean;
   error?: string | null;
   wsConnected?: boolean;
@@ -24,6 +45,8 @@ export interface ChatPaneProps {
     targetSessionOrAgentId: string,
     payload: PromptRequest,
   ) => Promise<unknown> | void;
+  onSendQueuedNow?: (promptId: string) => Promise<unknown> | void;
+  onCancelQueued?: (promptId: string) => Promise<unknown> | void;
   apiClient?: HubApiClient;
 }
 
@@ -53,14 +76,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   adapter,
   sessionId,
   turns,
+  isBusy,
+  queue,
   loading = false,
   error = null,
   wsConnected = false,
   onRefresh,
   onSendPrompt,
+  onSendQueuedNow,
+  onCancelQueued,
   apiClient,
 }) => {
   const [internalTurns, setInternalTurns] = React.useState<TranscriptTurn[]>([]);
+  const [internalIsBusy, setInternalIsBusy] = React.useState<boolean>(false);
+  const [internalQueue, setInternalQueue] = React.useState<QueuedOperatorPrompt[]>([]);
   const [internalLoading, setInternalLoading] = React.useState<boolean>(false);
   const [internalError, setInternalError] = React.useState<string | null>(null);
 
@@ -68,6 +97,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [promptText, setPromptText] = React.useState<string>("");
   const [urgency, setUrgency] = React.useState<"normal" | "urgent">("normal");
   const [subject, setSubject] = React.useState<string>("");
+  const [alwaysSendNow, setAlwaysSendNow] = React.useState<boolean>(() =>
+    readInitialAlwaysSendNow(),
+  );
   const [attachments, setAttachments] = React.useState<PromptAttachment[]>([]);
   const [submitting, setSubmitting] = React.useState<boolean>(false);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
@@ -80,6 +112,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const isNearBottomRef = React.useRef<boolean>(true);
 
   const effectiveTurns = turns ?? internalTurns;
+  const effectiveIsBusy = isBusy ?? internalIsBusy;
+  const effectiveQueue = queue ?? internalQueue;
   const effectiveLoading = loading || internalLoading;
   const effectiveError = error ?? internalError;
 
@@ -153,6 +187,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     try {
       const response = await apiClient.getSessionTranscript(targetId);
       setInternalTurns(response.turns ?? []);
+      setInternalIsBusy(Boolean(response.is_busy));
+      setInternalQueue(response.queue ?? []);
     } catch (err) {
       setInternalError(err instanceof Error ? err.message : "Failed to load transcript");
     } finally {
@@ -242,6 +278,70 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     }
   };
 
+  const handleToggleAlwaysSendNow = (next: boolean) => {
+    setAlwaysSendNow(next);
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.setItem(ALWAYS_SEND_NOW_STORAGE_KEY, String(next));
+      }
+    } catch {
+      // Ignore storage errors
+    }
+  };
+
+  const handleSendQueuedNow = async (promptId: string) => {
+    if (!targetSessionOrAgent) return;
+    try {
+      if (onSendQueuedNow) {
+        await onSendQueuedNow(promptId);
+      } else if (apiClient) {
+        const res = await apiClient.sendQueuedPromptNow(targetSessionOrAgent, promptId);
+        if (Array.isArray(res.queue)) {
+          setInternalQueue(res.queue);
+        }
+        if (typeof res.is_busy === "boolean") {
+          setInternalIsBusy(res.is_busy);
+        }
+        const content = res.effective_body || res.prompt;
+        if (content) {
+          setInternalTurns((prev) => [
+            ...prev,
+            {
+              index: prev.length,
+              role: "user",
+              content,
+              thinking: null,
+              tool_calls: [],
+              created_at: new Date().toISOString(),
+            },
+          ]);
+        }
+      }
+      scrollToBottom("smooth");
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to send queued prompt");
+    }
+  };
+
+  const handleCancelQueued = async (promptId: string) => {
+    if (!targetSessionOrAgent) return;
+    try {
+      if (onCancelQueued) {
+        await onCancelQueued(promptId);
+      } else if (apiClient) {
+        const res = await apiClient.cancelQueuedPrompt(targetSessionOrAgent, promptId);
+        if (Array.isArray(res.queue)) {
+          setInternalQueue(res.queue);
+        }
+        if (typeof res.is_busy === "boolean") {
+          setInternalIsBusy(res.is_busy);
+        }
+      }
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to cancel queued prompt");
+    }
+  };
+
   const canSend =
     (promptText.trim().length > 0 || attachments.length > 0) &&
     !submitting &&
@@ -259,21 +359,52 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       urgency,
       subject: trimmedSubject.length > 0 ? trimmedSubject : undefined,
       ...(attachments.length > 0 ? { attachments } : {}),
+      ...(alwaysSendNow ? { send_now: true } : {}),
     };
 
     setSubmitting(true);
     setSubmitError(null);
     try {
+      let wasQueued = false;
       if (onSendPrompt) {
-        await onSendPrompt(targetSessionOrAgent, payload);
+        const res = (await onSendPrompt(targetSessionOrAgent, payload)) as
+          | PromptResponse
+          | undefined;
+        if (res && (res.queued || res.status === "queued")) {
+          wasQueued = true;
+        }
       } else if (apiClient) {
-        await apiClient.sendSessionPrompt(targetSessionOrAgent, payload);
+        const res = await apiClient.sendSessionPrompt(targetSessionOrAgent, payload);
+        if (Array.isArray(res.queue)) {
+          setInternalQueue(res.queue);
+        }
+        if (typeof res.is_busy === "boolean") {
+          setInternalIsBusy(res.is_busy);
+        }
+        if (res.queued || res.status === "queued") {
+          wasQueued = true;
+        } else {
+          const content = res.effective_body || payload.prompt;
+          setInternalTurns((prev) => [
+            ...prev,
+            {
+              index: prev.length,
+              role: "user",
+              content,
+              thinking: null,
+              tool_calls: [],
+              created_at: new Date().toISOString(),
+            },
+          ]);
+        }
         await fetchTranscript();
       }
       setPromptText("");
       setSubject("");
       setAttachments([]);
-      scrollToBottom("smooth");
+      if (!wasQueued) {
+        scrollToBottom("smooth");
+      }
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : "Failed to send prompt");
     } finally {
@@ -323,6 +454,21 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           />
           <span className="fd-badge" data-testid="turn-count-badge">
             {filteredTurns.length} {filteredTurns.length === 1 ? "turn" : "turns"}
+          </span>
+          <span
+            className="fd-badge"
+            data-testid="session-busy-badge"
+            style={{
+              backgroundColor: effectiveIsBusy
+                ? "rgba(245, 158, 11, 0.16)"
+                : "rgba(16, 185, 129, 0.14)",
+              color: effectiveIsBusy ? "#FBBF24" : "#34D399",
+              borderColor: effectiveIsBusy
+                ? "rgba(245, 158, 11, 0.35)"
+                : "rgba(16, 185, 129, 0.3)",
+            }}
+          >
+            {effectiveIsBusy ? "Busy · Working" : "Idle"}
           </span>
         </div>
 
@@ -455,6 +601,100 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
         )}
 
+        {effectiveQueue.length > 0 && (
+          <div
+            data-testid="prompt-queue-bar"
+            className="fd-card"
+            style={{
+              padding: "8px 10px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "6px",
+              backgroundColor: "rgba(245, 158, 11, 0.08)",
+              borderColor: "rgba(245, 158, 11, 0.3)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                fontSize: "11px",
+                fontWeight: 600,
+                color: "#FBBF24",
+              }}
+            >
+              <span>Queued Prompts ({effectiveQueue.length})</span>
+              <span style={{ fontWeight: 400, color: "var(--text-muted)" }}>
+                Waiting for session to finish current turn
+              </span>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              {effectiveQueue.map((item, idx) => (
+                <div
+                  key={item.id}
+                  data-testid={`queued-prompt-item-${item.id}`}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    padding: "4px 8px",
+                    borderRadius: "4px",
+                    backgroundColor: "var(--bg-surface)",
+                    border: "1px solid var(--border-subtle)",
+                    fontSize: "12px",
+                  }}
+                >
+                  <span
+                    className="fd-badge"
+                    data-testid={`queued-prompt-pos-${idx}`}
+                    style={{ fontSize: "11px", padding: "1px 6px" }}
+                  >
+                    #{idx + 1}
+                  </span>
+                  <span
+                    style={{
+                      flex: 1,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      color: "var(--text-primary)",
+                    }}
+                    title={item.prompt}
+                  >
+                    {item.prompt}
+                  </span>
+                  {item.attachments && item.attachments.length > 0 && (
+                    <span className="fd-badge" style={{ fontSize: "10px" }}>
+                      {item.attachments.length} file{item.attachments.length === 1 ? "" : "s"}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    className="fd-btn fd-btn-primary"
+                    data-testid={`queued-send-now-${item.id}`}
+                    onClick={() => void handleSendQueuedNow(item.id)}
+                    style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
+                  >
+                    Send Now
+                  </button>
+                  <button
+                    type="button"
+                    className="fd-btn"
+                    aria-label="Remove"
+                    data-testid={`queued-cancel-${item.id}`}
+                    onClick={() => void handleCancelQueued(item.id)}
+                    style={{ fontSize: "11px", padding: "2px 6px", height: "24px" }}
+                    title="Remove from queue"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           <label
             style={{
@@ -520,6 +760,26 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >
             + Attach
           </button>
+
+          <label
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "6px",
+              fontSize: "12px",
+              color: "var(--text-muted)",
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              aria-label="Always send now"
+              data-testid="always-send-now-toggle"
+              checked={alwaysSendNow}
+              onChange={(e) => handleToggleAlwaysSendNow(e.target.checked)}
+            />
+            <span>Always send now</span>
+          </label>
         </div>
 
         {attachments.length > 0 && (

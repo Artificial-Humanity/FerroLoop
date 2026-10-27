@@ -1,11 +1,16 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { ChatPane, sessionScrollMemory } from "../components/ChatPane";
-import type { TranscriptTurn } from "../types/api";
+import {
+  ALWAYS_SEND_NOW_STORAGE_KEY,
+  ChatPane,
+  sessionScrollMemory,
+} from "../components/ChatPane";
+import type { QueuedOperatorPrompt, TranscriptTurn } from "../types/api";
 
 describe("ChatPane", () => {
   beforeEach(() => {
     sessionScrollMemory.clear();
+    window.localStorage.removeItem(ALWAYS_SEND_NOW_STORAGE_KEY);
   });
   const sampleTurns: TranscriptTurn[] = [
     {
@@ -409,5 +414,105 @@ describe("ChatPane", () => {
     expect(toggleBtn).toHaveAttribute("aria-expanded", "true");
     expect(toggleBtn.textContent).toContain("▼");
     expect(screen.getByText(/cargo test passed 42 tests/i)).toBeInTheDocument();
+  });
+
+  it("renders Queued Prompts bar and dispatches Send Now or Remove actions", async () => {
+    const onSendQueuedNow = vi.fn(async () => {});
+    const onCancelQueued = vi.fn(async () => {});
+    const queuedItems: QueuedOperatorPrompt[] = [
+      {
+        id: "qp-100-1",
+        session_id: "sess-ferris-01",
+        persona: "ferris",
+        prompt: "First queued prompt in line",
+        by: "owner",
+        created_at: "2026-10-27T16:10:00Z",
+      },
+      {
+        id: "qp-100-2",
+        session_id: "sess-ferris-01",
+        persona: "ferris",
+        prompt: "Second queued prompt with attachment",
+        by: "owner",
+        attachments: [
+          {
+            name: "diag.png",
+            media_type: "image/png",
+            path: "/tmp/diag.png",
+            url: "/api/v1/attachments/diag.png",
+          },
+        ],
+        created_at: "2026-10-27T16:10:05Z",
+      },
+    ];
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={sampleTurns}
+        isBusy={true}
+        queue={queuedItems}
+        onSendPrompt={vi.fn()}
+        onSendQueuedNow={onSendQueuedNow}
+        onCancelQueued={onCancelQueued}
+      />,
+    );
+
+    expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy · Working");
+    const queueBar = screen.getByTestId("prompt-queue-bar");
+    expect(queueBar).toBeInTheDocument();
+    expect(screen.getByText("Queued Prompts (2)")).toBeInTheDocument();
+    expect(screen.getByTestId("queued-prompt-pos-0")).toHaveTextContent("#1");
+    expect(screen.getByTestId("queued-prompt-pos-1")).toHaveTextContent("#2");
+    expect(screen.getByText("First queued prompt in line")).toBeInTheDocument();
+    expect(screen.getByText("Second queued prompt with attachment")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("queued-send-now-qp-100-1"));
+    await waitFor(() => {
+      expect(onSendQueuedNow).toHaveBeenCalledWith("qp-100-1");
+    });
+
+    fireEvent.click(screen.getByTestId("queued-cancel-qp-100-2"));
+    await waitFor(() => {
+      expect(onCancelQueued).toHaveBeenCalledWith("qp-100-2");
+    });
+  });
+
+  it("persists Always send now toggle in localStorage and passes send_now: true to onSendPrompt", async () => {
+    const onSendPrompt = vi.fn(async () => {});
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={[]}
+        onSendPrompt={onSendPrompt}
+      />,
+    );
+
+    const toggle = screen.getByTestId("always-send-now-toggle") as HTMLInputElement;
+    expect(toggle.checked).toBe(false);
+
+    fireEvent.click(toggle);
+    expect(toggle.checked).toBe(true);
+    expect(window.localStorage.getItem(ALWAYS_SEND_NOW_STORAGE_KEY)).toBe("true");
+
+    const promptInput = screen.getByLabelText("Prompt Message") as HTMLTextAreaElement;
+    fireEvent.change(promptInput, { target: { value: "Immediate override prompt" } });
+    fireEvent.click(screen.getByRole("button", { name: /Send Prompt/i }));
+
+    await waitFor(() => {
+      expect(onSendPrompt).toHaveBeenCalledWith("sess-ferris-01", {
+        prompt: "Immediate override prompt",
+        urgency: "normal",
+        subject: undefined,
+        send_now: true,
+      });
+    });
   });
 });

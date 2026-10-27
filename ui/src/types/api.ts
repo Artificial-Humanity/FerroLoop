@@ -128,13 +128,19 @@ export interface TranscriptTurn {
 export interface SessionTranscriptResponse {
   session_id: string;
   turns: TranscriptTurn[];
+  is_busy?: boolean;
+  queue?: QueuedOperatorPrompt[];
 }
+
+export type TranscriptResponse = SessionTranscriptResponse;
 
 export interface PromptAttachment {
   name: string;
   media_type: string;
   data_base64: string;
 }
+
+export type PromptAttachmentInput = PromptAttachment;
 
 export interface SavedPromptAttachment {
   name: string;
@@ -143,20 +149,51 @@ export interface SavedPromptAttachment {
   url: string;
 }
 
+export interface QueuedOperatorPrompt {
+  id: string;
+  session_id: string;
+  persona?: string | null;
+  prompt: string;
+  effective_body?: string;
+  by: string;
+  attachments?: SavedPromptAttachment[];
+  created_at: string;
+}
+
+export interface SessionQueueResponse {
+  session_id: string;
+  is_busy: boolean;
+  queue: QueuedOperatorPrompt[];
+}
+
 export interface PromptRequest {
   prompt: string;
   by?: string;
   urgency?: "normal" | "urgent";
   subject?: string;
+  send_now?: boolean;
   attachments?: PromptAttachment[];
 }
 
 export interface PromptResponse {
   session_id: string;
-  message: WireMessage;
-  receipts: WireReceipt[];
+  persona?: string | null;
+  status?: "sent" | "queued";
+  queued?: boolean;
+  is_busy?: boolean;
+  delivered?: boolean;
+  prompt_id?: string;
+  prompt?: string;
+  effective_body?: string;
+  by?: string;
+  queued_prompt?: QueuedOperatorPrompt;
+  queue?: QueuedOperatorPrompt[];
+  message?: WireMessage;
+  receipts?: WireReceipt[];
   attachments?: SavedPromptAttachment[];
 }
+
+export type SessionPromptResponse = PromptResponse;
 
 export interface WorktreeSummary {
   id: string;

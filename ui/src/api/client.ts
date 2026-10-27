@@ -8,11 +8,14 @@ import type {
   LivenessResponse,
   PrMergeRequest,
   PrMergeResponse,
+  PromptAttachment,
   PromptRequest,
   PromptResponse,
   PrReviewRequest,
   PrReviewResponse,
   PullRequestItem,
+  QueuedOperatorPrompt,
+  SessionQueueResponse,
   SessionTranscriptResponse,
   StateEntry,
   WireAckRequest,
@@ -204,15 +207,65 @@ export class HubApiClient {
     );
   }
 
+  public async getSessionQueue(sessionId: string): Promise<SessionQueueResponse> {
+    return this.request<SessionQueueResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue`,
+    );
+  }
+
   public async sendSessionPrompt(
     sessionId: string,
-    payload: PromptRequest,
+    payloadOrPrompt: PromptRequest | string,
+    attachments?: PromptAttachment[],
+    sendNow?: boolean,
   ): Promise<PromptResponse> {
+    const body: PromptRequest =
+      typeof payloadOrPrompt === "string"
+        ? {
+            prompt: payloadOrPrompt,
+            ...(attachments && attachments.length > 0 ? { attachments } : {}),
+            send_now: Boolean(sendNow),
+          }
+        : {
+            ...payloadOrPrompt,
+            send_now: Boolean(payloadOrPrompt.send_now ?? sendNow),
+          };
     return this.request<PromptResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/prompt`,
       {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify(body),
+      },
+    );
+  }
+
+  public async sendQueuedPromptNow(
+    sessionId: string,
+    promptId: string,
+  ): Promise<PromptResponse> {
+    return this.request<PromptResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}/send-now`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+    );
+  }
+
+  public async cancelQueuedPrompt(
+    sessionId: string,
+    promptId: string,
+  ): Promise<{
+    session_id: string;
+    status: string;
+    prompt_id: string;
+    is_busy?: boolean;
+    queue: QueuedOperatorPrompt[];
+  }> {
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`,
+      {
+        method: "DELETE",
       },
     );
   }
