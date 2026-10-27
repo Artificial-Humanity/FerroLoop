@@ -778,10 +778,7 @@ fn parse_muse_event_turn(
             })
         }
         "peer_message.admission.requested" => {
-            let body = val
-                .pointer("/payload/body")
-                .and_then(Value::as_str)?
-                .trim();
+            let body = val.pointer("/payload/body").and_then(Value::as_str)?.trim();
             if body.is_empty() {
                 return None;
             }
@@ -1531,7 +1528,8 @@ mod tests {
         .join("\n");
         fs::write(&jsonl_path, &jsonl).unwrap();
 
-        let found = find_transcript_file_in_home(home, session_id).expect("must find session.jsonl");
+        let found =
+            find_transcript_file_in_home(home, session_id).expect("must find session.jsonl");
         assert_eq!(found, jsonl_path.display().to_string());
 
         let turns = parse_jsonl_transcript(&jsonl);
