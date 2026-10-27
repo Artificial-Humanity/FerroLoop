@@ -155,6 +155,10 @@ export class HubApiClient {
     return this.request<AuthSessionResponse>("/api/v1/auth/session");
   }
 
+  public async getAuthSession(): Promise<AuthSessionResponse> {
+    return this.getSession();
+  }
+
   public async logout(): Promise<{ authenticated: boolean }> {
     try {
       return await this.request<{ authenticated: boolean }>("/api/v1/auth/logout", {
@@ -184,6 +188,10 @@ export class HubApiClient {
     const suffix =
       staleAfterMs !== undefined ? `?stale_after_ms=${encodeURIComponent(String(staleAfterMs))}` : "";
     return this.request<LivenessResponse>(`/api/v1/agents/liveness${suffix}`);
+  }
+
+  public async getAgentsLiveness(staleAfterMs?: number): Promise<LivenessResponse> {
+    return this.getLiveness(staleAfterMs);
   }
 
   public async getSessions(): Promise<{ sessions: DiscoveredSessionSummary[] }> {
@@ -221,6 +229,10 @@ export class HubApiClient {
 
   public async getPullRequests(): Promise<{ prs: PullRequestItem[] }> {
     return this.request<{ prs: PullRequestItem[] }>("/api/v1/prs");
+  }
+
+  public async getPrs(): Promise<{ prs: PullRequestItem[] }> {
+    return this.getPullRequests();
   }
 
   public async reviewPullRequest(

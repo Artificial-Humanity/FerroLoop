@@ -117,7 +117,7 @@ describe("ChatPane", () => {
   it("submits prompt with urgency and subject via Send Prompt button and Ctrl+Enter, then clears input", async () => {
     const onSendPrompt = vi.fn(async () => {});
 
-    render(
+    const { rerender } = render(
       <ChatPane
         agentName="ferris"
         agentDisplayName="Ferris"
@@ -155,11 +155,21 @@ describe("ChatPane", () => {
     });
 
     // Test Ctrl+Enter shortcut fallback to agentName when sessionId is null
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId={null}
+        turns={[]}
+        onSendPrompt={onSendPrompt}
+      />,
+    );
     fireEvent.change(promptInput, { target: { value: "Second prompt via shortcut" } });
     fireEvent.keyDown(promptInput, { key: "Enter", ctrlKey: true });
 
     await waitFor(() => {
-      expect(onSendPrompt).toHaveBeenCalledWith("sess-ferris-01", {
+      expect(onSendPrompt).toHaveBeenCalledWith("ferris", {
         prompt: "Second prompt via shortcut",
         urgency: "urgent",
         subject: undefined,
