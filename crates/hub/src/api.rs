@@ -1368,11 +1368,21 @@ fn handle_dynamic_api_routes(
             ("GET", "transcript") => {
                 drain_ready_session_queues(state, store);
                 let (canonical_id, _persona) = resolve_session_target(state, store, &session_id);
-                let turns = read_session_transcript_with_home(
+                let all_turns = read_session_transcript_with_home(
                     &session_id,
                     store,
                     state.config.home_override.as_deref(),
                 );
+                let total_turns = all_turns.len();
+                let limit_opt = match req.query.get("limit").map(|s| s.trim()) {
+                    Some("all" | "0") => None,
+                    Some(raw) => raw.parse::<usize>().ok().or(Some(250)),
+                    None => Some(250),
+                };
+                let turns = match limit_opt {
+                    Some(limit) if total_turns > limit => all_turns[total_turns - limit..].to_vec(),
+                    _ => all_turns,
+                };
                 let is_busy = state.is_session_busy(store, &canonical_id);
                 let queue = state.session_queue(&canonical_id);
                 return HttpResponse::json(
@@ -1380,6 +1390,7 @@ fn handle_dynamic_api_routes(
                     json!({
                         "session_id": session_id,
                         "turns": turns,
+                        "total_turns": total_turns,
                         "is_busy": is_busy,
                         "queue": queue,
                     }),

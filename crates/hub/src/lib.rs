@@ -1296,5 +1296,28 @@ mod tests {
             tr_json["is_busy"], true,
             "session should now be marked in_flight after draining qp3"
         );
+        assert_eq!(tr_json["total_turns"], 2);
+
+        // 7. Verify ?limit=<N> and ?limit=all tail slicing on GET /api/v1/sessions/ferris/transcript
+        let tr_limit_1 = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/sessions/ferris/transcript?limit=1")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        )
+        .json_value()
+        .unwrap();
+        assert_eq!(tr_limit_1["total_turns"], 2);
+        assert_eq!(tr_limit_1["turns"].as_array().unwrap().len(), 1);
+        assert_eq!(tr_limit_1["turns"][0]["content"], "Completed initial task.");
+
+        let tr_limit_all = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/sessions/ferris/transcript?limit=all")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        )
+        .json_value()
+        .unwrap();
+        assert_eq!(tr_limit_all["total_turns"], 2);
+        assert_eq!(tr_limit_all["turns"].as_array().unwrap().len(), 2);
     }
 }
