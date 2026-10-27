@@ -1,4 +1,5 @@
 import React from "react";
+import { RichMarkdown } from "./RichMarkdown";
 
 export interface ThinkingBlockProps {
   thinking: string;
@@ -66,8 +67,7 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
       </button>
 
       {expanded && (
-        <pre
-          className="fd-mono"
+        <div
           data-testid="thinking-content"
           style={{
             margin: "8px 0 0 0",
@@ -78,13 +78,12 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
             color: "var(--text-muted)",
             fontSize: "12px",
             lineHeight: 1.5,
-            whiteSpace: "pre-wrap",
             wordBreak: "break-word",
             overflowX: "auto",
           }}
         >
-          {trimmed}
-        </pre>
+          <RichMarkdown text={trimmed} />
+        </div>
       )}
     </div>
   );

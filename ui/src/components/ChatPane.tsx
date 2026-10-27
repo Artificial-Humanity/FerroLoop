@@ -95,8 +95,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
   const [promptText, setPromptText] = React.useState<string>("");
-  const [urgency, setUrgency] = React.useState<"normal" | "urgent">("normal");
-  const [subject, setSubject] = React.useState<string>("");
   const [alwaysSendNow, setAlwaysSendNow] = React.useState<boolean>(() =>
     readInitialAlwaysSendNow(),
   );
@@ -353,11 +351,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       return;
     }
 
-    const trimmedSubject = subject.trim();
     const payload: PromptRequest = {
       prompt: trimmedPrompt || "Attached file(s).",
-      urgency,
-      subject: trimmedSubject.length > 0 ? trimmedSubject : undefined,
+      urgency: "normal",
+      subject: undefined,
       ...(attachments.length > 0 ? { attachments } : {}),
       ...(alwaysSendNow ? { send_now: true } : {}),
     };
@@ -400,7 +397,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         await fetchTranscript();
       }
       setPromptText("");
-      setSubject("");
       setAttachments([]);
       if (!wasQueued) {
         scrollToBottom("smooth");
@@ -583,7 +579,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         style={{
           borderTop: "1px solid var(--border-subtle)",
           backgroundColor: "var(--bg-surface)",
-          padding: "12px 16px",
+          padding: "10px 16px calc(18px + env(safe-area-inset-bottom, 0px))",
           display: "flex",
           flexDirection: "column",
           gap: "8px",
@@ -695,162 +691,89 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
         )}
 
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-          <label
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "6px",
-              fontSize: "12px",
-              color: "var(--text-muted)",
-            }}
-          >
-            <span>Urgency</span>
-            <select
-              aria-label="Urgency"
-              className="fd-select"
-              value={urgency}
-              onChange={(e) => setUrgency(e.target.value as "normal" | "urgent")}
-              style={{ fontSize: "12px", padding: "4px 8px" }}
+        <div
+          data-testid="composer-card"
+          style={{
+            borderRadius: "16px",
+            border: "1px solid var(--border-subtle)",
+            backgroundColor: "var(--bg-surface)",
+            padding: "10px 12px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px",
+          }}
+        >
+          {attachments.length > 0 && (
+            <div
+              data-testid="attachment-chip-list"
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: "6px",
+                alignItems: "center",
+              }}
             >
-              <option value="normal">Normal</option>
-              <option value="urgent">Urgent</option>
-            </select>
-          </label>
-
-          <input
-            type="text"
-            name="fd-dispatch-tag"
-            autoComplete="off"
-            autoCorrect="off"
-            autoCapitalize="off"
-            spellCheck={false}
-            data-1p-ignore="true"
-            data-lpignore="true"
-            data-form-type="other"
-            aria-label="Prompt Subject"
-            placeholder="Optional subject (defaults to cockpit prompt)"
-            className="fd-input"
-            value={subject}
-            onChange={(e) => setSubject(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                void submitPrompt();
-              }
-            }}
-            style={{ flex: 1, minWidth: "180px", fontSize: "12px", padding: "5px 9px" }}
-          />
-
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.json,.log"
-            multiple
-            style={{ display: "none" }}
-            data-testid="prompt-file-input"
-            onChange={handleFileChange}
-          />
-          <button
-            type="button"
-            className="fd-btn"
-            data-testid="prompt-attach-btn"
-            onClick={() => fileInputRef.current?.click()}
-            style={{ fontSize: "12px", padding: "5px 10px" }}
-          >
-            + Attach
-          </button>
-
-          <label
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "6px",
-              fontSize: "12px",
-              color: "var(--text-muted)",
-              cursor: "pointer",
-            }}
-          >
-            <input
-              type="checkbox"
-              aria-label="Always send now"
-              data-testid="always-send-now-toggle"
-              checked={alwaysSendNow}
-              onChange={(e) => handleToggleAlwaysSendNow(e.target.checked)}
-            />
-            <span>Always send now</span>
-          </label>
-        </div>
-
-        {attachments.length > 0 && (
-          <div
-            data-testid="attachment-chip-list"
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              gap: "6px",
-              alignItems: "center",
-            }}
-          >
-            {attachments.map((att, idx) => (
-              <div
-                key={`${att.name}-${idx}`}
-                className="fd-badge"
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  padding: "4px 8px",
-                }}
-              >
-                {att.media_type.startsWith("image/") && (
-                  <img
-                    src={`data:${att.media_type};base64,${att.data_base64}`}
-                    alt={att.name}
-                    style={{
-                      width: "20px",
-                      height: "20px",
-                      objectFit: "cover",
-                      borderRadius: "2px",
-                    }}
-                  />
-                )}
-                <span>{att.name}</span>
-                <button
-                  type="button"
-                  data-testid={`remove-attachment-${idx}`}
-                  aria-label={`Remove ${att.name}`}
-                  onClick={() =>
-                    setAttachments((prev) => prev.filter((_, i) => i !== idx))
-                  }
+              {attachments.map((att, idx) => (
+                <div
+                  key={`${att.name}-${idx}`}
+                  className="fd-badge"
                   style={{
-                    background: "none",
-                    border: "none",
-                    color: "var(--text-muted)",
-                    cursor: "pointer",
-                    padding: 0,
-                    fontSize: "11px",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "6px",
+                    padding: "4px 8px",
                   }}
                 >
-                  ✕
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
+                  {att.media_type.startsWith("image/") && (
+                    <img
+                      src={`data:${att.media_type};base64,${att.data_base64}`}
+                      alt={att.name}
+                      style={{
+                        width: "20px",
+                        height: "20px",
+                        objectFit: "cover",
+                        borderRadius: "2px",
+                      }}
+                    />
+                  )}
+                  <span>{att.name}</span>
+                  <button
+                    type="button"
+                    data-testid={`remove-attachment-${idx}`}
+                    aria-label={`Remove ${att.name}`}
+                    onClick={() =>
+                      setAttachments((prev) => prev.filter((_, i) => i !== idx))
+                    }
+                    style={{
+                      background: "none",
+                      border: "none",
+                      color: "var(--text-muted)",
+                      cursor: "pointer",
+                      padding: 0,
+                      fontSize: "11px",
+                    }}
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
 
-        <div style={{ display: "flex", gap: "8px", alignItems: "flex-end" }}>
           <textarea
             rows={2}
+            role="searchbox"
             name="fd-dispatch-command"
-            autoComplete="off"
+            autoComplete="one-time-code"
             autoCorrect="off"
             autoCapitalize="sentences"
-            spellCheck={false}
+            spellCheck={true}
             enterKeyHint="send"
             data-1p-ignore="true"
             data-lpignore="true"
+            data-bwignore="true"
             data-form-type="other"
+            aria-autocomplete="none"
             aria-label="Prompt Message"
             placeholder={`Send a prompt to ${displayTarget}... (Ctrl+Enter to send)`}
             className="fd-textarea"
@@ -859,23 +782,81 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
             style={{
-              flex: 1,
+              width: "100%",
               resize: "vertical",
-              minHeight: "54px",
+              minHeight: "56px",
               maxHeight: "180px",
+              border: "none",
+              outline: "none",
+              backgroundColor: "transparent",
+              padding: "2px 0",
               fontFamily: "var(--font-sans)",
             }}
           />
 
-          <button
-            type="button"
-            className="fd-btn fd-btn-primary"
-            disabled={!canSend}
-            onClick={() => void submitPrompt()}
-            style={{ height: "38px", padding: "0 16px" }}
+          <div
+            data-testid="composer-action-bar"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              flexWrap: "wrap",
+              paddingTop: "6px",
+              borderTop: "1px solid var(--border-subtle)",
+            }}
           >
-            {submitting ? "Sending..." : "Send Prompt"}
-          </button>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" }}>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.pdf,.txt,.md,.json,.log"
+                multiple
+                style={{ display: "none" }}
+                data-testid="prompt-file-input"
+                onChange={handleFileChange}
+              />
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="prompt-attach-btn"
+                onClick={() => fileInputRef.current?.click()}
+                style={{ fontSize: "12px", padding: "5px 10px" }}
+              >
+                + Attach
+              </button>
+
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                  fontSize: "12px",
+                  color: "var(--text-muted)",
+                  cursor: "pointer",
+                }}
+              >
+                <input
+                  type="checkbox"
+                  aria-label="Always send now"
+                  data-testid="always-send-now-toggle"
+                  checked={alwaysSendNow}
+                  onChange={(e) => handleToggleAlwaysSendNow(e.target.checked)}
+                />
+                <span>Always send now</span>
+              </label>
+            </div>
+
+            <button
+              type="button"
+              className="fd-btn fd-btn-primary"
+              disabled={!canSend}
+              onClick={() => void submitPrompt()}
+              style={{ height: "34px", padding: "0 16px" }}
+            >
+              {submitting ? "Sending..." : "Send Prompt"}
+            </button>
+          </div>
         </div>
       </div>
     </section>

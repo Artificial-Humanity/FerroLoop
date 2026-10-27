@@ -122,7 +122,7 @@ describe("ChatPane", () => {
     expect(screen.queryByText(/"fl status"/i)).toBeNull();
   });
 
-  it("submits prompt with urgency and subject via Send Prompt button and Ctrl+Enter, then clears input", async () => {
+  it("submits prompt via Send Prompt button and Ctrl+Enter, then clears input", async () => {
     const onSendPrompt = vi.fn(async () => {});
 
     const { rerender } = render(
@@ -140,21 +140,17 @@ describe("ChatPane", () => {
     expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
 
     const promptInput = screen.getByPlaceholderText(/Send a prompt/i) as HTMLTextAreaElement;
-    const urgencySelect = screen.getByLabelText(/Urgency/i) as HTMLSelectElement;
-    const subjectInput = screen.getByPlaceholderText(/Optional subject/i) as HTMLInputElement;
     const sendButton = screen.getByRole("button", { name: /Send Prompt/i });
 
     fireEvent.change(promptInput, { target: { value: "Run fl arch check now" } });
-    fireEvent.change(urgencySelect, { target: { value: "urgent" } });
-    fireEvent.change(subjectInput, { target: { value: "Architecture check" } });
 
     fireEvent.click(sendButton);
 
     await waitFor(() => {
       expect(onSendPrompt).toHaveBeenCalledWith("sess-ferris-01", {
         prompt: "Run fl arch check now",
-        urgency: "urgent",
-        subject: "Architecture check",
+        urgency: "normal",
+        subject: undefined,
       });
     });
 
@@ -179,7 +175,7 @@ describe("ChatPane", () => {
     await waitFor(() => {
       expect(onSendPrompt).toHaveBeenCalledWith("ferris", {
         prompt: "Second prompt via shortcut",
-        urgency: "urgent",
+        urgency: "normal",
         subject: undefined,
       });
     });
@@ -263,7 +259,7 @@ describe("ChatPane", () => {
     expect(scrollDiv.scrollTop).toBe(180);
   });
 
-  it("applies anti-autofill attributes and renders composer as non-form region", () => {
+  it("applies anti-autofill attributes, omits Optional subject/Urgency fields, and places textarea above the bottom action bar", () => {
     render(
       <ChatPane
         agentName="ferris"
@@ -279,16 +275,33 @@ describe("ChatPane", () => {
     expect(composer.tagName.toLowerCase()).toBe("div");
     expect(composer).toHaveAttribute("role", "region");
 
-    const filterInput = screen.getByLabelText("Filter transcript");
-    const subjectInput = screen.getByLabelText("Prompt Subject");
-    const promptTextarea = screen.getByLabelText("Prompt Message");
+    expect(screen.queryByPlaceholderText(/Optional subject/i)).toBeNull();
+    expect(screen.queryByLabelText(/Prompt Subject/i)).toBeNull();
+    expect(screen.queryByLabelText(/Urgency/i)).toBeNull();
 
-    for (const el of [filterInput, subjectInput, promptTextarea]) {
-      expect(el).toHaveAttribute("autocomplete", "off");
-      expect(el).toHaveAttribute("data-1p-ignore", "true");
-      expect(el).toHaveAttribute("data-lpignore", "true");
-      expect(el).toHaveAttribute("data-form-type", "other");
-    }
+    const filterInput = screen.getByLabelText("Filter transcript");
+    expect(filterInput).toHaveAttribute("autocomplete", "off");
+    expect(filterInput).toHaveAttribute("data-1p-ignore", "true");
+    expect(filterInput).toHaveAttribute("data-lpignore", "true");
+    expect(filterInput).toHaveAttribute("data-form-type", "other");
+
+    const promptTextarea = screen.getByLabelText("Prompt Message");
+    expect(promptTextarea).toHaveAttribute("autocomplete", "one-time-code");
+    expect(promptTextarea).toHaveAttribute("role", "searchbox");
+    expect(promptTextarea).toHaveAttribute("data-1p-ignore", "true");
+    expect(promptTextarea).toHaveAttribute("data-lpignore", "true");
+    expect(promptTextarea).toHaveAttribute("data-bwignore", "true");
+    expect(promptTextarea).toHaveAttribute("data-form-type", "other");
+    expect(promptTextarea).toHaveAttribute("aria-autocomplete", "none");
+
+    const actionBar = screen.getByTestId("composer-action-bar");
+    const sendButton = screen.getByRole("button", { name: /Send Prompt/i });
+    expect(
+      promptTextarea.compareDocumentPosition(actionBar) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      promptTextarea.compareDocumentPosition(sendButton) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it("attaches a file via prompt-file-input, shows attachment chip, and submits attachments in PromptRequest", async () => {
@@ -514,5 +527,75 @@ describe("ChatPane", () => {
         send_now: true,
       });
     });
+  });
+
+  it("renders Antigravity-style rich Markdown headings, lists, bold, warm amber code pills, clickable URL code pills, and file-reference chips", () => {
+    const richTurns: TranscriptTurn[] = [
+      {
+        index: 0,
+        role: "assistant",
+        content: [
+          "### Summary of Changes",
+          "",
+          "- Updated [Home.jsx](file:///home/lmcfarlin/Projects/Artificial-Humanity/ArtificialHumanity.io/src/pages/Home.jsx) and [`TurnCard`](file:///home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop/ui/src/components/TurnCard.tsx#L10-L20) with **rich formatting**.",
+          "- Preview server running at `http://ai-lab-0:4173/` using `npm run build`.",
+        ].join("\n"),
+        thinking: null,
+        tool_calls: [],
+      },
+    ];
+
+    render(
+      <ChatPane
+        agentName="wesley"
+        agentDisplayName="Wesley"
+        adapter="antigravity"
+        sessionId="sess-wesley-01"
+        turns={richTurns}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const turnContent = screen.getByTestId("turn-content-0");
+
+    // 1. Heading
+    const heading = turnContent.querySelector("h3");
+    expect(heading).toBeTruthy();
+    expect(heading).toHaveTextContent("Summary of Changes");
+
+    // 2. Bulleted list
+    const ul = turnContent.querySelector("ul");
+    expect(ul).toBeTruthy();
+    const listItems = turnContent.querySelectorAll("li");
+    expect(listItems.length).toBe(2);
+
+    // 3. Bold text
+    const strong = turnContent.querySelector("strong");
+    expect(strong).toBeTruthy();
+    expect(strong).toHaveTextContent("rich formatting");
+
+    // 4. Warm amber inline code pills & clickable URL code pill
+    const codeSpan = screen.getByText("npm run build");
+    expect(codeSpan.tagName.toLowerCase()).toBe("code");
+
+    const urlCodeText = screen.getByText("http://ai-lab-0:4173/");
+    const urlLink = urlCodeText.closest("a");
+    expect(urlLink).toBeTruthy();
+    expect(urlLink).toHaveAttribute("href", "http://ai-lab-0:4173/");
+    expect(urlLink).toHaveAttribute("target", "_blank");
+
+    // 5. Antigravity-style File-Reference Chips (with .jsx/.tsx ⚛ icon, stripped backticks, and no raw file:/// text)
+    const chips = screen.getAllByTestId("file-reference-chip");
+    expect(chips.length).toBe(2);
+    expect(chips[0]).toHaveTextContent("⚛");
+    expect(chips[0]).toHaveTextContent("Home.jsx");
+    expect(chips[0]).toHaveAttribute(
+      "title",
+      "file:///home/lmcfarlin/Projects/Artificial-Humanity/ArtificialHumanity.io/src/pages/Home.jsx",
+    );
+    expect(chips[1]).toHaveTextContent("⚛");
+    expect(chips[1]).toHaveTextContent("TurnCard");
+    expect(chips[1].textContent).not.toContain("`");
+    expect(turnContent.textContent).not.toContain("file:///");
   });
 });
