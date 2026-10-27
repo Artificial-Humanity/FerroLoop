@@ -364,10 +364,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       if (explicit) return explicit;
     }
     const key = (selectedAgent?.name_key ?? "").toLowerCase();
+    if (!key) {
+      return null;
+    }
     return (
       sessions.find((s) => (s.persona ?? "").toLowerCase() === key) ??
       routes.find((r) => (r.persona ?? "").toLowerCase() === key) ??
-      sessions[0] ??
       null
     );
   }, [sessions, routes, selectedSessionId, selectedAgent]);

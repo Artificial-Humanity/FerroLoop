@@ -459,12 +459,14 @@ fn mime_type_for_path(path: &Path) -> &'static str {
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("pdf") => "application/pdf",
         Some("ico") => "image/x-icon",
         Some("woff2") => "font/woff2",
         Some("woff") => "font/woff",
         Some("ttf") => "font/ttf",
         Some("wasm") => "application/wasm",
-        Some("txt" | "c4") => "text/plain; charset=utf-8",
+        Some("txt" | "c4" | "md" | "log") => "text/plain; charset=utf-8",
         _ => "application/octet-stream",
     }
 }

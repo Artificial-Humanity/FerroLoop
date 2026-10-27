@@ -15,21 +15,7 @@ use std::fmt;
 pub const DEFAULT_OWNER_LOGIN: &str = "lmcfarlin";
 
 /// Default protected path patterns that always require `Owner` review and merge.
-pub const DEFAULT_PROTECTED_PATTERNS: &[&str] = &[
-    ".github/**",
-    ".fl/manifest.json",
-    ".agents/**",
-    "AGENTS.md",
-    "**/AGENTS.md",
-    "CLAUDE.md",
-    "**/CLAUDE.md",
-    "WORKFLOW.md",
-    "**/WORKFLOW.md",
-    "PERSONA.md",
-    "**/PERSONA.md",
-    "CONTRIBUTING.md",
-    "**/CONTRIBUTING.md",
-];
+pub const DEFAULT_PROTECTED_PATTERNS: &[&str] = &[".github/**", ".fl/manifest.json", ".agents/**"];
 
 const REVIEW_MARKER_PREFIX: &str = "<!-- fl-review:";
 const REVIEW_MARKER_SUFFIX: &str = "-->";
@@ -789,18 +775,16 @@ Signed-off-by: Someone <someone@example.com>
         assert!(is_protected_path(".fl/manifest.json", &extra));
         assert!(is_protected_path(".agents/AGENTS.md", &extra));
         assert!(is_protected_path(".agents/roles/lead.md", &extra));
-        assert!(is_protected_path("AGENTS.md", &extra));
-        assert!(is_protected_path("crates/core/AGENTS.md", &extra));
-        assert!(is_protected_path("CLAUDE.md", &extra));
-        assert!(is_protected_path("sub/CLAUDE.md", &extra));
-        assert!(is_protected_path("WORKFLOW.md", &extra));
-        assert!(is_protected_path("sub/WORKFLOW.md", &extra));
-        assert!(is_protected_path("PERSONA.md", &extra));
-        assert!(is_protected_path("CONTRIBUTING.md", &extra));
-        assert!(is_protected_path("docs/CONTRIBUTING.md", &extra));
         assert!(is_protected_path("secrets/token.txt", &extra));
         assert!(is_protected_path("config/prod.toml", &extra));
 
+        // Repo-level instruction files follow the normal tiered hierarchy (Assistant -> Lead -> LabManager).
+        assert!(!is_protected_path("AGENTS.md", &extra));
+        assert!(!is_protected_path("crates/core/AGENTS.md", &extra));
+        assert!(!is_protected_path("CLAUDE.md", &extra));
+        assert!(!is_protected_path("WORKFLOW.md", &extra));
+        assert!(!is_protected_path("PERSONA.md", &extra));
+        assert!(!is_protected_path("CONTRIBUTING.md", &extra));
         assert!(!is_protected_path("crates/core/src/pr_policy.rs", &extra));
         assert!(!is_protected_path("README.md", &extra));
         assert!(!is_protected_path("docs/AGENTS_GUIDE.md", &extra));

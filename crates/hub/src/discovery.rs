@@ -10,7 +10,7 @@ use fl_core::arch::{
     ArchConformanceReport, ArchitectureModel, PackageDep, SourceReference,
     check_architecture_conformance,
 };
-use fl_core::store::{Catalog, Ledger};
+use fl_core::store::{AgentRegistry, Catalog, Ledger};
 use fl_exec::stamp;
 use fl_store::RedbStore;
 use fl_wire::identity::{RouteTable, VendorRoute};
@@ -122,7 +122,20 @@ pub fn discover_sessions_with_home(
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
 
-    for (persona, entry) in &routes.entries {
+    let registered_names: BTreeSet<String> = store
+        .list_agents(None, true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|a| a.name_key.to_ascii_lowercase())
+        .collect();
+
+    let mut ordered_routes: Vec<_> = routes.entries.iter().collect();
+    ordered_routes.sort_by_key(|(persona, _)| {
+        let is_registered = registered_names.contains(&persona.to_ascii_lowercase());
+        (!is_registered, *persona)
+    });
+
+    for (persona, entry) in ordered_routes {
         let (adapter, raw_id, cwd, transcript_path) = match &entry.route {
             VendorRoute::Claude {
                 pid, session_id, ..
