@@ -598,4 +598,34 @@ describe("ChatPane", () => {
     expect(chips[1].textContent).not.toContain("`");
     expect(turnContent.textContent).not.toContain("file:///");
   });
+
+  it("refuses non-http(s) URL schemes such as javascript: and data: in Markdown links", () => {
+    const unsafeTurns: TranscriptTurn[] = [
+      {
+        index: 0,
+        role: "assistant",
+        content: "Links: [bad-js](javascript:alert(1)) and [bad-data](data:text/html,<script>alert(1)</script>) and [good-https](https://artificialhumanity.io)",
+        thinking: null,
+        tool_calls: [],
+      },
+    ];
+
+    render(
+      <ChatPane
+        agentName="wesley"
+        agentDisplayName="Wesley"
+        adapter="antigravity"
+        sessionId="sess-wesley-01"
+        turns={unsafeTurns}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const turnContent = screen.getByTestId("turn-content-0");
+    const anchors = Array.from(turnContent.querySelectorAll("a"));
+    expect(anchors.length).toBe(1);
+    expect(anchors[0]).toHaveAttribute("href", "https://artificialhumanity.io");
+    expect(screen.getByText("bad-js").closest("a")).toBeNull();
+    expect(screen.getByText("bad-data").closest("a")).toBeNull();
+  });
 });

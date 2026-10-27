@@ -135,7 +135,7 @@ export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.
             <span>{cleanedLabel}</span>
           </span>,
         );
-      } else {
+      } else if (/^https?:\/\//i.test(url)) {
         nodes.push(
           <a
             key={key}
@@ -149,6 +149,10 @@ export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.
           >
             {renderInlineMarkdown(cleanedLabel, `${key}-lbl`)}
           </a>,
+        );
+      } else {
+        nodes.push(
+          <span key={key}>{renderInlineMarkdown(cleanedLabel, `${key}-lbl`)}</span>,
         );
       }
     } else if (token.startsWith("`") && token.endsWith("`") && token.length >= 2) {
