@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-27  
 **Author:** Ferris (`ferris`, FerroLoop Lead)  
-**Status:** Draft (Pending Spec Review)
+**Status:** Approved by Spec Review (Pending Owner Review)
 
 ---
 
