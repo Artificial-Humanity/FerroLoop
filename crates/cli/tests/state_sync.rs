@@ -916,7 +916,7 @@ fn mcp_stdio_round_trip_and_releases_redb_lock_between_calls() {
         "method": "tools/list",
         "params": {}
     }));
-    assert_eq!(list_resp["result"]["tools"].as_array().unwrap().len(), 20);
+    assert_eq!(list_resp["result"]["tools"].as_array().unwrap().len(), 24);
     assert!(
         list_resp["result"]["tools"]
             .as_array()
@@ -925,6 +925,21 @@ fn mcp_stdio_round_trip_and_releases_redb_lock_between_calls() {
             .any(|t| t["name"] == "fl_memory_search"),
         "fl_memory_search must be advertised: {list_resp}"
     );
+    for tool in [
+        "fl_code_def",
+        "fl_code_search",
+        "fl_code_outline",
+        "fl_batch_search",
+    ] {
+        assert!(
+            list_resp["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["name"] == tool),
+            "{tool} must be advertised: {list_resp}"
+        );
+    }
 
     let reg_resp = rpc(serde_json::json!({
         "jsonrpc": "2.0",
@@ -1142,6 +1157,107 @@ fn mcp_stdio_fl_memory_search_returns_ranked_hits() {
     assert_eq!(hits.len(), 2, "{value}");
     assert_eq!(hits[0]["entry"]["slug"], "search-strong", "{value}");
     assert!(hits[0]["score_millis"].as_u64().unwrap() > 0, "{value}");
+
+    drop(child_in);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn mcp_stdio_code_def_and_batch_search_record_token_gain() {
+    let (_tmp, _bare, a, _b) = setup_two_machines(false);
+    std::fs::create_dir_all(a.repo_dir.join("src")).unwrap();
+    let mut code = String::from("pub fn widget_alpha() {}\npub struct WidgetBeta;\n");
+    for i in 0..40 {
+        code.push_str(&format!("// filler line {i} padding the file out\n"));
+    }
+    std::fs::write(a.repo_dir.join("src/lib.rs"), code).unwrap();
+
+    let mut child = a
+        .fl()
+        .args(["state", "mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child_in = child.stdin.take().unwrap();
+    let mut child_out = BufReader::new(child.stdout.take().unwrap());
+    let mut rpc = |req: Value| -> Value {
+        writeln!(child_in, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        child_in.flush().unwrap();
+        let mut line = String::new();
+        child_out.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+
+    let init_resp = rpc(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+    }));
+    assert_eq!(init_resp["result"]["serverInfo"]["name"], "fl-state-mcp");
+
+    let def_resp = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "fl_code_def",
+            "arguments": { "q": "widget_alpha" }
+        }
+    }));
+    assert_eq!(def_resp["result"]["isError"], false, "{def_resp}");
+    let def: Value =
+        serde_json::from_str(def_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(def["query"], "widget_alpha", "{def}");
+    assert_eq!(def["kind"], "def", "{def}");
+    assert_eq!(def["symbols"][0]["name"], "widget_alpha", "{def}");
+    assert_eq!(def["symbols"][0]["path"], "src/lib.rs", "{def}");
+    assert!(
+        def["tokens_saved_this_query"].as_u64().unwrap() > 0,
+        "{def}"
+    );
+    assert_eq!(def["token_gain"]["queries_count"], 1, "{def}");
+
+    let batch_resp = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "fl_batch_search",
+            "arguments": {
+                "queries": [
+                    { "kind": "def", "q": "WidgetBeta" },
+                    { "kind": "outline", "q": "src/lib.rs" }
+                ]
+            }
+        }
+    }));
+    assert_eq!(batch_resp["result"]["isError"], false, "{batch_resp}");
+    let batch: Value =
+        serde_json::from_str(batch_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(batch["results"].as_array().unwrap().len(), 2, "{batch}");
+    assert_eq!(batch["results"][0]["query"], "WidgetBeta", "{batch}");
+    assert_eq!(batch["results"][0]["kind"], "def", "{batch}");
+    assert_eq!(
+        batch["results"][0]["symbols"][0]["name"], "WidgetBeta",
+        "{batch}"
+    );
+    assert_eq!(batch["results"][1]["kind"], "outline", "{batch}");
+    assert_eq!(
+        batch["results"][1]["symbols"].as_array().unwrap().len(),
+        2,
+        "{batch}"
+    );
+    assert_eq!(batch["token_gain"]["queries_count"], 3, "{batch}");
+
+    let bad_resp = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "fl_code_search",
+            "arguments": { "q": "   " }
+        }
+    }));
+    assert_eq!(bad_resp["result"]["isError"], true, "{bad_resp}");
 
     drop(child_in);
     assert!(child.wait().unwrap().success());

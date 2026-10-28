@@ -4,9 +4,11 @@
 //! exclusive `redb` file lock is never held while waiting on `stdin`.
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 use fl_core::agent::{AgentRole, RegisterAgentArgs, reports_to};
 use fl_core::at::At;
+use fl_core::code_index::{CodeSearchKind, load_token_gain, scan_code_index};
 use fl_core::ferrostate::create_state_checkpoint;
 use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter};
 use fl_core::ids::{Kind, ProjectId, WorkflowRunId};
@@ -28,9 +30,10 @@ use std::time::Duration;
 
 use crate::cmd::agent::now_at;
 use crate::cmd::state::{
-    DEFAULT_RENDER_MAX_BYTES, StateEnv, collect_search_hits, effective_search_limit, parse_concern,
-    parse_memory_basis, parse_memory_category, parse_merge_mode, render_state_markdown,
-    resolve_state_in_store, search_result_json,
+    DEFAULT_RENDER_MAX_BYTES, StateEnv, code_search_response_json, collect_search_hits,
+    effective_code_limit, effective_search_limit, parse_concern, parse_memory_basis,
+    parse_memory_category, parse_merge_mode, render_state_markdown, resolve_state_in_store,
+    search_and_record, search_result_json,
 };
 use crate::cmd::wire::{
     execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
@@ -272,6 +275,136 @@ fn parse_checkpoint_args(args: &Value) -> Result<CheckpointArgs, String> {
         summary,
         by,
     })
+}
+
+/// Maximum number of subqueries in one `fl_batch_search` call.
+const MAX_BATCH_QUERIES: usize = 20;
+
+fn parse_code_kind(raw: &str) -> Result<CodeSearchKind, String> {
+    CodeSearchKind::from_wire(raw).ok_or_else(|| {
+        format!(
+            "unknown code search kind `{raw}`; expected one of: {}",
+            CodeSearchKind::wire_values()
+        )
+    })
+}
+
+/// Parse an optional code-search `limit` value: per-kind default when
+/// absent/`null`, capped at 1000, explicit `0` preserved. Wrong-typed,
+/// negative, or fractional values are errors (never silently defaulted).
+fn parse_code_limit_value(value: Option<&Value>, kind: CodeSearchKind) -> Result<usize, String> {
+    match value {
+        None | Some(Value::Null) => Ok(effective_code_limit(None, kind)),
+        Some(v) => {
+            if let Some(u) = v.as_u64() {
+                let n = usize::try_from(u)
+                    .map_err(|_| "argument `limit` must be a non-negative integer".to_string())?;
+                Ok(effective_code_limit(Some(n), kind))
+            } else if let Some(f) = v.as_f64() {
+                if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= usize::MAX as f64 {
+                    Ok(effective_code_limit(Some(f as usize), kind))
+                } else {
+                    Err("argument `limit` must be a non-negative integer".to_string())
+                }
+            } else {
+                Err("argument `limit` must be a number".to_string())
+            }
+        }
+    }
+}
+
+fn code_root(env: &StateEnv<'_>, args: &Value) -> Result<PathBuf, String> {
+    match opt_str(args, "root")? {
+        Some(raw) => Ok(PathBuf::from(raw)),
+        None => Ok(env.cwd.to_path_buf()),
+    }
+}
+
+/// One validated code subquery: `(kind, query, limit)`.
+struct CodeQuery {
+    kind: CodeSearchKind,
+    query: String,
+    limit: usize,
+}
+
+fn parse_code_query(args: &Value, kind: CodeSearchKind) -> Result<CodeQuery, String> {
+    if !args.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    let query = req_str(args, "q")?.to_string();
+    if query.trim().is_empty() {
+        return Err("argument `q` must not be blank".to_string());
+    }
+    let limit = parse_code_limit_value(args.get("limit"), kind)?;
+    Ok(CodeQuery { kind, query, limit })
+}
+
+fn parse_batch_queries(args: &Value) -> Result<Vec<CodeQuery>, String> {
+    if !args.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    let Some(items) = args.get("queries").and_then(Value::as_array) else {
+        return Err("missing required array argument `queries`".to_string());
+    };
+    if items.len() > MAX_BATCH_QUERIES {
+        return Err(format!(
+            "`queries` holds {} entries; at most {MAX_BATCH_QUERIES} are allowed",
+            items.len()
+        ));
+    }
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in items {
+        if !item.is_object() {
+            return Err("each `queries` entry must be a JSON object".to_string());
+        }
+        let kind = parse_code_kind(req_str(item, "kind")?)?;
+        parsed.push(parse_code_query(item, kind)?);
+    }
+    Ok(parsed)
+}
+
+fn run_code_tool(env: &StateEnv<'_>, kind: CodeSearchKind, args: &Value) -> Result<String, String> {
+    let parsed = parse_code_query(args, kind)?;
+    let root = code_root(env, args)?;
+    let index = scan_code_index(&root);
+    let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+    let (outcome, token_gain) =
+        search_and_record(&store, &index, parsed.kind, &parsed.query, parsed.limit)?;
+    let out = code_search_response_json(
+        &parsed.query,
+        parsed.kind,
+        &outcome.symbols,
+        outcome.tokens_saved_this_query,
+        token_gain,
+    );
+    Ok(serde_json::to_string_pretty(&out).unwrap())
+}
+
+fn run_batch_search_tool(env: &StateEnv<'_>, args: &Value) -> Result<String, String> {
+    // Validate every subquery (and the shared root) before scanning or
+    // recording anything, so a bad entry cannot half-record a batch.
+    let queries = parse_batch_queries(args)?;
+    let root = code_root(env, args)?;
+    let index = scan_code_index(&root);
+    let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+    let mut token_gain = load_token_gain(&store);
+    let mut results = Vec::with_capacity(queries.len());
+    for sub in &queries {
+        let (outcome, updated) =
+            search_and_record(&store, &index, sub.kind, &sub.query, sub.limit)?;
+        token_gain = updated;
+        results.push(json!({
+            "query": sub.query,
+            "kind": sub.kind.as_wire(),
+            "symbols": outcome.symbols,
+            "tokens_saved_this_query": outcome.tokens_saved_this_query,
+        }));
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "results": results,
+        "token_gain": token_gain,
+    }))
+    .unwrap())
 }
 
 fn memory_search_json(
@@ -1193,6 +1326,10 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
             }))
             .unwrap())
         }
+        "fl_code_def" => run_code_tool(env, CodeSearchKind::Def, args),
+        "fl_code_search" => run_code_tool(env, CodeSearchKind::Search, args),
+        "fl_code_outline" => run_code_tool(env, CodeSearchKind::Outline, args),
+        "fl_batch_search" => run_batch_search_tool(env, args),
         other => Err(format!("unknown tool `{other}`")),
     }
 }
@@ -1500,6 +1637,68 @@ fn tool_definitions() -> Value {
                     "by": { "type": "string" }
                 }
             }
+        },
+        {
+            "name": "fl_code_def",
+            "description": "Find symbol definitions by exact/prefix name in the structural code index. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                    "q": { "type": "string" },
+                    "limit": { "type": "number" },
+                    "root": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "fl_code_search",
+            "description": "Ranked text search over declarations and lines in the structural code index. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                    "q": { "type": "string" },
+                    "limit": { "type": "number" },
+                    "root": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "fl_code_outline",
+            "description": "List the symbols declared in a file (q is a file path or suffix) in source order. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                    "q": { "type": "string" },
+                    "limit": { "type": "number" },
+                    "root": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "fl_batch_search",
+            "description": "Run up to 20 code subqueries ({kind: def|search|outline, q, limit?}) over one scan. Returns {results: [{query, kind, symbols, tokens_saved_this_query}], token_gain}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["queries"],
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["kind", "q"],
+                            "properties": {
+                                "kind": { "type": "string" },
+                                "q": { "type": "string" },
+                                "limit": { "type": "number" }
+                            }
+                        }
+                    },
+                    "root": { "type": "string" }
+                }
+            }
         }
     ])
 }
@@ -1650,5 +1849,76 @@ mod tests {
                 .any(|d| d["name"] == "fl_state_checkpoint"),
             "fl_state_checkpoint missing from tool_definitions"
         );
+    }
+
+    #[test]
+    fn code_tools_are_advertised_and_args_validate() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 24, "{names:?}");
+        for tool in [
+            "fl_code_def",
+            "fl_code_search",
+            "fl_code_outline",
+            "fl_batch_search",
+        ] {
+            assert!(names.contains(&tool), "{tool} missing: {names:?}");
+        }
+
+        let parsed = parse_code_query(&json!({ "q": "widget" }), CodeSearchKind::Def).unwrap();
+        assert_eq!(parsed.limit, 50);
+        let parsed =
+            parse_code_query(&json!({ "q": "src/lib.rs" }), CodeSearchKind::Outline).unwrap();
+        assert_eq!(parsed.limit, 500);
+        let parsed =
+            parse_code_query(&json!({ "q": "x", "limit": 5000 }), CodeSearchKind::Search).unwrap();
+        assert_eq!(parsed.limit, 1000);
+        let parsed =
+            parse_code_query(&json!({ "q": "x", "limit": 0 }), CodeSearchKind::Search).unwrap();
+        assert_eq!(parsed.limit, 0);
+
+        for bad in [
+            json!({}),
+            json!({ "q": 3 }),
+            json!({ "q": "  " }),
+            json!({ "q": "x", "limit": "5" }),
+            json!({ "q": "x", "limit": -1 }),
+            json!({ "q": "x", "limit": 1.5 }),
+            json!(["nope"]),
+        ] {
+            assert!(
+                parse_code_query(&bad, CodeSearchKind::Def).is_err(),
+                "{bad}"
+            );
+        }
+
+        let batch = parse_batch_queries(
+            &json!({ "queries": [{ "kind": "def", "q": "a" }, { "kind": "outline", "q": "b.rs", "limit": 5 }] }),
+        )
+        .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].kind, CodeSearchKind::Def);
+        assert_eq!(batch[1].limit, 5);
+        for bad in [
+            json!({}),
+            json!({ "queries": "x" }),
+            json!({ "queries": [{ "kind": "bogus", "q": "a" }] }),
+            json!({ "queries": [{ "kind": 1, "q": "a" }] }),
+            json!({ "queries": [{ "kind": "def", "q": "" }] }),
+            json!({ "queries": [{ "kind": "def" }] }),
+            json!({ "queries": ["nope"] }),
+        ] {
+            assert!(parse_batch_queries(&bad).is_err(), "{bad}");
+        }
+        let too_many = json!({
+            "queries": (0..21).map(|_| json!({ "kind": "def", "q": "a" })).collect::<Vec<_>>()
+        });
+        assert!(parse_batch_queries(&too_many).is_err());
+        assert!(parse_code_kind("bogus").is_err());
     }
 }

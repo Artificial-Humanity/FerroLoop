@@ -1820,4 +1820,63 @@ mod tests {
             "HubStoreGuard must serialize RedbStore holders"
         );
     }
+
+    #[test]
+    fn code_search_route_records_token_gain_and_stats_exposes_it() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let mut code = String::from("pub fn hub_widget() {}\n");
+        for i in 0..40 {
+            code.push_str(&format!("// filler line {i} padding the file out\n"));
+        }
+        fs::write(tmp.path().join("src/widget.rs"), code).unwrap();
+
+        let hit = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/code-search?q=hub_widget&kind=def")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(hit.status, 200);
+        let hit_json = hit.json_value().unwrap();
+        assert_eq!(hit_json["query"], "hub_widget", "{hit_json}");
+        assert_eq!(hit_json["kind"], "def", "{hit_json}");
+        assert_eq!(hit_json["symbols"][0]["name"], "hub_widget", "{hit_json}");
+        assert!(
+            hit_json["tokens_saved_this_query"].as_u64().unwrap() > 0,
+            "{hit_json}"
+        );
+        assert_eq!(hit_json["token_gain"]["queries_count"], 1, "{hit_json}");
+
+        let stats = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/stats")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(stats.status, 200);
+        let stats_json = stats.json_value().unwrap();
+        assert_eq!(stats_json["token_gain"]["queries_count"], 1, "{stats_json}");
+        assert!(
+            stats_json["token_gain"]["files_indexed"].as_u64().unwrap() >= 1,
+            "{stats_json}"
+        );
+
+        let bad_kind = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/code-search?q=hub_widget&kind=bogus")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(bad_kind.status, 400);
+
+        let blank = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/code-search?kind=def")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(blank.status, 200);
+        let blank_json = blank.json_value().unwrap();
+        assert_eq!(blank_json["symbols"].as_array().unwrap().len(), 0);
+        assert_eq!(blank_json["tokens_saved_this_query"], 0);
+        assert_eq!(blank_json["token_gain"]["queries_count"], 1, "{blank_json}");
+    }
 }

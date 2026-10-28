@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use fl_core::agent::{AgentRecord, AgentStatus, AreaRecord, reports_to};
+use fl_core::code_index::{
+    CodeIndex, CodeSearchKind, CodeSearchOutcome, CodeSymbolHit, TokenGainSummary, load_token_gain,
+    record_token_gain_index, record_token_gain_query, scan_code_index,
+};
 use fl_core::ferrostate::{
     WorkspaceImportReport, apply_workspace_import, create_state_checkpoint, resolve_workspace_root,
     scan_workspace_import,
@@ -87,6 +91,87 @@ pub fn format_search_hit(hit: &StateSearchHit) -> String {
         hit.estimated_tokens,
         snippet.trim()
     )
+}
+
+/// Default hit count for `code-def`/`code-search` surfaces (CLI, MCP, Hub).
+pub const DEFAULT_CODE_LIMIT: usize = 50;
+
+/// Default hit count for `code-outline` surfaces (CLI, MCP, Hub).
+pub const DEFAULT_CODE_OUTLINE_LIMIT: usize = 500;
+
+/// Maximum hit count for code-index surfaces (CLI, MCP, Hub).
+pub const MAX_CODE_LIMIT: usize = 1000;
+
+/// The default code-search limit for `kind` when the caller omits one.
+pub fn default_code_limit(kind: CodeSearchKind) -> usize {
+    match kind {
+        CodeSearchKind::Outline => DEFAULT_CODE_OUTLINE_LIMIT,
+        CodeSearchKind::Def | CodeSearchKind::Search => DEFAULT_CODE_LIMIT,
+    }
+}
+
+/// Resolve a caller-supplied code-search limit: per-kind default, capped
+/// at 1000. An explicit `0` stays `0` (no symbols, no token-gain record).
+pub fn effective_code_limit(limit: Option<usize>, kind: CodeSearchKind) -> usize {
+    limit
+        .unwrap_or_else(|| default_code_limit(kind))
+        .min(MAX_CODE_LIMIT)
+}
+
+/// Wire shape shared by the CLI, MCP, and Hub code-search surfaces
+/// (`CodeSearchResponse` in `ui/src/types/api.ts`).
+pub fn code_search_response_json(
+    query: &str,
+    kind: CodeSearchKind,
+    symbols: &[CodeSymbolHit],
+    tokens_saved_this_query: u64,
+    token_gain: TokenGainSummary,
+) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "kind": kind.as_wire(),
+        "symbols": symbols,
+        "tokens_saved_this_query": tokens_saved_this_query,
+        "token_gain": token_gain,
+    })
+}
+
+/// One-line plain-text rendering of a code hit for the CLI:
+/// `path:start kind name — signature`.
+pub fn format_code_hit(hit: &CodeSymbolHit) -> String {
+    format!(
+        "{}:{} {} {} — {}",
+        hit.path, hit.start_line, hit.kind, hit.name, hit.signature
+    )
+}
+
+/// Run one search over an already-scanned `index` and record its token
+/// gain in `store`, returning the outcome and the updated ledger.
+///
+/// A `limit` of `0` returns no symbols and records nothing; the returned
+/// ledger is then the currently stored one ([`load_token_gain`]). Ledger
+/// write failures (malformed/sensitive ledger, store errors) propagate.
+pub fn search_and_record(
+    store: &impl StateStore,
+    index: &CodeIndex,
+    kind: CodeSearchKind,
+    query: &str,
+    limit: usize,
+) -> Result<(CodeSearchOutcome, TokenGainSummary), String> {
+    let outcome = index.search(kind, query, limit);
+    if limit == 0 {
+        return Ok((outcome, load_token_gain(store)));
+    }
+    let token_gain = record_token_gain_query(
+        store,
+        outcome.tokens_saved_this_query,
+        outcome.files_indexed,
+        outcome.symbols_indexed,
+        now_at(),
+        "fl",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((outcome, token_gain))
 }
 
 #[derive(Subcommand)]
@@ -216,6 +301,61 @@ pub enum StateCmd {
         workspace_root: Option<PathBuf>,
         #[arg(long, default_value = "fl")]
         by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scan a workspace tree into the structural code index and record its size.
+    Index {
+        /// Workspace root to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find symbol definitions by exact/prefix name in the code index.
+    #[command(name = "code-def")]
+    CodeDef {
+        /// Symbol name to look up.
+        symbol: String,
+        /// Workspace root to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ranked text search over declarations and lines in the code index.
+    #[command(name = "code-search")]
+    CodeSearch {
+        /// Search query text.
+        query: String,
+        /// Workspace root to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the symbols declared in a file (matched by path) in source order.
+    #[command(name = "code-outline")]
+    CodeOutline {
+        /// File path (or path suffix) to outline.
+        file_path: String,
+        /// Workspace root to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register the `ferrostate` MCP server (`fl state mcp`) across vendor CLI configs.
+    Install {
+        /// Write to user-home vendor configurations instead of the project files.
+        #[arg(long)]
+        user: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1277,7 +1417,101 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             }
             Ok(())
         }
+        StateCmd::Index { root, json } => {
+            let root = root.unwrap_or_else(|| env.cwd.to_path_buf());
+            let index = scan_code_index(&root);
+            let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+            let token_gain = record_token_gain_index(
+                &store,
+                index.files_indexed(),
+                index.symbols_indexed(),
+                now_at(),
+                "fl",
+            )
+            .map_err(|e| e.to_string())?;
+            if json {
+                let out = serde_json::json!({
+                    "files_indexed": index.files_indexed(),
+                    "symbols_indexed": index.symbols_indexed(),
+                    "token_gain": token_gain,
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                println!(
+                    "indexed files={} symbols={}",
+                    index.files_indexed(),
+                    index.symbols_indexed()
+                );
+            }
+            Ok(())
+        }
+        StateCmd::CodeDef {
+            symbol,
+            root,
+            limit,
+            json,
+        } => run_code_query(env, CodeSearchKind::Def, &symbol, root, limit, json),
+        StateCmd::CodeSearch {
+            query,
+            root,
+            limit,
+            json,
+        } => run_code_query(env, CodeSearchKind::Search, &query, root, limit, json),
+        StateCmd::CodeOutline {
+            file_path,
+            root,
+            limit,
+            json,
+        } => run_code_query(env, CodeSearchKind::Outline, &file_path, root, limit, json),
+        StateCmd::Install { user, json } => crate::cmd::vault::run_mcp_install(
+            env.cwd,
+            user,
+            json,
+            "ferrostate",
+            &["state", "mcp"],
+            "`ferrostate` MCP server",
+        )
+        .map(|_| ())
+        .map_err(|(_, msg)| msg),
     }
+}
+
+/// Shared body of `code-def`/`code-search`/`code-outline`: scan `root`
+/// (default `env.cwd`) once, search, record the query's token gain, and
+/// print the shared `CodeSearchResponse` JSON or one line per hit.
+fn run_code_query(
+    env: &StateEnv<'_>,
+    kind: CodeSearchKind,
+    query: &str,
+    root: Option<PathBuf>,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<(), String> {
+    if query.trim().is_empty() {
+        return Err("query must not be blank".to_string());
+    }
+    let root = root.unwrap_or_else(|| env.cwd.to_path_buf());
+    let effective_limit = effective_code_limit(limit, kind);
+    let index = scan_code_index(&root);
+    let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+    let (outcome, token_gain) = search_and_record(&store, &index, kind, query, effective_limit)?;
+    if json {
+        let out = code_search_response_json(
+            query,
+            kind,
+            &outcome.symbols,
+            outcome.tokens_saved_this_query,
+            token_gain,
+        );
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else if outcome.symbols.is_empty() {
+        println!("no hits for `{query}`");
+    } else {
+        for hit in &outcome.symbols {
+            println!("{}", format_code_hit(hit));
+        }
+    }
+    Ok(())
 }
 
 fn print_state_entry<S: Handles>(store: &S, entry: &StateEntry, json: bool) {

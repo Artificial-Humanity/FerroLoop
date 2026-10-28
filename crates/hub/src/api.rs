@@ -10,6 +10,9 @@ use fl_core::agent::AgentStatus;
 use fl_core::arch::{
     ArchitectureModel, DEFAULT_ARCH_MANIFEST_PATH, export_likec4_dsl, validate_architecture_model,
 };
+use fl_core::code_index::{
+    CodeSearchKind, load_token_gain, record_token_gain_query, scan_code_index,
+};
 use fl_core::ferrostate::{
     apply_workspace_import, create_state_checkpoint_from_probe, derive_import_slug, probe_git_repo,
     resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
@@ -409,6 +412,7 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         }
         ("GET", "/api/v1/state") => handle_get_state(&store, &authority, req),
         ("GET", "/api/v1/state/search") => handle_get_state_search(&store, &authority, req),
+        ("GET", "/api/v1/state/code-search") => handle_get_code_search(state, &store, req),
         ("POST", "/api/v1/state") => handle_post_state(&store, &authority, req),
         ("POST", "/api/v1/state/checkpoint") => {
             handle_post_state_checkpoint(state, &store, &authority, req)
@@ -1135,6 +1139,83 @@ fn handle_get_state_search(
     )
 }
 
+fn handle_get_code_search(state: &HubState, store: &RedbStore, req: &HttpRequest) -> HttpResponse {
+    let kind = match req.query.get("kind") {
+        Some(raw) if !raw.trim().is_empty() => match CodeSearchKind::from_wire(raw.trim()) {
+            Some(k) => k,
+            None => {
+                return HttpResponse::json(
+                    400,
+                    json!({
+                        "error": format!(
+                            "unknown code search kind `{raw}`; expected one of: {}",
+                            CodeSearchKind::wire_values()
+                        )
+                    }),
+                );
+            }
+        },
+        _ => CodeSearchKind::Search,
+    };
+    // Per-kind defaults mirror the CLI/MCP surfaces: 50 def/search,
+    // 500 outline, capped at 1000; an explicit 0 stays 0.
+    let default_limit = match kind {
+        CodeSearchKind::Outline => 500,
+        CodeSearchKind::Def | CodeSearchKind::Search => 50,
+    };
+    let limit = match req.query.get("limit") {
+        Some(raw) if !raw.trim().is_empty() => match raw.trim().parse::<usize>() {
+            Ok(n) => n.min(1000),
+            Err(_) => {
+                return HttpResponse::json(
+                    400,
+                    json!({ "error": format!("invalid `limit` `{raw}`; expected a non-negative integer") }),
+                );
+            }
+        },
+        _ => default_limit,
+    };
+
+    let query = req.query.get("q").cloned().unwrap_or_default();
+    // Missing/blank `q`, and an explicit `limit` of 0, return no symbols
+    // and record nothing; `token_gain` is the stored ledger unchanged.
+    if query.trim().is_empty() || limit == 0 {
+        return HttpResponse::json(
+            200,
+            json!({
+                "query": query,
+                "kind": kind.as_wire(),
+                "symbols": [],
+                "tokens_saved_this_query": 0,
+                "token_gain": load_token_gain(store),
+            }),
+        );
+    }
+
+    let outcome = scan_code_index(&state.config.repo_root).search(kind, &query, limit);
+    let token_gain = match record_token_gain_query(
+        store,
+        outcome.tokens_saved_this_query,
+        outcome.files_indexed,
+        outcome.symbols_indexed,
+        stamp::now(),
+        "fl",
+    ) {
+        Ok(gain) => gain,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+    HttpResponse::json(
+        200,
+        json!({
+            "query": query,
+            "kind": kind.as_wire(),
+            "symbols": outcome.symbols,
+            "tokens_saved_this_query": outcome.tokens_saved_this_query,
+            "token_gain": token_gain,
+        }),
+    )
+}
+
 fn handle_post_state(
     store: &RedbStore,
     authority: &HubAuthority,
@@ -1565,6 +1646,7 @@ fn handle_get_stats(store: &RedbStore, _req: &HttpRequest) -> HttpResponse {
             "zero_cost_attempts": zero_cost_attempts,
             "by_adapter": by_adapter,
             "regret_audit": regret_audit,
+            "token_gain": load_token_gain(store),
         }),
     )
 }
