@@ -326,30 +326,13 @@ impl RouteTable {
         let mut shared_csrf: Option<String> = None;
         let mut shared_exe: Option<PathBuf> = None;
 
-        for entry in self.entries.values() {
-            if let VendorRoute::Agy {
-                ls_address,
-                csrf_token,
-                agentapi_exe,
-                ..
-            } = &entry.route
-            {
-                if shared_ls_addr.is_none() {
-                    shared_ls_addr = ls_address.clone();
-                }
-                if shared_csrf.is_none() {
-                    shared_csrf = csrf_token.clone();
-                }
-                if shared_exe.is_none() {
-                    shared_exe = agentapi_exe.clone();
-                }
-            }
-        }
-
-        if shared_ls_addr.is_none()
-            && let Ok(log_text) = fs::read_to_string(agy_dir.join("cli.log"))
-        {
+        // 1. Prefer live language-server HTTP port from cli.log so host reboots immediately
+        // override stale pre-reboot ports persisted in routes.json.
+        if let Ok(log_text) = fs::read_to_string(agy_dir.join("cli.log")) {
             for line in log_text.lines().rev() {
+                if line.contains("for HTTPS") {
+                    continue;
+                }
                 if let Some(idx) = line.find("Language server listening on random port at ") {
                     let rest = &line[idx + "Language server listening on random port at ".len()..];
                     let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -361,8 +344,9 @@ impl RouteTable {
             }
         }
 
+        // 2. Inspect live /proc/*/environ when host discovery is enabled.
         if check_proc
-            && (shared_csrf.is_none() || shared_ls_addr.is_none())
+            && (shared_csrf.is_none() || shared_ls_addr.is_none() || shared_exe.is_none())
             && let Ok(proc_dir) = fs::read_dir("/proc")
         {
             for entry in proc_dir.flatten() {
@@ -396,13 +380,41 @@ impl RouteTable {
                         }
                     }
                 }
-                if shared_csrf.is_some() && shared_ls_addr.is_some() {
+                if shared_csrf.is_some() && shared_ls_addr.is_some() && shared_exe.is_some() {
                     break;
                 }
             }
         }
 
-        // Backfill shared ls_address / csrf_token onto existing Agy routes if missing
+        // 3. Fall back to existing Agy entries ordered from newest updated_at to oldest.
+        let mut agy_entries: Vec<&RouteEntry> = self
+            .entries
+            .values()
+            .filter(|e| matches!(e.route, VendorRoute::Agy { .. }))
+            .collect();
+        agy_entries.sort_by_key(|e| std::cmp::Reverse(e.updated_at.unix_millis()));
+        for entry in agy_entries {
+            if let VendorRoute::Agy {
+                ls_address,
+                csrf_token,
+                agentapi_exe,
+                ..
+            } = &entry.route
+            {
+                if shared_ls_addr.is_none() {
+                    shared_ls_addr = ls_address.clone();
+                }
+                if shared_csrf.is_none() {
+                    shared_csrf = csrf_token.clone();
+                }
+                if shared_exe.is_none() {
+                    shared_exe = agentapi_exe.clone();
+                }
+            }
+        }
+
+        // 4. Propagate the live/newest shared ls_address and csrf_token across all Agy routes
+        // so pre-reboot entries do not retain stale language-server ports or CSRF tokens.
         for entry in self.entries.values_mut() {
             if let VendorRoute::Agy {
                 ls_address,
@@ -411,10 +423,10 @@ impl RouteTable {
                 ..
             } = &mut entry.route
             {
-                if ls_address.is_none() {
+                if shared_ls_addr.is_some() {
                     *ls_address = shared_ls_addr.clone();
                 }
-                if csrf_token.is_none() {
+                if shared_csrf.is_some() {
                     *csrf_token = shared_csrf.clone();
                 }
                 if agentapi_exe.is_none() {
@@ -1440,6 +1452,57 @@ mod tests {
         assert!(matches!(
             primary.get("sonya").map(|e| &e.route),
             Some(VendorRoute::Claude { session_id, .. }) if session_id == "sess-newer"
+        ));
+    }
+
+    #[test]
+    fn discover_agy_routes_overwrites_stale_pre_reboot_ls_address_and_csrf_token() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agy_dir = home.join(".gemini").join("antigravity-cli");
+        fs::create_dir_all(agy_dir.join("brain")).unwrap();
+        fs::write(
+            agy_dir.join("cli.log"),
+            "I1028 17:44:33.477185 107 server.go:766] Language server listening on random port at 45143 for HTTPS (gRPC)\n\
+             I1028 17:44:33.477218 107 server.go:774] Language server listening on random port at 41547 for HTTP\n",
+        )
+        .unwrap();
+
+        let mut table = RouteTable::default();
+        // Pre-reboot stale entry for kayla (alphabetically earlier or older timestamp)
+        table.upsert(
+            "kayla",
+            VendorRoute::Agy {
+                conversation_id: "conv-kayla".into(),
+                ls_pid: None,
+                ls_address: Some("localhost:36313".into()),
+                csrf_token: Some("stale-csrf-pre-reboot".into()),
+                agentapi_exe: None,
+            },
+            At::parse("2026-10-28T15:00:00.000Z").unwrap(),
+        );
+        // Post-reboot refreshed entry for ferris with newer updated_at and new csrf_token
+        table.upsert(
+            "ferris",
+            VendorRoute::Agy {
+                conversation_id: "conv-ferris".into(),
+                ls_pid: None,
+                ls_address: Some("localhost:41547".into()),
+                csrf_token: Some("fresh-csrf-post-reboot".into()),
+                agentapi_exe: None,
+            },
+            At::parse("2026-10-28T17:50:00.000Z").unwrap(),
+        );
+
+        table.discover_routes(Some(home), At::parse("2026-10-28T17:55:00.000Z").unwrap());
+
+        assert!(matches!(
+            table.get("kayla").map(|e| &e.route),
+            Some(VendorRoute::Agy {
+                ls_address: Some(addr),
+                csrf_token: Some(csrf),
+                ..
+            }) if addr == "127.0.0.1:41547" && csrf == "fresh-csrf-post-reboot"
         ));
     }
 }
