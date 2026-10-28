@@ -70,6 +70,19 @@ function formatCount(value: number): string {
   return value.toLocaleString("en-US");
 }
 
+function replaceEntry(list: StateEntry[], saved: StateEntry): StateEntry[] {
+  const rest = list.filter(
+    (entry) =>
+      entry.id !== saved.id &&
+      !(
+        entry.scope === saved.scope &&
+        entry.concern === saved.concern &&
+        entry.slug === saved.slug
+      ),
+  );
+  return [...rest, saved];
+}
+
 function parseLines(raw: string): string[] {
   return raw
     .split("\n")
@@ -128,6 +141,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
 
   const [subView, setSubView] = useState<"explorer" | "code">("explorer");
   const [internalEntries, setInternalEntries] = useState<StateEntry[]>([]);
+  const [unfilteredEntries, setUnfilteredEntries] = useState<StateEntry[]>(() => entries ?? []);
   const [hits, setHits] = useState<StateSearchHit[] | null>(null);
   const [internalLoading, setInternalLoading] = useState(false);
   const [internalError, setInternalError] = useState<string | null>(null);
@@ -187,6 +201,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
   useEffect(() => {
     if (entries) {
       noteScopes(entries);
+      setUnfilteredEntries(entries);
     }
   }, [entries, noteScopes]);
 
@@ -215,6 +230,9 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
           setHits(null);
           if (entries === undefined) {
             setInternalEntries(res.entries ?? []);
+          }
+          if (!scope && !concern) {
+            setUnfilteredEntries(res.entries ?? []);
           }
           noteScopes(res.entries ?? []);
         }
@@ -272,12 +290,12 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
   }, [hits, effectiveEntries, scopeFilter, concernFilter]);
 
   const memoryCount = useMemo(
-    () => effectiveEntries.filter((entry) => entry.concern === "memory").length,
-    [effectiveEntries],
+    () => unfilteredEntries.filter((entry) => entry.concern === "memory").length,
+    [unfilteredEntries],
   );
   const handoffCount = useMemo(
-    () => effectiveEntries.filter((entry) => entry.concern === "handoff").length,
-    [effectiveEntries],
+    () => unfilteredEntries.filter((entry) => entry.concern === "handoff").length,
+    [unfilteredEntries],
   );
 
   const scopeOptions = useMemo(() => {
@@ -316,7 +334,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             category: formCategory,
             basis: formBasis,
             pinned: formPinned,
-            sensitive: formSensitive,
+            ...(formSensitive ? { sensitive: true } : {}),
             summary,
             body: formBody,
           }
@@ -324,7 +342,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             scope: formScope,
             slug,
             concern: "handoff",
-            sensitive: formSensitive,
+            ...(formSensitive ? { sensitive: true } : {}),
             summary,
             payload: {
               handoff: {
@@ -350,11 +368,11 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
       }
       setHits(null);
       setQuery("");
+      if (saved) {
+        setUnfilteredEntries((prev) => replaceEntry(prev, saved));
+      }
       if (entries === undefined && saved) {
-        setInternalEntries((prev) => {
-          const rest = prev.filter((entry) => entry.id !== saved.id);
-          return [...rest, saved];
-        });
+        setInternalEntries((prev) => replaceEntry(prev, saved));
         noteScopes([saved]);
       } else if (entries === undefined) {
         void runExplorer("", scopeFilter, concernFilter);
@@ -388,6 +406,16 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
         res = await apiClient.createStateCheckpoint({});
       } else {
         throw new Error("No FerroState API client is configured.");
+      }
+      if (res?.entry) {
+        const saved = res.entry;
+        setUnfilteredEntries((prev) => replaceEntry(prev, saved));
+        if (entries === undefined) {
+          setInternalEntries((prev) => replaceEntry(prev, saved));
+          noteScopes([saved]);
+        } else if (!onCreateCheckpoint) {
+          onRefresh?.();
+        }
       }
       setActionMessage(
         res

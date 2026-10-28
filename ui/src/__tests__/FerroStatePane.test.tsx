@@ -116,8 +116,26 @@ function makeStateClient() {
       });
     }
     if (url.startsWith("/api/v1/state/checkpoint") && method === "POST") {
+      const checkpointEntry: StateEntry = {
+        ...HANDOFF_ENTRY,
+        id: "urn:fl:state:checkpoint",
+        slug: "checkpoint-latest",
+        payload: {
+          handoff: {
+            summary: "Checkpoint snapshot",
+            shipped: ["Checkpoint shipped item"],
+            in_flight: [],
+            blockers: [],
+            next_steps: ["Resume from checkpoint"],
+            notes: null,
+          },
+        },
+        head_revision: "rev-checkpoint",
+        updated_at: "2026-10-28T01:00:00Z",
+      };
+      entries = [...entries.filter((e) => e.id !== checkpointEntry.id), checkpointEntry];
       return jsonResponse({
-        entry: HANDOFF_ENTRY,
+        entry: checkpointEntry,
         branch: "refs/heads/fl/state",
         head_sha: "abc1234deadbeef",
         dirty_files: 2,
@@ -131,7 +149,13 @@ function makeStateClient() {
       });
     }
     if (url.startsWith("/api/v1/state") && method === "GET") {
-      return jsonResponse({ entries });
+      const params = new URLSearchParams(url.split("?")[1] ?? "");
+      const scope = params.get("scope");
+      const concern = params.get("concern");
+      const filtered = entries
+        .filter((e) => !scope || e.scope === scope)
+        .filter((e) => !concern || e.concern === concern);
+      return jsonResponse({ entries: filtered });
     }
     if (url.startsWith("/api/v1/state") && method === "POST") {
       const entry: StateEntry = {
@@ -256,6 +280,8 @@ describe("FerroStatePane", () => {
         summary: "Agent loops need hard token ceilings",
         pinned: true,
       });
+      // Unchecked Sensitive must omit the key so the hub inherits, not declassifies.
+      expect(post?.body).not.toHaveProperty("sensitive");
     });
     expect(await screen.findByTestId("state-entry-token-ceilings")).toHaveTextContent(
       "Agent loops need hard token ceilings",
@@ -294,6 +320,10 @@ describe("FerroStatePane", () => {
       ).toBe(true);
     });
     expect(await screen.findByRole("status")).toHaveTextContent(/refs\/heads\/fl\/state/);
+    const checkpoint = await screen.findByTestId("state-entry-checkpoint-latest");
+    expect(checkpoint).toHaveTextContent("Checkpoint snapshot");
+    expect(checkpoint).toHaveTextContent("Resume from checkpoint");
+    expect(screen.getByTestId("handoff-count")).toHaveTextContent("2");
   });
 
   it("runs the owner-only workspace import after inline confirmation", async () => {
@@ -344,5 +374,89 @@ describe("FerroStatePane", () => {
     expect(screen.getByTestId("token-gain-saved")).toHaveTextContent(/21,340/);
     expect(screen.getByTestId("token-gain-queries")).toHaveTextContent("7");
     expect(screen.getByTestId("token-gain-symbols")).toHaveTextContent(/1,934/);
+  });
+
+  it("creates a handoff entry with the payload shape and shows its lists", async () => {
+    const { client, calls } = makeStateClient();
+
+    render(<FerroStatePane authority={OWNER} apiClient={client} />);
+    await screen.findByTestId("state-entry-pr-review-policy");
+
+    fireEvent.change(screen.getByLabelText(/Entry Concern/i), {
+      target: { value: "handoff" },
+    });
+    fireEvent.change(screen.getByLabelText(/Entry Slug/i), {
+      target: { value: "phase-2-handoff" },
+    });
+    fireEvent.change(screen.getByLabelText(/^Summary$/i), {
+      target: { value: "Phase 2 handoff ready" },
+    });
+    fireEvent.change(screen.getByLabelText(/^Shipped$/i), {
+      target: { value: "State store shipped\nBM25 recall shipped" },
+    });
+    fireEvent.change(screen.getByLabelText(/^In Flight$/i), {
+      target: { value: "FerroStatePane polish" },
+    });
+    fireEvent.change(screen.getByLabelText(/^Blockers$/i), {
+      target: { value: "Waiting on review" },
+    });
+    fireEvent.change(screen.getByLabelText(/^Next Steps$/i), {
+      target: { value: "Land the pane\nRun smoke checks" },
+    });
+    fireEvent.change(screen.getByLabelText(/^Notes$/i), {
+      target: { value: "Felix owns the pane." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Save Entry/i }));
+
+    await waitFor(() => {
+      const post = calls.find(
+        (c) => c.url === "/api/v1/state" && c.method === "POST",
+      );
+      expect(post?.body).toMatchObject({
+        slug: "phase-2-handoff",
+        concern: "handoff",
+        summary: "Phase 2 handoff ready",
+      });
+      expect(post?.body).not.toHaveProperty("sensitive");
+      expect((post?.body as { payload?: unknown } | undefined)?.payload).toEqual({
+        handoff: {
+          summary: "Phase 2 handoff ready",
+          shipped: ["State store shipped", "BM25 recall shipped"],
+          in_flight: ["FerroStatePane polish"],
+          blockers: ["Waiting on review"],
+          next_steps: ["Land the pane", "Run smoke checks"],
+          notes: "Felix owns the pane.",
+        },
+      });
+    });
+    const card = await screen.findByTestId("state-entry-phase-2-handoff");
+    expect(card).toHaveTextContent("Phase 2 handoff ready");
+    expect(card).toHaveTextContent("State store shipped");
+    expect(card).toHaveTextContent("BM25 recall shipped");
+    expect(card).toHaveTextContent("FerroStatePane polish");
+    expect(card).toHaveTextContent("Waiting on review");
+    expect(card).toHaveTextContent("Land the pane");
+    expect(card).toHaveTextContent("Run smoke checks");
+    expect(card).toHaveTextContent("Felix owns the pane.");
+  });
+
+  it("keeps header counts at unfiltered totals when a concern filter is applied", async () => {
+    const { client } = makeStateClient();
+
+    render(<FerroStatePane authority={PEER} apiClient={client} />);
+    await screen.findByTestId("state-entry-pr-review-policy");
+    expect(screen.getByTestId("memory-count")).toHaveTextContent("1");
+    expect(screen.getByTestId("handoff-count")).toHaveTextContent("1");
+
+    fireEvent.change(screen.getByLabelText(/Concern Filter/i), {
+      target: { value: "memory" },
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByTestId("state-entry-ferrostate-phase-2")).toBeNull();
+    });
+    expect(screen.getByTestId("state-entry-pr-review-policy")).toBeInTheDocument();
+    expect(screen.getByTestId("memory-count")).toHaveTextContent("1");
+    expect(screen.getByTestId("handoff-count")).toHaveTextContent("1");
   });
 });
