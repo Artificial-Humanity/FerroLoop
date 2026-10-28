@@ -44,6 +44,7 @@ export interface AppProps {
 export interface OptimisticPrompt {
   content: string;
   sentAt: number;
+  agentKey?: string;
 }
 
 export const OPTIMISTIC_PROMPT_TTL_MS = 5_000;
@@ -57,8 +58,17 @@ export function preserveOptimisticTurn(
   turns: TranscriptTurn[],
   optimistic: OptimisticPrompt | null,
   nowMs: number = Date.now(),
+  currentAgentKey?: string | null,
 ): TranscriptTurn[] {
   if (!optimistic || !optimistic.content.trim()) {
+    return turns;
+  }
+  if (
+    currentAgentKey != null &&
+    optimistic.agentKey != null &&
+    optimistic.agentKey.trim().toLowerCase() !==
+      currentAgentKey.trim().toLowerCase()
+  ) {
     return turns;
   }
   if (nowMs - optimistic.sentAt > OPTIMISTIC_PROMPT_TTL_MS) {
@@ -68,11 +78,7 @@ export function preserveOptimisticTurn(
     if ((turn.role || "").toLowerCase() !== "user" || !turn.content) {
       return false;
     }
-    return (
-      turn.content === optimistic.content ||
-      turn.content.includes(optimistic.content) ||
-      optimistic.content.includes(turn.content)
-    );
+    return turn.content.trim() === optimistic.content.trim();
   });
   if (onDisk) {
     return turns;
@@ -227,6 +233,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [sessionContextUsage, setSessionContextUsage] =
     useState<SessionContextUsage | null>(null);
   const optimisticPromptRef = useRef<OptimisticPrompt | null>(null);
+  const refreshInFlightRef = useRef<boolean>(false);
   const [lastSeenAssistantTurnIndex, setLastSeenAssistantTurnIndex] =
     useState<Record<string, number>>(readInitialLastSeenAssistantTurn);
   const [backgroundTranscripts, setBackgroundTranscripts] = useState<
@@ -263,9 +270,14 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   /** Apply a disk transcript without wiping a just-sent optimistic turn. */
   const applyTranscriptTurns = useCallback((turns: TranscriptTurn[]) => {
-    const merged = preserveOptimisticTurn(turns, optimisticPromptRef.current);
+    const merged = preserveOptimisticTurn(
+      turns,
+      optimisticPromptRef.current,
+      Date.now(),
+      selectedAgentNameRef.current,
+    );
     if (merged === turns && optimisticPromptRef.current) {
-      // Found on disk or aged out; the guard has served its purpose.
+      // Found on disk, aged out, or agent switched; guard has served its purpose.
       optimisticPromptRef.current = null;
     }
     setTranscriptTurns(merged);
@@ -335,11 +347,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         if (backgroundStampRef.current[persona] === stamp) {
           continue;
         }
-        backgroundStampRef.current[persona] = stamp;
         const bgRes = await apiClient
           .getSessionTranscript(session.id)
           .catch(() => null);
         if (bgRes?.turns) {
+          backgroundStampRef.current[persona] = stamp;
           recordTranscript(persona, bgRes.turns);
         }
       }
@@ -349,6 +361,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   const refreshSessionsAndTranscript = useCallback(
     async (sessionOverride?: string | null) => {
+      if (refreshInFlightRef.current) {
+        return;
+      }
+      refreshInFlightRef.current = true;
       try {
         const sessRes = await apiClient.getSessions().catch(() => null);
         const list = sessRes?.sessions ?? [];
@@ -384,6 +400,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         }
       } catch {
         // Ignore
+      } finally {
+        refreshInFlightRef.current = false;
       }
     },
     [apiClient, selectedSessionId, selectedAgentName, applyTranscriptTurns, scanBackgroundTranscripts, recordTranscript],
@@ -673,7 +691,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     return () => {
       cancelled = true;
     };
-  }, [apiClient, activeSession?.id, selectedAgent, authority?.tier, applyTranscriptTurns, recordTranscript]);
+  }, [apiClient, activeSession?.id, selectedAgent?.name_key, authority?.tier, applyTranscriptTurns, recordTranscript]);
 
   // The hub emits no WebSocket event for raw transcript.jsonl appends, so
   // poll the active transcript while the chat is on screen.
@@ -770,7 +788,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     }
     if (!res.queued && res.status !== "queued") {
       const content = res.effective_body || payload.prompt;
-      optimisticPromptRef.current = { content, sentAt: Date.now() };
+      optimisticPromptRef.current = {
+        content,
+        sentAt: Date.now(),
+        agentKey: selectedAgentName.trim().toLowerCase(),
+      };
       setTranscriptTurns((prev) => [
         ...prev,
         {

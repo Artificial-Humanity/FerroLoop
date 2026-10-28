@@ -22,7 +22,8 @@ export function summarizeWireContent(
   const label = wireSender ? `Wire · ${wireSender}` : "Wire";
   const subject = raw.match(/^\s*Subject:\s*(.+)$/m)?.[1]?.trim();
   if (subject) {
-    return `${label} — ${subject} (${lineLabel})`;
+    const preview = subject.length > 80 ? `${subject.slice(0, 80)}…` : subject;
+    return `${label} — ${preview} (${lineLabel})`;
   }
   const firstLine = lines.find((line) => line.trim().length > 0)?.trim() ?? "";
   if (!firstLine) {

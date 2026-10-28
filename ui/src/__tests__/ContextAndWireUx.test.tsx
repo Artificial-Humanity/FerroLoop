@@ -18,6 +18,7 @@ import {
   hasNewTurnActivity,
 } from "../components/ChatPane";
 import { ThinkingBlock } from "../components/ThinkingBlock";
+import { summarizeWireContent } from "../components/TurnCard";
 import type { TranscriptTurn } from "../types/api";
 
 function turn(partial: Partial<TranscriptTurn> & { index: number }): TranscriptTurn {
@@ -95,6 +96,13 @@ describe("collapsible Wire cards", () => {
     const toggle = screen.getByTestId("wire-output-toggle");
     expect(toggle).toHaveTextContent("Backend PR is up for the state endpoints.");
     expect(screen.queryByText(/Details follow here/)).toBeNull();
+  });
+
+  it("truncates a >80-char Subject with an ellipsis", () => {
+    const subject = "x".repeat(100);
+    const summary = summarizeWireContent(`Subject: ${subject}\nBody line.`, "jarvis");
+    expect(summary).toBe(`Wire · jarvis — ${"x".repeat(80)}… (2 lines)`);
+    expect(summary).not.toContain(subject);
   });
 });
 
@@ -445,6 +453,39 @@ describe("optimistic prompt preservation", () => {
       preserveOptimisticTurn(diskTurns, { content: "Ship it", sentAt: 1_000 }, 9_000),
     ).toBe(diskTurns);
     expect(preserveOptimisticTurn(diskTurns, null, 3_000)).toBe(diskTurns);
+  });
+
+  it("does not append the optimistic turn after switching agents", () => {
+    expect(
+      preserveOptimisticTurn(
+        diskTurns,
+        { content: "Ship it", sentAt: 1_000, agentKey: "ferris" },
+        3_000,
+        "jarvis",
+      ),
+    ).toBe(diskTurns);
+    const merged = preserveOptimisticTurn(
+      diskTurns,
+      { content: "Ship it", sentAt: 1_000, agentKey: "ferris" },
+      3_000,
+      "ferris",
+    );
+    expect(merged).toHaveLength(2);
+    expect(merged[1]).toMatchObject({ role: "user", content: "Ship it" });
+  });
+
+  it("does not treat a short prompt as on-disk via substring match", () => {
+    const withOlderUserTurn = [
+      turn({ index: 6, role: "user", content: "ok sounds good" }),
+      ...diskTurns,
+    ];
+    const merged = preserveOptimisticTurn(
+      withOlderUserTurn,
+      { content: "ok", sentAt: 1_000 },
+      3_000,
+    );
+    expect(merged).toHaveLength(3);
+    expect(merged[2]).toMatchObject({ role: "user", content: "ok" });
   });
 
   it("polls faster while the session is busy", () => {
