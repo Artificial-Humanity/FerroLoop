@@ -25,7 +25,7 @@ use fl_core::pr_policy::{
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    UpsertStateArgs,
+    StateSearchHit, UpsertStateArgs, search_state_entries,
 };
 use fl_core::store::{
     AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, WorkflowStore,
@@ -404,6 +404,7 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
             handle_post_workflow_run_start(state, &store, &authority, req)
         }
         ("GET", "/api/v1/state") => handle_get_state(&store, &authority, req),
+        ("GET", "/api/v1/state/search") => handle_get_state_search(&store, &authority, req),
         ("POST", "/api/v1/state") => handle_post_state(&store, &authority, req),
         ("GET", "/api/v1/stats") => handle_get_stats(&store, req),
         ("GET", "/api/v1/architecture") => handle_get_architecture(state, req),
@@ -1017,6 +1018,107 @@ fn handle_get_state(
         .collect();
 
     HttpResponse::json(200, json!({ "entries": filtered }))
+}
+
+fn is_internal_hub_entry(entry: &StateEntry) -> bool {
+    entry.scope == StateScope::Workspace
+        && (entry.slug.starts_with("hub-pairing-") || entry.slug.starts_with("hub-session-"))
+}
+
+fn redact_search_hit(mut hit: StateSearchHit, is_owner: bool) -> StateSearchHit {
+    if !is_owner && hit.entry.sensitive {
+        hit.entry = redact_sensitive_entry(hit.entry);
+        hit.snippet = "[REDACTED]".to_string();
+    }
+    hit
+}
+
+/// Rank hub search candidates: internal hub entries excluded, full ranked
+/// count returned before `limit` truncation, sensitive hits redacted for
+/// non-owners (entry and snippet).
+fn search_state_for_hub(
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+    is_owner: bool,
+) -> (Vec<StateSearchHit>, usize) {
+    let candidates: Vec<StateEntry> = entries
+        .iter()
+        .filter(|e| !is_internal_hub_entry(e))
+        .cloned()
+        .collect();
+    let all = search_state_entries(&candidates, query, scope, concern, usize::MAX);
+    let total_hits = all.len();
+    let hits: Vec<StateSearchHit> = all
+        .into_iter()
+        .take(limit)
+        .map(|hit| redact_search_hit(hit, is_owner))
+        .collect();
+    (hits, total_hits)
+}
+
+fn handle_get_state_search(
+    store: &RedbStore,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let scope = match req.query.get("scope") {
+        Some(s) if !s.trim().is_empty() => match StateScope::from_wire(s.trim()) {
+            Ok(sc) => Some(sc),
+            Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
+        },
+        _ => None,
+    };
+    let concern = match req.query.get("concern") {
+        Some(c) if !c.trim().is_empty() => match StateConcern::from_wire(c.trim()) {
+            Some(cn) => Some(cn),
+            None => {
+                return HttpResponse::json(
+                    400,
+                    json!({ "error": format!("unknown state concern `{c}`") }),
+                );
+            }
+        },
+        _ => None,
+    };
+    let limit = match req.query.get("limit") {
+        Some(s) if !s.trim().is_empty() => match s.trim().parse::<usize>() {
+            Ok(n) => n.min(100),
+            Err(_) => {
+                return HttpResponse::json(
+                    400,
+                    json!({ "error": format!("invalid `limit` `{s}`; expected a non-negative integer") }),
+                );
+            }
+        },
+        _ => 10,
+    };
+
+    let query = req.query.get("q").cloned().unwrap_or_default();
+    if query.trim().is_empty() {
+        return HttpResponse::json(200, json!({ "query": query, "hits": [], "total_hits": 0 }));
+    }
+
+    let entries = match store.list_state(scope.as_ref(), concern) {
+        Ok(list) => list,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    let (hits, total_hits) = search_state_for_hub(
+        &entries,
+        &query,
+        scope.as_ref(),
+        concern,
+        limit,
+        authority.is_owner(),
+    );
+
+    HttpResponse::json(
+        200,
+        json!({ "query": query, "hits": hits, "total_hits": total_hits }),
+    )
 }
 
 fn handle_post_state(
@@ -2740,5 +2842,88 @@ fn handle_post_gate_bridge_webhook(
                 Err(e) => HttpResponse::json(502, json!({ "error": e.to_string(), "plan": plan })),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_core::at::At;
+    use fl_core::ids::{RevisionId, StateId, seq_iri};
+
+    fn memory_entry(n: u64, slug: &str, body: &str, sensitive: bool) -> StateEntry {
+        StateEntry {
+            id: StateId(seq_iri(n)),
+            scope: StateScope::Workspace,
+            concern: StateConcern::Memory,
+            slug: slug.to_string(),
+            sensitive,
+            ever_sensitive: sensitive,
+            payload: StatePayload::Memory(MemoryEntry {
+                category: MemoryCategory::Note,
+                basis: MemoryBasis::Inference,
+                lifecycle: MemoryLifecycle::Active,
+                superseded_by: None,
+                pinned: false,
+                summary: format!("{slug} summary"),
+                body: body.to_string(),
+            }),
+            head_revision: RevisionId(seq_iri(1000 + n)),
+            updated_at: At::from_unix_millis(1_000 + n),
+            by: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn hub_search_redacts_sensitive_snippet_for_non_owner_only() {
+        let secret = memory_entry(
+            1,
+            "secret-note",
+            "zephyr secretbodytoken zephyr zephyr",
+            true,
+        );
+        let public = memory_entry(2, "public-note", "zephyr public note", false);
+        let internal = memory_entry(3, "hub-session-abc123", "zephyr internal", false);
+        let entries = vec![public, internal, secret];
+
+        // Non-owner: sensitive entry and snippet redacted, internal excluded.
+        let (hits, total) = search_state_for_hub(&entries, "zephyr", None, None, 10, false);
+        assert_eq!(total, 2, "internal hub entry must be excluded: {hits:?}");
+        let secret_hit = hits
+            .iter()
+            .find(|h| h.entry.slug == "secret-note")
+            .expect("sensitive hit present but redacted");
+        assert_eq!(secret_hit.snippet, "[REDACTED]");
+        let serialized = serde_json::to_string(&secret_hit).unwrap();
+        assert!(!serialized.contains("secretbodytoken"), "{serialized}");
+        assert!(serialized.contains("[REDACTED]"), "{serialized}");
+        // Public hit is untouched for non-owners.
+        let public_hit = hits.iter().find(|h| h.entry.slug == "public-note").unwrap();
+        assert_ne!(public_hit.snippet, "[REDACTED]");
+
+        // Owner sees full sensitive hit.
+        let (owner_hits, owner_total) =
+            search_state_for_hub(&entries, "zephyr", None, None, 10, true);
+        assert_eq!(owner_total, 2);
+        let owner_secret = owner_hits
+            .iter()
+            .find(|h| h.entry.slug == "secret-note")
+            .unwrap();
+        assert_ne!(owner_secret.snippet, "[REDACTED]");
+        assert!(
+            serde_json::to_string(owner_secret)
+                .unwrap()
+                .contains("secretbodytoken")
+        );
+
+        // Limit 0 returns no hits but keeps the full ranked count.
+        let (none, total_zero) = search_state_for_hub(&entries, "zephyr", None, None, 0, true);
+        assert!(none.is_empty());
+        assert_eq!(total_zero, 2);
+
+        // Truncation keeps total before the cap.
+        let (one, total_one) = search_state_for_hub(&entries, "zephyr", None, None, 1, true);
+        assert_eq!(one.len(), 1);
+        assert_eq!(total_one, 2);
     }
 }

@@ -7,7 +7,7 @@ use fl_core::iri::Iri;
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    UpsertStateArgs, validate_slug,
+    StateSearchHit, UpsertStateArgs, search_state_entries, validate_slug,
 };
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
@@ -19,6 +19,70 @@ use crate::refs::Ref;
 
 /// Default byte ceiling for `fl state render` (24.4 KB, matching workspace index cap).
 pub const DEFAULT_RENDER_MAX_BYTES: usize = 24_400;
+
+/// Default hit count for state search surfaces (CLI, MCP, Hub).
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
+
+/// Maximum hit count for state search surfaces (CLI, MCP, Hub).
+pub const MAX_SEARCH_LIMIT: usize = 100;
+
+/// Resolve a caller-supplied search limit: default 10, capped at 100.
+pub fn effective_search_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_SEARCH_LIMIT).min(MAX_SEARCH_LIMIT)
+}
+
+/// Rank `entries` with the core BM25 searcher and truncate at the surface,
+/// returning the full ranked count before truncation as the second value.
+/// Stores are local, so fetching the full ranked list is cheap.
+pub fn collect_search_hits(
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+) -> (Vec<StateSearchHit>, usize) {
+    let all = search_state_entries(entries, query, scope, concern, usize::MAX);
+    let total_hits = all.len();
+    let hits: Vec<StateSearchHit> = all.into_iter().take(limit).collect();
+    (hits, total_hits)
+}
+
+/// Wire shape shared by the CLI, MCP, and Hub search surfaces.
+pub fn search_result_json(
+    query: &str,
+    hits: &[StateSearchHit],
+    total_hits: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "hits": hits,
+        "total_hits": total_hits,
+    })
+}
+
+/// One-line plain-text rendering of a search hit for the CLI.
+pub fn format_search_hit(hit: &StateSearchHit) -> String {
+    let snippet: String = hit
+        .snippet
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!(
+        "{}\t{}\t{}\t{}\ttokens={}\t{}",
+        hit.score_millis,
+        hit.entry.scope.as_wire(),
+        hit.entry.concern.as_wire(),
+        hit.entry.slug,
+        hit.estimated_tokens,
+        snippet.trim()
+    )
+}
 
 #[derive(Subcommand)]
 pub enum StateCmd {
@@ -47,6 +111,19 @@ pub enum StateCmd {
         concern: Option<String>,
         #[arg(long)]
         history: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search state entries with BM25 ranking.
+    Search {
+        /// Search query text.
+        query: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        concern: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -819,6 +896,44 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             }
             Ok(())
         }
+        StateCmd::Search {
+            query,
+            scope,
+            concern,
+            limit,
+            json,
+        } => {
+            let parsed_scope = scope
+                .as_deref()
+                .map(StateScope::from_wire)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let parsed_concern: Option<StateConcern> =
+                concern.as_deref().map(parse_concern).transpose()?;
+            let effective_limit = effective_search_limit(limit);
+            let store = env.open_for_scope(parsed_scope.as_ref())?;
+            let entries: Vec<StateEntry> = store
+                .list_state(parsed_scope.as_ref(), parsed_concern)
+                .map_err(|e| e.to_string())?;
+            let (hits, total_hits) = collect_search_hits(
+                &entries,
+                &query,
+                parsed_scope.as_ref(),
+                parsed_concern,
+                effective_limit,
+            );
+            if json {
+                let out = search_result_json(&query, &hits, total_hits);
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else if hits.is_empty() {
+                println!("no hits for `{query}`");
+            } else {
+                for hit in &hits {
+                    println!("{}", format_search_hit(hit));
+                }
+            }
+            Ok(())
+        }
         StateCmd::List {
             scope,
             concern,
@@ -1206,6 +1321,82 @@ mod tests {
         // Resolve by handle
         let found_handle = resolve_state_in_store(&store, "1", None, None).unwrap();
         assert_eq!(found_handle.id, e.id);
+    }
+
+    #[test]
+    fn search_surface_ranks_hits_and_reports_total_before_truncation() {
+        let store = MemStore::default();
+        let weak = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "weak-note".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "ranking mention".into(),
+                    body: "ranking appears once here".into(),
+                }),
+                at: now_at(),
+                by: "ferris".into(),
+            })
+            .unwrap();
+        let strong = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "strong-note".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "search design".into(),
+                    body: "bm25 ranking search ranking bm25 ranking".into(),
+                }),
+                at: now_at(),
+                by: "ferris".into(),
+            })
+            .unwrap();
+        // Weakest first: only the ranker can put `strong-note` on top.
+        let entries = vec![weak, strong];
+
+        let (hits, total) = collect_search_hits(&entries, "bm25 ranking", None, None, 1);
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.slug, "strong-note");
+        assert!(hits[0].score_millis > 0);
+        assert!(hits[0].estimated_tokens > 0);
+        assert!(!hits[0].snippet.is_empty());
+
+        let value = search_result_json("bm25 ranking", &hits, total);
+        assert_eq!(value["query"], "bm25 ranking");
+        assert_eq!(value["total_hits"], 2);
+        assert_eq!(value["hits"][0]["entry"]["slug"], "strong-note");
+        assert!(value["hits"][0]["score_millis"].is_number());
+        assert!(value["hits"][0]["snippet"].is_string());
+
+        // Limit 0 returns no hits but keeps the full ranked count.
+        let (none, total_zero) = collect_search_hits(&entries, "bm25 ranking", None, None, 0);
+        assert!(none.is_empty());
+        assert_eq!(total_zero, 2);
+
+        // Human line carries score, scope, concern, slug, tokens, snippet.
+        let line = format_search_hit(&hits[0]);
+        assert!(line.contains("workspace"), "{line}");
+        assert!(line.contains("memory"), "{line}");
+        assert!(line.contains("strong-note"), "{line}");
+        assert!(line.contains("tokens="), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+
+        assert_eq!(effective_search_limit(None), DEFAULT_SEARCH_LIMIT);
+        assert_eq!(effective_search_limit(Some(0)), 0);
+        assert_eq!(effective_search_limit(Some(250)), MAX_SEARCH_LIMIT);
+        assert!(parse_concern("bogus").is_err());
     }
 
     #[test]

@@ -27,8 +27,9 @@ use std::time::Duration;
 
 use crate::cmd::agent::now_at;
 use crate::cmd::state::{
-    DEFAULT_RENDER_MAX_BYTES, StateEnv, parse_concern, parse_memory_basis, parse_memory_category,
-    parse_merge_mode, render_state_markdown, resolve_state_in_store,
+    DEFAULT_RENDER_MAX_BYTES, StateEnv, collect_search_hits, effective_search_limit, parse_concern,
+    parse_memory_basis, parse_memory_category, parse_merge_mode, render_state_markdown,
+    resolve_state_in_store, search_result_json,
 };
 use crate::cmd::wire::{
     execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
@@ -189,6 +190,63 @@ fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing required string argument `{key}`"))
+}
+
+fn opt_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("argument `{key}` must be a string")),
+    }
+}
+
+fn parse_search_limit(args: &Value) -> Result<usize, String> {
+    match args.get("limit") {
+        None | Some(Value::Null) => Ok(effective_search_limit(None)),
+        Some(v) => {
+            if let Some(u) = v.as_u64() {
+                let n = usize::try_from(u)
+                    .map_err(|_| "argument `limit` must be a non-negative integer".to_string())?;
+                Ok(effective_search_limit(Some(n)))
+            } else if let Some(f) = v.as_f64() {
+                if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= usize::MAX as f64 {
+                    Ok(effective_search_limit(Some(f as usize)))
+                } else {
+                    Err("argument `limit` must be a non-negative integer".to_string())
+                }
+            } else {
+                Err("argument `limit` must be a number".to_string())
+            }
+        }
+    }
+}
+
+/// Parsed `fl_memory_search` arguments: `(query, scope, concern, limit)`.
+fn parse_search_args(
+    args: &Value,
+) -> Result<(String, Option<StateScope>, Option<StateConcern>, usize), String> {
+    let query = req_str(args, "query")?.to_string();
+    let scope = match opt_str(args, "scope")? {
+        Some(s) => Some(StateScope::from_wire(&s).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let concern = match opt_str(args, "concern")? {
+        Some(s) => Some(parse_concern(&s)?),
+        None => None,
+    };
+    let limit = parse_search_limit(args)?;
+    Ok((query, scope, concern, limit))
+}
+
+fn memory_search_json(
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+) -> String {
+    let (hits, total_hits) = collect_search_hits(entries, query, scope, concern, limit);
+    serde_json::to_string_pretty(&search_result_json(query, &hits, total_hits)).unwrap()
 }
 
 fn open_workflow_store(
@@ -481,6 +539,20 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 })
                 .collect();
             Ok(serde_json::to_string_pretty(&entries).unwrap())
+        }
+        "fl_memory_search" => {
+            let (query, parsed_scope, parsed_concern, limit) = parse_search_args(args)?;
+            let store = env.open_for_scope(parsed_scope.as_ref())?;
+            let entries: Vec<StateEntry> = store
+                .list_state(parsed_scope.as_ref(), parsed_concern)
+                .map_err(|e| e.to_string())?;
+            Ok(memory_search_json(
+                &entries,
+                &query,
+                parsed_scope.as_ref(),
+                parsed_concern,
+                limit,
+            ))
         }
         "state_set_memory" => {
             let scope =
@@ -1143,6 +1215,20 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "fl_memory_search",
+            "description": "Search state entries with BM25 ranking. Returns {query, hits, total_hits} where total_hits is the full ranked count before limit truncation.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "scope": { "type": "string" },
+                    "concern": { "type": "string" },
+                    "limit": { "type": "number" }
+                }
+            }
+        },
+        {
             "name": "state_set_memory",
             "description": "Create, update, retire, or supersede a durable Memory entry.",
             "inputSchema": {
@@ -1350,4 +1436,114 @@ fn tool_definitions() -> Value {
             }
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_core::MemStore;
+
+    fn seeded_entries() -> Vec<StateEntry> {
+        let store = MemStore::default();
+        let weak = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "weak-note".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "ranking mention".into(),
+                    body: "ranking appears once here".into(),
+                }),
+                at: now_at(),
+                by: "ferris".into(),
+            })
+            .unwrap();
+        let strong = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "strong-note".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "search design".into(),
+                    body: "bm25 ranking search ranking bm25 ranking".into(),
+                }),
+                at: now_at(),
+                by: "ferris".into(),
+            })
+            .unwrap();
+        vec![weak, strong]
+    }
+
+    #[test]
+    fn fl_memory_search_returns_ranked_json_shape() {
+        let entries = seeded_entries();
+        let args = json!({ "query": "bm25 ranking", "limit": 1 });
+        let (query, scope, concern, limit) = parse_search_args(&args).unwrap();
+        let text = memory_search_json(&entries, &query, scope.as_ref(), concern, limit);
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["query"], "bm25 ranking");
+        assert_eq!(value["total_hits"], 2);
+        assert_eq!(value["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(value["hits"][0]["entry"]["slug"], "strong-note");
+        assert!(value["hits"][0]["score_millis"].as_u64().unwrap() > 0);
+
+        // Tool is advertised.
+        let defs = tool_definitions();
+        assert!(
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["name"] == "fl_memory_search"),
+            "fl_memory_search missing from tool_definitions"
+        );
+    }
+
+    #[test]
+    fn fl_memory_search_rejects_invalid_types_and_values() {
+        assert!(parse_search_args(&json!({})).is_err(), "missing query");
+        assert!(
+            parse_search_args(&json!({ "query": "x", "scope": 3 })).is_err(),
+            "non-string scope"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "scope": "bogus:1" })).is_err(),
+            "invalid scope value"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "concern": true })).is_err(),
+            "non-string concern"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "concern": "bogus" })).is_err(),
+            "invalid concern value"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "limit": "5" })).is_err(),
+            "string limit"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "limit": -1 })).is_err(),
+            "negative limit"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "limit": 1.5 })).is_err(),
+            "fractional limit"
+        );
+        let (_, _, _, default_limit) = parse_search_args(&json!({ "query": "x" })).unwrap();
+        assert_eq!(default_limit, 10);
+        let (_, _, _, capped) = parse_search_args(&json!({ "query": "x", "limit": 500 })).unwrap();
+        assert_eq!(capped, 100);
+        let (_, _, _, zero) = parse_search_args(&json!({ "query": "x", "limit": 0 })).unwrap();
+        assert_eq!(zero, 0);
+    }
 }

@@ -549,6 +549,110 @@ mod tests {
     }
 
     #[test]
+    fn state_search_route_ranks_redacts_and_validates() {
+        use fl_core::state::{
+            MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, SensitivityPatch,
+            StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            for (slug, body, sensitive) in [
+                ("weak-note", "zephyr appears once", false),
+                ("secret-note", "zephyr secretbodytoken zephyr zephyr", true),
+            ] {
+                store
+                    .upsert_state(UpsertStateArgs {
+                        scope: StateScope::Workspace,
+                        slug: slug.into(),
+                        sensitivity: if sensitive {
+                            SensitivityPatch::SetSensitive
+                        } else {
+                            SensitivityPatch::Inherit
+                        },
+                        payload: StatePayload::Memory(MemoryEntry {
+                            category: MemoryCategory::Note,
+                            basis: MemoryBasis::Inference,
+                            lifecycle: MemoryLifecycle::Active,
+                            superseded_by: None,
+                            pinned: false,
+                            summary: format!("{slug} summary"),
+                            body: body.into(),
+                        }),
+                        at: stamp::now(),
+                        by: "test".into(),
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Peer: ranked shape, sensitive snippet/entry redacted.
+        let peer_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/search?q=zephyr")
+                .with_header("Authorization", "Bearer peer-tok-secret"),
+        );
+        assert_eq!(peer_resp.status, 200);
+        let peer_json = peer_resp.json_value().unwrap();
+        assert_eq!(peer_json["query"], "zephyr");
+        assert_eq!(peer_json["total_hits"], 2);
+        assert_eq!(peer_json["hits"].as_array().unwrap().len(), 2);
+        let peer_str = String::from_utf8_lossy(&peer_resp.body);
+        assert!(!peer_str.contains("secretbodytoken"), "{peer_str}");
+        assert!(peer_str.contains("[REDACTED]"), "{peer_str}");
+
+        // Owner sees the full sensitive hit.
+        let owner_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/search?q=zephyr")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(owner_resp.status, 200);
+        assert!(
+            String::from_utf8_lossy(&owner_resp.body).contains("secretbodytoken"),
+            "owner must see full sensitive hit"
+        );
+
+        // limit=0 keeps total_hits; missing q is an empty 200, not a 500.
+        let zero_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/search?q=zephyr&limit=0")
+                .with_header("Authorization", "Bearer peer-tok-secret"),
+        );
+        assert_eq!(zero_resp.status, 200);
+        let zero_json = zero_resp.json_value().unwrap();
+        assert_eq!(zero_json["total_hits"], 2);
+        assert_eq!(zero_json["hits"].as_array().unwrap().len(), 0);
+
+        let blank_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/search")
+                .with_header("Authorization", "Bearer peer-tok-secret"),
+        );
+        assert_eq!(blank_resp.status, 200);
+        assert_eq!(blank_resp.json_value().unwrap()["total_hits"], 0);
+
+        // Bad scope/concern/limit are 400s.
+        for target in [
+            "/api/v1/state/search?q=zephyr&scope=bogus%3A1",
+            "/api/v1/state/search?q=zephyr&concern=bogus",
+            "/api/v1/state/search?q=zephyr&limit=abc",
+            "/api/v1/state/search?q=zephyr&limit=-1",
+        ] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("GET", target)
+                    .with_header("Authorization", "Bearer peer-tok-secret"),
+            );
+            assert_eq!(resp.status, 400, "{target}");
+            assert!(resp.json_value().unwrap()["error"].is_string(), "{target}");
+        }
+    }
+
+    #[test]
     fn static_ferrodeck_serving_spa_fallback_and_traversal_rejection() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
