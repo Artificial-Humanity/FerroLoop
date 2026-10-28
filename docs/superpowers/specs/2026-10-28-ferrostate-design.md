@@ -111,15 +111,16 @@ A checkpoint is how a session ends so the next one can resume without rereading 
 
 XERJ answered "what does this file declare?" without the file's full token cost. Phase 2 absorbs that job and XERJ is retired: no XERJ binary, config, or output files are read or required.
 
-### 5.1 Index entries
+### 5.1 Live structural code scan (`crates/core/src/code_index.rs`)
 
-* `fl state code-index` (§6.1) walks a root (default: repository root), skipping `.git/`, `target/`, and non-UTF-8 files. Each indexed file becomes one `Runtime` entry at scope `project:<root-slug>` (or `--scope`), slug `code-<path-slug>-<sha256(path)[:8]>` (path-slug: relative path ASCII-lowercased, non-`[a-z0-9]` runs folded to `-`, truncated to pass `validate_slug`), `merge_mode = last_writer`, value `{ "path": "crates/core/src/state.rs", "language": "rust", "symbols": [{ "kind": "fn", "name": "search_state_entries", "line": 640, "signature": "pub fn search_state_entries(...)" }], "full_tokens": n, "outline_tokens": n }`.
-* Extraction is line-oriented, no parser crate: Rust contributes `fn`/`struct`/`enum`/`trait`/`impl`/`mod` declaration lines (never bodies); Markdown contributes `heading` symbols; other UTF-8 files get a path-only stub. Rebuild is idempotent upsert at the deterministic slug; entries for deleted files are left in place (pruning is out of scope).
-* Index entries are `Runtime`, so §2 search already covers them (serialized JSON is the weight-1 body). Code recall is `fl state search --concern runtime`; no separate code search exists.
+* `scan_code_index(root)` walks a workspace tree (default: current directory or repository root), skipping `.git/`, `target/`, `node_modules/`, `dist/`, `.next/`, files larger than `1 MiB` (`MAX_CODE_FILE_BYTES`), and non-UTF-8 files, indexing `.rs`, `.ts`, `.tsx`, `.js`, `.py`, `.toml`, and `.md` files in deterministic relative-path order.
+* Extraction is line-oriented with no external parser crate: declarations (functions, types, traits, modules, headings, and TOML sections) become `CodeSymbolHit` items (`name`, `kind`, `path`, `start_line`, `end_line`, `signature`, `snippet`, `estimated_file_tokens`, `snippet_tokens`, `tokens_saved`), with raw line matches as the fallback tier for `CodeSearchKind::Search`.
+* Three query kinds (`CodeSearchKind`: `def` | `search` | `outline`) run directly against `CodeIndex::search(kind, q, limit)`.
 
-### 5.2 Token-savings ledger
+### 5.2 Token-savings ledger (`ferrostate-token-gain`)
 
-* Each `code-index` run appends one record per file to a `Runtime` entry at the same scope, slug `token-savings-ledger`, `merge_mode = append`: `{ "path": "...", "at": "<At>", "full_tokens": n, "outline_tokens": n, "saved_tokens": n }`, where `full_tokens = estimate_tokens(file_text)`, `outline_tokens = estimate_tokens(serialized_index_value)`, `saved_tokens = full_tokens.saturating_sub(outline_tokens)`. The ledger measures *avoided* tokens with the one shared estimator, so §2 budgets and §5 savings never disagree. Hub exposure: §6.3.
+* Cumulative savings are persisted in a single workspace `Runtime` entry at `(workspace, runtime, ferrostate-token-gain)` (`TOKEN_GAIN_SLUG`, `merge_mode = last_writer`) holding `TokenGainSummary`: `{ "queries_count": n, "tokens_saved": n, "files_indexed": n, "symbols_indexed": n }`.
+* For each query, `tokens_saved_this_query` is computed per distinct file as `max(0, file_tokens - sum(snippet_tokens of returned hits in that file))`, summed across files so multiple hits in the same file never double-count that file's tokens. `record_token_gain_query` increments `queries_count` and adds `tokens_saved_this_query`; `record_token_gain_index` updates `files_indexed` and `symbols_indexed`. Hub exposure: §6.3.
 
 ---
 
@@ -129,23 +130,28 @@ XERJ answered "what does this file declare?" without the file's full token cost.
 
 Existing subcommands are unchanged. Phase 2 adds:
 
-* `fl state search <query> [--scope <scope>] [--concern <concern>] [--limit <n>=20] [--budget-tokens <n>] [--json]` — `list_state` → `search_state_entries` → §2.5 prefix rule when budgeted. `--json`: `{ "hits": [<StateSearchHit>, ...] }`; text: one `<slug>  <score_millis>  <snippet>` line per hit.
+* `fl state search <query> [--scope <scope>] [--concern <concern>] [--limit <n>=10] [--json]` — `list_state` → `search_state_entries` (default limit 10, capped at 100). `--json`: `{ "query": ..., "hits": [<StateSearchHit>, ...], "total_hits": n }`; text: one tab-separated `<score_millis>\t<scope>\t<concern>\t<slug>\ttokens=<n>\t<snippet>` line per hit.
 * `fl state import-workspace [--workspace-root <path>] [--by <author>=fl] [--json]` — §3; the root is the explicit `--workspace-root`, else the first ancestor of the cwd holding `.agents/memory/` or `Notes/`. The scan is grouped by scope and each scope is written through the multi-store routing (`open_for_scope`). `--json` prints the full §3 report including `skipped`; text prints counts and scopes plus any skipped lines.
 * `fl state checkpoint [--scope <scope>] [--slug <slug>] [--summary <text>] [--by <author>=fl] [--json]` — §4: probes the git repository at the cwd and records it as a `Handoff` checkpoint. The default scope is the bound project scope for the cwd when configured, else `workspace`. `--json` prints the §4 report `{ "entry": <StateEntry>, "branch": ..., "head_sha": ..., "dirty_files": n }`; text prints one concise line naming scope/slug/branch/head/dirty. There is no checkpoint show command.
-* `fl state code-index [--root <path>] [--scope <scope>] [--by <author>=fl] [--json]` — §5; `--json`: `{ "indexed": n, "skipped": n, "full_tokens": n, "outline_tokens": n, "saved_tokens": n }`.
+* `fl state index [--root <path>] [--json]` — scans the workspace tree and records `files_indexed`/`symbols_indexed` in `ferrostate-token-gain`.
+* `fl state code-def <symbol> [--root <path>] [--limit <n>=50] [--json]`, `fl state code-search <query> [--root <path>] [--limit <n>=50] [--json]`, and `fl state code-outline <file_path> [--root <path>] [--limit <n>=500] [--json]` — §5 structural code queries; `--json`: `{ "query": ..., "kind": "def"|"search"|"outline", "symbols": [<CodeSymbolHit>, ...], "tokens_saved_this_query": n, "token_gain": <TokenGainSummary> }`.
+* `fl state install [--user] [--json]` — registers the `ferrostate` MCP server (`fl state mcp`) across vendor CLI configurations.
 
 ### 6.2 MCP tools (`fl state mcp`, `crates/cli/src/cmd/state_mcp.rs`)
 
-Tools join the existing stdio JSON-RPC 2.0 server (results keep the single JSON text block convention). Filesystem work (`import`, `code-index` rebuild) stays CLI-only; MCP callers recall the built index via search.
+Tools join the existing stdio JSON-RPC 2.0 server (results keep the single JSON text block convention).
 
 * `fl_memory_search` — `{ "query": string, "scope"?: string, "concern"?: "memory"|"handoff"|"runtime", "limit"?: number }` → `{ "query": ..., "hits": [<StateSearchHit>, ...], "total_hits": n }`.
 * `fl_state_checkpoint` — `{ "scope"?: string, "slug"?: string, "summary"?: string, "by"?: string = "fl" }` → the §4 report `{ "entry": <StateEntry>, "branch": ..., "head_sha": ..., "dirty_files": n }` as pretty JSON. The repository is the server's cwd; the default scope matches the CLI (bound project scope for the cwd when configured, else `workspace`). Wrong argument types or an invalid scope/slug are `isError` results. There is no checkpoint get tool; use `state_get`.
+* `fl_code_def`, `fl_code_search`, `fl_code_outline` — `{ "q": string, "root"?: string, "limit"?: number }` → `{ "query": ..., "kind": "def"|"search"|"outline", "symbols": [<CodeSymbolHit>, ...], "tokens_saved_this_query": n, "token_gain": <TokenGainSummary> }`.
+* `fl_batch_search` — `{ "queries": [{ "kind": "def"|"search"|"outline", "q": string, "limit"?: number }, ...], "root"?: string }` (up to 20 subqueries) → `{ "results": [...], "token_gain": <TokenGainSummary> }`.
 
 ### 6.3 Hub REST (`crates/hub/src/api.rs`)
 
-* `GET /api/v1/state/search?q=<query>[&scope=<scope>][&concern=<concern>][&limit=<n>][&budget_tokens=<n>]` → `200 { "hits": [<StateSearchHit>, ...] }`. `q` required; bad `scope`/`concern` → `400 { "error": ... }`, as in `handle_get_state`.
+* `GET /api/v1/state/search?q=<query>[&scope=<scope>][&concern=<concern>][&limit=<n>]` → `200 { "query": ..., "hits": [<StateSearchHit>, ...], "total_hits": n }`. Bad `scope`/`concern`/`limit` → `400 { "error": ... }`, as in `handle_get_state`.
+* `GET /api/v1/state/code-search?q=<query>[&kind=def|search|outline][&limit=<n>]` → `200 { "query": ..., "kind": ..., "symbols": [<CodeSymbolHit>, ...], "tokens_saved_this_query": n, "token_gain": <TokenGainSummary> }`.
 * `POST /api/v1/state/checkpoint`, body empty or `{ "scope"?: string, "slug"?: string, "summary"?: string, "by"?: string }` (non-object body or wrong-typed fields → `400`) → `200` with exactly the §4 report `{ "entry": <StateEntry>, "branch": ..., "head_sha": ..., "dirty_files": n }`. The repository is the Hub's configured repo root (git errors → `500`); the default scope is `project:<git-top-level basename slug>` when derivable, else `workspace`; `by` defaults to the caller's actor name. There is no `GET` checkpoint route; use `GET /api/v1/state`.
-* `GET /api/v1/stats` gains one additive field from all `token-savings-ledger` entries (§5.2), existing fields unchanged: `{ ..., "token_gain": { "full_tokens": n, "outline_tokens": n, "saved_tokens": n, "records": n } }` (saturating sums; present and all-zero with no ledger). Existing `GET`/`POST /api/v1/state` are unchanged.
+* `GET /api/v1/stats` gains one additive field from `ferrostate-token-gain` (§5.2), existing fields unchanged: `{ ..., "token_gain": { "queries_count": n, "tokens_saved": n, "files_indexed": n, "symbols_indexed": n } }` (present and all-zero when no ledger entry exists). Existing `GET`/`POST /api/v1/state` are unchanged.
 * `POST /api/v1/state/import-workspace`, **owner-only** (non-owner → `403`), body empty or `{ "workspace_root"?: string, "by"?: string }` (non-object body or wrong-typed fields → `400`) → `200 { "imported_memories": n, "imported_handoffs": n, "scopes": ["<wire scope>", ...] }` exactly (no `skipped` field). The root is the body's `workspace_root`, else resolved from the Hub's configured repo root; `by` defaults to the caller's actor name. All entries go to the Hub store (§3).
 
 ---

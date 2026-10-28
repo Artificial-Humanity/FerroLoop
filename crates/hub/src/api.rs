@@ -202,6 +202,7 @@ fn status_reason(status: u16) -> &'static str {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        413 => "Payload Too Large",
         422 => "Unprocessable Entity",
         500 => "Internal Server Error",
         _ => "OK",
@@ -422,6 +423,8 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         }
         ("GET", "/api/v1/stats") => handle_get_stats(&store, req),
         ("GET", "/api/v1/architecture") => handle_get_architecture(state, req),
+        ("GET" | "HEAD", "/api/v1/artifacts/preview") => handle_get_artifact_preview(state, req),
+        ("GET", "/api/v1/artifacts/list") => handle_get_artifacts_list(state, &store, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
         ("POST", "/api/v1/gate/secrets") => handle_post_gate_secret(state, &authority, req),
         ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
@@ -1716,6 +1719,386 @@ fn attachments_dir(state: &HubState) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("/tmp"))
         .join("attachments")
+}
+
+const MAX_ARTIFACT_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
+
+fn percent_encode_query_value(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    for b in input.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn classify_artifact_kind(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("md" | "markdown" | "mdx") => "markdown",
+        Some("mmd" | "mermaid") => "mermaid",
+        Some("svg") => "svg",
+        Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico") => "image",
+        Some("pdf") => "pdf",
+        Some(
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "toml" | "json" | "jsonl"
+            | "yaml" | "yml" | "css" | "html" | "htm" | "sh" | "bash" | "zsh" | "sql" | "c" | "cc"
+            | "cpp" | "h" | "hpp" | "go" | "java" | "kt" | "swift" | "txt" | "log" | "c4" | "xml"
+            | "csv" | "lock",
+        ) => "code",
+        _ => "binary",
+    }
+}
+
+fn is_forbidden_artifact_path(path: &Path) -> bool {
+    for comp in path.components() {
+        if let std::path::Component::Normal(os) = comp {
+            let seg = os.to_string_lossy().to_ascii_lowercase();
+            if seg == ".git"
+                || seg == "secrets"
+                || seg == ".env"
+                || seg.starts_with(".env.")
+                || seg == "vault.age"
+                || seg == "vault.json"
+                || seg == "vault.key"
+            {
+                return true;
+            }
+        }
+    }
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    normalized.contains("/.fl/gate/vault")
+        || normalized.ends_with("/.fl/gate")
+        || normalized.contains("/.git/")
+        || normalized.contains("/secrets/")
+}
+
+fn allowed_artifact_roots(state: &HubState) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(state.config.repo_root.clone());
+    candidates.push(resolve_workspace_root(&state.config.repo_root));
+    candidates.push(attachments_dir(state));
+
+    if let Ok(worktrees) = list_git_worktrees(&state.config.repo_root) {
+        for wt in worktrees {
+            candidates.push(PathBuf::from(wt.path));
+        }
+    }
+
+    let home_dir = state
+        .config
+        .home_override
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    if let Some(home) = home_dir {
+        candidates.push(home.join(".gemini/antigravity-cli/brain"));
+        candidates.push(home.join(".local/share/fl/attachments"));
+        if state.config.home_override.is_none() {
+            candidates.push(home.join("Projects/Artificial-Humanity"));
+        }
+    }
+
+    let mut canonical_roots = Vec::new();
+    for root in candidates {
+        if let Ok(canon) = fs::canonicalize(&root)
+            && !canonical_roots.contains(&canon)
+        {
+            canonical_roots.push(canon);
+        }
+    }
+    canonical_roots
+}
+
+fn resolve_artifact_candidate_path(
+    state: &HubState,
+    raw_query_path: &str,
+) -> Result<PathBuf, (u16, &'static str)> {
+    let trimmed = raw_query_path.trim();
+    if trimmed.is_empty() {
+        return Err((400, "missing required query parameter `path`"));
+    }
+    if trimmed.contains('\0') {
+        return Err((400, "invalid artifact path"));
+    }
+    let without_scheme = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    let without_fragment = without_scheme
+        .split('#')
+        .next()
+        .unwrap_or(without_scheme)
+        .trim();
+    if without_fragment.is_empty() {
+        return Err((400, "empty artifact path"));
+    }
+
+    let candidate = if let Some(att_rel) = without_fragment.strip_prefix("/api/v1/attachments/") {
+        let filename = percent_decode(att_rel.split('?').next().unwrap_or(att_rel));
+        if filename.is_empty()
+            || has_path_traversal(att_rel, &filename)
+            || filename.contains('/')
+            || filename.contains('\\')
+        {
+            return Err((400, "invalid attachment filename"));
+        }
+        attachments_dir(state).join(filename)
+    } else {
+        let p = Path::new(without_fragment);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            state.config.repo_root.join(p)
+        }
+    };
+
+    if is_forbidden_artifact_path(&candidate) {
+        return Err((403, "access to sensitive or internal path is forbidden"));
+    }
+
+    let allowed_roots = allowed_artifact_roots(state);
+    let canonical = match fs::canonicalize(&candidate) {
+        Ok(c) => c,
+        Err(_) => {
+            // Check whether the non-existent path was attempting to escape allowed roots.
+            let within_raw_root = allowed_roots.iter().any(|r| candidate.starts_with(r))
+                || candidate.starts_with(&state.config.repo_root)
+                || candidate.starts_with(attachments_dir(state));
+            if !within_raw_root || has_path_traversal(without_fragment, without_fragment) {
+                return Err((403, "artifact path outside allowed workspace roots"));
+            }
+            return Err((404, "artifact file not found"));
+        }
+    };
+
+    if is_forbidden_artifact_path(&canonical) {
+        return Err((403, "access to sensitive or internal path is forbidden"));
+    }
+
+    if !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err((403, "artifact path outside allowed workspace roots"));
+    }
+
+    Ok(canonical)
+}
+
+fn handle_get_artifact_preview(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    let raw_path = req.query.get("path").map(String::as_str).unwrap_or("");
+    let canonical = match resolve_artifact_candidate_path(state, raw_path) {
+        Ok(p) => p,
+        Err((status, msg)) => return HttpResponse::json(status, json!({ "error": msg })),
+    };
+
+    let meta = match fs::metadata(&canonical) {
+        Ok(m) => m,
+        Err(_) => return HttpResponse::json(404, json!({ "error": "artifact file not found" })),
+    };
+    if !meta.is_file() {
+        return HttpResponse::json(404, json!({ "error": "artifact is not a regular file" }));
+    }
+    let size_bytes = meta.len();
+    if size_bytes > MAX_ARTIFACT_PREVIEW_BYTES {
+        return HttpResponse::json(
+            413,
+            json!({
+                "error": "artifact exceeds 16 MiB preview limit",
+                "size_bytes": size_bytes,
+                "max_bytes": MAX_ARTIFACT_PREVIEW_BYTES,
+            }),
+        );
+    }
+
+    let download = req
+        .query
+        .get("download")
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let mode = req
+        .query
+        .get("mode")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "json".to_string());
+
+    let filename = canonical
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact")
+        .to_string();
+    let safe_header_name: String = filename
+        .chars()
+        .filter(|c| *c != '"' && *c != '\r' && *c != '\n' && *c != '\\')
+        .collect();
+    let mime_type = mime_type_for_path(&canonical);
+
+    if download || mode == "raw" {
+        let bytes = match fs::read(&canonical) {
+            Ok(b) => b,
+            Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+        };
+        let disposition = if download {
+            format!("attachment; filename=\"{safe_header_name}\"")
+        } else {
+            format!("inline; filename=\"{safe_header_name}\"")
+        };
+        return HttpResponse::bytes(200, mime_type, bytes)
+            .with_header("Content-Disposition", disposition)
+            .with_header("X-Content-Type-Options", "nosniff");
+    }
+
+    let kind = classify_artifact_kind(&canonical);
+    let ext = canonical
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let content = if matches!(kind, "markdown" | "mermaid" | "svg" | "code") {
+        fs::read(&canonical)
+            .ok()
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+    } else {
+        None
+    };
+
+    let canonical_str = canonical.display().to_string();
+    let encoded_path = percent_encode_query_value(&canonical_str);
+    let raw_url = format!("/api/v1/artifacts/preview?path={encoded_path}&mode=raw");
+    let download_url = format!("/api/v1/artifacts/preview?path={encoded_path}&download=1");
+
+    HttpResponse::json(
+        200,
+        json!({
+            "path": canonical_str,
+            "name": filename,
+            "ext": ext,
+            "mime_type": mime_type,
+            "size_bytes": size_bytes,
+            "kind": kind,
+            "content": content,
+            "raw_url": raw_url,
+            "download_url": download_url,
+        }),
+    )
+}
+
+fn handle_get_artifacts_list(
+    state: &HubState,
+    store: &RedbStore,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    if let Some(session_id) = req
+        .query
+        .get("session_id")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        let home_dir = state
+            .config
+            .home_override
+            .clone()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        if let Some(ref home) = home_dir {
+            let brain_dir = home.join(".gemini/antigravity-cli/brain").join(session_id);
+            if brain_dir.is_dir()
+                && let Ok(entries) = fs::read_dir(&brain_dir)
+            {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        candidate_paths.push(p);
+                    }
+                }
+            }
+        }
+
+        let turns = read_session_transcript_with_home(
+            session_id,
+            store,
+            state.config.home_override.as_deref(),
+        );
+        for turn in turns.iter().rev().take(60) {
+            for token in turn.content.split_whitespace() {
+                if let Some(rest) = token.strip_prefix("file:///") {
+                    let clean = rest
+                        .trim_end_matches(|c: char| {
+                            matches!(c, ')' | ']' | '>' | '"' | '\'' | ',' | '.')
+                        })
+                        .split('#')
+                        .next()
+                        .unwrap_or(rest);
+                    candidate_paths.push(PathBuf::from(format!("/{clean}")));
+                }
+            }
+        }
+    }
+
+    let att_dir = attachments_dir(state);
+    if att_dir.is_dir()
+        && let Ok(entries) = fs::read_dir(&att_dir)
+    {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() {
+                candidate_paths.push(p);
+            }
+        }
+    }
+
+    let allowed_roots = allowed_artifact_roots(state);
+    let mut items = Vec::new();
+    for cand in candidate_paths {
+        if is_forbidden_artifact_path(&cand) {
+            continue;
+        }
+        let Ok(canon) = fs::canonicalize(&cand) else {
+            continue;
+        };
+        if is_forbidden_artifact_path(&canon) || !allowed_roots.iter().any(|r| canon.starts_with(r))
+        {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&canon) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > MAX_ARTIFACT_PREVIEW_BYTES {
+            continue;
+        }
+        let path_str = canon.display().to_string();
+        if !seen.insert(path_str.clone()) {
+            continue;
+        }
+        let name = canon
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("artifact")
+            .to_string();
+        let ext = canon
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let kind = classify_artifact_kind(&canon);
+        items.push(json!({
+            "path": path_str,
+            "name": name,
+            "ext": ext,
+            "kind": kind,
+            "size_bytes": meta.len(),
+        }));
+        if items.len() >= 50 {
+            break;
+        }
+    }
+
+    HttpResponse::json(200, json!({ "artifacts": items }))
 }
 
 fn handle_dynamic_api_routes(
@@ -3268,6 +3651,126 @@ mod tests {
         let serialized_owner = serde_json::to_string(&owner_hits[0]).unwrap();
         for token in SECRET_TOKENS {
             assert!(serialized_owner.contains(token), "{serialized_owner}");
+        }
+    }
+
+    #[test]
+    fn artifact_preview_serves_allowed_files_and_rejects_sensitive_or_outside_paths() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("repo");
+        let home_dir = tmp.path().join("home");
+        let brain_dir = home_dir.join(".gemini/antigravity-cli/brain/conv-1");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::create_dir_all(&brain_dir).unwrap();
+
+        let md_path = repo_root.join("spec.md");
+        fs::write(
+            &md_path,
+            "# Tactical Spec\n\n```mermaid\ngraph TD\n  A-->B\n```\n",
+        )
+        .unwrap();
+
+        let brain_svg = brain_dir.join("diagram.svg");
+        fs::write(&brain_svg, "<svg viewBox=\"0 0 10 10\"></svg>").unwrap();
+
+        // Sensitive paths inside repo_root that must be rejected with 403.
+        let git_config = repo_root.join(".git/config");
+        fs::create_dir_all(git_config.parent().unwrap()).unwrap();
+        fs::write(&git_config, "[core]\n").unwrap();
+
+        let secrets_file = repo_root.join("secrets/api_key.txt");
+        fs::create_dir_all(secrets_file.parent().unwrap()).unwrap();
+        fs::write(&secrets_file, "TOP_SECRET").unwrap();
+
+        let env_file = repo_root.join(".env");
+        fs::write(&env_file, "TOKEN=123").unwrap();
+
+        let vault_file = repo_root.join(".fl/gate/vault.json");
+        fs::create_dir_all(vault_file.parent().unwrap()).unwrap();
+        fs::write(&vault_file, "{}").unwrap();
+
+        let outside_file = tmp.path().join("outside.txt");
+        fs::write(&outside_file, "outside root").unwrap();
+
+        let cfg = crate::HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: repo_root.clone(),
+            owner_token: Some("owner-test-tok".to_string()),
+            home_override: Some(home_dir),
+            ..crate::HubServerConfig::default()
+        };
+        let state = HubState::new(cfg);
+
+        let authed_get = |target: &str| -> HttpResponse {
+            let mut req = HttpRequest::new("GET", target);
+            req.headers.insert(
+                "authorization".to_string(),
+                "Bearer owner-test-tok".to_string(),
+            );
+            handle_http_request(&state, &req)
+        };
+
+        // 1. JSON preview of Markdown file inside repo_root.
+        let enc_md = percent_encode_query_value(&md_path.display().to_string());
+        let resp = authed_get(&format!("/api/v1/artifacts/preview?path={enc_md}"));
+        assert_eq!(resp.status, 200);
+        let body: Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["name"], "spec.md");
+        assert_eq!(body["kind"], "markdown");
+        assert!(
+            body["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("# Tactical Spec")
+        );
+        assert!(
+            body["download_url"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("download=1")
+        );
+
+        // 2. Download mode sets Content-Disposition: attachment.
+        let dl_resp = authed_get(&format!(
+            "/api/v1/artifacts/preview?path={enc_md}&download=1"
+        ));
+        assert_eq!(dl_resp.status, 200);
+        let disp = dl_resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Disposition"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert!(
+            disp.starts_with("attachment; filename=\"spec.md\""),
+            "{disp}"
+        );
+
+        // 3. Brain artifact directory file is allowed.
+        let enc_svg = percent_encode_query_value(&brain_svg.display().to_string());
+        let svg_resp = authed_get(&format!("/api/v1/artifacts/preview?path={enc_svg}"));
+        assert_eq!(svg_resp.status, 200);
+        let svg_body: Value = serde_json::from_slice(&svg_resp.body).unwrap();
+        assert_eq!(svg_body["kind"], "svg");
+
+        // 4. Reject sensitive paths (.git, secrets, .env, .fl/gate/vault) and outside files with 403.
+        for forbidden in [
+            &git_config,
+            &secrets_file,
+            &env_file,
+            &vault_file,
+            &outside_file,
+            Path::new("/etc/passwd"),
+        ] {
+            let enc = percent_encode_query_value(&forbidden.display().to_string());
+            let r = authed_get(&format!("/api/v1/artifacts/preview?path={enc}"));
+            assert_eq!(
+                r.status,
+                403,
+                "expected 403 for forbidden path {}, got {}",
+                forbidden.display(),
+                r.status
+            );
         }
     }
 }

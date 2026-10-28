@@ -2,7 +2,48 @@
  * Exact 1:1 TypeScript wire contract matching `crates/hub/src/{api,auth,discovery,terminal,ws}.rs`.
  */
 
-export type CockpitTab = "chat" | "git" | "mail" | "terminal" | "hub" | "gate" | "state";
+export type CockpitTab =
+  | "chat"
+  | "artifacts"
+  | "git"
+  | "mail"
+  | "terminal"
+  | "hub"
+  | "gate"
+  | "state";
+
+export type ArtifactKind =
+  | "markdown"
+  | "mermaid"
+  | "svg"
+  | "image"
+  | "pdf"
+  | "code"
+  | "binary";
+
+export interface ArtifactPreviewResponse {
+  path: string;
+  name: string;
+  ext: string;
+  mime_type: string;
+  size_bytes: number;
+  kind: ArtifactKind;
+  content?: string | null;
+  raw_url: string;
+  download_url: string;
+}
+
+export interface ArtifactSummaryItem {
+  path: string;
+  name: string;
+  ext: string;
+  kind: ArtifactKind;
+  size_bytes: number;
+}
+
+export interface ArtifactListResponse {
+  artifacts: ArtifactSummaryItem[];
+}
 
 export type HubAuthority =
   | { tier: "owner"; login: string }
@@ -601,6 +642,7 @@ export interface HubStatsResponse {
   zero_cost_attempts: number;
   by_adapter: Record<string, AdapterStats>;
   regret_audit: RegretChallenge[];
+  token_gain?: TokenGainSummary;
 }
 
 export interface ArchComponent {

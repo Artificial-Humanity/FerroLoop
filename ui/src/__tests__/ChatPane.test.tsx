@@ -144,8 +144,8 @@ describe("ChatPane", () => {
     // Empty state is shown when no turns exist
     expect(screen.getByTestId("chat-empty-state")).toBeInTheDocument();
 
-    const promptInput = screen.getByPlaceholderText(/Send a prompt/i) as HTMLTextAreaElement;
-    const sendButton = screen.getByRole("button", { name: /Send Prompt/i });
+    const promptInput = screen.getByPlaceholderText(/Send a message/i) as HTMLTextAreaElement;
+    const sendButton = screen.getByRole("button", { name: /Send Message/i });
 
     fireEvent.change(promptInput, { target: { value: "Run fl arch check now" } });
 
@@ -290,7 +290,7 @@ describe("ChatPane", () => {
     expect(filterInput).toHaveAttribute("data-lpignore", "true");
     expect(filterInput).toHaveAttribute("data-form-type", "other");
 
-    const promptTextarea = screen.getByLabelText("Prompt Message");
+    const promptTextarea = screen.getByLabelText("Message");
     expect(promptTextarea).toHaveAttribute("autocomplete", "one-time-code");
     expect(promptTextarea).toHaveAttribute("role", "searchbox");
     expect(promptTextarea).toHaveAttribute("data-1p-ignore", "true");
@@ -300,7 +300,7 @@ describe("ChatPane", () => {
     expect(promptTextarea).toHaveAttribute("aria-autocomplete", "none");
 
     const actionBar = screen.getByTestId("composer-action-bar");
-    const sendButton = screen.getByRole("button", { name: /Send Prompt/i });
+    const sendButton = screen.getByRole("button", { name: /Send Message/i });
     expect(
       promptTextarea.compareDocumentPosition(actionBar) & Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
@@ -333,7 +333,7 @@ describe("ChatPane", () => {
       expect(screen.getByText("screenshot.png")).toBeInTheDocument();
     });
 
-    const sendButton = screen.getByRole("button", { name: /Send Prompt/i });
+    const sendButton = screen.getByRole("button", { name: /Send Message/i });
     expect(sendButton).not.toBeDisabled();
     fireEvent.click(sendButton);
 
@@ -482,7 +482,7 @@ describe("ChatPane", () => {
     expect(screen.getByTestId("session-busy-badge")).toHaveTextContent("Busy · Working");
     const queueBar = screen.getByTestId("prompt-queue-bar");
     expect(queueBar).toBeInTheDocument();
-    expect(screen.getByText("Queued Prompts (2)")).toBeInTheDocument();
+    expect(screen.getByText("Queued Messages (2)")).toBeInTheDocument();
     expect(screen.getByTestId("queued-prompt-pos-0")).toHaveTextContent("#1");
     expect(screen.getByTestId("queued-prompt-pos-1")).toHaveTextContent("#2");
     expect(screen.getByText("First queued prompt in line")).toBeInTheDocument();
@@ -520,9 +520,9 @@ describe("ChatPane", () => {
     expect(toggle.checked).toBe(true);
     expect(window.localStorage.getItem(ALWAYS_SEND_NOW_STORAGE_KEY)).toBe("true");
 
-    const promptInput = screen.getByLabelText("Prompt Message") as HTMLTextAreaElement;
+    const promptInput = screen.getByLabelText("Message") as HTMLTextAreaElement;
     fireEvent.change(promptInput, { target: { value: "Immediate override prompt" } });
-    fireEvent.click(screen.getByRole("button", { name: /Send Prompt/i }));
+    fireEvent.click(screen.getByRole("button", { name: /Send Message/i }));
 
     await waitFor(() => {
       expect(onSendPrompt).toHaveBeenCalledWith("sess-ferris-01", {
@@ -680,7 +680,7 @@ describe("ChatPane draft persistence", () => {
     };
 
     const first = render(<ChatPane {...props} />);
-    const textarea = screen.getByLabelText("Prompt Message") as HTMLTextAreaElement;
+    const textarea = screen.getByLabelText("Message") as HTMLTextAreaElement;
     fireEvent.change(textarea, {
       target: { value: "Half-written prompt to ferris" },
     });
@@ -693,7 +693,7 @@ describe("ChatPane draft persistence", () => {
 
     render(<ChatPane {...props} />);
     expect(
-      (screen.getByLabelText("Prompt Message") as HTMLTextAreaElement).value,
+      (screen.getByLabelText("Message") as HTMLTextAreaElement).value,
     ).toBe("Half-written prompt to ferris");
   });
 
@@ -709,7 +709,7 @@ describe("ChatPane draft persistence", () => {
     };
 
     const { rerender } = render(<ChatPane {...props} />);
-    fireEvent.change(screen.getByLabelText("Prompt Message"), {
+    fireEvent.change(screen.getByLabelText("Message"), {
       target: { value: "Draft for A" },
     });
     expect(window.localStorage.getItem("ferrodeck.draft.sess-switch-a")).toBe(
@@ -728,7 +728,7 @@ describe("ChatPane draft persistence", () => {
     }
 
     expect(
-      (screen.getByLabelText("Prompt Message") as HTMLTextAreaElement).value,
+      (screen.getByLabelText("Message") as HTMLTextAreaElement).value,
     ).toBe("Draft for B");
     expect(window.localStorage.getItem("ferrodeck.draft.sess-switch-b")).toBe(
       "Draft for B",

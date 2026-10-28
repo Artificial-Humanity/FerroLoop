@@ -1,6 +1,6 @@
 import React from "react";
 import type { TranscriptTurn } from "../types/api";
-import { RichMarkdown } from "./RichMarkdown";
+import { dispatchOpenArtifact, MermaidDiagram, RichMarkdown } from "./RichMarkdown";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallBlock } from "./ToolCallBlock";
 
@@ -9,6 +9,7 @@ export interface TurnCardProps {
   agentDisplayName?: string;
   /** True for the latest turn while the session is busy (live thinking). */
   isActive?: boolean;
+  onOpenArtifact?: (pathOrUrl: string) => void;
 }
 
 /** One-line collapsed summary for a Wire message body. */
@@ -111,6 +112,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   turn,
   agentDisplayName,
   isActive = false,
+  onOpenArtifact,
 }) => {
   const roleNormalized = (turn.role || "assistant").toLowerCase();
   // Defensive: hub normalization can mislabel background task completions
@@ -165,7 +167,9 @@ export const TurnCard: React.FC<TurnCardProps> = ({
     ? "var(--border-accent)"
     : isDirectedAssistant
       ? "var(--card-assistant-border)"
-      : "var(--border-subtle)";
+      : isWire
+        ? "var(--wire-card-border, rgba(180, 120, 70, 0.42))"
+        : "var(--border-subtle)";
 
   const roleBadgeStyle: React.CSSProperties = isUser
     ? {
@@ -179,11 +183,17 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           borderColor: "var(--badge-assistant-border)",
           color: "var(--status-info)",
         }
-      : {
-          backgroundColor: "var(--bg-elevated)",
-          borderColor: "var(--border-subtle)",
-          color: isWire || isSystem ? "var(--text-secondary)" : "var(--text-primary)",
-        };
+      : isWire
+        ? {
+            backgroundColor: "rgba(180, 120, 70, 0.12)",
+            borderColor: "var(--wire-card-border, rgba(180, 120, 70, 0.42))",
+            color: "var(--wire-badge-text, #D99B66)",
+          }
+        : {
+            backgroundColor: "var(--bg-elevated)",
+            borderColor: "var(--border-subtle)",
+            color: isSystem ? "var(--text-secondary)" : "var(--text-primary)",
+          };
   const segments = React.useMemo(() => splitTurnContent(cleanedContent), [cleanedContent]);
   const hasThinking = Boolean(turn.thinking && turn.thinking.trim().length > 0);
   const toolCalls = turn.tool_calls ?? [];
@@ -207,18 +217,23 @@ export const TurnCard: React.FC<TurnCardProps> = ({
       className="fd-card"
       data-testid={`turn-card-${turn.index}`}
       data-directed-assistant={isDirectedAssistant ? "true" : undefined}
+      data-wire-card={isWire ? "true" : undefined}
       style={{
         borderColor: roleBorderColor,
         backgroundColor: isUser
           ? "var(--card-user-bg)"
           : isDirectedAssistant
             ? "var(--card-assistant-bg)"
-            : "var(--bg-surface)",
+            : isWire
+              ? "var(--wire-card-bg, rgba(180, 120, 70, 0.06))"
+              : "var(--bg-surface)",
         boxShadow: isUser
           ? "inset 3px 0 0 var(--accent-primary)"
           : isDirectedAssistant
             ? "inset 3px 0 0 var(--status-info)"
-            : undefined,
+            : isWire
+              ? "inset 3px 0 0 0 var(--wire-card-stripe, rgba(180, 120, 70, 0.72))"
+              : undefined,
         display: "flex",
         flexDirection: "column",
         gap: "8px",
@@ -400,6 +415,15 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           >
             {segments.map((seg, idx) => {
               if (seg.kind === "code") {
+                if ((seg.language || "").toLowerCase() === "mermaid") {
+                  return (
+                    <MermaidDiagram
+                      key={idx}
+                      code={seg.text}
+                      onOpenArtifact={onOpenArtifact}
+                    />
+                  );
+                }
                 const codeLines = seg.text.split("\n");
                 const isLargeCode = codeLines.length > 10;
                 const isExpanded = isLargeCode ? Boolean(expandedCodeBlocks[idx]) : true;
@@ -491,7 +515,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                     wordBreak: "break-word",
                   }}
                 >
-                  <RichMarkdown text={seg.text.trim()} />
+                  <RichMarkdown text={seg.text.trim()} onOpenArtifact={onOpenArtifact} />
                 </div>
               );
             })}
@@ -514,6 +538,8 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           {attachments.map((att, idx) => (
             <div
               key={`${att.path}-${idx}`}
+              data-testid={`turn-attachment-item-${turn.index}-${idx}`}
+              onClick={() => dispatchOpenArtifact(att.path || att.url || "", onOpenArtifact)}
               style={{
                 display: "flex",
                 flexDirection: "column",
@@ -523,6 +549,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                 border: "1px solid var(--border-subtle)",
                 backgroundColor: "var(--bg-elevated)",
                 maxWidth: "280px",
+                cursor: "pointer",
               }}
             >
               <div style={{ display: "flex", alignItems: "center", gap: "6px", fontSize: "11px" }}>
@@ -535,6 +562,11 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                     target="_blank"
                     rel="noreferrer"
                     className="fd-mono"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      e.preventDefault();
+                      dispatchOpenArtifact(att.path || att.url || "", onOpenArtifact);
+                    }}
                     style={{ color: "var(--accent-hover)", fontSize: "11px" }}
                   >
                     open

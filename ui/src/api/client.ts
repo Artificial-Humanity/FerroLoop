@@ -1,6 +1,8 @@
 import type {
   AgentsResponse,
   ArchitectureResponse,
+  ArtifactListResponse,
+  ArtifactPreviewResponse,
   AuthSessionResponse,
   DiscoveredSessionSummary,
   HealthResponse,
@@ -556,5 +558,32 @@ export class HubApiClient {
 
   public async listGateConnectors(): Promise<GateConnectorsResponse> {
     return this.request<GateConnectorsResponse>("/api/v1/gate/connectors");
+  }
+
+  public async getArtifactPreview(path: string): Promise<ArtifactPreviewResponse> {
+    const qs = new URLSearchParams({ path, mode: "json" });
+    return this.request<ArtifactPreviewResponse>(`/api/v1/artifacts/preview?${qs.toString()}`);
+  }
+
+  public async listSessionArtifacts(sessionId?: string | null): Promise<ArtifactListResponse> {
+    const qs = new URLSearchParams();
+    if (sessionId && sessionId.trim().length > 0) {
+      qs.set("session_id", sessionId.trim());
+    }
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return this.request<ArtifactListResponse>(`/api/v1/artifacts/list${suffix}`);
+  }
+
+  public getArtifactRawUrl(path: string, download = false): string {
+    const qs = new URLSearchParams({
+      path,
+      mode: "raw",
+      download: download ? "1" : "0",
+    });
+    const tok = this.getToken();
+    if (tok) {
+      qs.set("token", tok);
+    }
+    return `${this.baseUrl}/api/v1/artifacts/preview?${qs.toString()}`;
   }
 }
