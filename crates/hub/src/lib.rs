@@ -307,7 +307,7 @@ impl HubState {
     /// The returned [`HubStoreGuard`] holds `store_lock` for the store's whole
     /// lifetime, serializing concurrent in-process opens.
     pub fn open_store(&self) -> Result<HubStoreGuard<'_>, StoreError> {
-        let guard = self.store_lock.lock().ok();
+        let guard = Some(self.store_lock.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(parent) = self.config.store_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -1776,6 +1776,19 @@ mod tests {
         let current = Arc::new(AtomicUsize::new(0));
         let max_concurrent = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(4));
+
+        // White-box: the guard must actually hold store_lock for its lifetime.
+        // This fails if open_store drops the lock early, unlike holder counts alone.
+        let guard = state.open_store().expect("open_store for lock probe");
+        assert!(
+            state.store_lock.try_lock().is_err(),
+            "store_lock must be held while HubStoreGuard is alive"
+        );
+        drop(guard);
+        assert!(
+            state.store_lock.try_lock().is_ok(),
+            "store_lock must be released after HubStoreGuard is dropped"
+        );
 
         let handles: Vec<_> = (0..4)
             .map(|_| {
