@@ -526,6 +526,20 @@ fn normalize_role(raw: &str) -> String {
     }
 }
 
+fn clean_sender_token(raw: &str) -> String {
+    let mut s = raw.trim();
+    loop {
+        let before = s;
+        s = s.trim_matches(|c| c == '"' || c == '\'');
+        s = s.trim_end_matches([',', ';', ']', ')', '}']);
+        s = s.trim_matches(|c| c == '"' || c == '\'');
+        if s == before {
+            break;
+        }
+    }
+    s.to_string()
+}
+
 fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if role != "system" && !content.contains("<SYSTEM_MESSAGE>") {
         return (role.to_string(), content.to_string());
@@ -550,14 +564,21 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if inner.starts_with("[Message]") {
         let first_line_end = inner.find('\n').unwrap_or(inner.len());
         let first_line = &inner[..first_line_end];
-        if let Some(pos) = first_line.find("sender=") {
-            let after = &first_line[pos + "sender=".len()..];
-            msg_sender = after
+        let header_end = first_line.find(" content=").unwrap_or(first_line.len());
+        let header = &first_line[..header_end];
+        if let Some(pos) = header.match_indices("sender=").map(|(p, _)| p).find(|&p| {
+            p == 0
+                || header[..p]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_whitespace())
+        }) {
+            let after = &header[pos + "sender=".len()..];
+            let raw_token = after
                 .split(|c: char| c.is_whitespace())
                 .next()
-                .unwrap_or("")
-                .trim()
-                .to_string();
+                .unwrap_or("");
+            msg_sender = clean_sender_token(raw_token);
         }
         if let Some(pos) = inner[..first_line_end].find(" content=") {
             inner = inner[pos + " content=".len()..].trim();
@@ -1373,6 +1394,68 @@ mod tests {
         );
         assert_eq!(role, "tool");
         assert!(content.starts_with("Task id"));
+
+        // (a) /task- sender is the only trigger; content does not start with Task id.
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=abc/task-3597 priority=MESSAGE_PRIORITY_HIGH content=Finished with result: done\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "tool");
+        assert_eq!(content, "Finished with result: done");
+
+        // (b) sender= only inside the content payload must not classify.
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z priority=MESSAGE_PRIORITY_HIGH content=Please check sender=abc/task-1 in this log\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(content, "Please check sender=abc/task-1 in this log");
+
+        // Header xsender= must not match sender= (word boundary).
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z xsender=abc/task-1 priority=MESSAGE_PRIORITY_HIGH content=Direct prompt here\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(content, "Direct prompt here");
+
+        // (c) Non-system header sender does not hijack protected prefixes.
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=11111111-1111-1111-1111-111111111111 priority=MESSAGE_PRIORITY_HIGH content=[Operator Prompt via FerroDeck \u{2014} from owner]\n\nPlease inspect the iPad layout.\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(content, "Please inspect the iPad layout.");
+
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:20Z sender=11111111-1111-1111-1111-111111111111 priority=MESSAGE_PRIORITY_HIGH content=[Incoming NATS Message \u{2014} pushed automatically]\nFrom: jarvis\nSubject: PR #16 review\nTimestamp: 2026-10-27T15:35:20Z\nMessage ID: msg-1\n\nApproved and ready to merge.\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "wire:jarvis");
+        assert_eq!(content, "Approved and ready to merge.");
+
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:30Z sender=11111111-1111-1111-1111-111111111111 priority=MESSAGE_PRIORITY_HIGH content=[fl-wire mail/normal] from jarvis (id: urn:uuid:11111111-1111-1111-1111-111111111111, thread: urn:uuid:11111111-1111-1111-1111-111111111111): Status check\n\nAll systems nominal.\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "wire:jarvis");
+        assert_eq!(content, "All systems nominal.");
+
+        // (d) Quoted system sender stays a direct user prompt.
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=\"system\" priority=MESSAGE_PRIORITY_HIGH content=Direct prompt without prefix\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(content, "Direct prompt without prefix");
+
+        // Trailing closing punctuation on the system token is normalized too.
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=system] priority=MESSAGE_PRIORITY_HIGH content=Direct prompt without prefix\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(content, "Direct prompt without prefix");
     }
 
     #[test]
