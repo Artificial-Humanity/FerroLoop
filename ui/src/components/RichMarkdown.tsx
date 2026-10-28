@@ -21,8 +21,7 @@ export function dispatchOpenArtifact(
   }
   if (onOpenArtifact) {
     onOpenArtifact(normalized);
-  }
-  if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
+  } else if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
     window.dispatchEvent(
       new CustomEvent(OPEN_ARTIFACT_EVENT, {
         detail: { path: normalized, raw: rawPathOrUrl },

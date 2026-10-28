@@ -4,6 +4,7 @@ import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { App } from "../App";
 import { ArtifactPreviewPane } from "../components/ArtifactPreviewPane";
+import { OPEN_ARTIFACT_EVENT, dispatchOpenArtifact } from "../components/RichMarkdown";
 import type { ArtifactPreviewResponse } from "../types/api";
 
 function makeApiClient(
@@ -235,5 +236,73 @@ describe("ArtifactPreviewPane", () => {
     );
 
     unmount();
+  });
+
+  it("preserves local path selection without reverting to activePath, handles malformed mermaid:// URIs, and avoids duplicate window events", async () => {
+    const firstPath = "/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop/docs/first.md";
+    const secondPath = "/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop/docs/second.md";
+    const apiClient = makeApiClient({
+      [firstPath]: {
+        path: firstPath,
+        name: "first.md",
+        ext: "md",
+        mime_type: "text/plain; charset=utf-8",
+        size_bytes: 32,
+        kind: "markdown",
+        content: "# First Document",
+        raw_url: `/api/v1/artifacts/preview?path=${encodeURIComponent(firstPath)}&mode=raw`,
+        download_url: `/api/v1/artifacts/preview?path=${encodeURIComponent(firstPath)}&download=1`,
+      },
+      [secondPath]: {
+        path: secondPath,
+        name: "second.md",
+        ext: "md",
+        mime_type: "text/plain; charset=utf-8",
+        size_bytes: 32,
+        kind: "markdown",
+        content: "# Second Document",
+        raw_url: `/api/v1/artifacts/preview?path=${encodeURIComponent(secondPath)}&mode=raw`,
+        download_url: `/api/v1/artifacts/preview?path=${encodeURIComponent(secondPath)}&download=1`,
+      },
+    });
+
+    const { rerender } = render(
+      <ArtifactPreviewPane apiClient={apiClient} activePath={firstPath} />,
+    );
+    expect(await screen.findByTestId("artifact-markdown-body")).toHaveTextContent(
+      "First Document",
+    );
+
+    const input = screen.getByTestId("artifact-path-input");
+    fireEvent.change(input, { target: { value: secondPath } });
+    fireEvent.submit(input.closest("form")!);
+
+    expect(await screen.findByTestId("artifact-markdown-body")).toHaveTextContent(
+      "Second Document",
+    );
+
+    // Malformed percent sequence in mermaid:// must not throw URIError
+    rerender(
+      <ArtifactPreviewPane
+        apiClient={apiClient}
+        activePath="mermaid://graph TD%E0%A4%A"
+      />,
+    );
+    expect(await screen.findByTestId("mermaid-diagram-card")).toBeInTheDocument();
+
+    // dispatchOpenArtifact only dispatches window event when callback is omitted
+    const windowSpy = vi.fn();
+    window.addEventListener(OPEN_ARTIFACT_EVENT, windowSpy);
+    try {
+      const cb = vi.fn();
+      dispatchOpenArtifact("file:///tmp/test.md", cb);
+      expect(cb).toHaveBeenCalledWith("/tmp/test.md");
+      expect(windowSpy).not.toHaveBeenCalled();
+
+      dispatchOpenArtifact("file:///tmp/test2.md");
+      expect(windowSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      window.removeEventListener(OPEN_ARTIFACT_EVENT, windowSpy);
+    }
   });
 });

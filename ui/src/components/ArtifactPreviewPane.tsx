@@ -98,11 +98,11 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   const [zoom, setZoom] = useState<ZoomPreset>("fit");
 
   useEffect(() => {
-    if (activePath !== undefined && activePath !== null && activePath !== selectedPath) {
+    if (activePath !== undefined && activePath !== null) {
       setSelectedPath(activePath);
       setPathInput(activePath.startsWith("mermaid://") ? "Inline Mermaid Diagram" : activePath);
     }
-  }, [activePath, selectedPath]);
+  }, [activePath]);
 
   const handleSelectPath = useCallback(
     (nextPath: string) => {
@@ -178,7 +178,13 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     }
 
     if (selectedPath.startsWith("mermaid://")) {
-      const code = decodeURIComponent(selectedPath.slice("mermaid://".length));
+      const rawSlice = selectedPath.slice("mermaid://".length);
+      let code = rawSlice;
+      try {
+        code = decodeURIComponent(rawSlice);
+      } catch {
+        code = rawSlice;
+      }
       const svgString = renderMermaidToSvgString(code);
       const svgDataUrl = `data:image/svg+xml;utf8,${encodeURIComponent(svgString)}`;
       const rawDataUrl = `data:text/plain;utf8,${encodeURIComponent(code)}`;

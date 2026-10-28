@@ -1762,12 +1762,16 @@ fn is_forbidden_artifact_path(path: &Path) -> bool {
         if let std::path::Component::Normal(os) = comp {
             let seg = os.to_string_lossy().to_ascii_lowercase();
             if seg == ".git"
+                || seg == ".fl"
                 || seg == "secrets"
                 || seg == ".env"
                 || seg.starts_with(".env.")
                 || seg == "vault.age"
+                || seg == "vault.enc"
                 || seg == "vault.json"
                 || seg == "vault.key"
+                || seg == "gate-audit.jsonl"
+                || seg.ends_with(".redb")
             {
                 return true;
             }
@@ -1779,6 +1783,7 @@ fn is_forbidden_artifact_path(path: &Path) -> bool {
         .to_ascii_lowercase();
     normalized.contains("/.fl/gate/vault")
         || normalized.ends_with("/.fl/gate")
+        || normalized.contains("/.fl/")
         || normalized.contains("/.git/")
         || normalized.contains("/secrets/")
 }
@@ -1934,7 +1939,12 @@ fn handle_get_artifact_preview(state: &HubState, req: &HttpRequest) -> HttpRespo
         .chars()
         .filter(|c| *c != '"' && *c != '\r' && *c != '\n' && *c != '\\')
         .collect();
-    let mime_type = mime_type_for_path(&canonical);
+    let kind = classify_artifact_kind(&canonical);
+    let mime_type = if matches!(kind, "markdown" | "mermaid" | "code") {
+        "text/plain; charset=utf-8"
+    } else {
+        mime_type_for_path(&canonical)
+    };
 
     if download || mode == "raw" {
         let bytes = match fs::read(&canonical) {
@@ -1948,10 +1958,13 @@ fn handle_get_artifact_preview(state: &HubState, req: &HttpRequest) -> HttpRespo
         };
         return HttpResponse::bytes(200, mime_type, bytes)
             .with_header("Content-Disposition", disposition)
-            .with_header("X-Content-Type-Options", "nosniff");
+            .with_header("X-Content-Type-Options", "nosniff")
+            .with_header(
+                "Content-Security-Policy",
+                "script-src 'none'; object-src 'none'",
+            );
     }
 
-    let kind = classify_artifact_kind(&canonical);
     let ext = canonical
         .extension()
         .and_then(|s| s.to_str())
@@ -2000,20 +2013,33 @@ fn handle_get_artifacts_list(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
+        let (canonical_session_id, _persona) = resolve_session_target(state, store, session_id);
         let home_dir = state
             .config
             .home_override
             .clone()
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
         if let Some(ref home) = home_dir {
-            let brain_dir = home.join(".gemini/antigravity-cli/brain").join(session_id);
-            if brain_dir.is_dir()
-                && let Ok(entries) = fs::read_dir(&brain_dir)
-            {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.is_file() {
-                        candidate_paths.push(p);
+            for candidate_id in [session_id, canonical_session_id.as_str()] {
+                if candidate_id.is_empty()
+                    || candidate_id.contains('/')
+                    || candidate_id.contains('\\')
+                    || candidate_id.contains("..")
+                    || candidate_id.contains('\0')
+                {
+                    continue;
+                }
+                let brain_dir = home
+                    .join(".gemini/antigravity-cli/brain")
+                    .join(candidate_id);
+                if brain_dir.is_dir()
+                    && let Ok(entries) = fs::read_dir(&brain_dir)
+                {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.is_file() {
+                            candidate_paths.push(p);
+                        }
                     }
                 }
             }
@@ -3673,6 +3699,9 @@ mod tests {
         let brain_svg = brain_dir.join("diagram.svg");
         fs::write(&brain_svg, "<svg viewBox=\"0 0 10 10\"></svg>").unwrap();
 
+        let html_code = repo_root.join("page.html");
+        fs::write(&html_code, "<html><script>alert(1)</script></html>").unwrap();
+
         // Sensitive paths inside repo_root that must be rejected with 403.
         let git_config = repo_root.join(".git/config");
         fs::create_dir_all(git_config.parent().unwrap()).unwrap();
@@ -3685,9 +3714,15 @@ mod tests {
         let env_file = repo_root.join(".env");
         fs::write(&env_file, "TOKEN=123").unwrap();
 
-        let vault_file = repo_root.join(".fl/gate/vault.json");
+        let vault_file = repo_root.join(".fl/gate/vault.enc");
         fs::create_dir_all(vault_file.parent().unwrap()).unwrap();
-        fs::write(&vault_file, "{}").unwrap();
+        fs::write(&vault_file, "ENC").unwrap();
+
+        let gate_audit = repo_root.join("gate-audit.jsonl");
+        fs::write(&gate_audit, "{}").unwrap();
+
+        let redb_file = repo_root.join("store.redb");
+        fs::write(&redb_file, "REDB").unwrap();
 
         let outside_file = tmp.path().join("outside.txt");
         fs::write(&outside_file, "outside root").unwrap();
@@ -3730,7 +3765,7 @@ mod tests {
                 .contains("download=1")
         );
 
-        // 2. Download mode sets Content-Disposition: attachment.
+        // 2. Download mode sets Content-Disposition: attachment and CSP header.
         let dl_resp = authed_get(&format!(
             "/api/v1/artifacts/preview?path={enc_md}&download=1"
         ));
@@ -3745,6 +3780,21 @@ mod tests {
             disp.starts_with("attachment; filename=\"spec.md\""),
             "{disp}"
         );
+        let csp = dl_resp
+            .headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("Content-Security-Policy"))
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        assert_eq!(csp, "script-src 'none'; object-src 'none'");
+
+        // 2b. Code files (.html) serve with text/plain; charset=utf-8 in raw mode.
+        let enc_html = percent_encode_query_value(&html_code.display().to_string());
+        let html_raw = authed_get(&format!(
+            "/api/v1/artifacts/preview?path={enc_html}&mode=raw"
+        ));
+        assert_eq!(html_raw.status, 200);
+        assert_eq!(html_raw.content_type, "text/plain; charset=utf-8");
 
         // 3. Brain artifact directory file is allowed.
         let enc_svg = percent_encode_query_value(&brain_svg.display().to_string());
@@ -3753,12 +3803,14 @@ mod tests {
         let svg_body: Value = serde_json::from_slice(&svg_resp.body).unwrap();
         assert_eq!(svg_body["kind"], "svg");
 
-        // 4. Reject sensitive paths (.git, secrets, .env, .fl/gate/vault) and outside files with 403.
+        // 4. Reject sensitive paths (.git, secrets, .env, .fl/gate/vault.enc, gate-audit.jsonl, .redb) and outside files with 403.
         for forbidden in [
             &git_config,
             &secrets_file,
             &env_file,
             &vault_file,
+            &gate_audit,
+            &redb_file,
             &outside_file,
             Path::new("/etc/passwd"),
         ] {
