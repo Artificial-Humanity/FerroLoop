@@ -200,6 +200,130 @@ describe("HubApiClient", () => {
     ]);
   });
 
+  it("calls the FerroState list, search, code-search, checkpoint, and import endpoints", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, body });
+
+      if (url.startsWith("/api/v1/state/search")) {
+        return new Response(
+          JSON.stringify({ query: body ?? "merge policy", hits: [], total_hits: 0 }),
+          { status: 200 },
+        );
+      }
+      if (url.startsWith("/api/v1/state/code-search")) {
+        return new Response(
+          JSON.stringify({
+            query: "VaultGatePane",
+            kind: "def",
+            symbols: [],
+            tokens_saved_this_query: 0,
+            token_gain: {
+              queries_count: 1,
+              tokens_saved: 0,
+              files_indexed: 2,
+              symbols_indexed: 3,
+            },
+          }),
+          { status: 200 },
+        );
+      }
+      if (url === "/api/v1/state/checkpoint") {
+        return new Response(
+          JSON.stringify({
+            entry: { id: "e1" },
+            branch: "refs/heads/fl/state",
+            head_sha: "abc1234",
+            dirty_files: 0,
+          }),
+          { status: 200 },
+        );
+      }
+      if (url === "/api/v1/state/import-workspace") {
+        return new Response(
+          JSON.stringify({ imported_memories: 2, imported_handoffs: 1, scopes: ["workspace"] }),
+          { status: 200 },
+        );
+      }
+      if (url.startsWith("/api/v1/state") && method === "POST") {
+        return new Response(JSON.stringify({ entry: { slug: body.slug } }), {
+          status: 200,
+        });
+      }
+      if (url.startsWith("/api/v1/state")) {
+        return new Response(JSON.stringify({ entries: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    });
+
+    const client = new HubApiClient({
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    await client.listStateEntries({ scope: "project:ferroloop", concern: "memory" });
+    await client.upsertStateEntry({
+      scope: "workspace",
+      slug: "token-ceilings",
+      concern: "memory",
+      category: "rule",
+      basis: "ruling",
+      pinned: true,
+      summary: "Hard token ceilings",
+      body: "Fail fast on budget exhaustion.",
+    });
+    // Spaces and slashes in free-text queries must survive URL encoding.
+    await client.searchStateEntries({ q: "merge policy", scope: "workspace", limit: 10 });
+    const codeRes = await client.searchCodeIndex({ q: "VaultGatePane", kind: "def", limit: 5 });
+    expect(codeRes.token_gain.symbols_indexed).toBe(3);
+
+    const checkpoint = await client.createStateCheckpoint({ summary: "Nightly snapshot" });
+    expect(checkpoint.branch).toBe("refs/heads/fl/state");
+
+    const imported = await client.importWorkspaceState();
+    expect(imported.imported_memories).toBe(2);
+
+    expect(calls).toEqual([
+      {
+        url: "/api/v1/state?scope=project%3Aferroloop&concern=memory",
+        method: "GET",
+        body: undefined,
+      },
+      {
+        url: "/api/v1/state",
+        method: "POST",
+        body: {
+          scope: "workspace",
+          slug: "token-ceilings",
+          concern: "memory",
+          category: "rule",
+          basis: "ruling",
+          pinned: true,
+          summary: "Hard token ceilings",
+          body: "Fail fast on budget exhaustion.",
+        },
+      },
+      {
+        url: "/api/v1/state/search?q=merge+policy&scope=workspace&limit=10",
+        method: "GET",
+        body: undefined,
+      },
+      {
+        url: "/api/v1/state/code-search?q=VaultGatePane&kind=def&limit=5",
+        method: "GET",
+        body: undefined,
+      },
+      {
+        url: "/api/v1/state/checkpoint",
+        method: "POST",
+        body: { summary: "Nightly snapshot" },
+      },
+      { url: "/api/v1/state/import-workspace", method: "POST", body: {} },
+    ]);
+  });
+
   it("normalizes liveness verdicts across fl-core status and UI state strings", () => {
     expect(resolveLivenessState({ status: "live", pid: 1234 }, false)).toBe("alive");
     expect(resolveLivenessState({ state: "alive" }, false)).toBe("alive");
