@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,8 @@ struct IndexedSymbol {
     start_line: u64,
     end_line: u64,
     signature: String,
+    /// Full (uncapped) declaration line, for search tier matching.
+    declaration: String,
 }
 
 #[derive(Debug, Clone)]
@@ -158,12 +161,12 @@ impl CodeIndex {
     }
 
     fn search_def(&self, query: &str, limit: usize) -> Vec<CodeSymbolHit> {
-        let q = query.to_ascii_lowercase();
+        let q = query.to_lowercase();
         let mut exact: Vec<(&IndexedFile, &IndexedSymbol)> = Vec::new();
         let mut prefix: Vec<(&IndexedFile, &IndexedSymbol)> = Vec::new();
         for file in &self.files {
             for sym in &file.symbols {
-                let name = sym.name.to_ascii_lowercase();
+                let name = sym.name.to_lowercase();
                 if name == q {
                     exact.push((file, sym));
                 } else if name.starts_with(&q) {
@@ -173,7 +176,7 @@ impl CodeIndex {
         }
         let key = |f: &IndexedFile, s: &IndexedSymbol| {
             (
-                s.name.to_ascii_lowercase(),
+                s.name.to_lowercase(),
                 s.name.clone(),
                 f.path.clone(),
                 s.start_line,
@@ -194,18 +197,18 @@ impl CodeIndex {
         if terms.is_empty() {
             return Vec::new();
         }
-        let q = query.to_ascii_lowercase();
+        let q = query.to_lowercase();
         let mut ranked: Vec<(u8, &IndexedFile, &IndexedSymbol)> = Vec::new();
         for file in &self.files {
             for sym in &file.symbols {
-                let name = sym.name.to_ascii_lowercase();
+                let name = sym.name.to_lowercase();
                 let tier = if name == q {
                     Some(0)
                 } else if name.starts_with(&q) {
                     Some(1)
                 } else if name.contains(&q) {
                     Some(2)
-                } else if contains_all_terms(&sym.signature.to_ascii_lowercase(), &terms) {
+                } else if contains_all_terms(&sym.declaration.to_lowercase(), &terms) {
                     Some(3)
                 } else {
                     None
@@ -218,14 +221,14 @@ impl CodeIndex {
         ranked.sort_by(|a, b| {
             (
                 a.0,
-                a.2.name.to_ascii_lowercase(),
+                a.2.name.to_lowercase(),
                 a.2.name.clone(),
                 a.1.path.clone(),
                 a.2.start_line,
             )
                 .cmp(&(
                     b.0,
-                    b.2.name.to_ascii_lowercase(),
+                    b.2.name.to_lowercase(),
                     b.2.name.clone(),
                     b.1.path.clone(),
                     b.2.start_line,
@@ -252,7 +255,7 @@ impl CodeIndex {
                 if returned_decl.contains(&(file.path.clone(), line_no)) {
                     continue;
                 }
-                if contains_all_terms(&line.to_ascii_lowercase(), &terms) {
+                if contains_all_terms(&line.to_lowercase(), &terms) {
                     hits.push(line_hit(file, line_no, line));
                 }
             }
@@ -261,10 +264,10 @@ impl CodeIndex {
     }
 
     fn search_outline(&self, query: &str, limit: usize) -> Vec<CodeSymbolHit> {
-        let q = query.to_ascii_lowercase();
+        let q = query.to_lowercase();
         let mut hits = Vec::new();
         for file in &self.files {
-            if !file.path.to_ascii_lowercase().contains(&q) {
+            if !file.path.to_lowercase().contains(&q) {
                 continue;
             }
             for sym in &file.symbols {
@@ -305,14 +308,22 @@ fn split_terms(query: &str) -> Vec<String> {
     let mut terms = Vec::new();
     let mut cur = String::new();
     for ch in query.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '$' {
-            cur.push(ch.to_ascii_lowercase());
+        if ch.is_alphanumeric() || ch == '_' || ch == '$' {
+            cur.extend(ch.to_lowercase());
         } else if !cur.is_empty() {
             terms.push(std::mem::take(&mut cur));
         }
     }
     if !cur.is_empty() {
         terms.push(cur);
+    }
+    // A punctuation-only query (e.g. `->`) has no word terms; fall back to
+    // the whole query as one term so declaration/line matching can hit it.
+    if terms.is_empty() {
+        let whole = query.trim().to_lowercase();
+        if !whole.is_empty() {
+            terms.push(whole);
+        }
     }
     terms
 }
@@ -454,7 +465,15 @@ fn index_file(path: &Path, rel: String) -> Option<IndexedFile> {
     if md.file_type().is_symlink() || md.len() > MAX_CODE_FILE_BYTES {
         return None;
     }
-    let bytes = fs::read(path).ok()?;
+    // Bounded read off the opened handle: never slurp past cap+1, so a file
+    // that grows between the size pre-check and the read cannot blow up
+    // memory; one byte over the cap is enough to reject it.
+    let mut file = fs::File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(MAX_CODE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
     if bytes.len() as u64 > MAX_CODE_FILE_BYTES {
         return None;
     }
@@ -472,7 +491,7 @@ fn index_file(path: &Path, rel: String) -> Option<IndexedFile> {
 }
 
 fn extract_symbols(ext: &str, lines: &[String]) -> Vec<IndexedSymbol> {
-    let mut raw: Vec<(String, String, u64, String)> = Vec::new();
+    let mut raw: Vec<(String, String, u64, String, String)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let Some((name, kind)) = parse_declaration(ext, line) else {
             continue;
@@ -485,11 +504,12 @@ fn extract_symbols(ext: &str, lines: &[String]) -> Vec<IndexedSymbol> {
             kind,
             i as u64 + 1,
             cap_chars(line.trim(), MAX_SIGNATURE_CHARS),
+            line.trim().to_string(),
         ));
     }
     let last_line = lines.len() as u64;
     let mut symbols = Vec::with_capacity(raw.len());
-    for (idx, (name, kind, start, signature)) in raw.iter().enumerate() {
+    for (idx, (name, kind, start, signature, declaration)) in raw.iter().enumerate() {
         let end = match raw.get(idx + 1) {
             Some(next) => next.2.saturating_sub(1).max(*start),
             None => last_line.max(*start),
@@ -500,6 +520,7 @@ fn extract_symbols(ext: &str, lines: &[String]) -> Vec<IndexedSymbol> {
             start_line: *start,
             end_line: end,
             signature: signature.clone(),
+            declaration: declaration.clone(),
         });
     }
     symbols
@@ -521,7 +542,7 @@ fn parse_declaration(ext: &str, line: &str) -> Option<(String, String)> {
             if trimmed.starts_with("//") {
                 return None;
             }
-            parse_js(trimmed)
+            parse_js(line)
         }
         "py" => {
             if trimmed.starts_with('#') {
@@ -540,16 +561,28 @@ fn parse_declaration(ext: &str, line: &str) -> Option<(String, String)> {
     }
 }
 
-/// First identifier (`[A-Za-z_$][A-Za-z0-9_$]*`) at the start of `s`,
-/// plus the remainder after it.
+/// First identifier at the start of `s`, plus the remainder after it.
+/// A Unicode alphabetic (or `_`/`$`) starts it; alphanumerics/`_`/`$`
+/// continue it. A Rust raw prefix `r#` is stripped from the returned name.
 fn take_ident(s: &str) -> Option<(&str, &str)> {
     let s = s.trim_start();
+    let s = match s.strip_prefix("r#") {
+        Some(body)
+            if body
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_' || c == '$') =>
+        {
+            body
+        }
+        _ => s,
+    };
     let mut end = 0;
     for (i, ch) in s.char_indices() {
         let ok = if i == 0 {
-            ch.is_ascii_alphabetic() || ch == '_' || ch == '$'
+            ch.is_alphabetic() || ch == '_' || ch == '$'
         } else {
-            ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+            ch.is_alphanumeric() || ch == '_' || ch == '$'
         };
         if !ok {
             break;
@@ -575,9 +608,19 @@ fn parse_rust(trimmed: &str) -> Option<(String, String)> {
         let (word, rest) = take_ident(t)?;
         match word {
             "pub" | "async" | "unsafe" | "default" => s = rest,
+            // `extern "C" fn` / `extern fn`: skip the optional ABI string.
+            "extern" => {
+                let r = rest.trim_start();
+                if let Some(after_quote) = r.strip_prefix('"') {
+                    let close = after_quote.find('"')?;
+                    s = &after_quote[close + 1..];
+                } else {
+                    s = rest;
+                }
+            }
             "const" => match take_ident(rest) {
                 // `const fn` is a prefix; `const NAME` is a declaration.
-                Some(("fn", _)) => s = rest,
+                Some(("fn" | "async" | "unsafe" | "extern", _)) => s = rest,
                 _ => break,
             },
             _ => break,
@@ -601,11 +644,17 @@ fn parse_rust(trimmed: &str) -> Option<(String, String)> {
 fn rust_impl_name(rest: &str) -> Option<String> {
     let mut s = rest.trim_start();
     if s.starts_with('<') {
+        // Skip the generic parameter list. `->` inside a bound (e.g.
+        // `T: Fn() -> T`) must not close angle depth.
         let mut depth = 0usize;
         let mut end = None;
-        for (i, ch) in s.char_indices() {
+        let mut chars = s.char_indices().peekable();
+        while let Some((i, ch)) = chars.next() {
             match ch {
                 '<' => depth += 1,
+                '-' if chars.peek().is_some_and(|(_, c)| *c == '>') => {
+                    chars.next();
+                }
                 '>' => {
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
@@ -624,10 +673,12 @@ fn rust_impl_name(rest: &str) -> Option<String> {
         let mut search = s;
         let mut offset = 0usize;
         while let Some(pos) = search.find("for") {
-            let before_ok = pos == 0 || !is_ident_byte(search.as_bytes()[pos - 1]);
+            let before_ok = search[..pos]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !is_ident_char(c));
             let after = &search[pos + 3..];
-            let after_ok =
-                after.is_empty() || !after.as_bytes().first().is_some_and(|b| is_ident_byte(*b));
+            let after_ok = after.chars().next().is_none_or(|c| !is_ident_char(c));
             if before_ok && after_ok {
                 found = Some(offset + pos + 3);
                 break;
@@ -652,16 +703,21 @@ fn rust_impl_name(rest: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+fn is_ident_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '$'
 }
 
-fn parse_js(trimmed: &str) -> Option<(String, String)> {
-    let mut s = trimmed;
+fn parse_js(line: &str) -> Option<(String, String)> {
+    // `const`/`let`/`var` count only at zero indentation or when exported,
+    // so locals inside a function body do not pollute the outline.
+    let top_level = line.chars().next().is_none_or(|c| !c.is_whitespace());
+    let mut exported = false;
+    let mut s = line.trim_start();
     loop {
         let (word, rest) = take_ident(s)?;
         match word {
             "export" | "default" | "abstract" | "async" | "declare" => {
+                exported |= word == "export";
                 s = rest.trim_start();
                 if s.is_empty() {
                     return None;
@@ -676,7 +732,11 @@ fn parse_js(trimmed: &str) -> Option<(String, String)> {
             let (name, _) = take_ident(rest.trim_start().trim_start_matches('*'))?;
             Some((name.to_string(), "function".to_string()))
         }
-        "class" | "interface" | "type" | "enum" | "const" | "let" | "var" => {
+        "class" | "interface" | "type" | "enum" => {
+            let (name, _) = take_ident(rest)?;
+            Some((name.to_string(), word.to_string()))
+        }
+        "const" | "let" | "var" if top_level || exported => {
             let (name, _) = take_ident(rest)?;
             Some((name.to_string(), word.to_string()))
         }
@@ -685,28 +745,40 @@ fn parse_js(trimmed: &str) -> Option<(String, String)> {
 }
 
 fn parse_python(trimmed: &str) -> Option<(String, String)> {
-    if let Some(rest) = trimmed.strip_prefix("async def ") {
-        let (name, _) = take_ident(rest)?;
-        return Some((name.to_string(), "def".to_string()));
-    }
-    if let Some(rest) = trimmed.strip_prefix("def ") {
-        let (name, _) = take_ident(rest)?;
-        return Some((name.to_string(), "def".to_string()));
-    }
-    if let Some(rest) = trimmed.strip_prefix("class ") {
-        let (name, _) = take_ident(rest)?;
-        return Some((name.to_string(), "class".to_string()));
-    }
-    None
+    // Token-based: `async  def` / `def\tname` are accepted, not just the
+    // single-space spelling.
+    let (word, rest) = take_ident(trimmed)?;
+    let (kind, rest) = match word {
+        "def" => ("def", rest),
+        "class" => ("class", rest),
+        "async" => {
+            let (next, rest) = take_ident(rest)?;
+            if next != "def" {
+                return None;
+            }
+            ("def", rest)
+        }
+        _ => return None,
+    };
+    let (name, _) = take_ident(rest)?;
+    Some((name.to_string(), kind.to_string()))
 }
 
 fn parse_toml(trimmed: &str) -> Option<(String, String)> {
-    let inner = if let Some(r) = trimmed.strip_prefix("[[") {
-        r.strip_suffix("]]")?
+    // A trailing comment after the closing bracket(s) is allowed:
+    // `[x] # note`, `[[x]] # note`.
+    let (inner, rest) = if let Some(r) = trimmed.strip_prefix("[[") {
+        let close = r.find("]]")?;
+        (&r[..close], &r[close + 2..])
     } else {
         let r = trimmed.strip_prefix('[')?;
-        r.strip_suffix(']')?
+        let close = r.find(']')?;
+        (&r[..close], &r[close + 1..])
     };
+    let rest = rest.trim();
+    if !rest.is_empty() && !rest.starts_with('#') {
+        return None;
+    }
     let name = inner.trim();
     if name.is_empty() {
         None
@@ -732,19 +804,48 @@ fn parse_markdown(trimmed: &str) -> Option<(String, String)> {
     }
 }
 
-/// Load the token-gain ledger; missing or malformed state reads as default.
-pub fn load_token_gain(store: &impl StateStore) -> TokenGainSummary {
-    let Ok(Some(entry)) = store.get_state_by_key(
+/// Strict ledger load for the write paths.
+///
+/// A missing entry is a fresh ledger (`default`). Anything else that
+/// cannot be trusted — a store error, a non-`Runtime` payload, a value
+/// that does not decode as a [`TokenGainSummary`], or an existing entry
+/// flagged `sensitive`/`ever_sensitive` — is an error, never a silent
+/// reset to `default`: `record_*` must not overwrite ledger state it
+/// could not read (a malformed or sensitive entry stays untouched for a
+/// human to inspect, and a sensitive entry's value is never adopted).
+fn try_load_token_gain(store: &impl StateStore) -> Result<TokenGainSummary, StoreError> {
+    let Some(entry) = store.get_state_by_key(
         &StateScope::Workspace,
         StateConcern::Runtime,
         TOKEN_GAIN_SLUG,
-    ) else {
-        return TokenGainSummary::default();
+    )?
+    else {
+        return Ok(TokenGainSummary::default());
     };
-    match entry.payload {
-        StatePayload::Runtime(rt) => serde_json::from_value(rt.value).unwrap_or_default(),
-        _ => TokenGainSummary::default(),
+    if entry.sensitive || entry.ever_sensitive {
+        return Err(StoreError::InvalidState(format!(
+            "token-gain ledger at {TOKEN_GAIN_SLUG} is marked sensitive; refusing to read or overwrite it"
+        )));
     }
+    match entry.payload {
+        StatePayload::Runtime(rt) => serde_json::from_value(rt.value).map_err(|e| {
+            StoreError::Decode(format!("token-gain ledger at {TOKEN_GAIN_SLUG}: {e}"))
+        }),
+        _ => Err(StoreError::Decode(format!(
+            "token-gain ledger at {TOKEN_GAIN_SLUG} does not hold a Runtime payload"
+        ))),
+    }
+}
+
+/// Load the token-gain ledger for stats display.
+///
+/// Infallible by design: a missing entry reads as `default`, and so does
+/// anything the strict write-path load rejects (store error, wrong payload,
+/// malformed value, sensitive/`ever_sensitive` entry) — the display fails
+/// closed to zeroes instead of surfacing untrusted or sensitive numbers.
+/// Writes go through the strict load and propagate those cases as errors.
+pub fn load_token_gain(store: &impl StateStore) -> TokenGainSummary {
+    try_load_token_gain(store).unwrap_or_default()
 }
 
 fn save_token_gain(
@@ -775,6 +876,9 @@ fn save_token_gain(
 
 /// Record a completed scan: refresh the latest file/symbol counts only;
 /// `queries_count` and `tokens_saved` are untouched.
+///
+/// Propagates an error (writing nothing) when the existing ledger entry
+/// cannot be trusted — see `try_load_token_gain`.
 pub fn record_token_gain_index(
     store: &impl StateStore,
     files_indexed: u64,
@@ -782,7 +886,7 @@ pub fn record_token_gain_index(
     at: At,
     by: &str,
 ) -> Result<TokenGainSummary, StoreError> {
-    let mut summary = load_token_gain(store);
+    let mut summary = try_load_token_gain(store)?;
     summary.files_indexed = files_indexed;
     summary.symbols_indexed = symbols_indexed;
     save_token_gain(store, summary, at, by)
@@ -791,6 +895,9 @@ pub fn record_token_gain_index(
 /// Record one query: increment `queries_count` by 1, add
 /// `saved_this_query` to `tokens_saved` (saturating), and refresh the
 /// latest file/symbol counts.
+///
+/// Propagates an error (writing nothing) when the existing ledger entry
+/// cannot be trusted — see `try_load_token_gain`.
 pub fn record_token_gain_query(
     store: &impl StateStore,
     saved_this_query: u64,
@@ -799,7 +906,7 @@ pub fn record_token_gain_query(
     at: At,
     by: &str,
 ) -> Result<TokenGainSummary, StoreError> {
-    let mut summary = load_token_gain(store);
+    let mut summary = try_load_token_gain(store)?;
     summary.queries_count = summary.queries_count.saturating_add(1);
     summary.tokens_saved = summary.tokens_saved.saturating_add(saved_this_query);
     summary.files_indexed = files_indexed;
@@ -851,21 +958,50 @@ mod tests {
         );
         write(
             root,
+            "src/extra.rs",
+            concat!(
+                "pub(crate) async fn café() {}\n",
+                "pub(crate) const fn const_made() {}\n",
+                "extern \"C\" fn extern_made() {}\n",
+                "pub extern fn pub_extern_made() {}\n",
+                "pub fn r#match() {}\n",
+                "impl<T: Fn() -> T> Foo<T> {}\n",
+            ),
+        );
+        write(
+            root,
             "src/app.ts",
-            "export function buildWidget() {}\nexport interface WidgetProps { title: string }\n",
+            concat!(
+                "export function buildWidget() {}\n",
+                "export interface WidgetProps { title: string }\n",
+                "export default function defaultWidget() {}\n",
+                "export const exportedConst = 1;\n",
+                "const topConst = 2;\n",
+                "function outer() {\n",
+                "  const localConst = 3;\n",
+                "  let localLet = 4;\n",
+                "}\n",
+            ),
         );
         write(
             root,
             "tools/make.py",
-            "def make_widget():\n    return 1\n\nclass WidgetFactory:\n    pass\n",
+            "def make_widget():\n    return 1\n\nclass WidgetFactory:\n    pass\nasync  def fetch_widget():\n    pass\n",
         );
-        write(root, "Cargo.toml", "[package]\nname = \"x\"\n");
+        write(
+            root,
+            "Cargo.toml",
+            "[package] # the package\nname = \"x\"\n[[bin]] # binaries\nname = \"y\"\n",
+        );
         write(
             root,
             "README.md",
             "# Title Here\n\ntext\n## Sub Section\nmore\n",
         );
         write(root, "target/hidden.rs", "pub fn hidden_target() {}\n");
+        write(root, ".git/hidden.rs", "pub fn hidden_git() {}\n");
+        write(root, "dist/hidden.js", "function hidden_dist() {}\n");
+        write(root, ".next/hidden.js", "function hidden_next() {}\n");
         write(
             root,
             "node_modules/pkg/index.js",
@@ -881,7 +1017,7 @@ mod tests {
         let index = scan_code_index(root);
         assert_eq!(
             index.files_indexed(),
-            5,
+            6,
             "{:?}",
             index.files.iter().map(|f| &f.path).collect::<Vec<_>>()
         );
@@ -894,22 +1030,38 @@ mod tests {
             ]
         );
         assert_eq!(
+            syms(&index, "src/extra.rs"),
+            vec![
+                ("café", "fn", 1, 1),
+                ("const_made", "fn", 2, 2),
+                ("extern_made", "fn", 3, 3),
+                ("pub_extern_made", "fn", 4, 4),
+                ("match", "fn", 5, 5),
+                ("Foo", "impl", 6, 6)
+            ]
+        );
+        assert_eq!(
             syms(&index, "src/app.ts"),
             vec![
                 ("buildWidget", "function", 1, 1),
-                ("WidgetProps", "interface", 2, 2)
+                ("WidgetProps", "interface", 2, 2),
+                ("defaultWidget", "function", 3, 3),
+                ("exportedConst", "const", 4, 4),
+                ("topConst", "const", 5, 5),
+                ("outer", "function", 6, 9)
             ]
         );
         assert_eq!(
             syms(&index, "tools/make.py"),
             vec![
                 ("make_widget", "def", 1, 3),
-                ("WidgetFactory", "class", 4, 5)
+                ("WidgetFactory", "class", 4, 5),
+                ("fetch_widget", "def", 6, 7)
             ]
         );
         assert_eq!(
             syms(&index, "Cargo.toml"),
-            vec![("package", "section", 1, 2)]
+            vec![("package", "section", 1, 2), ("bin", "section", 3, 4)]
         );
         assert_eq!(
             syms(&index, "README.md"),
@@ -926,6 +1078,23 @@ mod tests {
         assert!(!all_names.contains(&"hidden_target"));
         assert!(!all_names.contains(&"hidden_nm"));
         assert!(!all_names.contains(&"ignored"));
+        assert!(!all_names.contains(&"hidden_git"));
+        assert!(!all_names.contains(&"hidden_dist"));
+        assert!(!all_names.contains(&"hidden_next"));
+        assert!(!all_names.contains(&"localConst"));
+        assert!(!all_names.contains(&"localLet"));
+        // Café exact-matches case-insensitively (Unicode) via Def and Search.
+        let def = index.search(CodeSearchKind::Def, "CAFÉ", 10);
+        assert_eq!(
+            def.symbols
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["café"]
+        );
+        let found = index.search(CodeSearchKind::Search, "café", 10);
+        assert_eq!(found.symbols[0].name, "café");
+        assert_eq!(found.symbols[0].kind, "fn");
     }
 
     #[test]
@@ -1036,6 +1205,68 @@ mod tests {
     }
 
     #[test]
+    fn search_matches_term_past_signature_cap_as_symbol_not_line() {
+        let tmp = TempDir::new().unwrap();
+        let pad = "a".repeat(220);
+        write(
+            tmp.path(),
+            "long.rs",
+            &format!("pub fn long_decl({pad}: u32, zzz_past_cap_marker: u32) {{}}\n"),
+        );
+        let index = scan_code_index(tmp.path());
+        let out = index.search(CodeSearchKind::Search, "zzz_past_cap_marker", 10);
+        assert_eq!(out.symbols.len(), 1, "{out:?}");
+        assert_eq!(out.symbols[0].name, "long_decl");
+        assert_eq!(out.symbols[0].kind, "fn");
+        assert!(!out.symbols[0].signature.contains("zzz_past_cap_marker"));
+    }
+
+    #[test]
+    fn punctuation_only_query_finds_line() {
+        let tmp = TempDir::new().unwrap();
+        write(
+            tmp.path(),
+            "punct.rs",
+            "pub fn holder() {\n    let x = a -> b;\n}\n",
+        );
+        let index = scan_code_index(tmp.path());
+        let out = index.search(CodeSearchKind::Search, "->", 10);
+        assert!(
+            out.symbols
+                .iter()
+                .any(|s| s.kind == "line" && s.start_line == 2),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn root_as_file_indexes_that_file_and_missing_root_is_empty() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "solo.rs", "pub fn solo() {}\n");
+        let file_root = scan_code_index(&tmp.path().join("solo.rs"));
+        assert_eq!(file_root.files_indexed(), 1);
+        assert_eq!(file_root.symbols_indexed(), 1);
+        let missing = scan_code_index(&tmp.path().join("does-not-exist"));
+        assert_eq!(missing.files_indexed(), 0);
+        assert_eq!(missing.symbols_indexed(), 0);
+        let out = missing.search(CodeSearchKind::Search, "solo", 10);
+        assert_eq!(out.files_indexed, 0);
+        assert_eq!(out.symbols_indexed, 0);
+        assert!(out.symbols.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_file_is_skipped() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "real.rs", "pub fn real_one() {}\n");
+        std::os::unix::fs::symlink(tmp.path().join("real.rs"), tmp.path().join("link.rs")).unwrap();
+        let index = scan_code_index(tmp.path());
+        assert_eq!(index.files_indexed(), 1);
+        assert_eq!(syms(&index, "real.rs"), vec![("real_one", "fn", 1, 1)]);
+    }
+
+    #[test]
     fn token_gain_ledger_records_index_then_queries() {
         let store = MemStore::default();
         assert_eq!(load_token_gain(&store), TokenGainSummary::default());
@@ -1082,6 +1313,68 @@ mod tests {
                 assert_eq!(rt.value["files_indexed"], 4);
                 assert_eq!(rt.value["symbols_indexed"], 12);
             }
+            other => panic!("expected Runtime payload, got {other:?}"),
+        }
+    }
+
+    fn seed_ledger(store: &MemStore, value: serde_json::Value, sensitivity: SensitivityPatch) {
+        store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: TOKEN_GAIN_SLUG.to_string(),
+                sensitivity,
+                payload: StatePayload::Runtime(RuntimeEntry {
+                    value,
+                    merge_mode: MergeMode::LastWriter,
+                }),
+                at: at(),
+                by: "seeder".to_string(),
+            })
+            .unwrap();
+    }
+
+    fn stored_ledger(store: &MemStore) -> crate::state::StateEntry {
+        store
+            .get_state_by_key(
+                &StateScope::Workspace,
+                StateConcern::Runtime,
+                TOKEN_GAIN_SLUG,
+            )
+            .unwrap()
+            .expect("ledger entry present")
+    }
+
+    #[test]
+    fn token_gain_malformed_entry_errors_and_stays_unchanged() {
+        let store = MemStore::default();
+        let bogus = serde_json::json!({"queries_count": "oops"});
+        seed_ledger(&store, bogus.clone(), SensitivityPatch::Inherit);
+        assert_eq!(load_token_gain(&store), TokenGainSummary::default());
+        assert!(record_token_gain_query(&store, 10, 1, 1, at(), "tester").is_err());
+        assert!(record_token_gain_index(&store, 1, 1, at(), "tester").is_err());
+        match stored_ledger(&store).payload {
+            StatePayload::Runtime(rt) => assert_eq!(rt.value, bogus),
+            other => panic!("expected Runtime payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_gain_sensitive_entry_errors_and_loads_as_default() {
+        let store = MemStore::default();
+        let secret = serde_json::json!({
+            "queries_count": 7,
+            "tokens_saved": 99,
+            "files_indexed": 1,
+            "symbols_indexed": 2
+        });
+        seed_ledger(&store, secret.clone(), SensitivityPatch::SetSensitive);
+        let seeded = stored_ledger(&store);
+        assert!(seeded.sensitive || seeded.ever_sensitive);
+        assert_eq!(load_token_gain(&store), TokenGainSummary::default());
+        assert!(record_token_gain_query(&store, 10, 1, 1, at(), "tester").is_err());
+        assert!(record_token_gain_index(&store, 1, 1, at(), "tester").is_err());
+        match stored_ledger(&store).payload {
+            StatePayload::Runtime(rt) => assert_eq!(rt.value, secret),
             other => panic!("expected Runtime payload, got {other:?}"),
         }
     }
