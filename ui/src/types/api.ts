@@ -2,7 +2,7 @@
  * Exact 1:1 TypeScript wire contract matching `crates/hub/src/{api,auth,discovery,terminal,ws}.rs`.
  */
 
-export type CockpitTab = "chat" | "git" | "mail" | "terminal" | "hub" | "gate";
+export type CockpitTab = "chat" | "git" | "mail" | "terminal" | "hub" | "gate" | "state";
 
 export type HubAuthority =
   | { tier: "owner"; login: string }
@@ -449,17 +449,114 @@ export interface RuntimeEntry {
   merge_mode: string;
 }
 
+export type MemoryPayload = MemoryEntry;
+export type HandoffPayload = HandoffEntry;
+export type RuntimePayload = RuntimeEntry;
+
+/**
+ * `StatePayload` in `crates/core/src/state.rs` is an externally tagged enum,
+ * so the wire shape is `{ memory: {...} }`, not `{ concern, ... }`.
+ */
+export type StatePayload =
+  | { memory: MemoryEntry }
+  | { handoff: HandoffEntry }
+  | { runtime: RuntimeEntry };
+
 export interface StateEntry {
   id: string;
+  /** Wire scope string: `"workspace" | "project:<slug>" | "agent:<slug>" | ...`. */
   scope: string;
   concern: "memory" | "handoff" | "runtime" | string;
   slug: string;
   sensitive: boolean;
   ever_sensitive: boolean;
-  payload: Record<string, unknown>;
+  payload: StatePayload;
   head_revision: string;
   updated_at: string;
   by: string;
+}
+
+export interface StateEntriesResponse {
+  entries: StateEntry[];
+}
+
+export interface StateEntryResponse {
+  entry: StateEntry;
+}
+
+/** Flat `POST /api/v1/state` body (`handle_post_state` also accepts `payload`). */
+export interface UpsertStateEntryInput {
+  scope?: string;
+  slug: string;
+  concern: "memory" | "handoff" | "runtime";
+  category?: string;
+  basis?: string;
+  pinned?: boolean;
+  sensitive?: boolean;
+  summary?: string;
+  body?: string;
+  notes?: string;
+  value?: unknown;
+  merge_mode?: string;
+  by?: string;
+  payload?: StatePayload;
+}
+
+export interface StateSearchHit {
+  entry: StateEntry;
+  score_millis: number;
+  matched_terms: string[];
+  snippet: string;
+  estimated_tokens: number;
+}
+
+export interface StateSearchResponse {
+  query: string;
+  hits: StateSearchHit[];
+  total_hits: number;
+}
+
+export interface CodeSymbolHit {
+  name: string;
+  kind: string;
+  path: string;
+  start_line: number;
+  end_line: number;
+  signature: string;
+  snippet: string;
+  estimated_file_tokens: number;
+  snippet_tokens: number;
+  tokens_saved: number;
+}
+
+export interface TokenGainSummary {
+  queries_count: number;
+  tokens_saved: number;
+  files_indexed: number;
+  symbols_indexed: number;
+}
+
+export type CodeSearchKind = "def" | "search" | "outline";
+
+export interface CodeSearchResponse {
+  query: string;
+  kind: string;
+  symbols: CodeSymbolHit[];
+  tokens_saved_this_query: number;
+  token_gain: TokenGainSummary;
+}
+
+export interface StateCheckpointResponse {
+  entry: StateEntry;
+  branch: string;
+  head_sha: string;
+  dirty_files: number;
+}
+
+export interface ImportWorkspaceStateResponse {
+  imported_memories: number;
+  imported_handoffs: number;
+  scopes: string[];
 }
 
 export interface WorkflowRunDetailResponse {

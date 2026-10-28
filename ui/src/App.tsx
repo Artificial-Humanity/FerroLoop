@@ -10,6 +10,7 @@ import { PairingModal } from "./components/PairingModal";
 import { RosterSidebar } from "./components/RosterSidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { VaultGatePane } from "./components/VaultGatePane";
+import { FerroStatePane } from "./components/FerroStatePane";
 import { WireMailPane } from "./components/WireMailPane";
 import {
   DEFAULT_WORKSPACE_AGENTS,
@@ -649,6 +650,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         );
       case "gate":
         return <VaultGatePane authority={authority} apiClient={apiClient} />;
+      case "state":
+        return <FerroStatePane authority={authority} apiClient={apiClient} />;
       case "chat":
       default:
         return (

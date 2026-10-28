@@ -17,7 +17,15 @@ import type {
   QueuedOperatorPrompt,
   SessionQueueResponse,
   SessionTranscriptResponse,
+  CodeSearchKind,
+  CodeSearchResponse,
+  ImportWorkspaceStateResponse,
+  StateCheckpointResponse,
+  StateEntriesResponse,
   StateEntry,
+  StateEntryResponse,
+  StateSearchResponse,
+  UpsertStateEntryInput,
   WireAckRequest,
   WireAckResponse,
   WireInboxItem,
@@ -428,10 +436,10 @@ export class HubApiClient {
     );
   }
 
-  public async getState(params?: {
+  public async listStateEntries(params?: {
     scope?: string;
     concern?: string;
-  }): Promise<{ entries: StateEntry[] }> {
+  }): Promise<StateEntriesResponse> {
     const qs = new URLSearchParams();
     if (params?.scope) {
       qs.set("scope", params.scope);
@@ -440,13 +448,79 @@ export class HubApiClient {
       qs.set("concern", params.concern);
     }
     const suffix = qs.toString() ? `?${qs.toString()}` : "";
-    return this.request<{ entries: StateEntry[] }>(`/api/v1/state${suffix}`);
+    return this.request<StateEntriesResponse>(`/api/v1/state${suffix}`);
+  }
+
+  public async getState(params?: {
+    scope?: string;
+    concern?: string;
+  }): Promise<{ entries: StateEntry[] }> {
+    return this.listStateEntries(params);
+  }
+
+  public async upsertStateEntry(
+    input: UpsertStateEntryInput,
+  ): Promise<StateEntryResponse> {
+    return this.request<StateEntryResponse>("/api/v1/state", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
   }
 
   public async upsertState(payload: Record<string, unknown>): Promise<{ entry: StateEntry }> {
-    return this.request<{ entry: StateEntry }>("/api/v1/state", {
+    return this.upsertStateEntry(payload as unknown as UpsertStateEntryInput);
+  }
+
+  public async searchStateEntries(params: {
+    q: string;
+    scope?: string;
+    concern?: string;
+    limit?: number;
+  }): Promise<StateSearchResponse> {
+    const qs = new URLSearchParams();
+    qs.set("q", params.q);
+    if (params.scope) {
+      qs.set("scope", params.scope);
+    }
+    if (params.concern) {
+      qs.set("concern", params.concern);
+    }
+    if (params.limit !== undefined) {
+      qs.set("limit", String(params.limit));
+    }
+    return this.request<StateSearchResponse>(`/api/v1/state/search?${qs.toString()}`);
+  }
+
+  public async searchCodeIndex(params: {
+    q: string;
+    kind?: CodeSearchKind;
+    limit?: number;
+  }): Promise<CodeSearchResponse> {
+    const qs = new URLSearchParams();
+    qs.set("q", params.q);
+    if (params.kind) {
+      qs.set("kind", params.kind);
+    }
+    if (params.limit !== undefined) {
+      qs.set("limit", String(params.limit));
+    }
+    return this.request<CodeSearchResponse>(`/api/v1/state/code-search?${qs.toString()}`);
+  }
+
+  public async createStateCheckpoint(
+    input: { scope?: string; slug?: string; summary?: string } = {},
+  ): Promise<StateCheckpointResponse> {
+    return this.request<StateCheckpointResponse>("/api/v1/state/checkpoint", {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify(input),
+    });
+  }
+
+  /** Owner-only on the hub; a peer session gets `HubApiError` 403. */
+  public async importWorkspaceState(): Promise<ImportWorkspaceStateResponse> {
+    return this.request<ImportWorkspaceStateResponse>("/api/v1/state/import-workspace", {
+      method: "POST",
+      body: JSON.stringify({}),
     });
   }
 
