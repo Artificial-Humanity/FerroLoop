@@ -125,11 +125,18 @@ export interface TranscriptTurn {
   created_at?: string | null;
 }
 
+export interface SessionContextUsage {
+  used_tokens: number;
+  max_tokens: number;
+}
+
 export interface SessionTranscriptResponse {
   session_id: string;
   turns: TranscriptTurn[];
   is_busy?: boolean;
   queue?: QueuedOperatorPrompt[];
+  /** Server-measured context usage when the hub reports it. */
+  context_usage?: SessionContextUsage | null;
 }
 
 export type TranscriptResponse = SessionTranscriptResponse;

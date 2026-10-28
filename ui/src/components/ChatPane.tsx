@@ -5,9 +5,102 @@ import type {
   PromptRequest,
   PromptResponse,
   QueuedOperatorPrompt,
+  SessionContextUsage,
   TranscriptTurn,
 } from "../types/api";
+import { ThinkingBlock } from "./ThinkingBlock";
 import { TurnCard } from "./TurnCard";
+
+/** Rough fixed cost of system prompt plus tool definitions per session. */
+export const BASE_SYSTEM_OVERHEAD_TOKENS = 12_000;
+
+export interface EstimatedContextUsage {
+  usedTokens: number;
+  maxTokens: number;
+  percent: number;
+}
+
+function maxTokensForAdapter(adapter?: string | null): number {
+  return (adapter ?? "").trim().toLowerCase() === "grok" ? 131_072 : 200_000;
+}
+
+/**
+ * Estimate active context usage from loaded transcript turns. The hub
+ * returns a sliding transcript window, so this is an approximation:
+ * server-reported usage, when present, always wins.
+ */
+export function estimateSessionContextUsage(
+  turns: TranscriptTurn[],
+  adapter?: string | null,
+  serverUsage?: SessionContextUsage | null,
+): EstimatedContextUsage {
+  if (serverUsage && serverUsage.max_tokens > 0) {
+    const usedTokens = Math.max(0, serverUsage.used_tokens);
+    return {
+      usedTokens,
+      maxTokens: serverUsage.max_tokens,
+      percent: Math.min(100, Math.round((usedTokens / serverUsage.max_tokens) * 100)),
+    };
+  }
+  const maxTokens = maxTokensForAdapter(adapter);
+  if (!turns || turns.length === 0) {
+    return { usedTokens: 0, maxTokens, percent: 0 };
+  }
+  let boundaryIndex = -1;
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const content = turns[i].content || "";
+    if (content.includes("<CONTEXT_SUMMARY>") || content.includes("[Compacted context]")) {
+      boundaryIndex = i;
+      break;
+    }
+  }
+  const activeTurns = boundaryIndex >= 0 ? turns.slice(boundaryIndex) : turns;
+  let usedTokens = BASE_SYSTEM_OVERHEAD_TOKENS;
+  for (const turn of activeTurns) {
+    const chars =
+      (turn.content?.length ?? 0) +
+      (turn.thinking?.length ?? 0) +
+      JSON.stringify(turn.tool_calls ?? []).length;
+    usedTokens += Math.ceil(chars / 4);
+  }
+  return {
+    usedTokens,
+    maxTokens,
+    percent: Math.min(100, Math.round((usedTokens / maxTokens) * 100)),
+  };
+}
+
+export function formatTokenCount(value: number): string {
+  if (value >= 1_000) {
+    return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return String(value);
+}
+
+/**
+ * Identity of the transcript tail. The hub returns a fixed-size sliding
+ * window, so turn *count* stays flat while new turns arrive; the tail key
+ * still changes on every new or streamed turn.
+ */
+export function computeLastTurnKey(turns: TranscriptTurn[]): string {
+  if (!turns || turns.length === 0) {
+    return "";
+  }
+  const last = turns[turns.length - 1];
+  return `${last.index}:${last.role}:${last.content?.length ?? 0}:${last.thinking?.length ?? 0}`;
+}
+
+export function hasNewTurnActivity(
+  prevCount: number,
+  prevLastTurnKey: string,
+  turns: TranscriptTurn[],
+): boolean {
+  const lastTurnKey = computeLastTurnKey(turns);
+  return (
+    turns.length > prevCount ||
+    (lastTurnKey !== "" && lastTurnKey !== prevLastTurnKey)
+  );
+}
 
 export const ALWAYS_SEND_NOW_STORAGE_KEY = "ferrodeck.always_send_now";
 
@@ -35,6 +128,8 @@ export interface ChatPaneProps {
   adapter?: string | null;
   sessionId?: string | null;
   turns?: TranscriptTurn[];
+  /** Server-measured context usage; estimates apply when absent. */
+  contextUsage?: SessionContextUsage | null;
   isBusy?: boolean;
   queue?: QueuedOperatorPrompt[];
   loading?: boolean;
@@ -76,6 +171,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   adapter,
   sessionId,
   turns,
+  contextUsage = null,
   isBusy,
   queue,
   loading = false,
@@ -92,6 +188,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [internalQueue, setInternalQueue] = React.useState<QueuedOperatorPrompt[]>([]);
   const [internalLoading, setInternalLoading] = React.useState<boolean>(false);
   const [internalError, setInternalError] = React.useState<string | null>(null);
+  const [internalContextUsage, setInternalContextUsage] =
+    React.useState<SessionContextUsage | null>(null);
+  const [compacting, setCompacting] = React.useState<boolean>(false);
+  const [compactFeedback, setCompactFeedback] = React.useState<string | null>(null);
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
   const [visibleTurnLimit, setVisibleTurnLimit] = React.useState<number>(100);
@@ -108,6 +208,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const prevTargetRef = React.useRef<string>("");
   const prevWsConnectedRef = React.useRef<boolean>(Boolean(wsConnected));
   const prevTurnCountRef = React.useRef<number>(0);
+  const prevLastTurnKeyRef = React.useRef<string>("");
   const isNearBottomRef = React.useRef<boolean>(true);
 
   const effectiveTurns = turns ?? internalTurns;
@@ -118,6 +219,78 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const targetSessionOrAgent = sessionId || agentName || "";
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
+
+  const contextEstimate = React.useMemo(
+    () =>
+      estimateSessionContextUsage(
+        effectiveTurns,
+        adapter,
+        contextUsage ?? internalContextUsage,
+      ),
+    [effectiveTurns, adapter, contextUsage, internalContextUsage],
+  );
+  const canCompact =
+    contextEstimate.percent >= 50 &&
+    Boolean(targetSessionOrAgent) &&
+    !compacting &&
+    !submitting;
+
+  const handleCompactContext = async () => {
+    if (!canCompact) {
+      return;
+    }
+    setCompacting(true);
+    setCompactFeedback(null);
+    setSubmitError(null);
+    // Best effort only: a missing checkpoint must not block compaction.
+    if (apiClient) {
+      try {
+        await apiClient.createStateCheckpoint({
+          summary: "Pre-compaction automatic checkpoint from FerroDeck",
+        });
+      } catch {
+        // Ignore checkpoint failures.
+      }
+    }
+    const payload: PromptRequest = { prompt: "/compact", send_now: true };
+    try {
+      if (onSendPrompt) {
+        await onSendPrompt(targetSessionOrAgent, payload);
+      } else if (apiClient) {
+        const res = await apiClient.sendSessionPrompt(targetSessionOrAgent, payload);
+        if (Array.isArray(res.queue)) {
+          setInternalQueue(res.queue);
+        }
+        if (typeof res.is_busy === "boolean") {
+          setInternalIsBusy(res.is_busy);
+        }
+        if (!res.queued && res.status !== "queued") {
+          const content = res.effective_body || payload.prompt;
+          setInternalTurns((prev) => [
+            ...prev,
+            {
+              index: prev.length,
+              role: "user",
+              content,
+              thinking: null,
+              tool_calls: [],
+              created_at: new Date().toISOString(),
+            },
+          ]);
+        }
+        void fetchTranscript();
+      } else {
+        throw new Error("No prompt route is configured for this session.");
+      }
+      setCompactFeedback("Sent /compact");
+      scrollToBottom("smooth");
+      requestAnimationFrame(() => scrollToBottom("smooth"));
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to send /compact");
+    } finally {
+      setCompacting(false);
+    }
+  };
 
   const scrollToBottom = React.useCallback(
     (behavior: ScrollBehavior = "auto") => {
@@ -188,6 +361,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setInternalTurns(response.turns ?? []);
       setInternalIsBusy(Boolean(response.is_busy));
       setInternalQueue(response.queue ?? []);
+      setInternalContextUsage(response.context_usage ?? null);
     } catch (err) {
       setInternalError(err instanceof Error ? err.message : "Failed to load transcript");
     } finally {
@@ -231,11 +405,22 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setVisibleTurnLimit(100);
   }, [targetSessionOrAgent]);
 
+  const lastTurnKey = React.useMemo(
+    () => computeLastTurnKey(filteredTurns),
+    [filteredTurns],
+  );
+
   React.useEffect(() => {
     const targetChanged = prevTargetRef.current !== targetSessionOrAgent;
     const reconnected = !prevWsConnectedRef.current && Boolean(wsConnected);
     const initialLoad = prevTurnCountRef.current === 0 && filteredTurns.length > 0;
-    const newTurnsArrived = filteredTurns.length > prevTurnCountRef.current;
+    // Count alone misses new turns in a full sliding window; the tail key
+    // changes on every new or streamed turn.
+    const newTurnsArrived = hasNewTurnActivity(
+      prevTurnCountRef.current,
+      prevLastTurnKeyRef.current,
+      filteredTurns,
+    );
 
     if (targetChanged) {
       prevTargetRef.current = targetSessionOrAgent;
@@ -255,9 +440,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
     prevWsConnectedRef.current = Boolean(wsConnected);
     prevTurnCountRef.current = filteredTurns.length;
+    prevLastTurnKeyRef.current = lastTurnKey;
   }, [
     targetSessionOrAgent,
     filteredTurns.length,
+    lastTurnKey,
+    filteredTurns,
     wsConnected,
     scrollToBottom,
     restoreOrScrollSession,
@@ -416,6 +604,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setAttachments([]);
       if (!wasQueued) {
         scrollToBottom("smooth");
+        // Run again after the optimistic turn and live indicator render.
+        requestAnimationFrame(() => scrollToBottom("smooth"));
       }
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : "Failed to send prompt");
@@ -482,6 +672,74 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >
             {effectiveIsBusy ? "Busy · Working" : "Idle"}
           </span>
+          <div
+            data-testid="context-level-meter"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              minWidth: "190px",
+            }}
+          >
+            <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+              Context: {formatTokenCount(contextEstimate.usedTokens)} /{" "}
+              {formatTokenCount(contextEstimate.maxTokens)} ({contextEstimate.percent}%)
+            </span>
+            <div
+              role="progressbar"
+              aria-label="Context level"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={contextEstimate.percent}
+              style={{
+                width: "64px",
+                height: "6px",
+                borderRadius: "3px",
+                backgroundColor: "var(--bg-input)",
+                border: "1px solid var(--border-subtle)",
+                overflow: "hidden",
+                flexShrink: 0,
+              }}
+            >
+              <div
+                style={{
+                  width: `${contextEstimate.percent}%`,
+                  height: "100%",
+                  backgroundColor:
+                    contextEstimate.percent >= 80
+                      ? "var(--status-danger)"
+                      : contextEstimate.percent >= 50
+                        ? "var(--status-stale)"
+                        : "var(--status-alive)",
+                }}
+              />
+            </div>
+          </div>
+          <button
+            type="button"
+            className={`fd-btn${canCompact ? " fd-btn-primary" : ""}`}
+            data-testid="compact-context-btn"
+            disabled={!canCompact}
+            title={
+              contextEstimate.percent >= 50
+                ? "Snapshot a FerroState checkpoint, then send /compact to the session"
+                : "Available when context reaches 50%"
+            }
+            onClick={() => void handleCompactContext()}
+            style={{ whiteSpace: "nowrap" }}
+          >
+            {compacting ? "Compacting..." : "Compact Context"}
+          </button>
+          {compactFeedback && (
+            <span
+              role="status"
+              data-testid="compact-feedback"
+              className="fd-badge"
+              style={{ color: "var(--diff-add-text)" }}
+            >
+              {compactFeedback}
+            </span>
+          )}
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
@@ -584,15 +842,26 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 </button>
               </div>
             )}
-            {displayedTurns.map((turn) => (
+            {displayedTurns.map((turn, idx) => (
               <TurnCard
                 key={`${turn.index}-${turn.created_at ?? ""}`}
                 turn={turn}
                 agentDisplayName={agentDisplayName ?? agentName ?? undefined}
+                isActive={effectiveIsBusy && idx === displayedTurns.length - 1}
               />
             ))}
           </>
         )}
+
+        {effectiveIsBusy &&
+          !displayedTurns[displayedTurns.length - 1]?.thinking?.trim() && (
+            <div data-testid="live-thinking-indicator">
+              <ThinkingBlock
+                thinking="Agent is reasoning and processing the current step..."
+                isActive
+              />
+            </div>
+          )}
       </div>
 
       {/* Unified Prompt Composer */}

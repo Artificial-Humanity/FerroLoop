@@ -7,6 +7,30 @@ import { ToolCallBlock } from "./ToolCallBlock";
 export interface TurnCardProps {
   turn: TranscriptTurn;
   agentDisplayName?: string;
+  /** True for the latest turn while the session is busy (live thinking). */
+  isActive?: boolean;
+}
+
+/** One-line collapsed summary for a Wire message body. */
+export function summarizeWireContent(
+  content: string,
+  wireSender?: string | null,
+): string {
+  const raw = content || "";
+  const lines = raw.split("\n");
+  const lineLabel = `${lines.length} ${lines.length === 1 ? "line" : "lines"}`;
+  const label = wireSender ? `Wire · ${wireSender}` : "Wire";
+  const subject = raw.match(/^\s*Subject:\s*(.+)$/m)?.[1]?.trim();
+  if (subject) {
+    const preview = subject.length > 80 ? `${subject.slice(0, 80)}…` : subject;
+    return `${label} — ${preview} (${lineLabel})`;
+  }
+  const firstLine = lines.find((line) => line.trim().length > 0)?.trim() ?? "";
+  if (!firstLine) {
+    return `${label} (${lineLabel})`;
+  }
+  const preview = firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine;
+  return `${label} — ${preview} (${lineLabel})`;
 }
 
 interface ContentSegment {
@@ -83,14 +107,24 @@ export function extractTurnAttachments(content: string): {
   return { cleanedContent, attachments };
 }
 
-export const TurnCard: React.FC<TurnCardProps> = ({ turn, agentDisplayName }) => {
+export const TurnCard: React.FC<TurnCardProps> = ({
+  turn,
+  agentDisplayName,
+  isActive = false,
+}) => {
   const roleNormalized = (turn.role || "assistant").toLowerCase();
-  const isUser = roleNormalized === "user";
+  // Defensive: hub normalization can mislabel background task completions
+  // as operator turns; the content shape is unambiguous tool output.
+  const looksLikeBackgroundTaskOutput = /^Task id "[^"]+" finished with result:/i.test(
+    turn.content.trimStart(),
+  );
+  const isUser = roleNormalized === "user" && !looksLikeBackgroundTaskOutput;
   const isWire = roleNormalized.startsWith("wire:");
   const wireSender = isWire ? turn.role.slice(5) : null;
   const isSystem = roleNormalized === "system";
   const isToolOutput =
     roleNormalized === "tool" ||
+    looksLikeBackgroundTaskOutput ||
     (!isUser &&
       !isSystem &&
       !isWire &&
@@ -98,6 +132,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({ turn, agentDisplayName }) =>
       (!turn.tool_calls || turn.tool_calls.length === 0));
 
   const [toolOutputExpanded, setToolOutputExpanded] = React.useState(false);
+  const [wireExpanded, setWireExpanded] = React.useState(false);
   const [expandedCodeBlocks, setExpandedCodeBlocks] = React.useState<Record<number, boolean>>({});
 
   const roleLabel = isUser
@@ -155,6 +190,11 @@ export const TurnCard: React.FC<TurnCardProps> = ({ turn, agentDisplayName }) =>
     return `Tool / Terminal Output (${lines.length} ${lines.length === 1 ? "line" : "lines"})${suffix}`;
   }, [isToolOutput, cleanedContent, turn.content]);
 
+  const wireSummary = React.useMemo(() => {
+    if (!isWire) return "";
+    return summarizeWireContent(cleanedContent || turn.content || "", wireSender);
+  }, [isWire, cleanedContent, turn.content, wireSender]);
+
   return (
     <article
       className="fd-card"
@@ -196,7 +236,9 @@ export const TurnCard: React.FC<TurnCardProps> = ({ turn, agentDisplayName }) =>
         )}
       </header>
 
-      {hasThinking && turn.thinking && <ThinkingBlock thinking={turn.thinking} />}
+      {hasThinking && turn.thinking && (
+        <ThinkingBlock thinking={turn.thinking} isActive={isActive} />
+      )}
 
       {toolCalls.length > 0 && (
         <div
@@ -213,7 +255,59 @@ export const TurnCard: React.FC<TurnCardProps> = ({ turn, agentDisplayName }) =>
         </div>
       )}
 
-      {isToolOutput && (cleanedContent || turn.content) ? (
+      {isWire && segments.length > 0 && (
+        <div
+          style={{
+            borderRadius: "var(--radius-sm)",
+            border: "1px solid var(--border-subtle)",
+            backgroundColor: "rgba(13, 17, 24, 0.65)",
+            overflow: "hidden",
+          }}
+        >
+          <button
+            type="button"
+            data-testid="wire-output-toggle"
+            aria-expanded={wireExpanded}
+            onClick={() => setWireExpanded((prev) => !prev)}
+            style={{
+              width: "100%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              padding: "6px 10px",
+              background: "transparent",
+              border: "none",
+              color: "var(--text-secondary)",
+              cursor: "pointer",
+              fontSize: "11px",
+              textAlign: "left",
+            }}
+          >
+            <span className="fd-mono" style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}>
+              <span style={{ color: "var(--accent-primary)" }}>
+                {wireExpanded ? "▼" : "▶"}
+              </span>
+              <span
+                style={{
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {wireSummary}
+              </span>
+            </span>
+            <span style={{ color: "var(--text-dim)", fontSize: "11px", flexShrink: 0 }}>
+              {wireExpanded ? "Hide message" : "Show message"}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {(!isWire || wireExpanded) && (
+        <>
+          {isToolOutput && (cleanedContent || turn.content) ? (
         <div
           data-testid={`turn-content-${turn.index}`}
           style={{
@@ -385,7 +479,9 @@ export const TurnCard: React.FC<TurnCardProps> = ({ turn, agentDisplayName }) =>
               );
             })}
           </div>
-        )
+          )
+          )}
+        </>
       )}
 
       {attachments.length > 0 && (

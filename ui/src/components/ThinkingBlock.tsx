@@ -4,11 +4,14 @@ import { RichMarkdown } from "./RichMarkdown";
 export interface ThinkingBlockProps {
   thinking: string;
   defaultExpanded?: boolean;
+  /** True while this block belongs to the turn the agent is still producing. */
+  isActive?: boolean;
 }
 
 export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
   thinking,
   defaultExpanded = false,
+  isActive = false,
 }) => {
   const [expanded, setExpanded] = React.useState<boolean>(defaultExpanded);
 
@@ -24,6 +27,7 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
     <div
       className="fd-card"
       data-testid="thinking-block"
+      data-active={isActive ? "true" : "false"}
       style={{
         padding: "8px 10px",
         backgroundColor: "rgba(13, 17, 24, 0.72)",
@@ -59,7 +63,14 @@ export const ThinkingBlock: React.FC<ThinkingBlockProps> = ({
           >
             {expanded ? "▼" : "▶"}
           </span>
-          <span>Thinking trace</span>
+          <span>Thinking...</span>
+          {isActive && (
+            <span
+              className="fd-thinking-dot"
+              data-testid="thinking-activity-dot"
+              aria-hidden="true"
+            />
+          )}
         </span>
         <span className="fd-badge" style={{ fontSize: "10px", color: "var(--text-muted)" }}>
           {lineCount} {lineCount === 1 ? "line" : "lines"} · {charCount} chars

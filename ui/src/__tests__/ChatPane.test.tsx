@@ -71,7 +71,7 @@ describe("ChatPane", () => {
     );
 
     // Collapsed by default
-    const toggleBtn = screen.getByRole("button", { name: /Thinking trace/i });
+    const toggleBtn = screen.getByRole("button", { name: /Thinking\.\.\./i });
     expect(toggleBtn).toHaveAttribute("aria-expanded", "false");
     expect(
       screen.queryByText(/First I should inspect the hub health endpoint\./i),
