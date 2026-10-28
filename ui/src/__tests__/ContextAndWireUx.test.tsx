@@ -197,11 +197,19 @@ describe("estimateSessionContextUsage", () => {
     expect(usage.percent).toBeLessThan(50);
   });
 
-  it("uses 1M windows for antigravity-family adapters and formats millions", () => {
-    for (const adapter of ["antigravity", "agy", "argon", "gemini"]) {
+  it("uses 1M windows for antigravity-family and muse adapters and formats millions", () => {
+    for (const adapter of [
+      "antigravity",
+      "agy",
+      "argon",
+      "gemini",
+      "muse",
+      "muse-wonder",
+      "muse-wonder-full",
+    ]) {
       expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(1_000_000);
     }
-    for (const adapter of ["claude", "codex", "muse"]) {
+    for (const adapter of ["claude", "codex"]) {
       expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(200_000);
     }
     expect(formatTokenCount(1_000_000)).toBe("1m");

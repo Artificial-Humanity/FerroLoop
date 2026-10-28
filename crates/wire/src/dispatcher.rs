@@ -179,28 +179,20 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             }
             Ok(())
         }
-        VendorRoute::Muse { session_id, cwd } => {
-            let bin = std::env::var_os("FL_WIRE_MUSE_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("muse"));
+        VendorRoute::Muse {
+            session_id,
+            cwd,
+            tmux_target,
+            tmux_pane,
+        } => {
             let formatted = format_push_message(msg);
-            let mut cmd = Command::new(&bin);
-            cmd.env("MUSE_NO_AUTO_UPDATE", "1");
-            cmd.args(["exec", "--session-id", session_id, "--json", &formatted])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            if let Some(dir) = cwd
-                && dir.exists()
-            {
-                cmd.current_dir(dir);
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
-            if !status.success() {
-                return Err(format!("muse exec exited with {status}"));
-            }
-            Ok(())
+            deliver_to_muse_route(
+                session_id,
+                cwd.as_ref(),
+                tmux_target.as_deref(),
+                tmux_pane.as_deref(),
+                &formatted,
+            )
         }
         VendorRoute::Grok { session_id, cwd } => {
             let bin = std::env::var_os("FL_WIRE_GROK_BIN")
@@ -254,6 +246,151 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
 
 /// Deliver a human operator chat prompt from FerroDeck directly to a live vendor session
 /// without creating a FerroWire `WireMessage` or inbox entry.
+fn deliver_to_muse_route(
+    session_id: &str,
+    cwd: Option<&PathBuf>,
+    tmux_target: Option<&str>,
+    tmux_pane: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    let use_tmux = std::env::var_os("FL_WIRE_TMUX_BIN").is_some()
+        || std::env::var_os("FL_WIRE_MUSE_BIN").is_none();
+    if use_tmux {
+        let mut candidates = Vec::new();
+        if let Some(t) = tmux_target.map(str::trim).filter(|s| !s.is_empty()) {
+            candidates.push(t.to_string());
+        }
+        if let Some(p) = tmux_pane.map(str::trim).filter(|s| !s.is_empty())
+            && !candidates.iter().any(|c| c == p)
+        {
+            candidates.push(p.to_string());
+        }
+        for target in &candidates {
+            if tmux_target_alive(target) {
+                return deliver_via_tmux_paste(target, text);
+            }
+        }
+    }
+
+    let bin = std::env::var_os("FL_WIRE_MUSE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("muse"));
+    let mut cmd = Command::new(&bin);
+    cmd.env("MUSE_NO_AUTO_UPDATE", "1");
+    cmd.args(["exec", "--session-id", session_id, "--json", text])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(dir) = cwd
+        && dir.exists()
+    {
+        cmd.current_dir(dir);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
+    if !status.success() {
+        return Err(format!("muse exec exited with {status}"));
+    }
+    Ok(())
+}
+
+fn tmux_bin() -> PathBuf {
+    std::env::var_os("FL_WIRE_TMUX_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("tmux"))
+}
+
+fn tmux_target_alive(target: &str) -> bool {
+    let Ok(out) = Command::new(tmux_bin())
+        .args(["display-message", "-p", "-t", target, "#{pane_id}"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+}
+
+fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
+    let tmux = tmux_bin();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let buf_name = format!("fl-wire-muse-{}-{nanos}", std::process::id());
+    let payload = format!("{}\n", text.trim());
+
+    let mut load_child = Command::new(&tmux)
+        .args(["load-buffer", "-b", &buf_name, "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn tmux load-buffer: {e}"))?;
+    if let Some(mut stdin) = load_child.stdin.take() {
+        stdin
+            .write_all(payload.as_bytes())
+            .map_err(|e| format!("failed to write to tmux load-buffer stdin: {e}"))?;
+    }
+    let load_status = load_child
+        .wait()
+        .map_err(|e| format!("failed waiting on tmux load-buffer: {e}"))?;
+    if !load_status.success() {
+        return Err(format!("tmux load-buffer exited with {load_status}"));
+    }
+
+    let paste_status = Command::new(&tmux)
+        .args(["paste-buffer", "-d", "-b", &buf_name, "-t", target])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("failed to spawn tmux paste-buffer: {e}"))?;
+    if !paste_status.success() {
+        let _ = Command::new(&tmux)
+            .args(["delete-buffer", "-b", &buf_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        return Err(format!("tmux paste-buffer exited with {paste_status}"));
+    }
+
+    let skip_sleep = std::env::var_os("FL_WIRE_TMUX_BIN").is_some();
+    if !skip_sleep {
+        std::thread::sleep(Duration::from_millis(350));
+    }
+
+    let enter_status = Command::new(&tmux)
+        .args(["send-keys", "-t", target, "Enter"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("failed to spawn tmux send-keys: {e}"))?;
+    if !enter_status.success() {
+        return Err(format!("tmux send-keys exited with {enter_status}"));
+    }
+
+    if !skip_sleep {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if let Ok(cap) = Command::new(&tmux)
+        .args(["capture-pane", "-p", "-t", target, "-S", "-8"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        && cap.status.success()
+        && String::from_utf8_lossy(&cap.stdout).contains("[Pasted Content")
+    {
+        let _ = Command::new(&tmux)
+            .args(["send-keys", "-t", target, "Enter"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    Ok(())
+}
+
 pub fn dispatch_operator_prompt_to_route(
     route: &VendorRoute,
     sender_name: &str,
@@ -390,28 +527,18 @@ pub fn dispatch_operator_prompt_to_route(
             }
             Ok(())
         }
-        VendorRoute::Muse { session_id, cwd } => {
-            let bin = std::env::var_os("FL_WIRE_MUSE_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("muse"));
-            let mut cmd = Command::new(&bin);
-            cmd.env("MUSE_NO_AUTO_UPDATE", "1");
-            cmd.args(["exec", "--session-id", session_id, "--json", body])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            if let Some(dir) = cwd
-                && dir.exists()
-            {
-                cmd.current_dir(dir);
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
-            if !status.success() {
-                return Err(format!("muse exec exited with {status}"));
-            }
-            Ok(())
-        }
+        VendorRoute::Muse {
+            session_id,
+            cwd,
+            tmux_target,
+            tmux_pane,
+        } => deliver_to_muse_route(
+            session_id,
+            cwd.as_ref(),
+            tmux_target.as_deref(),
+            tmux_pane.as_deref(),
+            body,
+        ),
         VendorRoute::Grok { session_id, cwd } => {
             let bin = std::env::var_os("FL_WIRE_GROK_BIN")
                 .map(PathBuf::from)
@@ -700,6 +827,8 @@ mod tests {
             &VendorRoute::Muse {
                 session_id: "ms-42".into(),
                 cwd: Some(tmp.path().to_path_buf()),
+                tmux_target: None,
+                tmux_pane: None,
             },
             &msg,
         )
@@ -715,6 +844,48 @@ mod tests {
         assert_eq!(muse_lines[3], "ms-42");
         assert_eq!(muse_lines[4], "--json");
         assert!(muse_lines[5].contains("muse check"));
+
+        let tmux_out = tmp.path().join("tmux.out");
+        let tmux_stdin_out = tmp.path().join("tmux.stdin");
+        let tmux_bin = tmp.path().join("fake-tmux.sh");
+        fs::write(
+            &tmux_bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  echo \"%9\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nelif [ \"$1\" = \"capture-pane\" ]; then\n  echo \"[Pasted Content 28 chars]\"\nfi\n",
+                tmux_out.display(),
+                tmux_stdin_out.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmux_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        unsafe {
+            std::env::set_var("FL_WIRE_TMUX_BIN", &tmux_bin);
+        }
+        dispatch_operator_prompt_to_route(
+            &VendorRoute::Muse {
+                session_id: "ms-42".into(),
+                cwd: Some(tmp.path().to_path_buf()),
+                tmux_target: Some("muse:felicia".into()),
+                tmux_pane: Some("%9".into()),
+            },
+            "owner",
+            "Hello Felicia via tmux",
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var("FL_WIRE_TMUX_BIN");
+        }
+        let tmux_cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(tmux_cmds.contains("display-message -p -t muse:felicia #{pane_id}"));
+        assert!(tmux_cmds.contains("load-buffer -b fl-wire-muse-"));
+        assert!(tmux_cmds.contains("-t muse:felicia"));
+        assert!(tmux_cmds.contains("send-keys -t muse:felicia Enter"));
+        let pasted_stdin = fs::read_to_string(&tmux_stdin_out).unwrap();
+        assert_eq!(pasted_stdin.trim(), "Hello Felicia via tmux");
 
         dispatch_to_route(
             &VendorRoute::Grok {

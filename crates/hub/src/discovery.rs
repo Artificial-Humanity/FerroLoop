@@ -177,7 +177,9 @@ pub fn discover_sessions_with_home(
                     tpath,
                 )
             }
-            VendorRoute::Muse { session_id, cwd } => {
+            VendorRoute::Muse {
+                session_id, cwd, ..
+            } => {
                 let tpath = home
                     .as_deref()
                     .and_then(|h| find_transcript_file_in_home(h, session_id));
@@ -405,6 +407,18 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
 
         if let Some(muse_turn) = parse_muse_event_turn(&val, created_at.clone(), turns.len()) {
             turns.push(muse_turn);
+            continue;
+        }
+        if is_muse_run_completed_terminal(&val) && is_transcript_busy(&turns) {
+            let index = turns.len();
+            turns.push(TranscriptTurn {
+                index,
+                role: "assistant".to_string(),
+                content: "(Run completed.)".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                created_at,
+            });
             continue;
         }
 
@@ -916,11 +930,46 @@ fn parse_muse_event_turn(
                         created_at,
                     })
                 }
+                "terminal" => {
+                    let terminal = ev
+                        .get("terminal")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
+                    if matches!(terminal, "failed" | "cancelled" | "aborted") {
+                        let reason = ev
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("Run ended without an assistant reply.");
+                        Some(TranscriptTurn {
+                            index,
+                            role: "assistant".to_string(),
+                            content: format!("⚠️ **Run {terminal}:** {reason}"),
+                            thinking: None,
+                            tool_calls: Vec::new(),
+                            created_at,
+                        })
+                    } else {
+                        None
+                    }
+                }
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+fn is_muse_run_completed_terminal(val: &Value) -> bool {
+    val.get("payload_type").and_then(Value::as_str) == Some("runtime.session")
+        && val.pointer("/payload/kind").and_then(Value::as_str) == Some("run")
+        && val.pointer("/payload/event/kind").and_then(Value::as_str) == Some("terminal")
+        && val
+            .pointer("/payload/event/terminal")
+            .and_then(Value::as_str)
+            == Some("completed")
 }
 
 fn slugify_worktree_path(path: &Path) -> String {
@@ -1680,5 +1729,48 @@ mod tests {
             "Peer session greeted Felicia; I replied with a hello back."
         );
         assert!(!is_transcript_busy(&turns));
+
+        // Verify that a subsequent user turn followed by a Muse terminal failure event
+        // surfaces the error turn and leaves the session non-busy so prompts do not stall in queue.
+        let quota_failed_jsonl = [
+            jsonl.as_str(),
+            &serde_json::json!({
+                "schema_version": 1,
+                "recorded_at": 1_793_198_990_000_000_i64,
+                "payload_type": "runtime.user_intent.accepted",
+                "payload": {
+                    "model_messages": [
+                        { "content": "Check status please" }
+                    ]
+                }
+            })
+            .to_string(),
+            &serde_json::json!({
+                "schema_version": 1,
+                "recorded_at": 1_793_198_995_473_433_i64,
+                "payload_type": "runtime.session",
+                "payload": {
+                    "kind": "run",
+                    "event": {
+                        "kind": "terminal",
+                        "terminal": "failed",
+                        "reason": "API error 429: Subscription quota exhausted. Your usage window resets at 2026-11-02T00:00:00Z."
+                    }
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        let failed_turns = parse_jsonl_transcript(&quota_failed_jsonl);
+        assert_eq!(failed_turns.len(), 5);
+        assert_eq!(failed_turns[3].role, "user");
+        assert_eq!(failed_turns[3].content, "Check status please");
+        assert_eq!(failed_turns[4].role, "assistant");
+        assert!(
+            failed_turns[4]
+                .content
+                .contains("Subscription quota exhausted")
+        );
+        assert!(!is_transcript_busy(&failed_turns));
     }
 }

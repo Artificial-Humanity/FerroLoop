@@ -42,6 +42,10 @@ pub enum VendorRoute {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_pane: Option<String>,
     },
     Grok {
         session_id: String,
@@ -108,9 +112,31 @@ impl RouteTable {
 
     pub fn merge_newer(&mut self, other: Self) {
         for (k, v) in other.entries {
-            match self.entries.get(&k) {
+            match self.entries.get_mut(&k) {
                 Some(existing)
-                    if existing.updated_at.unix_millis() >= v.updated_at.unix_millis() => {}
+                    if existing.updated_at.unix_millis() >= v.updated_at.unix_millis() =>
+                {
+                    if let (
+                        VendorRoute::Muse {
+                            tmux_target: existing_target,
+                            tmux_pane: existing_pane,
+                            ..
+                        },
+                        VendorRoute::Muse {
+                            tmux_target: other_target,
+                            tmux_pane: other_pane,
+                            ..
+                        },
+                    ) = (&mut existing.route, &v.route)
+                    {
+                        if existing_target.is_none() {
+                            *existing_target = other_target.clone();
+                        }
+                        if existing_pane.is_none() {
+                            *existing_pane = other_pane.clone();
+                        }
+                    }
+                }
                 _ => {
                     self.entries.insert(k, v);
                 }
@@ -498,7 +524,39 @@ impl RouteTable {
                     continue;
                 };
                 let (session_id, cwd) = extract_session_id_and_cwd(&path, stem);
-                self.upsert(&persona, VendorRoute::Muse { session_id, cwd }, at.clone());
+                let (existing_target, existing_pane) = match self.entries.get(&persona) {
+                    Some(RouteEntry {
+                        route:
+                            VendorRoute::Muse {
+                                tmux_target,
+                                tmux_pane,
+                                ..
+                            },
+                        ..
+                    }) => (tmux_target.clone(), tmux_pane.clone()),
+                    _ => (None, None),
+                };
+                self.upsert(
+                    &persona,
+                    VendorRoute::Muse {
+                        session_id,
+                        cwd,
+                        tmux_target: existing_target,
+                        tmux_pane: existing_pane,
+                    },
+                    at.clone(),
+                );
+            }
+        }
+        if !has_home_override
+            && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
+        {
+            for (persona, entry) in &mut self.entries {
+                if let VendorRoute::Muse { tmux_target, .. } = &mut entry.route
+                    && tmux_target.is_none()
+                {
+                    *tmux_target = Some(format!("muse:{persona}"));
+                }
             }
         }
     }
@@ -647,7 +705,24 @@ fn parse_legacy_route_item(item: &serde_json::Value) -> Option<VendorRoute> {
                 .as_str()?
                 .to_string();
             let cwd = item.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-            Some(VendorRoute::Muse { session_id, cwd })
+            let tmux_target = item
+                .get("tmux_target")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            let tmux_pane = item
+                .get("tmux_pane")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            Some(VendorRoute::Muse {
+                session_id,
+                cwd,
+                tmux_target,
+                tmux_pane,
+            })
         }
         "grok" => {
             let session_id = item
@@ -795,6 +870,10 @@ pub fn capture_current_env_route() -> Option<VendorRoute> {
         return Some(VendorRoute::Muse {
             session_id,
             cwd: std::env::current_dir().ok(),
+            tmux_target: None,
+            tmux_pane: std::env::var("TMUX_PANE")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         });
     }
     if let Ok(session_id) = std::env::var("GROK_SESSION_ID")

@@ -1758,11 +1758,17 @@ fn classify_artifact_kind(path: &Path) -> &'static str {
 }
 
 fn is_forbidden_artifact_path(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    let in_fl_attachments =
+        normalized.contains("/.fl/attachments/") || normalized.ends_with("/.fl/attachments");
     for comp in path.components() {
         if let std::path::Component::Normal(os) = comp {
             let seg = os.to_string_lossy().to_ascii_lowercase();
             if seg == ".git"
-                || seg == ".fl"
+                || (seg == ".fl" && !in_fl_attachments)
                 || seg == "secrets"
                 || seg == ".env"
                 || seg.starts_with(".env.")
@@ -1777,13 +1783,9 @@ fn is_forbidden_artifact_path(path: &Path) -> bool {
             }
         }
     }
-    let normalized = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
     normalized.contains("/.fl/gate/vault")
         || normalized.ends_with("/.fl/gate")
-        || normalized.contains("/.fl/")
+        || (normalized.contains("/.fl/") && !in_fl_attachments)
         || normalized.contains("/.git/")
         || normalized.contains("/secrets/")
 }
@@ -2051,17 +2053,30 @@ fn handle_get_artifacts_list(
             state.config.home_override.as_deref(),
         );
         for turn in turns.iter().rev().take(60) {
-            for token in turn.content.split_whitespace() {
-                if let Some(rest) = token.strip_prefix("file:///") {
-                    let clean = rest
-                        .trim_end_matches(|c: char| {
-                            matches!(c, ')' | ']' | '>' | '"' | '\'' | ',' | '.')
-                        })
+            let mut remainder = turn.content.as_str();
+            while let Some(pos) = remainder.find("file:///") {
+                let valid_prefix = pos == 0
+                    || remainder[..pos].chars().next_back().is_some_and(|c| {
+                        c.is_whitespace() || matches!(c, '(' | '<' | '"' | '\'' | '`')
+                    });
+                let after = &remainder[pos + "file:///".len()..];
+                let end = after
+                    .find(|c: char| {
+                        c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | '`')
+                    })
+                    .unwrap_or(after.len());
+                if valid_prefix {
+                    let raw_target = &after[..end];
+                    let clean = raw_target
+                        .trim_end_matches(['.', ',', ';'])
                         .split('#')
                         .next()
-                        .unwrap_or(rest);
-                    candidate_paths.push(PathBuf::from(format!("/{clean}")));
+                        .unwrap_or(raw_target);
+                    if !clean.is_empty() {
+                        candidate_paths.push(PathBuf::from(format!("/{clean}")));
+                    }
                 }
+                remainder = &after[end..];
             }
         }
     }
@@ -2372,6 +2387,31 @@ fn resolve_session_target(
     (trimmed.to_string(), Some(trimmed.to_ascii_lowercase()))
 }
 
+fn route_matches_session_id(route: &fl_wire::identity::VendorRoute, raw_id: &str) -> bool {
+    let trimmed = raw_id.trim();
+    match route {
+        fl_wire::identity::VendorRoute::Claude { session_id, .. } => {
+            session_id == trimmed || trimmed.strip_prefix("claude-") == Some(session_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Agy {
+            conversation_id, ..
+        } => {
+            conversation_id == trimmed
+                || trimmed.strip_prefix("agy-") == Some(conversation_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Codex { thread_id, .. } => {
+            thread_id == trimmed || trimmed.strip_prefix("codex-") == Some(thread_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Muse { session_id, .. } => {
+            session_id == trimmed || trimmed.strip_prefix("muse-") == Some(session_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Grok { session_id, .. } => {
+            session_id == trimmed || trimmed.strip_prefix("grok-") == Some(session_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Webhook { .. } => false,
+    }
+}
+
 fn dispatch_operator_prompt_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -2388,6 +2428,13 @@ fn dispatch_operator_prompt_for_session(
     routes.discover_routes(state.config.home_override.as_deref(), stamp::now());
     let lookup_key = persona.unwrap_or(fallback_session_id);
     if let Some(entry) = routes.get(lookup_key) {
+        return dispatch_operator_prompt_to_route(&entry.route, sender_name, effective_body);
+    }
+    if let Some(entry) = routes
+        .entries
+        .values()
+        .find(|e| route_matches_session_id(&e.route, fallback_session_id))
+    {
         return dispatch_operator_prompt_to_route(&entry.route, sender_name, effective_body);
     }
     Err(format!("no active vendor route for `{lookup_key}`"))
@@ -2407,14 +2454,18 @@ pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
                 &item.by,
                 &item.effective_body,
             );
-            state.mark_session_in_flight(store, &session_id);
+            if delivery_res.is_ok() {
+                state.mark_session_in_flight(store, &session_id);
+            }
+            let now_busy = delivery_res.is_ok() || state.is_session_busy(store, &session_id);
             let sent_data = json!({
                 "session_id": item.session_id,
                 "persona": item.persona,
                 "status": "sent",
                 "queued": false,
-                "is_busy": true,
+                "is_busy": now_busy,
                 "delivered": delivery_res.is_ok(),
+                "delivery_error": delivery_res.as_ref().err(),
                 "prompt_id": item.id,
                 "prompt": item.prompt,
                 "effective_body": item.effective_body,
@@ -2429,7 +2480,7 @@ pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
                 json!({
                     "session_id": item.session_id,
                     "persona": item.persona,
-                    "is_busy": true,
+                    "is_busy": now_busy,
                     "queue": queue,
                 }),
             );
@@ -2458,15 +2509,19 @@ fn handle_post_queued_prompt_send_now(
         &item.by,
         &item.effective_body,
     );
-    state.mark_session_in_flight(store, &canonical_id);
+    if delivery_res.is_ok() {
+        state.mark_session_in_flight(store, &canonical_id);
+    }
+    let now_busy = delivery_res.is_ok() || state.is_session_busy(store, &canonical_id);
 
     let data = json!({
         "session_id": canonical_id,
         "persona": item.persona.clone().or(target_persona.clone()),
         "status": "sent",
         "queued": false,
-        "is_busy": true,
+        "is_busy": now_busy,
         "delivered": delivery_res.is_ok(),
+        "delivery_error": delivery_res.as_ref().err(),
         "prompt_id": prompt_id,
         "prompt": item.prompt,
         "effective_body": item.effective_body,
@@ -2481,7 +2536,7 @@ fn handle_post_queued_prompt_send_now(
         json!({
             "session_id": canonical_id,
             "persona": item.persona.or(target_persona),
-            "is_busy": true,
+            "is_busy": now_busy,
             "queue": queue,
         }),
     );
@@ -2692,7 +2747,10 @@ fn handle_post_session_prompt(
         &sender_name,
         &effective_body,
     );
-    state.mark_session_in_flight(store, &canonical_session_id);
+    if delivery_res.is_ok() {
+        state.mark_session_in_flight(store, &canonical_session_id);
+    }
+    let now_busy = delivery_res.is_ok() || state.is_session_busy(store, &canonical_session_id);
     let queue = state.session_queue(&canonical_session_id);
 
     let data = json!({
@@ -2700,8 +2758,9 @@ fn handle_post_session_prompt(
         "persona": target_persona,
         "status": "sent",
         "queued": false,
-        "is_busy": true,
+        "is_busy": now_busy,
         "delivered": delivery_res.is_ok(),
+        "delivery_error": delivery_res.as_ref().err(),
         "prompt": prompt_text,
         "effective_body": effective_body,
         "by": sender_name,
