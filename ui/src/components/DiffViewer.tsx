@@ -301,6 +301,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             className={`fd-btn ${mode === "unified" ? "fd-btn-active" : ""}`}
             aria-pressed={mode === "unified"}
             onClick={() => setMode("unified")}
+            disabled={visibleFiles.length === 0}
           >
             Unified
           </button>
@@ -309,8 +310,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             className={`fd-btn ${mode === "split" ? "fd-btn-active" : ""}`}
             aria-pressed={mode === "split"}
             onClick={() => setMode("split")}
+            disabled={visibleFiles.length === 0}
           >
-            Split
+            Side-by-Side
           </button>
         </div>
       </div>

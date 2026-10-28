@@ -8,12 +8,14 @@ import {
   isUserDirectedAssistantTurn,
   LAST_SEEN_ASSISTANT_TURN_STORAGE_KEY,
   preserveOptimisticTurn,
+  THEME_STORAGE_KEY,
   transcriptPollIntervalMs,
 } from "../App";
 import type { HubWsClient } from "../api/ws";
 import {
   ChatPane,
   computeLastTurnKey,
+  formatTokenCount,
   estimateSessionContextUsage,
   hasNewTurnActivity,
 } from "../components/ChatPane";
@@ -193,6 +195,18 @@ describe("estimateSessionContextUsage", () => {
     // Only the boundary turn and the short follow-up count toward usage.
     expect(usage.usedTokens).toBeLessThan(13_000);
     expect(usage.percent).toBeLessThan(50);
+  });
+
+  it("uses 1M windows for antigravity-family adapters and formats millions", () => {
+    for (const adapter of ["antigravity", "agy", "argon", "gemini"]) {
+      expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(1_000_000);
+    }
+    for (const adapter of ["claude", "codex", "muse"]) {
+      expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(200_000);
+    }
+    expect(formatTokenCount(1_000_000)).toBe("1m");
+    expect(formatTokenCount(1_500_000)).toBe("1.5m");
+    expect(formatTokenCount(200_000)).toBe("200k");
   });
 
   it("prefers server usage and uses the grok context window", () => {
@@ -615,6 +629,49 @@ describe("roster unread badges", () => {
     expect(
       window.localStorage.getItem(LAST_SEEN_ASSISTANT_TURN_STORAGE_KEY),
     ).toContain('\"jarvis\":6');
+
+    unmount();
+  });
+});
+
+describe("App theme toggle", () => {
+  it("switches document theme between dark and light and persists it", async () => {
+    window.localStorage.removeItem(THEME_STORAGE_KEY);
+    document.documentElement.removeAttribute("data-theme");
+
+    const fetchImpl = vi.fn(async () =>
+      new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    const toggle = await screen.findByTestId("theme-toggle-btn");
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    // Applying the system-derived default must not persist it.
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBeNull();
+    expect(toggle).toHaveTextContent(/Light/);
+
+    fireEvent.click(toggle);
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("light");
+    expect(toggle).toHaveTextContent(/Dark/);
+
+    fireEvent.click(toggle);
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
 
     unmount();
   });

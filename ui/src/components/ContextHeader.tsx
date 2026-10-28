@@ -16,6 +16,8 @@ export interface ContextHeaderProps {
   onSelectTab: (tab: CockpitTab) => void;
   splitView: boolean;
   onToggleSplitView: () => void;
+  themeMode?: "dark" | "light";
+  onToggleTheme?: () => void;
   authority?: HubAuthority | null;
   wsConnected?: boolean;
   onOpenPairingModal: () => void;
@@ -42,6 +44,8 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
   onSelectTab,
   splitView,
   onToggleSplitView,
+  themeMode = "dark",
+  onToggleTheme,
   authority,
   wsConnected = false,
   onOpenPairingModal,
@@ -95,20 +99,32 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
 
         {agentSessions.length > 0 && (
           <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-            <select
-              aria-label="Active Session"
-              data-testid="session-selector"
-              className="fd-select fd-mono"
-              style={{ fontSize: "11px", padding: "4px 8px" }}
-              value={activeSession?.id ?? ""}
-              onChange={(e) => onSelectSession(e.target.value)}
-            >
-              {agentSessions.map((sess) => (
-                <option key={sess.id} value={sess.id}>
-                  [{sess.adapter}] {sess.persona || "session"} ({sess.id.slice(-8)})
-                </option>
-              ))}
-            </select>
+            {agentSessions.length > 1 ? (
+              <select
+                aria-label="Active Session"
+                data-testid="session-selector"
+                className="fd-select fd-mono"
+                style={{ fontSize: "11px", padding: "4px 8px" }}
+                value={activeSession?.id ?? ""}
+                onChange={(e) => onSelectSession(e.target.value)}
+              >
+                {agentSessions.map((sess) => (
+                  <option key={sess.id} value={sess.id}>
+                    [{sess.adapter}] {sess.persona || "session"} ({sess.id.slice(-8)})
+                  </option>
+                ))}
+              </select>
+            ) : (
+              activeSession && (
+                <span
+                  className="fd-badge fd-mono"
+                  data-testid="session-id-pill"
+                  title={activeSession.id}
+                >
+                  #{activeSession.id.slice(-8)}
+                </span>
+              )
+            )}
 
             {activeSession?.adapter && (
               <span className={getAdapterBadgeClass(activeSession.adapter)}>
@@ -153,16 +169,6 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-        <button
-          type="button"
-          data-testid="split-view-toggle"
-          className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
-          onClick={onToggleSplitView}
-          title="Toggle Desktop Split-View (Chat + Secondary Pane)"
-        >
-          {splitView ? "Split: ON" : "Split: OFF"}
-        </button>
-
         <span
           className="fd-badge"
           title={wsConnected ? "WebSocket Connected" : "WebSocket Disconnected"}
@@ -194,6 +200,34 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
             Sign Out
           </button>
         )}
+
+        {onToggleTheme && (
+          <button
+            type="button"
+            className="fd-btn"
+            data-testid="theme-toggle-btn"
+            onClick={onToggleTheme}
+            title={themeMode === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+          >
+            {themeMode === "dark" ? "☀ Light" : "☾ Dark"}
+          </button>
+        )}
+
+        <button
+          type="button"
+          data-testid="split-view-toggle"
+          className={`fd-btn${splitView ? " fd-btn-active" : ""}`}
+          onClick={onToggleSplitView}
+          title="Toggle Desktop Split-View (Chat + Secondary Pane)"
+          aria-label={splitView ? "Close right split panel" : "Open right split panel"}
+          aria-pressed={splitView}
+        >
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor" strokeWidth="1.4" />
+            <line x1="9.5" y1="2.5" x2="9.5" y2="13.5" stroke="currentColor" strokeWidth="1.4" />
+            <rect x="10.2" y="3.2" width="3.6" height="9.6" rx="0.8" fill="currentColor" fillOpacity={splitView ? 0.45 : 0.12} />
+          </svg>
+        </button>
       </div>
     </header>
   );

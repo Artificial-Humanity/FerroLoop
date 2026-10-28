@@ -343,6 +343,11 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
             className={`fd-btn ${subView === "prs" ? "fd-btn-active" : ""}`}
             aria-pressed={subView === "prs"}
             onClick={() => setSubView("prs")}
+            style={
+              effectivePrs.length === 0 && subView !== "prs"
+                ? { opacity: 0.65 }
+                : undefined
+            }
           >
             Pull Requests & Governance ({effectivePrs.length})
           </button>
@@ -828,13 +833,27 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
           <form
             onSubmit={handleFormReviewSubmit}
             data-testid="pr-governance-form"
+            data-prs-empty={effectivePrs.length === 0 ? "true" : undefined}
             className="fd-card"
             style={{
               display: "flex",
               flexDirection: "column",
               gap: "12px",
+              opacity: effectivePrs.length === 0 ? 0.45 : undefined,
             }}
           >
+            <fieldset
+              disabled={effectivePrs.length === 0}
+              style={{
+                border: "none",
+                display: "flex",
+                flexDirection: "column",
+                gap: "12px",
+                margin: 0,
+                padding: 0,
+                minWidth: 0,
+              }}
+            >
             <div style={{ fontWeight: 600, fontSize: "14px" }}>PR Governance Action Form</div>
 
             <div
@@ -927,6 +946,7 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
                 Merge Approved PR
               </button>
             </div>
+            </fieldset>
           </form>
         </div>
       )}
