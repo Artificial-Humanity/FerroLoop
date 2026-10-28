@@ -81,8 +81,8 @@ pub use stale::{Staleness, apply_staleness, is_stale};
 pub use state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateConflict, StateEntry, StateError,
-    StatePayload, StateRevision, StateScope, StateSyncCursor, UpsertStateArgs, validate_slug,
-    validate_summary,
+    StatePayload, StateRevision, StateScope, StateSearchHit, StateSyncCursor, UpsertStateArgs,
+    estimate_tokens, search_state_entries, validate_slug, validate_summary,
 };
 pub use store::{
     AgentRegistry, Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, MessageStore,

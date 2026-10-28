@@ -543,9 +543,299 @@ pub fn compute_last_writer_merge<'a>(
     }
 }
 
+/// One ranked hit from [`search_state_entries`] (FerroState Phase 2 spec §2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StateSearchHit {
+    pub entry: StateEntry,
+    pub score_millis: u64,
+    pub matched_terms: Vec<String>,
+    pub snippet: String,
+    pub estimated_tokens: u64,
+}
+
+/// Rough token estimate reused by recall budgets and the code-index
+/// savings ledger: `ceil(chars / 4)`, with empty text at `0`.
+pub fn estimate_tokens(text: &str) -> u64 {
+    let n = text.chars().count() as u64;
+    n.saturating_add(3) / 4
+}
+
+fn tokenize_search_text(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_alphanumeric() {
+            cur.push(ch.to_ascii_lowercase());
+        } else if !cur.is_empty() {
+            tokens.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.is_empty() {
+        tokens.push(cur);
+    }
+    tokens
+}
+
+/// `(summary, body)` searchable fields for an entry payload; the slug is
+/// handled separately. `Runtime` has no summary and searches over its
+/// serialized JSON value.
+fn searchable_summary_and_body(payload: &StatePayload) -> (String, String) {
+    match payload {
+        StatePayload::Memory(m) => (m.summary.clone(), m.body.clone()),
+        StatePayload::Handoff(h) => {
+            let mut parts: Vec<String> = Vec::new();
+            if let Some(notes) = &h.notes {
+                parts.push(notes.clone());
+            }
+            parts.extend(h.shipped.iter().cloned());
+            parts.extend(h.in_flight.iter().cloned());
+            parts.extend(h.blockers.iter().cloned());
+            parts.extend(h.next_steps.iter().cloned());
+            (h.summary.clone(), parts.join("\n"))
+        }
+        StatePayload::Runtime(r) => (
+            String::new(),
+            serde_json::to_string(&r.value).unwrap_or_default(),
+        ),
+    }
+}
+
+fn search_snippet(text: &str, summary: &str, matched_terms: &[String]) -> String {
+    let lower = text.to_ascii_lowercase();
+    let mut first: Option<usize> = None;
+    for term in matched_terms {
+        if let Some(pos) = lower.find(term.as_str()) {
+            first = Some(match first {
+                Some(prev) => prev.min(pos),
+                None => pos,
+            });
+        }
+    }
+    let Some(byte_pos) = first else {
+        let fallback = if summary.is_empty() { text } else { summary };
+        return fallback
+            .chars()
+            .take(200)
+            .collect::<String>()
+            .trim()
+            .to_string();
+    };
+    let char_idx = text[..byte_pos].chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let start = char_idx.saturating_sub(80);
+    let end = (start + 200).min(chars.len());
+    chars[start..end]
+        .iter()
+        .copied()
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Rank `entries` against `query` with field-weighted BM25 (spec §2):
+/// slug weight 3, summary weight 2, body weight 1; `k1 = 1.2`, `b = 0.75`.
+/// Pinned memories score x1.5, non-active memories x0.25. Only entries
+/// with score > 0 are returned, sorted by `score_millis` desc, then
+/// `updated_at` desc, then slug asc, capped at `limit`.
+pub fn search_state_entries(
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+) -> Vec<StateSearchHit> {
+    const K1: f64 = 1.2;
+    const B: f64 = 0.75;
+
+    if limit == 0 {
+        return Vec::new();
+    }
+    let query_terms: Vec<String> = tokenize_search_text(query)
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if query_terms.is_empty() {
+        return Vec::new();
+    }
+
+    struct SearchDoc {
+        entry: StateEntry,
+        weighted_tf: BTreeMap<String, f64>,
+        weighted_len: f64,
+        present: BTreeSet<String>,
+        summary: String,
+        searchable_text: String,
+    }
+
+    let mut docs: Vec<SearchDoc> = Vec::new();
+    for entry in entries {
+        if let Some(want_scope) = scope
+            && &entry.scope != want_scope
+        {
+            continue;
+        }
+        if let Some(want_concern) = concern
+            && entry.concern != want_concern
+        {
+            continue;
+        }
+        let (summary, body) = searchable_summary_and_body(&entry.payload);
+        let searchable_text = [&entry.slug, &summary, &body]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut weighted_tf: BTreeMap<String, f64> = BTreeMap::new();
+        let mut weighted_len = 0f64;
+        for (field, weight) in [(&entry.slug, 3.0f64), (&summary, 2.0f64), (&body, 1.0f64)] {
+            for token in tokenize_search_text(field) {
+                *weighted_tf.entry(token).or_default() += weight;
+                weighted_len += weight;
+            }
+        }
+        let present: BTreeSet<String> = weighted_tf.keys().cloned().collect();
+        docs.push(SearchDoc {
+            entry: entry.clone(),
+            weighted_tf,
+            weighted_len,
+            present,
+            summary,
+            searchable_text,
+        });
+    }
+    if docs.is_empty() {
+        return Vec::new();
+    }
+    let total = docs.len() as f64;
+    let avgdl = docs.iter().map(|d| d.weighted_len).sum::<f64>() / total;
+    if avgdl <= 0.0 {
+        return Vec::new();
+    }
+
+    // IDF over the provided (filtered) entry set, for query terms only.
+    let mut idf: BTreeMap<String, f64> = BTreeMap::new();
+    for term in &query_terms {
+        let df = docs.iter().filter(|d| d.present.contains(term)).count() as f64;
+        idf.insert(term.clone(), (1.0 + (total - df + 0.5) / (df + 0.5)).ln());
+    }
+
+    let mut hits: Vec<StateSearchHit> = Vec::new();
+    for doc in docs {
+        let matched_terms: Vec<String> = query_terms
+            .iter()
+            .filter(|t| doc.present.contains(*t))
+            .cloned()
+            .collect();
+        if matched_terms.is_empty() {
+            continue;
+        }
+        let mut score = 0f64;
+        for term in &matched_terms {
+            let f = doc.weighted_tf.get(term).copied().unwrap_or(0.0);
+            let denom = f + K1 * (1.0 - B + B * doc.weighted_len / avgdl);
+            if denom > 0.0 {
+                score += idf[term] * f * (K1 + 1.0) / denom;
+            }
+        }
+        if let StatePayload::Memory(m) = &doc.entry.payload {
+            if m.pinned {
+                score *= 1.5;
+            }
+            if m.lifecycle != MemoryLifecycle::Active {
+                score *= 0.25;
+            }
+        }
+        if !score.is_finite() || score <= 0.0 {
+            continue;
+        }
+        hits.push(StateSearchHit {
+            snippet: search_snippet(&doc.searchable_text, &doc.summary, &matched_terms),
+            estimated_tokens: estimate_tokens(&doc.searchable_text),
+            entry: doc.entry,
+            score_millis: (score * 1000.0) as u64,
+            matched_terms,
+        });
+    }
+
+    hits.sort_by(|a, b| {
+        b.score_millis
+            .cmp(&a.score_millis)
+            .then_with(|| {
+                b.entry
+                    .updated_at
+                    .unix_millis()
+                    .cmp(&a.entry.updated_at.unix_millis())
+            })
+            .then_with(|| a.entry.slug.cmp(&b.entry.slug))
+            .then_with(|| a.entry.id.as_str().cmp(b.entry.id.as_str()))
+    });
+    hits.truncate(limit);
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::seq_iri;
+
+    fn memory_entry(
+        n: u64,
+        slug: &str,
+        summary: &str,
+        body: &str,
+        pinned: bool,
+        lifecycle: MemoryLifecycle,
+        updated_ms: u64,
+    ) -> StateEntry {
+        StateEntry {
+            id: StateId(seq_iri(n)),
+            scope: StateScope::Workspace,
+            concern: StateConcern::Memory,
+            slug: slug.to_string(),
+            sensitive: false,
+            ever_sensitive: false,
+            payload: StatePayload::Memory(MemoryEntry {
+                category: MemoryCategory::Note,
+                basis: MemoryBasis::Inference,
+                lifecycle,
+                superseded_by: if lifecycle == MemoryLifecycle::Superseded {
+                    Some(StateId(seq_iri(999)))
+                } else {
+                    None
+                },
+                pinned,
+                summary: summary.to_string(),
+                body: body.to_string(),
+            }),
+            head_revision: RevisionId(seq_iri(1000 + n)),
+            updated_at: At::from_unix_millis(updated_ms),
+            by: "test".to_string(),
+        }
+    }
+
+    fn handoff_entry(n: u64, slug: &str, summary: &str, notes: &str) -> StateEntry {
+        StateEntry {
+            id: StateId(seq_iri(n)),
+            scope: StateScope::Workspace,
+            concern: StateConcern::Handoff,
+            slug: slug.to_string(),
+            sensitive: false,
+            ever_sensitive: false,
+            payload: StatePayload::Handoff(HandoffEntry {
+                summary: summary.to_string(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: Some(notes.to_string()),
+            }),
+            head_revision: RevisionId(seq_iri(1000 + n)),
+            updated_at: At::from_unix_millis(1_000),
+            by: "test".to_string(),
+        }
+    }
 
     #[test]
     fn slug_requires_leading_ascii_letter_and_normalizes_case() {
@@ -623,5 +913,297 @@ mod tests {
             Err(StateError::InvalidSummary)
         );
         assert_eq!(validate_summary("   "), Err(StateError::InvalidSummary));
+    }
+
+    #[test]
+    fn search_ranks_body_relevant_above_irrelevant() {
+        let irrelevant = memory_entry(
+            1,
+            "cooking-notes",
+            "cooking notes",
+            "pasta recipes and kitchen timers",
+            false,
+            MemoryLifecycle::Active,
+            3_000,
+        );
+        let partial = memory_entry(
+            2,
+            "partial-note",
+            "ranking mention",
+            "ranking appears once here",
+            false,
+            MemoryLifecycle::Active,
+            2_000,
+        );
+        let relevant = memory_entry(
+            3,
+            "relevant-note",
+            "search design",
+            "bm25 ranking search ranking bm25 ranking",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        // Input order is irrelevant, partial, relevant: an unscored
+        // input-order result would fail every assertion below.
+        let hits = search_state_entries(
+            &[irrelevant, partial, relevant],
+            "bm25 ranking",
+            None,
+            None,
+            10,
+        );
+        assert_eq!(hits.len(), 2, "irrelevant entry must be excluded: {hits:?}");
+        assert_eq!(hits[0].entry.slug, "relevant-note");
+        assert_eq!(hits[1].entry.slug, "partial-note");
+        assert!(
+            hits[0].score_millis > hits[1].score_millis,
+            "scores must descend: {} !> {}",
+            hits[0].score_millis,
+            hits[1].score_millis
+        );
+        assert!(hits[0].score_millis > 0);
+    }
+
+    #[test]
+    fn search_pinned_boost_beats_otherwise_equal_unpinned() {
+        let unpinned = memory_entry(
+            4,
+            "alpha-note",
+            "shared summary words",
+            "shared body 42terms token here",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let pinned = memory_entry(
+            5,
+            "bravo-note",
+            "shared summary words",
+            "shared body 42terms token here",
+            true,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let hits = search_state_entries(&[unpinned, pinned], "42terms", None, None, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].entry.slug, "bravo-note", "pinned must rank first");
+        assert!(
+            hits[0].score_millis > hits[1].score_millis,
+            "pinned boost must raise score: {} !> {}",
+            hits[0].score_millis,
+            hits[1].score_millis
+        );
+    }
+
+    #[test]
+    fn search_slug_match_beats_body_only_match() {
+        let body_only = memory_entry(
+            6,
+            "plain-guide",
+            "general notes here",
+            "bm25 words only here",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let slug_match = memory_entry(
+            7,
+            "bm25-guide",
+            "general notes here",
+            "general words only here",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let hits = search_state_entries(&[body_only, slug_match], "bm25", None, None, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].entry.slug, "bm25-guide");
+        assert!(hits[0].score_millis > hits[1].score_millis);
+    }
+
+    #[test]
+    fn search_scope_and_concern_filters_apply() {
+        let mut mem_ws = memory_entry(
+            8,
+            "mem-workspace",
+            "alpha summary",
+            "quixotic shared body",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        mem_ws.scope = StateScope::Workspace;
+        let mut mem_proj = memory_entry(
+            9,
+            "mem-project",
+            "alpha summary",
+            "quixotic shared body",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        mem_proj.scope = StateScope::Project("ferroloop".to_string());
+        let mut hand_proj = handoff_entry(10, "hand-project", "alpha summary", "quixotic notes");
+        hand_proj.scope = StateScope::Project("ferroloop".to_string());
+        let entries = vec![mem_ws, mem_proj, hand_proj];
+
+        let all = search_state_entries(&entries, "quixotic", None, None, 10);
+        assert_eq!(all.len(), 3, "unfiltered search sees every match");
+
+        let project = StateScope::Project("ferroloop".to_string());
+        let filtered = search_state_entries(
+            &entries,
+            "quixotic",
+            Some(&project),
+            Some(StateConcern::Handoff),
+            10,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].entry.slug, "hand-project");
+        assert_eq!(filtered[0].entry.concern, StateConcern::Handoff);
+        assert_eq!(filtered[0].entry.scope, project);
+
+        let ws_only =
+            search_state_entries(&entries, "quixotic", Some(&StateScope::Workspace), None, 10);
+        assert_eq!(ws_only.len(), 1);
+        assert_eq!(ws_only[0].entry.slug, "mem-workspace");
+    }
+
+    #[test]
+    fn search_empty_query_and_zero_limit_return_empty() {
+        let entries = vec![memory_entry(
+            11,
+            "some-note",
+            "some summary",
+            "some body token",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        )];
+        for query in ["", "   ", "\t\n", "!!!", "---"] {
+            assert!(
+                search_state_entries(&entries, query, None, None, 10).is_empty(),
+                "query {query:?} must produce no hits"
+            );
+        }
+        assert!(search_state_entries(&entries, "token", None, None, 0).is_empty());
+        assert!(search_state_entries(&[], "token", None, None, 10).is_empty());
+    }
+
+    #[test]
+    fn search_matched_terms_snippet_and_estimated_tokens_are_sane() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abcd"), 1);
+        assert_eq!(estimate_tokens("abcde"), 2);
+
+        let filler = "filler ".repeat(80);
+        let body = format!("{filler}FerroLoop uses Ranking for recall {filler}");
+        let entry = memory_entry(
+            12,
+            "recall-note",
+            "recall design summary",
+            &body,
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let hits = search_state_entries(&[entry], "RANKING ferroloop ranking", None, None, 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].matched_terms, vec!["ferroloop", "ranking"]);
+        let snippet_lower = hits[0].snippet.to_ascii_lowercase();
+        assert!(
+            snippet_lower.contains("ferroloop") || snippet_lower.contains("ranking"),
+            "snippet must contain a matched term: {:?}",
+            hits[0].snippet
+        );
+        assert!(
+            hits[0].snippet.chars().count() <= 200,
+            "snippet must be a ~200-char window, got {} chars",
+            hits[0].snippet.chars().count()
+        );
+        assert!(hits[0].estimated_tokens > 0);
+        // estimated_tokens is ceil(searchable chars / 4), so it must at
+        // least cover the body alone.
+        assert!(hits[0].estimated_tokens >= estimate_tokens(&body));
+    }
+
+    #[test]
+    fn search_retired_memory_is_deprioritized_vs_identical_active() {
+        let retired = memory_entry(
+            13,
+            "alpha-note",
+            "shared summary words",
+            "shared body zephyr token here",
+            false,
+            MemoryLifecycle::Retired,
+            1_000,
+        );
+        let active = memory_entry(
+            14,
+            "bravo-note",
+            "shared summary words",
+            "shared body zephyr token here",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let hits = search_state_entries(&[retired, active], "zephyr", None, None, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].entry.slug, "bravo-note", "active must rank first");
+        assert!(
+            hits[0].score_millis > hits[1].score_millis,
+            "retired penalty must lower score: {} !> {}",
+            hits[0].score_millis,
+            hits[1].score_millis
+        );
+    }
+
+    #[test]
+    fn search_tie_breaks_by_updated_at_desc_then_slug_asc() {
+        let older = memory_entry(
+            15,
+            "alpha-note",
+            "shared summary words",
+            "shared body lapis token here",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let newer = memory_entry(
+            16,
+            "bravo-note",
+            "shared summary words",
+            "shared body lapis token here",
+            false,
+            MemoryLifecycle::Active,
+            2_000,
+        );
+        let hits = search_state_entries(&[older, newer], "lapis", None, None, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].score_millis, hits[1].score_millis);
+        assert_eq!(hits[0].entry.slug, "bravo-note", "newer entry wins the tie");
+
+        let first = memory_entry(
+            17,
+            "bravo-note",
+            "shared summary words",
+            "shared body lapis token here",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let second = memory_entry(
+            18,
+            "alpha-note",
+            "shared summary words",
+            "shared body lapis token here",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let hits = search_state_entries(&[first, second], "lapis", None, None, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].entry.slug, "alpha-note", "slug asc wins full tie");
     }
 }
