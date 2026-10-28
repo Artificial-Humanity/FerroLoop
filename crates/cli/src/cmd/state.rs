@@ -1180,7 +1180,16 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             };
             let mut scopes = std::collections::BTreeSet::new();
             for (scope, upserts) in grouped {
-                let store = env.open_for_scope(Some(&scope))?;
+                let store = match env.open_for_scope(Some(&scope)) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        report.skipped.push(format!(
+                            "{}: failed to open state store: {e}",
+                            scope.as_wire()
+                        ));
+                        continue;
+                    }
+                };
                 let partial = apply_workspace_import(&store, upserts, Vec::new());
                 report.imported_memories += partial.imported_memories;
                 report.imported_handoffs += partial.imported_handoffs;
