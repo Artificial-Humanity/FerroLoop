@@ -1191,6 +1191,11 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             by,
             json,
         } => {
+            let by = if by.trim().is_empty() {
+                "fl".to_string()
+            } else {
+                by
+            };
             let resolved_scope = match scope.as_deref() {
                 Some(raw) => StateScope::from_wire(raw).map_err(|e| e.to_string())?,
                 None => env.default_checkpoint_scope(),

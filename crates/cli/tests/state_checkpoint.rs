@@ -71,4 +71,10 @@ fn state_checkpoint_records_git_state_with_json_report() {
         .args(["state", "checkpoint", "--json"])
         .assert()
         .failure();
+
+    // A blank `--by` normalizes to `fl` (entry author and default slug).
+    let blank =
+        run_json(fl(&cfg, &db, root).args(["state", "checkpoint", "--by", "   ", "--json"]));
+    assert_eq!(blank["entry"]["by"], "fl", "{blank}");
+    assert_eq!(blank["entry"]["slug"], "checkpoint-fl", "{blank}");
 }

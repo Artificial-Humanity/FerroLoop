@@ -873,7 +873,7 @@ pub struct StateCheckpointReport {
 }
 
 /// Git state probed for a checkpoint. `dirty_entries` holds one
-/// `XY path` string per `git status --porcelain` line.
+/// `XY path` string per `git status --porcelain=v1 -z` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitRepoProbe {
     pub top_level: PathBuf,
@@ -883,7 +883,7 @@ pub struct GitRepoProbe {
     pub dirty_entries: Vec<String>,
 }
 
-fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
+fn run_git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -904,18 +904,41 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
             repo.display()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(output.stdout)
 }
 
-/// Parse one `git status --porcelain` (v1) line into `XY path`, ignoring
-/// lines too short to carry a status and path.
-fn parse_porcelain_line(line: &str) -> Option<String> {
-    let status = line.get(..2)?;
-    let path = line.get(3..)?;
-    if path.is_empty() {
-        return None;
+fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&run_git_bytes(repo, args)?).into_owned())
+}
+
+/// Parse `git status --porcelain=v1 -z` output into one `XY path` string
+/// per entry. NUL termination keeps paths with newlines or non-ASCII
+/// bytes intact (decoded lossily, never C-quoted). A rename/copy entry
+/// is `XY dest\0src\0`; the following source field is consumed so the
+/// rename counts once, formatted `XY src -> dest`.
+fn parse_porcelain_z(stdout: &[u8]) -> Vec<String> {
+    let mut entries = Vec::new();
+    let mut fields = stdout.split(|b| *b == 0);
+    while let Some(field) = fields.next() {
+        if field.len() < 4 {
+            continue;
+        }
+        let status = String::from_utf8_lossy(&field[..2]).into_owned();
+        let path = String::from_utf8_lossy(&field[3..]).into_owned();
+        if path.is_empty() {
+            continue;
+        }
+        if field[0] == b'R' || field[0] == b'C' || field[1] == b'R' || field[1] == b'C' {
+            // In `-z` mode the source path follows as its own field.
+            if let Some(src) = fields.next() {
+                let src = String::from_utf8_lossy(src).into_owned();
+                entries.push(format!("{status} {src} -> {path}"));
+                continue;
+            }
+        }
+        entries.push(format!("{status} {path}"));
     }
-    Some(format!("{status} {path}"))
+    entries
 }
 
 /// Probe `repo` with git. A non-repository, a repository with no commits,
@@ -941,8 +964,11 @@ pub fn probe_git_repo(repo: &Path) -> Result<GitRepoProbe, String> {
         return Err(format!("no commits yet in {}", repo.display()));
     }
     let latest_subject = sanitize_summary(&run_git(repo, &["log", "-1", "--format=%s"])?);
-    let status = run_git(repo, &["status", "--porcelain"])?;
-    let dirty_entries = status.lines().filter_map(parse_porcelain_line).collect();
+    let status = run_git_bytes(
+        repo,
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )?;
+    let dirty_entries = parse_porcelain_z(&status);
     Ok(GitRepoProbe {
         top_level: PathBuf::from(top_level),
         branch,
@@ -1054,8 +1080,19 @@ pub fn create_state_checkpoint<S: StateStore>(
     by: &str,
     at: At,
 ) -> Result<StateCheckpointReport, String> {
+    // Validate/resolve the slug before probing git so an invalid explicit
+    // slug fails even when `repo` is not a repository.
+    let resolved_slug = resolve_checkpoint_slug(slug, by)?;
     let probe = probe_git_repo(repo)?;
-    create_state_checkpoint_from_probe(store, &probe, scope, slug, summary, by, at)
+    create_state_checkpoint_from_probe(
+        store,
+        &probe,
+        scope,
+        Some(resolved_slug.as_str()),
+        summary,
+        by,
+        at,
+    )
 }
 
 #[cfg(test)]
@@ -1645,6 +1682,84 @@ mod tests {
         git(empty.path(), &["init", "-b", "main"]);
         let err = probe_git_repo(empty.path()).unwrap_err();
         assert!(err.contains("HEAD"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_probe_expands_untracked_dir_and_preserves_odd_names() {
+        let tmp = git_fixture();
+        let repo = tmp.path();
+        // Baseline: 1 modified + 1 untracked file.
+        assert_eq!(probe_git_repo(repo).unwrap().dirty_entries.len(), 2);
+        write(&repo.join("newdir/a.txt"), "a\n");
+        write(&repo.join("newdir/b.txt"), "b\n");
+        write(&repo.join("café.txt"), "x\n");
+        write(&repo.join("line\nbreak.txt"), "x\n");
+        let probe = probe_git_repo(repo).unwrap();
+        assert_eq!(probe.dirty_entries.len(), 6, "{:?}", probe.dirty_entries);
+        for expected in [
+            "?? newdir/a.txt",
+            "?? newdir/b.txt",
+            "?? café.txt",
+            "?? line\nbreak.txt",
+        ] {
+            assert!(
+                probe.dirty_entries.iter().any(|d| d == expected),
+                "missing {expected:?} in {:?}",
+                probe.dirty_entries
+            );
+        }
+        assert!(
+            probe
+                .dirty_entries
+                .iter()
+                .all(|d| !d.contains('"') && !d.contains("\\303")),
+            "paths must not be C-quoted: {:?}",
+            probe.dirty_entries
+        );
+        assert!(
+            !probe.dirty_entries.iter().any(|d| d == "?? newdir/"),
+            "untracked dir must expand to files: {:?}",
+            probe.dirty_entries
+        );
+    }
+
+    #[test]
+    fn checkpoint_probe_rename_counts_as_one_entry() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.name", "Checkpoint Tester"]);
+        git(repo, &["config", "user.email", "tester@example.invalid"]);
+        write(&repo.join("old.txt"), "rename me with enough content\n");
+        git(repo, &["add", "old.txt"]);
+        git(repo, &["commit", "-m", "before rename"]);
+        git(repo, &["mv", "old.txt", "new.txt"]);
+        let probe = probe_git_repo(repo).unwrap();
+        assert_eq!(probe.dirty_entries.len(), 1, "{:?}", probe.dirty_entries);
+        assert!(
+            probe.dirty_entries[0].contains("old.txt -> new.txt"),
+            "{:?}",
+            probe.dirty_entries
+        );
+    }
+
+    #[test]
+    fn checkpoint_invalid_slug_fails_before_git_probe_on_non_repo() {
+        let plain = TempDir::new().unwrap();
+        let store = MemStore::default();
+        let err = create_state_checkpoint(
+            &store,
+            plain.path(),
+            StateScope::Workspace,
+            Some("1bad slug!"),
+            None,
+            "tester",
+            at(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid slug"), "{err}");
+        assert!(!err.contains("not a git repository"), "{err}");
+        assert!(store.list_state(None, None).unwrap().is_empty());
     }
 
     #[test]

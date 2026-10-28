@@ -992,6 +992,54 @@ fn mcp_stdio_round_trip_and_releases_redb_lock_between_calls() {
     assert!(status.success());
 }
 
+#[test]
+fn mcp_stdio_fl_state_checkpoint_records_git_state() {
+    let (_tmp, _bare, a, _b) = setup_two_machines(false);
+    std::fs::write(a.repo_dir.join("untracked.txt"), "new\n").unwrap();
+
+    let mut child = a
+        .fl()
+        .args(["state", "mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child_in = child.stdin.take().unwrap();
+    let mut child_out = BufReader::new(child.stdout.take().unwrap());
+    let mut rpc = |req: Value| -> Value {
+        writeln!(child_in, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        child_in.flush().unwrap();
+        let mut line = String::new();
+        child_out.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+
+    let init_resp = rpc(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+    }));
+    assert_eq!(init_resp["result"]["serverInfo"]["name"], "fl-state-mcp");
+
+    let resp = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "fl_state_checkpoint",
+            "arguments": { "by": "tester" }
+        }
+    }));
+    assert_eq!(resp["result"]["isError"], false, "{resp}");
+    let report: Value =
+        serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(report["entry"]["slug"], "checkpoint-tester", "{report}");
+    assert_eq!(report["entry"]["concern"], "handoff", "{report}");
+    assert_eq!(report["branch"], "main", "{report}");
+    assert_eq!(report["dirty_files"], 1, "{report}");
+
+    drop(child_in);
+    assert!(child.wait().unwrap().success());
+}
+
 fn seed_search_entries(a: &Machine) {
     for (key, summary, body) in [
         (

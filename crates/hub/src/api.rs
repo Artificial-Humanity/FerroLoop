@@ -1349,29 +1349,36 @@ fn handle_post_state_checkpoint(
         }
     }
 
-    let probe = match probe_git_repo(&state.config.repo_root) {
-        Ok(p) => p,
-        Err(e) => return HttpResponse::json(500, json!({ "error": e })),
-    };
-
-    let scope = match scope_field.as_deref().filter(|s| !s.trim().is_empty()) {
+    // Validate explicit scope and slug before probing git so invalid
+    // input is a 400 even when `repo_root` is not a repository. Only the
+    // default scope derivation waits for the probe's top level.
+    let explicit_scope = match scope_field.as_deref().filter(|s| !s.trim().is_empty()) {
         Some(raw) => match StateScope::from_wire(raw.trim()) {
-            Ok(s) => s,
+            Ok(s) => Some(s),
             Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
         },
-        None => probe
-            .top_level
-            .file_name()
-            .and_then(|n| n.to_str())
-            .and_then(derive_import_slug)
-            .map(StateScope::Project)
-            .unwrap_or(StateScope::Workspace),
+        None => None,
     };
 
     let slug = match resolve_checkpoint_slug(slug_field.as_deref(), &by) {
         Ok(s) => s,
         Err(e) => return HttpResponse::json(400, json!({ "error": e })),
     };
+
+    let probe = match probe_git_repo(&state.config.repo_root) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e })),
+    };
+
+    let scope = explicit_scope.unwrap_or_else(|| {
+        probe
+            .top_level
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(derive_import_slug)
+            .map(StateScope::Project)
+            .unwrap_or(StateScope::Workspace)
+    });
 
     // Non-owners cannot overwrite an already-sensitive checkpoint entry.
     if !authority.is_owner()

@@ -748,7 +748,11 @@ mod tests {
         }
 
         let tmp = TempDir::new().unwrap();
-        let repo = tmp.path();
+        // Isolated repo subdir: hub store/ui files live outside it, so the
+        // dirty count is exact and the derived scope is deterministic.
+        let repo = tmp.path().join("hubproj");
+        fs::create_dir_all(&repo).unwrap();
+        let repo = repo.as_path();
         hub_git(repo, &["init", "-b", "main"]);
         hub_git(repo, &["config", "user.name", "Checkpoint Tester"]);
         hub_git(repo, &["config", "user.email", "tester@example.invalid"]);
@@ -757,8 +761,8 @@ mod tests {
         hub_git(repo, &["commit", "-m", "hub checkpoint subject"]);
         fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
 
-        // `repo_root` is `tmp.path()`, so the hub probes this repository.
-        let state = test_hub_state(&tmp);
+        let mut state = test_hub_state(&tmp);
+        state.config.repo_root = repo.to_path_buf();
         let owner = ["Bearer ", "owner", "-tok-secret"].concat();
         let peer = ["Bearer ", "peer", "-tok-secret"].concat();
 
@@ -775,7 +779,7 @@ mod tests {
         assert_eq!(obj.len(), 4, "{body}");
         assert_eq!(body["branch"], "main");
         assert_eq!(body["head_sha"].as_str().unwrap().len(), 40);
-        assert!(body["dirty_files"].as_u64().unwrap() >= 1, "{body}");
+        assert_eq!(body["dirty_files"], 1, "{body}");
         assert_eq!(body["entry"]["slug"], "checkpoint-tester");
         assert_eq!(body["entry"]["scope"], "workspace");
         assert_eq!(body["entry"]["concern"], "handoff");
@@ -787,7 +791,14 @@ mod tests {
                 .with_header("Authorization", &owner),
         );
         assert_eq!(empty_resp.status, 200);
-        assert_eq!(empty_resp.json_value().unwrap()["entry"]["by"], "lmcfarlin");
+        let empty_body = empty_resp.json_value().unwrap();
+        assert_eq!(empty_body["entry"]["by"], "lmcfarlin");
+        // Default scope derives from the probed repo top-level name.
+        assert_eq!(
+            empty_body["entry"]["scope"], "project:hubproj",
+            "{empty_body}"
+        );
+        assert_eq!(empty_body["dirty_files"], 1, "{empty_body}");
 
         // Wrong-typed fields and non-object bodies are 400s.
         for bad in [
@@ -858,13 +869,26 @@ mod tests {
     fn state_checkpoint_route_non_repo_is_500() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
+        let owner = ["Bearer ", "owner", "-tok-secret"].concat();
+        // Invalid explicit scope/slug validate before the git probe: 400
+        // (reserved slug 403) even though `repo_root` is not a repository.
+        for (bad, expected) in [
+            (json!({ "scope": "bogus:1" }), 400),
+            (json!({ "slug": "1bad slug!" }), 400),
+            (json!({ "slug": "hub-pairing-forged" }), 403),
+        ] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                    .with_header("Authorization", &owner)
+                    .with_json_body(&bad),
+            );
+            assert_eq!(resp.status, expected, "{bad}");
+        }
         let resp = handle_http_request(
             &state,
             &HttpRequest::new("POST", "/api/v1/state/checkpoint")
-                .with_header(
-                    "Authorization",
-                    ["Bearer ", "owner", "-tok-secret"].concat(),
-                )
+                .with_header("Authorization", &owner)
                 .with_json_body(&json!({})),
         );
         assert_eq!(resp.status, 500);
