@@ -45,6 +45,10 @@
   --card-assistant-border: rgba(56, 189, 248, 0.45);
   --badge-assistant-bg: rgba(56, 189, 248, 0.12);
   --badge-assistant-border: rgba(56, 189, 248, 0.35);
+  --wire-card-bg: rgba(180, 120, 70, 0.06);
+  --wire-card-border: rgba(180, 120, 70, 0.42);
+  --wire-card-stripe: rgba(180, 120, 70, 0.72);
+  --wire-badge-text: #D99B66;
   --code-inline-bg: rgba(255, 255, 255, 0.06);
   --code-inline-text: #E5C07B;
 
@@ -85,6 +89,10 @@
   --card-assistant-border: rgba(2, 132, 199, 0.45);
   --badge-assistant-bg: rgba(2, 132, 199, 0.12);
   --badge-assistant-border: rgba(2, 132, 199, 0.35);
+  --wire-card-bg: rgba(180, 120, 70, 0.09);
+  --wire-card-border: rgba(154, 92, 42, 0.45);
+  --wire-card-stripe: rgba(154, 92, 42, 0.78);
+  --wire-badge-text: #8B4E24;
   --code-inline-bg: rgba(15, 23, 42, 0.06);
   --code-inline-text: #9A3412;
 }

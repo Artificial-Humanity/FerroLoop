@@ -2,11 +2,13 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import "./styles/tokens.css";
 import { HubApiClient, HubApiError } from "./api/client";
 import { HubWsClient } from "./api/ws";
+import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
 import { ChatPane } from "./components/ChatPane";
 import { COCKPIT_TABS, ContextHeader } from "./components/ContextHeader";
 import { GitPrPane } from "./components/GitPrPane";
 import { HubDrawer } from "./components/HubDrawer";
 import { PairingModal } from "./components/PairingModal";
+import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import { RosterSidebar } from "./components/RosterSidebar";
 import { TerminalPane } from "./components/TerminalPane";
 import { VaultGatePane } from "./components/VaultGatePane";
@@ -261,6 +263,37 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [splitView, setSplitView] = useState<boolean>(false);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
   const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
+  const [activeArtifactPath, setActiveArtifactPath] = useState<string | null>(null);
+  const [recentArtifacts, setRecentArtifacts] = useState<string[]>([]);
+
+  const handleOpenArtifact = useCallback((rawPathOrUrl: string) => {
+    const trimmed = (rawPathOrUrl || "").trim();
+    if (!trimmed) return;
+    const normalized = trimmed.startsWith("mermaid://")
+      ? trimmed
+      : normalizeArtifactTarget(trimmed);
+    if (!normalized) return;
+    setActiveArtifactPath(normalized);
+    setRecentArtifacts((prev) => {
+      const filtered = prev.filter((item) => item !== normalized);
+      return [normalized, ...filtered].slice(0, 20);
+    });
+    setSplitView(true);
+    setSecondaryTab("artifacts");
+    setActiveTab("artifacts");
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = (event: Event) => {
+      const custom = event as CustomEvent<{ path?: string }>;
+      if (custom.detail?.path) {
+        handleOpenArtifact(custom.detail.path);
+      }
+    };
+    window.addEventListener(OPEN_ARTIFACT_EVENT, handler);
+    return () => window.removeEventListener(OPEN_ARTIFACT_EVENT, handler);
+  }, [handleOpenArtifact]);
 
   useEffect(() => {
     applyThemeMode(themeMode);
@@ -932,6 +965,23 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   const renderSecondaryPane = (paneTab: CockpitTab) => {
     switch (paneTab) {
+      case "artifacts":
+        return (
+          <ArtifactPreviewPane
+            apiClient={apiClient}
+            activePath={activeArtifactPath}
+            recentPaths={recentArtifacts}
+            sessionId={activeSession?.id ?? selectedAgent?.name_key ?? null}
+            turns={transcriptTurns}
+            onSelectPath={(path) => {
+              setActiveArtifactPath(path);
+              setRecentArtifacts((prev) => {
+                const filtered = prev.filter((item) => item !== path);
+                return [path, ...filtered].slice(0, 20);
+              });
+            }}
+          />
+        );
       case "git":
         return (
           <GitPrPane
@@ -1016,6 +1066,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             onSendPrompt={handleSendPrompt}
             onSendQueuedNow={handleSendQueuedNow}
             onCancelQueued={handleCancelQueued}
+            onOpenArtifact={handleOpenArtifact}
             apiClient={apiClient}
           />
         );
@@ -1081,6 +1132,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 onSendPrompt={handleSendPrompt}
                 onSendQueuedNow={handleSendQueuedNow}
                 onCancelQueued={handleCancelQueued}
+                onOpenArtifact={handleOpenArtifact}
                 apiClient={apiClient}
               />
               {renderSecondaryPane(rightSplitTab)}

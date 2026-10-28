@@ -27,6 +27,7 @@ export interface ContextHeaderProps {
 
 export const COCKPIT_TABS: Array<{ id: CockpitTab; label: string }> = [
   { id: "chat", label: "Chat" },
+  { id: "artifacts", label: "Artifacts" },
   { id: "git", label: "Git & PRs" },
   { id: "mail", label: "Wire Mail" },
   { id: "terminal", label: "Terminal" },

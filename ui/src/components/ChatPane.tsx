@@ -197,6 +197,7 @@ export interface ChatPaneProps {
   ) => Promise<unknown> | void;
   onSendQueuedNow?: (promptId: string) => Promise<unknown> | void;
   onCancelQueued?: (promptId: string) => Promise<unknown> | void;
+  onOpenArtifact?: (pathOrUrl: string) => void;
   apiClient?: HubApiClient;
 }
 
@@ -236,6 +237,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onSendPrompt,
   onSendQueuedNow,
   onCancelQueued,
+  onOpenArtifact,
   apiClient,
 }) => {
   const [internalTurns, setInternalTurns] = React.useState<TranscriptTurn[]>([]);
@@ -375,7 +377,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
         void fetchTranscript();
       } else {
-        throw new Error("No prompt route is configured for this session.");
+        throw new Error("No message route is configured for this session.");
       }
       setCompactFeedback("Sent /compact");
       scrollToBottom("smooth");
@@ -616,7 +618,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       scrollToBottom("smooth");
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to send queued prompt");
+      setSubmitError(err instanceof Error ? err.message : "Failed to send queued message");
     }
   };
 
@@ -635,7 +637,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
       }
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to cancel queued prompt");
+      setSubmitError(err instanceof Error ? err.message : "Failed to cancel queued message");
     }
   };
 
@@ -704,7 +706,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         requestAnimationFrame(() => scrollToBottom("smooth"));
       }
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to send prompt");
+      setSubmitError(err instanceof Error ? err.message : "Failed to send message");
     } finally {
       setSubmitting(false);
     }
@@ -917,7 +919,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             </div>
             <div style={{ fontSize: "12px", maxWidth: "460px", margin: "0 auto" }}>
               {effectiveTurns.length === 0
-                ? `Send a prompt below to dispatch directly to ${displayTarget}${
+                ? `Send a message below to dispatch directly to ${displayTarget}${
                     adapter ? ` (${adapter})` : ""
                   } over FerroWire and active session routes.`
                 : "Clear the search filter above to view all session turns."}
@@ -944,6 +946,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 turn={turn}
                 agentDisplayName={agentDisplayName ?? agentName ?? undefined}
                 isActive={effectiveIsBusy && idx === displayedTurns.length - 1}
+                onOpenArtifact={onOpenArtifact}
               />
             ))}
           </>
@@ -960,10 +963,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           )}
       </div>
 
-      {/* Unified Prompt Composer */}
+      {/* Unified Message Composer */}
       <div
         role="region"
-        aria-label="Prompt Composer"
+        aria-label="Message Composer"
         data-testid="prompt-composer"
         onDragOver={(e) => e.preventDefault()}
         onDrop={(e) => {
@@ -1016,7 +1019,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 color: "#FBBF24",
               }}
             >
-              <span>Queued Prompts ({effectiveQueue.length})</span>
+              <span>Queued Messages ({effectiveQueue.length})</span>
               <span style={{ fontWeight: 400, color: "var(--text-muted)" }}>
                 Waiting for session to finish current turn
               </span>
@@ -1170,8 +1173,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             data-bwignore="true"
             data-form-type="other"
             aria-autocomplete="none"
-            aria-label="Prompt Message"
-            placeholder={`Send a prompt to ${displayTarget}... (Ctrl+Enter to send)`}
+            aria-label="Message"
+            placeholder={`Send a message to ${displayTarget}... (Ctrl+Enter to submit, paste or attach files)`}
             className="fd-textarea"
             value={promptText}
             onChange={(e) => setPromptText(e.target.value)}
@@ -1250,7 +1253,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               onClick={() => void submitPrompt()}
               style={{ height: "34px", padding: "0 16px" }}
             >
-              {submitting ? "Sending..." : "Send Prompt"}
+              {submitting ? "Sending..." : "Send Message"}
             </button>
           </div>
         </div>

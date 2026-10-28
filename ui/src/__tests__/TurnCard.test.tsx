@@ -75,7 +75,7 @@ describe("TurnCard directed assistant highlight", () => {
     );
   });
 
-  it("does not highlight wire turns as directed replies", () => {
+  it("does not highlight wire turns as directed replies and applies subdued brown/bronze wire outline", () => {
     render(
       <TurnCard
         turn={turn({
@@ -86,9 +86,11 @@ describe("TurnCard directed assistant highlight", () => {
       />,
     );
 
-    expect(screen.getByTestId("turn-card-4")).not.toHaveAttribute(
-      "data-directed-assistant",
-      "true",
-    );
+    const card = screen.getByTestId("turn-card-4");
+    expect(card).not.toHaveAttribute("data-directed-assistant", "true");
+    expect(card).toHaveAttribute("data-wire-card", "true");
+    expect(card.style.borderColor).toContain("--wire-card-border");
+    expect(card.style.boxShadow).toContain("--wire-card-stripe");
+    expect(card.style.backgroundColor).toContain("--wire-card-bg");
   });
 });
