@@ -962,6 +962,10 @@ fn redact_sensitive_entry(mut entry: StateEntry) -> StateEntry {
         StatePayload::Handoff(mut h) => {
             h.summary = "[REDACTED]".to_string();
             h.notes = Some("[REDACTED]".to_string());
+            h.shipped.clear();
+            h.in_flight.clear();
+            h.blockers.clear();
+            h.next_steps.clear();
             StatePayload::Handoff(h)
         }
         StatePayload::Runtime(mut r) => {
@@ -2874,6 +2878,28 @@ mod tests {
         }
     }
 
+    fn sensitive_handoff_entry(n: u64) -> StateEntry {
+        StateEntry {
+            id: StateId(seq_iri(n)),
+            scope: StateScope::Workspace,
+            concern: StateConcern::Handoff,
+            slug: "secret-handoff".to_string(),
+            sensitive: true,
+            ever_sensitive: true,
+            payload: StatePayload::Handoff(HandoffEntry {
+                summary: "zephyr handoff summary".to_string(),
+                shipped: vec!["zephyr shippedsecrettoken".to_string()],
+                in_flight: vec!["zephyr inflightsecrettoken".to_string()],
+                blockers: vec!["zephyr blockersecrettoken".to_string()],
+                next_steps: vec!["zephyr nextstepsecrettoken".to_string()],
+                notes: Some("zephyr notes".to_string()),
+            }),
+            head_revision: RevisionId(seq_iri(1000 + n)),
+            updated_at: At::from_unix_millis(1_000 + n),
+            by: "test".to_string(),
+        }
+    }
+
     #[test]
     fn hub_search_redacts_sensitive_snippet_for_non_owner_only() {
         let secret = memory_entry(
@@ -2925,5 +2951,53 @@ mod tests {
         let (one, total_one) = search_state_for_hub(&entries, "zephyr", None, None, 1, true);
         assert_eq!(one.len(), 1);
         assert_eq!(total_one, 2);
+    }
+
+    #[test]
+    fn hub_search_redacts_sensitive_handoff_lists_for_non_owner_only() {
+        const SECRET_TOKENS: [&str; 4] = [
+            "shippedsecrettoken",
+            "inflightsecrettoken",
+            "blockersecrettoken",
+            "nextstepsecrettoken",
+        ];
+        let entry = sensitive_handoff_entry(10);
+        let entries = vec![entry.clone()];
+
+        // List path: redact_sensitive_entry clears all four handoff lists.
+        let redacted = redact_sensitive_entry(entry.clone());
+        let StatePayload::Handoff(h) = &redacted.payload else {
+            panic!("expected handoff payload");
+        };
+        assert_eq!(h.summary, "[REDACTED]");
+        assert_eq!(h.notes.as_deref(), Some("[REDACTED]"));
+        assert!(h.shipped.is_empty() && h.in_flight.is_empty());
+        assert!(h.blockers.is_empty() && h.next_steps.is_empty());
+        let serialized_entry = serde_json::to_string(&redacted).unwrap();
+        for token in SECRET_TOKENS {
+            assert!(!serialized_entry.contains(token), "{serialized_entry}");
+        }
+
+        // Search path: non-owner hit leaks no list-only token.
+        let (hits, total) = search_state_for_hub(&entries, "zephyr", None, None, 10, false);
+        assert_eq!(total, 1);
+        let hit = &hits[0];
+        assert_eq!(hit.snippet, "[REDACTED]");
+        let StatePayload::Handoff(hit_h) = &hit.entry.payload else {
+            panic!("expected handoff payload");
+        };
+        assert!(hit_h.shipped.is_empty() && hit_h.in_flight.is_empty());
+        assert!(hit_h.blockers.is_empty() && hit_h.next_steps.is_empty());
+        let serialized_hit = serde_json::to_string(hit).unwrap();
+        for token in SECRET_TOKENS {
+            assert!(!serialized_hit.contains(token), "{serialized_hit}");
+        }
+
+        // Owner still sees the list contents.
+        let (owner_hits, _) = search_state_for_hub(&entries, "zephyr", None, None, 10, true);
+        let serialized_owner = serde_json::to_string(&owner_hits[0]).unwrap();
+        for token in SECRET_TOKENS {
+            assert!(serialized_owner.contains(token), "{serialized_owner}");
+        }
     }
 }

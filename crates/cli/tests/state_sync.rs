@@ -991,3 +991,110 @@ fn mcp_stdio_round_trip_and_releases_redb_lock_between_calls() {
     let status = child.wait().unwrap();
     assert!(status.success());
 }
+
+fn seed_search_entries(a: &Machine) {
+    for (key, summary, body) in [
+        (
+            "search-weak",
+            "Weak note",
+            "quixotic mention in passing only",
+        ),
+        (
+            "search-strong",
+            "Strong note",
+            "quixotic quixotic quixotic ranking evidence quixotic",
+        ),
+    ] {
+        let mut set = a.fl();
+        set.args([
+            "state",
+            "memory",
+            "set",
+            "--scope",
+            "workspace",
+            "--key",
+            key,
+            "--category",
+            "note",
+            "--basis",
+            "inference",
+            "--summary",
+            summary,
+            "--body",
+            body,
+            "--by",
+            "test",
+            "--json",
+        ]);
+        run_json(set);
+    }
+}
+
+#[test]
+fn cli_state_search_json_via_binary_returns_ranked_hits() {
+    let (_tmp, _bare, a, _b) = setup_two_machines(false);
+    seed_search_entries(&a);
+
+    let mut search = a.fl();
+    search.args(["state", "search", "quixotic", "--json"]);
+    let value = run_json(search);
+
+    assert_eq!(value["query"], "quixotic", "{value}");
+    assert_eq!(value["total_hits"], 2, "{value}");
+    let hits = value["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{value}");
+    assert_eq!(hits[0]["entry"]["slug"], "search-strong", "{value}");
+    assert!(hits[0]["score_millis"].as_u64().unwrap() > 0, "{value}");
+}
+
+#[test]
+fn mcp_stdio_fl_memory_search_returns_ranked_hits() {
+    let (_tmp, _bare, a, _b) = setup_two_machines(false);
+    seed_search_entries(&a);
+
+    let mut child = a
+        .fl()
+        .args(["state", "mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child_in = child.stdin.take().unwrap();
+    let mut child_out = BufReader::new(child.stdout.take().unwrap());
+    let mut rpc = |req: Value| -> Value {
+        writeln!(child_in, "{}", serde_json::to_string(&req).unwrap()).unwrap();
+        child_in.flush().unwrap();
+        let mut line = String::new();
+        child_out.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+
+    let init_resp = rpc(serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+    }));
+    assert_eq!(init_resp["result"]["serverInfo"]["name"], "fl-state-mcp");
+
+    let search_resp = rpc(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "fl_memory_search",
+            "arguments": { "query": "quixotic" }
+        }
+    }));
+    assert_eq!(search_resp["result"]["isError"], false, "{search_resp}");
+    let text = search_resp["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let value: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(value["query"], "quixotic", "{value}");
+    assert_eq!(value["total_hits"], 2, "{value}");
+    let hits = value["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 2, "{value}");
+    assert_eq!(hits[0]["entry"]["slug"], "search-strong", "{value}");
+    assert!(hits[0]["score_millis"].as_u64().unwrap() > 0, "{value}");
+
+    drop(child_in);
+    assert!(child.wait().unwrap().success());
+}
