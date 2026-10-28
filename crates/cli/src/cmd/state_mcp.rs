@@ -7,6 +7,7 @@ use std::io::{BufRead, Write};
 
 use fl_core::agent::{AgentRole, RegisterAgentArgs, reports_to};
 use fl_core::at::At;
+use fl_core::ferrostate::create_state_checkpoint;
 use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter};
 use fl_core::ids::{Kind, ProjectId, WorkflowRunId};
 use fl_core::state::{
@@ -236,6 +237,41 @@ fn parse_search_args(
     };
     let limit = parse_search_limit(args)?;
     Ok((query, scope, concern, limit))
+}
+
+/// Parsed `fl_state_checkpoint` arguments, with `scope` left unresolved
+/// (`None` means the caller's default checkpoint scope) and `by`
+/// defaulting to `"fl"`.
+struct CheckpointArgs {
+    scope: Option<StateScope>,
+    slug: Option<String>,
+    summary: Option<String>,
+    by: String,
+}
+
+fn parse_checkpoint_args(args: &Value) -> Result<CheckpointArgs, String> {
+    if !args.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    let scope = match opt_str(args, "scope")? {
+        Some(s) => Some(StateScope::from_wire(&s).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let slug = opt_str(args, "slug")?;
+    if let Some(raw) = slug.as_deref() {
+        fl_core::state::validate_slug(raw).map_err(|e| e.to_string())?;
+    }
+    let summary = opt_str(args, "summary")?;
+    let by = match opt_str(args, "by")? {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => "fl".to_string(),
+    };
+    Ok(CheckpointArgs {
+        scope,
+        slug,
+        summary,
+        by,
+    })
 }
 
 fn memory_search_json(
@@ -539,6 +575,23 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 })
                 .collect();
             Ok(serde_json::to_string_pretty(&entries).unwrap())
+        }
+        "fl_state_checkpoint" => {
+            let parsed = parse_checkpoint_args(args)?;
+            let scope = parsed
+                .scope
+                .unwrap_or_else(|| env.default_checkpoint_scope());
+            let store = env.open_for_scope(Some(&scope))?;
+            let report = create_state_checkpoint(
+                &store,
+                env.cwd,
+                scope,
+                parsed.slug.as_deref(),
+                parsed.summary.as_deref(),
+                &parsed.by,
+                now_at(),
+            )?;
+            Ok(serde_json::to_string_pretty(&report).unwrap())
         }
         "fl_memory_search" => {
             let (query, parsed_scope, parsed_concern, limit) = parse_search_args(args)?;
@@ -1215,6 +1268,19 @@ fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "fl_state_checkpoint",
+            "description": "Record an automatic git session checkpoint (branch, HEAD, dirty files) as a Handoff state entry. Returns {entry, branch, head_sha, dirty_files}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string" },
+                    "slug": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "by": { "type": "string" }
+                }
+            }
+        },
+        {
             "name": "fl_memory_search",
             "description": "Search state entries with BM25 ranking. Returns {query, hits, total_hits} where total_hits is the full ranked count before limit truncation.",
             "inputSchema": {
@@ -1545,5 +1611,44 @@ mod tests {
         assert_eq!(capped, 100);
         let (_, _, _, zero) = parse_search_args(&json!({ "query": "x", "limit": 0 })).unwrap();
         assert_eq!(zero, 0);
+    }
+
+    #[test]
+    fn fl_state_checkpoint_args_default_and_reject_bad_types() {
+        let parsed = parse_checkpoint_args(&json!({})).unwrap();
+        assert!(parsed.scope.is_none());
+        assert!(parsed.slug.is_none());
+        assert!(parsed.summary.is_none());
+        assert_eq!(parsed.by, "fl");
+
+        let parsed = parse_checkpoint_args(
+            &json!({ "scope": "workspace", "slug": "snap-1", "summary": "hi", "by": "tester" }),
+        )
+        .unwrap();
+        assert_eq!(parsed.scope, Some(StateScope::Workspace));
+        assert_eq!(parsed.slug.as_deref(), Some("snap-1"));
+        assert_eq!(parsed.summary.as_deref(), Some("hi"));
+        assert_eq!(parsed.by, "tester");
+
+        for bad in [
+            json!({ "scope": 3 }),
+            json!({ "scope": "bogus:1" }),
+            json!({ "slug": 4 }),
+            json!({ "slug": "1bad slug!" }),
+            json!({ "summary": true }),
+            json!({ "by": 5 }),
+            json!(["nope"]),
+        ] {
+            assert!(parse_checkpoint_args(&bad).is_err(), "{bad}");
+        }
+
+        assert!(
+            tool_definitions()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["name"] == "fl_state_checkpoint"),
+            "fl_state_checkpoint missing from tool_definitions"
+        );
     }
 }

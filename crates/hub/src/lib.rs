@@ -727,6 +727,151 @@ mod tests {
     }
 
     #[test]
+    fn state_checkpoint_route_reports_git_state_and_enforces_protections() {
+        use fl_core::state::{
+            HandoffEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+
+        fn hub_git(repo: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        hub_git(repo, &["init", "-b", "main"]);
+        hub_git(repo, &["config", "user.name", "Checkpoint Tester"]);
+        hub_git(repo, &["config", "user.email", "tester@example.invalid"]);
+        fs::write(repo.join("tracked.txt"), "initial\n").unwrap();
+        hub_git(repo, &["add", "tracked.txt"]);
+        hub_git(repo, &["commit", "-m", "hub checkpoint subject"]);
+        fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
+
+        // `repo_root` is `tmp.path()`, so the hub probes this repository.
+        let state = test_hub_state(&tmp);
+        let owner = ["Bearer ", "owner", "-tok-secret"].concat();
+        let peer = ["Bearer ", "peer", "-tok-secret"].concat();
+
+        // Success: exactly the shared report shape.
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &owner)
+                .with_json_body(&json!({ "scope": "workspace", "by": "tester" })),
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = resp.json_value().unwrap();
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.len(), 4, "{body}");
+        assert_eq!(body["branch"], "main");
+        assert_eq!(body["head_sha"].as_str().unwrap().len(), 40);
+        assert!(body["dirty_files"].as_u64().unwrap() >= 1, "{body}");
+        assert_eq!(body["entry"]["slug"], "checkpoint-tester");
+        assert_eq!(body["entry"]["scope"], "workspace");
+        assert_eq!(body["entry"]["concern"], "handoff");
+
+        // Empty body works and defaults `by` to the caller's actor name.
+        let empty_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &owner),
+        );
+        assert_eq!(empty_resp.status, 200);
+        assert_eq!(empty_resp.json_value().unwrap()["entry"]["by"], "lmcfarlin");
+
+        // Wrong-typed fields and non-object bodies are 400s.
+        for bad in [
+            json!({ "slug": 42 }),
+            json!({ "scope": "bogus:1" }),
+            json!(["x"]),
+        ] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                    .with_header("Authorization", &owner)
+                    .with_json_body(&bad),
+            );
+            assert_eq!(resp.status, 400, "{bad}");
+        }
+
+        // Reserved hub slugs are 403 for owner and peer alike.
+        for auth in [&owner, &peer] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                    .with_header("Authorization", auth)
+                    .with_json_body(&json!({ "slug": "hub-pairing-forged" })),
+            );
+            assert_eq!(resp.status, 403);
+        }
+
+        // A peer cannot overwrite an existing sensitive checkpoint.
+        {
+            let store = state.open_store().unwrap();
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: "checkpoint-sensitive".into(),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Handoff(HandoffEntry {
+                        summary: "secret checkpoint".into(),
+                        shipped: Vec::new(),
+                        in_flight: Vec::new(),
+                        blockers: Vec::new(),
+                        next_steps: Vec::new(),
+                        notes: None,
+                    }),
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        let peer_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &peer)
+                .with_header("X-Fl-Agent", "ferris")
+                .with_json_body(&json!({ "scope": "workspace", "slug": "checkpoint-sensitive" })),
+        );
+        assert_eq!(peer_resp.status, 403);
+        // The owner still can.
+        let owner_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &owner)
+                .with_json_body(&json!({ "scope": "workspace", "slug": "checkpoint-sensitive" })),
+        );
+        assert_eq!(owner_resp.status, 200);
+    }
+
+    #[test]
+    fn state_checkpoint_route_non_repo_is_500() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header(
+                    "Authorization",
+                    ["Bearer ", "owner", "-tok-secret"].concat(),
+                )
+                .with_json_body(&json!({})),
+        );
+        assert_eq!(resp.status, 500);
+        assert!(resp.json_value().unwrap()["error"].is_string());
+    }
+
+    #[test]
     fn static_ferrodeck_serving_spa_fallback_and_traversal_rejection() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);

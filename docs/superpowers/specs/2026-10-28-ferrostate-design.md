@@ -98,11 +98,12 @@ Core search is budget-agnostic (`limit` only). A *recall* is the surface rule (�
 
 ## 4. Session Checkpoints
 
-A checkpoint is how a session ends so the next one can resume without rereading the workspace. It introduces no new type:
+A checkpoint is how a session ends so the next one can resume without rereading the workspace. It is captured **automatically from git** and introduces no new type. The shared core lives in `crates/core/src/ferrostate.rs` (`probe_git_repo`, `create_state_checkpoint`), so the CLI, MCP, and Hub surfaces (§6) never duplicate the git probing:
 
-* A checkpoint **is** a `Handoff` entry at `(scope, handoff, <key>)`, `<key>` defaulting to `checkpoint` — distinct from the canonical `current`, so mid-task checkpointing never overwrites the published handoff. `--key <slug>` allows named checkpoints (e.g. `checkpoint-api`).
-* `fl state checkpoint save` (§6.1) wraps the existing handoff write path (`HandoffEntry` via `UpsertStateArgs`): required `--summary`, repeatable `--shipped`/`--in-flight`/`--blockers`/`--next-steps`, `--notes`/`--notes-file`. Record branch, worktree, and in-flight subagents in `in_flight`/`notes`; `updated_at`/`by` stamp who and when.
-* Resume is `checkpoint show`, then §2.5 recall for the task terms. Promotion to the canonical handoff is an ordinary `fl state handoff set`; no promotion command is added. Checkpoints revise, sync, conflict, and redact like any other `Handoff` (Phase 1 §3.3, §7).
+* A checkpoint **is** a `Handoff` entry at `(scope, handoff, <slug>)`, distinct from the canonical `current`, so checkpointing never overwrites the published handoff. An explicit slug must pass `validate_slug`; the default slug is `checkpoint-<by>` derived to a valid slug.
+* The probe of a repo path resolves the git top-level (`git rev-parse --show-toplevel`), branch (`git branch --show-current`; empty/detached → `detached`), HEAD SHA (`rev-parse HEAD`), latest commit subject (`log -1 --format=%s`), and dirty files (`git status --porcelain`). A non-repository, a repository with no commits, or any git failure is a clear error — never a bogus checkpoint.
+* The write is one `Handoff` upsert through `StateStore::upsert_state` with `SensitivityPatch::Inherit`. `shipped` gets the HEAD commit line (`<head_sha> <subject>`), `in_flight` gets the dirty `XY path` entries (capped at 200, with the full count preserved in the notes and the report), and `notes` records `branch`/`head_sha`/`dirty_files`/latest subject/repo top-level lines. An explicit summary is sanitized to one line of at most 240 characters; the default is `Checkpoint on <branch> @ <short-head> (<n> dirty): <subject>`. `updated_at`/`by` stamp who and when.
+* Every surface returns the same serializable report: `{ "entry": <StateEntry>, "branch": string, "head_sha": string, "dirty_files": n }`. There is **no** checkpoint show/get command: resume reads the checkpoint like any other `Handoff` (`fl state get`, `state_get`, `GET /api/v1/state`), then §2.5 recall for the task terms. Promotion to the canonical handoff is an ordinary `fl state handoff set`; no promotion command is added. Checkpoints revise, sync, conflict, and redact like any other `Handoff` (Phase 1 §3.3, §7).
 
 ---
 
@@ -130,23 +131,20 @@ Existing subcommands are unchanged. Phase 2 adds:
 
 * `fl state search <query> [--scope <scope>] [--concern <concern>] [--limit <n>=20] [--budget-tokens <n>] [--json]` — `list_state` → `search_state_entries` → §2.5 prefix rule when budgeted. `--json`: `{ "hits": [<StateSearchHit>, ...] }`; text: one `<slug>  <score_millis>  <snippet>` line per hit.
 * `fl state import-workspace [--workspace-root <path>] [--by <author>=fl] [--json]` — §3; the root is the explicit `--workspace-root`, else the first ancestor of the cwd holding `.agents/memory/` or `Notes/`. The scan is grouped by scope and each scope is written through the multi-store routing (`open_for_scope`). `--json` prints the full §3 report including `skipped`; text prints counts and scopes plus any skipped lines.
-* `fl state checkpoint save --scope <scope> --summary <text> --by <author> [--key <slug>=checkpoint] [--shipped <text>...] [--in-flight <text>...] [--blockers <text>...] [--next-steps <text>...] [--notes <text> | --notes-file <path>] [--sensitive | --not-sensitive] [--json]` — §4; `--json`: `{ "entry": <StateEntry> }`.
-* `fl state checkpoint show --scope <scope> [--key <slug>=checkpoint] [--json]` — the checkpoint entry (`{ "entry": <StateEntry> }` with `--json`).
+* `fl state checkpoint [--scope <scope>] [--slug <slug>] [--summary <text>] [--by <author>=fl] [--json]` — §4: probes the git repository at the cwd and records it as a `Handoff` checkpoint. The default scope is the bound project scope for the cwd when configured, else `workspace`. `--json` prints the §4 report `{ "entry": <StateEntry>, "branch": ..., "head_sha": ..., "dirty_files": n }`; text prints one concise line naming scope/slug/branch/head/dirty. There is no checkpoint show command.
 * `fl state code-index [--root <path>] [--scope <scope>] [--by <author>=fl] [--json]` — §5; `--json`: `{ "indexed": n, "skipped": n, "full_tokens": n, "outline_tokens": n, "saved_tokens": n }`.
 
 ### 6.2 MCP tools (`fl state mcp`, `crates/cli/src/cmd/state_mcp.rs`)
 
-Three tools join the existing stdio JSON-RPC 2.0 server (results keep the single JSON text block convention). Filesystem work (`import`, `code-index` rebuild) stays CLI-only; MCP callers recall the built index via `state_search`.
+Tools join the existing stdio JSON-RPC 2.0 server (results keep the single JSON text block convention). Filesystem work (`import`, `code-index` rebuild) stays CLI-only; MCP callers recall the built index via search.
 
-* `state_search` — `{ "query": string, "scope"?: string, "concern"?: "memory"|"handoff"|"runtime", "limit"?: number = 20, "budget_tokens"?: number }` → `{ "hits": [<StateSearchHit>, ...] }` (§2.5 rule when budgeted).
-* `state_checkpoint_save` — `{ "scope": string, "by": string, "summary": string, "key"?: string = "checkpoint", "shipped"?, "in_flight"?, "blockers"?, "next_steps"?: string[], "notes"?: string, "sensitive"?: bool, "clear_sensitive"?: bool }` → `{ "entry": <StateEntry> }`.
-* `state_checkpoint_get` — `{ "scope": string, "key"?: string }` → `{ "entry": <StateEntry> }`, or an `isError` result when absent.
+* `fl_memory_search` — `{ "query": string, "scope"?: string, "concern"?: "memory"|"handoff"|"runtime", "limit"?: number }` → `{ "query": ..., "hits": [<StateSearchHit>, ...], "total_hits": n }`.
+* `fl_state_checkpoint` — `{ "scope"?: string, "slug"?: string, "summary"?: string, "by"?: string = "fl" }` → the §4 report `{ "entry": <StateEntry>, "branch": ..., "head_sha": ..., "dirty_files": n }` as pretty JSON. The repository is the server's cwd; the default scope matches the CLI (bound project scope for the cwd when configured, else `workspace`). Wrong argument types or an invalid scope/slug are `isError` results. There is no checkpoint get tool; use `state_get`.
 
 ### 6.3 Hub REST (`crates/hub/src/api.rs`)
 
 * `GET /api/v1/state/search?q=<query>[&scope=<scope>][&concern=<concern>][&limit=<n>][&budget_tokens=<n>]` → `200 { "hits": [<StateSearchHit>, ...] }`. `q` required; bad `scope`/`concern` → `400 { "error": ... }`, as in `handle_get_state`.
-* `POST /api/v1/state/checkpoint`, body `{ "scope": string, "key"?: string, "summary": string, "shipped"?, "in_flight"?, "blockers"?, "next_steps"?: string[], "notes"?: string, "sensitive"?: bool, "by"?: string }` → `200 { "entry": <StateEntry> }` (§4).
-* `GET /api/v1/state/checkpoint?scope=<scope>[&key=<slug>]` → `200 { "entry": <StateEntry> }`, else `404 { "error": ... }`.
+* `POST /api/v1/state/checkpoint`, body empty or `{ "scope"?: string, "slug"?: string, "summary"?: string, "by"?: string }` (non-object body or wrong-typed fields → `400`) → `200` with exactly the §4 report `{ "entry": <StateEntry>, "branch": ..., "head_sha": ..., "dirty_files": n }`. The repository is the Hub's configured repo root (git errors → `500`); the default scope is `project:<git-top-level basename slug>` when derivable, else `workspace`; `by` defaults to the caller's actor name. There is no `GET` checkpoint route; use `GET /api/v1/state`.
 * `GET /api/v1/stats` gains one additive field from all `token-savings-ledger` entries (§5.2), existing fields unchanged: `{ ..., "token_gain": { "full_tokens": n, "outline_tokens": n, "saved_tokens": n, "records": n } }` (saturating sums; present and all-zero with no ledger). Existing `GET`/`POST /api/v1/state` are unchanged.
 * `POST /api/v1/state/import-workspace`, **owner-only** (non-owner → `403`), body empty or `{ "workspace_root"?: string, "by"?: string }` (non-object body or wrong-typed fields → `400`) → `200 { "imported_memories": n, "imported_handoffs": n, "scopes": ["<wire scope>", ...] }` exactly (no `skipped` field). The root is the body's `workspace_root`, else resolved from the Hub's configured repo root; `by` defaults to the caller's actor name. All entries go to the Hub store (§3).
 
@@ -156,8 +154,8 @@ Three tools join the existing stdio JSON-RPC 2.0 server (results keep the single
 
 No Phase 1 semantics change: `sensitive` stays sticky (`SensitivityPatch`), `ever_sensitive` keeps whole revision streams off non-private remotes, clearing never erases history. New Hub endpoints mirror `handle_get_state` / `handle_post_state` / `redact_sensitive_entry` (`crates/hub/src/api.rs`) exactly:
 
-* **Reads** (search, checkpoint get): workspace `hub-pairing-`/`hub-session-` slugs are filtered out; owners see full entries; non-owners get sensitive entries through `redact_sensitive_entry` (`Memory` summary+body, `Handoff` summary+notes → `[REDACTED]` with `shipped`/`in_flight`/`blockers`/`next_steps` cleared, and `Runtime` value → `[REDACTED]`). Redaction also covers the search `snippet` (`[REDACTED]`), since it derives from the body; `score_millis`/`matched_terms`/`estimated_tokens` remain, as redacted entries themselves do today.
-* **Writes** (checkpoint post): reserved slug prefixes → `403`; `sensitive: true` requires owner (`403`); non-owners cannot modify an entry with `sensitive`/`ever_sensitive` set (`403`).
+* **Reads** (search; checkpoints are read through the ordinary state reads): workspace `hub-pairing-`/`hub-session-` slugs are filtered out; owners see full entries; non-owners get sensitive entries through `redact_sensitive_entry` (`Memory` summary+body, `Handoff` summary+notes → `[REDACTED]` with `shipped`/`in_flight`/`blockers`/`next_steps` cleared, and `Runtime` value → `[REDACTED]`). Redaction also covers the search `snippet` (`[REDACTED]`), since it derives from the body; `score_millis`/`matched_terms`/`estimated_tokens` remain, as redacted entries themselves do today.
+* **Writes** (checkpoint post): reserved `hub-pairing-`/`hub-session-` slug prefixes → `403`; non-owners cannot modify an existing checkpoint entry with `sensitive`/`ever_sensitive` set (`403`). Checkpoint writes always use `SensitivityPatch::Inherit`, so they never set or clear sensitivity.
 * **CLI/MCP are local-trust** and return full entries; `fl state render` still excludes sensitive entries without `--include-sensitive`. Code-index entries hold only paths/signatures/headings, are written non-sensitive, and the indexer never reads state entries.
 
 ---

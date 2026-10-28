@@ -10,7 +10,10 @@ use fl_core::agent::AgentStatus;
 use fl_core::arch::{
     ArchitectureModel, DEFAULT_ARCH_MANIFEST_PATH, export_likec4_dsl, validate_architecture_model,
 };
-use fl_core::ferrostate::{apply_workspace_import, resolve_workspace_root, scan_workspace_import};
+use fl_core::ferrostate::{
+    apply_workspace_import, create_state_checkpoint_from_probe, derive_import_slug, probe_git_repo,
+    resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
+};
 use fl_core::ferrowire::{
     DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter,
     validate_sender_name,
@@ -407,6 +410,9 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET", "/api/v1/state") => handle_get_state(&store, &authority, req),
         ("GET", "/api/v1/state/search") => handle_get_state_search(&store, &authority, req),
         ("POST", "/api/v1/state") => handle_post_state(&store, &authority, req),
+        ("POST", "/api/v1/state/checkpoint") => {
+            handle_post_state_checkpoint(state, &store, &authority, req)
+        }
         ("POST", "/api/v1/state/import-workspace") => {
             handle_post_state_import_workspace(state, &store, &authority, req)
         }
@@ -1281,6 +1287,117 @@ fn handle_post_state(
     }) {
         Ok(entry) => HttpResponse::json(200, json!({ "entry": entry })),
         Err(e) => HttpResponse::json(400, json!({ "error": e.to_string() })),
+    }
+}
+
+fn handle_post_state_checkpoint(
+    state: &HubState,
+    store: &RedbStore,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let raw: Value = if req.body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        match req.json() {
+            Ok(v) => v,
+            Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+        }
+    };
+    let Some(obj) = raw.as_object() else {
+        return HttpResponse::json(400, json!({ "error": "expected JSON object" }));
+    };
+    let optional_str = |key: &str| -> Result<Option<String>, HttpResponse> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(HttpResponse::json(
+                400,
+                json!({ "error": format!("`{key}` must be a string") }),
+            )),
+        }
+    };
+    let scope_field = match optional_str("scope") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let slug_field = match optional_str("slug") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let summary_field = match optional_str("summary") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let by_field = match optional_str("by") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let by = by_field
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| authority.actor_name().to_string());
+
+    // Reserved internal hub slugs, mirroring `handle_post_state` (checked
+    // on the trimmed, lowercased input before slug validation).
+    if let Some(raw_slug) = slug_field.as_deref() {
+        let normalized = raw_slug.trim().to_ascii_lowercase();
+        if normalized.starts_with("hub-pairing-") || normalized.starts_with("hub-session-") {
+            return HttpResponse::json(
+                403,
+                json!({ "error": "reserved internal hub authentication slug prefix" }),
+            );
+        }
+    }
+
+    let probe = match probe_git_repo(&state.config.repo_root) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e })),
+    };
+
+    let scope = match scope_field.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => match StateScope::from_wire(raw.trim()) {
+            Ok(s) => s,
+            Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
+        },
+        None => probe
+            .top_level
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(derive_import_slug)
+            .map(StateScope::Project)
+            .unwrap_or(StateScope::Workspace),
+    };
+
+    let slug = match resolve_checkpoint_slug(slug_field.as_deref(), &by) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+
+    // Non-owners cannot overwrite an already-sensitive checkpoint entry.
+    if !authority.is_owner()
+        && let Ok(Some(existing)) = store.get_state_by_key(&scope, StateConcern::Handoff, &slug)
+        && (existing.sensitive || existing.ever_sensitive)
+    {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "owner authority required to modify sensitive state entries" }),
+        );
+    }
+
+    match create_state_checkpoint_from_probe(
+        store,
+        &probe,
+        scope,
+        Some(slug.as_str()),
+        summary_field.as_deref(),
+        &by,
+        stamp::now(),
+    ) {
+        Ok(report) => HttpResponse::json(
+            200,
+            serde_json::to_value(&report).unwrap_or_else(|_| json!({})),
+        ),
+        Err(e) => HttpResponse::json(500, json!({ "error": e })),
     }
 }
 

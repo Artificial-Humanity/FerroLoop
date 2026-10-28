@@ -1,6 +1,7 @@
 //! One-shot workspace importer: legacy `.agents/memory/*.md` files become
 //! `Memory` entries and `Notes/*/STATE.md` files become `Handoff` entries
-//! (FerroState Phase 2 design §3, §8).
+//! (FerroState Phase 2 design §3, §8). Also automatic git session
+//! checkpoints (§4): [`probe_git_repo`] plus [`create_state_checkpoint`].
 //!
 //! The scan/apply split is shared by the CLI (`fl state import-workspace`)
 //! and the Hub (`POST /api/v1/state/import-workspace`) so neither surface
@@ -13,14 +14,15 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
 use crate::at::At;
 use crate::state::{
     HandoffEntry, MAX_BODY_BYTES, MAX_NOTES_BYTES, MAX_SUMMARY_CHARS, MemoryBasis, MemoryCategory,
-    MemoryEntry, MemoryLifecycle, SensitivityPatch, StateConcern, StatePayload, StateScope,
-    UpsertStateArgs, validate_slug,
+    MemoryEntry, MemoryLifecycle, SensitivityPatch, StateConcern, StateEntry, StatePayload,
+    StateScope, UpsertStateArgs, validate_slug,
 };
 use crate::store::StateStore;
 
@@ -856,6 +858,206 @@ pub fn apply_workspace_import<S: StateStore>(
     report
 }
 
+/// Maximum dirty entries recorded in a checkpoint's `in_flight` list.
+/// The full count is always preserved in the notes and the report.
+pub const MAX_CHECKPOINT_DIRTY_ENTRIES: usize = 200;
+
+/// Serializable outcome of a state checkpoint (CLI/MCP/Hub report shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateCheckpointReport {
+    pub entry: StateEntry,
+    pub branch: String,
+    pub head_sha: String,
+    /// Full dirty-file count, even when the captured list is capped.
+    pub dirty_files: usize,
+}
+
+/// Git state probed for a checkpoint. `dirty_entries` holds one
+/// `XY path` string per `git status --porcelain` line.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitRepoProbe {
+    pub top_level: PathBuf,
+    pub branch: String,
+    pub head_sha: String,
+    pub latest_subject: String,
+    pub dirty_entries: Vec<String>,
+}
+
+fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| format!("failed to run `git {}`: {e}", args.join(" ")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
+        return Err(format!(
+            "`git {}` failed in {}{detail}",
+            args.join(" "),
+            repo.display()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Parse one `git status --porcelain` (v1) line into `XY path`, ignoring
+/// lines too short to carry a status and path.
+fn parse_porcelain_line(line: &str) -> Option<String> {
+    let status = line.get(..2)?;
+    let path = line.get(3..)?;
+    if path.is_empty() {
+        return None;
+    }
+    Some(format!("{status} {path}"))
+}
+
+/// Probe `repo` with git. A non-repository, a repository with no commits,
+/// or any git failure is a clear `Err`; never a bogus checkpoint.
+pub fn probe_git_repo(repo: &Path) -> Result<GitRepoProbe, String> {
+    let top_level = run_git(repo, &["rev-parse", "--show-toplevel"])
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("not a git repository at {} ({e})", repo.display()))?;
+    if top_level.is_empty() {
+        return Err(format!("not a git repository at {}", repo.display()));
+    }
+    let branch = run_git(repo, &["branch", "--show-current"])?;
+    let branch = branch.trim();
+    let branch = if branch.is_empty() {
+        "detached".to_string()
+    } else {
+        branch.to_string()
+    };
+    let head_sha = run_git(repo, &["rev-parse", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .map_err(|e| format!("cannot resolve HEAD in {} ({e})", repo.display()))?;
+    if head_sha.is_empty() {
+        return Err(format!("no commits yet in {}", repo.display()));
+    }
+    let latest_subject = sanitize_summary(&run_git(repo, &["log", "-1", "--format=%s"])?);
+    let status = run_git(repo, &["status", "--porcelain"])?;
+    let dirty_entries = status.lines().filter_map(parse_porcelain_line).collect();
+    Ok(GitRepoProbe {
+        top_level: PathBuf::from(top_level),
+        branch,
+        head_sha,
+        latest_subject,
+        dirty_entries,
+    })
+}
+
+/// Resolve a checkpoint slug: an explicit slug must pass
+/// [`validate_slug`]; the default is `checkpoint-<by>` derived to a
+/// valid slug (falling back to plain `checkpoint`).
+pub fn resolve_checkpoint_slug(slug: Option<&str>, by: &str) -> Result<String, String> {
+    match slug {
+        Some(raw) => validate_slug(raw).map_err(|e| e.to_string()),
+        None => Ok(derive_import_slug(&format!("checkpoint-{by}"))
+            .unwrap_or_else(|| "checkpoint".to_string())),
+    }
+}
+
+/// Build the `Handoff` upsert for a checkpoint from `probe`.
+pub fn build_checkpoint_upsert(
+    probe: &GitRepoProbe,
+    scope: StateScope,
+    slug: Option<&str>,
+    summary: Option<&str>,
+    by: &str,
+    at: At,
+) -> Result<UpsertStateArgs, String> {
+    let slug = resolve_checkpoint_slug(slug, by)?;
+    let dirty_total = probe.dirty_entries.len();
+    let short_head: String = probe.head_sha.chars().take(7).collect();
+    let default_summary = format!(
+        "Checkpoint on {} @ {} ({} dirty): {}",
+        probe.branch, short_head, dirty_total, probe.latest_subject
+    );
+    let summary = summary
+        .map(sanitize_summary)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| sanitize_summary(&default_summary));
+    let summary = if summary.is_empty() {
+        format!("Checkpoint on {} @ {}", probe.branch, short_head)
+    } else {
+        summary
+    };
+    let mut notes_lines = vec![
+        format!("branch: {}", probe.branch),
+        format!("head_sha: {}", probe.head_sha),
+        format!("dirty_files: {dirty_total}"),
+        format!("latest_subject: {}", probe.latest_subject),
+        format!("repo_top_level: {}", probe.top_level.display()),
+    ];
+    if dirty_total > MAX_CHECKPOINT_DIRTY_ENTRIES {
+        notes_lines.push(format!(
+            "dirty_files_truncated: in_flight lists first {MAX_CHECKPOINT_DIRTY_ENTRIES} of {dirty_total}"
+        ));
+    }
+    let notes = truncate_bytes(&notes_lines.join("\n"), MAX_NOTES_BYTES);
+    Ok(UpsertStateArgs {
+        scope,
+        slug,
+        sensitivity: SensitivityPatch::Inherit,
+        payload: StatePayload::Handoff(HandoffEntry {
+            summary,
+            shipped: vec![format!("{} {}", probe.head_sha, probe.latest_subject)],
+            in_flight: probe
+                .dirty_entries
+                .iter()
+                .take(MAX_CHECKPOINT_DIRTY_ENTRIES)
+                .cloned()
+                .collect(),
+            blockers: Vec::new(),
+            next_steps: Vec::new(),
+            notes: Some(notes),
+        }),
+        at,
+        by: by.to_string(),
+    })
+}
+
+/// Write a checkpoint for an already-probed repository.
+pub fn create_state_checkpoint_from_probe<S: StateStore>(
+    store: &S,
+    probe: &GitRepoProbe,
+    scope: StateScope,
+    slug: Option<&str>,
+    summary: Option<&str>,
+    by: &str,
+    at: At,
+) -> Result<StateCheckpointReport, String> {
+    let args = build_checkpoint_upsert(probe, scope, slug, summary, by, at)?;
+    let dirty_files = probe.dirty_entries.len();
+    let entry = store.upsert_state(args).map_err(|e| e.to_string())?;
+    Ok(StateCheckpointReport {
+        entry,
+        branch: probe.branch.clone(),
+        head_sha: probe.head_sha.clone(),
+        dirty_files,
+    })
+}
+
+/// Probe `repo` with git and record the result as a `Handoff` checkpoint.
+pub fn create_state_checkpoint<S: StateStore>(
+    store: &S,
+    repo: &Path,
+    scope: StateScope,
+    slug: Option<&str>,
+    summary: Option<&str>,
+    by: &str,
+    at: At,
+) -> Result<StateCheckpointReport, String> {
+    let probe = probe_git_repo(repo)?;
+    create_state_checkpoint_from_probe(store, &probe, scope, slug, summary, by, at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,5 +1471,187 @@ mod tests {
             "{:?}",
             scan.skipped
         );
+    }
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} in {}: {}",
+            args,
+            repo.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// A git repo on `main` with one commit, one modified tracked file,
+    /// and one untracked file.
+    fn git_fixture() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.name", "Checkpoint Tester"]);
+        git(repo, &["config", "user.email", "tester@example.invalid"]);
+        write(&repo.join("tracked.txt"), "initial\n");
+        git(repo, &["add", "tracked.txt"]);
+        git(repo, &["commit", "-m", "initial subject line"]);
+        write(&repo.join("tracked.txt"), "modified\n");
+        write(&repo.join("untracked.txt"), "new\n");
+        tmp
+    }
+
+    #[test]
+    fn checkpoint_probe_and_create_capture_git_state() {
+        let tmp = git_fixture();
+        let repo = tmp.path();
+        let probe = probe_git_repo(repo).unwrap();
+        assert_eq!(probe.branch, "main");
+        assert_eq!(probe.head_sha, git(repo, &["rev-parse", "HEAD"]));
+        assert_eq!(probe.head_sha.len(), 40);
+        assert_eq!(probe.latest_subject, "initial subject line");
+        assert_eq!(probe.dirty_entries.len(), 2, "{:?}", probe.dirty_entries);
+        assert!(
+            probe
+                .dirty_entries
+                .iter()
+                .any(|d| d.trim() == "M tracked.txt"),
+            "{:?}",
+            probe.dirty_entries
+        );
+        assert!(
+            probe.dirty_entries.iter().any(|d| d == "?? untracked.txt"),
+            "{:?}",
+            probe.dirty_entries
+        );
+
+        let store = MemStore::default();
+        let report = create_state_checkpoint(
+            &store,
+            repo,
+            StateScope::Workspace,
+            None,
+            None,
+            "tester",
+            at(),
+        )
+        .unwrap();
+        assert_eq!(report.branch, "main");
+        assert_eq!(report.head_sha, probe.head_sha);
+        assert_eq!(report.dirty_files, 2);
+        assert_eq!(report.entry.slug, "checkpoint-tester");
+        assert_eq!(report.entry.scope, StateScope::Workspace);
+        assert_eq!(report.entry.concern, StateConcern::Handoff);
+        assert!(!report.entry.sensitive);
+        let StatePayload::Handoff(h) = &report.entry.payload else {
+            panic!("checkpoint must be a handoff");
+        };
+        let short: String = probe.head_sha.chars().take(7).collect();
+        assert_eq!(
+            h.summary,
+            format!("Checkpoint on main @ {short} (2 dirty): initial subject line")
+        );
+        assert_eq!(
+            h.shipped,
+            vec![format!("{} initial subject line", probe.head_sha)]
+        );
+        assert_eq!(h.in_flight.len(), 2);
+        assert!(h.in_flight.iter().any(|d| d == "?? untracked.txt"));
+        let notes = h.notes.as_deref().unwrap();
+        assert!(notes.contains("branch: main"), "{notes}");
+        assert!(
+            notes.contains(&format!("head_sha: {}", probe.head_sha)),
+            "{notes}"
+        );
+        assert!(notes.contains("dirty_files: 2"), "{notes}");
+        assert!(notes.contains("initial subject line"), "{notes}");
+        assert!(
+            notes.contains(&probe.top_level.display().to_string()),
+            "{notes}"
+        );
+
+        // The report serializes to exactly the shared wire shape.
+        let wire = serde_json::to_value(&report).unwrap();
+        let obj = wire.as_object().unwrap();
+        assert_eq!(obj.len(), 4, "{wire}");
+        assert_eq!(wire["branch"], "main");
+        assert_eq!(wire["dirty_files"], 2);
+        assert_eq!(wire["entry"]["slug"], "checkpoint-tester");
+    }
+
+    #[test]
+    fn checkpoint_explicit_slug_and_summary_are_sanitized() {
+        let tmp = git_fixture();
+        let store = MemStore::default();
+        let long = format!("  hello\nworld\t  {}", "x".repeat(300));
+        let report = create_state_checkpoint(
+            &store,
+            tmp.path(),
+            StateScope::Workspace,
+            Some("My-Checkpoint"),
+            Some(long.as_str()),
+            "tester",
+            at(),
+        )
+        .unwrap();
+        assert_eq!(report.entry.slug, "my-checkpoint");
+        let StatePayload::Handoff(h) = &report.entry.payload else {
+            panic!("checkpoint must be a handoff");
+        };
+        assert!(!h.summary.contains('\n'), "{}", h.summary);
+        assert!(h.summary.starts_with("hello world"), "{}", h.summary);
+        assert_eq!(h.summary.chars().count(), MAX_SUMMARY_CHARS);
+
+        let err = create_state_checkpoint(
+            &store,
+            tmp.path(),
+            StateScope::Workspace,
+            Some("1bad slug!"),
+            None,
+            "tester",
+            at(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid slug"), "{err}");
+        assert_eq!(store.list_state(None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn checkpoint_non_repo_and_empty_repo_are_errors() {
+        let plain = TempDir::new().unwrap();
+        let err = probe_git_repo(plain.path()).unwrap_err();
+        assert!(err.contains("not a git repository"), "{err}");
+        let store = MemStore::default();
+        assert!(
+            create_state_checkpoint(
+                &store,
+                plain.path(),
+                StateScope::Workspace,
+                None,
+                None,
+                "tester",
+                at(),
+            )
+            .is_err()
+        );
+        assert!(store.list_state(None, None).unwrap().is_empty());
+
+        let empty = TempDir::new().unwrap();
+        git(empty.path(), &["init", "-b", "main"]);
+        let err = probe_git_repo(empty.path()).unwrap_err();
+        assert!(err.contains("HEAD"), "{err}");
+    }
+
+    #[test]
+    fn checkpoint_detached_head_reports_detached_branch() {
+        let tmp = git_fixture();
+        git(tmp.path(), &["checkout", "--detach", "HEAD"]);
+        let probe = probe_git_repo(tmp.path()).unwrap();
+        assert_eq!(probe.branch, "detached");
     }
 }

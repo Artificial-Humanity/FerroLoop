@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use fl_core::agent::{AgentRecord, AgentStatus, AreaRecord, reports_to};
 use fl_core::ferrostate::{
-    WorkspaceImportReport, apply_workspace_import, resolve_workspace_root, scan_workspace_import,
+    WorkspaceImportReport, apply_workspace_import, create_state_checkpoint, resolve_workspace_root,
+    scan_workspace_import,
 };
 use fl_core::ids::{Kind, RevisionId, StateId};
 use fl_core::iri::Iri;
@@ -196,6 +197,19 @@ pub enum StateCmd {
     },
     /// Run the newline-delimited JSON-RPC 2.0 MCP server over stdio.
     Mcp,
+    /// Record an automatic git session checkpoint as a `Handoff` entry.
+    Checkpoint {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        slug: Option<String>,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long, default_value = "fl")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// One-shot import of `.agents/memory/*.md` and `Notes/*/STATE.md`.
     ImportWorkspace {
         #[arg(long = "workspace-root")]
@@ -611,6 +625,17 @@ impl<'a> StateEnv<'a> {
             scopes.push(StateScope::Project(slug));
         }
         scopes
+    }
+
+    /// Default checkpoint scope: the bound project scope for `cwd` when
+    /// configured, else `workspace`.
+    pub fn default_checkpoint_scope(&self) -> StateScope {
+        if let Ok(Some(entry)) = crate::config::bound_entry(&self.cfg.projects, self.cwd)
+            && let Some(slug) = entry.inferred_slug()
+        {
+            return StateScope::Project(slug);
+        }
+        StateScope::Workspace
     }
 
     pub fn open_for_scope(&self, scope: Option<&StateScope>) -> Result<RedbStore, String> {
@@ -1155,6 +1180,41 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
                     report.verified_revisions,
                     report.verified_registry_events,
                     report.verified_wire_messages
+                );
+            }
+            Ok(())
+        }
+        StateCmd::Checkpoint {
+            scope,
+            slug,
+            summary,
+            by,
+            json,
+        } => {
+            let resolved_scope = match scope.as_deref() {
+                Some(raw) => StateScope::from_wire(raw).map_err(|e| e.to_string())?,
+                None => env.default_checkpoint_scope(),
+            };
+            let store = env.open_for_scope(Some(&resolved_scope))?;
+            let report = create_state_checkpoint(
+                &store,
+                env.cwd,
+                resolved_scope,
+                slug.as_deref(),
+                summary.as_deref(),
+                &by,
+                now_at(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else {
+                println!(
+                    "checkpoint scope={} slug={} branch={} head={} dirty={}",
+                    report.entry.scope.as_wire(),
+                    report.entry.slug,
+                    report.branch,
+                    report.head_sha,
+                    report.dirty_files
                 );
             }
             Ok(())
