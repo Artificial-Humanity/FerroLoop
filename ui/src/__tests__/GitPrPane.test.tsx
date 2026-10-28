@@ -96,7 +96,7 @@ describe("DiffViewer", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/-\s+\.route\("\/health", get\(old_health\)\)/)).toBeInTheDocument();
 
-    const splitBtn = screen.getByRole("button", { name: /Split/i });
+    const splitBtn = screen.getByRole("button", { name: /Side-by-Side/i });
     const unifiedBtn = screen.getByRole("button", { name: /Unified/i });
 
     expect(unifiedBtn).toHaveAttribute("aria-pressed", "true");
@@ -251,5 +251,42 @@ describe("GitPrPane", () => {
         }),
       );
     });
+  });
+});
+
+describe("empty-state muting", () => {
+  it("disables Unified and Side-by-Side when the diff has no files", () => {
+    render(<DiffViewer diff="" />);
+
+    expect(screen.getByRole("button", { name: /^Unified$/i })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^Side-by-Side$/i })).toBeDisabled();
+    expect(screen.getByTestId("diff-empty-state")).toBeInTheDocument();
+  });
+
+  it("greys and disables the PR governance form when no PRs are tracked", () => {
+    render(
+      <GitPrPane
+        worktrees={SAMPLE_WORKTREES}
+        selectedWorktreeId="fl-ferrodeck-ui"
+        worktreeDiff={SAMPLE_WORKTREE_DIFF}
+        prs={[]}
+        onSelectWorktree={vi.fn()}
+        onRefreshWorktrees={vi.fn()}
+        onReviewPr={vi.fn()}
+        onMergePr={vi.fn()}
+      />,
+    );
+
+    const prTab = screen.getByRole("button", {
+      name: /Pull Requests & Governance \(0\)/i,
+    });
+    expect(prTab.style.opacity).toBe("0.65");
+    fireEvent.click(prTab);
+
+    const form = screen.getByTestId("pr-governance-form");
+    expect(form).toHaveAttribute("data-prs-empty", "true");
+    expect(form.style.opacity).toBe("0.45");
+    expect(screen.getByLabelText(/PR Number/i)).toBeDisabled();
+    expect(screen.getByRole("button", { name: /Submit Review/i })).toBeDisabled();
   });
 });

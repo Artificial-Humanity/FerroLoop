@@ -68,11 +68,11 @@ export function getFileBadgeSpec(urlOrLabel: string, fallbackLabel?: string): Fi
 const AMBER_CODE_PILL_STYLE: React.CSSProperties = {
   fontFamily: "var(--font-mono)",
   fontSize: "12.5px",
-  padding: "1px 6px",
-  borderRadius: "5px",
-  backgroundColor: "rgba(245, 158, 11, 0.12)",
-  border: "1px solid rgba(245, 158, 11, 0.24)",
-  color: "#FCD34D",
+  padding: "1px 4px",
+  borderRadius: "4px",
+  backgroundColor: "var(--code-inline-bg)",
+  border: "none",
+  color: "var(--code-inline-text)",
 };
 
 const FILE_CHIP_STYLE: React.CSSProperties = {
@@ -90,7 +90,31 @@ const FILE_CHIP_STYLE: React.CSSProperties = {
 };
 
 const INLINE_TOKEN_REGEX =
-  /(\[(?:`[^`]+`|[^\]\n]+)\]\([^)\s]+\)|`[^`\n]+`|\*\*[^*\n]+?\*\*|~~[^~\n]+?~~|\*(?!\s)[^*\n]+?(?<!\s)\*|https?:\/\/[^\s<)]+)/g;
+  /(\[(?:`[^`]+`|[^\]\n]+)\]\([^)\s]+\)|`[^`\n]+`|\*\*[^*\n]+?\*\*|~~[^~\n]+?~~|\*(?!\s)[^*\n]+?(?<!\s)\*|<https?:\/\/[^\s>]+>|https?:\/\/[^\s<>]+)/g;
+
+/** Split trailing sentence punctuation and unmatched closers off a bare URL. */
+function splitBareUrlSuffix(token: string): { cleanUrl: string; suffix: string } {
+  let cleanUrl = token;
+  let suffix = "";
+  for (;;) {
+    if (/[.,;:!?]$/.test(cleanUrl)) {
+      suffix = cleanUrl.slice(-1) + suffix;
+      cleanUrl = cleanUrl.slice(0, -1);
+      continue;
+    }
+    if (cleanUrl.endsWith(")")) {
+      const opens = (cleanUrl.match(/\(/g) ?? []).length;
+      const closes = (cleanUrl.match(/\)/g) ?? []).length;
+      if (closes > opens) {
+        suffix = ")" + suffix;
+        cleanUrl = cleanUrl.slice(0, -1);
+        continue;
+      }
+    }
+    break;
+  }
+  return { cleanUrl, suffix };
+}
 
 export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.ReactNode[] {
   if (!text) {
@@ -155,9 +179,27 @@ export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.
           <span key={key}>{renderInlineMarkdown(cleanedLabel, `${key}-lbl`)}</span>,
         );
       }
+    } else if (token.startsWith("<") && token.endsWith(">") && /^<https?:\/\//i.test(token)) {
+      const url = token.slice(1, -1);
+      nodes.push(
+        <a
+          key={key}
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{
+            color: "var(--accent-sky, #38BDF8)",
+            textDecoration: "underline",
+          }}
+        >
+          {url}
+        </a>,
+      );
     } else if (token.startsWith("`") && token.endsWith("`") && token.length >= 2) {
       const codeText = token.slice(1, -1);
-      const trimmedCode = codeText.trim();
+      const trimmedCode = codeText
+        .trim()
+        .replace(/^<(\S+)>$/, "$1");
       if (/^https?:\/\/\S+$/i.test(trimmedCode)) {
         nodes.push(
           <a
@@ -185,7 +227,7 @@ export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.
     } else if (token.startsWith("**") && token.endsWith("**") && token.length > 4) {
       const inner = token.slice(2, -2);
       nodes.push(
-        <strong key={key} style={{ color: "#F8FAFC", fontWeight: 600 }}>
+        <strong key={key} style={{ color: "var(--text-primary)", fontWeight: 600 }}>
           {renderInlineMarkdown(inner, `${key}-b`)}
         </strong>,
       );
@@ -196,9 +238,7 @@ export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.
       const inner = token.slice(1, -1);
       nodes.push(<em key={key}>{renderInlineMarkdown(inner, `${key}-i`)}</em>);
     } else if (/^https?:\/\//i.test(token)) {
-      const trailingMatch = token.match(/([.,;:!?]+)$/);
-      const cleanUrl = trailingMatch ? token.slice(0, -trailingMatch[1].length) : token;
-      const trailingPunct = trailingMatch ? trailingMatch[1] : "";
+      const { cleanUrl, suffix: trailingPunct } = splitBareUrlSuffix(token);
       nodes.push(
         <a
           key={key}

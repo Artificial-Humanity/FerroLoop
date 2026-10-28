@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ALWAYS_SEND_NOW_STORAGE_KEY,
   ChatPane,
+  sessionDraftMemory,
   sessionScrollMemory,
 } from "../components/ChatPane";
 import type { QueuedOperatorPrompt, TranscriptTurn } from "../types/api";
@@ -10,7 +11,11 @@ import type { QueuedOperatorPrompt, TranscriptTurn } from "../types/api";
 describe("ChatPane", () => {
   beforeEach(() => {
     sessionScrollMemory.clear();
+    sessionDraftMemory.clear();
     window.localStorage.removeItem(ALWAYS_SEND_NOW_STORAGE_KEY);
+    for (const key of Object.keys(window.localStorage)) {
+      if (key.startsWith("ferrodeck.draft.")) window.localStorage.removeItem(key);
+    }
   });
   const sampleTurns: TranscriptTurn[] = [
     {
@@ -660,5 +665,35 @@ describe("ChatPane", () => {
     fireEvent.click(loadEarlierBtn);
     expect(screen.getByTestId("turn-card-0")).toBeInTheDocument();
     expect(screen.queryByTestId("load-earlier-turns-btn")).toBeNull();
+  });
+});
+
+describe("ChatPane draft persistence", () => {
+  it("restores an in-progress draft after unmount and remount", () => {
+    const props = {
+      agentName: "ferris",
+      agentDisplayName: "Ferris",
+      adapter: "claude",
+      sessionId: "sess-draft-01",
+      turns: [] as TranscriptTurn[],
+      onSendPrompt: vi.fn(),
+    };
+
+    const first = render(<ChatPane {...props} />);
+    const textarea = screen.getByLabelText("Prompt Message") as HTMLTextAreaElement;
+    fireEvent.change(textarea, {
+      target: { value: "Half-written prompt to ferris" },
+    });
+    expect(window.localStorage.getItem("ferrodeck.draft.sess-draft-01")).toBe(
+      "Half-written prompt to ferris",
+    );
+
+    // Switching tabs unmounts ChatPane in App.
+    first.unmount();
+
+    render(<ChatPane {...props} />);
+    expect(
+      (screen.getByLabelText("Prompt Message") as HTMLTextAreaElement).value,
+    ).toBe("Half-written prompt to ferris");
   });
 });

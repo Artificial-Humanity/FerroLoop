@@ -41,6 +41,48 @@ export interface AppProps {
   wsClient?: HubWsClient;
 }
 
+export type ThemeMode = "dark" | "light";
+
+export const THEME_STORAGE_KEY = "ferrodeck.theme";
+
+export function getInitialThemeMode(): ThemeMode {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+      if (stored === "light" || stored === "dark") {
+        return stored;
+      }
+    }
+  } catch {
+    // Ignore storage access errors in private/sandboxed contexts.
+  }
+  try {
+    if (
+      typeof window !== "undefined" &&
+      typeof window.matchMedia === "function" &&
+      window.matchMedia("(prefers-color-scheme: light)").matches
+    ) {
+      return "light";
+    }
+  } catch {
+    // Ignore matchMedia errors.
+  }
+  return "dark";
+}
+
+export function applyThemeMode(mode: ThemeMode): void {
+  if (typeof document !== "undefined") {
+    document.documentElement.setAttribute("data-theme", mode);
+  }
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.setItem(THEME_STORAGE_KEY, mode);
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
 export interface OptimisticPrompt {
   content: string;
   sentAt: number;
@@ -215,6 +257,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [secondaryTab, setSecondaryTab] = useState<Exclude<CockpitTab, "chat">>("git");
   const [splitView, setSplitView] = useState<boolean>(false);
   const [mobileRosterOpen, setMobileRosterOpen] = useState<boolean>(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(getInitialThemeMode);
+
+  useEffect(() => {
+    applyThemeMode(themeMode);
+  }, [themeMode]);
 
   // Data State
   const [agents, setAgents] = useState<AgentRecord[]>(DEFAULT_WORKSPACE_AGENTS);
@@ -995,6 +1042,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           onSelectTab={handleSelectTab}
           splitView={splitView}
           onToggleSplitView={() => setSplitView((prev) => !prev)}
+          themeMode={themeMode}
+          onToggleTheme={() =>
+            setThemeMode((prev) => (prev === "dark" ? "light" : "dark"))
+          }
           authority={authority}
           wsConnected={wsConnected}
           onOpenPairingModal={() => setPairingOpen(true)}

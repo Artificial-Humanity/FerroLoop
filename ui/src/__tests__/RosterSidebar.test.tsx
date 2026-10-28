@@ -249,3 +249,78 @@ describe("PairingModal", () => {
     });
   });
 });
+
+describe("ContextHeader session pill and header controls", () => {
+  const ferrisAgent = DEFAULT_WORKSPACE_AGENTS.find((a) => a.name_key === "ferris")!;
+  const oneSession: DiscoveredSessionSummary[] = [
+    {
+      id: "sess-only-1234abcd",
+      source: "route",
+      adapter: "claude",
+      persona: "ferris",
+      status: "active",
+    },
+  ];
+
+  it("shows a session id pill instead of the selector for a single session", () => {
+    render(
+      <ContextHeader
+        selectedAgent={ferrisAgent}
+        sessions={oneSession}
+        selectedSessionId="sess-only-1234abcd"
+        onSelectSession={() => {}}
+        activeTab="chat"
+        onSelectTab={() => {}}
+        splitView={false}
+        onToggleSplitView={() => {}}
+        themeMode="dark"
+        onToggleTheme={() => {}}
+        onOpenPairingModal={() => {}}
+      />,
+    );
+
+    expect(screen.queryByTestId("session-selector")).toBeNull();
+    expect(screen.getByTestId("session-id-pill")).toHaveTextContent("#1234abcd");
+    expect(screen.getByTestId("theme-toggle-btn")).toHaveTextContent(/Light/);
+    const splitToggle = screen.getByTestId("split-view-toggle");
+    expect(splitToggle).toHaveAttribute("aria-label", "Open right split panel");
+    expect(splitToggle).toHaveAttribute("aria-pressed", "false");
+    expect(splitToggle.querySelector("svg")).not.toBeNull();
+    expect(splitToggle).not.toHaveTextContent(/Split:/);
+  });
+
+  it("keeps the selector when the agent has multiple sessions", () => {
+    render(
+      <ContextHeader
+        selectedAgent={ferrisAgent}
+        sessions={[
+          ...oneSession,
+          {
+            id: "sess-second-5678efgh",
+            source: "attempt",
+            adapter: "codex",
+            persona: "ferris",
+            status: "completed",
+          },
+        ]}
+        selectedSessionId="sess-only-1234abcd"
+        onSelectSession={() => {}}
+        activeTab="chat"
+        onSelectTab={() => {}}
+        splitView={true}
+        onToggleSplitView={() => {}}
+        themeMode="light"
+        onToggleTheme={() => {}}
+        onOpenPairingModal={() => {}}
+      />,
+    );
+
+    expect(screen.getByTestId("session-selector")).toBeInTheDocument();
+    expect(screen.queryByTestId("session-id-pill")).toBeNull();
+    expect(screen.getByTestId("theme-toggle-btn")).toHaveTextContent(/Dark/);
+    expect(screen.getByTestId("split-view-toggle")).toHaveAttribute(
+      "aria-label",
+      "Close right split panel",
+    );
+  });
+});

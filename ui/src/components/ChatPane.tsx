@@ -21,7 +21,19 @@ export interface EstimatedContextUsage {
 }
 
 function maxTokensForAdapter(adapter?: string | null): number {
-  return (adapter ?? "").trim().toLowerCase() === "grok" ? 131_072 : 200_000;
+  const normalized = (adapter ?? "").trim().toLowerCase();
+  if (
+    normalized === "antigravity" ||
+    normalized === "agy" ||
+    normalized === "argon" ||
+    normalized === "gemini"
+  ) {
+    return 1_000_000;
+  }
+  if (normalized === "grok") {
+    return 131_072;
+  }
+  return 200_000;
 }
 
 /**
@@ -71,6 +83,9 @@ export function estimateSessionContextUsage(
 }
 
 export function formatTokenCount(value: number): string {
+  if (value >= 1_000_000) {
+    return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}m`;
+  }
   if (value >= 1_000) {
     return `${(value / 1_000).toFixed(1).replace(/\.0$/, "")}k`;
   }
@@ -121,6 +136,46 @@ export interface SessionScrollState {
 }
 
 export const sessionScrollMemory = new Map<string, SessionScrollState>();
+
+export interface SessionDraft {
+  promptText: string;
+  attachments: PromptAttachment[];
+}
+
+/** In-progress composer drafts survive tab switches and agent switches. */
+export const sessionDraftMemory = new Map<string, SessionDraft>();
+
+export const DRAFT_STORAGE_PREFIX = "ferrodeck.draft.";
+
+function loadSessionDraft(targetKey: string): SessionDraft {
+  const cached = targetKey ? sessionDraftMemory.get(targetKey) : undefined;
+  if (cached) {
+    return cached;
+  }
+  let storedText = "";
+  try {
+    if (targetKey && typeof window !== "undefined" && window.localStorage) {
+      storedText = window.localStorage.getItem(DRAFT_STORAGE_PREFIX + targetKey) ?? "";
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+  return { promptText: storedText, attachments: [] };
+}
+
+function clearSessionDraft(targetKey: string): void {
+  if (!targetKey) {
+    return;
+  }
+  sessionDraftMemory.delete(targetKey);
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.removeItem(DRAFT_STORAGE_PREFIX + targetKey);
+    }
+  } catch {
+    // Ignore storage errors.
+  }
+}
 
 export interface ChatPaneProps {
   agentName?: string | null;
@@ -195,11 +250,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
   const [visibleTurnLimit, setVisibleTurnLimit] = React.useState<number>(100);
-  const [promptText, setPromptText] = React.useState<string>("");
+  const initialDraftRef = React.useRef<SessionDraft | null>(null);
+  if (initialDraftRef.current === null) {
+    initialDraftRef.current = loadSessionDraft(sessionId || agentName || "");
+  }
+  const [promptText, setPromptText] = React.useState<string>(
+    initialDraftRef.current.promptText,
+  );
   const [alwaysSendNow, setAlwaysSendNow] = React.useState<boolean>(() =>
     readInitialAlwaysSendNow(),
   );
-  const [attachments, setAttachments] = React.useState<PromptAttachment[]>([]);
+  const [attachments, setAttachments] = React.useState<PromptAttachment[]>(
+    initialDraftRef.current.attachments,
+  );
   const [submitting, setSubmitting] = React.useState<boolean>(false);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
 
@@ -219,6 +282,40 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const targetSessionOrAgent = sessionId || agentName || "";
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
+
+  // Load the incoming target's draft on switch (declared before the save
+  // effect so a switch never writes the old draft under the new key).
+  const prevDraftTargetRef = React.useRef<string>(targetSessionOrAgent);
+  React.useEffect(() => {
+    if (prevDraftTargetRef.current === targetSessionOrAgent) {
+      return;
+    }
+    prevDraftTargetRef.current = targetSessionOrAgent;
+    const draft = loadSessionDraft(targetSessionOrAgent);
+    setPromptText(draft.promptText);
+    setAttachments(draft.attachments);
+  }, [targetSessionOrAgent]);
+
+  React.useEffect(() => {
+    if (!targetSessionOrAgent) {
+      return;
+    }
+    if (promptText.length === 0 && attachments.length === 0) {
+      clearSessionDraft(targetSessionOrAgent);
+      return;
+    }
+    sessionDraftMemory.set(targetSessionOrAgent, { promptText, attachments });
+    try {
+      if (typeof window !== "undefined" && window.localStorage) {
+        window.localStorage.setItem(
+          DRAFT_STORAGE_PREFIX + targetSessionOrAgent,
+          promptText,
+        );
+      }
+    } catch {
+      // Ignore storage errors.
+    }
+  }, [promptText, attachments, targetSessionOrAgent]);
 
   const contextEstimate = React.useMemo(
     () =>
@@ -600,6 +697,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
         await fetchTranscript();
       }
+      clearSessionDraft(targetSessionOrAgent);
       setPromptText("");
       setAttachments([]);
       if (!wasQueued) {

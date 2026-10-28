@@ -147,13 +147,25 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           ? "Tool Output"
           : agentDisplayName || "Assistant";
 
+  const { cleanedContent, attachments } = React.useMemo(
+    () => extractTurnAttachments(turn.content),
+    [turn.content],
+  );
+
+  // Prose agent output addressed to the operator is the conversation's
+  // other first-class voice; thinking/tool-only turns stay subdued.
+  const isDirectedAssistant =
+    !isUser &&
+    !isWire &&
+    !isSystem &&
+    !isToolOutput &&
+    cleanedContent.trim().length > 0;
+
   const roleBorderColor = isUser
     ? "var(--border-accent)"
-    : isWire
-      ? "rgba(56, 189, 248, 0.45)"
-      : isSystem
-        ? "rgba(56, 189, 248, 0.35)"
-        : "var(--border-subtle)";
+    : isDirectedAssistant
+      ? "var(--card-assistant-border)"
+      : "var(--border-subtle)";
 
   const roleBadgeStyle: React.CSSProperties = isUser
     ? {
@@ -161,22 +173,17 @@ export const TurnCard: React.FC<TurnCardProps> = ({
         borderColor: "var(--border-accent)",
         color: "var(--accent-hover)",
       }
-    : isWire || isSystem
+    : isDirectedAssistant
       ? {
-          backgroundColor: "rgba(56, 189, 248, 0.12)",
-          borderColor: "rgba(56, 189, 248, 0.35)",
+          backgroundColor: "var(--badge-assistant-bg)",
+          borderColor: "var(--badge-assistant-border)",
           color: "var(--status-info)",
         }
       : {
           backgroundColor: "var(--bg-elevated)",
           borderColor: "var(--border-subtle)",
-          color: "var(--text-primary)",
+          color: isWire || isSystem ? "var(--text-secondary)" : "var(--text-primary)",
         };
-
-  const { cleanedContent, attachments } = React.useMemo(
-    () => extractTurnAttachments(turn.content),
-    [turn.content],
-  );
   const segments = React.useMemo(() => splitTurnContent(cleanedContent), [cleanedContent]);
   const hasThinking = Boolean(turn.thinking && turn.thinking.trim().length > 0);
   const toolCalls = turn.tool_calls ?? [];
@@ -199,9 +206,19 @@ export const TurnCard: React.FC<TurnCardProps> = ({
     <article
       className="fd-card"
       data-testid={`turn-card-${turn.index}`}
+      data-directed-assistant={isDirectedAssistant ? "true" : undefined}
       style={{
         borderColor: roleBorderColor,
-        backgroundColor: isUser ? "rgba(23, 30, 41, 0.55)" : "var(--bg-surface)",
+        backgroundColor: isUser
+          ? "var(--card-user-bg)"
+          : isDirectedAssistant
+            ? "var(--card-assistant-bg)"
+            : "var(--bg-surface)",
+        boxShadow: isUser
+          ? "inset 3px 0 0 var(--accent-primary)"
+          : isDirectedAssistant
+            ? "inset 3px 0 0 var(--status-info)"
+            : undefined,
         display: "flex",
         flexDirection: "column",
         gap: "8px",
