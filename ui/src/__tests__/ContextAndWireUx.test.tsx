@@ -660,6 +660,8 @@ describe("App theme toggle", () => {
 
     const toggle = await screen.findByTestId("theme-toggle-btn");
     expect(document.documentElement.dataset.theme).toBe("dark");
+    // Applying the system-derived default must not persist it.
+    expect(window.localStorage.getItem(THEME_STORAGE_KEY)).toBeNull();
     expect(toggle).toHaveTextContent(/Light/);
 
     fireEvent.click(toggle);

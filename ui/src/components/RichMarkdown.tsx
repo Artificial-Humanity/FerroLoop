@@ -180,11 +180,11 @@ export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.
         );
       }
     } else if (token.startsWith("<") && token.endsWith(">") && /^<https?:\/\//i.test(token)) {
-      const url = token.slice(1, -1);
+      const { cleanUrl, suffix } = splitBareUrlSuffix(token.slice(1, -1));
       nodes.push(
         <a
           key={key}
-          href={url}
+          href={cleanUrl}
           target="_blank"
           rel="noopener noreferrer"
           style={{
@@ -192,19 +192,23 @@ export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.
             textDecoration: "underline",
           }}
         >
-          {url}
+          {cleanUrl}
         </a>,
       );
+      if (suffix) {
+        nodes.push(suffix);
+      }
     } else if (token.startsWith("`") && token.endsWith("`") && token.length >= 2) {
       const codeText = token.slice(1, -1);
       const trimmedCode = codeText
         .trim()
         .replace(/^<(\S+)>$/, "$1");
-      if (/^https?:\/\/\S+$/i.test(trimmedCode)) {
+      const { cleanUrl, suffix } = splitBareUrlSuffix(trimmedCode);
+      if (/^https?:\/\/\S+$/i.test(cleanUrl)) {
         nodes.push(
           <a
             key={key}
-            href={trimmedCode}
+            href={cleanUrl}
             target="_blank"
             rel="noopener noreferrer"
             style={{
@@ -213,10 +217,13 @@ export function renderInlineMarkdown(text: string, keyPrefix = "inline"): React.
             }}
           >
             <code style={{ fontFamily: "inherit", fontSize: "inherit", color: "inherit" }}>
-              {codeText}
+              {cleanUrl}
             </code>
           </a>,
         );
+        if (suffix) {
+          nodes.push(suffix);
+        }
       } else {
         nodes.push(
           <code key={key} style={AMBER_CODE_PILL_STYLE}>

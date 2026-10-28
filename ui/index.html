@@ -17,8 +17,34 @@
     <link rel="icon" type="image/svg+xml" href="/icon-192.svg" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.svg" />
     <title>FerroDeck — AI-Lab-0 Command Center</title>
+    <script>
+      (function () {
+        try {
+          var t = null;
+          try {
+            t = window.localStorage.getItem("ferrodeck.theme");
+          } catch (e) {}
+          if (t !== "light" && t !== "dark") {
+            t =
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: light)").matches
+                ? "light"
+                : "dark";
+          }
+          var r = document.documentElement;
+          r.setAttribute("data-theme", t);
+          r.style.backgroundColor = t === "light" ? "#F8FAFC" : "#0A0D12";
+        } catch (e) {}
+      })();
+    </script>
   </head>
-  <body style="background-color: #0A0D12; color: #F1F5F9; margin: 0">
+  <body
+    style="
+      background-color: var(--bg-canvas, #0a0d12);
+      color: var(--text-primary, #f1f5f9);
+      margin: 0;
+    "
+  >
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

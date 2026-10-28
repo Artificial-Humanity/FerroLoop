@@ -37,6 +37,24 @@ describe("RichMarkdown inline code and links", () => {
     }
   });
 
+  it("cleans backticked and angle-bracketed URLs", () => {
+    const { container } = render(
+      <RichMarkdown text={"Code `<https://example.com/e.>` angle <https://example.com/f)> end."} />,
+    );
+
+    const backticked = screen.getByRole("link", {
+      name: "https://example.com/e",
+    }) as HTMLAnchorElement;
+    expect(backticked.href).toBe("https://example.com/e");
+    expect(backticked).not.toHaveTextContent("<https://example.com/e.>");
+    expect(container).not.toHaveTextContent("<https://example.com/e");
+
+    const angled = screen.getByRole("link", {
+      name: "https://example.com/f",
+    }) as HTMLAnchorElement;
+    expect(angled.href).toBe("https://example.com/f");
+  });
+
   it("keeps balanced parentheses inside a bare URL path", () => {
     render(
       <RichMarkdown text="See https://en.wikipedia.org/wiki/Foo_(bar) for detail." />,

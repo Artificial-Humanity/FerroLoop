@@ -74,6 +74,9 @@ export function applyThemeMode(mode: ThemeMode): void {
   if (typeof document !== "undefined") {
     document.documentElement.setAttribute("data-theme", mode);
   }
+}
+
+export function persistThemeMode(mode: ThemeMode): void {
   try {
     if (typeof window !== "undefined" && window.localStorage) {
       window.localStorage.setItem(THEME_STORAGE_KEY, mode);
@@ -261,6 +264,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   useEffect(() => {
     applyThemeMode(themeMode);
+  }, [themeMode]);
+
+  const handleToggleTheme = useCallback(() => {
+    const next: ThemeMode = themeMode === "dark" ? "light" : "dark";
+    persistThemeMode(next);
+    setThemeMode(next);
   }, [themeMode]);
 
   // Data State
@@ -1043,9 +1052,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           splitView={splitView}
           onToggleSplitView={() => setSplitView((prev) => !prev)}
           themeMode={themeMode}
-          onToggleTheme={() =>
-            setThemeMode((prev) => (prev === "dark" ? "light" : "dark"))
-          }
+          onToggleTheme={handleToggleTheme}
           authority={authority}
           wsConnected={wsConnected}
           onOpenPairingModal={() => setPairingOpen(true)}

@@ -696,4 +696,42 @@ describe("ChatPane draft persistence", () => {
       (screen.getByLabelText("Prompt Message") as HTMLTextAreaElement).value,
     ).toBe("Half-written prompt to ferris");
   });
+
+  it("never writes the old draft under the new target key on session switch", () => {
+    window.localStorage.setItem("ferrodeck.draft.sess-switch-b", "Draft for B");
+    const props = {
+      agentName: "ferris",
+      agentDisplayName: "Ferris",
+      adapter: "claude",
+      sessionId: "sess-switch-a",
+      turns: [] as TranscriptTurn[],
+      onSendPrompt: vi.fn(),
+    };
+
+    const { rerender } = render(<ChatPane {...props} />);
+    fireEvent.change(screen.getByLabelText("Prompt Message"), {
+      target: { value: "Draft for A" },
+    });
+    expect(window.localStorage.getItem("ferrodeck.draft.sess-switch-a")).toBe(
+      "Draft for A",
+    );
+
+    const setItemSpy = vi.spyOn(Storage.prototype, "setItem");
+    try {
+      rerender(<ChatPane {...props} sessionId="sess-switch-b" />);
+      const bWrites = setItemSpy.mock.calls.filter(
+        ([key]) => key === "ferrodeck.draft.sess-switch-b",
+      );
+      expect(bWrites.every(([, value]) => value !== "Draft for A")).toBe(true);
+    } finally {
+      setItemSpy.mockRestore();
+    }
+
+    expect(
+      (screen.getByLabelText("Prompt Message") as HTMLTextAreaElement).value,
+    ).toBe("Draft for B");
+    expect(window.localStorage.getItem("ferrodeck.draft.sess-switch-b")).toBe(
+      "Draft for B",
+    );
+  });
 });

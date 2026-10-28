@@ -250,9 +250,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
   const [visibleTurnLimit, setVisibleTurnLimit] = React.useState<number>(100);
+  const targetSessionOrAgent = sessionId || agentName || "";
   const initialDraftRef = React.useRef<SessionDraft | null>(null);
   if (initialDraftRef.current === null) {
-    initialDraftRef.current = loadSessionDraft(sessionId || agentName || "");
+    initialDraftRef.current = loadSessionDraft(targetSessionOrAgent);
   }
   const [promptText, setPromptText] = React.useState<string>(
     initialDraftRef.current.promptText,
@@ -263,6 +264,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [attachments, setAttachments] = React.useState<PromptAttachment[]>(
     initialDraftRef.current.attachments,
   );
+  // Render-phase draft load on target switch: swap in the incoming
+  // target's draft before commit so effects never see the new target
+  // paired with the old target's draft.
+  const [prevDraftTarget, setPrevDraftTarget] =
+    React.useState<string>(targetSessionOrAgent);
+  if (prevDraftTarget !== targetSessionOrAgent) {
+    const draft = loadSessionDraft(targetSessionOrAgent);
+    setPrevDraftTarget(targetSessionOrAgent);
+    setPromptText(draft.promptText);
+    setAttachments(draft.attachments);
+  }
   const [submitting, setSubmitting] = React.useState<boolean>(false);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
 
@@ -280,21 +292,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const effectiveLoading = loading || internalLoading;
   const effectiveError = error ?? internalError;
 
-  const targetSessionOrAgent = sessionId || agentName || "";
   const displayTarget = agentDisplayName || agentName || sessionId || "Agent";
-
-  // Load the incoming target's draft on switch (declared before the save
-  // effect so a switch never writes the old draft under the new key).
-  const prevDraftTargetRef = React.useRef<string>(targetSessionOrAgent);
-  React.useEffect(() => {
-    if (prevDraftTargetRef.current === targetSessionOrAgent) {
-      return;
-    }
-    prevDraftTargetRef.current = targetSessionOrAgent;
-    const draft = loadSessionDraft(targetSessionOrAgent);
-    setPromptText(draft.promptText);
-    setAttachments(draft.attachments);
-  }, [targetSessionOrAgent]);
 
   React.useEffect(() => {
     if (!targetSessionOrAgent) {
