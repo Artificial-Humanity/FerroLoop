@@ -199,6 +199,7 @@ export interface ChatPaneProps {
   ) => Promise<unknown> | void;
   onSendQueuedNow?: (promptId: string) => Promise<unknown> | void;
   onCancelQueued?: (promptId: string) => Promise<unknown> | void;
+  onUpdateQueued?: (promptId: string, prompt: string) => Promise<unknown> | void;
   onOpenArtifact?: (pathOrUrl: string) => void;
   apiClient?: HubApiClient;
 }
@@ -239,12 +240,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onSendPrompt,
   onSendQueuedNow,
   onCancelQueued,
+  onUpdateQueued,
   onOpenArtifact,
   apiClient,
 }) => {
   const [internalTurns, setInternalTurns] = React.useState<TranscriptTurn[]>([]);
   const [internalIsBusy, setInternalIsBusy] = React.useState<boolean>(false);
   const [internalQueue, setInternalQueue] = React.useState<QueuedOperatorPrompt[]>([]);
+  const [editingQueueId, setEditingQueueId] = React.useState<string | null>(null);
+  const [editingQueueText, setEditingQueueText] = React.useState<string>("");
   const [internalLoading, setInternalLoading] = React.useState<boolean>(false);
   const [internalError, setInternalError] = React.useState<string | null>(null);
   const [internalContextUsage, setInternalContextUsage] =
@@ -626,6 +630,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const handleCancelQueued = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
+    if (editingQueueId === promptId) {
+      setEditingQueueId(null);
+      setEditingQueueText("");
+    }
     try {
       if (onCancelQueued) {
         await onCancelQueued(promptId);
@@ -640,6 +648,34 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
     } catch (err) {
       setSubmitError(err instanceof Error ? err.message : "Failed to cancel queued message");
+    }
+  };
+
+  const handleSaveEditedQueued = async (promptId: string) => {
+    const trimmed = editingQueueText.trim();
+    if (!targetSessionOrAgent || !trimmed) return;
+    try {
+      if (onUpdateQueued) {
+        await onUpdateQueued(promptId, trimmed);
+      } else if (apiClient) {
+        const res = await apiClient.updateQueuedPrompt(targetSessionOrAgent, promptId, trimmed);
+        if (Array.isArray(res.queue)) {
+          setInternalQueue(res.queue);
+        }
+        if (typeof res.is_busy === "boolean") {
+          setInternalIsBusy(res.is_busy);
+        }
+      } else {
+        setInternalQueue((prev) =>
+          prev.map((item) =>
+            item.id === promptId ? { ...item, prompt: trimmed, effective_body: trimmed } : item,
+          ),
+        );
+      }
+      setEditingQueueId(null);
+      setEditingQueueText("");
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : "Failed to update queued message");
     }
   };
 
@@ -1027,67 +1063,135 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               </span>
             </div>
             <div style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
-              {effectiveQueue.map((item, idx) => (
-                <div
-                  key={item.id}
-                  data-testid={`queued-prompt-item-${item.id}`}
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: "8px",
-                    padding: "4px 8px",
-                    borderRadius: "4px",
-                    backgroundColor: "var(--bg-surface)",
-                    border: "1px solid var(--border-subtle)",
-                    fontSize: "12px",
-                  }}
-                >
-                  <span
-                    className="fd-badge"
-                    data-testid={`queued-prompt-pos-${idx}`}
-                    style={{ fontSize: "11px", padding: "1px 6px" }}
-                  >
-                    #{idx + 1}
-                  </span>
-                  <span
+              {effectiveQueue.map((item, idx) => {
+                const isEditing = editingQueueId === item.id;
+                return (
+                  <div
+                    key={item.id}
+                    data-testid={`queued-prompt-item-${item.id}`}
                     style={{
-                      flex: 1,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      color: "var(--text-primary)",
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "8px",
+                      padding: "4px 8px",
+                      borderRadius: "4px",
+                      backgroundColor: "var(--bg-surface)",
+                      border: "1px solid var(--border-subtle)",
+                      fontSize: "12px",
                     }}
-                    title={item.prompt}
                   >
-                    {item.prompt}
-                  </span>
-                  {item.attachments && item.attachments.length > 0 && (
-                    <span className="fd-badge" style={{ fontSize: "10px" }}>
-                      {item.attachments.length} file{item.attachments.length === 1 ? "" : "s"}
+                    <span
+                      className="fd-badge"
+                      data-testid={`queued-prompt-pos-${idx}`}
+                      style={{ fontSize: "11px", padding: "1px 6px" }}
+                    >
+                      #{idx + 1}
                     </span>
-                  )}
-                  <button
-                    type="button"
-                    className="fd-btn fd-btn-primary"
-                    data-testid={`queued-send-now-${item.id}`}
-                    onClick={() => void handleSendQueuedNow(item.id)}
-                    style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
-                  >
-                    Send Now
-                  </button>
-                  <button
-                    type="button"
-                    className="fd-btn"
-                    aria-label="Remove"
-                    data-testid={`queued-cancel-${item.id}`}
-                    onClick={() => void handleCancelQueued(item.id)}
-                    style={{ fontSize: "11px", padding: "2px 6px", height: "24px" }}
-                    title="Remove from queue"
-                  >
-                    ✕
-                  </button>
-                </div>
-              ))}
+                    {isEditing ? (
+                      <>
+                        <input
+                          type="text"
+                          className="fd-input"
+                          data-testid={`queued-edit-input-${item.id}`}
+                          aria-label="Edit queued message"
+                          value={editingQueueText}
+                          onChange={(e) => setEditingQueueText(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              void handleSaveEditedQueued(item.id);
+                            } else if (e.key === "Escape") {
+                              setEditingQueueId(null);
+                              setEditingQueueText("");
+                            }
+                          }}
+                          style={{
+                            flex: 1,
+                            height: "24px",
+                            padding: "2px 8px",
+                            fontSize: "12px",
+                          }}
+                        />
+                        <button
+                          type="button"
+                          className="fd-btn fd-btn-primary"
+                          data-testid={`queued-save-${item.id}`}
+                          disabled={!editingQueueText.trim()}
+                          onClick={() => void handleSaveEditedQueued(item.id)}
+                          style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
+                        >
+                          Save
+                        </button>
+                        <button
+                          type="button"
+                          className="fd-btn"
+                          data-testid={`queued-edit-cancel-${item.id}`}
+                          onClick={() => {
+                            setEditingQueueId(null);
+                            setEditingQueueText("");
+                          }}
+                          style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <span
+                          style={{
+                            flex: 1,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                            color: "var(--text-primary)",
+                          }}
+                          title={item.prompt}
+                        >
+                          {item.prompt}
+                        </span>
+                        {item.attachments && item.attachments.length > 0 && (
+                          <span className="fd-badge" style={{ fontSize: "10px" }}>
+                            {item.attachments.length} file{item.attachments.length === 1 ? "" : "s"}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          className="fd-btn"
+                          data-testid={`queued-edit-${item.id}`}
+                          onClick={() => {
+                            setEditingQueueId(item.id);
+                            setEditingQueueText(item.prompt);
+                          }}
+                          style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
+                          title="Edit queued message"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="fd-btn fd-btn-primary"
+                          data-testid={`queued-send-now-${item.id}`}
+                          onClick={() => void handleSendQueuedNow(item.id)}
+                          style={{ fontSize: "11px", padding: "2px 8px", height: "24px" }}
+                        >
+                          Send Now
+                        </button>
+                        <button
+                          type="button"
+                          className="fd-btn"
+                          aria-label="Remove"
+                          data-testid={`queued-cancel-${item.id}`}
+                          onClick={() => void handleCancelQueued(item.id)}
+                          style={{ fontSize: "11px", padding: "2px 6px", height: "24px" }}
+                          title="Remove from queue"
+                        >
+                          ✕
+                        </button>
+                      </>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </div>
         )}

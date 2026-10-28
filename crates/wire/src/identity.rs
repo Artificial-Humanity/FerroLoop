@@ -94,6 +94,29 @@ pub fn legacy_routes_path() -> Option<PathBuf> {
     }
 }
 
+fn preserve_muse_tmux_fields(target_route: &mut VendorRoute, fallback_route: &VendorRoute) {
+    if let (
+        VendorRoute::Muse {
+            tmux_target: dst_target,
+            tmux_pane: dst_pane,
+            ..
+        },
+        VendorRoute::Muse {
+            tmux_target: src_target,
+            tmux_pane: src_pane,
+            ..
+        },
+    ) = (target_route, fallback_route)
+    {
+        if dst_target.is_none() {
+            *dst_target = src_target.clone();
+        }
+        if dst_pane.is_none() {
+            *dst_pane = src_pane.clone();
+        }
+    }
+}
+
 impl RouteTable {
     pub fn load(custom_path: Option<&Path>) -> Self {
         let primary = custom_path
@@ -111,33 +134,18 @@ impl RouteTable {
     }
 
     pub fn merge_newer(&mut self, other: Self) {
-        for (k, v) in other.entries {
+        for (k, mut v) in other.entries {
             match self.entries.get_mut(&k) {
                 Some(existing)
                     if existing.updated_at.unix_millis() >= v.updated_at.unix_millis() =>
                 {
-                    if let (
-                        VendorRoute::Muse {
-                            tmux_target: existing_target,
-                            tmux_pane: existing_pane,
-                            ..
-                        },
-                        VendorRoute::Muse {
-                            tmux_target: other_target,
-                            tmux_pane: other_pane,
-                            ..
-                        },
-                    ) = (&mut existing.route, &v.route)
-                    {
-                        if existing_target.is_none() {
-                            *existing_target = other_target.clone();
-                        }
-                        if existing_pane.is_none() {
-                            *existing_pane = other_pane.clone();
-                        }
-                    }
+                    preserve_muse_tmux_fields(&mut existing.route, &v.route);
                 }
-                _ => {
+                Some(existing) => {
+                    preserve_muse_tmux_fields(&mut v.route, &existing.route);
+                    self.entries.insert(k, v);
+                }
+                None => {
                     self.entries.insert(k, v);
                 }
             }
@@ -211,8 +219,11 @@ impl RouteTable {
         Ok(())
     }
 
-    pub fn upsert(&mut self, persona: &str, route: VendorRoute, at: At) {
+    pub fn upsert(&mut self, persona: &str, mut route: VendorRoute, at: At) {
         if let Some(norm) = normalize_persona(persona) {
+            if let Some(existing) = self.entries.get(&norm) {
+                preserve_muse_tmux_fields(&mut route, &existing.route);
+            }
             self.entries.insert(
                 norm.clone(),
                 RouteEntry {

@@ -285,6 +285,27 @@ export class HubApiClient {
     );
   }
 
+  public async updateQueuedPrompt(
+    sessionId: string,
+    promptId: string,
+    prompt: string,
+  ): Promise<{
+    session_id: string;
+    status: string;
+    prompt_id: string;
+    queued_prompt: QueuedOperatorPrompt;
+    is_busy?: boolean;
+    queue: QueuedOperatorPrompt[];
+  }> {
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ prompt }),
+      },
+    );
+  }
+
   public async getWorktrees(): Promise<{ worktrees: WorktreeSummary[] }> {
     return this.request<{ worktrees: WorktreeSummary[] }>("/api/v1/worktrees");
   }

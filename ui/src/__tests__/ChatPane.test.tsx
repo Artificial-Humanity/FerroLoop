@@ -666,6 +666,46 @@ describe("ChatPane", () => {
     expect(screen.getByTestId("turn-card-0")).toBeInTheDocument();
     expect(screen.queryByTestId("load-earlier-turns-btn")).toBeNull();
   });
+
+  it("allows editing a queued message in-place before it leaves the queue", async () => {
+    const onUpdateQueued = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={sampleTurns}
+        isBusy={true}
+        queue={[
+          {
+            id: "qp-edit-1",
+            session_id: "sess-ferris-01",
+            persona: "ferris",
+            prompt: "Draft message in queue",
+            effective_body: "Draft message in queue",
+            by: "owner",
+            attachments: [],
+            created_at: "2026-10-28T16:50:00Z",
+          },
+        ]}
+        onUpdateQueued={onUpdateQueued}
+      />,
+    );
+
+    const editBtn = screen.getByTestId("queued-edit-qp-edit-1");
+    fireEvent.click(editBtn);
+
+    const editInput = screen.getByTestId("queued-edit-input-qp-edit-1") as HTMLInputElement;
+    expect(editInput.value).toBe("Draft message in queue");
+
+    fireEvent.change(editInput, { target: { value: "Updated message in queue" } });
+    fireEvent.click(screen.getByTestId("queued-save-qp-edit-1"));
+
+    await waitFor(() => {
+      expect(onUpdateQueued).toHaveBeenCalledWith("qp-edit-1", "Updated message in queue");
+    });
+  });
 });
 
 describe("ChatPane draft persistence", () => {

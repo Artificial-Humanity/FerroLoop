@@ -1758,17 +1758,32 @@ fn classify_artifact_kind(path: &Path) -> &'static str {
 }
 
 fn is_forbidden_artifact_path(path: &Path) -> bool {
-    let normalized = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .to_ascii_lowercase();
-    let in_fl_attachments =
-        normalized.contains("/.fl/attachments/") || normalized.ends_with("/.fl/attachments");
-    for comp in path.components() {
+    let comps: Vec<std::path::Component<'_>> = path.components().collect();
+    if comps
+        .iter()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+    let mut in_fl_attachments = false;
+    for (idx, comp) in comps.iter().enumerate() {
         if let std::path::Component::Normal(os) = comp {
             let seg = os.to_string_lossy().to_ascii_lowercase();
+            let next_is_attachments = comps
+                .get(idx + 1)
+                .and_then(|next| match next {
+                    std::path::Component::Normal(n) => {
+                        Some(n.to_string_lossy().to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .is_some_and(|n| n == "attachments");
+            if seg == ".fl" && next_is_attachments {
+                in_fl_attachments = true;
+                continue;
+            }
             if seg == ".git"
-                || (seg == ".fl" && !in_fl_attachments)
+                || seg == ".fl"
                 || seg == "secrets"
                 || seg == ".env"
                 || seg.starts_with(".env.")
@@ -1783,6 +1798,10 @@ fn is_forbidden_artifact_path(path: &Path) -> bool {
             }
         }
     }
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
     normalized.contains("/.fl/gate/vault")
         || normalized.ends_with("/.fl/gate")
         || (normalized.contains("/.fl/") && !in_fl_attachments)
@@ -2252,6 +2271,9 @@ fn handle_dynamic_api_routes(
         if segments.len() == 7 && segments[6] == "send-now" && method == "POST" {
             return handle_post_queued_prompt_send_now(state, store, &session_id, &prompt_id);
         }
+        if segments.len() == 6 && (method == "PATCH" || method == "PUT") {
+            return handle_patch_queued_prompt(state, store, &session_id, &prompt_id, req);
+        }
         if segments.len() == 6 && method == "DELETE" {
             return handle_delete_queued_prompt(state, store, &session_id, &prompt_id);
         }
@@ -2541,6 +2563,60 @@ fn handle_post_queued_prompt_send_now(
         }),
     );
     HttpResponse::json(200, data)
+}
+
+fn handle_patch_queued_prompt(
+    state: &HubState,
+    store: &RedbStore,
+    raw_session_id: &str,
+    prompt_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    #[derive(Deserialize, Default)]
+    struct PatchQueuedPromptPayload {
+        #[serde(default)]
+        prompt: String,
+    }
+
+    let payload: PatchQueuedPromptPayload = match req.json() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let trimmed = payload.prompt.trim().to_string();
+    if trimmed.is_empty() {
+        return HttpResponse::json(400, json!({ "error": "prompt must not be empty" }));
+    }
+
+    let (canonical_id, target_persona) = resolve_session_target(state, store, raw_session_id);
+    let updated = state
+        .update_queued_prompt(&canonical_id, prompt_id, trimmed.clone())
+        .or_else(|| state.update_queued_prompt(raw_session_id, prompt_id, trimmed));
+    let Some((item, queue)) = updated else {
+        return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
+    };
+
+    let is_busy = state.is_session_busy(store, &canonical_id);
+    state.broadcast(
+        "session",
+        "queue_updated",
+        json!({
+            "session_id": canonical_id,
+            "persona": item.persona.clone().or(target_persona),
+            "is_busy": is_busy,
+            "queue": queue,
+        }),
+    );
+    HttpResponse::json(
+        200,
+        json!({
+            "session_id": canonical_id,
+            "status": "updated",
+            "prompt_id": prompt_id,
+            "queued_prompt": item,
+            "is_busy": is_busy,
+            "queue": queue,
+        }),
+    )
 }
 
 fn handle_delete_queued_prompt(
