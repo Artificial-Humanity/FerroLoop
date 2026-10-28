@@ -546,8 +546,19 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
         }
     }
 
+    let mut msg_sender = String::new();
     if inner.starts_with("[Message]") {
         let first_line_end = inner.find('\n').unwrap_or(inner.len());
+        let first_line = &inner[..first_line_end];
+        if let Some(pos) = first_line.find("sender=") {
+            let after = &first_line[pos + "sender=".len()..];
+            msg_sender = after
+                .split(|c: char| c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
+        }
         if let Some(pos) = inner[..first_line_end].find(" content=") {
             inner = inner[pos + " content=".len()..].trim();
         }
@@ -636,6 +647,18 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
             return (format!("wire:{}", sender.to_ascii_lowercase()), body);
         }
         return ("system".to_string(), body);
+    }
+
+    if !inner.starts_with("[Operator Prompt via FerroDeck")
+        && !inner.starts_with("[Incoming NATS Message")
+        && !inner.starts_with("[fl-wire ")
+    {
+        if inner.starts_with("Task id \"") || msg_sender.contains("/task-") {
+            return ("tool".to_string(), inner.to_string());
+        }
+        if !msg_sender.is_empty() && !msg_sender.eq_ignore_ascii_case("system") {
+            return ("wire:subagent".to_string(), inner.to_string());
+        }
     }
 
     if content.contains("<SYSTEM_MESSAGE>")
@@ -1326,6 +1349,30 @@ mod tests {
         assert_eq!(turns[3].role, "wire:jarvis");
         assert_eq!(turns[3].content, "All systems nominal.");
         assert!(!turns[3].content.contains("<SYSTEM_MESSAGE>"));
+    }
+
+    #[test]
+    fn normalize_system_turn_classifies_task_and_subagent_senders() {
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=abc/task-3597 priority=MESSAGE_PRIORITY_HIGH content=Task id \"x\" finished with result: done\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "tool");
+        assert!(content.starts_with("Task id"));
+
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=11111111-1111-1111-1111-111111111111 priority=MESSAGE_PRIORITY_HIGH content=Subagent reply here\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Subagent reply here");
+
+        let (role, content) = normalize_system_turn(
+            "system",
+            "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=system priority=MESSAGE_PRIORITY_HIGH content=Task id \"y\" finished with result: done\n</SYSTEM_MESSAGE>",
+        );
+        assert_eq!(role, "tool");
+        assert!(content.starts_with("Task id"));
     }
 
     #[test]
