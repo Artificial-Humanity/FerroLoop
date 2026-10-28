@@ -1062,6 +1062,10 @@ pub fn run_vendor_hook(
             VendorRoute::Muse {
                 session_id,
                 cwd: Some(hook_cwd.clone()),
+                tmux_target: Some(format!("muse:{persona}")),
+                tmux_pane: std::env::var("TMUX_PANE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
             },
         );
     } else if is_grok && !session_id.is_empty() {

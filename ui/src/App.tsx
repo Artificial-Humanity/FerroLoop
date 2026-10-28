@@ -280,7 +280,6 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     });
     setSplitView(true);
     setSecondaryTab("artifacts");
-    setActiveTab("artifacts");
   }, []);
 
   useEffect(() => {
@@ -937,6 +936,18 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     }
   };
 
+  const handleUpdateQueued = async (promptId: string, prompt: string) => {
+    const targetId = activeSession?.id || selectedAgent?.name_key;
+    if (!targetId) return;
+    const res = await apiClient.updateQueuedPrompt(targetId, promptId, prompt);
+    if (Array.isArray(res.queue)) {
+      setSessionQueue(res.queue);
+    }
+    if (typeof res.is_busy === "boolean") {
+      setIsSessionBusy(res.is_busy);
+    }
+  };
+
   const handleReviewPr = async (number: number, payload: PrReviewRequest) => {
     await apiClient.reviewPullRequest(number, payload);
     const prsRes = await apiClient.getPrs().catch(() => null);
@@ -980,6 +991,14 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 return [path, ...filtered].slice(0, 20);
               });
             }}
+            onClose={
+              splitView
+                ? () => {
+                    setSplitView(false);
+                    setActiveTab("chat");
+                  }
+                : undefined
+            }
           />
         );
       case "git":
@@ -1066,6 +1085,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             onSendPrompt={handleSendPrompt}
             onSendQueuedNow={handleSendQueuedNow}
             onCancelQueued={handleCancelQueued}
+            onUpdateQueued={handleUpdateQueued}
             onOpenArtifact={handleOpenArtifact}
             apiClient={apiClient}
           />
@@ -1101,7 +1121,14 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           activeTab={activeTab}
           onSelectTab={handleSelectTab}
           splitView={splitView}
-          onToggleSplitView={() => setSplitView((prev) => !prev)}
+          onToggleSplitView={() => {
+            setSplitView((prev) => {
+              if (prev) {
+                setActiveTab("chat");
+              }
+              return !prev;
+            });
+          }}
           themeMode={themeMode}
           onToggleTheme={handleToggleTheme}
           authority={authority}
@@ -1132,6 +1159,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 onSendPrompt={handleSendPrompt}
                 onSendQueuedNow={handleSendQueuedNow}
                 onCancelQueued={handleCancelQueued}
+                onUpdateQueued={handleUpdateQueued}
                 onOpenArtifact={handleOpenArtifact}
                 apiClient={apiClient}
               />

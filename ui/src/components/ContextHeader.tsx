@@ -169,7 +169,15 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
         })}
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          flexWrap: "wrap",
+          marginLeft: "auto",
+        }}
+      >
         <span
           className="fd-badge"
           title={wsConnected ? "WebSocket Connected" : "WebSocket Disconnected"}

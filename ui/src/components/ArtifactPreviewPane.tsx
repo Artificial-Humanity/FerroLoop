@@ -21,6 +21,7 @@ export interface ArtifactPreviewPaneProps {
   sessionId?: string | null;
   turns?: TranscriptTurn[];
   onSelectPath?: (path: string) => void;
+  onClose?: () => void;
 }
 
 type ZoomPreset = "fit" | 50 | 100 | 150 | 200;
@@ -87,6 +88,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   sessionId = null,
   turns = [],
   onSelectPath,
+  onClose,
 }) => {
   const [pathInput, setPathInput] = useState<string>(activePath ?? "");
   const [selectedPath, setSelectedPath] = useState<string | null>(activePath);
@@ -381,52 +383,66 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             )}
           </div>
 
-          {artifact && (
-            <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}>
-              {(artifact.kind === "markdown" || artifact.kind === "svg") &&
-                typeof artifact.content === "string" && (
-                  <div style={{ display: "inline-flex", gap: "4px" }}>
-                    <button
-                      type="button"
-                      data-testid="artifact-view-rendered"
-                      className={`fd-btn${viewMode === "rendered" ? " fd-btn-active" : ""}`}
-                      onClick={() => setViewMode("rendered")}
-                    >
-                      Rendered
-                    </button>
-                    <button
-                      type="button"
-                      data-testid="artifact-view-source"
-                      className={`fd-btn${viewMode === "source" ? " fd-btn-active" : ""}`}
-                      onClick={() => setViewMode("source")}
-                    >
-                      Source
-                    </button>
-                  </div>
-                )}
+          <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginLeft: "auto" }}>
+            {artifact && (
+              <>
+                {(artifact.kind === "markdown" || artifact.kind === "svg") &&
+                  typeof artifact.content === "string" && (
+                    <div style={{ display: "inline-flex", gap: "4px" }}>
+                      <button
+                        type="button"
+                        data-testid="artifact-view-rendered"
+                        className={`fd-btn${viewMode === "rendered" ? " fd-btn-active" : ""}`}
+                        onClick={() => setViewMode("rendered")}
+                      >
+                        Rendered
+                      </button>
+                      <button
+                        type="button"
+                        data-testid="artifact-view-source"
+                        className={`fd-btn${viewMode === "source" ? " fd-btn-active" : ""}`}
+                        onClick={() => setViewMode("source")}
+                      >
+                        Source
+                      </button>
+                    </div>
+                  )}
 
-              <a
-                href={rawUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                data-testid="artifact-open-raw-btn"
+                <a
+                  href={rawUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-testid="artifact-open-raw-btn"
+                  className="fd-btn"
+                  style={{ textDecoration: "none" }}
+                >
+                  Open Raw
+                </a>
+
+                <a
+                  href={downloadUrl}
+                  download={artifact.kind === "mermaid" && downloadUrl.startsWith("data:image/svg") ? "diagram.svg" : artifact.name}
+                  data-testid="artifact-download-btn"
+                  className="fd-btn fd-btn-primary"
+                  style={{ textDecoration: "none" }}
+                >
+                  ↓ Download
+                </a>
+              </>
+            )}
+            {onClose && (
+              <button
+                type="button"
+                data-testid="artifact-close-panel-btn"
                 className="fd-btn"
-                style={{ textDecoration: "none" }}
+                onClick={onClose}
+                title="Close side panel"
+                aria-label="Close side panel"
               >
-                Open Raw
-              </a>
-
-              <a
-                href={downloadUrl}
-                download={artifact.kind === "mermaid" && downloadUrl.startsWith("data:image/svg") ? "diagram.svg" : artifact.name}
-                data-testid="artifact-download-btn"
-                className="fd-btn fd-btn-primary"
-                style={{ textDecoration: "none" }}
-              >
-                ↓ Download
-              </a>
-            </div>
-          )}
+                ✕
+              </button>
+            )}
+          </div>
         </div>
 
         <form

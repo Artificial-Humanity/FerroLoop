@@ -257,6 +257,29 @@ impl HubState {
         Some((item, snapshot))
     }
 
+    pub fn update_queued_prompt(
+        &self,
+        session_key: &str,
+        prompt_id: &str,
+        new_prompt: String,
+    ) -> Option<(QueuedOperatorPrompt, Vec<QueuedOperatorPrompt>)> {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = guard.queues.get_mut(session_key)?;
+        let item = queue.iter_mut().find(|item| item.id == prompt_id)?;
+        let mut effective_body = new_prompt.clone();
+        for saved in &item.attachments {
+            effective_body.push_str(&format!(
+                "\n\n[Attached file: {} ({})]",
+                saved.path, saved.url
+            ));
+        }
+        item.prompt = new_prompt;
+        item.effective_body = effective_body;
+        let updated = item.clone();
+        let snapshot = queue.clone();
+        Some((updated, snapshot))
+    }
+
     pub fn is_session_busy(&self, store: &RedbStore, session_id: &str) -> bool {
         let turns = read_session_transcript_with_home(
             session_id,
@@ -1616,6 +1639,24 @@ mod tests {
         let del_json = del_resp.json_value().unwrap();
         assert_eq!(del_json["status"], "cancelled");
         assert_eq!(del_json["queue"].as_array().unwrap().len(), 2);
+
+        // 3b. Edit qp3 in-place via PATCH /api/v1/sessions/ferris/queue/:prompt_id
+        let patch_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("PATCH", format!("/api/v1/sessions/ferris/queue/{qp3_id}"))
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({
+                    "prompt": "Third queued prompt (edited)"
+                })),
+        );
+        assert_eq!(patch_resp.status, 200);
+        let patch_json = patch_resp.json_value().unwrap();
+        assert_eq!(patch_json["status"], "updated");
+        assert_eq!(
+            patch_json["queued_prompt"]["prompt"],
+            "Third queued prompt (edited)"
+        );
+        assert_eq!(patch_json["queue"].as_array().unwrap().len(), 2);
 
         // 4. Send qp1 now via POST /api/v1/sessions/ferris/queue/:prompt_id/send-now
         let send_now_resp = handle_http_request(

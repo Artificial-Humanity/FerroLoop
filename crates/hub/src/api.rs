@@ -1758,9 +1758,30 @@ fn classify_artifact_kind(path: &Path) -> &'static str {
 }
 
 fn is_forbidden_artifact_path(path: &Path) -> bool {
-    for comp in path.components() {
+    let comps: Vec<std::path::Component<'_>> = path.components().collect();
+    if comps
+        .iter()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return true;
+    }
+    let mut in_fl_attachments = false;
+    for (idx, comp) in comps.iter().enumerate() {
         if let std::path::Component::Normal(os) = comp {
             let seg = os.to_string_lossy().to_ascii_lowercase();
+            let next_is_attachments = comps
+                .get(idx + 1)
+                .and_then(|next| match next {
+                    std::path::Component::Normal(n) => {
+                        Some(n.to_string_lossy().to_ascii_lowercase())
+                    }
+                    _ => None,
+                })
+                .is_some_and(|n| n == "attachments");
+            if seg == ".fl" && next_is_attachments {
+                in_fl_attachments = true;
+                continue;
+            }
             if seg == ".git"
                 || seg == ".fl"
                 || seg == "secrets"
@@ -1783,7 +1804,7 @@ fn is_forbidden_artifact_path(path: &Path) -> bool {
         .to_ascii_lowercase();
     normalized.contains("/.fl/gate/vault")
         || normalized.ends_with("/.fl/gate")
-        || normalized.contains("/.fl/")
+        || (normalized.contains("/.fl/") && !in_fl_attachments)
         || normalized.contains("/.git/")
         || normalized.contains("/secrets/")
 }
@@ -2051,17 +2072,30 @@ fn handle_get_artifacts_list(
             state.config.home_override.as_deref(),
         );
         for turn in turns.iter().rev().take(60) {
-            for token in turn.content.split_whitespace() {
-                if let Some(rest) = token.strip_prefix("file:///") {
-                    let clean = rest
-                        .trim_end_matches(|c: char| {
-                            matches!(c, ')' | ']' | '>' | '"' | '\'' | ',' | '.')
-                        })
+            let mut remainder = turn.content.as_str();
+            while let Some(pos) = remainder.find("file:///") {
+                let valid_prefix = pos == 0
+                    || remainder[..pos].chars().next_back().is_some_and(|c| {
+                        c.is_whitespace() || matches!(c, '(' | '<' | '"' | '\'' | '`')
+                    });
+                let after = &remainder[pos + "file:///".len()..];
+                let end = after
+                    .find(|c: char| {
+                        c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | '`')
+                    })
+                    .unwrap_or(after.len());
+                if valid_prefix {
+                    let raw_target = &after[..end];
+                    let clean = raw_target
+                        .trim_end_matches(['.', ',', ';'])
                         .split('#')
                         .next()
-                        .unwrap_or(rest);
-                    candidate_paths.push(PathBuf::from(format!("/{clean}")));
+                        .unwrap_or(raw_target);
+                    if !clean.is_empty() {
+                        candidate_paths.push(PathBuf::from(format!("/{clean}")));
+                    }
                 }
+                remainder = &after[end..];
             }
         }
     }
@@ -2237,6 +2271,9 @@ fn handle_dynamic_api_routes(
         if segments.len() == 7 && segments[6] == "send-now" && method == "POST" {
             return handle_post_queued_prompt_send_now(state, store, &session_id, &prompt_id);
         }
+        if segments.len() == 6 && (method == "PATCH" || method == "PUT") {
+            return handle_patch_queued_prompt(state, store, &session_id, &prompt_id, req);
+        }
         if segments.len() == 6 && method == "DELETE" {
             return handle_delete_queued_prompt(state, store, &session_id, &prompt_id);
         }
@@ -2372,6 +2409,31 @@ fn resolve_session_target(
     (trimmed.to_string(), Some(trimmed.to_ascii_lowercase()))
 }
 
+fn route_matches_session_id(route: &fl_wire::identity::VendorRoute, raw_id: &str) -> bool {
+    let trimmed = raw_id.trim();
+    match route {
+        fl_wire::identity::VendorRoute::Claude { session_id, .. } => {
+            session_id == trimmed || trimmed.strip_prefix("claude-") == Some(session_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Agy {
+            conversation_id, ..
+        } => {
+            conversation_id == trimmed
+                || trimmed.strip_prefix("agy-") == Some(conversation_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Codex { thread_id, .. } => {
+            thread_id == trimmed || trimmed.strip_prefix("codex-") == Some(thread_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Muse { session_id, .. } => {
+            session_id == trimmed || trimmed.strip_prefix("muse-") == Some(session_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Grok { session_id, .. } => {
+            session_id == trimmed || trimmed.strip_prefix("grok-") == Some(session_id.as_str())
+        }
+        fl_wire::identity::VendorRoute::Webhook { .. } => false,
+    }
+}
+
 fn dispatch_operator_prompt_for_session(
     state: &HubState,
     persona: Option<&str>,
@@ -2388,6 +2450,13 @@ fn dispatch_operator_prompt_for_session(
     routes.discover_routes(state.config.home_override.as_deref(), stamp::now());
     let lookup_key = persona.unwrap_or(fallback_session_id);
     if let Some(entry) = routes.get(lookup_key) {
+        return dispatch_operator_prompt_to_route(&entry.route, sender_name, effective_body);
+    }
+    if let Some(entry) = routes
+        .entries
+        .values()
+        .find(|e| route_matches_session_id(&e.route, fallback_session_id))
+    {
         return dispatch_operator_prompt_to_route(&entry.route, sender_name, effective_body);
     }
     Err(format!("no active vendor route for `{lookup_key}`"))
@@ -2415,6 +2484,7 @@ pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
                 "queued": false,
                 "is_busy": true,
                 "delivered": delivery_res.is_ok(),
+                "delivery_error": delivery_res.as_ref().err(),
                 "prompt_id": item.id,
                 "prompt": item.prompt,
                 "effective_body": item.effective_body,
@@ -2467,6 +2537,7 @@ fn handle_post_queued_prompt_send_now(
         "queued": false,
         "is_busy": true,
         "delivered": delivery_res.is_ok(),
+        "delivery_error": delivery_res.as_ref().err(),
         "prompt_id": prompt_id,
         "prompt": item.prompt,
         "effective_body": item.effective_body,
@@ -2486,6 +2557,60 @@ fn handle_post_queued_prompt_send_now(
         }),
     );
     HttpResponse::json(200, data)
+}
+
+fn handle_patch_queued_prompt(
+    state: &HubState,
+    store: &RedbStore,
+    raw_session_id: &str,
+    prompt_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    #[derive(Deserialize, Default)]
+    struct PatchQueuedPromptPayload {
+        #[serde(default)]
+        prompt: String,
+    }
+
+    let payload: PatchQueuedPromptPayload = match req.json() {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let trimmed = payload.prompt.trim().to_string();
+    if trimmed.is_empty() {
+        return HttpResponse::json(400, json!({ "error": "prompt must not be empty" }));
+    }
+
+    let (canonical_id, target_persona) = resolve_session_target(state, store, raw_session_id);
+    let updated = state
+        .update_queued_prompt(&canonical_id, prompt_id, trimmed.clone())
+        .or_else(|| state.update_queued_prompt(raw_session_id, prompt_id, trimmed));
+    let Some((item, queue)) = updated else {
+        return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
+    };
+
+    let is_busy = state.is_session_busy(store, &canonical_id);
+    state.broadcast(
+        "session",
+        "queue_updated",
+        json!({
+            "session_id": canonical_id,
+            "persona": item.persona.clone().or(target_persona),
+            "is_busy": is_busy,
+            "queue": queue,
+        }),
+    );
+    HttpResponse::json(
+        200,
+        json!({
+            "session_id": canonical_id,
+            "status": "updated",
+            "prompt_id": prompt_id,
+            "queued_prompt": item,
+            "is_busy": is_busy,
+            "queue": queue,
+        }),
+    )
 }
 
 fn handle_delete_queued_prompt(
@@ -2702,6 +2827,7 @@ fn handle_post_session_prompt(
         "queued": false,
         "is_busy": true,
         "delivered": delivery_res.is_ok(),
+        "delivery_error": delivery_res.as_ref().err(),
         "prompt": prompt_text,
         "effective_body": effective_body,
         "by": sender_name,
