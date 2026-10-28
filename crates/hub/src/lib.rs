@@ -9,6 +9,7 @@ pub mod terminal;
 pub mod ws;
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -136,6 +137,30 @@ pub struct HubState {
     pub ws_tx: broadcast::Sender<HubWsFrame>,
     store_lock: Arc<Mutex<()>>,
     prompt_queues: Arc<Mutex<PromptQueueState>>,
+}
+
+/// RAII guard holding a [`RedbStore`] together with the `store_lock` mutex for
+/// the store's whole lifetime, so concurrent in-process opens are serialized.
+pub struct HubStoreGuard<'a> {
+    store: Option<RedbStore>,
+    _guard: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl Deref for HubStoreGuard<'_> {
+    type Target = RedbStore;
+
+    fn deref(&self) -> &RedbStore {
+        self.store
+            .as_ref()
+            .expect("store present while guard is alive")
+    }
+}
+
+impl Drop for HubStoreGuard<'_> {
+    fn drop(&mut self) {
+        // Release the redb file lock before the mutex guard unlocks.
+        self.store.take();
+    }
 }
 
 impl HubState {
@@ -279,20 +304,27 @@ impl HubState {
 
     /// Open the workspace `RedbStore` for the duration of a single operation, retrying
     /// briefly if an external CLI process holds a transient lock on the `.redb` file.
-    pub fn open_store(&self) -> Result<RedbStore, StoreError> {
-        let _guard = self.store_lock.lock().ok();
+    /// The returned [`HubStoreGuard`] holds `store_lock` for the store's whole
+    /// lifetime, serializing concurrent in-process opens.
+    pub fn open_store(&self) -> Result<HubStoreGuard<'_>, StoreError> {
+        let guard = self.store_lock.lock().ok();
         if let Some(parent) = self.config.store_path.parent()
             && !parent.as_os_str().is_empty()
         {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut last_err = None;
-        for attempt in 0..40 {
+        for attempt in 0..200 {
             match RedbStore::open(&self.config.store_path) {
-                Ok(store) => return Ok(store),
+                Ok(store) => {
+                    return Ok(HubStoreGuard {
+                        store: Some(store),
+                        _guard: guard,
+                    });
+                }
                 Err(e) => {
                     last_err = Some(e);
-                    if attempt < 39 {
+                    if attempt < 199 {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }
@@ -1732,5 +1764,47 @@ mod tests {
                 .with_header("Authorization", "Bearer owner-tok-secret"),
         );
         assert_eq!(del_secret_resp.status, 200);
+    }
+
+    #[test]
+    fn open_store_serializes_concurrent_holders() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(test_hub_state(&tmp));
+        let current = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(4));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let current = Arc::clone(&current);
+                let max_concurrent = Arc::clone(&max_concurrent);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = state
+                        .open_store()
+                        .expect("serialized open_store must not collide");
+                    let holders = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_concurrent.fetch_max(holders, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = store.list_workflow_defs(None);
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    drop(store);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("open_store thread panicked");
+        }
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "HubStoreGuard must serialize RedbStore holders"
+        );
     }
 }

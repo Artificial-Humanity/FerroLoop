@@ -137,7 +137,7 @@ fn authenticate_ws_request(state: &HubState, req: &HttpRequest) -> Option<HubAut
     let store = state.open_store().ok();
     state
         .auth
-        .authenticate_request(store.as_ref(), &req.headers, &req.query)
+        .authenticate_request(store.as_deref(), &req.headers, &req.query)
 }
 
 async fn handle_connection(mut stream: TcpStream, state: HubState) -> io::Result<()> {

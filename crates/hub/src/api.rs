@@ -351,7 +351,7 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
 
     let Some(authority) = state
         .auth
-        .authenticate_request(Some(&store), &req.headers, &req.query)
+        .authenticate_request(Some(&*store), &req.headers, &req.query)
     else {
         return HttpResponse::json(401, json!({ "error": "unauthorized" }));
     };
@@ -375,7 +375,7 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
                         .and_then(|a| extract_bearer_token(a))
                 })
             {
-                state.auth.revoke_session_token(Some(&store), &tok);
+                state.auth.revoke_session_token(Some(&*store), &tok);
             }
             HttpResponse::json(200, json!({ "authenticated": false }))
                 .with_header("Set-Cookie", format_logout_set_cookie())
@@ -439,7 +439,7 @@ fn handle_auth_pair(state: &HubState, req: &HttpRequest) -> HttpResponse {
     };
     let store = state.open_store().ok();
     match state.auth.exchange_pairing_or_token(
-        store.as_ref(),
+        store.as_deref(),
         parsed.code.as_deref(),
         parsed.token.as_deref(),
     ) {
