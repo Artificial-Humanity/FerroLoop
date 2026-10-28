@@ -9,6 +9,7 @@ pub mod terminal;
 pub mod ws;
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -136,6 +137,30 @@ pub struct HubState {
     pub ws_tx: broadcast::Sender<HubWsFrame>,
     store_lock: Arc<Mutex<()>>,
     prompt_queues: Arc<Mutex<PromptQueueState>>,
+}
+
+/// RAII guard holding a [`RedbStore`] together with the `store_lock` mutex for
+/// the store's whole lifetime, so concurrent in-process opens are serialized.
+pub struct HubStoreGuard<'a> {
+    store: Option<RedbStore>,
+    _guard: Option<std::sync::MutexGuard<'a, ()>>,
+}
+
+impl Deref for HubStoreGuard<'_> {
+    type Target = RedbStore;
+
+    fn deref(&self) -> &RedbStore {
+        self.store
+            .as_ref()
+            .expect("store present while guard is alive")
+    }
+}
+
+impl Drop for HubStoreGuard<'_> {
+    fn drop(&mut self) {
+        // Release the redb file lock before the mutex guard unlocks.
+        self.store.take();
+    }
 }
 
 impl HubState {
@@ -279,20 +304,27 @@ impl HubState {
 
     /// Open the workspace `RedbStore` for the duration of a single operation, retrying
     /// briefly if an external CLI process holds a transient lock on the `.redb` file.
-    pub fn open_store(&self) -> Result<RedbStore, StoreError> {
-        let _guard = self.store_lock.lock().ok();
+    /// The returned [`HubStoreGuard`] holds `store_lock` for the store's whole
+    /// lifetime, serializing concurrent in-process opens.
+    pub fn open_store(&self) -> Result<HubStoreGuard<'_>, StoreError> {
+        let guard = Some(self.store_lock.lock().unwrap_or_else(|e| e.into_inner()));
         if let Some(parent) = self.config.store_path.parent()
             && !parent.as_os_str().is_empty()
         {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut last_err = None;
-        for attempt in 0..40 {
+        for attempt in 0..200 {
             match RedbStore::open(&self.config.store_path) {
-                Ok(store) => return Ok(store),
+                Ok(store) => {
+                    return Ok(HubStoreGuard {
+                        store: Some(store),
+                        _guard: guard,
+                    });
+                }
                 Err(e) => {
                     last_err = Some(e);
-                    if attempt < 39 {
+                    if attempt < 199 {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 }
@@ -546,6 +578,353 @@ mod tests {
             owner_approve_resp.json_value().unwrap()["run"]["status"],
             "completed"
         );
+    }
+
+    #[test]
+    fn state_search_route_ranks_redacts_and_validates() {
+        use fl_core::state::{
+            MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, SensitivityPatch,
+            StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            for (slug, body, sensitive) in [
+                ("weak-note", "zephyr appears once", false),
+                ("secret-note", "zephyr secretbodytoken zephyr zephyr", true),
+            ] {
+                store
+                    .upsert_state(UpsertStateArgs {
+                        scope: StateScope::Workspace,
+                        slug: slug.into(),
+                        sensitivity: if sensitive {
+                            SensitivityPatch::SetSensitive
+                        } else {
+                            SensitivityPatch::Inherit
+                        },
+                        payload: StatePayload::Memory(MemoryEntry {
+                            category: MemoryCategory::Note,
+                            basis: MemoryBasis::Inference,
+                            lifecycle: MemoryLifecycle::Active,
+                            superseded_by: None,
+                            pinned: false,
+                            summary: format!("{slug} summary"),
+                            body: body.into(),
+                        }),
+                        at: stamp::now(),
+                        by: "test".into(),
+                    })
+                    .unwrap();
+            }
+        }
+
+        // Peer: ranked shape, sensitive snippet/entry redacted.
+        let peer_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/search?q=zephyr")
+                .with_header("Authorization", "Bearer peer-tok-secret"),
+        );
+        assert_eq!(peer_resp.status, 200);
+        let peer_json = peer_resp.json_value().unwrap();
+        assert_eq!(peer_json["query"], "zephyr");
+        assert_eq!(peer_json["total_hits"], 2);
+        assert_eq!(peer_json["hits"].as_array().unwrap().len(), 2);
+        let peer_str = String::from_utf8_lossy(&peer_resp.body);
+        assert!(!peer_str.contains("secretbodytoken"), "{peer_str}");
+        assert!(peer_str.contains("[REDACTED]"), "{peer_str}");
+
+        // Owner sees the full sensitive hit.
+        let owner_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/search?q=zephyr")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(owner_resp.status, 200);
+        assert!(
+            String::from_utf8_lossy(&owner_resp.body).contains("secretbodytoken"),
+            "owner must see full sensitive hit"
+        );
+
+        // limit=0 keeps total_hits; missing q is an empty 200, not a 500.
+        let zero_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/search?q=zephyr&limit=0")
+                .with_header("Authorization", "Bearer peer-tok-secret"),
+        );
+        assert_eq!(zero_resp.status, 200);
+        let zero_json = zero_resp.json_value().unwrap();
+        assert_eq!(zero_json["total_hits"], 2);
+        assert_eq!(zero_json["hits"].as_array().unwrap().len(), 0);
+
+        let blank_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/search")
+                .with_header("Authorization", "Bearer peer-tok-secret"),
+        );
+        assert_eq!(blank_resp.status, 200);
+        assert_eq!(blank_resp.json_value().unwrap()["total_hits"], 0);
+
+        // Bad scope/concern/limit are 400s.
+        for target in [
+            "/api/v1/state/search?q=zephyr&scope=bogus%3A1",
+            "/api/v1/state/search?q=zephyr&concern=bogus",
+            "/api/v1/state/search?q=zephyr&limit=abc",
+            "/api/v1/state/search?q=zephyr&limit=-1",
+        ] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("GET", target)
+                    .with_header("Authorization", "Bearer peer-tok-secret"),
+            );
+            assert_eq!(resp.status, 400, "{target}");
+            assert!(resp.json_value().unwrap()["error"].is_string(), "{target}");
+        }
+    }
+
+    #[test]
+    fn state_import_workspace_is_owner_only_with_exact_three_field_shape() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let root = tmp.path();
+        let mem = root.join(".agents/memory/keep-this.md");
+        fs::create_dir_all(mem.parent().unwrap()).unwrap();
+        fs::write(
+            &mem,
+            "---\ndescription: Keep this rule\nmetadata:\n  type: feedback\n---\nBody text.\n",
+        )
+        .unwrap();
+        let state_md = root.join("Notes/Demo.io/STATE.md");
+        fs::create_dir_all(state_md.parent().unwrap()).unwrap();
+        fs::write(
+            &state_md,
+            "# Demo State\n\n## Shipped\n\n- Did a thing\n\n## Next steps\n\n- Do the next thing\n",
+        )
+        .unwrap();
+
+        // Peer is refused before anything is written.
+        let peer_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/import-workspace")
+                .with_header("Authorization", ["Bearer ", "peer", "-tok-secret"].concat())
+                .with_json_body(&json!({ "workspace_root": root.to_string_lossy() })),
+        );
+        assert_eq!(peer_resp.status, 403);
+
+        // Owner import returns exactly the three documented fields.
+        let owner_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/import-workspace")
+                .with_header(
+                    "Authorization",
+                    ["Bearer ", "owner", "-tok-secret"].concat(),
+                )
+                .with_json_body(
+                    &json!({ "workspace_root": root.to_string_lossy(), "by": "tester" }),
+                ),
+        );
+        assert_eq!(
+            owner_resp.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&owner_resp.body)
+        );
+        let body = owner_resp.json_value().unwrap();
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "{body}");
+        assert_eq!(obj["imported_memories"], 1);
+        assert_eq!(obj["imported_handoffs"], 1);
+        assert_eq!(obj["scopes"], json!(["project:demo-io", "workspace"]));
+        assert!(!obj.contains_key("skipped"));
+
+        // Wrong-typed fields and non-object bodies are 400s (owner).
+        for bad in [
+            json!({ "workspace_root": 42 }),
+            json!({ "by": true }),
+            json!(["nope"]),
+        ] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/state/import-workspace")
+                    .with_header(
+                        "Authorization",
+                        ["Bearer ", "owner", "-tok-secret"].concat(),
+                    )
+                    .with_json_body(&bad),
+            );
+            assert_eq!(resp.status, 400, "{bad}");
+        }
+    }
+
+    #[test]
+    fn state_checkpoint_route_reports_git_state_and_enforces_protections() {
+        use fl_core::state::{
+            HandoffEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+        };
+        use fl_core::store::StateStore;
+
+        fn hub_git(repo: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        let tmp = TempDir::new().unwrap();
+        // Isolated repo subdir: hub store/ui files live outside it, so the
+        // dirty count is exact and the derived scope is deterministic.
+        let repo = tmp.path().join("hubproj");
+        fs::create_dir_all(&repo).unwrap();
+        let repo = repo.as_path();
+        hub_git(repo, &["init", "-b", "main"]);
+        hub_git(repo, &["config", "user.name", "Checkpoint Tester"]);
+        hub_git(repo, &["config", "user.email", "tester@example.invalid"]);
+        fs::write(repo.join("tracked.txt"), "initial\n").unwrap();
+        hub_git(repo, &["add", "tracked.txt"]);
+        hub_git(repo, &["commit", "-m", "hub checkpoint subject"]);
+        fs::write(repo.join("tracked.txt"), "modified\n").unwrap();
+
+        let mut state = test_hub_state(&tmp);
+        state.config.repo_root = repo.to_path_buf();
+        let owner = ["Bearer ", "owner", "-tok-secret"].concat();
+        let peer = ["Bearer ", "peer", "-tok-secret"].concat();
+
+        // Success: exactly the shared report shape.
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &owner)
+                .with_json_body(&json!({ "scope": "workspace", "by": "tester" })),
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = resp.json_value().unwrap();
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.len(), 4, "{body}");
+        assert_eq!(body["branch"], "main");
+        assert_eq!(body["head_sha"].as_str().unwrap().len(), 40);
+        assert_eq!(body["dirty_files"], 1, "{body}");
+        assert_eq!(body["entry"]["slug"], "checkpoint-tester");
+        assert_eq!(body["entry"]["scope"], "workspace");
+        assert_eq!(body["entry"]["concern"], "handoff");
+
+        // Empty body works and defaults `by` to the caller's actor name.
+        let empty_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &owner),
+        );
+        assert_eq!(empty_resp.status, 200);
+        let empty_body = empty_resp.json_value().unwrap();
+        assert_eq!(empty_body["entry"]["by"], "lmcfarlin");
+        // Default scope derives from the probed repo top-level name.
+        assert_eq!(
+            empty_body["entry"]["scope"], "project:hubproj",
+            "{empty_body}"
+        );
+        assert_eq!(empty_body["dirty_files"], 1, "{empty_body}");
+
+        // Wrong-typed fields and non-object bodies are 400s.
+        for bad in [
+            json!({ "slug": 42 }),
+            json!({ "scope": "bogus:1" }),
+            json!(["x"]),
+        ] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                    .with_header("Authorization", &owner)
+                    .with_json_body(&bad),
+            );
+            assert_eq!(resp.status, 400, "{bad}");
+        }
+
+        // Reserved hub slugs are 403 for owner and peer alike.
+        for auth in [&owner, &peer] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                    .with_header("Authorization", auth)
+                    .with_json_body(&json!({ "slug": "hub-pairing-forged" })),
+            );
+            assert_eq!(resp.status, 403);
+        }
+
+        // A peer cannot overwrite an existing sensitive checkpoint.
+        {
+            let store = state.open_store().unwrap();
+            store
+                .upsert_state(UpsertStateArgs {
+                    scope: StateScope::Workspace,
+                    slug: "checkpoint-sensitive".into(),
+                    sensitivity: SensitivityPatch::SetSensitive,
+                    payload: StatePayload::Handoff(HandoffEntry {
+                        summary: "secret checkpoint".into(),
+                        shipped: Vec::new(),
+                        in_flight: Vec::new(),
+                        blockers: Vec::new(),
+                        next_steps: Vec::new(),
+                        notes: None,
+                    }),
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        let peer_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &peer)
+                .with_header("X-Fl-Agent", "ferris")
+                .with_json_body(&json!({ "scope": "workspace", "slug": "checkpoint-sensitive" })),
+        );
+        assert_eq!(peer_resp.status, 403);
+        // The owner still can.
+        let owner_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &owner)
+                .with_json_body(&json!({ "scope": "workspace", "slug": "checkpoint-sensitive" })),
+        );
+        assert_eq!(owner_resp.status, 200);
+    }
+
+    #[test]
+    fn state_checkpoint_route_non_repo_is_500() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let owner = ["Bearer ", "owner", "-tok-secret"].concat();
+        // Invalid explicit scope/slug validate before the git probe: 400
+        // (reserved slug 403) even though `repo_root` is not a repository.
+        for (bad, expected) in [
+            (json!({ "scope": "bogus:1" }), 400),
+            (json!({ "slug": "1bad slug!" }), 400),
+            (json!({ "slug": "hub-pairing-forged" }), 403),
+        ] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                    .with_header("Authorization", &owner)
+                    .with_json_body(&bad),
+            );
+            assert_eq!(resp.status, expected, "{bad}");
+        }
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                .with_header("Authorization", &owner)
+                .with_json_body(&json!({})),
+        );
+        assert_eq!(resp.status, 500);
+        assert!(resp.json_value().unwrap()["error"].is_string());
     }
 
     #[test]
@@ -1385,5 +1764,119 @@ mod tests {
                 .with_header("Authorization", "Bearer owner-tok-secret"),
         );
         assert_eq!(del_secret_resp.status, 200);
+    }
+
+    #[test]
+    fn open_store_serializes_concurrent_holders() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let state = Arc::new(test_hub_state(&tmp));
+        let current = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(4));
+
+        // White-box: the guard must actually hold store_lock for its lifetime.
+        // This fails if open_store drops the lock early, unlike holder counts alone.
+        let guard = state.open_store().expect("open_store for lock probe");
+        assert!(
+            state.store_lock.try_lock().is_err(),
+            "store_lock must be held while HubStoreGuard is alive"
+        );
+        drop(guard);
+        assert!(
+            state.store_lock.try_lock().is_ok(),
+            "store_lock must be released after HubStoreGuard is dropped"
+        );
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let state = Arc::clone(&state);
+                let current = Arc::clone(&current);
+                let max_concurrent = Arc::clone(&max_concurrent);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let store = state
+                        .open_store()
+                        .expect("serialized open_store must not collide");
+                    let holders = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_concurrent.fetch_max(holders, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = store.list_workflow_defs(None);
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    drop(store);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().expect("open_store thread panicked");
+        }
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "HubStoreGuard must serialize RedbStore holders"
+        );
+    }
+
+    #[test]
+    fn code_search_route_records_token_gain_and_stats_exposes_it() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let mut code = String::from("pub fn hub_widget() {}\n");
+        for i in 0..40 {
+            code.push_str(&format!("// filler line {i} padding the file out\n"));
+        }
+        fs::write(tmp.path().join("src/widget.rs"), code).unwrap();
+
+        let hit = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/code-search?q=hub_widget&kind=def")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(hit.status, 200);
+        let hit_json = hit.json_value().unwrap();
+        assert_eq!(hit_json["query"], "hub_widget", "{hit_json}");
+        assert_eq!(hit_json["kind"], "def", "{hit_json}");
+        assert_eq!(hit_json["symbols"][0]["name"], "hub_widget", "{hit_json}");
+        assert!(
+            hit_json["tokens_saved_this_query"].as_u64().unwrap() > 0,
+            "{hit_json}"
+        );
+        assert_eq!(hit_json["token_gain"]["queries_count"], 1, "{hit_json}");
+
+        let stats = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/stats")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(stats.status, 200);
+        let stats_json = stats.json_value().unwrap();
+        assert_eq!(stats_json["token_gain"]["queries_count"], 1, "{stats_json}");
+        assert!(
+            stats_json["token_gain"]["files_indexed"].as_u64().unwrap() >= 1,
+            "{stats_json}"
+        );
+
+        let bad_kind = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/code-search?q=hub_widget&kind=bogus")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(bad_kind.status, 400);
+
+        let blank = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/state/code-search?kind=def")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(blank.status, 200);
+        let blank_json = blank.json_value().unwrap();
+        assert_eq!(blank_json["symbols"].as_array().unwrap().len(), 0);
+        assert_eq!(blank_json["tokens_saved_this_query"], 0);
+        assert_eq!(blank_json["token_gain"]["queries_count"], 1, "{blank_json}");
     }
 }

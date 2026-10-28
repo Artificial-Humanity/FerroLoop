@@ -10,6 +10,13 @@ use fl_core::agent::AgentStatus;
 use fl_core::arch::{
     ArchitectureModel, DEFAULT_ARCH_MANIFEST_PATH, export_likec4_dsl, validate_architecture_model,
 };
+use fl_core::code_index::{
+    CodeSearchKind, load_token_gain, record_token_gain_query, scan_code_index,
+};
+use fl_core::ferrostate::{
+    apply_workspace_import, create_state_checkpoint_from_probe, derive_import_slug, probe_git_repo,
+    resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
+};
 use fl_core::ferrowire::{
     DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter,
     validate_sender_name,
@@ -25,7 +32,7 @@ use fl_core::pr_policy::{
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    UpsertStateArgs,
+    StateSearchHit, UpsertStateArgs, search_state_entries,
 };
 use fl_core::store::{
     AgentRegistry, Catalog, Handles, Ledger, MessageStore, StateStore, WorkflowStore,
@@ -347,7 +354,7 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
 
     let Some(authority) = state
         .auth
-        .authenticate_request(Some(&store), &req.headers, &req.query)
+        .authenticate_request(Some(&*store), &req.headers, &req.query)
     else {
         return HttpResponse::json(401, json!({ "error": "unauthorized" }));
     };
@@ -371,7 +378,7 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
                         .and_then(|a| extract_bearer_token(a))
                 })
             {
-                state.auth.revoke_session_token(Some(&store), &tok);
+                state.auth.revoke_session_token(Some(&*store), &tok);
             }
             HttpResponse::json(200, json!({ "authenticated": false }))
                 .with_header("Set-Cookie", format_logout_set_cookie())
@@ -404,7 +411,15 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
             handle_post_workflow_run_start(state, &store, &authority, req)
         }
         ("GET", "/api/v1/state") => handle_get_state(&store, &authority, req),
+        ("GET", "/api/v1/state/search") => handle_get_state_search(&store, &authority, req),
+        ("GET", "/api/v1/state/code-search") => handle_get_code_search(state, &store, req),
         ("POST", "/api/v1/state") => handle_post_state(&store, &authority, req),
+        ("POST", "/api/v1/state/checkpoint") => {
+            handle_post_state_checkpoint(state, &store, &authority, req)
+        }
+        ("POST", "/api/v1/state/import-workspace") => {
+            handle_post_state_import_workspace(state, &store, &authority, req)
+        }
         ("GET", "/api/v1/stats") => handle_get_stats(&store, req),
         ("GET", "/api/v1/architecture") => handle_get_architecture(state, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
@@ -428,7 +443,7 @@ fn handle_auth_pair(state: &HubState, req: &HttpRequest) -> HttpResponse {
     };
     let store = state.open_store().ok();
     match state.auth.exchange_pairing_or_token(
-        store.as_ref(),
+        store.as_deref(),
         parsed.code.as_deref(),
         parsed.token.as_deref(),
     ) {
@@ -961,6 +976,10 @@ fn redact_sensitive_entry(mut entry: StateEntry) -> StateEntry {
         StatePayload::Handoff(mut h) => {
             h.summary = "[REDACTED]".to_string();
             h.notes = Some("[REDACTED]".to_string());
+            h.shipped.clear();
+            h.in_flight.clear();
+            h.blockers.clear();
+            h.next_steps.clear();
             StatePayload::Handoff(h)
         }
         StatePayload::Runtime(mut r) => {
@@ -1017,6 +1036,184 @@ fn handle_get_state(
         .collect();
 
     HttpResponse::json(200, json!({ "entries": filtered }))
+}
+
+fn is_internal_hub_entry(entry: &StateEntry) -> bool {
+    entry.scope == StateScope::Workspace
+        && (entry.slug.starts_with("hub-pairing-") || entry.slug.starts_with("hub-session-"))
+}
+
+fn redact_search_hit(mut hit: StateSearchHit, is_owner: bool) -> StateSearchHit {
+    if !is_owner && hit.entry.sensitive {
+        hit.entry = redact_sensitive_entry(hit.entry);
+        hit.snippet = "[REDACTED]".to_string();
+    }
+    hit
+}
+
+/// Rank hub search candidates: internal hub entries excluded, full ranked
+/// count returned before `limit` truncation, sensitive hits redacted for
+/// non-owners (entry and snippet).
+fn search_state_for_hub(
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+    is_owner: bool,
+) -> (Vec<StateSearchHit>, usize) {
+    let candidates: Vec<StateEntry> = entries
+        .iter()
+        .filter(|e| !is_internal_hub_entry(e))
+        .cloned()
+        .collect();
+    let all = search_state_entries(&candidates, query, scope, concern, usize::MAX);
+    let total_hits = all.len();
+    let hits: Vec<StateSearchHit> = all
+        .into_iter()
+        .take(limit)
+        .map(|hit| redact_search_hit(hit, is_owner))
+        .collect();
+    (hits, total_hits)
+}
+
+fn handle_get_state_search(
+    store: &RedbStore,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let scope = match req.query.get("scope") {
+        Some(s) if !s.trim().is_empty() => match StateScope::from_wire(s.trim()) {
+            Ok(sc) => Some(sc),
+            Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
+        },
+        _ => None,
+    };
+    let concern = match req.query.get("concern") {
+        Some(c) if !c.trim().is_empty() => match StateConcern::from_wire(c.trim()) {
+            Some(cn) => Some(cn),
+            None => {
+                return HttpResponse::json(
+                    400,
+                    json!({ "error": format!("unknown state concern `{c}`") }),
+                );
+            }
+        },
+        _ => None,
+    };
+    let limit = match req.query.get("limit") {
+        Some(s) if !s.trim().is_empty() => match s.trim().parse::<usize>() {
+            Ok(n) => n.min(100),
+            Err(_) => {
+                return HttpResponse::json(
+                    400,
+                    json!({ "error": format!("invalid `limit` `{s}`; expected a non-negative integer") }),
+                );
+            }
+        },
+        _ => 10,
+    };
+
+    let query = req.query.get("q").cloned().unwrap_or_default();
+    if query.trim().is_empty() {
+        return HttpResponse::json(200, json!({ "query": query, "hits": [], "total_hits": 0 }));
+    }
+
+    let entries = match store.list_state(scope.as_ref(), concern) {
+        Ok(list) => list,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+
+    let (hits, total_hits) = search_state_for_hub(
+        &entries,
+        &query,
+        scope.as_ref(),
+        concern,
+        limit,
+        authority.is_owner(),
+    );
+
+    HttpResponse::json(
+        200,
+        json!({ "query": query, "hits": hits, "total_hits": total_hits }),
+    )
+}
+
+fn handle_get_code_search(state: &HubState, store: &RedbStore, req: &HttpRequest) -> HttpResponse {
+    let kind = match req.query.get("kind") {
+        Some(raw) if !raw.trim().is_empty() => match CodeSearchKind::from_wire(raw.trim()) {
+            Some(k) => k,
+            None => {
+                return HttpResponse::json(
+                    400,
+                    json!({
+                        "error": format!(
+                            "unknown code search kind `{raw}`; expected one of: {}",
+                            CodeSearchKind::wire_values()
+                        )
+                    }),
+                );
+            }
+        },
+        _ => CodeSearchKind::Search,
+    };
+    // Per-kind defaults mirror the CLI/MCP surfaces: 50 def/search,
+    // 500 outline, capped at 1000; an explicit 0 stays 0.
+    let default_limit = match kind {
+        CodeSearchKind::Outline => 500,
+        CodeSearchKind::Def | CodeSearchKind::Search => 50,
+    };
+    let limit = match req.query.get("limit") {
+        Some(raw) if !raw.trim().is_empty() => match raw.trim().parse::<usize>() {
+            Ok(n) => n.min(1000),
+            Err(_) => {
+                return HttpResponse::json(
+                    400,
+                    json!({ "error": format!("invalid `limit` `{raw}`; expected a non-negative integer") }),
+                );
+            }
+        },
+        _ => default_limit,
+    };
+
+    let query = req.query.get("q").cloned().unwrap_or_default();
+    // Missing/blank `q`, and an explicit `limit` of 0, return no symbols
+    // and record nothing; `token_gain` is the stored ledger unchanged.
+    if query.trim().is_empty() || limit == 0 {
+        return HttpResponse::json(
+            200,
+            json!({
+                "query": query,
+                "kind": kind.as_wire(),
+                "symbols": [],
+                "tokens_saved_this_query": 0,
+                "token_gain": load_token_gain(store),
+            }),
+        );
+    }
+
+    let outcome = scan_code_index(&state.config.repo_root).search(kind, &query, limit);
+    let token_gain = match record_token_gain_query(
+        store,
+        outcome.tokens_saved_this_query,
+        outcome.files_indexed,
+        outcome.symbols_indexed,
+        stamp::now(),
+        "fl",
+    ) {
+        Ok(gain) => gain,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+    HttpResponse::json(
+        200,
+        json!({
+            "query": query,
+            "kind": kind.as_wire(),
+            "symbols": outcome.symbols,
+            "tokens_saved_this_query": outcome.tokens_saved_this_query,
+            "token_gain": token_gain,
+        }),
+    )
 }
 
 fn handle_post_state(
@@ -1174,6 +1371,184 @@ fn handle_post_state(
     }
 }
 
+fn handle_post_state_checkpoint(
+    state: &HubState,
+    store: &RedbStore,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let raw: Value = if req.body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        match req.json() {
+            Ok(v) => v,
+            Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+        }
+    };
+    let Some(obj) = raw.as_object() else {
+        return HttpResponse::json(400, json!({ "error": "expected JSON object" }));
+    };
+    let optional_str = |key: &str| -> Result<Option<String>, HttpResponse> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(HttpResponse::json(
+                400,
+                json!({ "error": format!("`{key}` must be a string") }),
+            )),
+        }
+    };
+    let scope_field = match optional_str("scope") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let slug_field = match optional_str("slug") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let summary_field = match optional_str("summary") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let by_field = match optional_str("by") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let by = by_field
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| authority.actor_name().to_string());
+
+    // Reserved internal hub slugs, mirroring `handle_post_state` (checked
+    // on the trimmed, lowercased input before slug validation).
+    if let Some(raw_slug) = slug_field.as_deref() {
+        let normalized = raw_slug.trim().to_ascii_lowercase();
+        if normalized.starts_with("hub-pairing-") || normalized.starts_with("hub-session-") {
+            return HttpResponse::json(
+                403,
+                json!({ "error": "reserved internal hub authentication slug prefix" }),
+            );
+        }
+    }
+
+    // Validate explicit scope and slug before probing git so invalid
+    // input is a 400 even when `repo_root` is not a repository. Only the
+    // default scope derivation waits for the probe's top level.
+    let explicit_scope = match scope_field.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some(raw) => match StateScope::from_wire(raw.trim()) {
+            Ok(s) => Some(s),
+            Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
+        },
+        None => None,
+    };
+
+    let slug = match resolve_checkpoint_slug(slug_field.as_deref(), &by) {
+        Ok(s) => s,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+
+    let probe = match probe_git_repo(&state.config.repo_root) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e })),
+    };
+
+    let scope = explicit_scope.unwrap_or_else(|| {
+        probe
+            .top_level
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(derive_import_slug)
+            .map(StateScope::Project)
+            .unwrap_or(StateScope::Workspace)
+    });
+
+    // Non-owners cannot overwrite an already-sensitive checkpoint entry.
+    if !authority.is_owner()
+        && let Ok(Some(existing)) = store.get_state_by_key(&scope, StateConcern::Handoff, &slug)
+        && (existing.sensitive || existing.ever_sensitive)
+    {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "owner authority required to modify sensitive state entries" }),
+        );
+    }
+
+    match create_state_checkpoint_from_probe(
+        store,
+        &probe,
+        scope,
+        Some(slug.as_str()),
+        summary_field.as_deref(),
+        &by,
+        stamp::now(),
+    ) {
+        Ok(report) => HttpResponse::json(
+            200,
+            serde_json::to_value(&report).unwrap_or_else(|_| json!({})),
+        ),
+        Err(e) => HttpResponse::json(500, json!({ "error": e })),
+    }
+}
+
+fn handle_post_state_import_workspace(
+    state: &HubState,
+    store: &RedbStore,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "owner authority required to import workspace state" }),
+        );
+    }
+    let raw: Value = if req.body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        match req.json() {
+            Ok(v) => v,
+            Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+        }
+    };
+    let Some(obj) = raw.as_object() else {
+        return HttpResponse::json(400, json!({ "error": "expected JSON object" }));
+    };
+    let optional_str = |key: &str| -> Result<Option<String>, HttpResponse> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(HttpResponse::json(
+                400,
+                json!({ "error": format!("`{key}` must be a string") }),
+            )),
+        }
+    };
+    let workspace_root = match optional_str("workspace_root") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let by_field = match optional_str("by") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let root = workspace_root
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve_workspace_root(&state.config.repo_root));
+    let by = by_field
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| authority.actor_name().to_string());
+    let scan = scan_workspace_import(&root, &by, stamp::now());
+    let report = apply_workspace_import(store, scan.upserts, scan.skipped);
+    HttpResponse::json(
+        200,
+        json!({
+            "imported_memories": report.imported_memories,
+            "imported_handoffs": report.imported_handoffs,
+            "scopes": report.scopes,
+        }),
+    )
+}
+
 fn handle_get_stats(store: &RedbStore, _req: &HttpRequest) -> HttpResponse {
     let projects = match store.list_projects() {
         Ok(p) => p,
@@ -1271,6 +1646,7 @@ fn handle_get_stats(store: &RedbStore, _req: &HttpRequest) -> HttpResponse {
             "zero_cost_attempts": zero_cost_attempts,
             "by_adapter": by_adapter,
             "regret_audit": regret_audit,
+            "token_gain": load_token_gain(store),
         }),
     )
 }
@@ -2739,6 +3115,159 @@ fn handle_post_gate_bridge_webhook(
                 ),
                 Err(e) => HttpResponse::json(502, json!({ "error": e.to_string(), "plan": plan })),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_core::at::At;
+    use fl_core::ids::{RevisionId, StateId, seq_iri};
+
+    fn memory_entry(n: u64, slug: &str, body: &str, sensitive: bool) -> StateEntry {
+        StateEntry {
+            id: StateId(seq_iri(n)),
+            scope: StateScope::Workspace,
+            concern: StateConcern::Memory,
+            slug: slug.to_string(),
+            sensitive,
+            ever_sensitive: sensitive,
+            payload: StatePayload::Memory(MemoryEntry {
+                category: MemoryCategory::Note,
+                basis: MemoryBasis::Inference,
+                lifecycle: MemoryLifecycle::Active,
+                superseded_by: None,
+                pinned: false,
+                summary: format!("{slug} summary"),
+                body: body.to_string(),
+            }),
+            head_revision: RevisionId(seq_iri(1000 + n)),
+            updated_at: At::from_unix_millis(1_000 + n),
+            by: "test".to_string(),
+        }
+    }
+
+    fn sensitive_handoff_entry(n: u64) -> StateEntry {
+        StateEntry {
+            id: StateId(seq_iri(n)),
+            scope: StateScope::Workspace,
+            concern: StateConcern::Handoff,
+            slug: "secret-handoff".to_string(),
+            sensitive: true,
+            ever_sensitive: true,
+            payload: StatePayload::Handoff(HandoffEntry {
+                summary: "zephyr handoff summary".to_string(),
+                shipped: vec!["zephyr shippedsecrettoken".to_string()],
+                in_flight: vec!["zephyr inflightsecrettoken".to_string()],
+                blockers: vec!["zephyr blockersecrettoken".to_string()],
+                next_steps: vec!["zephyr nextstepsecrettoken".to_string()],
+                notes: Some("zephyr notes".to_string()),
+            }),
+            head_revision: RevisionId(seq_iri(1000 + n)),
+            updated_at: At::from_unix_millis(1_000 + n),
+            by: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn hub_search_redacts_sensitive_snippet_for_non_owner_only() {
+        let secret = memory_entry(
+            1,
+            "secret-note",
+            "zephyr secretbodytoken zephyr zephyr",
+            true,
+        );
+        let public = memory_entry(2, "public-note", "zephyr public note", false);
+        let internal = memory_entry(3, "hub-session-abc123", "zephyr internal", false);
+        let entries = vec![public, internal, secret];
+
+        // Non-owner: sensitive entry and snippet redacted, internal excluded.
+        let (hits, total) = search_state_for_hub(&entries, "zephyr", None, None, 10, false);
+        assert_eq!(total, 2, "internal hub entry must be excluded: {hits:?}");
+        let secret_hit = hits
+            .iter()
+            .find(|h| h.entry.slug == "secret-note")
+            .expect("sensitive hit present but redacted");
+        assert_eq!(secret_hit.snippet, "[REDACTED]");
+        let serialized = serde_json::to_string(&secret_hit).unwrap();
+        assert!(!serialized.contains("secretbodytoken"), "{serialized}");
+        assert!(serialized.contains("[REDACTED]"), "{serialized}");
+        // Public hit is untouched for non-owners.
+        let public_hit = hits.iter().find(|h| h.entry.slug == "public-note").unwrap();
+        assert_ne!(public_hit.snippet, "[REDACTED]");
+
+        // Owner sees full sensitive hit.
+        let (owner_hits, owner_total) =
+            search_state_for_hub(&entries, "zephyr", None, None, 10, true);
+        assert_eq!(owner_total, 2);
+        let owner_secret = owner_hits
+            .iter()
+            .find(|h| h.entry.slug == "secret-note")
+            .unwrap();
+        assert_ne!(owner_secret.snippet, "[REDACTED]");
+        assert!(
+            serde_json::to_string(owner_secret)
+                .unwrap()
+                .contains("secretbodytoken")
+        );
+
+        // Limit 0 returns no hits but keeps the full ranked count.
+        let (none, total_zero) = search_state_for_hub(&entries, "zephyr", None, None, 0, true);
+        assert!(none.is_empty());
+        assert_eq!(total_zero, 2);
+
+        // Truncation keeps total before the cap.
+        let (one, total_one) = search_state_for_hub(&entries, "zephyr", None, None, 1, true);
+        assert_eq!(one.len(), 1);
+        assert_eq!(total_one, 2);
+    }
+
+    #[test]
+    fn hub_search_redacts_sensitive_handoff_lists_for_non_owner_only() {
+        const SECRET_TOKENS: [&str; 4] = [
+            "shippedsecrettoken",
+            "inflightsecrettoken",
+            "blockersecrettoken",
+            "nextstepsecrettoken",
+        ];
+        let entry = sensitive_handoff_entry(10);
+        let entries = vec![entry.clone()];
+
+        // List path: redact_sensitive_entry clears all four handoff lists.
+        let redacted = redact_sensitive_entry(entry.clone());
+        let StatePayload::Handoff(h) = &redacted.payload else {
+            panic!("expected handoff payload");
+        };
+        assert_eq!(h.summary, "[REDACTED]");
+        assert_eq!(h.notes.as_deref(), Some("[REDACTED]"));
+        assert!(h.shipped.is_empty() && h.in_flight.is_empty());
+        assert!(h.blockers.is_empty() && h.next_steps.is_empty());
+        let serialized_entry = serde_json::to_string(&redacted).unwrap();
+        for token in SECRET_TOKENS {
+            assert!(!serialized_entry.contains(token), "{serialized_entry}");
+        }
+
+        // Search path: non-owner hit leaks no list-only token.
+        let (hits, total) = search_state_for_hub(&entries, "zephyr", None, None, 10, false);
+        assert_eq!(total, 1);
+        let hit = &hits[0];
+        assert_eq!(hit.snippet, "[REDACTED]");
+        let StatePayload::Handoff(hit_h) = &hit.entry.payload else {
+            panic!("expected handoff payload");
+        };
+        assert!(hit_h.shipped.is_empty() && hit_h.in_flight.is_empty());
+        assert!(hit_h.blockers.is_empty() && hit_h.next_steps.is_empty());
+        let serialized_hit = serde_json::to_string(hit).unwrap();
+        for token in SECRET_TOKENS {
+            assert!(!serialized_hit.contains(token), "{serialized_hit}");
+        }
+
+        // Owner still sees the list contents.
+        let (owner_hits, _) = search_state_for_hub(&entries, "zephyr", None, None, 10, true);
+        let serialized_owner = serde_json::to_string(&owner_hits[0]).unwrap();
+        for token in SECRET_TOKENS {
+            assert!(serialized_owner.contains(token), "{serialized_owner}");
         }
     }
 }

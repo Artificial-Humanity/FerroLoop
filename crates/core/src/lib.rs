@@ -5,6 +5,7 @@ mod wire;
 pub mod agent;
 pub mod arch;
 pub mod at;
+pub mod code_index;
 #[cfg(any(test, feature = "conformance"))]
 #[doc(hidden)]
 pub mod conformance;
@@ -12,6 +13,7 @@ pub mod decision;
 pub mod escalate;
 pub mod escalation;
 pub mod fault;
+pub mod ferrostate;
 pub mod ferrowire;
 pub mod finding;
 pub mod ids;
@@ -43,10 +45,21 @@ pub use arch::{
     check_architecture_conformance, export_likec4_dsl, validate_architecture_model,
 };
 pub use at::{At, AtError};
+pub use code_index::{
+    CodeIndex, CodeSearchKind, CodeSearchOutcome, CodeSymbolHit, MAX_CODE_FILE_BYTES,
+    TOKEN_GAIN_SLUG, TokenGainSummary, load_token_gain, record_token_gain_index,
+    record_token_gain_query, scan_code_index, search_code_index,
+};
 pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, TransitionOutcome};
 pub use escalate::Prepared;
 pub use escalation::{EscalationFault, Escalations, Mark, Outgoing, Provenance, Tombstone};
 pub use fault::LedgerFault;
+pub use ferrostate::{
+    GitRepoProbe, MAX_CHECKPOINT_DIRTY_ENTRIES, StateCheckpointReport, WorkspaceImportReport,
+    WorkspaceImportScan, apply_workspace_import, build_checkpoint_upsert, create_state_checkpoint,
+    create_state_checkpoint_from_probe, derive_import_slug, probe_git_repo,
+    resolve_checkpoint_slug, resolve_workspace_root, scan_workspace_import,
+};
 pub use ferrowire::{
     DeliveryReceipt, DeliveryStatus, MAX_SUBJECT_BYTES, MAX_WIRE_BODY_BYTES, MessageKind,
     MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter, WireInboxItem, WireMessage,
@@ -81,8 +94,8 @@ pub use stale::{Staleness, apply_staleness, is_stale};
 pub use state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateConflict, StateEntry, StateError,
-    StatePayload, StateRevision, StateScope, StateSyncCursor, UpsertStateArgs, validate_slug,
-    validate_summary,
+    StatePayload, StateRevision, StateScope, StateSearchHit, StateSyncCursor, UpsertStateArgs,
+    estimate_tokens, search_state_entries, validate_slug, validate_summary,
 };
 pub use store::{
     AgentRegistry, Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, MessageStore,

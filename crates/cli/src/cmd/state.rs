@@ -1,13 +1,22 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use fl_core::agent::{AgentRecord, AgentStatus, AreaRecord, reports_to};
+use fl_core::code_index::{
+    CodeIndex, CodeSearchKind, CodeSearchOutcome, CodeSymbolHit, TokenGainSummary, load_token_gain,
+    record_token_gain_index, record_token_gain_query, scan_code_index,
+};
+use fl_core::ferrostate::{
+    WorkspaceImportReport, apply_workspace_import, create_state_checkpoint, resolve_workspace_root,
+    scan_workspace_import,
+};
 use fl_core::ids::{Kind, RevisionId, StateId};
 use fl_core::iri::Iri;
 use fl_core::state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
-    UpsertStateArgs, validate_slug,
+    StateSearchHit, UpsertStateArgs, search_state_entries, validate_slug,
 };
 use fl_core::store::{AgentRegistry, Handles, StateStore};
 use fl_exec::state_sync::{sync_state, verify_state};
@@ -19,6 +28,151 @@ use crate::refs::Ref;
 
 /// Default byte ceiling for `fl state render` (24.4 KB, matching workspace index cap).
 pub const DEFAULT_RENDER_MAX_BYTES: usize = 24_400;
+
+/// Default hit count for state search surfaces (CLI, MCP, Hub).
+pub const DEFAULT_SEARCH_LIMIT: usize = 10;
+
+/// Maximum hit count for state search surfaces (CLI, MCP, Hub).
+pub const MAX_SEARCH_LIMIT: usize = 100;
+
+/// Resolve a caller-supplied search limit: default 10, capped at 100.
+pub fn effective_search_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(DEFAULT_SEARCH_LIMIT).min(MAX_SEARCH_LIMIT)
+}
+
+/// Rank `entries` with the core BM25 searcher and truncate at the surface,
+/// returning the full ranked count before truncation as the second value.
+/// Stores are local, so fetching the full ranked list is cheap.
+pub fn collect_search_hits(
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+) -> (Vec<StateSearchHit>, usize) {
+    let all = search_state_entries(entries, query, scope, concern, usize::MAX);
+    let total_hits = all.len();
+    let hits: Vec<StateSearchHit> = all.into_iter().take(limit).collect();
+    (hits, total_hits)
+}
+
+/// Wire shape shared by the CLI, MCP, and Hub search surfaces.
+pub fn search_result_json(
+    query: &str,
+    hits: &[StateSearchHit],
+    total_hits: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "hits": hits,
+        "total_hits": total_hits,
+    })
+}
+
+/// One-line plain-text rendering of a search hit for the CLI.
+pub fn format_search_hit(hit: &StateSearchHit) -> String {
+    let snippet: String = hit
+        .snippet
+        .chars()
+        .map(|c| {
+            if c == '\n' || c == '\r' || c == '\t' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    format!(
+        "{}\t{}\t{}\t{}\ttokens={}\t{}",
+        hit.score_millis,
+        hit.entry.scope.as_wire(),
+        hit.entry.concern.as_wire(),
+        hit.entry.slug,
+        hit.estimated_tokens,
+        snippet.trim()
+    )
+}
+
+/// Default hit count for `code-def`/`code-search` surfaces (CLI, MCP, Hub).
+pub const DEFAULT_CODE_LIMIT: usize = 50;
+
+/// Default hit count for `code-outline` surfaces (CLI, MCP, Hub).
+pub const DEFAULT_CODE_OUTLINE_LIMIT: usize = 500;
+
+/// Maximum hit count for code-index surfaces (CLI, MCP, Hub).
+pub const MAX_CODE_LIMIT: usize = 1000;
+
+/// The default code-search limit for `kind` when the caller omits one.
+pub fn default_code_limit(kind: CodeSearchKind) -> usize {
+    match kind {
+        CodeSearchKind::Outline => DEFAULT_CODE_OUTLINE_LIMIT,
+        CodeSearchKind::Def | CodeSearchKind::Search => DEFAULT_CODE_LIMIT,
+    }
+}
+
+/// Resolve a caller-supplied code-search limit: per-kind default, capped
+/// at 1000. An explicit `0` stays `0` (no symbols, no token-gain record).
+pub fn effective_code_limit(limit: Option<usize>, kind: CodeSearchKind) -> usize {
+    limit
+        .unwrap_or_else(|| default_code_limit(kind))
+        .min(MAX_CODE_LIMIT)
+}
+
+/// Wire shape shared by the CLI, MCP, and Hub code-search surfaces
+/// (`CodeSearchResponse` in `ui/src/types/api.ts`).
+pub fn code_search_response_json(
+    query: &str,
+    kind: CodeSearchKind,
+    symbols: &[CodeSymbolHit],
+    tokens_saved_this_query: u64,
+    token_gain: TokenGainSummary,
+) -> serde_json::Value {
+    serde_json::json!({
+        "query": query,
+        "kind": kind.as_wire(),
+        "symbols": symbols,
+        "tokens_saved_this_query": tokens_saved_this_query,
+        "token_gain": token_gain,
+    })
+}
+
+/// One-line plain-text rendering of a code hit for the CLI:
+/// `path:start kind name — signature`.
+pub fn format_code_hit(hit: &CodeSymbolHit) -> String {
+    format!(
+        "{}:{} {} {} — {}",
+        hit.path, hit.start_line, hit.kind, hit.name, hit.signature
+    )
+}
+
+/// Run one search over an already-scanned `index` and record its token
+/// gain in `store`, returning the outcome and the updated ledger.
+///
+/// A `limit` of `0` returns no symbols and records nothing; the returned
+/// ledger is then the currently stored one ([`load_token_gain`]). Ledger
+/// write failures (malformed/sensitive ledger, store errors) propagate.
+pub fn search_and_record(
+    store: &impl StateStore,
+    index: &CodeIndex,
+    kind: CodeSearchKind,
+    query: &str,
+    limit: usize,
+) -> Result<(CodeSearchOutcome, TokenGainSummary), String> {
+    let outcome = index.search(kind, query, limit);
+    if limit == 0 {
+        return Ok((outcome, load_token_gain(store)));
+    }
+    let token_gain = record_token_gain_query(
+        store,
+        outcome.tokens_saved_this_query,
+        outcome.files_indexed,
+        outcome.symbols_indexed,
+        now_at(),
+        "fl",
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((outcome, token_gain))
+}
 
 #[derive(Subcommand)]
 pub enum StateCmd {
@@ -47,6 +201,19 @@ pub enum StateCmd {
         concern: Option<String>,
         #[arg(long)]
         history: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search state entries with BM25 ranking.
+    Search {
+        /// Search query text.
+        query: String,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        concern: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
         #[arg(long)]
         json: bool,
     },
@@ -115,6 +282,83 @@ pub enum StateCmd {
     },
     /// Run the newline-delimited JSON-RPC 2.0 MCP server over stdio.
     Mcp,
+    /// Record an automatic git session checkpoint as a `Handoff` entry.
+    Checkpoint {
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        slug: Option<String>,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long, default_value = "fl")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One-shot import of `.agents/memory/*.md` and `Notes/*/STATE.md`.
+    ImportWorkspace {
+        #[arg(long = "workspace-root")]
+        workspace_root: Option<PathBuf>,
+        #[arg(long, default_value = "fl")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scan a workspace tree into the structural code index and record its size.
+    Index {
+        /// Workspace root to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Find symbol definitions by exact/prefix name in the code index.
+    #[command(name = "code-def")]
+    CodeDef {
+        /// Symbol name to look up.
+        symbol: String,
+        /// Workspace root to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ranked text search over declarations and lines in the code index.
+    #[command(name = "code-search")]
+    CodeSearch {
+        /// Search query text.
+        query: String,
+        /// Workspace root to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the symbols declared in a file (matched by path) in source order.
+    #[command(name = "code-outline")]
+    CodeOutline {
+        /// File path (or path suffix) to outline.
+        file_path: String,
+        /// Workspace root to scan (defaults to the current directory).
+        #[arg(long)]
+        root: Option<PathBuf>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register the `ferrostate` MCP server (`fl state mcp`) across vendor CLI configs.
+    Install {
+        /// Write to user-home vendor configurations instead of the project files.
+        #[arg(long)]
+        user: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -523,6 +767,17 @@ impl<'a> StateEnv<'a> {
         scopes
     }
 
+    /// Default checkpoint scope: the bound project scope for `cwd` when
+    /// configured, else `workspace`.
+    pub fn default_checkpoint_scope(&self) -> StateScope {
+        if let Ok(Some(entry)) = crate::config::bound_entry(&self.cfg.projects, self.cwd)
+            && let Some(slug) = entry.inferred_slug()
+        {
+            return StateScope::Project(slug);
+        }
+        StateScope::Workspace
+    }
+
     pub fn open_for_scope(&self, scope: Option<&StateScope>) -> Result<RedbStore, String> {
         let path = if let Some(db) = self.explicit_db {
             db.to_path_buf()
@@ -819,6 +1074,44 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             }
             Ok(())
         }
+        StateCmd::Search {
+            query,
+            scope,
+            concern,
+            limit,
+            json,
+        } => {
+            let parsed_scope = scope
+                .as_deref()
+                .map(StateScope::from_wire)
+                .transpose()
+                .map_err(|e| e.to_string())?;
+            let parsed_concern: Option<StateConcern> =
+                concern.as_deref().map(parse_concern).transpose()?;
+            let effective_limit = effective_search_limit(limit);
+            let store = env.open_for_scope(parsed_scope.as_ref())?;
+            let entries: Vec<StateEntry> = store
+                .list_state(parsed_scope.as_ref(), parsed_concern)
+                .map_err(|e| e.to_string())?;
+            let (hits, total_hits) = collect_search_hits(
+                &entries,
+                &query,
+                parsed_scope.as_ref(),
+                parsed_concern,
+                effective_limit,
+            );
+            if json {
+                let out = search_result_json(&query, &hits, total_hits);
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else if hits.is_empty() {
+                println!("no hits for `{query}`");
+            } else {
+                for hit in &hits {
+                    println!("{}", format_search_hit(hit));
+                }
+            }
+            Ok(())
+        }
         StateCmd::List {
             scope,
             concern,
@@ -1031,8 +1324,194 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             }
             Ok(())
         }
+        StateCmd::Checkpoint {
+            scope,
+            slug,
+            summary,
+            by,
+            json,
+        } => {
+            let by = if by.trim().is_empty() {
+                "fl".to_string()
+            } else {
+                by
+            };
+            let resolved_scope = match scope.as_deref() {
+                Some(raw) => StateScope::from_wire(raw).map_err(|e| e.to_string())?,
+                None => env.default_checkpoint_scope(),
+            };
+            let store = env.open_for_scope(Some(&resolved_scope))?;
+            let report = create_state_checkpoint(
+                &store,
+                env.cwd,
+                resolved_scope,
+                slug.as_deref(),
+                summary.as_deref(),
+                &by,
+                now_at(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else {
+                println!(
+                    "checkpoint scope={} slug={} branch={} head={} dirty={}",
+                    report.entry.scope.as_wire(),
+                    report.entry.slug,
+                    report.branch,
+                    report.head_sha,
+                    report.dirty_files
+                );
+            }
+            Ok(())
+        }
         StateCmd::Mcp => crate::cmd::state_mcp::run(env),
+        StateCmd::ImportWorkspace {
+            workspace_root,
+            by,
+            json,
+        } => {
+            let root = workspace_root.unwrap_or_else(|| resolve_workspace_root(env.cwd));
+            let scan = scan_workspace_import(&root, &by, now_at());
+            let mut grouped: BTreeMap<StateScope, Vec<UpsertStateArgs>> = BTreeMap::new();
+            for upsert in scan.upserts {
+                grouped
+                    .entry(upsert.scope.clone())
+                    .or_default()
+                    .push(upsert);
+            }
+            let mut report = WorkspaceImportReport {
+                skipped: scan.skipped,
+                ..WorkspaceImportReport::default()
+            };
+            let mut scopes = std::collections::BTreeSet::new();
+            for (scope, upserts) in grouped {
+                let store = match env.open_for_scope(Some(&scope)) {
+                    Ok(store) => store,
+                    Err(e) => {
+                        report.skipped.push(format!(
+                            "{}: failed to open state store: {e}",
+                            scope.as_wire()
+                        ));
+                        continue;
+                    }
+                };
+                let partial = apply_workspace_import(&store, upserts, Vec::new());
+                report.imported_memories += partial.imported_memories;
+                report.imported_handoffs += partial.imported_handoffs;
+                scopes.extend(partial.scopes);
+                report.skipped.extend(partial.skipped);
+            }
+            report.scopes = scopes.into_iter().collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else {
+                println!(
+                    "imported memories={} handoffs={} scopes={}",
+                    report.imported_memories,
+                    report.imported_handoffs,
+                    report.scopes.join(",")
+                );
+                for skipped in &report.skipped {
+                    println!("skipped: {skipped}");
+                }
+            }
+            Ok(())
+        }
+        StateCmd::Index { root, json } => {
+            let root = root.unwrap_or_else(|| env.cwd.to_path_buf());
+            let index = scan_code_index(&root);
+            let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+            let token_gain = record_token_gain_index(
+                &store,
+                index.files_indexed(),
+                index.symbols_indexed(),
+                now_at(),
+                "fl",
+            )
+            .map_err(|e| e.to_string())?;
+            if json {
+                let out = serde_json::json!({
+                    "files_indexed": index.files_indexed(),
+                    "symbols_indexed": index.symbols_indexed(),
+                    "token_gain": token_gain,
+                });
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                println!(
+                    "indexed files={} symbols={}",
+                    index.files_indexed(),
+                    index.symbols_indexed()
+                );
+            }
+            Ok(())
+        }
+        StateCmd::CodeDef {
+            symbol,
+            root,
+            limit,
+            json,
+        } => run_code_query(env, CodeSearchKind::Def, &symbol, root, limit, json),
+        StateCmd::CodeSearch {
+            query,
+            root,
+            limit,
+            json,
+        } => run_code_query(env, CodeSearchKind::Search, &query, root, limit, json),
+        StateCmd::CodeOutline {
+            file_path,
+            root,
+            limit,
+            json,
+        } => run_code_query(env, CodeSearchKind::Outline, &file_path, root, limit, json),
+        StateCmd::Install { user, json } => crate::cmd::vault::run_mcp_install(
+            env.cwd,
+            user,
+            json,
+            "ferrostate",
+            &["state", "mcp"],
+            "`ferrostate` MCP server",
+        )
+        .map(|_| ())
+        .map_err(|(_, msg)| msg),
     }
+}
+
+/// Shared body of `code-def`/`code-search`/`code-outline`: scan `root`
+/// (default `env.cwd`) once, search, record the query's token gain, and
+/// print the shared `CodeSearchResponse` JSON or one line per hit.
+fn run_code_query(
+    env: &StateEnv<'_>,
+    kind: CodeSearchKind,
+    query: &str,
+    root: Option<PathBuf>,
+    limit: Option<usize>,
+    json: bool,
+) -> Result<(), String> {
+    if query.trim().is_empty() {
+        return Err("query must not be blank".to_string());
+    }
+    let root = root.unwrap_or_else(|| env.cwd.to_path_buf());
+    let effective_limit = effective_code_limit(limit, kind);
+    let index = scan_code_index(&root);
+    let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+    let (outcome, token_gain) = search_and_record(&store, &index, kind, query, effective_limit)?;
+    if json {
+        let out = code_search_response_json(
+            query,
+            kind,
+            &outcome.symbols,
+            outcome.tokens_saved_this_query,
+            token_gain,
+        );
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    } else if outcome.symbols.is_empty() {
+        println!("no hits for `{query}`");
+    } else {
+        for hit in &outcome.symbols {
+            println!("{}", format_code_hit(hit));
+        }
+    }
+    Ok(())
 }
 
 fn print_state_entry<S: Handles>(store: &S, entry: &StateEntry, json: bool) {
@@ -1206,6 +1685,82 @@ mod tests {
         // Resolve by handle
         let found_handle = resolve_state_in_store(&store, "1", None, None).unwrap();
         assert_eq!(found_handle.id, e.id);
+    }
+
+    #[test]
+    fn search_surface_ranks_hits_and_reports_total_before_truncation() {
+        let store = MemStore::default();
+        let weak = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "weak-note".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "ranking mention".into(),
+                    body: "ranking appears once here".into(),
+                }),
+                at: now_at(),
+                by: "ferris".into(),
+            })
+            .unwrap();
+        let strong = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "strong-note".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "search design".into(),
+                    body: "bm25 ranking search ranking bm25 ranking".into(),
+                }),
+                at: now_at(),
+                by: "ferris".into(),
+            })
+            .unwrap();
+        // Weakest first: only the ranker can put `strong-note` on top.
+        let entries = vec![weak, strong];
+
+        let (hits, total) = collect_search_hits(&entries, "bm25 ranking", None, None, 1);
+        assert_eq!(total, 2);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.slug, "strong-note");
+        assert!(hits[0].score_millis > 0);
+        assert!(hits[0].estimated_tokens > 0);
+        assert!(!hits[0].snippet.is_empty());
+
+        let value = search_result_json("bm25 ranking", &hits, total);
+        assert_eq!(value["query"], "bm25 ranking");
+        assert_eq!(value["total_hits"], 2);
+        assert_eq!(value["hits"][0]["entry"]["slug"], "strong-note");
+        assert!(value["hits"][0]["score_millis"].is_number());
+        assert!(value["hits"][0]["snippet"].is_string());
+
+        // Limit 0 returns no hits but keeps the full ranked count.
+        let (none, total_zero) = collect_search_hits(&entries, "bm25 ranking", None, None, 0);
+        assert!(none.is_empty());
+        assert_eq!(total_zero, 2);
+
+        // Human line carries score, scope, concern, slug, tokens, snippet.
+        let line = format_search_hit(&hits[0]);
+        assert!(line.contains("workspace"), "{line}");
+        assert!(line.contains("memory"), "{line}");
+        assert!(line.contains("strong-note"), "{line}");
+        assert!(line.contains("tokens="), "{line}");
+        assert!(!line.contains('\n'), "{line}");
+
+        assert_eq!(effective_search_limit(None), DEFAULT_SEARCH_LIMIT);
+        assert_eq!(effective_search_limit(Some(0)), 0);
+        assert_eq!(effective_search_limit(Some(250)), MAX_SEARCH_LIMIT);
+        assert!(parse_concern("bogus").is_err());
     }
 
     #[test]

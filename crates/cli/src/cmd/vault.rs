@@ -473,6 +473,29 @@ fn cmd_mcp(cwd: &Path, connector_filter: Option<&str>) -> Result<i32, (i32, Stri
 }
 
 fn cmd_install(cwd: &Path, user_level: bool, as_json: bool) -> Result<i32, (i32, String)> {
+    run_mcp_install(
+        cwd,
+        user_level,
+        as_json,
+        "ferrogate",
+        &["vault", "mcp"],
+        "unified `ferrogate` MCP server",
+    )
+}
+
+/// Register one MCP server (`server_name`, invoked as `fl <args...>`)
+/// across the vendor CLI configs, project-scoped under `cwd` or at user
+/// level under `$HOME`. `display_label` only feeds the human summary line
+/// (`Registered {display_label} (`<fl> <args>`) in N files.`); the JSON
+/// summary and the written files are the same shape for every caller.
+pub(crate) fn run_mcp_install(
+    cwd: &Path,
+    user_level: bool,
+    as_json: bool,
+    server_name: &str,
+    args: &[&str],
+    display_label: &str,
+) -> Result<i32, (i32, String)> {
     let fl_bin = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(ToOwned::to_owned))
@@ -491,15 +514,22 @@ fn cmd_install(cwd: &Path, user_level: bool, as_json: bool) -> Result<i32, (i32,
             ".config/muse/settings.json",
         ] {
             let path = home.join(rel);
-            upsert_json_mcp_server(&path, &fl_bin)?;
+            upsert_json_mcp_server(&path, &fl_bin, server_name, args)?;
             updated_files.push(path.display().to_string());
         }
         let codex_path = home.join(".codex/config.toml");
-        upsert_toml_mcp_server(&codex_path, "mcp_servers", &fl_bin, false)?;
+        upsert_toml_mcp_server(
+            &codex_path,
+            "mcp_servers",
+            &fl_bin,
+            false,
+            server_name,
+            args,
+        )?;
         updated_files.push(codex_path.display().to_string());
     } else {
         let fl_mcp_path = cwd.join(".fl/mcp.toml");
-        upsert_toml_mcp_server(&fl_mcp_path, "server", &fl_bin, true)?;
+        upsert_toml_mcp_server(&fl_mcp_path, "server", &fl_bin, true, server_name, args)?;
         updated_files.push(fl_mcp_path.display().to_string());
 
         for rel in [
@@ -508,11 +538,18 @@ fn cmd_install(cwd: &Path, user_level: bool, as_json: bool) -> Result<i32, (i32,
             ".muse/settings.json",
         ] {
             let path = cwd.join(rel);
-            upsert_json_mcp_server(&path, &fl_bin)?;
+            upsert_json_mcp_server(&path, &fl_bin, server_name, args)?;
             updated_files.push(path.display().to_string());
         }
         let codex_path = cwd.join(".codex/config.toml");
-        upsert_toml_mcp_server(&codex_path, "mcp_servers", &fl_bin, false)?;
+        upsert_toml_mcp_server(
+            &codex_path,
+            "mcp_servers",
+            &fl_bin,
+            false,
+            server_name,
+            args,
+        )?;
         updated_files.push(codex_path.display().to_string());
     }
 
@@ -528,15 +565,21 @@ fn cmd_install(cwd: &Path, user_level: bool, as_json: bool) -> Result<i32, (i32,
         );
     } else {
         println!(
-            "Registered unified `ferrogate` MCP server (`{} vault mcp`) in {} files.",
+            "Registered {display_label} (`{} {}`) in {} files.",
             fl_bin,
+            args.join(" "),
             updated_files.len()
         );
     }
     Ok(0)
 }
 
-fn upsert_json_mcp_server(path: &Path, fl_bin: &str) -> Result<(), (i32, String)> {
+fn upsert_json_mcp_server(
+    path: &Path,
+    fl_bin: &str,
+    server_name: &str,
+    args: &[&str],
+) -> Result<(), (i32, String)> {
     let mut root_obj = if path.is_file() {
         let raw = fs::read_to_string(path)
             .map_err(|e| (1, format!("failed to read {}: {e}", path.display())))?;
@@ -554,10 +597,10 @@ fn upsert_json_mcp_server(path: &Path, fl_bin: &str) -> Result<(), (i32, String)
         *servers = json!({});
     }
     servers.as_object_mut().expect("object").insert(
-        "ferrogate".to_string(),
+        server_name.to_string(),
         json!({
             "command": fl_bin,
-            "args": ["vault", "mcp"]
+            "args": args
         }),
     );
 
@@ -579,6 +622,8 @@ fn upsert_toml_mcp_server(
     section_key: &str,
     fl_bin: &str,
     include_transport: bool,
+    server_name: &str,
+    args: &[&str],
 ) -> Result<(), (i32, String)> {
     let mut doc = if path.is_file() {
         let raw = fs::read_to_string(path)
@@ -613,15 +658,16 @@ fn upsert_toml_mcp_server(
     );
     server_tbl.insert(
         "args".to_string(),
-        toml::Value::Array(vec![
-            toml::Value::String("vault".to_string()),
-            toml::Value::String("mcp".to_string()),
-        ]),
+        toml::Value::Array(
+            args.iter()
+                .map(|a| toml::Value::String((*a).to_string()))
+                .collect(),
+        ),
     );
     section_entry
         .as_table_mut()
         .expect("table")
-        .insert("ferrogate".to_string(), toml::Value::Table(server_tbl));
+        .insert(server_name.to_string(), toml::Value::Table(server_tbl));
 
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()

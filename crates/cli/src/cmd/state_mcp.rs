@@ -4,9 +4,12 @@
 //! exclusive `redb` file lock is never held while waiting on `stdin`.
 
 use std::io::{BufRead, Write};
+use std::path::PathBuf;
 
 use fl_core::agent::{AgentRole, RegisterAgentArgs, reports_to};
 use fl_core::at::At;
+use fl_core::code_index::{CodeSearchKind, load_token_gain, scan_code_index};
+use fl_core::ferrostate::create_state_checkpoint;
 use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter};
 use fl_core::ids::{Kind, ProjectId, WorkflowRunId};
 use fl_core::state::{
@@ -27,8 +30,10 @@ use std::time::Duration;
 
 use crate::cmd::agent::now_at;
 use crate::cmd::state::{
-    DEFAULT_RENDER_MAX_BYTES, StateEnv, parse_concern, parse_memory_basis, parse_memory_category,
-    parse_merge_mode, render_state_markdown, resolve_state_in_store,
+    DEFAULT_RENDER_MAX_BYTES, StateEnv, code_search_response_json, collect_search_hits,
+    effective_code_limit, effective_search_limit, parse_concern, parse_memory_basis,
+    parse_memory_category, parse_merge_mode, render_state_markdown, resolve_state_in_store,
+    search_and_record, search_result_json,
 };
 use crate::cmd::wire::{
     execute_ack, execute_read, execute_reply, execute_send, inbox_item_to_json, now_millis,
@@ -189,6 +194,228 @@ fn req_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| format!("missing required string argument `{key}`"))
+}
+
+fn opt_str(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(format!("argument `{key}` must be a string")),
+    }
+}
+
+fn parse_search_limit(args: &Value) -> Result<usize, String> {
+    match args.get("limit") {
+        None | Some(Value::Null) => Ok(effective_search_limit(None)),
+        Some(v) => {
+            if let Some(u) = v.as_u64() {
+                let n = usize::try_from(u)
+                    .map_err(|_| "argument `limit` must be a non-negative integer".to_string())?;
+                Ok(effective_search_limit(Some(n)))
+            } else if let Some(f) = v.as_f64() {
+                if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= usize::MAX as f64 {
+                    Ok(effective_search_limit(Some(f as usize)))
+                } else {
+                    Err("argument `limit` must be a non-negative integer".to_string())
+                }
+            } else {
+                Err("argument `limit` must be a number".to_string())
+            }
+        }
+    }
+}
+
+/// Parsed `fl_memory_search` arguments: `(query, scope, concern, limit)`.
+fn parse_search_args(
+    args: &Value,
+) -> Result<(String, Option<StateScope>, Option<StateConcern>, usize), String> {
+    let query = req_str(args, "query")?.to_string();
+    let scope = match opt_str(args, "scope")? {
+        Some(s) => Some(StateScope::from_wire(&s).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let concern = match opt_str(args, "concern")? {
+        Some(s) => Some(parse_concern(&s)?),
+        None => None,
+    };
+    let limit = parse_search_limit(args)?;
+    Ok((query, scope, concern, limit))
+}
+
+/// Parsed `fl_state_checkpoint` arguments, with `scope` left unresolved
+/// (`None` means the caller's default checkpoint scope) and `by`
+/// defaulting to `"fl"`.
+struct CheckpointArgs {
+    scope: Option<StateScope>,
+    slug: Option<String>,
+    summary: Option<String>,
+    by: String,
+}
+
+fn parse_checkpoint_args(args: &Value) -> Result<CheckpointArgs, String> {
+    if !args.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    let scope = match opt_str(args, "scope")? {
+        Some(s) => Some(StateScope::from_wire(&s).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let slug = opt_str(args, "slug")?;
+    if let Some(raw) = slug.as_deref() {
+        fl_core::state::validate_slug(raw).map_err(|e| e.to_string())?;
+    }
+    let summary = opt_str(args, "summary")?;
+    let by = match opt_str(args, "by")? {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => "fl".to_string(),
+    };
+    Ok(CheckpointArgs {
+        scope,
+        slug,
+        summary,
+        by,
+    })
+}
+
+/// Maximum number of subqueries in one `fl_batch_search` call.
+const MAX_BATCH_QUERIES: usize = 20;
+
+fn parse_code_kind(raw: &str) -> Result<CodeSearchKind, String> {
+    CodeSearchKind::from_wire(raw).ok_or_else(|| {
+        format!(
+            "unknown code search kind `{raw}`; expected one of: {}",
+            CodeSearchKind::wire_values()
+        )
+    })
+}
+
+/// Parse an optional code-search `limit` value: per-kind default when
+/// absent/`null`, capped at 1000, explicit `0` preserved. Wrong-typed,
+/// negative, or fractional values are errors (never silently defaulted).
+fn parse_code_limit_value(value: Option<&Value>, kind: CodeSearchKind) -> Result<usize, String> {
+    match value {
+        None | Some(Value::Null) => Ok(effective_code_limit(None, kind)),
+        Some(v) => {
+            if let Some(u) = v.as_u64() {
+                let n = usize::try_from(u)
+                    .map_err(|_| "argument `limit` must be a non-negative integer".to_string())?;
+                Ok(effective_code_limit(Some(n), kind))
+            } else if let Some(f) = v.as_f64() {
+                if f.is_finite() && f >= 0.0 && f.fract() == 0.0 && f <= usize::MAX as f64 {
+                    Ok(effective_code_limit(Some(f as usize), kind))
+                } else {
+                    Err("argument `limit` must be a non-negative integer".to_string())
+                }
+            } else {
+                Err("argument `limit` must be a number".to_string())
+            }
+        }
+    }
+}
+
+fn code_root(env: &StateEnv<'_>, args: &Value) -> Result<PathBuf, String> {
+    match opt_str(args, "root")? {
+        Some(raw) => Ok(PathBuf::from(raw)),
+        None => Ok(env.cwd.to_path_buf()),
+    }
+}
+
+/// One validated code subquery: `(kind, query, limit)`.
+struct CodeQuery {
+    kind: CodeSearchKind,
+    query: String,
+    limit: usize,
+}
+
+fn parse_code_query(args: &Value, kind: CodeSearchKind) -> Result<CodeQuery, String> {
+    if !args.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    let query = req_str(args, "q")?.to_string();
+    if query.trim().is_empty() {
+        return Err("argument `q` must not be blank".to_string());
+    }
+    let limit = parse_code_limit_value(args.get("limit"), kind)?;
+    Ok(CodeQuery { kind, query, limit })
+}
+
+fn parse_batch_queries(args: &Value) -> Result<Vec<CodeQuery>, String> {
+    if !args.is_object() {
+        return Err("arguments must be a JSON object".to_string());
+    }
+    let Some(items) = args.get("queries").and_then(Value::as_array) else {
+        return Err("missing required array argument `queries`".to_string());
+    };
+    if items.len() > MAX_BATCH_QUERIES {
+        return Err(format!(
+            "`queries` holds {} entries; at most {MAX_BATCH_QUERIES} are allowed",
+            items.len()
+        ));
+    }
+    let mut parsed = Vec::with_capacity(items.len());
+    for item in items {
+        if !item.is_object() {
+            return Err("each `queries` entry must be a JSON object".to_string());
+        }
+        let kind = parse_code_kind(req_str(item, "kind")?)?;
+        parsed.push(parse_code_query(item, kind)?);
+    }
+    Ok(parsed)
+}
+
+fn run_code_tool(env: &StateEnv<'_>, kind: CodeSearchKind, args: &Value) -> Result<String, String> {
+    let parsed = parse_code_query(args, kind)?;
+    let root = code_root(env, args)?;
+    let index = scan_code_index(&root);
+    let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+    let (outcome, token_gain) =
+        search_and_record(&store, &index, parsed.kind, &parsed.query, parsed.limit)?;
+    let out = code_search_response_json(
+        &parsed.query,
+        parsed.kind,
+        &outcome.symbols,
+        outcome.tokens_saved_this_query,
+        token_gain,
+    );
+    Ok(serde_json::to_string_pretty(&out).unwrap())
+}
+
+fn run_batch_search_tool(env: &StateEnv<'_>, args: &Value) -> Result<String, String> {
+    // Validate every subquery (and the shared root) before scanning or
+    // recording anything, so a bad entry cannot half-record a batch.
+    let queries = parse_batch_queries(args)?;
+    let root = code_root(env, args)?;
+    let index = scan_code_index(&root);
+    let store = env.open_for_scope(Some(&StateScope::Workspace))?;
+    let mut token_gain = load_token_gain(&store);
+    let mut results = Vec::with_capacity(queries.len());
+    for sub in &queries {
+        let (outcome, updated) =
+            search_and_record(&store, &index, sub.kind, &sub.query, sub.limit)?;
+        token_gain = updated;
+        results.push(json!({
+            "query": sub.query,
+            "kind": sub.kind.as_wire(),
+            "symbols": outcome.symbols,
+            "tokens_saved_this_query": outcome.tokens_saved_this_query,
+        }));
+    }
+    Ok(serde_json::to_string_pretty(&json!({
+        "results": results,
+        "token_gain": token_gain,
+    }))
+    .unwrap())
+}
+
+fn memory_search_json(
+    entries: &[StateEntry],
+    query: &str,
+    scope: Option<&StateScope>,
+    concern: Option<StateConcern>,
+    limit: usize,
+) -> String {
+    let (hits, total_hits) = collect_search_hits(entries, query, scope, concern, limit);
+    serde_json::to_string_pretty(&search_result_json(query, &hits, total_hits)).unwrap()
 }
 
 fn open_workflow_store(
@@ -481,6 +708,37 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
                 })
                 .collect();
             Ok(serde_json::to_string_pretty(&entries).unwrap())
+        }
+        "fl_state_checkpoint" => {
+            let parsed = parse_checkpoint_args(args)?;
+            let scope = parsed
+                .scope
+                .unwrap_or_else(|| env.default_checkpoint_scope());
+            let store = env.open_for_scope(Some(&scope))?;
+            let report = create_state_checkpoint(
+                &store,
+                env.cwd,
+                scope,
+                parsed.slug.as_deref(),
+                parsed.summary.as_deref(),
+                &parsed.by,
+                now_at(),
+            )?;
+            Ok(serde_json::to_string_pretty(&report).unwrap())
+        }
+        "fl_memory_search" => {
+            let (query, parsed_scope, parsed_concern, limit) = parse_search_args(args)?;
+            let store = env.open_for_scope(parsed_scope.as_ref())?;
+            let entries: Vec<StateEntry> = store
+                .list_state(parsed_scope.as_ref(), parsed_concern)
+                .map_err(|e| e.to_string())?;
+            Ok(memory_search_json(
+                &entries,
+                &query,
+                parsed_scope.as_ref(),
+                parsed_concern,
+                limit,
+            ))
         }
         "state_set_memory" => {
             let scope =
@@ -1068,6 +1326,10 @@ fn dispatch_tool(env: &StateEnv<'_>, name: &str, args: &Value) -> Result<String,
             }))
             .unwrap())
         }
+        "fl_code_def" => run_code_tool(env, CodeSearchKind::Def, args),
+        "fl_code_search" => run_code_tool(env, CodeSearchKind::Search, args),
+        "fl_code_outline" => run_code_tool(env, CodeSearchKind::Outline, args),
+        "fl_batch_search" => run_batch_search_tool(env, args),
         other => Err(format!("unknown tool `{other}`")),
     }
 }
@@ -1139,6 +1401,33 @@ fn tool_definitions() -> Value {
                     "concern": { "type": "string" },
                     "category": { "type": "string" },
                     "include_retired": { "type": "boolean" }
+                }
+            }
+        },
+        {
+            "name": "fl_state_checkpoint",
+            "description": "Record an automatic git session checkpoint (branch, HEAD, dirty files) as a Handoff state entry. Returns {entry, branch, head_sha, dirty_files}.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string" },
+                    "slug": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "by": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "fl_memory_search",
+            "description": "Search state entries with BM25 ranking. Returns {query, hits, total_hits} where total_hits is the full ranked count before limit truncation.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "scope": { "type": "string" },
+                    "concern": { "type": "string" },
+                    "limit": { "type": "number" }
                 }
             }
         },
@@ -1348,6 +1637,288 @@ fn tool_definitions() -> Value {
                     "by": { "type": "string" }
                 }
             }
+        },
+        {
+            "name": "fl_code_def",
+            "description": "Find symbol definitions by exact/prefix name in the structural code index. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                    "q": { "type": "string" },
+                    "limit": { "type": "number" },
+                    "root": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "fl_code_search",
+            "description": "Ranked text search over declarations and lines in the structural code index. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                    "q": { "type": "string" },
+                    "limit": { "type": "number" },
+                    "root": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "fl_code_outline",
+            "description": "List the symbols declared in a file (q is a file path or suffix) in source order. Returns {query, kind, symbols, tokens_saved_this_query, token_gain}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["q"],
+                "properties": {
+                    "q": { "type": "string" },
+                    "limit": { "type": "number" },
+                    "root": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "fl_batch_search",
+            "description": "Run up to 20 code subqueries ({kind: def|search|outline, q, limit?}) over one scan. Returns {results: [{query, kind, symbols, tokens_saved_this_query}], token_gain}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["queries"],
+                "properties": {
+                    "queries": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["kind", "q"],
+                            "properties": {
+                                "kind": { "type": "string" },
+                                "q": { "type": "string" },
+                                "limit": { "type": "number" }
+                            }
+                        }
+                    },
+                    "root": { "type": "string" }
+                }
+            }
         }
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fl_core::MemStore;
+
+    fn seeded_entries() -> Vec<StateEntry> {
+        let store = MemStore::default();
+        let weak = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "weak-note".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "ranking mention".into(),
+                    body: "ranking appears once here".into(),
+                }),
+                at: now_at(),
+                by: "ferris".into(),
+            })
+            .unwrap();
+        let strong = store
+            .upsert_state(UpsertStateArgs {
+                scope: StateScope::Workspace,
+                slug: "strong-note".into(),
+                sensitivity: SensitivityPatch::Inherit,
+                payload: StatePayload::Memory(MemoryEntry {
+                    category: MemoryCategory::Note,
+                    basis: MemoryBasis::Inference,
+                    lifecycle: MemoryLifecycle::Active,
+                    superseded_by: None,
+                    pinned: false,
+                    summary: "search design".into(),
+                    body: "bm25 ranking search ranking bm25 ranking".into(),
+                }),
+                at: now_at(),
+                by: "ferris".into(),
+            })
+            .unwrap();
+        vec![weak, strong]
+    }
+
+    #[test]
+    fn fl_memory_search_returns_ranked_json_shape() {
+        let entries = seeded_entries();
+        let args = json!({ "query": "bm25 ranking", "limit": 1 });
+        let (query, scope, concern, limit) = parse_search_args(&args).unwrap();
+        let text = memory_search_json(&entries, &query, scope.as_ref(), concern, limit);
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["query"], "bm25 ranking");
+        assert_eq!(value["total_hits"], 2);
+        assert_eq!(value["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(value["hits"][0]["entry"]["slug"], "strong-note");
+        assert!(value["hits"][0]["score_millis"].as_u64().unwrap() > 0);
+
+        // Tool is advertised.
+        let defs = tool_definitions();
+        assert!(
+            defs.as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["name"] == "fl_memory_search"),
+            "fl_memory_search missing from tool_definitions"
+        );
+    }
+
+    #[test]
+    fn fl_memory_search_rejects_invalid_types_and_values() {
+        assert!(parse_search_args(&json!({})).is_err(), "missing query");
+        assert!(
+            parse_search_args(&json!({ "query": "x", "scope": 3 })).is_err(),
+            "non-string scope"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "scope": "bogus:1" })).is_err(),
+            "invalid scope value"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "concern": true })).is_err(),
+            "non-string concern"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "concern": "bogus" })).is_err(),
+            "invalid concern value"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "limit": "5" })).is_err(),
+            "string limit"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "limit": -1 })).is_err(),
+            "negative limit"
+        );
+        assert!(
+            parse_search_args(&json!({ "query": "x", "limit": 1.5 })).is_err(),
+            "fractional limit"
+        );
+        let (_, _, _, default_limit) = parse_search_args(&json!({ "query": "x" })).unwrap();
+        assert_eq!(default_limit, 10);
+        let (_, _, _, capped) = parse_search_args(&json!({ "query": "x", "limit": 500 })).unwrap();
+        assert_eq!(capped, 100);
+        let (_, _, _, zero) = parse_search_args(&json!({ "query": "x", "limit": 0 })).unwrap();
+        assert_eq!(zero, 0);
+    }
+
+    #[test]
+    fn fl_state_checkpoint_args_default_and_reject_bad_types() {
+        let parsed = parse_checkpoint_args(&json!({})).unwrap();
+        assert!(parsed.scope.is_none());
+        assert!(parsed.slug.is_none());
+        assert!(parsed.summary.is_none());
+        assert_eq!(parsed.by, "fl");
+
+        let parsed = parse_checkpoint_args(
+            &json!({ "scope": "workspace", "slug": "snap-1", "summary": "hi", "by": "tester" }),
+        )
+        .unwrap();
+        assert_eq!(parsed.scope, Some(StateScope::Workspace));
+        assert_eq!(parsed.slug.as_deref(), Some("snap-1"));
+        assert_eq!(parsed.summary.as_deref(), Some("hi"));
+        assert_eq!(parsed.by, "tester");
+
+        for bad in [
+            json!({ "scope": 3 }),
+            json!({ "scope": "bogus:1" }),
+            json!({ "slug": 4 }),
+            json!({ "slug": "1bad slug!" }),
+            json!({ "summary": true }),
+            json!({ "by": 5 }),
+            json!(["nope"]),
+        ] {
+            assert!(parse_checkpoint_args(&bad).is_err(), "{bad}");
+        }
+
+        assert!(
+            tool_definitions()
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["name"] == "fl_state_checkpoint"),
+            "fl_state_checkpoint missing from tool_definitions"
+        );
+    }
+
+    #[test]
+    fn code_tools_are_advertised_and_args_validate() {
+        let defs = tool_definitions();
+        let names: Vec<&str> = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|d| d["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 24, "{names:?}");
+        for tool in [
+            "fl_code_def",
+            "fl_code_search",
+            "fl_code_outline",
+            "fl_batch_search",
+        ] {
+            assert!(names.contains(&tool), "{tool} missing: {names:?}");
+        }
+
+        let parsed = parse_code_query(&json!({ "q": "widget" }), CodeSearchKind::Def).unwrap();
+        assert_eq!(parsed.limit, 50);
+        let parsed =
+            parse_code_query(&json!({ "q": "src/lib.rs" }), CodeSearchKind::Outline).unwrap();
+        assert_eq!(parsed.limit, 500);
+        let parsed =
+            parse_code_query(&json!({ "q": "x", "limit": 5000 }), CodeSearchKind::Search).unwrap();
+        assert_eq!(parsed.limit, 1000);
+        let parsed =
+            parse_code_query(&json!({ "q": "x", "limit": 0 }), CodeSearchKind::Search).unwrap();
+        assert_eq!(parsed.limit, 0);
+
+        for bad in [
+            json!({}),
+            json!({ "q": 3 }),
+            json!({ "q": "  " }),
+            json!({ "q": "x", "limit": "5" }),
+            json!({ "q": "x", "limit": -1 }),
+            json!({ "q": "x", "limit": 1.5 }),
+            json!(["nope"]),
+        ] {
+            assert!(
+                parse_code_query(&bad, CodeSearchKind::Def).is_err(),
+                "{bad}"
+            );
+        }
+
+        let batch = parse_batch_queries(
+            &json!({ "queries": [{ "kind": "def", "q": "a" }, { "kind": "outline", "q": "b.rs", "limit": 5 }] }),
+        )
+        .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].kind, CodeSearchKind::Def);
+        assert_eq!(batch[1].limit, 5);
+        for bad in [
+            json!({}),
+            json!({ "queries": "x" }),
+            json!({ "queries": [{ "kind": "bogus", "q": "a" }] }),
+            json!({ "queries": [{ "kind": 1, "q": "a" }] }),
+            json!({ "queries": [{ "kind": "def", "q": "" }] }),
+            json!({ "queries": [{ "kind": "def" }] }),
+            json!({ "queries": ["nope"] }),
+        ] {
+            assert!(parse_batch_queries(&bad).is_err(), "{bad}");
+        }
+        let too_many = json!({
+            "queries": (0..21).map(|_| json!({ "kind": "def", "q": "a" })).collect::<Vec<_>>()
+        });
+        assert!(parse_batch_queries(&too_many).is_err());
+        assert!(parse_code_kind("bogus").is_err());
+    }
 }
