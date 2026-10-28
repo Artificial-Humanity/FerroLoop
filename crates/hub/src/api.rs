@@ -2476,16 +2476,13 @@ pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
                 &item.by,
                 &item.effective_body,
             );
-            if delivery_res.is_ok() {
-                state.mark_session_in_flight(store, &session_id);
-            }
-            let now_busy = delivery_res.is_ok() || state.is_session_busy(store, &session_id);
+            state.mark_session_in_flight(store, &session_id);
             let sent_data = json!({
                 "session_id": item.session_id,
                 "persona": item.persona,
                 "status": "sent",
                 "queued": false,
-                "is_busy": now_busy,
+                "is_busy": true,
                 "delivered": delivery_res.is_ok(),
                 "delivery_error": delivery_res.as_ref().err(),
                 "prompt_id": item.id,
@@ -2502,7 +2499,7 @@ pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
                 json!({
                     "session_id": item.session_id,
                     "persona": item.persona,
-                    "is_busy": now_busy,
+                    "is_busy": true,
                     "queue": queue,
                 }),
             );
@@ -2531,17 +2528,14 @@ fn handle_post_queued_prompt_send_now(
         &item.by,
         &item.effective_body,
     );
-    if delivery_res.is_ok() {
-        state.mark_session_in_flight(store, &canonical_id);
-    }
-    let now_busy = delivery_res.is_ok() || state.is_session_busy(store, &canonical_id);
+    state.mark_session_in_flight(store, &canonical_id);
 
     let data = json!({
         "session_id": canonical_id,
         "persona": item.persona.clone().or(target_persona.clone()),
         "status": "sent",
         "queued": false,
-        "is_busy": now_busy,
+        "is_busy": true,
         "delivered": delivery_res.is_ok(),
         "delivery_error": delivery_res.as_ref().err(),
         "prompt_id": prompt_id,
@@ -2558,7 +2552,7 @@ fn handle_post_queued_prompt_send_now(
         json!({
             "session_id": canonical_id,
             "persona": item.persona.or(target_persona),
-            "is_busy": now_busy,
+            "is_busy": true,
             "queue": queue,
         }),
     );
@@ -2823,10 +2817,7 @@ fn handle_post_session_prompt(
         &sender_name,
         &effective_body,
     );
-    if delivery_res.is_ok() {
-        state.mark_session_in_flight(store, &canonical_session_id);
-    }
-    let now_busy = delivery_res.is_ok() || state.is_session_busy(store, &canonical_session_id);
+    state.mark_session_in_flight(store, &canonical_session_id);
     let queue = state.session_queue(&canonical_session_id);
 
     let data = json!({
@@ -2834,7 +2825,7 @@ fn handle_post_session_prompt(
         "persona": target_persona,
         "status": "sent",
         "queued": false,
-        "is_busy": now_busy,
+        "is_busy": true,
         "delivered": delivery_res.is_ok(),
         "delivery_error": delivery_res.as_ref().err(),
         "prompt": prompt_text,
