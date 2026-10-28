@@ -635,7 +635,7 @@ fn search_snippet(text: &str, summary: &str, matched_terms: &[String]) -> String
 /// Rank `entries` against `query` with field-weighted BM25 (spec §2):
 /// slug weight 3, summary weight 2, body weight 1; `k1 = 1.2`, `b = 0.75`.
 /// Pinned memories score x1.5, non-active memories x0.25. Only entries
-/// with score > 0 are returned, sorted by `score_millis` desc, then
+/// with score > 0 are returned, sorted by raw score desc, then
 /// `updated_at` desc, then slug asc, capped at `limit`.
 pub fn search_state_entries(
     entries: &[StateEntry],
@@ -721,7 +721,10 @@ pub fn search_state_entries(
         idf.insert(term.clone(), (1.0 + (total - df + 0.5) / (df + 0.5)).ln());
     }
 
-    let mut hits: Vec<StateSearchHit> = Vec::new();
+    // Keep the raw score beside each hit until after sorting: distinct
+    // positive scores below one milli apart would otherwise truncate to
+    // equal `score_millis` and fall through to the tie-breaks.
+    let mut hits: Vec<(f64, StateSearchHit)> = Vec::new();
     for doc in docs {
         let matched_terms: Vec<String> = query_terms
             .iter()
@@ -750,29 +753,33 @@ pub fn search_state_entries(
         if !score.is_finite() || score <= 0.0 {
             continue;
         }
-        hits.push(StateSearchHit {
-            snippet: search_snippet(&doc.searchable_text, &doc.summary, &matched_terms),
-            estimated_tokens: estimate_tokens(&doc.searchable_text),
-            entry: doc.entry,
-            score_millis: (score * 1000.0) as u64,
-            matched_terms,
-        });
+        hits.push((
+            score,
+            StateSearchHit {
+                snippet: search_snippet(&doc.searchable_text, &doc.summary, &matched_terms),
+                estimated_tokens: estimate_tokens(&doc.searchable_text),
+                entry: doc.entry,
+                score_millis: (score * 1000.0) as u64,
+                matched_terms,
+            },
+        ));
     }
 
     hits.sort_by(|a, b| {
-        b.score_millis
-            .cmp(&a.score_millis)
+        // `score` is finite and positive (checked above), so total_cmp is
+        // a safe descending raw-score order here.
+        b.0.total_cmp(&a.0)
             .then_with(|| {
-                b.entry
+                b.1.entry
                     .updated_at
                     .unix_millis()
-                    .cmp(&a.entry.updated_at.unix_millis())
+                    .cmp(&a.1.entry.updated_at.unix_millis())
             })
-            .then_with(|| a.entry.slug.cmp(&b.entry.slug))
-            .then_with(|| a.entry.id.as_str().cmp(b.entry.id.as_str()))
+            .then_with(|| a.1.entry.slug.cmp(&b.1.entry.slug))
+            .then_with(|| a.1.entry.id.as_str().cmp(b.1.entry.id.as_str()))
     });
     hits.truncate(limit);
-    hits
+    hits.into_iter().map(|(_, hit)| hit).collect()
 }
 
 #[cfg(test)]
@@ -830,6 +837,24 @@ mod tests {
                 blockers: vec![],
                 next_steps: vec![],
                 notes: Some(notes.to_string()),
+            }),
+            head_revision: RevisionId(seq_iri(1000 + n)),
+            updated_at: At::from_unix_millis(1_000),
+            by: "test".to_string(),
+        }
+    }
+
+    fn runtime_entry(n: u64, slug: &str, value: Value) -> StateEntry {
+        StateEntry {
+            id: StateId(seq_iri(n)),
+            scope: StateScope::Workspace,
+            concern: StateConcern::Runtime,
+            slug: slug.to_string(),
+            sensitive: false,
+            ever_sensitive: false,
+            payload: StatePayload::Runtime(RuntimeEntry {
+                value,
+                merge_mode: MergeMode::LastWriter,
             }),
             head_revision: RevisionId(seq_iri(1000 + n)),
             updated_at: At::from_unix_millis(1_000),
@@ -1205,5 +1230,138 @@ mod tests {
         let hits = search_state_entries(&[first, second], "lapis", None, None, 10);
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].entry.slug, "alpha-note", "slug asc wins full tie");
+    }
+
+    #[test]
+    fn search_runtime_json_value_is_searchable() {
+        let entry = runtime_entry(
+            19,
+            "runtime-state",
+            serde_json::json!({"mode": "quixoticroot", "count": 3}),
+        );
+        let hits = search_state_entries(&[entry], "quixoticroot", None, None, 10);
+        assert_eq!(hits.len(), 1, "runtime JSON term must hit: {hits:?}");
+        assert_eq!(hits[0].entry.slug, "runtime-state");
+        assert_eq!(hits[0].entry.concern, StateConcern::Runtime);
+        assert_eq!(hits[0].matched_terms, vec!["quixoticroot"]);
+        assert!(hits[0].snippet.contains("quixoticroot"));
+    }
+
+    #[test]
+    fn search_handoff_list_fields_are_searchable() {
+        let mut entry = handoff_entry(20, "handoff-lists", "plain summary", "plain notes");
+        if let StatePayload::Handoff(h) = &mut entry.payload {
+            h.shipped = vec!["shippedterm done".to_string()];
+            h.in_flight = vec!["flightterm ongoing".to_string()];
+            h.blockers = vec!["blockerterm waiting".to_string()];
+            h.next_steps = vec!["nextterm planned".to_string()];
+            h.notes = None;
+        } else {
+            panic!("expected handoff payload");
+        }
+        for term in ["shippedterm", "flightterm", "blockerterm", "nextterm"] {
+            let hits = search_state_entries(std::slice::from_ref(&entry), term, None, None, 10);
+            assert_eq!(hits.len(), 1, "handoff list term {term} must hit: {hits:?}");
+            assert_eq!(hits[0].entry.slug, "handoff-lists");
+            assert_eq!(hits[0].matched_terms, vec![term]);
+        }
+    }
+
+    #[test]
+    fn search_summary_match_outranks_body_match_with_same_counts() {
+        let body_hit = memory_entry(
+            21,
+            "alpha-note",
+            "plain shared words",
+            "weightsum body words here",
+            false,
+            MemoryLifecycle::Active,
+            2_000,
+        );
+        let summary_hit = memory_entry(
+            22,
+            "zulu-note",
+            "weightsum shared words",
+            "shared body words here",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let hits = search_state_entries(&[body_hit, summary_hit], "weightsum", None, None, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].entry.slug, "zulu-note",
+            "summary-weighted hit must rank above body-only hit"
+        );
+        assert_eq!(hits[1].entry.slug, "alpha-note");
+        assert!(hits[0].score_millis > hits[1].score_millis);
+    }
+
+    #[test]
+    fn search_limit_truncation_keeps_top_hit_only() {
+        let weak = memory_entry(
+            23,
+            "weak-note",
+            "general summary",
+            "limitprobe appears once",
+            false,
+            MemoryLifecycle::Active,
+            2_000,
+        );
+        let strong = memory_entry(
+            24,
+            "strong-note",
+            "general summary",
+            "limitprobe limitprobe limitprobe limitprobe",
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let entries = vec![weak, strong];
+        let all = search_state_entries(&entries, "limitprobe", None, None, 10);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].entry.slug, "strong-note");
+        let limited = search_state_entries(&entries, "limitprobe", None, None, 1);
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].entry.slug, "strong-note", "limit keeps top hit");
+        assert_eq!(limited[0].score_millis, all[0].score_millis);
+    }
+
+    #[test]
+    fn search_sorts_by_raw_score_not_truncated_millis() {
+        // Scores differ only by one filler token of length normalization,
+        // so both truncate to the same score_millis. The shorter (raw
+        // higher) doc is older and sorts later by slug, so only raw-score
+        // ordering puts it first.
+        let shorter_body = format!("{}lapiscore", "filler ".repeat(500));
+        let longer_body = format!("{}lapiscore", "filler ".repeat(501));
+        let longer = memory_entry(
+            25,
+            "alpha-note",
+            "shared summary words",
+            &longer_body,
+            false,
+            MemoryLifecycle::Active,
+            2_000,
+        );
+        let shorter = memory_entry(
+            26,
+            "zulu-note",
+            "shared summary words",
+            &shorter_body,
+            false,
+            MemoryLifecycle::Active,
+            1_000,
+        );
+        let hits = search_state_entries(&[longer, shorter], "lapiscore", None, None, 10);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].score_millis, hits[1].score_millis,
+            "setup must truncate to equal millis: {hits:?}"
+        );
+        assert_eq!(
+            hits[0].entry.slug, "zulu-note",
+            "raw higher score must win despite equal millis and losing tie-breaks"
+        );
     }
 }
