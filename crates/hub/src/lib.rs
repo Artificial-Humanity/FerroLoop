@@ -653,6 +653,80 @@ mod tests {
     }
 
     #[test]
+    fn state_import_workspace_is_owner_only_with_exact_three_field_shape() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let root = tmp.path();
+        let mem = root.join(".agents/memory/keep-this.md");
+        fs::create_dir_all(mem.parent().unwrap()).unwrap();
+        fs::write(
+            &mem,
+            "---\ndescription: Keep this rule\nmetadata:\n  type: feedback\n---\nBody text.\n",
+        )
+        .unwrap();
+        let state_md = root.join("Notes/Demo.io/STATE.md");
+        fs::create_dir_all(state_md.parent().unwrap()).unwrap();
+        fs::write(
+            &state_md,
+            "# Demo State\n\n## Shipped\n\n- Did a thing\n\n## Next steps\n\n- Do the next thing\n",
+        )
+        .unwrap();
+
+        // Peer is refused before anything is written.
+        let peer_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/import-workspace")
+                .with_header("Authorization", ["Bearer ", "peer", "-tok-secret"].concat())
+                .with_json_body(&json!({ "workspace_root": root.to_string_lossy() })),
+        );
+        assert_eq!(peer_resp.status, 403);
+
+        // Owner import returns exactly the three documented fields.
+        let owner_resp = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/state/import-workspace")
+                .with_header(
+                    "Authorization",
+                    ["Bearer ", "owner", "-tok-secret"].concat(),
+                )
+                .with_json_body(
+                    &json!({ "workspace_root": root.to_string_lossy(), "by": "tester" }),
+                ),
+        );
+        assert_eq!(
+            owner_resp.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&owner_resp.body)
+        );
+        let body = owner_resp.json_value().unwrap();
+        let obj = body.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "{body}");
+        assert_eq!(obj["imported_memories"], 1);
+        assert_eq!(obj["imported_handoffs"], 1);
+        assert_eq!(obj["scopes"], json!(["project:demo-io", "workspace"]));
+        assert!(!obj.contains_key("skipped"));
+
+        // Wrong-typed fields and non-object bodies are 400s (owner).
+        for bad in [
+            json!({ "workspace_root": 42 }),
+            json!({ "by": true }),
+            json!(["nope"]),
+        ] {
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/state/import-workspace")
+                    .with_header(
+                        "Authorization",
+                        ["Bearer ", "owner", "-tok-secret"].concat(),
+                    )
+                    .with_json_body(&bad),
+            );
+            assert_eq!(resp.status, 400, "{bad}");
+        }
+    }
+
+    #[test]
     fn static_ferrodeck_serving_spa_fallback_and_traversal_rejection() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);

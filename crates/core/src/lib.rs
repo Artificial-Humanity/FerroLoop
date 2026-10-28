@@ -12,6 +12,7 @@ pub mod decision;
 pub mod escalate;
 pub mod escalation;
 pub mod fault;
+pub mod ferrostate;
 pub mod ferrowire;
 pub mod finding;
 pub mod ids;
@@ -47,6 +48,10 @@ pub use decision::{Decision, DecisionKind, Flushed, LeftLocal, Outcome, Transiti
 pub use escalate::Prepared;
 pub use escalation::{EscalationFault, Escalations, Mark, Outgoing, Provenance, Tombstone};
 pub use fault::LedgerFault;
+pub use ferrostate::{
+    WorkspaceImportReport, WorkspaceImportScan, apply_workspace_import, derive_import_slug,
+    resolve_workspace_root, scan_workspace_import,
+};
 pub use ferrowire::{
     DeliveryReceipt, DeliveryStatus, MAX_SUBJECT_BYTES, MAX_WIRE_BODY_BYTES, MessageKind,
     MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter, WireInboxItem, WireMessage,

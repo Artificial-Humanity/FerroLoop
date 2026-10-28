@@ -10,6 +10,7 @@ use fl_core::agent::AgentStatus;
 use fl_core::arch::{
     ArchitectureModel, DEFAULT_ARCH_MANIFEST_PATH, export_likec4_dsl, validate_architecture_model,
 };
+use fl_core::ferrostate::{apply_workspace_import, resolve_workspace_root, scan_workspace_import};
 use fl_core::ferrowire::{
     DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter,
     validate_sender_name,
@@ -406,6 +407,9 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET", "/api/v1/state") => handle_get_state(&store, &authority, req),
         ("GET", "/api/v1/state/search") => handle_get_state_search(&store, &authority, req),
         ("POST", "/api/v1/state") => handle_post_state(&store, &authority, req),
+        ("POST", "/api/v1/state/import-workspace") => {
+            handle_post_state_import_workspace(state, &store, &authority, req)
+        }
         ("GET", "/api/v1/stats") => handle_get_stats(&store, req),
         ("GET", "/api/v1/architecture") => handle_get_architecture(state, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
@@ -1278,6 +1282,66 @@ fn handle_post_state(
         Ok(entry) => HttpResponse::json(200, json!({ "entry": entry })),
         Err(e) => HttpResponse::json(400, json!({ "error": e.to_string() })),
     }
+}
+
+fn handle_post_state_import_workspace(
+    state: &HubState,
+    store: &RedbStore,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "owner authority required to import workspace state" }),
+        );
+    }
+    let raw: Value = if req.body.iter().all(u8::is_ascii_whitespace) {
+        json!({})
+    } else {
+        match req.json() {
+            Ok(v) => v,
+            Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+        }
+    };
+    let Some(obj) = raw.as_object() else {
+        return HttpResponse::json(400, json!({ "error": "expected JSON object" }));
+    };
+    let optional_str = |key: &str| -> Result<Option<String>, HttpResponse> {
+        match obj.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => Err(HttpResponse::json(
+                400,
+                json!({ "error": format!("`{key}` must be a string") }),
+            )),
+        }
+    };
+    let workspace_root = match optional_str("workspace_root") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let by_field = match optional_str("by") {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let root = workspace_root
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| resolve_workspace_root(&state.config.repo_root));
+    let by = by_field
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| authority.actor_name().to_string());
+    let scan = scan_workspace_import(&root, &by, stamp::now());
+    let report = apply_workspace_import(store, scan.upserts, scan.skipped);
+    HttpResponse::json(
+        200,
+        json!({
+            "imported_memories": report.imported_memories,
+            "imported_handoffs": report.imported_handoffs,
+            "scopes": report.scopes,
+        }),
+    )
 }
 
 fn handle_get_stats(store: &RedbStore, _req: &HttpRequest) -> HttpResponse {

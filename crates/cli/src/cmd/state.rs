@@ -1,7 +1,11 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::Subcommand;
 use fl_core::agent::{AgentRecord, AgentStatus, AreaRecord, reports_to};
+use fl_core::ferrostate::{
+    WorkspaceImportReport, apply_workspace_import, resolve_workspace_root, scan_workspace_import,
+};
 use fl_core::ids::{Kind, RevisionId, StateId};
 use fl_core::iri::Iri;
 use fl_core::state::{
@@ -192,6 +196,15 @@ pub enum StateCmd {
     },
     /// Run the newline-delimited JSON-RPC 2.0 MCP server over stdio.
     Mcp,
+    /// One-shot import of `.agents/memory/*.md` and `Notes/*/STATE.md`.
+    ImportWorkspace {
+        #[arg(long = "workspace-root")]
+        workspace_root: Option<PathBuf>,
+        #[arg(long, default_value = "fl")]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1147,6 +1160,49 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
             Ok(())
         }
         StateCmd::Mcp => crate::cmd::state_mcp::run(env),
+        StateCmd::ImportWorkspace {
+            workspace_root,
+            by,
+            json,
+        } => {
+            let root = workspace_root.unwrap_or_else(|| resolve_workspace_root(env.cwd));
+            let scan = scan_workspace_import(&root, &by, now_at());
+            let mut grouped: BTreeMap<StateScope, Vec<UpsertStateArgs>> = BTreeMap::new();
+            for upsert in scan.upserts {
+                grouped
+                    .entry(upsert.scope.clone())
+                    .or_default()
+                    .push(upsert);
+            }
+            let mut report = WorkspaceImportReport {
+                skipped: scan.skipped,
+                ..WorkspaceImportReport::default()
+            };
+            let mut scopes = std::collections::BTreeSet::new();
+            for (scope, upserts) in grouped {
+                let store = env.open_for_scope(Some(&scope))?;
+                let partial = apply_workspace_import(&store, upserts, Vec::new());
+                report.imported_memories += partial.imported_memories;
+                report.imported_handoffs += partial.imported_handoffs;
+                scopes.extend(partial.scopes);
+                report.skipped.extend(partial.skipped);
+            }
+            report.scopes = scopes.into_iter().collect();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+            } else {
+                println!(
+                    "imported memories={} handoffs={} scopes={}",
+                    report.imported_memories,
+                    report.imported_handoffs,
+                    report.scopes.join(",")
+                );
+                for skipped in &report.skipped {
+                    println!("skipped: {skipped}");
+                }
+            }
+            Ok(())
+        }
     }
 }
 
