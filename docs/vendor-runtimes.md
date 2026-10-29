@@ -75,6 +75,14 @@ when both are set.
 FerroLoop sends with `agy agentapi send-message` to the language-server HTTP endpoint, using
 the CSRF token and listen address from the route.
 
+For `Clear` and `Reforge`, FerroLoop calls
+`POST /exa.language_server_pb.LanguageServerService/RevertToCascadeStep` with `stepIndex` `0`,
+`conversationOnly` `true`, and `overrideConfig.plannerConfig.planModel`
+(`MODEL_PLACEHOLDER_M418`, or `defaultOverrideModelConfig.modelOrAlias.model` from
+`GetCascadeModelConfigData` if the language server rejects the default placeholder), then
+truncates `transcript.jsonl` and `transcript_full.jsonl` to retain only line 1 when its
+`step_index` is `0`.
+
 ## Claude Code 2.1.312
 
 Home: `~/.claude/`.
