@@ -512,45 +512,76 @@ impl RouteTable {
     }
 
     fn discover_codex_routes(&mut self, home: &Path, at: &At) {
-        let index_path = home.join(".codex").join("session_index.jsonl");
-        let Ok(text) = fs::read_to_string(&index_path) else {
-            return;
-        };
-        for line in text.lines() {
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+        let codex_dir = home.join(".codex");
+        let index_path = codex_dir.join("session_index.jsonl");
+        if let Ok(text) = fs::read_to_string(&index_path) {
+            for line in text.lines() {
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let Some(thread_id) = val
+                    .get("id")
+                    .or_else(|| val.get("thread_id"))
+                    .and_then(|v| v.as_str())
+                else {
+                    continue;
+                };
+                let persona_raw = val
+                    .get("agentName")
+                    .or_else(|| val.get("persona"))
+                    .or_else(|| val.get("thread_name"))
+                    .or_else(|| val.get("title"))
+                    .and_then(|v| v.as_str());
+                let Some(persona) = persona_raw.and_then(normalize_persona) else {
+                    continue;
+                };
+                if matches!(
+                    persona.as_str(),
+                    "exit"
+                        | "quit"
+                        | "help"
+                        | "clear"
+                        | "status"
+                        | "compact"
+                        | "unknown"
+                        | "default"
+                ) {
+                    continue;
+                }
+                let cwd = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
+                self.upsert(
+                    &persona,
+                    VendorRoute::Codex {
+                        thread_id: thread_id.to_string(),
+                        cwd,
+                    },
+                    at.clone(),
+                );
+            }
+        }
+
+        let mut rollout_files = Vec::new();
+        collect_codex_rollout_files(&codex_dir.join("sessions"), 0, &mut rollout_files);
+        let mut candidates: Vec<(u64, String, String, Option<PathBuf>)> = Vec::new();
+        for path in rollout_files {
+            let Some(persona) = scan_transcript_for_persona(&path, 120) else {
                 continue;
             };
-            let Some(thread_id) = val
-                .get("id")
-                .or_else(|| val.get("thread_id"))
-                .and_then(|v| v.as_str())
-            else {
-                continue;
-            };
-            let persona_raw = val
-                .get("agentName")
-                .or_else(|| val.get("persona"))
-                .or_else(|| val.get("thread_name"))
-                .or_else(|| val.get("title"))
-                .and_then(|v| v.as_str());
-            let Some(persona) = persona_raw.and_then(normalize_persona) else {
-                continue;
-            };
-            if matches!(
-                persona.as_str(),
-                "exit" | "quit" | "help" | "clear" | "status" | "compact" | "unknown" | "default"
-            ) {
+            let (thread_id, cwd) = extract_codex_rollout_meta(&path);
+            if thread_id.is_empty() {
                 continue;
             }
-            let cwd = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-            self.upsert(
-                &persona,
-                VendorRoute::Codex {
-                    thread_id: thread_id.to_string(),
-                    cwd,
-                },
-                at.clone(),
-            );
+            let updated_ms = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            candidates.push((updated_ms, persona, thread_id, cwd));
+        }
+        candidates.sort_by_key(|c| c.0);
+        for (_updated_ms, persona, thread_id, cwd) in candidates {
+            self.upsert(&persona, VendorRoute::Codex { thread_id, cwd }, at.clone());
         }
     }
 
@@ -926,6 +957,73 @@ fn read_grok_summary_metadata(
     (sid, cwd, updated_ms, persona)
 }
 
+fn collect_codex_rollout_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 4 || !dir.is_dir() {
+        return;
+    }
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in read_dir.flatten() {
+        let p = entry.path();
+        if p.is_dir() {
+            collect_codex_rollout_files(&p, depth + 1, out);
+        } else if p.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            out.push(p);
+        }
+    }
+}
+
+fn extract_codex_rollout_meta(path: &Path) -> (String, Option<PathBuf>) {
+    let fallback_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let mut thread_id = String::new();
+    let mut cwd = None;
+    if let Ok(text) = fs::read_to_string(path) {
+        for line in text.lines().take(20) {
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let is_response_item =
+                val.get("type").and_then(|v| v.as_str()) == Some("response_item");
+            if thread_id.is_empty()
+                && !is_response_item
+                && let Some(sid) = val
+                    .pointer("/payload/session_id")
+                    .or_else(|| val.pointer("/payload/id"))
+                    .or_else(|| val.get("session_id"))
+                    .or_else(|| val.get("id"))
+                    .and_then(|v| v.as_str())
+                && !sid.is_empty()
+            {
+                thread_id = sid.to_string();
+            }
+            if cwd.is_none()
+                && let Some(dir) = val
+                    .pointer("/payload/cwd")
+                    .or_else(|| val.get("cwd"))
+                    .and_then(|v| v.as_str())
+                && !dir.is_empty()
+            {
+                cwd = Some(PathBuf::from(dir));
+            }
+            if !thread_id.is_empty() && cwd.is_some() {
+                break;
+            }
+        }
+    }
+    if thread_id.is_empty() {
+        if let Some(rest) = fallback_stem.strip_prefix("rollout-")
+            && let Some(tail) = rest.get(rest.len().saturating_sub(36)..)
+            && tail.len() == 36
+        {
+            thread_id = tail.to_string();
+        } else {
+            thread_id = fallback_stem.to_string();
+        }
+    }
+    (thread_id, cwd)
+}
+
 fn extract_session_id_and_cwd(path: &Path, fallback_stem: &str) -> (String, Option<PathBuf>) {
     let mut session_id = fallback_stem.to_string();
     let mut cwd = None;
@@ -1036,7 +1134,11 @@ fn parse_legacy_route_item(item: &serde_json::Value) -> Option<VendorRoute> {
             })
         }
         "codex" => {
-            let thread_id = item.get("thread_id")?.as_str()?.to_string();
+            let thread_id = item
+                .get("thread_id")
+                .or_else(|| item.get("session_id"))?
+                .as_str()?
+                .to_string();
             let cwd = item.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
             Some(VendorRoute::Codex { thread_id, cwd })
         }
@@ -1187,24 +1289,46 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
         if line.trim().is_empty() {
             continue;
         }
-        let candidate_text: String =
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                for field in ["agentName", "customTitle", "persona"] {
-                    if let Some(s) = val.get(field).and_then(|v| v.as_str())
-                        && let Some(norm) = normalize_claude_session_name(s)
+        let candidate_text: String = if let Ok(val) =
+            serde_json::from_str::<serde_json::Value>(line)
+        {
+            for field in ["agentName", "customTitle", "persona"] {
+                if let Some(s) = val.get(field).and_then(|v| v.as_str())
+                    && let Some(norm) = normalize_claude_session_name(s)
+                {
+                    return Some(norm);
+                }
+            }
+            if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+                || val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+                || val.get("synthetic_reason").is_some()
+            {
+                continue;
+            }
+            let t = val.get("type").and_then(|v| v.as_str());
+            if matches!(t, Some("tool_result" | "TOOL_RESULT")) {
+                if let Some(c) = val.get("content").and_then(extract_text_from_json_content)
+                    && let Some(reg_idx) = c.find("Registered ")
+                {
+                    let after = &c[reg_idx + "Registered ".len()..];
+                    let token: String = after
+                        .chars()
+                        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+                        .collect();
+                    if after[token.len()..].starts_with(" <")
+                        && let Some(norm) = normalize_claude_session_name(&token)
                     {
                         return Some(norm);
                     }
                 }
-                if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
-                    || val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
-                    || val.get("synthetic_reason").is_some()
-                {
-                    continue;
-                }
-                let t = val.get("type").and_then(|v| v.as_str());
-                if matches!(t, Some("tool_result" | "TOOL_RESULT")) {
-                    if let Some(c) = val.get("content").and_then(extract_text_from_json_content)
+                continue;
+            }
+            if t == Some("response_item") {
+                let pt = val.pointer("/payload/type").and_then(|v| v.as_str());
+                if matches!(pt, Some("custom_tool_call_output" | "function_call_output")) {
+                    if let Some(c) = val
+                        .pointer("/payload/output")
+                        .and_then(extract_text_from_json_content)
                         && let Some(reg_idx) = c.find("Registered ")
                     {
                         let after = &c[reg_idx + "Registered ".len()..];
@@ -1220,6 +1344,26 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
                     }
                     continue;
                 }
+                if pt == Some("message")
+                    && val.pointer("/payload/role").and_then(|v| v.as_str()) == Some("user")
+                    && let Some(c) = val
+                        .pointer("/payload/content")
+                        .and_then(extract_text_from_json_content)
+                {
+                    let trimmed_c = c.trim_start();
+                    if trimmed_c.starts_with("# AGENTS.md instructions for ")
+                        || trimmed_c.starts_with("<environment_context>")
+                        || trimmed_c.starts_with("<INSTRUCTIONS>")
+                        || trimmed_c.starts_with("<permissions instructions>")
+                        || trimmed_c.starts_with("<user_shell_command>")
+                    {
+                        continue;
+                    }
+                    c
+                } else {
+                    continue;
+                }
+            } else {
                 if !matches!(t, None | Some("USER_INPUT" | "user" | "human")) {
                     continue;
                 }
@@ -1238,9 +1382,10 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
                     continue;
                 };
                 s
-            } else {
-                line.to_string()
-            };
+            }
+        } else {
+            line.to_string()
+        };
         let lower = candidate_text.to_ascii_lowercase();
         for marker in [
             "take the name of ",
@@ -2282,6 +2427,77 @@ mod tests {
                 cwd: Some(cwd),
                 ..
             }) if session_id == "01a18538-6f1a-79c2-99d2-8e8540366c72"
+                && cwd == Path::new("/home/lmcfarlin/Projects/Artificial-Humanity")
+        ));
+    }
+
+    #[test]
+    fn discover_codex_routes_resolves_nested_rollout_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+
+        let codex_dir = home.join(".codex");
+        let day_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("29");
+        fs::create_dir_all(&day_dir).unwrap();
+
+        fs::write(
+            codex_dir.join("session_index.jsonl"),
+            r#"{"id":"01a18550-1b11-7882-82b6-ea40058ed587","thread_name":"Report to Kayla","updated_at":"2026-10-29T01:40:39.621480658Z"}"#,
+        )
+        .unwrap();
+
+        let rollout_path =
+            day_dir.join("rollout-2026-10-29T01-39-41-01a18550-1b11-7882-82b6-ea40058ed587.jsonl");
+        fs::write(
+            &rollout_path,
+            [
+                serde_json::json!({
+                    "timestamp": "2026-10-29T01:39:41.000Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "01a18550-1b11-7882-82b6-ea40058ed587",
+                        "cwd": "/home/lmcfarlin/Projects/Artificial-Humanity"
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": "2026-10-29T01:39:41.100Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /home/lmcfarlin/Projects/Artificial-Humanity\n\nTake the name of <Name>"}]
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "timestamp": "2026-10-29T01:40:14.794Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "You are Katie. Please review the agent instructions in front of you and note the agent registration process."}]
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(home), At::parse("2026-10-29T01:45:00.000Z").unwrap());
+
+        assert!(matches!(
+            table.get("katie").map(|e| &e.route),
+            Some(VendorRoute::Codex {
+                thread_id,
+                cwd: Some(cwd),
+            }) if thread_id == "01a18550-1b11-7882-82b6-ea40058ed587"
                 && cwd == Path::new("/home/lmcfarlin/Projects/Artificial-Humanity")
         ));
     }

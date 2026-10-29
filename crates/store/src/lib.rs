@@ -464,10 +464,27 @@ fn routed_store_is_taken() -> StoreError {
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let label = path.display().to_string();
-        let db = Database::create(path).map_err(|e| StoreError::Unreachable {
-            store: label.clone(),
-            cause: e.to_string(),
-        })?;
+        let mut attempts = 0u32;
+        let db = loop {
+            match Database::create(path) {
+                Ok(db) => break db,
+                Err(e)
+                    if attempts < 200
+                        && (matches!(e, redb::DatabaseError::DatabaseAlreadyOpen)
+                            || e.to_string().contains("Database already open")
+                            || e.to_string().contains("Cannot acquire lock")) =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(e) => {
+                    return Err(StoreError::Unreachable {
+                        store: label.clone(),
+                        cause: e.to_string(),
+                    });
+                }
+            }
+        };
 
         // ⚠ Read before writing. A missing version key must not read as
         // "fresh": that would make an old store look empty — a vacuous pass.
