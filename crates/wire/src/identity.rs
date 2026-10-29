@@ -170,7 +170,7 @@ pub fn resolve_agy_exe(
     PathBuf::from("agy")
 }
 
-fn agy_ls_port(addr: &str) -> Option<u16> {
+pub(crate) fn agy_ls_port(addr: &str) -> Option<u16> {
     let addr = addr.trim();
     if addr.is_empty() {
         return None;

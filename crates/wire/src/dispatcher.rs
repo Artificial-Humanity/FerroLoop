@@ -1,7 +1,8 @@
 //! Native vendor push dispatcher for Claude Code, Antigravity, Codex, and Webhook routes (spec §3.2).
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
+use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -384,10 +385,192 @@ fn deliver_to_agy_route(
     Ok(())
 }
 
+/// `Ok(true)` after `RevertToCascadeStep` and transcript truncation.
+/// `Ok(false)` when `FL_WIRE_AGY_BIN` is set and the live endpoint is incomplete,
+/// so the caller sends `/clear` through the mock binary instead.
+fn reset_agy_cascade_in_place(
+    conversation_id: &str,
+    ls_address: &Option<String>,
+    csrf_token: &Option<String>,
+) -> Result<bool, String> {
+    let listening = agy_listening_address(ls_address);
+    let csrf = agy_csrf_token(csrf_token);
+    if let (Some(addr), Some(csrf)) = (&listening, csrf.as_deref()) {
+        if csrf.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+            return Err("antigravity reset csrf token is not a single header value".into());
+        }
+        let port = crate::identity::agy_ls_port(addr)
+            .ok_or_else(|| format!("antigravity reset could not parse a port from {addr}"))?;
+        validate_agy_conversation_id(conversation_id)?;
+        post_revert_to_cascade_step(port, csrf, conversation_id)?;
+        truncate_agy_transcripts(conversation_id)?;
+        return Ok(true);
+    }
+    if std::env::var_os("FL_WIRE_AGY_BIN").is_some() {
+        return Ok(false);
+    }
+    if listening.is_none() {
+        return Err(agy_address_error(ls_address));
+    }
+    Err("antigravity reset needs a csrf token (route csrf_token or ANTIGRAVITY_CSRF_TOKEN)".into())
+}
+
+fn agy_listening_address(route_address: &Option<String>) -> Option<String> {
+    agy_address_candidates(route_address)
+        .into_iter()
+        .find(|addr| crate::identity::agy_ls_address_listening(addr))
+}
+
+fn agy_nonempty_address(route_address: &Option<String>) -> Option<String> {
+    agy_address_candidates(route_address).into_iter().next()
+}
+
+fn agy_address_candidates(route_address: &Option<String>) -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(addr) = route_address
+        .as_deref()
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+    {
+        candidates.push(addr.to_string());
+    }
+    if let Ok(addr) = std::env::var("ANTIGRAVITY_LS_ADDRESS") {
+        let addr = addr.trim();
+        if !addr.is_empty() && !candidates.iter().any(|seen| seen == addr) {
+            candidates.push(addr.to_string());
+        }
+    }
+    candidates
+}
+
+fn agy_address_error(route_address: &Option<String>) -> String {
+    match agy_nonempty_address(route_address) {
+        Some(addr) if crate::identity::agy_ls_port(&addr).is_none() => {
+            format!("antigravity reset could not parse a port from {addr}")
+        }
+        Some(addr) => format!(
+            "antigravity reset needs a listening language-server address; {addr} is not accepting connections on 127.0.0.1"
+        ),
+        None => "antigravity reset needs a listening language-server address (route ls_address or ANTIGRAVITY_LS_ADDRESS)".into(),
+    }
+}
+
+fn agy_csrf_token(route_csrf: &Option<String>) -> Option<String> {
+    route_csrf
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("ANTIGRAVITY_CSRF_TOKEN")
+                .ok()
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty())
+        })
+}
+
+fn validate_agy_conversation_id(conversation_id: &str) -> Result<(), String> {
+    if conversation_id.is_empty()
+        || conversation_id.contains(['/', '\\', '\0'])
+        || conversation_id.contains("..")
+        || conversation_id.trim() == "."
+    {
+        return Err(format!(
+            "antigravity conversation id `{conversation_id}` is not a single directory name"
+        ));
+    }
+    Ok(())
+}
+
+fn post_revert_to_cascade_step(port: u16, csrf: &str, conversation_id: &str) -> Result<(), String> {
+    let body = serde_json::json!({
+        "cascadeId": conversation_id,
+        "stepIndex": 0,
+        "conversationOnly": true,
+    })
+    .to_string();
+    let host = format!("127.0.0.1:{port}");
+    let request = format!(
+        "POST /exa.language_server_pb.LanguageServerService/RevertToCascadeStep HTTP/1.1\r\n\
+         Host: {host}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\
+         x-codeium-csrf-token: {csrf}\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    let target = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))
+        .map_err(|err| format!("antigravity revert connect to {host} failed: {err}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| format!("antigravity revert read timeout failed: {err}"))?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|err| format!("antigravity revert write timeout failed: {err}"))?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|err| format!("antigravity revert write to {host} failed: {err}"))?;
+    let mut status = String::new();
+    BufRead::read_line(&mut std::io::BufReader::new(stream), &mut status)
+        .map_err(|err| format!("antigravity revert read from {host} failed: {err}"))?;
+    let code = status.split_whitespace().nth(1).unwrap_or("");
+    if code != "200" {
+        return Err(format!("antigravity revert returned {}", status.trim()));
+    }
+    Ok(())
+}
+
+fn truncate_agy_transcripts(conversation_id: &str) -> Result<(), String> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(());
+    };
+    let logs = PathBuf::from(home)
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("brain")
+        .join(conversation_id)
+        .join(".system_generated")
+        .join("logs");
+    for name in ["transcript.jsonl", "transcript_full.jsonl"] {
+        let path = logs.join(name);
+        if path.is_file() {
+            truncate_agy_transcript_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn truncate_agy_transcript_file(path: &Path) -> Result<(), String> {
+    let raw = fs::read_to_string(path)
+        .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+    let keep = match raw.lines().next() {
+        Some(line) => {
+            let step_zero = serde_json::from_str::<serde_json::Value>(line.trim())
+                .ok()
+                .and_then(|val| val.get("step_index").and_then(|step| step.as_u64()))
+                == Some(0);
+            if step_zero {
+                format!("{line}\n")
+            } else {
+                String::new()
+            }
+        }
+        None => String::new(),
+    };
+    fs::write(path, keep).map_err(|err| format!("failed to truncate {}: {err}", path.display()))
+}
+
 /// Reset a live vendor session. Tmux-backed Muse and Grok routes send `C-u`,
-/// the slash command, and `Enter` through `tmux send-keys`. Every other route
-/// sends that slash command through [`dispatch_operator_prompt_to_route`].
-/// Codex and Grok use `/new`. Claude, Muse, Antigravity, and Webhook use `/clear`.
+/// the slash command, and `Enter` through `tmux send-keys`. Codex and Grok use
+/// `/new`. Claude, Muse, and Webhook use `/clear`.
+///
+/// Antigravity rewinds the open cascade with `RevertToCascadeStep`
+/// (`stepIndex` 0, `conversationOnly` true) and keeps only the `step_index` 0
+/// transcript line. A mock `FL_WIRE_AGY_BIN` without a listening address and
+/// csrf token still sends `/clear`.
 ///
 /// Reforge requires a non-empty prompt before any tmux or vendor dispatch.
 /// It waits 2s after a tmux reset (skipped when `FL_WIRE_TMUX_BIN` is set)
@@ -403,6 +586,19 @@ pub fn clear_or_reforge_session(
     } else {
         None
     };
+    if let VendorRoute::Agy {
+        conversation_id,
+        ls_address,
+        csrf_token,
+        ..
+    } = route
+        && reset_agy_cascade_in_place(conversation_id, ls_address, csrf_token)?
+    {
+        if let Some(prompt) = prompt {
+            dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
+        }
+        return Ok(());
+    }
     let slash = session_reset_slash(route);
     if let Some(target) = alive_tmux_reset_target(route) {
         send_tmux_reset_keys(&target, slash)?;
@@ -782,6 +978,18 @@ mod tests {
     /// must hold this lock for the whole test, including the earlier vendor
     /// dispatch that treats a set tmux bin as permission to use tmux.
     static TMUX_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Antigravity reset reads `FL_WIRE_AGY_BIN`, `ANTIGRAVITY_LS_ADDRESS`, and
+    /// `ANTIGRAVITY_CSRF_TOKEN`. Tests that change those variables hold this lock
+    /// for the whole test so a mock binary cannot hide a live revert, and a live
+    /// revert cannot run against the host language server.
+    static AGY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn validate_agy_conversation_id_rejects_dot_and_nul() {
+        assert!(validate_agy_conversation_id(".").is_err());
+        assert!(validate_agy_conversation_id("a\0b").is_err());
+    }
 
     #[test]
     fn claude_socket_dispatch_sends_auth_and_user_frame_and_acks_receipt() {
@@ -1238,6 +1446,12 @@ mod tests {
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
 
+        let _agy_lock = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        // SAFETY: restores FL_WIRE_AGY_BIN and the Antigravity endpoint variables.
+        // A mock binary with no csrf token keeps the `/clear` script path.
+        let _bin_env = EnvGuard::set("FL_WIRE_AGY_BIN", &bin);
+        let _ls_env = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _csrf_env = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
         clear_or_reforge_session(
             &VendorRoute::Agy {
                 conversation_id: "conv-felicia".into(),
@@ -1251,6 +1465,10 @@ mod tests {
             Some("reforge agy now"),
         )
         .unwrap();
+        drop(_csrf_env);
+        drop(_ls_env);
+        drop(_bin_env);
+        drop(_agy_lock);
 
         let log = fs::read_to_string(&out).unwrap();
         let mut calls = log.split("--CALL--");
@@ -1291,6 +1509,7 @@ mod tests {
         .unwrap();
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
 
+        let _agy_lock = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let ls_address = Some("127.0.0.1:1".to_string());
         let exe = Some(bin.clone());
         deliver_to_agy_route("conv-felicia", &ls_address, &None, &exe, "title", "body").unwrap();
@@ -1309,6 +1528,7 @@ mod tests {
 
         let recorded = fs::read_to_string(&out).unwrap();
         assert_eq!(recorded.lines().last(), Some("127.0.0.1:1"));
+        drop(_agy_lock);
     }
 
     #[test]
@@ -1347,6 +1567,209 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clear_or_reforge_agy_reverts_cascade_and_truncates_transcripts() {
+        use std::io::{BufRead, Read, Write};
+        use std::net::TcpListener;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+
+        let _agy_lock = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _ls_env = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        let _csrf_env = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        let _bin_env = EnvGuard::remove("FL_WIRE_AGY_BIN");
+
+        let missing = VendorRoute::Agy {
+            conversation_id: "conv-missing".into(),
+            ls_pid: None,
+            ls_address: Some("not-a-port".into()),
+            csrf_token: Some("csrf-test".into()),
+            agentapi_exe: None,
+        };
+        let parse_err =
+            clear_or_reforge_session(&missing, SessionResetMode::Clear, "owner", None).unwrap_err();
+        assert!(parse_err.contains("could not parse a port"), "{parse_err}");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let no_csrf = VendorRoute::Agy {
+            conversation_id: "conv-no-csrf".into(),
+            ls_pid: None,
+            ls_address: Some(format!("127.0.0.1:{port}")),
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        let csrf_err =
+            clear_or_reforge_session(&no_csrf, SessionResetMode::Clear, "owner", None).unwrap_err();
+        assert!(csrf_err.contains("csrf token"), "{csrf_err}");
+
+        let (status_tx, status_rx) = mpsc::channel::<u16>();
+        let (req_tx, req_rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok(code) = status_rx.recv() {
+                // `agy_ls_address_listening` connects and drops before the POST.
+                // Skip that probe and answer the next request that carries headers.
+                loop {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(200)))
+                        .unwrap();
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut headers = String::new();
+                    let mut saw_request = false;
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) => {
+                                saw_request = true;
+                                headers.push_str(&line);
+                                if line == "\r\n" {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    if !saw_request || !headers.contains("\r\n\r\n") {
+                        continue;
+                    }
+                    let len = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                        })
+                        .unwrap_or(0);
+                    let mut body = vec![0u8; len];
+                    if reader.read_exact(&mut body).is_err() {
+                        continue;
+                    }
+                    let captured = format!("{headers}{}", String::from_utf8_lossy(&body));
+                    let reason = if code == 200 { "OK" } else { "ERR" };
+                    let response = format!(
+                        "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    stream.write_all(response.as_bytes()).unwrap();
+                    req_tx.send(captured).unwrap();
+                    break;
+                }
+            }
+        });
+
+        let home = std::env::var("HOME").expect("HOME");
+        let conversation_id = format!(
+            "fl-wire-revert-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let logs = PathBuf::from(&home)
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(&conversation_id)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        struct RemoveDir(PathBuf);
+        impl Drop for RemoveDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveDir(logs.parent().unwrap().parent().unwrap().to_path_buf());
+        let transcript = logs.join("transcript.jsonl");
+        let full = logs.join("transcript_full.jsonl");
+        let step_zero = "{\"step_index\":0,\"type\":\"USER_INPUT\",\"content\":\"keep me\"}\n";
+        let write_logs = || {
+            fs::write(
+                &transcript,
+                format!("{step_zero}{{\"step_index\":4,\"type\":\"PLANNER_RESPONSE\",\"content\":\"old\"}}\n"),
+            )
+            .unwrap();
+            fs::write(
+                &full,
+                "{\"step_index\":4,\"type\":\"PLANNER_RESPONSE\",\"content\":\"drop\"}\n",
+            )
+            .unwrap();
+        };
+        write_logs();
+
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("agy-args.txt");
+        let bin = tmp.path().join("fake-agy.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let route = VendorRoute::Agy {
+            conversation_id: conversation_id.clone(),
+            ls_pid: None,
+            ls_address: Some(format!("127.0.0.1:{port}")),
+            csrf_token: Some("csrf-test".into()),
+            agentapi_exe: Some(bin),
+        };
+
+        status_tx.send(200).unwrap();
+        clear_or_reforge_session(&route, SessionResetMode::Clear, "owner", None).unwrap();
+        let captured = req_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(captured.starts_with(
+            "POST /exa.language_server_pb.LanguageServerService/RevertToCascadeStep HTTP/1.1\r\n"
+        ));
+        assert!(captured.contains("Content-Type: application/json\r\n"));
+        assert!(captured.contains("x-codeium-csrf-token: csrf-test\r\n"));
+        let body = captured.split("\r\n\r\n").nth(1).expect("request body");
+        let payload: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(payload["cascadeId"], conversation_id);
+        assert_eq!(payload["stepIndex"], 0);
+        assert_eq!(payload["conversationOnly"], true);
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), step_zero);
+        assert_eq!(fs::read_to_string(&full).unwrap(), "");
+        assert!(!out.exists() || fs::read_to_string(&out).unwrap().is_empty());
+
+        write_logs();
+        status_tx.send(200).unwrap();
+        clear_or_reforge_session(
+            &route,
+            SessionResetMode::Reforge,
+            "owner",
+            Some("reforge agy now"),
+        )
+        .unwrap();
+        let captured = req_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(captured.contains("\"stepIndex\":0"));
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), step_zero);
+        let prompt_log = fs::read_to_string(&out).unwrap();
+        assert!(prompt_log.contains("reforge agy now"), "{prompt_log}");
+        assert!(!prompt_log.contains("\n/clear\n"), "{prompt_log}");
+
+        write_logs();
+        let before = fs::read_to_string(&transcript).unwrap();
+        status_tx.send(500).unwrap();
+        let failed =
+            clear_or_reforge_session(&route, SessionResetMode::Clear, "owner", None).unwrap_err();
+        assert!(failed.contains("500"), "{failed}");
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), before);
+        drop(_bin_env);
+        drop(_csrf_env);
+        drop(_ls_env);
+        drop(_agy_lock);
+    }
+
     struct EnvGuard {
         key: &'static str,
         prev: Option<std::ffi::OsString>,
@@ -1355,8 +1778,20 @@ mod tests {
     impl EnvGuard {
         fn set(key: &'static str, value: &std::path::Path) -> Self {
             let prev = std::env::var_os(key);
+            // SAFETY: the guard restores the previous value on drop. Callers hold
+            // the matching env lock for the whole test.
             unsafe {
                 std::env::set_var(key, value);
+            }
+            Self { key, prev }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var_os(key);
+            // SAFETY: the guard restores the previous value on drop. Callers hold
+            // the matching env lock for the whole test.
+            unsafe {
+                std::env::remove_var(key);
             }
             Self { key, prev }
         }
