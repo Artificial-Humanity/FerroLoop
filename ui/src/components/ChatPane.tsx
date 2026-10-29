@@ -28,7 +28,9 @@ function maxTokensForAdapter(adapter?: string | null): number {
     normalized === "argon" ||
     normalized === "gemini" ||
     normalized === "muse" ||
-    normalized.startsWith("muse-")
+    normalized.startsWith("muse-") ||
+    normalized === "claude" ||
+    normalized.startsWith("claude-")
   ) {
     return 1_000_000;
   }

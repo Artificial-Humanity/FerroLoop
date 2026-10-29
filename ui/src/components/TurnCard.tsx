@@ -120,10 +120,17 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   const looksLikeBackgroundTaskOutput = /^Task id "[^"]+" finished with result:/i.test(
     turn.content.trimStart(),
   );
-  const isUser = roleNormalized === "user" && !looksLikeBackgroundTaskOutput;
+  // Defensive: raw system/code snippet dumps can be mislabeled as user turns.
+  const looksLikeSystemCodeDump = /^"\)\r?\n\d+:\s/.test(turn.content.trimStart());
+  const isUser =
+    roleNormalized === "user" &&
+    !looksLikeBackgroundTaskOutput &&
+    !looksLikeSystemCodeDump;
   const isWire = roleNormalized.startsWith("wire:");
   const wireSender = isWire ? turn.role.slice(5) : null;
-  const isSystem = roleNormalized === "system";
+  const isSystem =
+    roleNormalized === "system" ||
+    (roleNormalized === "user" && looksLikeSystemCodeDump);
   const isToolOutput =
     roleNormalized === "tool" ||
     looksLikeBackgroundTaskOutput ||
@@ -135,6 +142,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
 
   const [toolOutputExpanded, setToolOutputExpanded] = React.useState(false);
   const [wireExpanded, setWireExpanded] = React.useState(false);
+  const [systemExpanded, setSystemExpanded] = React.useState(false);
   const [expandedCodeBlocks, setExpandedCodeBlocks] = React.useState<Record<number, boolean>>({});
 
   const roleLabel = isUser
@@ -211,6 +219,13 @@ export const TurnCard: React.FC<TurnCardProps> = ({
     if (!isWire) return "";
     return summarizeWireContent(cleanedContent || turn.content || "", wireSender);
   }, [isWire, cleanedContent, turn.content, wireSender]);
+
+  const systemOutputSummary = React.useMemo(() => {
+    if (!isSystem) return "";
+    const raw = cleanedContent || turn.content || "";
+    const lines = raw.split("\n");
+    return `System (${lines.length} ${lines.length === 1 ? "line" : "lines"})`;
+  }, [isSystem, cleanedContent, turn.content]);
 
   return (
     <article
@@ -337,7 +352,49 @@ export const TurnCard: React.FC<TurnCardProps> = ({
         </div>
       )}
 
-      {(!isWire || wireExpanded) && (
+      {isSystem && (cleanedContent || turn.content) && (
+        <div
+          style={{
+            borderRadius: "var(--radius-sm)",
+            border: "1px solid var(--border-subtle)",
+            backgroundColor: "rgba(13, 17, 24, 0.65)",
+            overflow: "hidden",
+          }}
+        >
+          <button
+            type="button"
+            data-testid={`turn-system-output-toggle-${turn.index}`}
+            aria-expanded={systemExpanded}
+            onClick={() => setSystemExpanded((prev) => !prev)}
+            style={{
+              width: "100%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              padding: "6px 10px",
+              background: "transparent",
+              border: "none",
+              color: "var(--text-secondary)",
+              cursor: "pointer",
+              fontSize: "11px",
+              textAlign: "left",
+            }}
+          >
+            <span className="fd-mono" style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+              <span style={{ color: "var(--accent-primary)" }}>
+                {systemExpanded ? "▼" : "▶"}
+              </span>
+              <span>{systemOutputSummary}</span>
+            </span>
+            <span style={{ color: "var(--text-dim)", fontSize: "11px" }}>
+              {systemExpanded ? "Hide output" : "Show output"}
+            </span>
+          </button>
+        </div>
+      )}
+
+      {(!isWire || wireExpanded) && (!isSystem || systemExpanded) && (
         <>
           {isToolOutput && (cleanedContent || turn.content) ? (
         <div
