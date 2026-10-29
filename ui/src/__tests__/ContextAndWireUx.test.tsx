@@ -160,7 +160,7 @@ describe("estimateSessionContextUsage", () => {
   it("estimates overhead plus content, thinking, and tool calls below 50%", () => {
     const usage = estimateSessionContextUsage(
       [turn({ index: 0, content: "x".repeat(400) })],
-      "codex",
+      null,
     );
     // 12_000 overhead + ceil((400 + 0 + 2) / 4) for content + "[]" tool calls.
     expect(usage.usedTokens).toBe(12_101);
@@ -171,14 +171,14 @@ describe("estimateSessionContextUsage", () => {
   it("crosses the 50% threshold on a large transcript and caps at 100%", () => {
     const usage = estimateSessionContextUsage(
       [turn({ index: 0, content: "x".repeat(360_000) })],
-      "codex",
+      null,
     );
     expect(usage.percent).toBe(51);
     expect(usage.percent).toBeGreaterThanOrEqual(50);
 
     const capped = estimateSessionContextUsage(
       [turn({ index: 0, content: "x".repeat(2_000_000) })],
-      "codex",
+      null,
     );
     expect(capped.percent).toBe(100);
   });
@@ -190,14 +190,14 @@ describe("estimateSessionContextUsage", () => {
         turn({ index: 1, content: "[Compacted context] Earlier work summary." }),
         turn({ index: 2, content: "Next step." }),
       ],
-      "codex",
+      null,
     );
     // Only the boundary turn and the short follow-up count toward usage.
     expect(usage.usedTokens).toBeLessThan(13_000);
     expect(usage.percent).toBeLessThan(50);
   });
 
-  it("uses 1M windows for antigravity-family, muse, and claude adapters and formats millions", () => {
+  it("uses 1M windows for antigravity-family, muse, and claude adapters and 500k for grok and codex", () => {
     for (const adapter of [
       "antigravity",
       "agy",
@@ -212,18 +212,23 @@ describe("estimateSessionContextUsage", () => {
     ]) {
       expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(1_000_000);
     }
-    for (const adapter of ["codex", null]) {
-      expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(200_000);
+    for (const adapter of ["codex", "grok"]) {
+      expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(500_000);
     }
+    expect(estimateSessionContextUsage([], null).maxTokens).toBe(200_000);
     expect(formatTokenCount(1_000_000)).toBe("1m");
     expect(formatTokenCount(1_500_000)).toBe("1.5m");
+    expect(formatTokenCount(500_000)).toBe("500k");
     expect(formatTokenCount(200_000)).toBe("200k");
   });
 
-  it("prefers server usage and uses the grok context window", () => {
+  it("prefers server usage and uses 500k context defaults for grok and codex", () => {
     expect(
       estimateSessionContextUsage([turn({ index: 0, content: "hi" })], "grok"),
-    ).toMatchObject({ maxTokens: 131_072 });
+    ).toMatchObject({ maxTokens: 500_000 });
+    expect(
+      estimateSessionContextUsage([turn({ index: 0, content: "hi" })], "codex"),
+    ).toMatchObject({ maxTokens: 500_000 });
 
     expect(
       estimateSessionContextUsage([], "claude", {
@@ -283,7 +288,7 @@ describe("Compact Context button", () => {
       <ChatPane
         agentName="ferris"
         agentDisplayName="Ferris"
-        adapter="codex"
+        adapter={null}
         sessionId="sess-ferris-01"
         turns={[turn({ index: 0, role: "user", content: "x".repeat(360_000) })]}
         onSendPrompt={onSendPrompt}
@@ -320,7 +325,7 @@ describe("Compact Context button", () => {
       <ChatPane
         agentName="ferris"
         agentDisplayName="Ferris"
-        adapter="codex"
+        adapter={null}
         sessionId="sess-ferris-01"
         turns={[turn({ index: 0, role: "user", content: "x".repeat(360_000) })]}
         onSendPrompt={onSendPrompt}
@@ -466,7 +471,7 @@ describe("optimistic prompt preservation", () => {
     expect(merged[1]).toMatchObject({ role: "user", content: "Ship it" });
   });
 
-  it("drops the optimistic turn once it reaches the disk tail or ages out", () => {
+  it("drops the optimistic turn once it reaches the disk tail or ages out past 60s", () => {
     const onDisk = [
       ...diskTurns,
       turn({ index: 8, role: "user", content: "Ship it" }),
@@ -475,7 +480,10 @@ describe("optimistic prompt preservation", () => {
       preserveOptimisticTurn(onDisk, { content: "Ship it", sentAt: 1_000 }, 3_000),
     ).toBe(onDisk);
     expect(
-      preserveOptimisticTurn(diskTurns, { content: "Ship it", sentAt: 1_000 }, 9_000),
+      preserveOptimisticTurn(diskTurns, { content: "Ship it", sentAt: 1_000 }, 30_000),
+    ).toHaveLength(2);
+    expect(
+      preserveOptimisticTurn(diskTurns, { content: "Ship it", sentAt: 1_000 }, 62_000),
     ).toBe(diskTurns);
     expect(preserveOptimisticTurn(diskTurns, null, 3_000)).toBe(diskTurns);
   });
@@ -499,18 +507,18 @@ describe("optimistic prompt preservation", () => {
     expect(merged[1]).toMatchObject({ role: "user", content: "Ship it" });
   });
 
-  it("does not treat a short prompt as on-disk via substring match", () => {
-    const withOlderUserTurn = [
-      turn({ index: 6, role: "user", content: "ok sounds good" }),
+  it("recognizes an on-disk user turn that wraps the prompt via substring match", () => {
+    const wrappedOnDisk = [
       ...diskTurns,
+      turn({ index: 8, role: "user", content: "<USER_REQUEST>\nShip it\n</USER_REQUEST>" }),
     ];
-    const merged = preserveOptimisticTurn(
-      withOlderUserTurn,
-      { content: "ok", sentAt: 1_000 },
-      3_000,
-    );
-    expect(merged).toHaveLength(3);
-    expect(merged[2]).toMatchObject({ role: "user", content: "ok" });
+    expect(
+      preserveOptimisticTurn(
+        wrappedOnDisk,
+        { content: "Ship it", sentAt: 1_000 },
+        3_000,
+      ),
+    ).toBe(wrappedOnDisk);
   });
 
   it("polls faster while the session is busy", () => {
