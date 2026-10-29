@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fl_core::agent::{AgentRole, AgentStatus};
 use fl_core::at::At;
@@ -132,6 +134,105 @@ fn preserve_muse_tmux_fields(target_route: &mut VendorRoute, fallback_route: &Ve
             }
         }
         _ => {}
+    }
+}
+
+/// An Antigravity binary is usable when it is a real file and not an
+/// `agy.<timestamp>.old` leftover from an in-place auto-update.
+pub fn agy_exe_is_usable(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    !name.ends_with(".old") && path.is_file()
+}
+
+/// Pick an Antigravity `agentapi` binary.
+///
+/// `configured` (the route) wins when it is usable. Then `env_exe`
+/// (`ANTIGRAVITY_AGENTAPI_EXE`) when that path is usable. Then
+/// `$HOME/.local/bin/agy` when that file exists. Otherwise the bare `agy`
+/// command name, which the caller resolves through `PATH`.
+pub fn resolve_agy_exe(
+    configured: Option<&Path>,
+    env_exe: Option<&Path>,
+    home: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = configured.filter(|path| agy_exe_is_usable(path)) {
+        return path.to_path_buf();
+    }
+    if let Some(path) = env_exe.filter(|path| agy_exe_is_usable(path)) {
+        return path.to_path_buf();
+    }
+    if let Some(home) = home {
+        let local = home.join(".local").join("bin").join("agy");
+        if local.is_file() {
+            return local;
+        }
+    }
+    PathBuf::from("agy")
+}
+
+fn agy_ls_port(addr: &str) -> Option<u16> {
+    let addr = addr.trim();
+    if addr.is_empty() {
+        return None;
+    }
+    let port_src = if let Some(rest) = addr.strip_prefix('[') {
+        rest.split_once(']')?.1.strip_prefix(':')?
+    } else if let Some((_, port)) = addr.rsplit_once(':') {
+        port
+    } else {
+        addr
+    };
+    let digits: String = port_src
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// True when `addr`'s TCP port accepts a connection on `127.0.0.1` within 50ms.
+fn agy_ls_address_listening(addr: &str) -> bool {
+    let Some(port) = agy_ls_port(addr) else {
+        return false;
+    };
+    let target = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    TcpStream::connect_timeout(&target, Duration::from_millis(50)).is_ok()
+}
+
+/// Read one `/proc/<pid>/environ` blob. A language-server address is kept only
+/// when its port is listening, and an `agentapi` path is kept only when the
+/// file is usable. Dead `bwrap` ports and unlinked `.old` binaries are skipped
+/// so a later process can still supply the live values.
+fn note_agy_proc_env(
+    env_bytes: &[u8],
+    shared_csrf: &mut Option<String>,
+    shared_ls_addr: &mut Option<String>,
+    shared_exe: &mut Option<PathBuf>,
+) {
+    for kv in env_bytes.split(|&b| b == 0) {
+        let Ok(kv_str) = std::str::from_utf8(kv) else {
+            continue;
+        };
+        if shared_csrf.is_none()
+            && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_CSRF_TOKEN=")
+            && !val.is_empty()
+        {
+            *shared_csrf = Some(val.to_string());
+        } else if shared_ls_addr.is_none()
+            && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_LS_ADDRESS=")
+            && !val.is_empty()
+            && agy_ls_address_listening(val)
+        {
+            *shared_ls_addr = Some(val.to_string());
+        } else if shared_exe.is_none()
+            && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_AGENTAPI_EXE=")
+            && agy_exe_is_usable(Path::new(val))
+        {
+            *shared_exe = Some(PathBuf::from(val));
+        }
     }
 }
 
@@ -377,6 +478,19 @@ impl RouteTable {
         let agy_dir = home.join(".gemini").join("antigravity-cli");
         let brain_dir = agy_dir.join("brain");
         if !brain_dir.is_dir() {
+            // No transcript to scan. Still replace a missing or `.old` exe with
+            // `$HOME/.local/bin/agy` when that file exists, otherwise `agy`.
+            // cli.log and /proc stay unused on this path.
+            let fallback = resolve_agy_exe(None, None, Some(home));
+            for entry in self.entries.values_mut() {
+                if let VendorRoute::Agy { agentapi_exe, .. } = &mut entry.route
+                    && agentapi_exe
+                        .as_ref()
+                        .is_none_or(|path| !agy_exe_is_usable(path))
+                {
+                    *agentapi_exe = Some(fallback.clone());
+                }
+            }
             return;
         }
         let mut shared_ls_addr: Option<String> = None;
@@ -417,26 +531,12 @@ impl RouteTable {
                 let Ok(env_bytes) = fs::read(entry.path().join("environ")) else {
                     continue;
                 };
-                for kv in env_bytes.split(|&b| b == 0) {
-                    if let Ok(kv_str) = std::str::from_utf8(kv) {
-                        if shared_csrf.is_none()
-                            && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_CSRF_TOKEN=")
-                            && !val.is_empty()
-                        {
-                            shared_csrf = Some(val.to_string());
-                        } else if shared_ls_addr.is_none()
-                            && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_LS_ADDRESS=")
-                            && !val.is_empty()
-                        {
-                            shared_ls_addr = Some(val.to_string());
-                        } else if shared_exe.is_none()
-                            && let Some(val) = kv_str.strip_prefix("ANTIGRAVITY_AGENTAPI_EXE=")
-                            && !val.is_empty()
-                        {
-                            shared_exe = Some(PathBuf::from(val));
-                        }
-                    }
-                }
+                note_agy_proc_env(
+                    &env_bytes,
+                    &mut shared_csrf,
+                    &mut shared_ls_addr,
+                    &mut shared_exe,
+                );
                 if shared_csrf.is_some() && shared_ls_addr.is_some() && shared_exe.is_some() {
                     break;
                 }
@@ -464,14 +564,26 @@ impl RouteTable {
                 if shared_csrf.is_none() {
                     shared_csrf = csrf_token.clone();
                 }
-                if shared_exe.is_none() {
-                    shared_exe = agentapi_exe.clone();
+                if shared_exe.is_none()
+                    && let Some(exe) = agentapi_exe.as_ref().filter(|path| agy_exe_is_usable(path))
+                {
+                    shared_exe = Some(exe.clone());
                 }
             }
         }
 
         // 4. Propagate the live/newest shared ls_address and csrf_token across all Agy routes
         // so pre-reboot entries do not retain stale language-server ports or CSRF tokens.
+        // Replace a missing or `.old` agentapi binary. A usable exe already on the route stays.
+        // Host `ANTIGRAVITY_AGENTAPI_EXE` is consulted only for live `/proc` discovery so a
+        // temp-home unit test does not pick up the machine's binary.
+        let env_exe = if check_proc {
+            std::env::var_os("ANTIGRAVITY_AGENTAPI_EXE").map(PathBuf::from)
+        } else {
+            None
+        };
+        let resolved_shared =
+            resolve_agy_exe(shared_exe.as_deref(), env_exe.as_deref(), Some(home));
         for entry in self.entries.values_mut() {
             if let VendorRoute::Agy {
                 ls_address,
@@ -486,8 +598,11 @@ impl RouteTable {
                 if shared_csrf.is_some() {
                     *csrf_token = shared_csrf.clone();
                 }
-                if agentapi_exe.is_none() {
-                    *agentapi_exe = shared_exe.clone();
+                if agentapi_exe
+                    .as_ref()
+                    .is_none_or(|path| !agy_exe_is_usable(path))
+                {
+                    *agentapi_exe = Some(resolved_shared.clone());
                 }
             }
         }
@@ -524,7 +639,7 @@ impl RouteTable {
                         ls_pid: None,
                         ls_address: shared_ls_addr.clone(),
                         csrf_token: shared_csrf.clone(),
-                        agentapi_exe: shared_exe.clone(),
+                        agentapi_exe: Some(resolved_shared.clone()),
                     },
                     at.clone(),
                 );
@@ -2114,6 +2229,7 @@ mod tests {
     use super::*;
     use fl_core::agent::{AreaRecord, RegisterAgentArgs};
     use fl_core::mem::MemStore;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -3191,5 +3307,184 @@ mod tests {
         .unwrap();
 
         assert!(resolve_grok_pid_persona(home, fake_pid).is_none());
+    }
+
+    #[test]
+    fn resolve_agy_exe_rejects_old_and_missing_paths() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let bin_dir = home.join(".local").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let local = bin_dir.join("agy");
+        fs::write(&local, b"#!/bin/sh\n").unwrap();
+        let old = bin_dir.join("agy.1710000000.old");
+        fs::write(&old, b"#!/bin/sh\n").unwrap();
+        let good = bin_dir.join("agy-good");
+        fs::write(&good, b"#!/bin/sh\n").unwrap();
+        let missing = bin_dir.join("agy-missing");
+
+        assert_eq!(resolve_agy_exe(Some(&old), Some(&old), Some(home)), local);
+        assert_eq!(resolve_agy_exe(Some(&missing), None, Some(home)), local);
+        assert_eq!(resolve_agy_exe(Some(&good), Some(&old), Some(home)), good);
+        assert_eq!(
+            resolve_agy_exe(Some(&old), Some(&old), None),
+            PathBuf::from("agy")
+        );
+        assert!(!agy_exe_is_usable(&old));
+        assert!(!agy_exe_is_usable(&missing));
+        assert!(agy_exe_is_usable(&good));
+    }
+
+    #[test]
+    fn agy_ls_address_listening_requires_an_open_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(agy_ls_address_listening(&format!("127.0.0.1:{port}")));
+        assert!(agy_ls_address_listening(&format!("localhost:{port}")));
+        // Port 1 is not an ephemeral bind target, so a parallel test cannot steal it.
+        assert!(!agy_ls_address_listening("127.0.0.1:1"));
+        assert!(!agy_ls_address_listening("not-a-port"));
+        drop(listener);
+    }
+
+    #[test]
+    fn note_agy_proc_env_skips_dead_ports_and_old_binaries() {
+        let tmp = TempDir::new().unwrap();
+        let live = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        // Port 1 is closed and is not recycled by other tests that bind port 0.
+        let dead_port = 1u16;
+
+        let old = tmp.path().join("agy.9.old");
+        fs::write(&old, b"old").unwrap();
+        let good = tmp.path().join("agy-bin");
+        fs::write(&good, b"good").unwrap();
+
+        let mut csrf = None;
+        let mut addr = None;
+        let mut exe = None;
+        let dead_env = format!(
+            "ANTIGRAVITY_CSRF_TOKEN=csrf-1\0ANTIGRAVITY_LS_ADDRESS=127.0.0.1:{dead_port}\0ANTIGRAVITY_AGENTAPI_EXE={}\0",
+            old.display()
+        );
+        note_agy_proc_env(dead_env.as_bytes(), &mut csrf, &mut addr, &mut exe);
+        assert_eq!(csrf.as_deref(), Some("csrf-1"));
+        assert!(addr.is_none());
+        assert!(exe.is_none());
+
+        let live_env = format!(
+            "ANTIGRAVITY_LS_ADDRESS=127.0.0.1:{live_port}\0ANTIGRAVITY_AGENTAPI_EXE={}\0",
+            good.display()
+        );
+        note_agy_proc_env(live_env.as_bytes(), &mut csrf, &mut addr, &mut exe);
+        assert_eq!(
+            addr.as_deref(),
+            Some(format!("127.0.0.1:{live_port}").as_str())
+        );
+        assert_eq!(exe.as_deref(), Some(good.as_path()));
+    }
+
+    #[test]
+    fn discover_agy_routes_replaces_old_or_missing_agentapi_exe() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agy_dir = home.join(".gemini").join("antigravity-cli");
+        fs::create_dir_all(agy_dir.join("brain")).unwrap();
+        let bin_dir = home.join(".local").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let local = bin_dir.join("agy");
+        fs::write(&local, b"#!/bin/sh\n").unwrap();
+        let old = bin_dir.join("agy.42.old");
+        fs::write(&old, b"#!/bin/sh\n").unwrap();
+        let missing = bin_dir.join("agy-missing");
+        let good = bin_dir.join("agy-good");
+        fs::write(&good, b"#!/bin/sh\n").unwrap();
+
+        let at = At::parse("2026-10-29T12:00:00.000Z").unwrap();
+        let mut stale = RouteTable::default();
+        stale.upsert(
+            "oldie",
+            VendorRoute::Agy {
+                conversation_id: "conv-old".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(old),
+            },
+            at.clone(),
+        );
+        stale.upsert(
+            "gone",
+            VendorRoute::Agy {
+                conversation_id: "conv-gone".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(missing),
+            },
+            at.clone(),
+        );
+        stale.discover_routes(Some(home), At::parse("2026-10-29T12:05:00.000Z").unwrap());
+        let exe_of = |table: &RouteTable, persona: &str| match &table.get(persona).unwrap().route {
+            VendorRoute::Agy { agentapi_exe, .. } => agentapi_exe.clone(),
+            other => panic!("expected agy route, got {other:?}"),
+        };
+        assert_eq!(exe_of(&stale, "oldie"), Some(local.clone()));
+        assert_eq!(exe_of(&stale, "gone"), Some(local));
+
+        let mut kept = RouteTable::default();
+        kept.upsert(
+            "kept",
+            VendorRoute::Agy {
+                conversation_id: "conv-kept".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(good.clone()),
+            },
+            at,
+        );
+        kept.discover_routes(Some(home), At::parse("2026-10-29T12:05:00.000Z").unwrap());
+        assert_eq!(exe_of(&kept, "kept"), Some(good));
+    }
+
+    #[test]
+    fn discover_agy_routes_repairs_old_exe_when_brain_missing() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        assert!(
+            !home
+                .join(".gemini")
+                .join("antigravity-cli")
+                .join("brain")
+                .exists()
+        );
+        let bin_dir = home.join(".local").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let local = bin_dir.join("agy");
+        fs::write(&local, b"#!/bin/sh\n").unwrap();
+        let old = bin_dir.join("agy.1710000000.old");
+        fs::write(&old, b"#!/bin/sh\n").unwrap();
+
+        let mut table = RouteTable::default();
+        table.upsert(
+            "felicia",
+            VendorRoute::Agy {
+                conversation_id: "conv-felicia".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(old),
+            },
+            At::parse("2026-10-29T12:00:00.000Z").unwrap(),
+        );
+        table.discover_routes(Some(home), At::parse("2026-10-29T12:05:00.000Z").unwrap());
+
+        match &table.get("felicia").unwrap().route {
+            VendorRoute::Agy { agentapi_exe, .. } => {
+                assert_eq!(agentapi_exe.as_deref(), Some(local.as_path()));
+            }
+            other => panic!("expected agy route, got {other:?}"),
+        }
     }
 }

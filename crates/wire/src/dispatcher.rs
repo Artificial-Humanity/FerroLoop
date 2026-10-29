@@ -11,7 +11,15 @@ use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
 use fl_core::store::MessageStore;
 
-use crate::identity::{RouteTable, VendorRoute, resolve_claude_key_path};
+use crate::identity::{RouteTable, VendorRoute, resolve_agy_exe, resolve_claude_key_path};
+
+/// `clear` sends the vendor reset command only. `reforge` sends that command
+/// and then the canonical hydration prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResetMode {
+    Clear,
+    Reforge,
+}
 
 /// Maximum automatic push delivery attempts before leaving a message `Pending` for explicit poll.
 pub const MAX_DELIVER: u32 = 5;
@@ -98,24 +106,6 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             agentapi_exe,
             ..
         } => {
-            let exe = agentapi_exe
-                .clone()
-                .or_else(|| std::env::var_os("ANTIGRAVITY_AGENTAPI_EXE").map(PathBuf::from))
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .map(|h| h.join(".local").join("bin").join("agy"))
-                })
-                .unwrap_or_else(|| PathBuf::from("agy"));
-            let addr = ls_address
-                .clone()
-                .or_else(|| std::env::var("ANTIGRAVITY_LS_ADDRESS").ok())
-                .unwrap_or_default();
-            let csrf = csrf_token
-                .clone()
-                .or_else(|| std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok())
-                .unwrap_or_default();
-
             let title = format!("--title={}", format_push_header(msg));
             let delivered_body = if msg.sender_name.eq_ignore_ascii_case("owner")
                 || msg.sender_name.eq_ignore_ascii_case("lmcfarlin")
@@ -131,31 +121,14 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             } else {
                 format_push_message(msg)
             };
-            let mut cmd = Command::new(&exe);
-            cmd.args([
-                "agentapi",
-                "send-message",
-                &title,
+            deliver_to_agy_route(
                 conversation_id,
+                ls_address,
+                csrf_token,
+                agentapi_exe,
+                &title,
                 &delivered_body,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-            cmd.env("ANTIGRAVITY_CONVERSATION_ID", conversation_id);
-            cmd.env("ANTIGRAVITY_AGENTAPI_EXE", &exe);
-            if !addr.is_empty() {
-                cmd.env("ANTIGRAVITY_LS_ADDRESS", &addr);
-            }
-            if !csrf.is_empty() {
-                cmd.env("ANTIGRAVITY_CSRF_TOKEN", &csrf);
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
-            if !status.success() {
-                return Err(format!("agy send-message exited with {status}"));
-            }
-            Ok(())
+            )
         }
         VendorRoute::Codex { thread_id, cwd } => {
             let formatted = format_push_message(msg);
@@ -358,6 +331,147 @@ fn deliver_to_grok_route(
     Ok(())
 }
 
+fn deliver_to_agy_route(
+    conversation_id: &str,
+    ls_address: &Option<String>,
+    csrf_token: &Option<String>,
+    agentapi_exe: &Option<PathBuf>,
+    title: &str,
+    body: &str,
+) -> Result<(), String> {
+    let env_exe = std::env::var_os("ANTIGRAVITY_AGENTAPI_EXE").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let exe = resolve_agy_exe(agentapi_exe.as_deref(), env_exe.as_deref(), home.as_deref());
+    let addr = ls_address
+        .clone()
+        .or_else(|| std::env::var("ANTIGRAVITY_LS_ADDRESS").ok())
+        .unwrap_or_default();
+    let csrf = csrf_token
+        .clone()
+        .or_else(|| std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok())
+        .unwrap_or_default();
+
+    let mut cmd = Command::new(&exe);
+    cmd.args(["agentapi", "send-message", title, conversation_id, body])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.env("ANTIGRAVITY_CONVERSATION_ID", conversation_id);
+    cmd.env("ANTIGRAVITY_AGENTAPI_EXE", &exe);
+    if !addr.is_empty() {
+        cmd.env("ANTIGRAVITY_LS_ADDRESS", &addr);
+    }
+    if !csrf.is_empty() {
+        cmd.env("ANTIGRAVITY_CSRF_TOKEN", &csrf);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
+    if !status.success() {
+        return Err(format!("agy send-message exited with {status}"));
+    }
+    Ok(())
+}
+
+/// Reset a live vendor session. Tmux-backed Muse and Grok routes send `C-u`,
+/// the slash command, and `Enter` through `tmux send-keys`. Every other route
+/// sends that slash command through [`dispatch_operator_prompt_to_route`].
+/// Codex and Grok use `/new`. Claude, Muse, Antigravity, and Webhook use `/clear`.
+///
+/// Reforge waits 2s after a tmux reset (skipped when `FL_WIRE_TMUX_BIN` is set)
+/// and then delivers `reforge_prompt` on the same route.
+pub fn clear_or_reforge_session(
+    route: &VendorRoute,
+    mode: SessionResetMode,
+    sender_name: &str,
+    reforge_prompt: Option<&str>,
+) -> Result<(), String> {
+    let slash = session_reset_slash(route);
+    if let Some(target) = alive_tmux_reset_target(route) {
+        send_tmux_reset_keys(&target, slash)?;
+        if mode == SessionResetMode::Reforge {
+            let prompt = require_reforge_prompt(reforge_prompt)?;
+            if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() {
+                std::thread::sleep(Duration::from_millis(2000));
+            }
+            dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
+        }
+        return Ok(());
+    }
+    dispatch_operator_prompt_to_route(route, sender_name, slash)?;
+    if mode == SessionResetMode::Reforge {
+        let prompt = require_reforge_prompt(reforge_prompt)?;
+        dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
+    }
+    Ok(())
+}
+
+fn require_reforge_prompt(reforge_prompt: Option<&str>) -> Result<&str, String> {
+    reforge_prompt
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .ok_or_else(|| "missing reforge prompt".to_string())
+}
+
+fn session_reset_slash(route: &VendorRoute) -> &'static str {
+    match route {
+        VendorRoute::Codex { .. } | VendorRoute::Grok { .. } => "/new",
+        VendorRoute::Claude { .. }
+        | VendorRoute::Muse { .. }
+        | VendorRoute::Agy { .. }
+        | VendorRoute::Webhook { .. } => "/clear",
+    }
+}
+
+fn alive_tmux_reset_target(route: &VendorRoute) -> Option<String> {
+    let ordered: [&Option<String>; 2] = match route {
+        VendorRoute::Grok {
+            tmux_pane,
+            tmux_target,
+            ..
+        } => [tmux_pane, tmux_target],
+        VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        } => [tmux_target, tmux_pane],
+        VendorRoute::Claude { .. }
+        | VendorRoute::Codex { .. }
+        | VendorRoute::Agy { .. }
+        | VendorRoute::Webhook { .. } => return None,
+    };
+    let mut seen = Vec::new();
+    for slot in ordered {
+        let Some(raw) = slot else {
+            continue;
+        };
+        let target = raw.trim();
+        if target.is_empty() || seen.iter().any(|seen| seen == target) {
+            continue;
+        }
+        seen.push(target.to_string());
+        if tmux_target_alive(target) {
+            return Some(target.to_string());
+        }
+    }
+    None
+}
+
+fn send_tmux_reset_keys(target: &str, slash: &str) -> Result<(), String> {
+    let tmux = tmux_bin();
+    for key in ["C-u", slash, "Enter"] {
+        let status = Command::new(&tmux)
+            .args(["send-keys", "-t", target, key])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map_err(|e| format!("failed to spawn tmux send-keys: {e}"))?;
+        if !status.success() {
+            return Err(format!("tmux send-keys {key} exited with {status}"));
+        }
+    }
+    Ok(())
+}
+
 fn tmux_bin() -> PathBuf {
     std::env::var_os("FL_WIRE_TMUX_BIN")
         .map(PathBuf::from)
@@ -525,55 +639,25 @@ pub fn dispatch_operator_prompt_to_route(
             agentapi_exe,
             ..
         } => {
-            let exe = agentapi_exe
-                .clone()
-                .or_else(|| std::env::var_os("ANTIGRAVITY_AGENTAPI_EXE").map(PathBuf::from))
-                .or_else(|| {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .map(|h| h.join(".local").join("bin").join("agy"))
-                })
-                .unwrap_or_else(|| PathBuf::from("agy"));
-            let addr = ls_address
-                .clone()
-                .or_else(|| std::env::var("ANTIGRAVITY_LS_ADDRESS").ok())
-                .unwrap_or_default();
-            let csrf = csrf_token
-                .clone()
-                .or_else(|| std::env::var("ANTIGRAVITY_CSRF_TOKEN").ok())
-                .unwrap_or_default();
-
             let title = "--title=[Operator Prompt via FerroDeck]";
-            let delivered_body = if body.starts_with("[Operator Prompt via FerroDeck") {
+            // `/clear` and `/new` must reach Antigravity as the reset command.
+            // Every other body, including the reforge prompt, keeps the prefix.
+            let trimmed = body.trim();
+            let delivered_body = if matches!(trimmed, "/clear" | "/new") {
+                trimmed.to_string()
+            } else if body.starts_with("[Operator Prompt via FerroDeck") {
                 body.to_string()
             } else {
                 format!("[Operator Prompt via FerroDeck — from {sender_name}]\n\n{body}")
             };
-            let mut cmd = Command::new(&exe);
-            cmd.args([
-                "agentapi",
-                "send-message",
-                title,
+            deliver_to_agy_route(
                 conversation_id,
+                ls_address,
+                csrf_token,
+                agentapi_exe,
+                title,
                 &delivered_body,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-            cmd.env("ANTIGRAVITY_CONVERSATION_ID", conversation_id);
-            cmd.env("ANTIGRAVITY_AGENTAPI_EXE", &exe);
-            if !addr.is_empty() {
-                cmd.env("ANTIGRAVITY_LS_ADDRESS", &addr);
-            }
-            if !csrf.is_empty() {
-                cmd.env("ANTIGRAVITY_CSRF_TOKEN", &csrf);
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
-            if !status.success() {
-                return Err(format!("agy send-message exited with {status}"));
-            }
-            Ok(())
+            )
         }
         VendorRoute::Codex { thread_id, cwd } => {
             deliver_to_codex_route(thread_id, cwd.as_ref(), body)
@@ -675,7 +759,13 @@ mod tests {
     use fl_core::mem::MemStore;
     use std::io::BufRead;
     use std::os::unix::net::UnixListener;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// `FL_WIRE_TMUX_BIN` is process-global. Tests that point it at a fake tmux
+    /// must hold this lock for the whole test, including the earlier vendor
+    /// dispatch that treats a set tmux bin as permission to use tmux.
+    static TMUX_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn claude_socket_dispatch_sends_auth_and_user_frame_and_acks_receipt() {
@@ -806,6 +896,7 @@ mod tests {
     fn muse_and_grok_dispatch_invokes_configured_binaries_with_expected_args() {
         use std::os::unix::fs::PermissionsExt;
 
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let tmp = TempDir::new().unwrap();
         let muse_out = tmp.path().join("muse-args.txt");
         let muse_bin = tmp.path().join("mock-muse.sh");
@@ -1008,5 +1099,188 @@ mod tests {
         assert_eq!(wh_json["kind"], "operator_prompt");
         assert_eq!(wh_json["sender_name"], "lmcfarlin");
         assert_eq!(wh_json["body"], "Inspect the UI");
+    }
+
+    #[test]
+    fn clear_or_reforge_tmux_sends_reset_keys_then_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let tmux_out = tmp.path().join("tmux.out");
+        let tmux_stdin = tmp.path().join("tmux.stdin");
+        let tmux_bin = tmp.path().join("fake-tmux.sh");
+        fs::write(
+            &tmux_bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  echo \"%9\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
+                tmux_out.display(),
+                tmux_stdin.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let grok = VendorRoute::Grok {
+            session_id: "gs-1".into(),
+            cwd: None,
+            tmux_target: Some("grok:felicia".into()),
+            tmux_pane: Some("%9".into()),
+        };
+        let muse = VendorRoute::Muse {
+            session_id: "ms-1".into(),
+            cwd: None,
+            tmux_target: Some("muse:felicia".into()),
+            tmux_pane: None,
+        };
+
+        // SAFETY: this test is the only fl-wire test that keeps FL_WIRE_TMUX_BIN set
+        // for clear/reforge. The guard restores the previous value on drop.
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        clear_or_reforge_session(&grok, SessionResetMode::Clear, "owner", None).unwrap();
+        clear_or_reforge_session(
+            &muse,
+            SessionResetMode::Reforge,
+            "owner",
+            Some("reforge muse now"),
+        )
+        .unwrap();
+        drop(_env);
+
+        let log = fs::read_to_string(&tmux_out).unwrap();
+        assert!(log.contains("send-keys -t %9 C-u"));
+        assert!(log.contains("send-keys -t %9 /new"));
+        assert!(log.contains("send-keys -t %9 Enter"));
+        assert!(log.contains("send-keys -t muse:felicia C-u"));
+        assert!(log.contains("send-keys -t muse:felicia /clear"));
+        assert!(log.contains("send-keys -t muse:felicia Enter"));
+        assert!(log.contains("load-buffer -b fl-wire-muse-"));
+        let pasted = fs::read_to_string(&tmux_stdin).unwrap();
+        assert_eq!(pasted.trim(), "reforge muse now");
+        let reset_at = log.find("send-keys -t muse:felicia /clear").unwrap();
+        let paste_at = log.find("load-buffer -b fl-wire-muse-").unwrap();
+        assert!(reset_at < paste_at);
+    }
+
+    #[test]
+    fn clear_or_reforge_codex_sends_new_then_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("codex.out");
+        let bin = tmp.path().join("fake-codex.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // SAFETY: restores FL_WIRE_CODEX_BIN when the guard drops.
+        let _env = EnvGuard::set("FL_WIRE_CODEX_BIN", &bin);
+        clear_or_reforge_session(
+            &VendorRoute::Codex {
+                thread_id: "thread-7".into(),
+                cwd: None,
+            },
+            SessionResetMode::Reforge,
+            "owner",
+            Some("reforge codex"),
+        )
+        .unwrap();
+        drop(_env);
+
+        let log = fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines[0], "queue");
+        assert_eq!(lines[1], "--thread");
+        assert_eq!(lines[2], "thread-7");
+        assert_eq!(lines[3], "--message");
+        assert_eq!(lines[4], "/new");
+        assert_eq!(lines[5], "queue");
+        assert_eq!(lines[9], "reforge codex");
+    }
+
+    #[test]
+    fn clear_or_reforge_agy_sends_raw_slash_then_prefixed_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("agy-args.txt");
+        let bin = tmp.path().join("fake-agy.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nprintf '%s\\n' '--CALL--' >> \"{}\"\n",
+                out.display(),
+                out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        clear_or_reforge_session(
+            &VendorRoute::Agy {
+                conversation_id: "conv-felicia".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: Some(bin),
+            },
+            SessionResetMode::Reforge,
+            "owner",
+            Some("reforge agy now"),
+        )
+        .unwrap();
+
+        let log = fs::read_to_string(&out).unwrap();
+        let mut calls = log.split("--CALL--");
+        let first = calls.next().expect("slash invocation");
+        let second = calls.next().expect("reforge invocation");
+        let first_args: Vec<&str> = first.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(
+            first_args.last().copied(),
+            Some("/clear"),
+            "slash must be delivered raw, got {first}"
+        );
+        assert!(
+            !first.contains("[Operator Prompt via FerroDeck — from"),
+            "reset slash must not be wrapped: {first}"
+        );
+        let slash_at = log.find("\n/clear\n").expect("raw /clear");
+        let prefix_at = log
+            .find("[Operator Prompt via FerroDeck — from owner]")
+            .expect("operator prefix");
+        assert!(slash_at < prefix_at);
+        assert!(second.contains("reforge agy now"), "{second}");
+    }
+
+    struct EnvGuard {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
     }
 }
