@@ -358,10 +358,14 @@ pub fn discover_sessions_from_snapshot(
     }
 
     for session in &mut out {
-        if session.source == "route"
-            && matches!(session.adapter.as_str(), "codex" | "grok" | "muse")
-        {
-            session.quota_usage = read_session_quota_usage_with_home(&session.id, home_override);
+        if session.source == "route" {
+            // `home` is for transcript lookup only. Production passes `None`
+            // so probes may use `PATH`; `Some($HOME)` would skip them.
+            session.quota_usage = quota_for_resolved_route(
+                &session.adapter,
+                session.transcript_path.as_deref(),
+                home_override,
+            );
         }
     }
 
@@ -495,7 +499,7 @@ fn read_codex_configured_context_window(tpath: &Path) -> Option<u64> {
     None
 }
 
-fn json_f64(value: Option<&Value>) -> Option<f64> {
+pub(crate) fn json_f64(value: Option<&Value>) -> Option<f64> {
     let value = value?;
     value
         .as_f64()
@@ -511,7 +515,7 @@ fn json_u64_token(value: Option<&Value>) -> u64 {
 ///
 /// Accepts `fl_core::At`'s 24-character millisecond `Z` spelling, second-precision `Z`,
 /// and numeric offsets (`+00:00`, `-05:30`).
-fn parse_iso8601_unix_millis(raw: &str) -> Option<u64> {
+pub(crate) fn parse_iso8601_unix_millis(raw: &str) -> Option<u64> {
     let s = raw.trim().trim_end_matches(['.', ',', ';']);
     if let Ok(at) = fl_core::At::parse(s) {
         return Some(at.unix_millis());
@@ -785,12 +789,23 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
     None
 }
 
-/// Read account quota for `session_id` from on-disk vendor files.
+/// Read account quota for `session_id`.
 ///
 /// Codex rollouts supply both windows. Grok's unified log supplies the weekly window.
-/// Muse supplies an exhaustion reason when a terminal quota failure is still current.
-/// Claude and Antigravity return `None`.
+/// Muse, Claude, and Antigravity merge on-disk exhaustion with the direct account probe.
+/// The probe result is cached for 60 seconds. A home override does not run host binaries.
 pub fn read_session_quota_usage_with_home(
+    session_id: &str,
+    home_override: Option<&Path>,
+) -> Option<SessionQuotaUsage> {
+    crate::direct_quota::with_probe_lock(|| {
+        read_session_quota_usage_locked(session_id, home_override)
+    })
+}
+
+/// Same read as [`read_session_quota_usage_with_home`], for a caller that already holds
+/// the probe lock.
+pub(crate) fn read_session_quota_usage_locked(
     session_id: &str,
     home_override: Option<&Path>,
 ) -> Option<SessionQuotaUsage> {
@@ -801,19 +816,103 @@ pub fn read_session_quota_usage_with_home(
     let home = home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
-    let tpath = PathBuf::from(find_transcript_file_in_home(&home, trimmed)?);
-    let lossy = tpath.to_string_lossy();
-    let file_name = tpath.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let tpath = find_transcript_file_in_home(&home, trimmed)?;
+    let adapter = adapter_for_transcript(Path::new(&tpath))?;
+    quota_for_resolved_route_locked(&adapter, Some(&tpath), home_override)
+}
+
+/// Quota for a route row whose transcript path is already known.
+///
+/// This does not search the home directory again.
+pub(crate) fn quota_for_resolved_route(
+    adapter: &str,
+    transcript_path: Option<&str>,
+    home_override: Option<&Path>,
+) -> Option<SessionQuotaUsage> {
+    crate::direct_quota::with_probe_lock(|| {
+        quota_for_resolved_route_locked(adapter, transcript_path, home_override)
+    })
+}
+
+fn quota_for_resolved_route_locked(
+    adapter: &str,
+    transcript_path: Option<&str>,
+    home_override: Option<&Path>,
+) -> Option<SessionQuotaUsage> {
+    let home = home_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+    match adapter {
+        "codex" => {
+            let path = transcript_path?;
+            let raw = fs::read_to_string(path).ok()?;
+            codex_quota_from_rollout(&raw)
+        }
+        "grok" => {
+            transcript_path?;
+            let home = home?;
+            grok_quota_from_home(&home)
+        }
+        "muse" => {
+            let disk = transcript_path.and_then(|path| {
+                let raw = fs::read_to_string(path).ok()?;
+                muse_quota_from_session(&raw)
+            });
+            let account = crate::direct_quota::muse_account_quota(home_override);
+            crate::direct_quota::merge_account_quota(account, disk)
+        }
+        "claude" => {
+            let disk = transcript_path.and_then(|path| {
+                let raw = fs::read_to_string(path).ok()?;
+                let reason = crate::direct_quota::claude_rate_limit_reason(&raw)?;
+                Some(SessionQuotaUsage {
+                    tier: None,
+                    primary_window: None,
+                    secondary_window: None,
+                    exhausted_reason: Some(reason),
+                })
+            });
+            let account = crate::direct_quota::claude_account_quota(home_override);
+            crate::direct_quota::merge_account_quota(account, disk)
+        }
+        "antigravity" => {
+            let disk = transcript_path.and_then(|path| {
+                let raw = fs::read_to_string(path).ok()?;
+                let reason = crate::direct_quota::antigravity_exhausted_reason(&raw)?;
+                Some(SessionQuotaUsage {
+                    tier: None,
+                    primary_window: None,
+                    secondary_window: None,
+                    exhausted_reason: Some(reason),
+                })
+            });
+            let account = crate::direct_quota::agy_account_quota(home_override);
+            crate::direct_quota::merge_account_quota(account, disk)
+        }
+        _ => None,
+    }
+}
+
+fn adapter_for_transcript(path: &Path) -> Option<String> {
+    let lossy = path.to_string_lossy();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     if lossy.contains(".codex") && file_name.starts_with("rollout-") {
-        let raw = fs::read_to_string(&tpath).ok()?;
-        return codex_quota_from_rollout(&raw);
+        return Some("codex".to_string());
     }
     if lossy.contains(".grok") {
-        return grok_quota_from_home(&home);
+        return Some("grok".to_string());
     }
     if file_name == "session.jsonl" && lossy.contains("muse") {
-        let raw = fs::read_to_string(&tpath).ok()?;
-        return muse_quota_from_session(&raw);
+        return Some("muse".to_string());
+    }
+    if lossy.contains(".claude") {
+        return Some("claude".to_string());
+    }
+    if is_antigravity_transcript(path) {
+        return Some("antigravity".to_string());
     }
     None
 }
@@ -3421,5 +3520,161 @@ mod tests {
         });
         fs::write(&path, format!("{failure}\n{completed}\n")).unwrap();
         assert!(read_session_quota_usage_with_home(session, Some(home)).is_none());
+    }
+
+    #[test]
+    fn resolved_transcript_path_supplies_quota_without_searching_home() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let logs = home.join(".grok").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let line = serde_json::json!({
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "subscriptionTier": "SuperGrok",
+                "config": { "creditUsagePercent": 1.0 }
+            }
+        });
+        fs::write(logs.join("unified.jsonl"), format!("{line}\n")).unwrap();
+        assert!(quota_for_resolved_route("grok", None, Some(home)).is_none());
+
+        let quota = quota_for_resolved_route("grok", Some("already-resolved"), Some(home))
+            .expect("resolved grok path");
+        assert_eq!(quota.tier.as_deref(), Some("SuperGrok"));
+
+        let rollout = tmp.path().join("not-under-codex.jsonl");
+        let event = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "plan_type": "plus",
+                    "primary": { "used_percent": 3.0, "resets_at": 10 },
+                    "secondary": { "used_percent": 4.0, "resets_at": 20 }
+                }
+            }
+        });
+        fs::write(&rollout, format!("{event}\n")).unwrap();
+        let codex = quota_for_resolved_route("codex", Some(rollout.to_str().unwrap()), None)
+            .expect("resolved codex path");
+        assert_eq!(codex.tier.as_deref(), Some("plus"));
+        assert_eq!(codex.primary_window.unwrap().window_minutes, Some(300));
+        assert!(quota_for_resolved_route("codex", None, Some(home)).is_none());
+    }
+
+    #[test]
+    fn production_snapshot_probes_muse_on_path_when_home_override_is_none() {
+        crate::direct_quota::with_probe_lock(|| {
+            struct RestoreEnv {
+                home: Option<std::ffi::OsString>,
+                path: Option<std::ffi::OsString>,
+                xdg: Option<std::ffi::OsString>,
+                disable_host: Option<std::ffi::OsString>,
+                muse_bin: Option<std::ffi::OsString>,
+                claude_bin: Option<std::ffi::OsString>,
+                claude_usage: Option<std::ffi::OsString>,
+                agy: Option<std::ffi::OsString>,
+            }
+
+            impl RestoreEnv {
+                fn capture() -> Self {
+                    Self {
+                        home: std::env::var_os("HOME"),
+                        path: std::env::var_os("PATH"),
+                        xdg: std::env::var_os("XDG_RUNTIME_DIR"),
+                        disable_host: std::env::var_os("FL_WIRE_DISABLE_HOST_DISCOVERY"),
+                        muse_bin: std::env::var_os("FL_HUB_MUSE_BIN"),
+                        claude_bin: std::env::var_os("FL_HUB_CLAUDE_BIN"),
+                        claude_usage: std::env::var_os("FL_CLAUDE_USAGE_JSON"),
+                        agy: std::env::var_os("FL_AGY_QUOTA_JSON"),
+                    }
+                }
+
+                fn restore_one(key: &str, value: &Option<std::ffi::OsString>) {
+                    // SAFETY: PROBE_LOCK is held, and this guard restores the
+                    // previous value before that lock is released.
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+
+            impl Drop for RestoreEnv {
+                fn drop(&mut self) {
+                    Self::restore_one("HOME", &self.home);
+                    Self::restore_one("PATH", &self.path);
+                    Self::restore_one("XDG_RUNTIME_DIR", &self.xdg);
+                    Self::restore_one("FL_WIRE_DISABLE_HOST_DISCOVERY", &self.disable_host);
+                    Self::restore_one("FL_HUB_MUSE_BIN", &self.muse_bin);
+                    Self::restore_one("FL_HUB_CLAUDE_BIN", &self.claude_bin);
+                    Self::restore_one("FL_CLAUDE_USAGE_JSON", &self.claude_usage);
+                    Self::restore_one("FL_AGY_QUOTA_JSON", &self.agy);
+                }
+            }
+
+            use std::os::unix::fs::PermissionsExt;
+
+            let _restore = RestoreEnv::capture();
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path();
+            let session_id = "muse-direct-probe-6f0a9c2e";
+            let routes = format!(
+                r#"{{"entries":{{"muse-persona":{{"persona":"muse-persona","updated_at":"2026-10-29T00:00:00.000Z","route":{{"kind":"muse","session_id":"{session_id}"}}}}}}}}"#
+            );
+            fs::write(root.join("fl-wire-routes.json"), routes).unwrap();
+
+            let bin_dir = root.join("bin");
+            fs::create_dir_all(&bin_dir).unwrap();
+            let counter_path = root.join("muse-count");
+            let script = bin_dir.join("muse");
+            fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nf=\"{}\"\nn=0\nif [ -f \"$f\" ]; then n=$(cat \"$f\"); fi\nn=$((n+1))\nprintf '%s\\n' \"$n\" > \"$f\"\nprintf '%s\\n' '{{\"allowance\":null}}'\n",
+                    counter_path.display()
+                ),
+            )
+            .unwrap();
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+
+            let mut path_dirs = vec![bin_dir];
+            if let Some(path) = std::env::var_os("PATH") {
+                path_dirs.extend(std::env::split_paths(&path));
+            }
+            let path = std::env::join_paths(&path_dirs).unwrap();
+            // SAFETY: PROBE_LOCK is held, and RestoreEnv restores HOME, PATH,
+            // and the probe variables before that lock is released.
+            unsafe {
+                std::env::set_var("HOME", root);
+                std::env::set_var("XDG_RUNTIME_DIR", root);
+                std::env::set_var("PATH", &path);
+                std::env::set_var("FL_WIRE_DISABLE_HOST_DISCOVERY", "1");
+                std::env::remove_var("FL_HUB_MUSE_BIN");
+                std::env::remove_var("FL_HUB_CLAUDE_BIN");
+                std::env::remove_var("FL_CLAUDE_USAGE_JSON");
+                std::env::remove_var("FL_AGY_QUOTA_JSON");
+            }
+            crate::direct_quota::expire_direct_quota_cache();
+
+            let sessions =
+                discover_sessions_from_snapshot(&DiscoveryStoreSnapshot::default(), None);
+            assert_eq!(
+                sessions
+                    .iter()
+                    .filter(|session| session.id == session_id)
+                    .count(),
+                1
+            );
+            let hits = fs::read_to_string(&counter_path)
+                .ok()
+                .and_then(|text| text.trim().parse::<u64>().ok())
+                .unwrap_or(0);
+            assert_eq!(hits, 1);
+        });
     }
 }

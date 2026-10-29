@@ -1,7 +1,10 @@
 # Vendor runtimes
 
 On-disk shapes for the five host runtimes FerroLoop discovers and FerroDeck displays.
-Hub reads these files. It does not call quota RPCs, and it does not send OAuth requests.
+Hub reads these files. It also asks the local `muse` and `claude` CLIs for account
+allowance at most once every 60 seconds. A cold probe waits at most 3 seconds, outside
+the store lock. A home override, as in unit tests, does not run the host binaries
+unless `FL_HUB_MUSE_BIN` or `FL_HUB_CLAUDE_BIN` is set.
 
 Versions seen on a live host: Claude Code 2.1.312, OpenAI Codex 0.165.0, xAI Grok CLI 1.0.70.
 Antigravity and Meta Muse do not write a version file.
@@ -19,15 +22,16 @@ peer credentials, or request ids into this document or into tests.
 | Field | Meaning |
 | --- | --- |
 | `tier` | Vendor plan name, when the file has one. |
-| `primary_window` | Shorter window. Codex uses 300 minutes. Muse uses this for a quota-exhausted reset. |
+| `primary_window` | Shorter window. Codex and Claude use 300 minutes. A Muse CLI `window` uses `windowDurationMins`. A Muse quota-exhausted reset also uses this field. |
 | `secondary_window` | Longer window. Codex and Grok use 10080 minutes (7 days). |
 | `exhausted_reason` | Vendor string when the account is out of quota. |
 | `QuotaWindowUsage.used_percent` | Vendor number, copied as written. Not rescaled. |
 | `window_minutes` | Length of the window, when Hub knows it. |
 | `resets_at_ms` | Unix milliseconds when the window resets. |
 
-Attempt rows from the store have no `quota_usage`. Claude Code and Antigravity have no
-allowance file, so their sessions omit `quota_usage`.
+Attempt rows from the store have no `quota_usage`. Claude Code, Antigravity, and Muse
+fill `quota_usage` from a direct probe, an override JSON value, or a rate-limit error
+in the transcript.
 
 ## Antigravity
 
@@ -57,8 +61,14 @@ with no positive sum reports no context usage.
 
 ### Account quota
 
-No allowance file. A live language-server method named `RetrieveUserQuotaSummary` appears in
-`cli.log`. Hub does not call it. The response body is not on disk.
+`ERROR_MESSAGE.error` is `exhausted_reason` when the text contains `429`, `quota`, or a
+rate-limit phrase. The latest matching line wins.
+
+Hub does not call `RetrieveUserQuotaSummary`. When `FL_AGY_QUOTA_JSON` is a JSON object
+or a path to one, Hub maps `tier`, `window` (`usedPercent`, `windowDurationMins`,
+`resetsAtMs`), and `weekly` (`usedPercent`, `resetsAtMs`, 10080 minutes). That result is
+cached for 60 seconds and merged with the transcript reason. The transcript reason wins
+when both are set.
 
 ### Delivery
 
@@ -91,8 +101,23 @@ Hub sums those four usage fields on the latest non-sidechain line with a positiv
 
 ### Account quota
 
-No 5-hour window and no weekly window on disk. `userType` and `service_tier` are not plan
-allowances. `quota_usage` stays empty.
+`claude auth status --json` supplies `tier` from `subscriptionType` (for example `pro`
+or `max`). Hub runs `claude` on `PATH`, or else `~/.local/bin/claude`. The timeout is
+3 seconds. The result is cached for 60 seconds.
+
+`primary_window` is `five_hour` (300 minutes). `secondary_window` is `seven_day`
+(10080 minutes). `utilization` or `used_percentage` is copied as written. `resets_at`
+is an ISO-8601 timestamp converted to Unix milliseconds.
+
+Those windows come from `FL_CLAUDE_USAGE_JSON` (JSON text or a file path), or from
+`five_hour` and `seven_day` on `claudeAiOauth`. When neither is present, `rateLimitTier`
+is set, and Hub is using the real home directory, Hub sends one request to
+`https://api.anthropic.com/api/oauth/usage`. The access token is not logged and is not
+returned on the API.
+
+A `system` or `api-request` transcript row, or an assistant `error` field, sets
+`exhausted_reason` when the text contains a rate-limit phrase. The latest matching row
+wins. Hub merges that reason with the account windows.
 
 ### Delivery
 
@@ -233,8 +258,17 @@ No allowance counter file. A `runtime.session` event with `kind`
 * `primary_window.window_minutes` omitted
 * `primary_window.resets_at_ms` parsed from `Your usage window resets at <ISO-8601>.`
 
-A later `model_completed` event clears the exhaustion. Hub then omits `quota_usage`.
-The reset instant comes from the reason text, not from `recorded_at`.
+A later `model_completed` event clears the exhaustion. Hub then omits `quota_usage`
+unless the CLI probe still has an allowance. The reset instant comes from the reason
+text, not from `recorded_at`.
+
+Hub also runs `muse usage --json` (`muse` on `PATH`, or else `~/.local/bin/muse`) with
+the same 3-second timeout and 60-second cache. `allowance.tier` is `tier`.
+`allowance.window` is `primary_window` (`usedPercent`, `windowDurationMins`, `resetsAtMs`).
+`allowance.weekly` is `secondary_window` (`usedPercent`, `resetsAtMs`, 10080 minutes).
+A null `allowance` leaves the on-disk result unchanged. When both exist, the CLI `tier`
+and windows are kept, a missing CLI window falls back to the file, and the transcript
+`exhausted_reason` is kept.
 
 ### Delivery
 
@@ -247,10 +281,11 @@ HTTP authentication opens the store only long enough to resolve a session token,
 it. Owner and peer bearer tokens are compared in memory and do not need a store open.
 Each route opens the store again only around B-tree reads and writes.
 
-Session discovery, transcript parsing, `git` and `gh` subprocesses, and prompt delivery run
-after that guard is dropped. `GET /api/v1/worktrees` and `GET /api/v1/architecture` do not
-open the store. Queue drain snapshots `list_agents` and attempt rows, drops the guard, then
-reads transcripts and dispatches prompts.
+Session discovery, transcript parsing, `git` and `gh` subprocesses, quota CLI probes, and
+prompt delivery run after that guard is dropped. `GET /api/v1/worktrees` and
+`GET /api/v1/architecture` do not open the store. Queue drain returns before it opens the
+store when no prompt is queued. When a prompt is queued, drain snapshots attempt rows,
+drops the guard, then reads transcripts and dispatches prompts.
 
 `GET /api/v1/prs` reads workspace runtime state keys `pr-*`. This tree has no `gh pr` handler
 and no `list_pr_reviews` call in the hub crate. Those commands are not inserted here.

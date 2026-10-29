@@ -2621,15 +2621,18 @@ fn dispatch_operator_prompt_for_session(
 /// Automatically drain and dispatch the next queued operator prompt for any session whose
 /// transcript/in-flight state has transitioned from busy to idle.
 pub fn drain_ready_session_queues(state: &HubState) {
+    let keys = state.queued_session_keys();
+    if keys.is_empty() {
+        return;
+    }
     let snap = {
         let Ok(store) = state.open_store() else {
             return;
         };
-        let _live_agents = store.list_agents(None, false).unwrap_or_default();
         snapshot_discovery_store(&store)
     };
     let home = state.config.home_override.as_deref();
-    for session_id in state.queued_session_keys() {
+    for session_id in keys {
         let turns = read_session_transcript_from_snapshot(&session_id, &snap, home);
         if !state.is_session_busy_from_turns(&session_id, &turns)
             && let Some((item, queue)) = state.pop_next_queued_prompt(&session_id)
