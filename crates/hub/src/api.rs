@@ -64,8 +64,8 @@ use crate::auth::{
     format_session_set_cookie,
 };
 use crate::discovery::{
-    discover_sessions_with_home, list_git_worktrees, read_session_transcript_with_home,
-    read_worktree_diff, scan_cargo_architecture_conformance,
+    discover_sessions_with_home, list_git_worktrees, read_session_context_usage_with_home,
+    read_session_transcript_with_home, read_worktree_diff, scan_cargo_architecture_conformance,
 };
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
 
@@ -2227,6 +2227,11 @@ fn handle_dynamic_api_routes(
                 };
                 let is_busy = state.is_session_busy(store, &canonical_id);
                 let queue = state.session_queue(&canonical_id);
+                let context_usage = read_session_context_usage_with_home(
+                    &session_id,
+                    store,
+                    state.config.home_override.as_deref(),
+                );
                 return HttpResponse::json(
                     200,
                     json!({
@@ -2235,6 +2240,7 @@ fn handle_dynamic_api_routes(
                         "total_turns": total_turns,
                         "is_busy": is_busy,
                         "queue": queue,
+                        "context_usage": context_usage,
                     }),
                 );
             }

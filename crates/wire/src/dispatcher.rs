@@ -194,35 +194,20 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
                 &formatted,
             )
         }
-        VendorRoute::Grok { session_id, cwd } => {
-            let bin = std::env::var_os("FL_WIRE_GROK_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("grok"));
+        VendorRoute::Grok {
+            session_id,
+            cwd,
+            tmux_target,
+            tmux_pane,
+        } => {
             let formatted = format_push_message(msg);
-            let mut cmd = Command::new(&bin);
-            cmd.args([
-                "--no-auto-update",
-                "--no-alt-screen",
-                "--always-approve",
-                "-s",
+            deliver_to_grok_route(
                 session_id,
-                "-p",
+                cwd.as_ref(),
+                tmux_target.as_deref(),
+                tmux_pane.as_deref(),
                 &formatted,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-            if let Some(dir) = cwd
-                && dir.exists()
-            {
-                cmd.current_dir(dir);
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
-            if !status.success() {
-                return Err(format!("grok exited with {status}"));
-            }
-            Ok(())
+            )
         }
         VendorRoute::Webhook { socket_path } => {
             let mut stream = UnixStream::connect(socket_path).map_err(|e| {
@@ -290,6 +275,61 @@ fn deliver_to_muse_route(
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
     if !status.success() {
         return Err(format!("muse exec exited with {status}"));
+    }
+    Ok(())
+}
+
+fn deliver_to_grok_route(
+    session_id: &str,
+    cwd: Option<&PathBuf>,
+    tmux_target: Option<&str>,
+    tmux_pane: Option<&str>,
+    text: &str,
+) -> Result<(), String> {
+    let use_tmux = std::env::var_os("FL_WIRE_TMUX_BIN").is_some()
+        || std::env::var_os("FL_WIRE_GROK_BIN").is_none();
+    if use_tmux {
+        let mut candidates = Vec::new();
+        if let Some(p) = tmux_pane.map(str::trim).filter(|s| !s.is_empty()) {
+            candidates.push(p.to_string());
+        }
+        if let Some(t) = tmux_target.map(str::trim).filter(|s| !s.is_empty())
+            && !candidates.iter().any(|c| c == t)
+        {
+            candidates.push(t.to_string());
+        }
+        for target in &candidates {
+            if tmux_target_alive(target) {
+                return deliver_via_tmux_paste(target, text);
+            }
+        }
+    }
+
+    let bin = std::env::var_os("FL_WIRE_GROK_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("grok"));
+    let mut cmd = Command::new(&bin);
+    cmd.args([
+        "--no-auto-update",
+        "--no-alt-screen",
+        "--always-approve",
+        "-s",
+        session_id,
+        "-p",
+        text,
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    if let Some(dir) = cwd
+        && dir.exists()
+    {
+        cmd.current_dir(dir);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
+    if !status.success() {
+        return Err(format!("grok exited with {status}"));
     }
     Ok(())
 }
@@ -539,35 +579,18 @@ pub fn dispatch_operator_prompt_to_route(
             tmux_pane.as_deref(),
             body,
         ),
-        VendorRoute::Grok { session_id, cwd } => {
-            let bin = std::env::var_os("FL_WIRE_GROK_BIN")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("grok"));
-            let mut cmd = Command::new(&bin);
-            cmd.args([
-                "--no-auto-update",
-                "--no-alt-screen",
-                "--always-approve",
-                "-s",
-                session_id,
-                "-p",
-                body,
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-            if let Some(dir) = cwd
-                && dir.exists()
-            {
-                cmd.current_dir(dir);
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
-            if !status.success() {
-                return Err(format!("grok exited with {status}"));
-            }
-            Ok(())
-        }
+        VendorRoute::Grok {
+            session_id,
+            cwd,
+            tmux_target,
+            tmux_pane,
+        } => deliver_to_grok_route(
+            session_id,
+            cwd.as_ref(),
+            tmux_target.as_deref(),
+            tmux_pane.as_deref(),
+            body,
+        ),
         VendorRoute::Webhook { socket_path } => {
             let mut stream = UnixStream::connect(socket_path).map_err(|e| {
                 format!(
@@ -891,6 +914,8 @@ mod tests {
             &VendorRoute::Grok {
                 session_id: "gs-99".into(),
                 cwd: Some(tmp.path().to_path_buf()),
+                tmux_target: None,
+                tmux_pane: None,
             },
             &msg,
         )
