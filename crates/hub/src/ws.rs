@@ -107,9 +107,7 @@ impl HubServer {
                     if !self.state.queued_session_keys().is_empty() {
                         let state = self.state.clone();
                         let _ = tokio::task::spawn_blocking(move || {
-                            if let Ok(store) = state.open_store() {
-                                drain_ready_session_queues(&state, &store);
-                            }
+                            drain_ready_session_queues(&state);
                         }).await;
                     }
                 }

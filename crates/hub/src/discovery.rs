@@ -35,6 +35,10 @@ pub struct DiscoveredSessionSummary {
     pub record_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
+    /// Account quota or rate-limit window for this vendor session, when the runtime
+    /// persists one. Omitted for attempt rows and for vendors with no on-disk allowance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_usage: Option<SessionQuotaUsage>,
 }
 
 /// Normalized tool invocation inside a [`TranscriptTurn`] (spec §3.2).
@@ -65,6 +69,103 @@ pub struct TranscriptTurn {
 pub struct SessionContextUsage {
     pub used_tokens: u64,
     pub max_tokens: u64,
+}
+
+/// One vendor allowance window (5-hour primary, weekly secondary, or a single reset).
+///
+/// `used_percent` is the vendor's number, copied verbatim. Equality compares the IEEE bits
+/// so [`DiscoveredSessionSummary`] can keep `Eq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuotaWindowUsage {
+    pub used_percent: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_minutes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resets_at_ms: Option<u64>,
+}
+
+impl PartialEq for QuotaWindowUsage {
+    fn eq(&self, other: &Self) -> bool {
+        self.used_percent.to_bits() == other.used_percent.to_bits()
+            && self.window_minutes == other.window_minutes
+            && self.resets_at_ms == other.resets_at_ms
+    }
+}
+
+impl Eq for QuotaWindowUsage {}
+
+/// Account quota or rate-limit snapshot attached to a discovered vendor session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionQuotaUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_window: Option<QuotaWindowUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_window: Option<QuotaWindowUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exhausted_reason: Option<String>,
+}
+
+/// B-tree rows discovery needs, captured while a [`RedbStore`] guard is held.
+/// Filesystem walks use this snapshot after the guard is dropped.
+#[derive(Debug, Clone, Default)]
+pub struct DiscoveryStoreSnapshot {
+    registered_names: BTreeSet<String>,
+    attempts: Vec<DiscoveryAttemptRow>,
+}
+
+#[derive(Debug, Clone)]
+struct DiscoveryAttemptRow {
+    id: String,
+    adapter: String,
+    status: String,
+    updated_at: Option<String>,
+    cwd: String,
+    record_id: String,
+    record_str: String,
+    output_excerpt: Option<String>,
+    created_at: Option<String>,
+}
+
+/// Read agent names and attempt rows. Does not walk the filesystem.
+pub fn snapshot_discovery_store(store: &RedbStore) -> DiscoveryStoreSnapshot {
+    let registered_names = store
+        .list_agents(None, true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|agent| agent.name_key.to_ascii_lowercase())
+        .collect();
+    let mut attempts = Vec::new();
+    if let Ok(projects) = store.list_projects() {
+        for project in projects {
+            if let Ok(rows) = store.attempts(&project.id) {
+                for (idx, attempt) in rows.into_iter().enumerate() {
+                    let id = attempt
+                        .id
+                        .as_ref()
+                        .map(|i| i.to_string())
+                        .unwrap_or_else(|| format!("attempt-{}-{idx}", project.id));
+                    let created_at = attempt.at.map(|at| at.to_string());
+                    attempts.push(DiscoveryAttemptRow {
+                        id,
+                        adapter: attempt.adapter,
+                        status: attempt.status.as_wire().to_string(),
+                        updated_at: created_at.clone(),
+                        cwd: project.root.clone(),
+                        record_id: attempt.record.to_string(),
+                        record_str: attempt.record.as_str().to_string(),
+                        output_excerpt: attempt.output_excerpt,
+                        created_at,
+                    });
+                }
+            }
+        }
+    }
+    DiscoveryStoreSnapshot {
+        registered_names,
+        attempts,
+    }
 }
 
 /// Summary of a Git worktree discovered via `git worktree list --porcelain` (spec §3.3).
@@ -117,6 +218,16 @@ pub fn discover_sessions_with_home(
     store: &RedbStore,
     home_override: Option<&Path>,
 ) -> Vec<DiscoveredSessionSummary> {
+    let snap = snapshot_discovery_store(store);
+    discover_sessions_from_snapshot(&snap, home_override)
+}
+
+/// Discover sessions from a store snapshot. Filesystem route discovery runs here, with no
+/// live [`RedbStore`] borrow.
+pub fn discover_sessions_from_snapshot(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Vec<DiscoveredSessionSummary> {
     let mut out = Vec::new();
     let mut seen_ids = BTreeSet::new();
 
@@ -129,12 +240,7 @@ pub fn discover_sessions_with_home(
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
 
-    let registered_names: BTreeSet<String> = store
-        .list_agents(None, true)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| a.name_key.to_ascii_lowercase())
-        .collect();
+    let registered_names = &snap.registered_names;
 
     let mut ordered_routes: Vec<_> = routes.entries.iter().collect();
     ordered_routes.sort_by_key(|(persona, _)| {
@@ -229,34 +335,33 @@ pub fn discover_sessions_with_home(
                 cwd,
                 record_id: None,
                 transcript_path,
+                quota_usage: None,
             });
         }
     }
 
-    if let Ok(projects) = store.list_projects() {
-        for project in projects {
-            if let Ok(attempts) = store.attempts(&project.id) {
-                for (idx, attempt) in attempts.into_iter().enumerate() {
-                    let id = attempt
-                        .id
-                        .as_ref()
-                        .map(|i| i.to_string())
-                        .unwrap_or_else(|| format!("attempt-{}-{idx}", project.id));
-                    if seen_ids.insert(id.clone()) {
-                        out.push(DiscoveredSessionSummary {
-                            id,
-                            source: "attempt".to_string(),
-                            adapter: attempt.adapter,
-                            persona: None,
-                            status: attempt.status.as_wire().to_string(),
-                            updated_at: attempt.at.map(|a| a.to_string()),
-                            cwd: Some(project.root.clone()),
-                            record_id: Some(attempt.record.to_string()),
-                            transcript_path: None,
-                        });
-                    }
-                }
-            }
+    for attempt in &snap.attempts {
+        if seen_ids.insert(attempt.id.clone()) {
+            out.push(DiscoveredSessionSummary {
+                id: attempt.id.clone(),
+                source: "attempt".to_string(),
+                adapter: attempt.adapter.clone(),
+                persona: None,
+                status: attempt.status.clone(),
+                updated_at: attempt.updated_at.clone(),
+                cwd: Some(attempt.cwd.clone()),
+                record_id: Some(attempt.record_id.clone()),
+                transcript_path: None,
+                quota_usage: None,
+            });
+        }
+    }
+
+    for session in &mut out {
+        if session.source == "route"
+            && matches!(session.adapter.as_str(), "codex" | "grok" | "muse")
+        {
+            session.quota_usage = read_session_quota_usage_with_home(&session.id, home_override);
         }
     }
 
@@ -390,12 +495,346 @@ fn read_codex_configured_context_window(tpath: &Path) -> Option<u64> {
     None
 }
 
+fn json_f64(value: Option<&Value>) -> Option<f64> {
+    let value = value?;
+    value
+        .as_f64()
+        .or_else(|| value.as_i64().map(|n| n as f64))
+        .or_else(|| value.as_u64().map(|n| n as f64))
+}
+
+fn json_u64_token(value: Option<&Value>) -> u64 {
+    json_f64(value).map(|n| n.max(0.0) as u64).unwrap_or(0)
+}
+
+/// Normalize an ISO-8601 timestamp to Unix milliseconds.
+///
+/// Accepts `fl_core::At`'s 24-character millisecond `Z` spelling, second-precision `Z`,
+/// and numeric offsets (`+00:00`, `-05:30`).
+fn parse_iso8601_unix_millis(raw: &str) -> Option<u64> {
+    let s = raw.trim().trim_end_matches(['.', ',', ';']);
+    if let Ok(at) = fl_core::At::parse(s) {
+        return Some(at.unix_millis());
+    }
+    let (datetime, offset_minutes) = if let Some(rest) = s.strip_suffix('Z') {
+        (rest, 0i32)
+    } else {
+        let idx = s.rfind(['+', '-'])?;
+        if idx < 11 {
+            return None;
+        }
+        let (dt, off) = s.split_at(idx);
+        (dt, parse_utc_offset_minutes(off)?)
+    };
+    let (base, frac_ms) = if let Some((clock, frac)) = datetime.split_once('.') {
+        let mut digits = String::new();
+        for ch in frac.chars() {
+            if ch.is_ascii_digit() {
+                digits.push(ch);
+            } else {
+                break;
+            }
+            if digits.len() == 3 {
+                break;
+            }
+        }
+        if digits.is_empty() {
+            return None;
+        }
+        let padded = format!("{digits:0<3}");
+        let ms: i64 = padded.parse().ok()?;
+        (clock, ms)
+    } else {
+        (datetime, 0)
+    };
+    if base.len() != 19 {
+        return None;
+    }
+    let spelled = format!("{base}.{frac_ms:03}Z");
+    let at = fl_core::At::parse(&spelled).ok()?;
+    let adjusted = at.unix_millis() as i64 - i64::from(offset_minutes) * 60_000;
+    if adjusted < 0 {
+        return None;
+    }
+    Some(adjusted as u64)
+}
+
+fn parse_utc_offset_minutes(raw: &str) -> Option<i32> {
+    let (sign, rest) = if let Some(rest) = raw.strip_prefix('+') {
+        (1i32, rest)
+    } else {
+        let rest = raw.strip_prefix('-')?;
+        (-1, rest)
+    };
+    let (hours, minutes) = if let Some((h, m)) = rest.split_once(':') {
+        (h, m)
+    } else if rest.len() == 4 {
+        rest.split_at(2)
+    } else if rest.len() == 2 {
+        (rest, "00")
+    } else {
+        return None;
+    };
+    let hours: i32 = hours.parse().ok()?;
+    let minutes: i32 = minutes.parse().ok()?;
+    if !(0..=23).contains(&hours) || !(0..=59).contains(&minutes) {
+        return None;
+    }
+    Some(sign * (hours * 60 + minutes))
+}
+
+fn parse_reset_instant_from_reason(reason: &str) -> Option<u64> {
+    const MARKER: &str = "resets at ";
+    let idx = reason.find(MARKER)?;
+    let token = reason[idx + MARKER.len()..].split_whitespace().next()?;
+    parse_iso8601_unix_millis(token)
+}
+
+fn codex_window(value: Option<&Value>, window_minutes: u64) -> Option<QuotaWindowUsage> {
+    let value = value?;
+    let used_percent = json_f64(value.get("used_percent"))?;
+    let resets_at_ms = value.get("resets_at").and_then(|raw| {
+        raw.as_i64()
+            .or_else(|| raw.as_u64().map(|n| n as i64))
+            .or_else(|| raw.as_f64().map(|n| n as i64))
+            .filter(|secs| *secs > 0)
+            .map(|secs| (secs as u64).saturating_mul(1000))
+    });
+    Some(QuotaWindowUsage {
+        used_percent,
+        window_minutes: Some(window_minutes),
+        resets_at_ms,
+    })
+}
+
+fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
+    let mut latest = None;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || !trimmed.contains("\"token_count\"")
+            || !trimmed.contains("rate_limits")
+        {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if val.get("type").and_then(Value::as_str) != Some("event_msg")
+            || val.pointer("/payload/type").and_then(Value::as_str) != Some("token_count")
+        {
+            continue;
+        }
+        let Some(limits) = val
+            .pointer("/payload/rate_limits")
+            .filter(|v| v.is_object())
+        else {
+            continue;
+        };
+        let tier = limits
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let exhausted_reason = limits
+            .get("rate_limit_reached_type")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let primary_window = codex_window(limits.get("primary"), 300);
+        let secondary_window = codex_window(limits.get("secondary"), 10_080);
+        if tier.is_none()
+            && exhausted_reason.is_none()
+            && primary_window.is_none()
+            && secondary_window.is_none()
+        {
+            continue;
+        }
+        latest = Some(SessionQuotaUsage {
+            tier,
+            primary_window,
+            secondary_window,
+            exhausted_reason,
+        });
+    }
+    latest
+}
+
+fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
+    let raw = fs::read_to_string(home.join(".grok").join("logs").join("unified.jsonl")).ok()?;
+    let mut latest = None;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if !trimmed.contains("billing: fetched credits config") {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if val.get("msg").and_then(Value::as_str) != Some("billing: fetched credits config") {
+            continue;
+        }
+        let Some(ctx) = val.get("ctx") else {
+            continue;
+        };
+        let tier = ctx
+            .get("subscriptionTier")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let used_percent = json_f64(ctx.pointer("/config/creditUsagePercent"));
+        let resets_at_ms = ctx
+            .pointer("/config/currentPeriod/end")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                ctx.pointer("/config/billingPeriodEnd")
+                    .and_then(Value::as_str)
+            })
+            .and_then(parse_iso8601_unix_millis);
+        let secondary_window = used_percent.map(|used_percent| QuotaWindowUsage {
+            used_percent,
+            window_minutes: Some(10_080),
+            resets_at_ms,
+        });
+        if tier.is_none() && secondary_window.is_none() {
+            continue;
+        }
+        latest = Some(SessionQuotaUsage {
+            tier,
+            primary_window: None,
+            secondary_window,
+            exhausted_reason: None,
+        });
+    }
+    latest
+}
+
+fn muse_quota_from_session(raw: &str) -> Option<SessionQuotaUsage> {
+    let mut exhausted_reason = None;
+    let mut resets_at_ms = None;
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains("runtime.session") {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if val.get("payload_type").and_then(Value::as_str) != Some("runtime.session") {
+            continue;
+        }
+        let kind = val.pointer("/payload/event/kind").and_then(Value::as_str);
+        if kind == Some("model_completed") {
+            exhausted_reason = None;
+            resets_at_ms = None;
+            continue;
+        }
+        if !matches!(kind, Some("model_failure_terminal_intent" | "failed")) {
+            continue;
+        }
+        let Some(reason) = val.pointer("/payload/event/reason").and_then(Value::as_str) else {
+            continue;
+        };
+        if !reason.contains("Subscription quota exhausted") {
+            continue;
+        }
+        resets_at_ms = parse_reset_instant_from_reason(reason);
+        exhausted_reason = Some(reason.to_string());
+    }
+    let exhausted_reason = exhausted_reason?;
+    Some(SessionQuotaUsage {
+        tier: None,
+        primary_window: Some(QuotaWindowUsage {
+            used_percent: 100.0,
+            window_minutes: None,
+            resets_at_ms,
+        }),
+        secondary_window: None,
+        exhausted_reason: Some(exhausted_reason),
+    })
+}
+
+fn is_antigravity_transcript(path: &Path) -> bool {
+    let lossy = path.to_string_lossy();
+    lossy.contains(".system_generated/logs/transcript.jsonl")
+        || lossy.contains(".system_generated\\logs\\transcript.jsonl")
+}
+
+fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage> {
+    for line in raw.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains("PLANNER_RESPONSE") {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if val.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE") {
+            continue;
+        }
+        let used_tokens = json_u64_token(val.get("input_tokens"))
+            + json_u64_token(val.get("cache_read_tokens"))
+            + json_u64_token(val.get("output_tokens"));
+        if used_tokens > 0 {
+            return Some(SessionContextUsage {
+                used_tokens,
+                max_tokens: 1_000_000,
+            });
+        }
+    }
+    None
+}
+
+/// Read account quota for `session_id` from on-disk vendor files.
+///
+/// Codex rollouts supply both windows. Grok's unified log supplies the weekly window.
+/// Muse supplies an exhaustion reason when a terminal quota failure is still current.
+/// Claude and Antigravity return `None`.
+pub fn read_session_quota_usage_with_home(
+    session_id: &str,
+    home_override: Option<&Path>,
+) -> Option<SessionQuotaUsage> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let home = home_override
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))?;
+    let tpath = PathBuf::from(find_transcript_file_in_home(&home, trimmed)?);
+    let lossy = tpath.to_string_lossy();
+    let file_name = tpath.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if lossy.contains(".codex") && file_name.starts_with("rollout-") {
+        let raw = fs::read_to_string(&tpath).ok()?;
+        return codex_quota_from_rollout(&raw);
+    }
+    if lossy.contains(".grok") {
+        return grok_quota_from_home(&home);
+    }
+    if file_name == "session.jsonl" && lossy.contains("muse") {
+        let raw = fs::read_to_string(&tpath).ok()?;
+        return muse_quota_from_session(&raw);
+    }
+    None
+}
+
 /// Read server-measured context window token usage for `session_id` when vendor session
 /// metadata (such as Grok `signals.json`/`summary.json`, Claude `message.usage`, Codex `token_count`,
-/// or Muse `model_completed`) is available.
+/// Antigravity `PLANNER_RESPONSE`, or Muse `model_completed`) is available.
 pub fn read_session_context_usage_with_home(
     session_id: &str,
     store: &RedbStore,
+    home_override: Option<&Path>,
+) -> Option<SessionContextUsage> {
+    let snap = snapshot_discovery_store(store);
+    read_session_context_usage_from_snapshot(session_id, &snap, home_override)
+}
+
+/// Context-window read that does not borrow a live store. `snap` only supplies attempt
+/// identity; the transcript scan is filesystem IO.
+pub fn read_session_context_usage_from_snapshot(
+    session_id: &str,
+    snap: &DiscoveryStoreSnapshot,
     home_override: Option<&Path>,
 ) -> Option<SessionContextUsage> {
     let trimmed = session_id.trim();
@@ -403,7 +842,7 @@ pub fn read_session_context_usage_with_home(
         return None;
     }
 
-    let sessions = discover_sessions_with_home(store, home_override);
+    let sessions = discover_sessions_from_snapshot(snap, home_override);
     let mut tpath_opt = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -593,6 +1032,13 @@ pub fn read_session_context_usage_with_home(
         }
     }
 
+    if is_antigravity_transcript(&tpath)
+        && let Ok(raw) = fs::read_to_string(&tpath)
+        && let Some(usage) = antigravity_context_from_transcript(&raw)
+    {
+        return Some(usage);
+    }
+
     None
 }
 
@@ -607,13 +1053,23 @@ pub fn read_session_transcript_with_home(
     store: &RedbStore,
     home_override: Option<&Path>,
 ) -> Vec<TranscriptTurn> {
+    let snap = snapshot_discovery_store(store);
+    read_session_transcript_from_snapshot(session_id, &snap, home_override)
+}
+
+/// Transcript read that uses a store snapshot for attempt fallback and does the file
+/// parse after the caller has dropped the store guard.
+pub fn read_session_transcript_from_snapshot(
+    session_id: &str,
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Vec<TranscriptTurn> {
     let trimmed = session_id.trim();
     if trimmed.is_empty() {
         return Vec::new();
     }
 
-    // 1. Check discovered sessions for a matching id or persona with a transcript_path.
-    let sessions = discover_sessions_with_home(store, home_override);
+    let sessions = discover_sessions_from_snapshot(snap, home_override);
     for s in &sessions {
         if (s.id == trimmed || s.persona.as_deref() == Some(trimmed))
             && let Some(ref tpath) = s.transcript_path
@@ -626,7 +1082,6 @@ pub fn read_session_transcript_with_home(
         }
     }
 
-    // 2. Search under HOME directly by session_id.
     let home = home_override
         .map(Path::to_path_buf)
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
@@ -640,29 +1095,16 @@ pub fn read_session_transcript_with_home(
         }
     }
 
-    // 3. Fall back to recorded `Attempt` output in `store`.
-    if let Ok(projects) = store.list_projects() {
-        for project in projects {
-            if let Ok(attempts) = store.attempts(&project.id) {
-                for (idx, attempt) in attempts.into_iter().enumerate() {
-                    let id = attempt
-                        .id
-                        .as_ref()
-                        .map(|i| i.to_string())
-                        .unwrap_or_else(|| format!("attempt-{}-{idx}", project.id));
-                    if id == trimmed || attempt.record.as_str() == trimmed {
-                        let content = attempt.output_excerpt.unwrap_or_default();
-                        return vec![TranscriptTurn {
-                            index: 0,
-                            role: "assistant".to_string(),
-                            content,
-                            thinking: None,
-                            tool_calls: Vec::new(),
-                            created_at: attempt.at.map(|a| a.to_string()),
-                        }];
-                    }
-                }
-            }
+    for attempt in &snap.attempts {
+        if attempt.id == trimmed || attempt.record_str == trimmed {
+            return vec![TranscriptTurn {
+                index: 0,
+                role: "assistant".to_string(),
+                content: attempt.output_excerpt.clone().unwrap_or_default(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                created_at: attempt.created_at.clone(),
+            }];
         }
     }
 
@@ -2722,5 +3164,262 @@ mod tests {
                 max_tokens: 872000,
             }
         );
+    }
+
+    #[test]
+    fn antigravity_planner_response_context_usage_uses_latest_nonzero_sum() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let store = RedbStore::open(&home.join("store.redb")).unwrap();
+        let conv = "conv-agy-ctx";
+        let logs = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(conv)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("transcript.jsonl");
+        let jsonl = [
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 10,
+                "cache_read_tokens": 1,
+                "output_tokens": 2
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0,
+                "cache_read_tokens": 0,
+                "output_tokens": 0
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 100,
+                "cache_read_tokens": 20,
+                "output_tokens": 5
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "USER_INPUT",
+                "content": "next",
+                "input_tokens": 9999
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0,
+                "cache_read_tokens": 0,
+                "output_tokens": 0
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&path, jsonl).unwrap();
+
+        let usage = read_session_context_usage_with_home(conv, &store, Some(home))
+            .expect("latest non-zero planner response");
+        assert_eq!(
+            usage,
+            SessionContextUsage {
+                used_tokens: 125,
+                max_tokens: 1_000_000,
+            }
+        );
+
+        fs::write(
+            &path,
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "content": "done"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(read_session_context_usage_with_home(conv, &store, Some(home)).is_none());
+    }
+
+    #[test]
+    fn codex_rate_limits_map_to_session_quota_usage_latest_event_wins() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let thread = "01a18550-1b11-7882-82b6-ea40058ed587";
+        let dir = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("29");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-10-29T01-39-41-{thread}.jsonl"));
+        let line = |primary: f64, secondary: f64, reached: Option<&str>, plan: &str| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "rate_limits": {
+                        "plan_type": plan,
+                        "rate_limit_reached_type": reached,
+                        "primary": {
+                            "used_percent": primary,
+                            "window_minutes": 300,
+                            "resets_at": 1_700_000_000_i64
+                        },
+                        "secondary": {
+                            "used_percent": secondary,
+                            "window_minutes": 10080,
+                            "resets_at": 1_700_086_400_i64
+                        }
+                    }
+                }
+            })
+            .to_string()
+        };
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                line(1.0, 2.0, Some("stale"), "free"),
+                line(12.5, 40.0, None, "plus")
+            ),
+        )
+        .unwrap();
+
+        let quota = read_session_quota_usage_with_home(thread, Some(home)).expect("codex quota");
+        assert_eq!(quota.tier.as_deref(), Some("plus"));
+        assert!(quota.exhausted_reason.is_none());
+        assert_eq!(
+            quota.primary_window,
+            Some(QuotaWindowUsage {
+                used_percent: 12.5,
+                window_minutes: Some(300),
+                resets_at_ms: Some(1_700_000_000_000),
+            })
+        );
+        assert_eq!(
+            quota.secondary_window,
+            Some(QuotaWindowUsage {
+                used_percent: 40.0,
+                window_minutes: Some(10_080),
+                resets_at_ms: Some(1_700_086_400_000),
+            })
+        );
+
+        fs::write(
+            &path,
+            format!("{}\n", line(9.0, 9.0, Some("primary"), "plus")),
+        )
+        .unwrap();
+        let blocked = read_session_quota_usage_with_home(thread, Some(home)).expect("exhausted");
+        assert_eq!(blocked.exhausted_reason.as_deref(), Some("primary"));
+    }
+
+    #[test]
+    fn grok_billing_log_maps_weekly_window_and_ignores_other_vendors() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let session = "01a18538-6f1a-79c2-99d2-8e8540366c72";
+        let session_dir = home.join(".grok").join("sessions").join(session);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("chat_history.jsonl"), "{}\n").unwrap();
+        let logs = home.join(".grok").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        let end = "2026-11-05T01:11:25.780+00:00";
+        let expected_ms = fl_core::At::parse("2026-11-05T01:11:25.780Z")
+            .unwrap()
+            .unix_millis();
+        let line = serde_json::json!({
+            "msg": "billing: fetched credits config",
+            "ctx": {
+                "subscriptionTier": "SuperGrok",
+                "config": {
+                    "creditUsagePercent": 1.0,
+                    "currentPeriod": {
+                        "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                        "end": end
+                    },
+                    "billingPeriodEnd": "2026-12-01T00:00:00Z"
+                }
+            }
+        });
+        fs::write(logs.join("unified.jsonl"), format!("{line}\n")).unwrap();
+
+        let quota = read_session_quota_usage_with_home(session, Some(home)).expect("grok quota");
+        assert_eq!(quota.tier.as_deref(), Some("SuperGrok"));
+        assert!(quota.primary_window.is_none());
+        assert!(quota.exhausted_reason.is_none());
+        assert_eq!(
+            quota.secondary_window,
+            Some(QuotaWindowUsage {
+                used_percent: 1.0,
+                window_minutes: Some(10_080),
+                resets_at_ms: Some(expected_ms),
+            })
+        );
+
+        let claude = home.join(".claude").join("projects").join("demo");
+        fs::create_dir_all(&claude).unwrap();
+        fs::write(claude.join("claude-session.jsonl"), "{}\n").unwrap();
+        assert!(read_session_quota_usage_with_home("claude-session", Some(home)).is_none());
+    }
+
+    #[test]
+    fn muse_subscription_exhaustion_clears_after_model_completed() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let session = "muse-session-1";
+        let dir = home
+            .join(".local")
+            .join("share")
+            .join("muse")
+            .join("sessions")
+            .join(session);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let reason = "API error 429: Subscription quota exhausted. Your usage window resets at 2026-11-02T00:00:00Z.";
+        let failure = serde_json::json!({
+            "payload_type": "runtime.session",
+            "payload": {
+                "event": {
+                    "kind": "model_failure_terminal_intent",
+                    "reason": reason
+                }
+            }
+        });
+        let failed = serde_json::json!({
+            "payload_type": "runtime.session",
+            "payload": {
+                "event": {
+                    "kind": "failed",
+                    "reason": reason
+                }
+            }
+        });
+        fs::write(&path, format!("{failure}\n{failed}\n")).unwrap();
+        let expected_ms = fl_core::At::parse("2026-11-02T00:00:00.000Z")
+            .unwrap()
+            .unix_millis();
+        let quota = read_session_quota_usage_with_home(session, Some(home)).expect("muse quota");
+        assert_eq!(quota.exhausted_reason.as_deref(), Some(reason));
+        assert!(quota.tier.is_none());
+        assert!(quota.secondary_window.is_none());
+        assert_eq!(
+            quota.primary_window,
+            Some(QuotaWindowUsage {
+                used_percent: 100.0,
+                window_minutes: None,
+                resets_at_ms: Some(expected_ms),
+            })
+        );
+
+        let completed = serde_json::json!({
+            "payload_type": "runtime.session",
+            "payload": { "event": { "kind": "model_completed" } }
+        });
+        fs::write(&path, format!("{failure}\n{completed}\n")).unwrap();
+        assert!(read_session_quota_usage_with_home(session, Some(home)).is_none());
     }
 }

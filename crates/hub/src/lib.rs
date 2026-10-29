@@ -34,12 +34,12 @@ pub use auth::{
     session_state_slug, sha256_hex,
 };
 pub use discovery::{
-    DiscoveredSessionSummary, SessionContextUsage, TranscriptToolCall, TranscriptTurn,
-    WorkspaceArchScan, WorktreeDiff, WorktreeFileStatus, WorktreeSummary, discover_sessions,
-    discover_sessions_with_home, is_transcript_busy, list_git_worktrees, parse_jsonl_transcript,
-    read_session_context_usage_with_home, read_session_transcript,
-    read_session_transcript_with_home, read_worktree_diff, scan_cargo_architecture_conformance,
-    scan_workspace_for_arch,
+    DiscoveredSessionSummary, QuotaWindowUsage, SessionContextUsage, SessionQuotaUsage,
+    TranscriptToolCall, TranscriptTurn, WorkspaceArchScan, WorktreeDiff, WorktreeFileStatus,
+    WorktreeSummary, discover_sessions, discover_sessions_with_home, is_transcript_busy,
+    list_git_worktrees, parse_jsonl_transcript, read_session_context_usage_with_home,
+    read_session_quota_usage_with_home, read_session_transcript, read_session_transcript_with_home,
+    read_worktree_diff, scan_cargo_architecture_conformance, scan_workspace_for_arch,
 };
 pub use terminal::{TerminalManager, TerminalSession};
 pub use ws::{HubServer, HubWsClient, compute_accept_key, try_parse_ws_frame};
@@ -287,13 +287,20 @@ impl HubState {
             store,
             self.config.home_override.as_deref(),
         );
-        let transcript_busy = is_transcript_busy(&turns);
+        self.is_session_busy_from_turns(session_id, &turns)
+    }
+
+    /// Busy check from turns already read. Does not open the store or the transcript file.
+    pub fn is_session_busy_from_turns(&self, session_id: &str, turns: &[TranscriptTurn]) -> bool {
+        let transcript_busy = is_transcript_busy(turns);
         let now_ms = stamp::now().unix_millis() as i64;
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         let in_flight_active = if let Some(in_flight) = guard.in_flight.get(session_id) {
             let expired = now_ms - in_flight.dispatched_at_ms > 300_000;
-            let completed = (turns.len() > in_flight.baseline_turn_count
-                || in_flight.baseline_busy)
+            // An empty slice is not a transcript observation. Do not clear in-flight
+            // just because the caller has no turns yet.
+            let completed = !turns.is_empty()
+                && (turns.len() > in_flight.baseline_turn_count || in_flight.baseline_busy)
                 && !transcript_busy;
             if expired || completed {
                 guard.in_flight.remove(session_id);
@@ -307,13 +314,33 @@ impl HubState {
         in_flight_active || transcript_busy
     }
 
+    /// Open the store, snapshot attempt rows, drop the guard, then read the transcript.
+    /// A failed open still reads vendor files against an empty attempt snapshot.
+    pub fn is_session_busy_released(&self, session_id: &str) -> bool {
+        let snap = match self.open_store() {
+            Ok(store) => discovery::snapshot_discovery_store(&store),
+            Err(_) => discovery::DiscoveryStoreSnapshot::default(),
+        };
+        let turns = discovery::read_session_transcript_from_snapshot(
+            session_id,
+            &snap,
+            self.config.home_override.as_deref(),
+        );
+        self.is_session_busy_from_turns(session_id, &turns)
+    }
+
     pub fn mark_session_in_flight(&self, store: &RedbStore, session_key: &str) {
         let turns = read_session_transcript_with_home(
             session_key,
             store,
             self.config.home_override.as_deref(),
         );
-        let baseline_busy = is_transcript_busy(&turns);
+        self.mark_session_in_flight_from_turns(session_key, &turns);
+    }
+
+    /// Record an in-flight prompt from turns already read. Does not touch the store.
+    pub fn mark_session_in_flight_from_turns(&self, session_key: &str, turns: &[TranscriptTurn]) {
+        let baseline_busy = is_transcript_busy(turns);
         let now_ms = stamp::now().unix_millis() as i64;
         let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
         guard.in_flight.insert(
@@ -324,6 +351,21 @@ impl HubState {
                 dispatched_at_ms: now_ms,
             },
         );
+    }
+
+    /// Open the store, snapshot, drop the guard, then read the transcript and mark in-flight.
+    /// A failed open still reads vendor files and records in-flight.
+    pub fn mark_session_in_flight_released(&self, session_key: &str) {
+        let snap = match self.open_store() {
+            Ok(store) => discovery::snapshot_discovery_store(&store),
+            Err(_) => discovery::DiscoveryStoreSnapshot::default(),
+        };
+        let turns = discovery::read_session_transcript_from_snapshot(
+            session_key,
+            &snap,
+            self.config.home_override.as_deref(),
+        );
+        self.mark_session_in_flight_from_turns(session_key, &turns);
     }
 
     /// Open the workspace `RedbStore` for the duration of a single operation, retrying
@@ -1806,6 +1848,84 @@ mod tests {
                 .with_header("Authorization", "Bearer owner-tok-secret"),
         );
         assert_eq!(del_secret_resp.status, 200);
+    }
+
+    #[test]
+    fn store_open_failure_keeps_vendor_busy_and_sessions_returns_500() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = test_hub_state(&tmp);
+        let conv_id = "conv-store-open-fail";
+        let logs_dir = tmp
+            .path()
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs_dir).unwrap();
+        let turn = json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "content": "still working",
+            "created_at": "2026-10-29T16:00:00Z"
+        })
+        .to_string();
+        fs::write(logs_dir.join("transcript.jsonl"), format!("{turn}\n")).unwrap();
+
+        let store_dir = tmp.path().join("store-is-a-directory");
+        fs::create_dir_all(&store_dir).unwrap();
+        state.config.store_path = store_dir;
+
+        assert!(
+            state.is_session_busy_released(conv_id),
+            "a failed store open must not treat a busy vendor transcript as idle"
+        );
+        state.mark_session_in_flight_released(conv_id);
+        assert!(
+            state.is_session_busy_from_turns(conv_id, &[]),
+            "in-flight must stay set when the follow-up turn slice is empty"
+        );
+
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("GET", "/api/v1/sessions")
+                .with_header("Authorization", "Bearer owner-tok-secret"),
+        );
+        assert_eq!(resp.status, 500);
+        let body = String::from_utf8_lossy(&resp.body);
+        assert!(
+            body.contains("failed to open store"),
+            "error body was {body}"
+        );
+    }
+
+    #[test]
+    fn worktrees_request_does_not_take_store_lock() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let _guard = state.open_store().expect("hold store lock");
+        let state2 = state.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let resp = handle_http_request(
+                &state2,
+                &HttpRequest::new("GET", "/api/v1/worktrees")
+                    .with_header("Authorization", "Bearer owner-tok-secret"),
+            );
+            let _ = tx.send((started.elapsed(), resp.status));
+        });
+        let (elapsed, status) = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("GET /api/v1/worktrees blocked on HubStoreGuard");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "worktrees handler waited {elapsed:?}"
+        );
+        assert!(status == 200 || status == 500, "status {status}");
+        drop(_guard);
+        handle.join().expect("worktrees thread");
     }
 
     #[test]

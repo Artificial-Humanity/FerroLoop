@@ -54,18 +54,21 @@ use fl_gate::{
     handle_registry_v01_get, verify_inbound_bridge_webhook,
 };
 use fl_store::RedbStore;
-use fl_wire::dispatcher::{dispatch_message_for_store, dispatch_operator_prompt_to_route};
+use fl_wire::dispatcher::{MAX_DELIVER, dispatch_operator_prompt_to_route, dispatch_to_route};
 use fl_wire::identity::RouteTable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::HubStoreGuard;
 use crate::auth::{
     HubAuthority, extract_bearer_token, extract_session_cookie, format_logout_set_cookie,
     format_session_set_cookie,
 };
 use crate::discovery::{
-    discover_sessions_with_home, list_git_worktrees, read_session_context_usage_with_home,
-    read_session_transcript_with_home, read_worktree_diff, scan_cargo_architecture_conformance,
+    DiscoveryStoreSnapshot, discover_sessions_from_snapshot, list_git_worktrees,
+    read_session_context_usage_from_snapshot, read_session_quota_usage_with_home,
+    read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
+    snapshot_discovery_store,
 };
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
 
@@ -342,22 +345,11 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         return handle_static_request(state, req);
     }
 
-    // 4. Authenticate `/api/v1/*` request.
-    let store = match state.open_store() {
-        Ok(s) => s,
-        Err(e) => {
-            return HttpResponse::json(
-                500,
-                json!({ "error": format!("failed to open store: {e}") }),
-            );
-        }
-    };
-
-    let Some(authority) = state
-        .auth
-        .authenticate_request(Some(&*store), &req.headers, &req.query)
-    else {
-        return HttpResponse::json(401, json!({ "error": "unauthorized" }));
+    // 4. Authenticate `/api/v1/*`. Owner and peer bearer tokens compare in memory.
+    // Session tokens open the store only for that lookup, then the guard drops.
+    let authority = match authenticate_api_request(state, req) {
+        Ok(authority) => authority,
+        Err(resp) => return resp,
     };
 
     match (method, path) {
@@ -368,70 +360,166 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
                 "authority": authority,
             }),
         ),
-        ("POST", "/api/v1/auth/logout") => {
-            if let Some(tok) = req
-                .headers
-                .get("cookie")
-                .and_then(|c| extract_session_cookie(c))
-                .or_else(|| {
-                    req.headers
-                        .get("authorization")
-                        .and_then(|a| extract_bearer_token(a))
-                })
-            {
-                state.auth.revoke_session_token(Some(&*store), &tok);
-            }
-            HttpResponse::json(200, json!({ "authenticated": false }))
-                .with_header("Set-Cookie", format_logout_set_cookie())
-        }
-        ("GET", "/api/v1/agents") => handle_get_agents(state, &store, req),
-        ("GET", "/api/v1/agents/liveness") => handle_get_agents_liveness(state, &store, req),
-        ("GET", "/api/v1/sessions") => {
-            drain_ready_session_queues(state, &store);
-            let sessions =
-                discover_sessions_with_home(&store, state.config.home_override.as_deref());
-            HttpResponse::json(200, json!({ "sessions": sessions }))
-        }
+        ("POST", "/api/v1/auth/logout") => handle_auth_logout(state, req),
+        ("GET", "/api/v1/agents") => handle_get_agents(state, req),
+        ("GET", "/api/v1/agents/liveness") => handle_get_agents_liveness(state, req),
+        ("GET", "/api/v1/sessions") => handle_get_sessions(state),
         ("GET", "/api/v1/worktrees") => match list_git_worktrees(&state.config.repo_root) {
             Ok(worktrees) => HttpResponse::json(200, json!({ "worktrees": worktrees })),
             Err(e) => HttpResponse::json(500, json!({ "error": e })),
         },
-        ("GET", "/api/v1/prs") => handle_get_prs(&store),
-        ("GET", "/api/v1/wire/messages") => handle_get_wire_messages(&store, req),
-        ("POST", "/api/v1/wire/send") => handle_post_wire_send(state, &store, &authority, req),
-        ("POST", "/api/v1/wire/ack") => handle_post_wire_ack(state, &store, &authority, req),
-        ("GET", "/api/v1/workflows") => match store.list_workflow_defs(None) {
-            Ok(workflows) => HttpResponse::json(200, json!({ "workflows": workflows })),
-            Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
-        },
-        ("GET", "/api/v1/workflow-runs") => match store.list_workflow_runs(None, None) {
-            Ok(runs) => HttpResponse::json(200, json!({ "runs": runs })),
-            Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
-        },
+        ("GET", "/api/v1/prs") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            handle_get_prs(&store)
+        }
+        ("GET", "/api/v1/wire/messages") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            handle_get_wire_messages(&store, req)
+        }
+        ("POST", "/api/v1/wire/send") => handle_post_wire_send(state, &authority, req),
+        ("POST", "/api/v1/wire/ack") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            handle_post_wire_ack(state, &store, &authority, req)
+        }
+        ("GET", "/api/v1/workflows") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            match store.list_workflow_defs(None) {
+                Ok(workflows) => HttpResponse::json(200, json!({ "workflows": workflows })),
+                Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+            }
+        }
+        ("GET", "/api/v1/workflow-runs") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            match store.list_workflow_runs(None, None) {
+                Ok(runs) => HttpResponse::json(200, json!({ "runs": runs })),
+                Err(e) => HttpResponse::json(500, json!({ "error": e.to_string() })),
+            }
+        }
         ("POST", "/api/v1/workflow-runs") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
             handle_post_workflow_run_start(state, &store, &authority, req)
         }
-        ("GET", "/api/v1/state") => handle_get_state(&store, &authority, req),
-        ("GET", "/api/v1/state/search") => handle_get_state_search(&store, &authority, req),
-        ("GET", "/api/v1/state/code-search") => handle_get_code_search(state, &store, req),
-        ("POST", "/api/v1/state") => handle_post_state(&store, &authority, req),
+        ("GET", "/api/v1/state") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            handle_get_state(&store, &authority, req)
+        }
+        ("GET", "/api/v1/state/search") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            handle_get_state_search(&store, &authority, req)
+        }
+        ("GET", "/api/v1/state/code-search") => handle_get_code_search(state, req),
+        ("POST", "/api/v1/state") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            handle_post_state(&store, &authority, req)
+        }
         ("POST", "/api/v1/state/checkpoint") => {
-            handle_post_state_checkpoint(state, &store, &authority, req)
+            handle_post_state_checkpoint(state, &authority, req)
         }
         ("POST", "/api/v1/state/import-workspace") => {
-            handle_post_state_import_workspace(state, &store, &authority, req)
+            handle_post_state_import_workspace(state, &authority, req)
         }
-        ("GET", "/api/v1/stats") => handle_get_stats(&store, req),
+        ("GET", "/api/v1/stats") => {
+            let Ok(store) = open_store_response(state) else {
+                return store_open_failure();
+            };
+            handle_get_stats(&store, req)
+        }
         ("GET", "/api/v1/architecture") => handle_get_architecture(state, req),
         ("GET" | "HEAD", "/api/v1/artifacts/preview") => handle_get_artifact_preview(state, req),
-        ("GET", "/api/v1/artifacts/list") => handle_get_artifacts_list(state, &store, req),
+        ("GET", "/api/v1/artifacts/list") => handle_get_artifacts_list(state, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
         ("POST", "/api/v1/gate/secrets") => handle_post_gate_secret(state, &authority, req),
         ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
         ("POST", "/api/v1/gate/call") => handle_post_gate_call(state, &authority, req),
         ("POST", "/api/v1/gate/mcp") => handle_post_gate_mcp(state, &authority, None, req),
-        _ => handle_dynamic_api_routes(state, &store, &authority, req),
+        _ => handle_dynamic_api_routes(state, &authority, req),
     }
+}
+
+fn store_open_failure() -> HttpResponse {
+    HttpResponse::json(
+        500,
+        json!({ "error": "failed to open store: store unavailable" }),
+    )
+}
+
+fn open_store_response(state: &HubState) -> Result<HubStoreGuard<'_>, ()> {
+    state.open_store().map_err(|_| ())
+}
+
+fn authenticate_api_request(
+    state: &HubState,
+    req: &HttpRequest,
+) -> Result<HubAuthority, HttpResponse> {
+    if let Some(authority) = state
+        .auth
+        .authenticate_request(None, &req.headers, &req.query)
+    {
+        return Ok(authority);
+    }
+    let Ok(store) = open_store_response(state) else {
+        return Err(HttpResponse::json(
+            500,
+            json!({ "error": "failed to open store: store unavailable" }),
+        ));
+    };
+    state
+        .auth
+        .authenticate_request(Some(&*store), &req.headers, &req.query)
+        .ok_or_else(|| HttpResponse::json(401, json!({ "error": "unauthorized" })))
+}
+
+fn handle_auth_logout(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    if let Some(tok) = req
+        .headers
+        .get("cookie")
+        .and_then(|c| extract_session_cookie(c))
+        .or_else(|| {
+            req.headers
+                .get("authorization")
+                .and_then(|a| extract_bearer_token(a))
+        })
+        && let Ok(store) = state.open_store()
+    {
+        state.auth.revoke_session_token(Some(&*store), &tok);
+    }
+    HttpResponse::json(200, json!({ "authenticated": false }))
+        .with_header("Set-Cookie", format_logout_set_cookie())
+}
+
+fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapshot {
+    match state.open_store() {
+        Ok(store) => snapshot_discovery_store(&store),
+        Err(_) => DiscoveryStoreSnapshot::default(),
+    }
+}
+
+fn handle_get_sessions(state: &HubState) -> HttpResponse {
+    drain_ready_session_queues(state);
+    let snap = match state.open_store() {
+        Ok(store) => snapshot_discovery_store(&store),
+        Err(_) => return store_open_failure(),
+    };
+    let sessions = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
+    HttpResponse::json(200, json!({ "sessions": sessions }))
 }
 
 fn handle_auth_pair(state: &HubState, req: &HttpRequest) -> HttpResponse {
@@ -552,12 +640,15 @@ fn handle_static_request(state: &HubState, req: &HttpRequest) -> HttpResponse {
     )
 }
 
-fn handle_get_agents(state: &HubState, store: &RedbStore, req: &HttpRequest) -> HttpResponse {
+fn handle_get_agents(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let project_filter = req.query.get("project").map(String::as_str);
     let include_retired = req
         .query
         .get("include_retired")
         .is_some_and(|v| v == "true" || v == "1");
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
     let agents = match store.list_agents(project_filter, include_retired) {
         Ok(a) => a,
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
@@ -566,7 +657,9 @@ fn handle_get_agents(state: &HubState, store: &RedbStore, req: &HttpRequest) -> 
         Ok(a) => a,
         Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
     };
-    let routes = discover_sessions_with_home(store, state.config.home_override.as_deref());
+    let snap = snapshot_discovery_store(&store);
+    drop(store);
+    let routes = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
     HttpResponse::json(
         200,
         json!({
@@ -577,11 +670,7 @@ fn handle_get_agents(state: &HubState, store: &RedbStore, req: &HttpRequest) -> 
     )
 }
 
-fn handle_get_agents_liveness(
-    state: &HubState,
-    store: &RedbStore,
-    req: &HttpRequest,
-) -> HttpResponse {
+fn handle_get_agents_liveness(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let stale_after_ms = req
         .query
         .get("stale_after_ms")
@@ -598,10 +687,11 @@ fn handle_get_agents_liveness(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "localhost".to_string());
 
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
     let agents = store.list_agents(None, false).unwrap_or_default();
-    let sessions = discover_sessions_with_home(store, state.config.home_override.as_deref());
-
-    let mut items = Vec::with_capacity(agents.len());
+    let mut heartbeats = Vec::with_capacity(agents.len());
     for ag in &agents {
         let slug = liveness_agent_slug(&ag.name_key);
         let hb: Option<AttemptHeartbeat> = store
@@ -612,6 +702,14 @@ fn handle_get_agents_liveness(
                 StatePayload::Runtime(rt) => serde_json::from_value(rt.value).ok(),
                 _ => None,
             });
+        heartbeats.push(hb);
+    }
+    let snap = snapshot_discovery_store(&store);
+    drop(store);
+    let sessions = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
+
+    let mut items = Vec::with_capacity(agents.len());
+    for (ag, hb) in agents.iter().zip(heartbeats.iter()) {
         let verdict = evaluate_liveness(hb.as_ref(), &now, stale_after_ms, &local_host, |pid| {
             Path::new(&format!("/proc/{pid}")).exists()
         });
@@ -706,7 +804,6 @@ fn handle_get_wire_messages(store: &RedbStore, req: &HttpRequest) -> HttpRespons
 
 fn handle_post_wire_send(
     state: &HubState,
-    store: &RedbStore,
     authority: &HubAuthority,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -759,12 +856,15 @@ fn handle_post_wire_send(
         .or(payload.from.as_deref())
         .unwrap_or_else(|| authority.actor_name());
     let sender_name = validate_sender_name(raw_sender).unwrap_or_else(|_| "owner".to_string());
+    let now = stamp::now();
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
     let sender_id = store
         .agent_by_name(&sender_name)
         .ok()
         .flatten()
         .map(|a| a.id);
-    let now = stamp::now();
 
     let args = SendWireArgs {
         id: None,
@@ -787,6 +887,7 @@ fn handle_post_wire_send(
         Ok(res) => res,
         Err(e) => return HttpResponse::json(400, json!({ "error": e.to_string() })),
     };
+    drop(store);
 
     let route_override = state
         .config
@@ -794,14 +895,39 @@ fn handle_post_wire_send(
         .as_ref()
         .map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
     let mut routes = RouteTable::load(route_override.as_deref());
-    let updated = dispatch_message_for_store(
-        store,
-        &mut routes,
-        state.config.home_override.as_deref(),
-        &msg,
-        now,
-    );
-    if !updated.is_empty()
+    routes.discover_routes(state.config.home_override.as_deref(), now.clone());
+    let mut any_updated = false;
+    for rcpt in &receipts {
+        if matches!(rcpt.status, DeliveryStatus::Acked | DeliveryStatus::Expired)
+            || rcpt.attempts >= MAX_DELIVER
+        {
+            continue;
+        }
+        let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
+            continue;
+        };
+        let target_status = match dispatch_to_route(&entry.route, &msg) {
+            Ok(()) => DeliveryStatus::Acked,
+            Err(_) => DeliveryStatus::Pending,
+        };
+        if let Ok(store) = state.open_store()
+            && store
+                .update_wire_receipt(
+                    &msg.id,
+                    &rcpt.recipient_name,
+                    target_status,
+                    true,
+                    now.clone(),
+                )
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            any_updated = true;
+        }
+    }
+    if any_updated
+        && let Ok(store) = state.open_store()
         && let Ok(fresh) = store.list_wire_receipts(&msg.id)
     {
         receipts = fresh;
@@ -1142,7 +1268,7 @@ fn handle_get_state_search(
     )
 }
 
-fn handle_get_code_search(state: &HubState, store: &RedbStore, req: &HttpRequest) -> HttpResponse {
+fn handle_get_code_search(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let kind = match req.query.get("kind") {
         Some(raw) if !raw.trim().is_empty() => match CodeSearchKind::from_wire(raw.trim()) {
             Some(k) => k,
@@ -1183,6 +1309,9 @@ fn handle_get_code_search(state: &HubState, store: &RedbStore, req: &HttpRequest
     // Missing/blank `q`, and an explicit `limit` of 0, return no symbols
     // and record nothing; `token_gain` is the stored ledger unchanged.
     if query.trim().is_empty() || limit == 0 {
+        let Ok(store) = open_store_response(state) else {
+            return store_open_failure();
+        };
         return HttpResponse::json(
             200,
             json!({
@@ -1190,14 +1319,17 @@ fn handle_get_code_search(state: &HubState, store: &RedbStore, req: &HttpRequest
                 "kind": kind.as_wire(),
                 "symbols": [],
                 "tokens_saved_this_query": 0,
-                "token_gain": load_token_gain(store),
+                "token_gain": load_token_gain(&*store),
             }),
         );
     }
 
     let outcome = scan_code_index(&state.config.repo_root).search(kind, &query, limit);
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
     let token_gain = match record_token_gain_query(
-        store,
+        &*store,
         outcome.tokens_saved_this_query,
         outcome.files_indexed,
         outcome.symbols_indexed,
@@ -1376,7 +1508,6 @@ fn handle_post_state(
 
 fn handle_post_state_checkpoint(
     state: &HubState,
-    store: &RedbStore,
     authority: &HubAuthority,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -1464,6 +1595,10 @@ fn handle_post_state_checkpoint(
             .unwrap_or(StateScope::Workspace)
     });
 
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+
     // Non-owners cannot overwrite an already-sensitive checkpoint entry.
     if !authority.is_owner()
         && let Ok(Some(existing)) = store.get_state_by_key(&scope, StateConcern::Handoff, &slug)
@@ -1476,7 +1611,7 @@ fn handle_post_state_checkpoint(
     }
 
     match create_state_checkpoint_from_probe(
-        store,
+        &*store,
         &probe,
         scope,
         Some(slug.as_str()),
@@ -1494,7 +1629,6 @@ fn handle_post_state_checkpoint(
 
 fn handle_post_state_import_workspace(
     state: &HubState,
-    store: &RedbStore,
     authority: &HubAuthority,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -1541,7 +1675,10 @@ fn handle_post_state_import_workspace(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| authority.actor_name().to_string());
     let scan = scan_workspace_import(&root, &by, stamp::now());
-    let report = apply_workspace_import(store, scan.upserts, scan.skipped);
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let report = apply_workspace_import(&*store, scan.upserts, scan.skipped);
     HttpResponse::json(
         200,
         json!({
@@ -2020,11 +2157,7 @@ fn handle_get_artifact_preview(state: &HubState, req: &HttpRequest) -> HttpRespo
     )
 }
 
-fn handle_get_artifacts_list(
-    state: &HubState,
-    store: &RedbStore,
-    req: &HttpRequest,
-) -> HttpResponse {
+fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let mut candidate_paths: Vec<PathBuf> = Vec::new();
     let mut seen = BTreeSet::new();
 
@@ -2034,7 +2167,7 @@ fn handle_get_artifacts_list(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
     {
-        let (canonical_session_id, _persona) = resolve_session_target(state, store, session_id);
+        let (canonical_session_id, _persona) = resolve_session_target(state, session_id);
         let home_dir = state
             .config
             .home_override
@@ -2066,9 +2199,10 @@ fn handle_get_artifacts_list(
             }
         }
 
-        let turns = read_session_transcript_with_home(
+        let snap = load_discovery_snapshot(state);
+        let turns = read_session_transcript_from_snapshot(
             session_id,
-            store,
+            &snap,
             state.config.home_override.as_deref(),
         );
         for turn in turns.iter().rev().take(60) {
@@ -2163,7 +2297,6 @@ fn handle_get_artifacts_list(
 
 fn handle_dynamic_api_routes(
     state: &HubState,
-    store: &RedbStore,
     authority: &HubAuthority,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -2208,13 +2341,12 @@ fn handle_dynamic_api_routes(
         let session_id = percent_decode(segments[3]);
         match (method, segments[4]) {
             ("GET", "transcript") => {
-                drain_ready_session_queues(state, store);
-                let (canonical_id, _persona) = resolve_session_target(state, store, &session_id);
-                let all_turns = read_session_transcript_with_home(
-                    &session_id,
-                    store,
-                    state.config.home_override.as_deref(),
-                );
+                drain_ready_session_queues(state);
+                let snap = load_discovery_snapshot(state);
+                let home = state.config.home_override.as_deref();
+                let (canonical_id, _persona) =
+                    resolve_session_target_from_snapshot(state, &snap, &session_id);
+                let all_turns = read_session_transcript_from_snapshot(&session_id, &snap, home);
                 let total_turns = all_turns.len();
                 let limit_opt = match req.query.get("limit").map(|s| s.trim()) {
                     Some("all" | "0") => None,
@@ -2225,13 +2357,19 @@ fn handle_dynamic_api_routes(
                     Some(limit) if total_turns > limit => all_turns[total_turns - limit..].to_vec(),
                     _ => all_turns,
                 };
-                let is_busy = state.is_session_busy(store, &canonical_id);
+                let busy_turns = read_session_transcript_from_snapshot(&canonical_id, &snap, home);
+                let is_busy = state.is_session_busy_from_turns(&canonical_id, &busy_turns);
                 let queue = state.session_queue(&canonical_id);
-                let context_usage = read_session_context_usage_with_home(
-                    &session_id,
-                    store,
-                    state.config.home_override.as_deref(),
-                );
+                let context_usage =
+                    read_session_context_usage_from_snapshot(&session_id, &snap, home);
+                let quota_usage =
+                    read_session_quota_usage_with_home(&canonical_id, home).or_else(|| {
+                        if canonical_id == session_id {
+                            None
+                        } else {
+                            read_session_quota_usage_with_home(&session_id, home)
+                        }
+                    });
                 return HttpResponse::json(
                     200,
                     json!({
@@ -2241,13 +2379,14 @@ fn handle_dynamic_api_routes(
                         "is_busy": is_busy,
                         "queue": queue,
                         "context_usage": context_usage,
+                        "quota_usage": quota_usage,
                     }),
                 );
             }
             ("GET", "queue") => {
-                drain_ready_session_queues(state, store);
-                let (canonical_id, _persona) = resolve_session_target(state, store, &session_id);
-                let is_busy = state.is_session_busy(store, &canonical_id);
+                drain_ready_session_queues(state);
+                let (canonical_id, _persona) = resolve_session_target(state, &session_id);
+                let is_busy = state.is_session_busy_released(&canonical_id);
                 let queue = state.session_queue(&canonical_id);
                 return HttpResponse::json(
                     200,
@@ -2259,7 +2398,7 @@ fn handle_dynamic_api_routes(
                 );
             }
             ("POST", "prompt") => {
-                return handle_post_session_prompt(state, store, authority, &session_id, req);
+                return handle_post_session_prompt(state, authority, &session_id, req);
             }
             _ => {}
         }
@@ -2275,13 +2414,13 @@ fn handle_dynamic_api_routes(
         let session_id = percent_decode(segments[3]);
         let prompt_id = percent_decode(segments[5]);
         if segments.len() == 7 && segments[6] == "send-now" && method == "POST" {
-            return handle_post_queued_prompt_send_now(state, store, &session_id, &prompt_id);
+            return handle_post_queued_prompt_send_now(state, &session_id, &prompt_id);
         }
         if segments.len() == 6 && (method == "PATCH" || method == "PUT") {
-            return handle_patch_queued_prompt(state, store, &session_id, &prompt_id, req);
+            return handle_patch_queued_prompt(state, &session_id, &prompt_id, req);
         }
         if segments.len() == 6 && method == "DELETE" {
-            return handle_delete_queued_prompt(state, store, &session_id, &prompt_id);
+            return handle_delete_queued_prompt(state, &session_id, &prompt_id);
         }
     }
 
@@ -2308,12 +2447,15 @@ fn handle_dynamic_api_routes(
         let Ok(number) = segments[3].parse::<u64>() else {
             return HttpResponse::json(400, json!({ "error": "invalid PR number" }));
         };
+        let Ok(store) = open_store_response(state) else {
+            return store_open_failure();
+        };
         match (method, segments[4]) {
             ("POST", "review") => {
-                return handle_post_pr_review(store, authority, number, req);
+                return handle_post_pr_review(&store, authority, number, req);
             }
             ("POST", "merge") => {
-                return handle_post_pr_merge(store, authority, number, req);
+                return handle_post_pr_merge(&store, authority, number, req);
             }
             _ => {}
         }
@@ -2325,8 +2467,11 @@ fn handle_dynamic_api_routes(
         && segments[1] == "v1"
         && segments[2] == "workflow-runs"
     {
+        let Ok(store) = open_store_response(state) else {
+            return store_open_failure();
+        };
         let raw_run_id = percent_decode(segments[3]);
-        let run_id = match resolve_workflow_run_id(store, &raw_run_id) {
+        let run_id = match resolve_workflow_run_id(&store, &raw_run_id) {
             Ok(id) => id,
             Err(e) => return HttpResponse::json(404, json!({ "error": e })),
         };
@@ -2334,8 +2479,8 @@ fn handle_dynamic_api_routes(
         if segments.len() == 4 && method == "GET" {
             return match store.get_workflow_run(&run_id) {
                 Ok(Some(run)) => {
-                    let handoffs = list_workflow_handoffs(store, &run_id).unwrap_or_default();
-                    let facts = list_workflow_facts(store, &run_id).unwrap_or_default();
+                    let handoffs = list_workflow_handoffs(&*store, &run_id).unwrap_or_default();
+                    let facts = list_workflow_facts(&*store, &run_id).unwrap_or_default();
                     HttpResponse::json(
                         200,
                         json!({
@@ -2353,23 +2498,23 @@ fn handle_dynamic_api_routes(
         if segments.len() == 5 && method == "POST" {
             match segments[4] {
                 "step" => {
-                    return handle_post_workflow_step(state, store, authority, &run_id, req);
+                    return handle_post_workflow_step(state, &store, authority, &run_id, req);
                 }
                 "handoff" => {
-                    return handle_post_workflow_handoff(state, store, authority, &run_id, req);
+                    return handle_post_workflow_handoff(state, &store, authority, &run_id, req);
                 }
                 "approve" => {
                     return handle_post_workflow_sign_off(
-                        state, store, authority, &run_id, true, req,
+                        state, &store, authority, &run_id, true, req,
                     );
                 }
                 "reject" => {
                     return handle_post_workflow_sign_off(
-                        state, store, authority, &run_id, false, req,
+                        state, &store, authority, &run_id, false, req,
                     );
                 }
                 "abort" => {
-                    return handle_post_workflow_abort(state, store, authority, &run_id, req);
+                    return handle_post_workflow_abort(state, &store, authority, &run_id, req);
                 }
                 _ => {}
             }
@@ -2392,20 +2537,25 @@ fn handle_dynamic_api_routes(
             && method == "POST"
         {
             let bridge_id = percent_decode(segments[4]);
-            return handle_post_gate_bridge_webhook(state, store, authority, &bridge_id, req);
+            return handle_post_gate_bridge_webhook(state, authority, &bridge_id, req);
         }
     }
 
     HttpResponse::json(404, json!({ "error": "not found" }))
 }
 
-fn resolve_session_target(
+fn resolve_session_target(state: &HubState, raw_session_id: &str) -> (String, Option<String>) {
+    let snap = load_discovery_snapshot(state);
+    resolve_session_target_from_snapshot(state, &snap, raw_session_id)
+}
+
+fn resolve_session_target_from_snapshot(
     state: &HubState,
-    store: &RedbStore,
+    snap: &DiscoveryStoreSnapshot,
     raw_session_id: &str,
 ) -> (String, Option<String>) {
     let trimmed = raw_session_id.trim();
-    let sessions = discover_sessions_with_home(store, state.config.home_override.as_deref());
+    let sessions = discover_sessions_from_snapshot(snap, state.config.home_override.as_deref());
     if let Some(matched) = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -2470,9 +2620,18 @@ fn dispatch_operator_prompt_for_session(
 
 /// Automatically drain and dispatch the next queued operator prompt for any session whose
 /// transcript/in-flight state has transitioned from busy to idle.
-pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
+pub fn drain_ready_session_queues(state: &HubState) {
+    let snap = {
+        let Ok(store) = state.open_store() else {
+            return;
+        };
+        let _live_agents = store.list_agents(None, false).unwrap_or_default();
+        snapshot_discovery_store(&store)
+    };
+    let home = state.config.home_override.as_deref();
     for session_id in state.queued_session_keys() {
-        if !state.is_session_busy(store, &session_id)
+        let turns = read_session_transcript_from_snapshot(&session_id, &snap, home);
+        if !state.is_session_busy_from_turns(&session_id, &turns)
             && let Some((item, queue)) = state.pop_next_queued_prompt(&session_id)
         {
             let delivery_res = dispatch_operator_prompt_for_session(
@@ -2482,7 +2641,8 @@ pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
                 &item.by,
                 &item.effective_body,
             );
-            state.mark_session_in_flight(store, &session_id);
+            let after = read_session_transcript_from_snapshot(&session_id, &snap, home);
+            state.mark_session_in_flight_from_turns(&session_id, &after);
             let sent_data = json!({
                 "session_id": item.session_id,
                 "persona": item.persona,
@@ -2515,11 +2675,10 @@ pub fn drain_ready_session_queues(state: &HubState, store: &RedbStore) {
 
 fn handle_post_queued_prompt_send_now(
     state: &HubState,
-    store: &RedbStore,
     raw_session_id: &str,
     prompt_id: &str,
 ) -> HttpResponse {
-    let (canonical_id, target_persona) = resolve_session_target(state, store, raw_session_id);
+    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
     let removed = state
         .remove_queued_prompt(&canonical_id, prompt_id)
         .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
@@ -2534,7 +2693,7 @@ fn handle_post_queued_prompt_send_now(
         &item.by,
         &item.effective_body,
     );
-    state.mark_session_in_flight(store, &canonical_id);
+    state.mark_session_in_flight_released(&canonical_id);
 
     let data = json!({
         "session_id": canonical_id,
@@ -2567,7 +2726,6 @@ fn handle_post_queued_prompt_send_now(
 
 fn handle_patch_queued_prompt(
     state: &HubState,
-    store: &RedbStore,
     raw_session_id: &str,
     prompt_id: &str,
     req: &HttpRequest,
@@ -2587,7 +2745,7 @@ fn handle_patch_queued_prompt(
         return HttpResponse::json(400, json!({ "error": "prompt must not be empty" }));
     }
 
-    let (canonical_id, target_persona) = resolve_session_target(state, store, raw_session_id);
+    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
     let updated = state
         .update_queued_prompt(&canonical_id, prompt_id, trimmed.clone())
         .or_else(|| state.update_queued_prompt(raw_session_id, prompt_id, trimmed));
@@ -2595,7 +2753,7 @@ fn handle_patch_queued_prompt(
         return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
     };
 
-    let is_busy = state.is_session_busy(store, &canonical_id);
+    let is_busy = state.is_session_busy_released(&canonical_id);
     state.broadcast(
         "session",
         "queue_updated",
@@ -2621,11 +2779,10 @@ fn handle_patch_queued_prompt(
 
 fn handle_delete_queued_prompt(
     state: &HubState,
-    store: &RedbStore,
     raw_session_id: &str,
     prompt_id: &str,
 ) -> HttpResponse {
-    let (canonical_id, target_persona) = resolve_session_target(state, store, raw_session_id);
+    let (canonical_id, target_persona) = resolve_session_target(state, raw_session_id);
     let removed = state
         .remove_queued_prompt(&canonical_id, prompt_id)
         .or_else(|| state.remove_queued_prompt(raw_session_id, prompt_id));
@@ -2633,7 +2790,7 @@ fn handle_delete_queued_prompt(
         return HttpResponse::json(404, json!({ "error": "queued prompt not found" }));
     };
 
-    let is_busy = state.is_session_busy(store, &canonical_id);
+    let is_busy = state.is_session_busy_released(&canonical_id);
     state.broadcast(
         "session",
         "queue_updated",
@@ -2658,7 +2815,6 @@ fn handle_delete_queued_prompt(
 
 fn handle_post_session_prompt(
     state: &HubState,
-    store: &RedbStore,
     authority: &HubAuthority,
     session_id: &str,
     req: &HttpRequest,
@@ -2777,9 +2933,9 @@ fn handle_post_session_prompt(
         .unwrap_or_else(|| authority.actor_name());
     let sender_name = validate_sender_name(sender_raw).unwrap_or_else(|_| "owner".to_string());
 
-    drain_ready_session_queues(state, store);
-    let (canonical_session_id, target_persona) = resolve_session_target(state, store, session_id);
-    let busy = state.is_session_busy(store, &canonical_session_id);
+    drain_ready_session_queues(state);
+    let (canonical_session_id, target_persona) = resolve_session_target(state, session_id);
+    let busy = state.is_session_busy_released(&canonical_session_id);
     let has_queued = !state.session_queue(&canonical_session_id).is_empty();
 
     if !payload.send_now && (busy || has_queued) {
@@ -2823,7 +2979,7 @@ fn handle_post_session_prompt(
         &sender_name,
         &effective_body,
     );
-    state.mark_session_in_flight(store, &canonical_session_id);
+    state.mark_session_in_flight_released(&canonical_session_id);
     let queue = state.session_queue(&canonical_session_id);
 
     let data = json!({
@@ -3548,7 +3704,6 @@ fn handle_post_gate_mcp(
 
 fn handle_post_gate_bridge_webhook(
     state: &HubState,
-    store: &RedbStore,
     authority: &HubAuthority,
     bridge_id: &str,
     req: &HttpRequest,
@@ -3601,7 +3756,7 @@ fn handle_post_gate_bridge_webhook(
 
     match &plan.target {
         BridgeTarget::WireAgent { persona } => {
-            let (canonical_id, target_persona) = resolve_session_target(state, store, persona);
+            let (canonical_id, target_persona) = resolve_session_target(state, persona);
             let sender_label = event.sender_name.as_deref().unwrap_or(&event.sender_id);
             let delivery_res = dispatch_operator_prompt_for_session(
                 state,
@@ -3610,7 +3765,7 @@ fn handle_post_gate_bridge_webhook(
                 sender_label,
                 &plan.prompt_body,
             );
-            state.mark_session_in_flight(store, &canonical_id);
+            state.mark_session_in_flight_released(&canonical_id);
             HttpResponse::json(
                 200,
                 json!({
