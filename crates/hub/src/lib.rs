@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod auth;
+mod direct_quota;
 pub mod discovery;
 pub mod terminal;
 pub mod ws;
@@ -188,6 +189,14 @@ impl HubState {
             return Vec::new();
         };
         guard.queues.get(session_key).cloned().unwrap_or_default()
+    }
+
+    /// Account quota for `session_id`, including the 60-second direct vendor probe cache.
+    pub fn session_quota_usage(&self, session_id: &str) -> Option<SessionQuotaUsage> {
+        discovery::read_session_quota_usage_with_home(
+            session_id,
+            self.config.home_override.as_deref(),
+        )
     }
 
     pub fn queued_session_keys(&self) -> Vec<String> {
@@ -1926,6 +1935,29 @@ mod tests {
         assert!(status == 200 || status == 500, "status {status}");
         drop(_guard);
         handle.join().expect("worktrees thread");
+    }
+
+    #[test]
+    fn empty_prompt_queue_does_not_open_the_store() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let _guard = state.open_store().expect("hold store lock");
+        let state2 = state.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            drain_ready_session_queues(&state2);
+            let _ = tx.send(started.elapsed());
+        });
+        let elapsed = rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("drain with an empty queue blocked on HubStoreGuard");
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "empty drain waited {elapsed:?}"
+        );
+        drop(_guard);
+        handle.join().expect("drain thread");
     }
 
     #[test]
