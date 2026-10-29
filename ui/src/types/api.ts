@@ -232,6 +232,16 @@ export interface SessionQueueResponse {
   queue: QueuedOperatorPrompt[];
 }
 
+export type ClearSessionMode = "clear" | "reforge";
+
+export interface ClearSessionResponse {
+  ok: boolean;
+  session_id: string;
+  persona?: string | null;
+  mode: ClearSessionMode;
+  prompt?: string | null;
+}
+
 export interface PromptRequest {
   prompt: string;
   by?: string;

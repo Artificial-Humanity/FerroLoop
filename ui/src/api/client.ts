@@ -4,6 +4,8 @@ import type {
   ArtifactListResponse,
   ArtifactPreviewResponse,
   AuthSessionResponse,
+  ClearSessionMode,
+  ClearSessionResponse,
   DiscoveredSessionSummary,
   HealthResponse,
   HubStatsResponse,
@@ -225,6 +227,19 @@ export class HubApiClient {
   public async getSessionQueue(sessionId: string): Promise<SessionQueueResponse> {
     return this.request<SessionQueueResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/queue`,
+    );
+  }
+
+  public async clearSession(
+    sessionId: string,
+    mode: ClearSessionMode,
+  ): Promise<ClearSessionResponse> {
+    return this.request<ClearSessionResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/clear`,
+      {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      },
     );
   }
 

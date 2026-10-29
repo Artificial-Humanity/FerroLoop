@@ -1,5 +1,6 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { HubApiClient } from "../api/client";
 import {
   ALWAYS_SEND_NOW_STORAGE_KEY,
   ChatPane,
@@ -875,5 +876,112 @@ describe("ChatPane vendor account quota allowance badge", () => {
     expect(screen.getByTestId("quota-exhausted-alert")).toHaveTextContent(
       "HTTP 429: quota exhausted, resets at 03:15 UTC",
     );
+  });
+});
+
+describe("ChatPane Clear | Reforge modal and ephemeral ? help", () => {
+  it("opens the Cancel | Clear | Reforge modal and auto-hides the ? help popover after 5 seconds", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <ChatPane
+          agentName="ferris"
+          agentDisplayName="Ferris"
+          adapter="claude"
+          sessionId="sess-ferris-01"
+          turns={[]}
+          onSendPrompt={vi.fn()}
+        />,
+      );
+
+      const clearBtn = screen.getByTestId("clear-context-btn");
+      expect(clearBtn).not.toBeDisabled();
+      fireEvent.click(clearBtn);
+
+      const modal = screen.getByTestId("clear-session-modal");
+      expect(modal).toHaveAttribute("role", "dialog");
+      expect(modal).toHaveAttribute("aria-modal", "true");
+      expect(screen.getByTestId("clear-modal-cancel-btn")).toHaveTextContent("Cancel");
+      expect(screen.getByTestId("clear-modal-clear-btn")).toHaveTextContent("Clear");
+      expect(screen.getByTestId("clear-modal-reforge-btn")).toHaveTextContent("Reforge");
+
+      expect(screen.queryByTestId("clear-modal-help-popover")).toBeNull();
+      fireEvent.click(screen.getByTestId("clear-modal-help-btn"));
+
+      const popover = screen.getByTestId("clear-modal-help-popover");
+      expect(popover).toHaveTextContent(/Clear:/);
+      expect(popover).toHaveTextContent(/Reforge:/);
+      expect(popover).toHaveTextContent(/registered identity, project, and role prompt/i);
+
+      act(() => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(screen.queryByTestId("clear-modal-help-popover")).toBeNull();
+
+      fireEvent.click(screen.getByTestId("clear-modal-cancel-btn"));
+      expect(screen.queryByTestId("clear-session-modal")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("calls POST /api/v1/sessions/:id/clear with mode 'clear' and 'reforge'", async () => {
+    const clearCalls: Array<{ url: string; body: unknown }> = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/sess-ferris-01/clear" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        clearCalls.push({ url, body });
+        return new Response(
+          JSON.stringify({
+            ok: true,
+            session_id: "sess-ferris-01",
+            persona: "ferris",
+            mode: body.mode,
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="claude"
+        sessionId="sess-ferris-01"
+        turns={[]}
+        apiClient={apiClient}
+      />,
+    );
+
+    // 1. Clear mode
+    fireEvent.click(screen.getByTestId("clear-context-btn"));
+    fireEvent.click(screen.getByTestId("clear-modal-clear-btn"));
+
+    await waitFor(() => {
+      expect(clearCalls).toEqual([
+        { url: "/api/v1/sessions/sess-ferris-01/clear", body: { mode: "clear" } },
+      ]);
+    });
+    expect(screen.queryByTestId("clear-session-modal")).toBeNull();
+    expect(await screen.findByTestId("compact-feedback")).toHaveTextContent("Cleared context");
+
+    // 2. Reforge mode
+    fireEvent.click(screen.getByTestId("clear-context-btn"));
+    fireEvent.click(screen.getByTestId("clear-modal-reforge-btn"));
+
+    await waitFor(() => {
+      expect(clearCalls).toEqual([
+        { url: "/api/v1/sessions/sess-ferris-01/clear", body: { mode: "clear" } },
+        { url: "/api/v1/sessions/sess-ferris-01/clear", body: { mode: "reforge" } },
+      ]);
+    });
+    expect(screen.queryByTestId("clear-session-modal")).toBeNull();
+    expect(await screen.findByTestId("compact-feedback")).toHaveTextContent("Reforged session");
   });
 });
