@@ -765,7 +765,29 @@ fn is_antigravity_transcript(path: &Path) -> bool {
 }
 
 fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage> {
-    for line in raw.lines().rev() {
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut last_step_index: Option<u64> = None;
+    let mut segment_start = 0usize;
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(step) = val.get("step_index").and_then(Value::as_u64)
+            && last_step_index.is_some_and(|prev| step <= prev)
+        {
+            segment_start = index;
+        }
+        if let Some(step) = val.get("step_index").and_then(Value::as_u64) {
+            last_step_index = Some(step);
+        }
+    }
+
+    let mut latest: Option<SessionContextUsage> = None;
+    for line in lines.iter().skip(segment_start) {
         let trimmed = line.trim();
         if trimmed.is_empty() || !trimmed.contains("PLANNER_RESPONSE") {
             continue;
@@ -780,13 +802,13 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
             + json_u64_token(val.get("cache_read_tokens"))
             + json_u64_token(val.get("output_tokens"));
         if used_tokens > 0 {
-            return Some(SessionContextUsage {
+            latest = Some(SessionContextUsage {
                 used_tokens,
                 max_tokens: 1_000_000,
             });
         }
     }
-    None
+    latest
 }
 
 /// Read account quota for `session_id`.
@@ -1210,10 +1232,47 @@ pub fn read_session_transcript_from_snapshot(
     Vec::new()
 }
 
+/// A falling or repeated Antigravity `step_index` starts a new trajectory.
+/// `step_index` 0 replaces the history. A later rewind keeps that step 0 turn.
+fn apply_agy_step_rewind(
+    step_index: Option<u64>,
+    last_step_index: &mut Option<u64>,
+    step_zero_turn: &mut Option<TranscriptTurn>,
+    turns: &mut Vec<TranscriptTurn>,
+) {
+    let Some(step) = step_index else {
+        return;
+    };
+    if last_step_index.is_some_and(|prev| step <= prev) {
+        turns.clear();
+        if step > 0
+            && let Some(mut zero) = step_zero_turn.clone()
+        {
+            zero.index = 0;
+            turns.push(zero);
+        }
+    }
+    *last_step_index = Some(step);
+}
+
+fn remember_agy_step_zero(
+    step_index: Option<u64>,
+    step_zero_turn: &mut Option<TranscriptTurn>,
+    turns: &[TranscriptTurn],
+) {
+    if step_index == Some(0)
+        && let Some(turn) = turns.last()
+    {
+        *step_zero_turn = Some(turn.clone());
+    }
+}
+
 /// Normalize JSONL lines from Antigravity (`transcript.jsonl`), Claude Code, Codex, Muse, or Grok
 /// into a unified `Vec<TranscriptTurn>` sequence (spec §3.2).
 pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
     let mut turns = Vec::new();
+    let mut last_step_index: Option<u64> = None;
+    let mut step_zero_turn: Option<TranscriptTurn> = None;
     for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1225,6 +1284,7 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         let Some(obj) = val.as_object() else {
             continue;
         };
+        let step_index = obj.get("step_index").and_then(Value::as_u64);
 
         let created_at = obj
             .get("created_at")
@@ -1408,6 +1468,13 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             continue;
         }
 
+        apply_agy_step_rewind(
+            step_index,
+            &mut last_step_index,
+            &mut step_zero_turn,
+            &mut turns,
+        );
+
         // Merge standalone reasoning turn (e.g. Grok `{"type":"reasoning","summary":[...]}`)
         // into the immediately following assistant turn when that assistant turn has no thinking yet.
         if role == "assistant"
@@ -1424,6 +1491,7 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             if prev.created_at.is_none() {
                 prev.created_at = created_at;
             }
+            remember_agy_step_zero(step_index, &mut step_zero_turn, &turns);
             continue;
         }
 
@@ -1436,6 +1504,7 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             tool_calls,
             created_at,
         });
+        remember_agy_step_zero(step_index, &mut step_zero_turn, &turns);
     }
     turns
 }
@@ -3339,6 +3408,115 @@ mod tests {
         )
         .unwrap();
         assert!(read_session_context_usage_with_home(conv, &store, Some(home)).is_none());
+    }
+
+    #[test]
+    fn parse_jsonl_transcript_drops_turns_before_antigravity_step_rewind() {
+        let jsonl = [
+            serde_json::json!({
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "content": "keep"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "content": "old"
+            }),
+            serde_json::json!({
+                "step_index": 27,
+                "type": "PLANNER_RESPONSE",
+                "content": "older"
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "content": "fresh"
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].index, 0);
+        assert_eq!(turns[0].content, "keep");
+        assert_eq!(turns[1].index, 1);
+        assert_eq!(turns[1].role, "user");
+        assert_eq!(turns[1].content, "fresh");
+
+        let reset = [
+            serde_json::json!({"step_index": 0, "type": "USER_INPUT", "content": "first"}),
+            serde_json::json!({"step_index": 3, "type": "PLANNER_RESPONSE", "content": "mid"}),
+            serde_json::json!({"step_index": 0, "type": "USER_INPUT", "content": "reset"}),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let turns = parse_jsonl_transcript(&reset);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "reset");
+        assert_eq!(turns[0].index, 0);
+    }
+
+    #[test]
+    fn antigravity_context_ignores_tokens_before_step_rewind() {
+        let stale = [
+            serde_json::json!({
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 10
+            }),
+            serde_json::json!({
+                "step_index": 27,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 50000
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0,
+                "output_tokens": 0
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(antigravity_context_from_transcript(&stale).is_none());
+
+        let fresh = [
+            serde_json::json!({
+                "step_index": 27,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 50000
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 4
+            }),
+            serde_json::json!({
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 7,
+                "cache_read_tokens": 1,
+                "output_tokens": 1
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_eq!(
+            antigravity_context_from_transcript(&fresh),
+            Some(SessionContextUsage {
+                used_tokens: 9,
+                max_tokens: 1_000_000,
+            })
+        );
     }
 
     #[test]
