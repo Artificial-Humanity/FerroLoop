@@ -244,17 +244,22 @@ pub(crate) fn claude_rate_limit_reason(raw: &str) -> Option<String> {
             continue;
         };
         let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let found = match kind {
-            "assistant" => value
-                .get("error")
-                .and_then(Value::as_str)
-                .filter(|text| is_rate_text(text))
-                .map(ToOwned::to_owned),
-            "system" | "api-request" => first_rate_string(&value, 0),
-            _ => None,
-        };
-        if found.is_some() {
-            latest = found;
+        match kind {
+            // A later assistant turn with no error is a completed turn. It clears
+            // an earlier rate-limit reason, the same way Muse clears on model_completed.
+            "assistant" => match value.get("error") {
+                None | Some(Value::Null) => latest = None,
+                Some(Value::String(text)) if is_rate_text(text) => {
+                    latest = Some(text.clone());
+                }
+                Some(_) => {}
+            },
+            "system" | "api-request" => {
+                if let Some(found) = first_rate_string(&value, 0) {
+                    latest = Some(found);
+                }
+            }
+            _ => {}
         }
     }
     latest
@@ -264,20 +269,26 @@ pub(crate) fn antigravity_exhausted_reason(raw: &str) -> Option<String> {
     let mut latest = None;
     for line in raw.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() || !trimmed.contains("ERROR_MESSAGE") {
+        if trimmed.is_empty()
+            || (!trimmed.contains("ERROR_MESSAGE") && !trimmed.contains("PLANNER_RESPONSE"))
+        {
             continue;
         }
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if value.get("type").and_then(Value::as_str) != Some("ERROR_MESSAGE") {
-            continue;
-        }
-        let Some(error) = value.get("error").and_then(Value::as_str) else {
-            continue;
-        };
-        if is_rate_text(error) {
-            latest = Some(error.to_string());
+        match value.get("type").and_then(Value::as_str) {
+            // A later planner turn means the earlier quota error is no longer current.
+            Some("PLANNER_RESPONSE") => latest = None,
+            Some("ERROR_MESSAGE") => {
+                let Some(error) = value.get("error").and_then(Value::as_str) else {
+                    continue;
+                };
+                if is_rate_text(error) {
+                    latest = Some(error.to_string());
+                }
+            }
+            _ => {}
         }
     }
     latest
@@ -664,17 +675,31 @@ impl Drop for TempSecret<'_> {
 }
 
 fn is_rate_text(text: &str) -> bool {
+    // A SHA-256 digest is alphanumeric. Splitting only on non-digits used to
+    // treat the `429` inside `...b429d...` as an HTTP status.
+    if text.len() >= 32 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+        return false;
+    }
     let lower = text.to_ascii_lowercase();
     if lower.contains("rate limit")
         || lower.contains("rate_limit")
         || lower.contains("session limit")
-        || lower.contains("quota")
     {
         return true;
     }
-    lower
-        .split(|ch: char| !ch.is_ascii_digit())
-        .any(|part| part == "429")
+    let has_429 = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|part| part == "429");
+    if has_429 {
+        return true;
+    }
+    if lower.contains("quota") {
+        return lower.contains("exhausted")
+            || lower.contains("exceeded")
+            || lower.contains("reached")
+            || lower.contains("limit");
+    }
+    false
 }
 
 fn first_rate_string(value: &Value, depth: usize) -> Option<String> {
@@ -1141,5 +1166,55 @@ mod tests {
             assert!(raw.contains("not-a-real-token"));
             assert!(!raw.contains("sk-ant"));
         });
+    }
+
+    #[test]
+    fn sha256_digest_and_bare_quota_are_not_exhaustion() {
+        let digest = "46b062aeae5a97c4e6c16eb9c078d9c5813439b429d59dc9224b1d979b381d72";
+        assert!(!is_rate_text(digest));
+        assert!(!is_rate_text("Please check the quota documentation"));
+        assert!(!is_rate_text("aaaaaaaa-bbbb-4291-cccc-dddddddddddd"));
+        assert!(is_rate_text("Subscription quota exhausted"));
+        assert!(is_rate_text("HTTP 429"));
+        let raw = format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"system","message": digest}),
+            serde_json::json!({"type":"assistant","error": digest}),
+        );
+        assert!(claude_rate_limit_reason(&raw).is_none());
+        let agy = format!(
+            "{}\n",
+            serde_json::json!({"type":"ERROR_MESSAGE","error": digest})
+        );
+        assert!(antigravity_exhausted_reason(&agy).is_none());
+    }
+
+    #[test]
+    fn completed_turn_clears_an_earlier_rate_limit_reason() {
+        let claude = concat!(
+            r#"{"type":"assistant","error":"HTTP 429 rate limit reached"}"#,
+            "\n",
+            r#"{"type":"assistant","content":"the follow-up completed"}"#,
+            "\n",
+        );
+        assert!(claude_rate_limit_reason(claude).is_none());
+        let still = r#"{"type":"system","message":"HTTP 429 rate limit reached"}"#;
+        assert_eq!(
+            claude_rate_limit_reason(still).as_deref(),
+            Some("HTTP 429 rate limit reached")
+        );
+        let agy = concat!(
+            r#"{"type":"ERROR_MESSAGE","error":"429 RESOURCE_EXHAUSTED: quota exceeded"}"#,
+            "\n",
+            r#"{"type":"PLANNER_RESPONSE","content":"next step"}"#,
+            "\n",
+        );
+        assert!(antigravity_exhausted_reason(agy).is_none());
+        let agy_open =
+            r#"{"type":"ERROR_MESSAGE","error":"429 RESOURCE_EXHAUSTED: quota exceeded"}"#;
+        assert_eq!(
+            antigravity_exhausted_reason(agy_open).as_deref(),
+            Some("429 RESOURCE_EXHAUSTED: quota exceeded")
+        );
     }
 }
