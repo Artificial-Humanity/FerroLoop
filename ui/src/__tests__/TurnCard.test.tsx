@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { TurnCard } from "../components/TurnCard";
 import type { TranscriptTurn } from "../types/api";
@@ -92,5 +92,69 @@ describe("TurnCard directed assistant highlight", () => {
     expect(card.style.borderColor).toContain("--wire-card-border");
     expect(card.style.boxShadow).toContain("--wire-card-stripe");
     expect(card.style.backgroundColor).toContain("--wire-card-bg");
+  });
+
+  it("renders system cards without highlight and collapsed by default until clicked", () => {
+    render(
+      <TurnCard
+        turn={turn({
+          index: 5,
+          role: "system",
+          content: "System instruction line 1\nSystem instruction line 2",
+        })}
+      />,
+    );
+
+    const card = screen.getByTestId("turn-card-5");
+    expect(within(card).getByText("System")).toBeInTheDocument();
+    expect(within(card).queryByText("Operator")).toBeNull();
+    expect(card).not.toHaveAttribute("data-directed-assistant", "true");
+    expect(card.style.borderColor).toBe("var(--border-subtle)");
+    expect(card.style.backgroundColor).toBe("var(--bg-surface)");
+    expect(card.style.boxShadow).toBe("");
+
+    const toggle = within(card).getByTestId("turn-system-output-toggle-5");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveTextContent("System (2 lines)");
+    expect(toggle).toHaveTextContent("Show output");
+    expect(within(card).queryByText(/System instruction line 1/)).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveTextContent("Hide output");
+    expect(within(card).getByText(/System instruction line 1/)).toBeInTheDocument();
+  });
+
+  it("defensively classifies raw code-snippet user dumps as collapsed System turns", () => {
+    render(
+      <TurnCard
+        turn={turn({
+          index: 6,
+          role: "user",
+          content: [
+            '")',
+            '729: && !inner.starts_with("<local-command-stdout>")',
+            '730: && !inner.starts_with("<bash-notification>")',
+          ].join("\n"),
+        })}
+      />,
+    );
+
+    const card = screen.getByTestId("turn-card-6");
+    expect(within(card).getByText("System")).toBeInTheDocument();
+    expect(within(card).queryByText("Operator")).toBeNull();
+    expect(card).not.toHaveAttribute("data-directed-assistant", "true");
+    expect(card.style.borderColor).toBe("var(--border-subtle)");
+    expect(card.style.backgroundColor).toBe("var(--bg-surface)");
+    expect(card.style.boxShadow).toBe("");
+
+    const toggle = within(card).getByTestId("turn-system-output-toggle-6");
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveTextContent("System (3 lines)");
+    expect(within(card).queryByText(/729: && !inner\.starts_with/)).toBeNull();
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(within(card).getByText(/729: && !inner\.starts_with/)).toBeInTheDocument();
   });
 });

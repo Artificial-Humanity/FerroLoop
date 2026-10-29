@@ -152,7 +152,7 @@ describe("estimateSessionContextUsage", () => {
   it("returns zero usage for an empty transcript", () => {
     expect(estimateSessionContextUsage([], "claude")).toEqual({
       usedTokens: 0,
-      maxTokens: 200_000,
+      maxTokens: 1_000_000,
       percent: 0,
     });
   });
@@ -160,7 +160,7 @@ describe("estimateSessionContextUsage", () => {
   it("estimates overhead plus content, thinking, and tool calls below 50%", () => {
     const usage = estimateSessionContextUsage(
       [turn({ index: 0, content: "x".repeat(400) })],
-      "claude",
+      "codex",
     );
     // 12_000 overhead + ceil((400 + 0 + 2) / 4) for content + "[]" tool calls.
     expect(usage.usedTokens).toBe(12_101);
@@ -171,14 +171,14 @@ describe("estimateSessionContextUsage", () => {
   it("crosses the 50% threshold on a large transcript and caps at 100%", () => {
     const usage = estimateSessionContextUsage(
       [turn({ index: 0, content: "x".repeat(360_000) })],
-      "claude",
+      "codex",
     );
     expect(usage.percent).toBe(51);
     expect(usage.percent).toBeGreaterThanOrEqual(50);
 
     const capped = estimateSessionContextUsage(
       [turn({ index: 0, content: "x".repeat(2_000_000) })],
-      "claude",
+      "codex",
     );
     expect(capped.percent).toBe(100);
   });
@@ -190,14 +190,14 @@ describe("estimateSessionContextUsage", () => {
         turn({ index: 1, content: "[Compacted context] Earlier work summary." }),
         turn({ index: 2, content: "Next step." }),
       ],
-      "claude",
+      "codex",
     );
     // Only the boundary turn and the short follow-up count toward usage.
     expect(usage.usedTokens).toBeLessThan(13_000);
     expect(usage.percent).toBeLessThan(50);
   });
 
-  it("uses 1M windows for antigravity-family and muse adapters and formats millions", () => {
+  it("uses 1M windows for antigravity-family, muse, and claude adapters and formats millions", () => {
     for (const adapter of [
       "antigravity",
       "agy",
@@ -206,10 +206,13 @@ describe("estimateSessionContextUsage", () => {
       "muse",
       "muse-wonder",
       "muse-wonder-full",
+      "claude",
+      "claude-sonnet-4-5",
+      "claude-haiku-5-5",
     ]) {
       expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(1_000_000);
     }
-    for (const adapter of ["claude", "codex"]) {
+    for (const adapter of ["codex", null]) {
       expect(estimateSessionContextUsage([], adapter).maxTokens).toBe(200_000);
     }
     expect(formatTokenCount(1_000_000)).toBe("1m");
@@ -280,7 +283,7 @@ describe("Compact Context button", () => {
       <ChatPane
         agentName="ferris"
         agentDisplayName="Ferris"
-        adapter="claude"
+        adapter="codex"
         sessionId="sess-ferris-01"
         turns={[turn({ index: 0, role: "user", content: "x".repeat(360_000) })]}
         onSendPrompt={onSendPrompt}
@@ -317,7 +320,7 @@ describe("Compact Context button", () => {
       <ChatPane
         agentName="ferris"
         agentDisplayName="Ferris"
-        adapter="claude"
+        adapter="codex"
         sessionId="sess-ferris-01"
         turns={[turn({ index: 0, role: "user", content: "x".repeat(360_000) })]}
         onSendPrompt={onSendPrompt}
