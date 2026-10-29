@@ -471,8 +471,9 @@ fn agy_csrf_token(route_csrf: &Option<String>) -> Option<String> {
 
 fn validate_agy_conversation_id(conversation_id: &str) -> Result<(), String> {
     if conversation_id.is_empty()
-        || conversation_id.contains(['/', '\\'])
+        || conversation_id.contains(['/', '\\', '\0'])
         || conversation_id.contains("..")
+        || conversation_id.trim() == "."
     {
         return Err(format!(
             "antigravity conversation id `{conversation_id}` is not a single directory name"
@@ -983,6 +984,12 @@ mod tests {
     /// for the whole test so a mock binary cannot hide a live revert, and a live
     /// revert cannot run against the host language server.
     static AGY_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn validate_agy_conversation_id_rejects_dot_and_nul() {
+        assert!(validate_agy_conversation_id(".").is_err());
+        assert!(validate_agy_conversation_id("a\0b").is_err());
+    }
 
     #[test]
     fn claude_socket_dispatch_sends_auth_and_user_frame_and_acks_receipt() {

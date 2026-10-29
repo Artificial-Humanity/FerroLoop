@@ -777,7 +777,7 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
             continue;
         };
         if let Some(step) = val.get("step_index").and_then(Value::as_u64)
-            && last_step_index.is_some_and(|prev| step <= prev)
+            && last_step_index.is_some_and(|prev| agy_step_is_rewind(step, prev))
         {
             segment_start = index;
         }
@@ -1232,8 +1232,16 @@ pub fn read_session_transcript_from_snapshot(
     Vec::new()
 }
 
-/// A falling or repeated Antigravity `step_index` starts a new trajectory.
-/// `step_index` 0 replaces the history. A later rewind keeps that step 0 turn.
+/// A lower step rewinds. Step 0 or 1 also rewinds when it repeats.
+/// A repeat above 1 is the same step, such as a command moving to the background.
+/// `step < prev || step <= 1` is wrong: it rewinds the normal `0 -> 1` transition.
+fn agy_step_is_rewind(step: u64, prev: u64) -> bool {
+    step < prev || (step <= 1 && step <= prev)
+}
+
+/// Apply [`agy_step_is_rewind`]. `step_index` 0 drops any saved step 0 turn before
+/// the clear. A displayable step 0 line is saved again after it is pushed. A later
+/// rewind keeps that turn.
 fn apply_agy_step_rewind(
     step_index: Option<u64>,
     last_step_index: &mut Option<u64>,
@@ -1243,7 +1251,10 @@ fn apply_agy_step_rewind(
     let Some(step) = step_index else {
         return;
     };
-    if last_step_index.is_some_and(|prev| step <= prev) {
+    if step == 0 {
+        *step_zero_turn = None;
+    }
+    if last_step_index.is_some_and(|prev| agy_step_is_rewind(step, prev)) {
         turns.clear();
         if step > 0
             && let Some(mut zero) = step_zero_turn.clone()
@@ -1285,6 +1296,12 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             continue;
         };
         let step_index = obj.get("step_index").and_then(Value::as_u64);
+        apply_agy_step_rewind(
+            step_index,
+            &mut last_step_index,
+            &mut step_zero_turn,
+            &mut turns,
+        );
 
         let created_at = obj
             .get("created_at")
@@ -1467,13 +1484,6 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         if content.is_empty() && thinking.is_none() && tool_calls.is_empty() {
             continue;
         }
-
-        apply_agy_step_rewind(
-            step_index,
-            &mut last_step_index,
-            &mut step_zero_turn,
-            &mut turns,
-        );
 
         // Merge standalone reasoning turn (e.g. Grok `{"type":"reasoning","summary":[...]}`)
         // into the immediately following assistant turn when that assistant turn has no thinking yet.
@@ -3517,6 +3527,165 @@ mod tests {
                 max_tokens: 1_000_000,
             })
         );
+    }
+
+    #[test]
+    fn parse_jsonl_transcript_rewinds_on_token_only_antigravity_planner_step() {
+        let jsonl = [
+            serde_json::json!({"step_index": 0, "type": "USER_INPUT", "content": "keep"}),
+            serde_json::json!({"step_index": 27, "type": "PLANNER_RESPONSE", "content": "older"}),
+            serde_json::json!({"step_index": 1, "type": "PLANNER_RESPONSE", "input_tokens": 0}),
+            serde_json::json!({"step_index": 2, "type": "PLANNER_RESPONSE", "content": "next"}),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].index, 0);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "keep");
+        assert_eq!(turns[1].index, 1);
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "next");
+
+        let empty_step_zero = [
+            serde_json::json!({"step_index": 0, "type": "USER_INPUT", "content": "keep"}),
+            serde_json::json!({"step_index": 4, "type": "PLANNER_RESPONSE", "content": "mid"}),
+            serde_json::json!({"step_index": 0, "type": "PLANNER_RESPONSE", "input_tokens": 0}),
+            serde_json::json!({"step_index": 5, "type": "USER_INPUT", "content": "later"}),
+            serde_json::json!({"step_index": 1, "type": "USER_INPUT", "content": "fresh"}),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let turns = parse_jsonl_transcript(&empty_step_zero);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "fresh");
+        assert_eq!(turns[0].index, 0);
+    }
+
+    #[test]
+    fn parse_jsonl_transcript_keeps_repeated_antigravity_steps_above_one() {
+        let jsonl = [
+            serde_json::json!({"step_index": 0, "type": "USER_INPUT", "content": "keep"}),
+            serde_json::json!({"step_index": 1, "type": "PLANNER_RESPONSE", "content": "first"}),
+            serde_json::json!({"step_index": 37, "type": "GENERIC", "content": "bg-a"}),
+            serde_json::json!({"step_index": 37, "type": "GENERIC", "content": "bg-b"}),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 4);
+        assert_eq!(turns[0].content, "keep");
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[1].content, "first");
+        assert_eq!(turns[2].content, "bg-a");
+        assert_eq!(turns[2].role, "tool");
+        assert_eq!(turns[3].content, "bg-b");
+        assert_eq!(turns[3].role, "tool");
+
+        let repeat_one = [
+            serde_json::json!({"step_index": 0, "type": "USER_INPUT", "content": "keep"}),
+            serde_json::json!({"step_index": 1, "type": "PLANNER_RESPONSE", "content": "old"}),
+            serde_json::json!({"step_index": 1, "type": "USER_INPUT", "content": "fresh"}),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let turns = parse_jsonl_transcript(&repeat_one);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].content, "keep");
+        assert_eq!(turns[1].content, "fresh");
+    }
+
+    #[test]
+    fn antigravity_context_repeated_step_does_not_split_and_rewind_still_drops_prior_tokens() {
+        let repeated = [
+            serde_json::json!({
+                "step_index": 36,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 15
+            }),
+            serde_json::json!({
+                "step_index": 37,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0
+            }),
+            serde_json::json!({
+                "step_index": 37,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_eq!(
+            antigravity_context_from_transcript(&repeated),
+            Some(SessionContextUsage {
+                used_tokens: 15,
+                max_tokens: 1_000_000,
+            })
+        );
+
+        let forward = [
+            serde_json::json!({
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 4
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert_eq!(
+            antigravity_context_from_transcript(&forward),
+            Some(SessionContextUsage {
+                used_tokens: 4,
+                max_tokens: 1_000_000,
+            })
+        );
+
+        let rewind = [
+            serde_json::json!({
+                "step_index": 27,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 50000
+            }),
+            serde_json::json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0
+            }),
+            serde_json::json!({
+                "step_index": 37,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0
+            }),
+            serde_json::json!({
+                "step_index": 37,
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(antigravity_context_from_transcript(&rewind).is_none());
     }
 
     #[test]
