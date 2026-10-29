@@ -514,7 +514,10 @@ fn load_discovery_snapshot(state: &HubState) -> DiscoveryStoreSnapshot {
 
 fn handle_get_sessions(state: &HubState) -> HttpResponse {
     drain_ready_session_queues(state);
-    let snap = load_discovery_snapshot(state);
+    let snap = match state.open_store() {
+        Ok(store) => snapshot_discovery_store(&store),
+        Err(_) => return store_open_failure(),
+    };
     let sessions = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
     HttpResponse::json(200, json!({ "sessions": sessions }))
 }

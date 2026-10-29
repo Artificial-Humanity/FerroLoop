@@ -3209,6 +3209,13 @@ mod tests {
                 "input_tokens": 9999
             })
             .to_string(),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "input_tokens": 0,
+                "cache_read_tokens": 0,
+                "output_tokens": 0
+            })
+            .to_string(),
         ]
         .join("\n");
         fs::write(&path, jsonl).unwrap();
