@@ -253,6 +253,27 @@ impl RouteTable {
         }
     }
 
+    /// Record a file-discovered route at its own mtime.
+    ///
+    /// A newer route already in the table (for example a live Antigravity
+    /// session) is left in place. `updated_ms == 0` falls back to `now`.
+    fn upsert_discovered(&mut self, persona: &str, route: VendorRoute, updated_ms: u64, now: &At) {
+        let file_at = if updated_ms > 0 {
+            At::from_unix_millis(updated_ms)
+        } else {
+            now.clone()
+        };
+        if let Some(norm) = normalize_persona(persona)
+            && self
+                .entries
+                .get(&norm)
+                .is_some_and(|existing| existing.updated_at.unix_millis() > file_at.unix_millis())
+        {
+            return;
+        }
+        self.upsert(persona, route, file_at);
+    }
+
     pub fn get(&self, persona: &str) -> Option<&RouteEntry> {
         let norm = normalize_persona(persona)?;
         self.entries.get(&norm)
@@ -513,8 +534,33 @@ impl RouteTable {
 
     fn discover_codex_routes(&mut self, home: &Path, at: &At) {
         let codex_dir = home.join(".codex");
+        let mut rollout_files = Vec::new();
+        collect_codex_rollout_files(&codex_dir.join("sessions"), 0, &mut rollout_files);
+        // Index `updated_at` and the index file mtime move when the index is rewritten.
+        // The rollout file mtime is the session age the later pass also uses.
+        let mut rollout_mtime_by_thread: BTreeMap<String, u64> = BTreeMap::new();
+        for path in &rollout_files {
+            let (thread_id, _) = extract_codex_rollout_meta(path);
+            if thread_id.is_empty() {
+                continue;
+            }
+            let file_ms = mtime_ms(path);
+            if file_ms == 0 {
+                continue;
+            }
+            rollout_mtime_by_thread
+                .entry(thread_id)
+                .and_modify(|prev| {
+                    if file_ms > *prev {
+                        *prev = file_ms;
+                    }
+                })
+                .or_insert(file_ms);
+        }
+
         let index_path = codex_dir.join("session_index.jsonl");
         if let Ok(text) = fs::read_to_string(&index_path) {
+            let index_ms = mtime_ms(&index_path);
             for line in text.lines() {
                 let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue;
@@ -549,19 +595,31 @@ impl RouteTable {
                     continue;
                 }
                 let cwd = val.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-                self.upsert(
+                let line_updated_ms = val
+                    .get("updated_at")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_flexible_at)
+                    .map(|stamp| stamp.unix_millis())
+                    .filter(|ms| *ms > 0);
+                // Prefer the matching rollout mtime. Fall back to the line's `updated_at`,
+                // then the index mtime. Zero means `upsert_discovered` may use `at`.
+                let updated_ms = rollout_mtime_by_thread
+                    .get(thread_id)
+                    .copied()
+                    .filter(|ms| *ms > 0)
+                    .or(line_updated_ms)
+                    .unwrap_or(index_ms);
+                self.upsert_discovered(
                     &persona,
                     VendorRoute::Codex {
                         thread_id: thread_id.to_string(),
                         cwd,
                     },
-                    at.clone(),
+                    updated_ms,
+                    at,
                 );
             }
         }
-
-        let mut rollout_files = Vec::new();
-        collect_codex_rollout_files(&codex_dir.join("sessions"), 0, &mut rollout_files);
         let mut candidates: Vec<(u64, String, String, Option<PathBuf>)> = Vec::new();
         for path in rollout_files {
             let Some(persona) = scan_transcript_for_persona(&path, 120) else {
@@ -580,8 +638,13 @@ impl RouteTable {
             candidates.push((updated_ms, persona, thread_id, cwd));
         }
         candidates.sort_by_key(|c| c.0);
-        for (_updated_ms, persona, thread_id, cwd) in candidates {
-            self.upsert(&persona, VendorRoute::Codex { thread_id, cwd }, at.clone());
+        for (updated_ms, persona, thread_id, cwd) in candidates {
+            self.upsert_discovered(
+                &persona,
+                VendorRoute::Codex { thread_id, cwd },
+                updated_ms,
+                at,
+            );
         }
     }
 
@@ -626,7 +689,7 @@ impl RouteTable {
                     }) => (tmux_target.clone(), tmux_pane.clone()),
                     _ => (None, None),
                 };
-                self.upsert(
+                self.upsert_discovered(
                     &persona,
                     VendorRoute::Muse {
                         session_id,
@@ -634,7 +697,8 @@ impl RouteTable {
                         tmux_target: existing_target,
                         tmux_pane: existing_pane,
                     },
-                    at.clone(),
+                    mtime_ms(&path),
+                    at,
                 );
             }
         }
@@ -724,6 +788,9 @@ impl RouteTable {
                 let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                     continue;
                 };
+                if transcript_is_grok_build_subagent(&path) {
+                    continue;
+                }
                 let Some(persona) = scan_transcript_for_persona(&path, 50) else {
                     continue;
                 };
@@ -740,7 +807,7 @@ impl RouteTable {
                     }) => (tmux_target.clone(), tmux_pane.clone()),
                     _ => (None, None),
                 };
-                self.upsert(
+                self.upsert_discovered(
                     &persona,
                     VendorRoute::Grok {
                         session_id,
@@ -748,7 +815,8 @@ impl RouteTable {
                         tmux_target: existing_target,
                         tmux_pane: existing_pane,
                     },
-                    at.clone(),
+                    mtime_ms(&path),
+                    at,
                 );
             }
         }
@@ -764,6 +832,9 @@ impl RouteTable {
             }
             let chat_path = dir.join("chat_history.jsonl");
             let summary_path = dir.join("summary.json");
+            if chat_path.is_file() && transcript_is_grok_build_subagent(&chat_path) {
+                continue;
+            }
             let (summary_sid, summary_cwd, summary_updated_ms, summary_persona) =
                 read_grok_summary_metadata(&summary_path);
             let session_id = summary_sid.unwrap_or_else(|| dir_sid.to_string());
@@ -771,14 +842,16 @@ impl RouteTable {
             let is_active = active_meta.is_some();
             let cwd = active_meta.and_then(|m| m.cwd.clone()).or(summary_cwd);
             let tmux_pane = active_meta.and_then(|m| m.tmux_pane.clone());
-            let updated_ms = summary_updated_ms.unwrap_or_else(|| {
-                fs::metadata(&chat_path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0)
-            });
+            // Active sessions upsert at wall-clock `at`. Inactive ones must not use
+            // summary.json `updated_at` / `last_active_at` / `created_at`: a rewrite of
+            // that file is not the chat transcript's age.
+            let updated_ms = if is_active {
+                summary_updated_ms.unwrap_or_else(|| mtime_ms(&chat_path))
+            } else if chat_path.is_file() {
+                mtime_ms(&chat_path)
+            } else {
+                mtime_ms(&summary_path)
+            };
 
             let persona = active_meta
                 .and_then(|m| m.env_persona.clone())
@@ -830,16 +903,17 @@ impl RouteTable {
                 }) => (tmux_target.clone(), tmux_pane.clone()),
                 _ => (None, None),
             };
-            self.upsert(
-                &cand.persona,
-                VendorRoute::Grok {
-                    session_id: cand.session_id,
-                    cwd: cand.cwd,
-                    tmux_target: existing_target,
-                    tmux_pane: cand.tmux_pane.or(existing_pane),
-                },
-                at.clone(),
-            );
+            let route = VendorRoute::Grok {
+                session_id: cand.session_id,
+                cwd: cand.cwd,
+                tmux_target: existing_target,
+                tmux_pane: cand.tmux_pane.or(existing_pane),
+            };
+            if cand.is_active {
+                self.upsert(&cand.persona, route, at.clone());
+            } else {
+                self.upsert_discovered(&cand.persona, route, cand.updated_ms, at);
+            }
         }
 
         if check_proc {
@@ -1283,109 +1357,226 @@ fn extract_text_from_json_content(val: &serde_json::Value) -> Option<String> {
     None
 }
 
+fn mtime_ms(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn transcript_is_grok_build_subagent(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    first_system_message_is_grok_subagent(&text)
+}
+
+/// The first `system` row of a Grok Build subagent session.
+fn first_system_message_is_grok_subagent(text: &str) -> bool {
+    for line in text.lines().take(200) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let kind = val
+            .get("type")
+            .and_then(|v| v.as_str())
+            .or_else(|| val.get("role").and_then(|v| v.as_str()));
+        if !matches!(kind, Some("system" | "SYSTEM")) {
+            continue;
+        }
+        let content = row_text(&val).unwrap_or_default();
+        return content.contains("You are a Grok Build subagent");
+    }
+    false
+}
+
+fn row_text(val: &serde_json::Value) -> Option<String> {
+    val.get("content")
+        .and_then(extract_text_from_json_content)
+        .or_else(|| {
+            val.pointer("/message/content")
+                .and_then(extract_text_from_json_content)
+        })
+        .or_else(|| {
+            val.pointer("/payload/content")
+                .and_then(extract_text_from_json_content)
+        })
+        .or_else(|| {
+            val.pointer("/payload/body")
+                .and_then(extract_text_from_json_content)
+        })
+        .or_else(|| val.get("text").and_then(extract_text_from_json_content))
+        .or_else(|| val.get("output").and_then(extract_text_from_json_content))
+}
+
+fn push_json_text(parts: &mut Vec<String>, val: &serde_json::Value) {
+    match val {
+        serde_json::Value::String(text) => {
+            if !text.is_empty() {
+                parts.push(text.clone());
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                push_json_text(parts, item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for child in map.values() {
+                push_json_text(parts, child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn tool_call_argument_text(val: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    for calls in [
+        val.get("tool_calls"),
+        val.get("toolCalls"),
+        val.pointer("/message/tool_calls"),
+        val.pointer("/payload/tool_calls"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|v| v.as_array())
+    {
+        for call in calls {
+            for key in ["arguments", "args", "input", "command"] {
+                if let Some(arg) = call.get(key) {
+                    push_json_text(&mut parts, arg);
+                }
+                if let Some(arg) = call.pointer(&format!("/function/{key}")) {
+                    push_json_text(&mut parts, arg);
+                }
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn response_item_tool_input_text(val: &serde_json::Value) -> String {
+    let mut parts = Vec::new();
+    if let Some(payload) = val.get("payload") {
+        for key in ["input", "arguments", "args", "command"] {
+            if let Some(arg) = payload.get(key) {
+                push_json_text(&mut parts, arg);
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn is_tool_output_type(kind: Option<&str>) -> bool {
+    matches!(
+        kind,
+        Some("tool_result" | "TOOL_RESULT" | "custom_tool_call_output" | "function_call_output")
+    )
+}
+
 pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
+    if first_system_message_is_grok_subagent(&text) {
+        return None;
+    }
     for line in text.lines().take(max_lines) {
         if line.trim().is_empty() {
             continue;
         }
-        let candidate_text: String = if let Ok(val) =
-            serde_json::from_str::<serde_json::Value>(line)
-        {
-            for field in ["agentName", "customTitle", "persona"] {
-                if let Some(s) = val.get(field).and_then(|v| v.as_str())
-                    && let Some(norm) = normalize_claude_session_name(s)
-                {
-                    return Some(norm);
-                }
-            }
-            if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
-                || val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
-                || val.get("synthetic_reason").is_some()
-            {
-                continue;
-            }
-            let t = val.get("type").and_then(|v| v.as_str());
-            if matches!(t, Some("tool_result" | "TOOL_RESULT")) {
-                if let Some(c) = val.get("content").and_then(extract_text_from_json_content)
-                    && let Some(reg_idx) = c.find("Registered ")
-                {
-                    let after = &c[reg_idx + "Registered ".len()..];
-                    let token: String = after
-                        .chars()
-                        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
-                        .collect();
-                    if after[token.len()..].starts_with(" <")
-                        && let Some(norm) = normalize_claude_session_name(&token)
+        let candidate_text: String =
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                for field in ["agentName", "customTitle", "persona"] {
+                    if let Some(s) = val.get(field).and_then(|v| v.as_str())
+                        && let Some(norm) = normalize_claude_session_name(s)
                     {
                         return Some(norm);
                     }
                 }
-                continue;
-            }
-            if t == Some("response_item") {
-                let pt = val.pointer("/payload/type").and_then(|v| v.as_str());
-                if matches!(pt, Some("custom_tool_call_output" | "function_call_output")) {
-                    if let Some(c) = val
-                        .pointer("/payload/output")
-                        .and_then(extract_text_from_json_content)
-                        && let Some(reg_idx) = c.find("Registered ")
-                    {
-                        let after = &c[reg_idx + "Registered ".len()..];
-                        let token: String = after
-                            .chars()
-                            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
-                            .collect();
-                        if after[token.len()..].starts_with(" <")
-                            && let Some(norm) = normalize_claude_session_name(&token)
-                        {
-                            return Some(norm);
-                        }
-                    }
+                if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+                    || val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+                    || val.get("synthetic_reason").is_some()
+                {
                     continue;
                 }
-                if pt == Some("message")
-                    && val.pointer("/payload/role").and_then(|v| v.as_str()) == Some("user")
-                    && let Some(c) = val
-                        .pointer("/payload/content")
-                        .and_then(extract_text_from_json_content)
-                {
-                    let trimmed_c = c.trim_start();
-                    if trimmed_c.starts_with("# AGENTS.md instructions for ")
-                        || trimmed_c.starts_with("<environment_context>")
-                        || trimmed_c.starts_with("<INSTRUCTIONS>")
-                        || trimmed_c.starts_with("<permissions instructions>")
-                        || trimmed_c.starts_with("<user_shell_command>")
-                    {
+                let t = val.get("type").and_then(|v| v.as_str());
+                // Tool output includes repository source and test fixtures that name
+                // other personas. Do not read those rows.
+                if is_tool_output_type(t) {
+                    continue;
+                }
+                if t == Some("response_item") {
+                    let pt = val.pointer("/payload/type").and_then(|v| v.as_str());
+                    if is_tool_output_type(pt) {
                         continue;
                     }
-                    c
+                    if matches!(pt, Some("custom_tool_call" | "function_call")) {
+                        let args = response_item_tool_input_text(&val);
+                        if args.is_empty() {
+                            continue;
+                        }
+                        args
+                    } else if pt == Some("message")
+                        && val.pointer("/payload/role").and_then(|v| v.as_str()) == Some("user")
+                        && let Some(c) = val
+                            .pointer("/payload/content")
+                            .and_then(extract_text_from_json_content)
+                    {
+                        let trimmed_c = c.trim_start();
+                        if trimmed_c.starts_with("# AGENTS.md instructions for ")
+                            || trimmed_c.starts_with("<environment_context>")
+                            || trimmed_c.starts_with("<INSTRUCTIONS>")
+                            || trimmed_c.starts_with("<permissions instructions>")
+                            || trimmed_c.starts_with("<user_shell_command>")
+                        {
+                            continue;
+                        }
+                        c
+                    } else {
+                        continue;
+                    }
+                } else if matches!(t, Some("GENERIC" | "generic")) {
+                    if line.contains("Showing lines ") {
+                        continue;
+                    }
+                    let Some(s) = row_text(&val) else {
+                        continue;
+                    };
+                    s
+                } else if matches!(
+                    t,
+                    Some("assistant" | "PLANNER_RESPONSE" | "planner_response")
+                ) {
+                    let mut parts = Vec::new();
+                    if let Some(s) = row_text(&val) {
+                        parts.push(s);
+                    }
+                    let args = tool_call_argument_text(&val);
+                    if !args.is_empty() {
+                        parts.push(args);
+                    }
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    parts.join("\n")
                 } else {
-                    continue;
+                    if !matches!(t, None | Some("USER_INPUT" | "user" | "human")) {
+                        continue;
+                    }
+                    let Some(s) = row_text(&val) else {
+                        continue;
+                    };
+                    s
                 }
             } else {
-                if !matches!(t, None | Some("USER_INPUT" | "user" | "human")) {
-                    continue;
-                }
-                let Some(s) = val
-                    .get("content")
-                    .and_then(extract_text_from_json_content)
-                    .or_else(|| {
-                        val.pointer("/message/content")
-                            .and_then(extract_text_from_json_content)
-                    })
-                    .or_else(|| {
-                        val.pointer("/payload/body")
-                            .and_then(extract_text_from_json_content)
-                    })
-                else {
-                    continue;
-                };
-                s
-            }
-        } else {
-            line.to_string()
-        };
+                line.to_string()
+            };
         let lower = candidate_text.to_ascii_lowercase();
         for marker in [
             "take the name of ",
@@ -1837,6 +2028,9 @@ fn resolve_grok_pid_persona(home: &Path, start_pid: u32) -> Option<String> {
         };
         if let Some(dir) = candidate_dir {
             let chat_path = dir.join("chat_history.jsonl");
+            if chat_path.is_file() && transcript_is_grok_build_subagent(&chat_path) {
+                return None;
+            }
             if chat_path.is_file()
                 && let Some(norm) = scan_transcript_for_persona(&chat_path, 120)
             {
@@ -2500,5 +2694,502 @@ mod tests {
             }) if thread_id == "01a18550-1b11-7882-82b6-ea40058ed587"
                 && cwd == Path::new("/home/lmcfarlin/Projects/Artificial-Humanity")
         ));
+    }
+
+    fn set_mtime(path: &Path, ms: u64) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        let when = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+        file.set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn scan_ignores_tool_output_subagents_and_read_file_dumps() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub.jsonl");
+        fs::write(
+            &sub,
+            [
+                serde_json::json!({
+                    "type": "system",
+                    "content": "You are a Grok Build subagent. Read the file and report."
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "tool_result",
+                    "content": "AGENT_PERSONA=katie\nYou are Katie"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert!(scan_transcript_for_persona(&sub, 50).is_none());
+
+        let tools = tmp.path().join("tools.jsonl");
+        fs::write(
+            &tools,
+            [
+                serde_json::json!({
+                    "type": "tool_result",
+                    "content": "agent-msg register Katie <katie@example.com>"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "custom_tool_call_output",
+                    "output": "You are Penelope"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "GENERIC",
+                    "content": "Showing lines 1-20 of discovery.rs\nAGENT_PERSONA=katie"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        assert!(scan_transcript_for_persona(&tools, 50).is_none());
+
+        let generic = tmp.path().join("generic.jsonl");
+        fs::write(
+            &generic,
+            serde_json::json!({
+                "type": "GENERIC",
+                "content": "agent-msg register Wesley"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_transcript_for_persona(&generic, 20).as_deref(),
+            Some("wesley")
+        );
+
+        let assistant = tmp.path().join("assistant.jsonl");
+        fs::write(
+            &assistant,
+            serde_json::json!({
+                "type": "assistant",
+                "tool_calls": [{
+                    "function": {"arguments": "agent-msg register Penelope"}
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_transcript_for_persona(&assistant, 20).as_deref(),
+            Some("penelope")
+        );
+
+        let planner = tmp.path().join("planner.jsonl");
+        fs::write(
+            &planner,
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "content": "You are Sonya. Continue the review."
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_transcript_for_persona(&planner, 20).as_deref(),
+            Some("sonya")
+        );
+
+        let planner_cmd = tmp.path().join("planner-cmd.jsonl");
+        fs::write(
+            &planner_cmd,
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [{
+                    "name": "run_command",
+                    "arguments": {"cmd": "agent-msg register Katie"}
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_transcript_for_persona(&planner_cmd, 20).as_deref(),
+            Some("katie")
+        );
+
+        let codex_call = tmp.path().join("codex-call.jsonl");
+        fs::write(
+            &codex_call,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": "agent-msg register Wesley"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_transcript_for_persona(&codex_call, 20).as_deref(),
+            Some("wesley")
+        );
+
+        let codex_fn = tmp.path().join("codex-fn.jsonl");
+        fs::write(
+            &codex_fn,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell",
+                    "input": "agent-msg register Penelope"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            scan_transcript_for_persona(&codex_fn, 20).as_deref(),
+            Some("penelope")
+        );
+
+        let codex_out = tmp.path().join("codex-out.jsonl");
+        fs::write(
+            &codex_out,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "output": "agent-msg register Katie"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(scan_transcript_for_persona(&codex_out, 20).is_none());
+    }
+
+    #[test]
+    fn grok_build_subagent_session_is_not_a_route() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let session = home
+            .join(".grok")
+            .join("sessions")
+            .join("proj")
+            .join("01a18599-c714-7700-85bb-e276825a98b2");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("chat_history.jsonl"),
+            [
+                serde_json::json!({
+                    "type": "system",
+                    "content": "You are a Grok Build subagent. Inspect the diff."
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "tool_result",
+                    "content": "fn test(){ let _ = \"AGENT_PERSONA=katie\"; }"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": "01a18599-c714-7700-85bb-e276825a98b2"},
+                "session_summary": "Katie registers from a tool result",
+                "updated_at": "2026-10-29T03:00:00.000Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(home), At::parse("2026-10-29T04:00:00.000Z").unwrap());
+        assert!(table.get("katie").is_none());
+    }
+
+    #[test]
+    fn stale_historical_sessions_do_not_overwrite_a_newer_route() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
+        let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
+
+        let day = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("16");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-09-16T10-40-52-01a0a9ce-old.jsonl");
+        fs::write(
+            &rollout,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "You are Wesley. Old Codex session."}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        set_mtime(&rollout, old_ms);
+
+        let muse_dir = home
+            .join(".local")
+            .join("share")
+            .join("muse")
+            .join("sessions");
+        fs::create_dir_all(&muse_dir).unwrap();
+        let muse = muse_dir.join("old-muse.jsonl");
+        fs::write(
+            &muse,
+            serde_json::json!({
+                "type": "user",
+                "content": "You are Wesley. Old Muse session."
+            })
+            .to_string(),
+        )
+        .unwrap();
+        set_mtime(&muse, old_ms);
+
+        let grok = home
+            .join(".grok")
+            .join("sessions")
+            .join("proj")
+            .join("old-grok-session");
+        fs::create_dir_all(&grok).unwrap();
+        let chat = grok.join("chat_history.jsonl");
+        fs::write(
+            &chat,
+            [
+                serde_json::json!({"type":"system","content":"You are Grok 4.7 released by xAI."})
+                    .to_string(),
+                serde_json::json!({"type":"user","content":"You are Wesley. Old Grok session."})
+                    .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        set_mtime(&chat, old_ms);
+
+        let mut table = RouteTable::default();
+        table.upsert(
+            "wesley",
+            VendorRoute::Agy {
+                conversation_id: "conv-wesley".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            live_at,
+        );
+        table.discover_routes(Some(home), At::parse("2026-10-29T04:00:00.000Z").unwrap());
+
+        assert!(
+            matches!(
+                table.get("wesley").map(|e| &e.route),
+                Some(VendorRoute::Agy { conversation_id, .. }) if conversation_id == "conv-wesley"
+            ),
+            "stale codex, muse, and grok files must not replace the newer route"
+        );
+    }
+
+    #[test]
+    fn inactive_grok_summary_updated_at_does_not_replace_newer_route() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
+        let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
+        let summary_ms = At::parse("2026-10-29T05:00:00.000Z").unwrap().unix_millis();
+
+        let grok = home
+            .join(".grok")
+            .join("sessions")
+            .join("proj")
+            .join("old-grok-session");
+        fs::create_dir_all(&grok).unwrap();
+        let chat = grok.join("chat_history.jsonl");
+        fs::write(
+            &chat,
+            [
+                serde_json::json!({"type":"system","content":"You are Grok 4.7 released by xAI."})
+                    .to_string(),
+                serde_json::json!({"type":"user","content":"You are Wesley. Old Grok session."})
+                    .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let summary = grok.join("summary.json");
+        fs::write(
+            &summary,
+            serde_json::json!({
+                "info": {"id": "old-grok-session"},
+                "session_summary": "Wesley registers from a rewritten summary",
+                "updated_at": "2026-10-29T05:00:00.000Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        set_mtime(&summary, summary_ms);
+        set_mtime(&chat, old_ms);
+
+        let mut table = RouteTable::default();
+        table.upsert(
+            "wesley",
+            VendorRoute::Agy {
+                conversation_id: "conv-wesley".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            live_at.clone(),
+        );
+        table.discover_routes(Some(home), At::parse("2026-10-29T06:00:00.000Z").unwrap());
+
+        let entry = table.get("wesley").expect("existing route");
+        assert!(
+            matches!(
+                &entry.route,
+                VendorRoute::Agy { conversation_id, .. } if conversation_id == "conv-wesley"
+            ),
+            "inactive grok chat mtime must not lose to summary.json updated_at"
+        );
+        assert_eq!(entry.updated_at, live_at);
+    }
+
+    #[test]
+    fn codex_index_updated_at_does_not_outstamp_older_rollout() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let old_ms = At::parse("2026-09-16T10:40:52.000Z").unwrap().unix_millis();
+        let live_at = At::parse("2026-10-29T01:42:59.000Z").unwrap();
+        let thread_id = "01a0a9ce-1111-7222-8333-ea40058ed587";
+
+        let day = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("09")
+            .join("16");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join(format!("rollout-2026-09-16T10-40-52-{thread_id}.jsonl"));
+        fs::write(
+            &rollout,
+            [
+                serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": thread_id,
+                        "cwd": "/tmp/old-codex"
+                    }
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "You are Wesley. Old Codex session."}]
+                    }
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        set_mtime(&rollout, old_ms);
+
+        let index = home.join(".codex").join("session_index.jsonl");
+        fs::write(
+            &index,
+            serde_json::json!({
+                "id": thread_id,
+                "agentName": "Wesley",
+                "updated_at": "2026-10-29T05:00:00.000Z",
+                "cwd": "/tmp/fresh-index"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        set_mtime(
+            &index,
+            At::parse("2026-10-29T05:00:01.000Z").unwrap().unix_millis(),
+        );
+
+        let mut table = RouteTable::default();
+        table.upsert(
+            "wesley",
+            VendorRoute::Agy {
+                conversation_id: "conv-wesley".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            live_at.clone(),
+        );
+        table.discover_routes(Some(home), At::parse("2026-10-29T06:00:00.000Z").unwrap());
+
+        let entry = table.get("wesley").expect("existing route");
+        assert!(
+            matches!(
+                &entry.route,
+                VendorRoute::Agy { conversation_id, .. } if conversation_id == "conv-wesley"
+            ),
+            "index updated_at newer than the route must not beat an older rollout mtime"
+        );
+        assert_eq!(entry.updated_at, live_at);
+    }
+
+    #[test]
+    fn resolve_grok_pid_persona_skips_subagent_summary() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sid = "01a18599-c714-7700-85bb-e276825a98b2";
+        let fake_pid = 4_000_000_001_u32;
+        let session = home.join(".grok").join("sessions").join("proj").join(sid);
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            home.join(".grok").join("active_sessions.json"),
+            serde_json::json!([{
+                "session_id": sid,
+                "pid": fake_pid,
+                "cwd": "/tmp/proj"
+            }])
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            session.join("chat_history.jsonl"),
+            serde_json::json!({
+                "type": "system",
+                "content": "You are a Grok Build subagent. Inspect the diff."
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            session.join("summary.json"),
+            serde_json::json!({
+                "info": {"id": sid},
+                "session_summary": "Katie registers from a subagent summary",
+                "updated_at": "2026-10-29T03:00:00.000Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(resolve_grok_pid_persona(home, fake_pid).is_none());
     }
 }
