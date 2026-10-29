@@ -158,26 +158,8 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             Ok(())
         }
         VendorRoute::Codex { thread_id, cwd } => {
-            let mut cmd = Command::new("codex");
-            cmd.args([
-                "queue",
-                "--thread",
-                thread_id,
-                "--message",
-                &format_push_message(msg),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-            if let Some(dir) = cwd {
-                cmd.current_dir(dir);
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("failed to spawn codex queue: {e}"))?;
-            if !status.success() {
-                return Err(format!("codex queue exited with {status}"));
-            }
-            Ok(())
+            let formatted = format_push_message(msg);
+            deliver_to_codex_route(thread_id, cwd.as_ref(), &formatted)
         }
         VendorRoute::Muse {
             session_id,
@@ -227,6 +209,48 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             Ok(())
         }
     }
+}
+
+fn deliver_to_codex_route(
+    thread_id: &str,
+    cwd: Option<&PathBuf>,
+    text: &str,
+) -> Result<(), String> {
+    let mut bins = Vec::new();
+    if let Some(custom) = std::env::var_os("FL_WIRE_CODEX_BIN") {
+        bins.push(PathBuf::from(custom));
+    } else {
+        bins.push(PathBuf::from("codex"));
+        if let Some(home) = std::env::var_os("HOME") {
+            let local_bin = PathBuf::from(home).join(".local").join("bin").join("codex");
+            if local_bin.is_file() {
+                bins.push(local_bin);
+            }
+        }
+    }
+
+    let mut last_err = String::new();
+    for bin in bins {
+        let mut cmd = Command::new(&bin);
+        cmd.args(["queue", "--thread", thread_id, "--message", text])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(dir) = cwd
+            && dir.exists()
+        {
+            cmd.current_dir(dir);
+        }
+        match cmd.status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(status) => {
+                return Err(format!("codex queue exited with {status}"));
+            }
+            Err(e) => {
+                last_err = format!("failed to spawn codex queue: {e}");
+            }
+        }
+    }
+    Err(last_err)
 }
 
 /// Deliver a human operator chat prompt from FerroDeck directly to a live vendor session
@@ -552,20 +576,7 @@ pub fn dispatch_operator_prompt_to_route(
             Ok(())
         }
         VendorRoute::Codex { thread_id, cwd } => {
-            let mut cmd = Command::new("codex");
-            cmd.args(["queue", "--thread", thread_id, "--message", body])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            if let Some(dir) = cwd {
-                cmd.current_dir(dir);
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("failed to spawn codex queue: {e}"))?;
-            if !status.success() {
-                return Err(format!("codex queue exited with {status}"));
-            }
-            Ok(())
+            deliver_to_codex_route(thread_id, cwd.as_ref(), body)
         }
         VendorRoute::Muse {
             session_id,

@@ -316,7 +316,23 @@ fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String>
         if !sub.is_dir() {
             continue;
         }
-        for entry in WalkDir::new(&sub).max_depth(8).into_iter().flatten() {
+        for entry in WalkDir::new(&sub)
+            .max_depth(8)
+            .into_iter()
+            .filter_entry(|e| {
+                if !e.file_type().is_dir() {
+                    return true;
+                }
+                let Some(name) = e.file_name().to_str() else {
+                    return true;
+                };
+                !matches!(
+                    name,
+                    ".tmp" | "tmp" | ".git" | "plugins" | "cache" | "node_modules" | "subagents"
+                )
+            })
+            .flatten()
+        {
             let p = entry.path();
             if !p.is_file() {
                 continue;
@@ -328,7 +344,7 @@ fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String>
                 continue;
             }
             if let Some(stem) = p.file_stem().and_then(|s| s.to_str())
-                && stem == session_id
+                && (stem == session_id || stem.ends_with(&format!("-{session_id}")))
             {
                 return Some(p.display().to_string());
             }
@@ -348,8 +364,35 @@ fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String>
     None
 }
 
+fn read_codex_configured_context_window(tpath: &Path) -> Option<u64> {
+    let codex_dir = tpath
+        .ancestors()
+        .find(|a| a.file_name().and_then(|s| s.to_str()) == Some(".codex"))?;
+    let raw = fs::read_to_string(codex_dir.join("config.toml")).ok()?;
+    for line in raw.lines() {
+        let trimmed = line.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = trimmed.strip_prefix("model_context_window") {
+            let Some(after_eq) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let cleaned: String = after_eq
+                .trim()
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(val) = cleaned.parse::<u64>()
+                && val > 0
+            {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
 /// Read server-measured context window token usage for `session_id` when vendor session
-/// metadata (such as Grok `signals.json`/`summary.json` or Claude `message.usage`) is available.
+/// metadata (such as Grok `signals.json`/`summary.json`, Claude `message.usage`, Codex `token_count`,
+/// or Muse `model_completed`) is available.
 pub fn read_session_context_usage_with_home(
     session_id: &str,
     store: &RedbStore,
@@ -417,6 +460,94 @@ pub fn read_session_context_usage_with_home(
                 used_tokens,
                 max_tokens,
             });
+        }
+    }
+
+    if tpath.to_string_lossy().contains(".codex")
+        && let Ok(raw) = fs::read_to_string(&tpath)
+    {
+        let configured_max = read_codex_configured_context_window(&tpath);
+        for line in raw.lines().rev() {
+            let trimmed_line = line.trim();
+            if trimmed_line.is_empty() || !trimmed_line.contains("\"token_count\"") {
+                continue;
+            }
+            let Ok(val) = serde_json::from_str::<Value>(trimmed_line) else {
+                continue;
+            };
+            if val.get("type").and_then(Value::as_str) != Some("event_msg")
+                || val.pointer("/payload/type").and_then(Value::as_str) != Some("token_count")
+            {
+                continue;
+            }
+            let used_tokens = val
+                .pointer("/payload/info/last_token_usage/total_tokens")
+                .and_then(Value::as_u64)
+                .filter(|&n| n > 0)
+                .or_else(|| {
+                    val.pointer("/payload/info/total_token_usage/total_tokens")
+                        .and_then(Value::as_u64)
+                        .filter(|&n| n > 0)
+                });
+            let max_tokens = configured_max
+                .or_else(|| {
+                    val.pointer("/payload/info/model_context_window")
+                        .and_then(Value::as_u64)
+                        .filter(|&n| n > 0)
+                })
+                .unwrap_or(500_000);
+            if let Some(used_tokens) = used_tokens {
+                return Some(SessionContextUsage {
+                    used_tokens,
+                    max_tokens,
+                });
+            }
+        }
+        if let Some(max_tokens) = configured_max {
+            return Some(SessionContextUsage {
+                used_tokens: 0,
+                max_tokens,
+            });
+        }
+    }
+
+    if tpath.file_name().and_then(|s| s.to_str()) == Some("session.jsonl")
+        && let Ok(raw) = fs::read_to_string(&tpath)
+    {
+        for line in raw.lines().rev() {
+            let trimmed_line = line.trim();
+            if trimmed_line.is_empty() || !trimmed_line.contains("\"model_completed\"") {
+                continue;
+            }
+            let Ok(val) = serde_json::from_str::<Value>(trimmed_line) else {
+                continue;
+            };
+            if val.pointer("/payload/event/kind").and_then(Value::as_str) == Some("model_completed")
+            {
+                let input = val
+                    .pointer("/payload/event/usage/input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let output = val
+                    .pointer("/payload/event/usage/output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let estimated = val
+                    .pointer("/payload/event/estimated_prompt_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let used_tokens = if input + output > 0 {
+                    input + output
+                } else {
+                    estimated
+                };
+                if used_tokens > 0 {
+                    return Some(SessionContextUsage {
+                        used_tokens,
+                        max_tokens: 1_000_000,
+                    });
+                }
+            }
         }
     }
 
@@ -579,6 +710,9 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
                 tool_calls: Vec::new(),
                 created_at,
             });
+            continue;
+        }
+        if handle_codex_rollout_line(&val, created_at.clone(), &mut turns) {
             continue;
         }
 
@@ -763,6 +897,174 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         });
     }
     turns
+}
+
+fn handle_codex_rollout_line(
+    val: &Value,
+    created_at: Option<String>,
+    turns: &mut Vec<TranscriptTurn>,
+) -> bool {
+    let Some(top_type) = val.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if matches!(top_type, "session_meta" | "turn_context" | "event_msg") {
+        return true;
+    }
+    if top_type != "response_item" {
+        return false;
+    }
+    let Some(payload) = val.get("payload") else {
+        return true;
+    };
+    let ptype = payload.get("type").and_then(Value::as_str).unwrap_or("");
+    match ptype {
+        "message" => {
+            let raw_role = payload
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("assistant");
+            let mut content_parts = Vec::new();
+            let mut thinking_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            if let Some(c) = payload.get("content") {
+                extract_content_and_tools(
+                    c,
+                    &mut content_parts,
+                    &mut thinking_parts,
+                    &mut tool_calls,
+                );
+            }
+            let raw_joined = content_parts.join("\n");
+            let initial_role = if raw_role == "developer" {
+                "system".to_string()
+            } else if raw_role == "user" {
+                let trimmed_raw = raw_joined.trim_start();
+                if trimmed_raw.starts_with("# AGENTS.md instructions for ")
+                    || trimmed_raw.starts_with("<environment_context>")
+                    || trimmed_raw.starts_with("<INSTRUCTIONS>")
+                    || trimmed_raw.starts_with("<permissions instructions>")
+                {
+                    "system".to_string()
+                } else if trimmed_raw.starts_with("<user_shell_command>") {
+                    "tool".to_string()
+                } else {
+                    "user".to_string()
+                }
+            } else {
+                normalize_role(raw_role)
+            };
+            let (role, content) = normalize_system_turn(&initial_role, &raw_joined);
+            let thinking = if thinking_parts.is_empty() {
+                None
+            } else {
+                Some(thinking_parts.join("\n"))
+            };
+            if content.is_empty() && thinking.is_none() && tool_calls.is_empty() {
+                return true;
+            }
+            if role == "assistant"
+                && thinking.is_none()
+                && let Some(prev) = turns.last_mut()
+                && prev.role == "assistant"
+                && prev.content.is_empty()
+                && prev.tool_calls.is_empty()
+                && prev.thinking.is_some()
+            {
+                prev.content = content;
+                prev.tool_calls = tool_calls;
+                if prev.created_at.is_none() {
+                    prev.created_at = created_at;
+                }
+                return true;
+            }
+            let index = turns.len();
+            turns.push(TranscriptTurn {
+                index,
+                role,
+                content,
+                thinking,
+                tool_calls,
+                created_at,
+            });
+            true
+        }
+        "reasoning" => {
+            let mut thinking_parts = Vec::new();
+            if let Some(summary_arr) = payload.get("summary").and_then(Value::as_array) {
+                for item in summary_arr {
+                    if let Some(s) = item.as_str() {
+                        if !s.trim().is_empty() {
+                            thinking_parts.push(s.to_string());
+                        }
+                    } else if let Some(t) = item.get("text").and_then(Value::as_str)
+                        && !t.trim().is_empty()
+                    {
+                        thinking_parts.push(t.to_string());
+                    }
+                }
+            }
+            if !thinking_parts.is_empty() {
+                let index = turns.len();
+                turns.push(TranscriptTurn {
+                    index,
+                    role: "assistant".to_string(),
+                    content: String::new(),
+                    thinking: Some(thinking_parts.join("\n")),
+                    tool_calls: Vec::new(),
+                    created_at,
+                });
+            }
+            true
+        }
+        "custom_tool_call" | "function_call" => {
+            if let Some(tc) = parse_tool_call_item(payload) {
+                if let Some(prev) = turns.last_mut()
+                    && prev.role == "assistant"
+                    && prev.tool_calls.is_empty()
+                {
+                    prev.tool_calls.push(tc);
+                } else {
+                    let index = turns.len();
+                    turns.push(TranscriptTurn {
+                        index,
+                        role: "assistant".to_string(),
+                        content: String::new(),
+                        thinking: None,
+                        tool_calls: vec![tc],
+                        created_at,
+                    });
+                }
+            }
+            true
+        }
+        "custom_tool_call_output" | "function_call_output" => {
+            let mut content_parts = Vec::new();
+            let mut thinking_parts = Vec::new();
+            let mut tool_calls = Vec::new();
+            if let Some(out) = payload.get("output") {
+                extract_content_and_tools(
+                    out,
+                    &mut content_parts,
+                    &mut thinking_parts,
+                    &mut tool_calls,
+                );
+            }
+            let content = content_parts.join("\n");
+            if !content.is_empty() {
+                let index = turns.len();
+                turns.push(TranscriptTurn {
+                    index,
+                    role: "tool".to_string(),
+                    content,
+                    thinking: None,
+                    tool_calls: Vec::new(),
+                    created_at,
+                });
+            }
+            true
+        }
+        _ => true,
+    }
 }
 
 fn strip_grok_user_query_wrapper(content: &str) -> String {
@@ -2269,6 +2571,155 @@ mod tests {
             SessionContextUsage {
                 used_tokens: 47874,
                 max_tokens: 500000,
+            }
+        );
+    }
+
+    #[test]
+    fn codex_rollout_transcript_normalization_and_context_usage() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let store = RedbStore::open(&home.join("store.redb")).unwrap();
+
+        let codex_dir = home.join(".codex");
+        let day_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("29");
+        fs::create_dir_all(&day_dir).unwrap();
+
+        fs::write(
+            codex_dir.join("config.toml"),
+            "model = \"gpt-6.1-terra\"\nmodel_context_window = 872000\n",
+        )
+        .unwrap();
+
+        let rollout_path =
+            day_dir.join("rollout-2026-10-29T01-39-41-01a18550-1b11-7882-82b6-ea40058ed587.jsonl");
+        let jsonl = [
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:39:41.000Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": "01a18550-1b11-7882-82b6-ea40058ed587",
+                    "cwd": "/home/lmcfarlin/Projects/Artificial-Humanity"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:39:41.050Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "You are Codex, an agent based on GPT-6."}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:39:41.100Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /home/lmcfarlin/Projects/Artificial-Humanity"}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:40:14.794Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "You are Katie. Please review the agent instructions and register as assistant to Kayla."}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:40:20.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "I'll read AGENTS.md and register as Katie."}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:40:20.500Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "input": "agent-msg register Katie --project Kaggle-Gemma4 --role assistant"
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:40:21.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "output": [{"type": "input_text", "text": "Registered Katie <katie@artificialhumanity.io>"}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:40:25.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Registered as Katie and checked in with Kayla."}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "timestamp": "2026-10-29T01:40:26.000Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "total_tokens": 65560
+                        },
+                        "model_context_window": 828400
+                    }
+                }
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(&rollout_path, &jsonl).unwrap();
+
+        let sessions = discover_sessions_with_home(&store, Some(home));
+        let katie_sess = sessions
+            .iter()
+            .find(|s| s.persona.as_deref() == Some("katie"))
+            .expect("katie codex session should be discovered");
+        assert_eq!(katie_sess.adapter, "codex");
+        assert_eq!(katie_sess.id, "01a18550-1b11-7882-82b6-ea40058ed587");
+
+        let turns = read_session_transcript_with_home("katie", &store, Some(home));
+        assert_eq!(turns.len(), 6);
+        assert_eq!(turns[0].role, "system");
+        assert_eq!(turns[1].role, "system");
+        assert_eq!(turns[2].role, "user");
+        assert_eq!(turns[3].role, "assistant");
+        assert_eq!(turns[3].tool_calls.len(), 1);
+        assert_eq!(turns[4].role, "tool");
+        assert_eq!(turns[5].role, "assistant");
+        assert!(!is_transcript_busy(&turns));
+
+        let usage = read_session_context_usage_with_home("katie", &store, Some(home))
+            .expect("codex context usage should be read from rollout + config.toml");
+        assert_eq!(
+            usage,
+            SessionContextUsage {
+                used_tokens: 65560,
+                max_tokens: 872000,
             }
         );
     }
