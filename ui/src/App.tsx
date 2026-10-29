@@ -94,7 +94,7 @@ export interface OptimisticPrompt {
   agentKey?: string;
 }
 
-export const OPTIMISTIC_PROMPT_TTL_MS = 5_000;
+export const OPTIMISTIC_PROMPT_TTL_MS = 60_000;
 
 /**
  * Keep a just-sent user turn visible until the vendor CLI flushes it to the
@@ -125,7 +125,10 @@ export function preserveOptimisticTurn(
     if ((turn.role || "").toLowerCase() !== "user" || !turn.content) {
       return false;
     }
-    return turn.content.trim() === optimistic.content.trim();
+    return (
+      turn.content.trim() === optimistic.content.trim() ||
+      turn.content.includes(optimistic.content.trim())
+    );
   });
   if (onDisk) {
     return turns;

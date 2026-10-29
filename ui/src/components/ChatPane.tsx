@@ -34,8 +34,13 @@ function maxTokensForAdapter(adapter?: string | null): number {
   ) {
     return 1_000_000;
   }
-  if (normalized === "grok") {
-    return 131_072;
+  if (
+    normalized === "grok" ||
+    normalized.startsWith("grok-") ||
+    normalized === "codex" ||
+    normalized.startsWith("codex-")
+  ) {
+    return 500_000;
   }
   return 200_000;
 }
