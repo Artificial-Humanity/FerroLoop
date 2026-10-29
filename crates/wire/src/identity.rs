@@ -263,6 +263,14 @@ impl RouteTable {
     }
 
     fn discover_claude_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
+        if check_proc {
+            self.entries.retain(|_, entry| match &entry.route {
+                VendorRoute::Claude { pid, .. } if *pid > 0 => {
+                    Path::new(&format!("/proc/{pid}")).exists()
+                }
+                _ => true,
+            });
+        }
         let sessions_dir = home.join(".claude").join("sessions");
         let Ok(read_dir) = fs::read_dir(&sessions_dir) else {
             return;
@@ -287,10 +295,20 @@ impl RouteTable {
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
                 continue;
             };
-            let Some(name) = val.get("name").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(persona) = normalize_claude_session_name(name) else {
+            if val.get("nameSource").and_then(|v| v.as_str()) == Some("derived")
+                && let Some(derived_key) = val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .and_then(normalize_persona)
+                && matches!(
+                    self.entries.get(&derived_key).map(|e| &e.route),
+                    Some(VendorRoute::Claude { .. })
+                )
+            {
+                self.entries.remove(&derived_key);
+            }
+            let Some(persona) = resolve_claude_session_persona(home, &val, Some(&self.entries))
+            else {
                 continue;
             };
             let Some(sock_str) = val.get("messagingSocketPath").and_then(|v| v.as_str()) else {
@@ -820,24 +838,90 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-            for field in ["agentName", "customTitle", "persona"] {
-                if let Some(s) = val.get(field).and_then(|v| v.as_str())
-                    && let Some(norm) = normalize_claude_session_name(s)
-                {
-                    return Some(norm);
+        let candidate_text: String =
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                for field in ["agentName", "customTitle", "persona"] {
+                    if let Some(s) = val.get(field).and_then(|v| v.as_str())
+                        && let Some(norm) = normalize_claude_session_name(s)
+                    {
+                        return Some(norm);
+                    }
                 }
-            }
-        }
-        let lower = line.to_ascii_lowercase();
-        for marker in ["take the name of ", "you will be "] {
+                if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
+                    || val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    continue;
+                }
+                let t = val.get("type").and_then(|v| v.as_str());
+                if !matches!(t, None | Some("USER_INPUT" | "user" | "human")) {
+                    continue;
+                }
+                let Some(s) = val
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| val.pointer("/message/content").and_then(|v| v.as_str()))
+                    .or_else(|| val.pointer("/payload/body").and_then(|v| v.as_str()))
+                else {
+                    continue;
+                };
+                s.to_string()
+            } else {
+                line.to_string()
+            };
+        let lower = candidate_text.to_ascii_lowercase();
+        for marker in [
+            "take the name of ",
+            "agent-msg register ",
+            "fl wire register ",
+            "you will be ",
+            "you are ",
+        ] {
             if let Some(idx) = lower.find(marker) {
-                let after = &line[idx + marker.len()..];
+                let after = &candidate_text[idx + marker.len()..];
                 let token: String = after
-                    .trim_start_matches(['"', '\'', '`', ' '])
+                    .trim_start_matches(['"', '\'', '`', ' ', '\\'])
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
                     .collect();
+                if matches!(marker, "you will be " | "you are ")
+                    && !token.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                {
+                    continue;
+                }
+                let token_lower = token.to_ascii_lowercase();
+                if matches!(
+                    token_lower.as_str(),
+                    "a" | "an"
+                        | "the"
+                        | "now"
+                        | "in"
+                        | "on"
+                        | "at"
+                        | "our"
+                        | "my"
+                        | "notified"
+                        | "interactive"
+                        | "antigravity"
+                        | "claude"
+                        | "codex"
+                        | "muse"
+                        | "grok"
+                        | "working"
+                        | "running"
+                        | "powered"
+                        | "taking"
+                        | "hearing"
+                        | "assistant"
+                        | "lead"
+                        | "scribe"
+                        | "resident"
+                        | "login"
+                        | "pair"
+                        | "connected"
+                        | "not"
+                ) {
+                    continue;
+                }
                 if let Some(norm) = normalize_claude_session_name(&token) {
                     return Some(norm);
                 }
@@ -1060,6 +1144,60 @@ fn resolve_persona_with_sources(
     "unknown".to_string()
 }
 
+fn resolve_claude_session_persona(
+    home: &Path,
+    val: &serde_json::Value,
+    existing_entries: Option<&BTreeMap<String, RouteEntry>>,
+) -> Option<String> {
+    let name_source = val.get("nameSource").and_then(|v| v.as_str());
+    let derived_name = if name_source == Some("derived") {
+        val.get("name")
+            .and_then(|v| v.as_str())
+            .and_then(normalize_persona)
+    } else {
+        None
+    };
+    if name_source != Some("derived")
+        && let Some(name) = val.get("name").and_then(|v| v.as_str())
+        && let Some(persona) = normalize_claude_session_name(name)
+    {
+        return Some(persona);
+    }
+
+    let sid = val
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+
+    if let Some(entries) = existing_entries {
+        for entry in entries.values() {
+            if Some(&entry.persona) == derived_name.as_ref() {
+                continue;
+            }
+            if let VendorRoute::Claude { session_id, .. } = &entry.route
+                && session_id == sid
+            {
+                return Some(entry.persona.clone());
+            }
+        }
+    }
+
+    let projects_dir = home.join(".claude").join("projects");
+    let target_fname = format!("{sid}.jsonl");
+    if let Ok(proj_dirs) = fs::read_dir(&projects_dir) {
+        for pentry in proj_dirs.flatten() {
+            let candidate = pentry.path().join(&target_fname);
+            if candidate.exists()
+                && let Some(norm) = scan_transcript_for_persona(&candidate, 100)
+            {
+                return Some(norm);
+            }
+        }
+    }
+    None
+}
+
 fn resolve_claude_pid_persona(home: &Path, start_pid: u32) -> Option<String> {
     let sessions_dir = home.join(".claude").join("sessions");
     let projects_dir = home.join(".claude").join("projects");
@@ -1071,8 +1209,7 @@ fn resolve_claude_pid_persona(home: &Path, start_pid: u32) -> Option<String> {
         let session_file = sessions_dir.join(format!("{pid}.json"));
         if let Ok(raw) = fs::read_to_string(&session_file)
             && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
-            && let Some(name) = val.get("name").and_then(|v| v.as_str())
-            && let Some(norm) = normalize_claude_session_name(name)
+            && let Some(norm) = resolve_claude_session_persona(home, &val, None)
         {
             return Some(norm);
         }
@@ -1503,6 +1640,100 @@ mod tests {
                 csrf_token: Some(csrf),
                 ..
             }) if addr == "127.0.0.1:41547" && csrf == "fresh-csrf-post-reboot"
+        ));
+    }
+
+    #[test]
+    fn discover_claude_routes_ignores_derived_name_and_resolves_from_project_transcript() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+
+        let claude_sessions = home.join(".claude").join("sessions");
+        fs::create_dir_all(&claude_sessions).unwrap();
+        let sock_path = home.join("cc.sock");
+        fs::write(&sock_path, "").unwrap();
+        let key_path = claude_sessions.join("1419565.deadbeef.key");
+        fs::write(&key_path, r#"{"peerToken":"tok-login"}"#).unwrap();
+
+        // 1. Derived session from `claude login` with no agent transcript should be ignored
+        fs::write(
+            claude_sessions.join("1419565.json"),
+            serde_json::json!({
+                "pid": 1419565,
+                "name": "lmcfarlin-e6",
+                "nameSource": "derived",
+                "sessionId": "2d86ba53-a2a1-41e0-8ee9-88dc0acbb997",
+                "messagingSocketPath": sock_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // 2. Derived session with a matching ~/.claude/projects/<proj>/<sessionId>.jsonl transcript resolves persona
+        let key_path_wendy = claude_sessions.join("1419566.deadbeef.key");
+        fs::write(&key_path_wendy, r#"{"peerToken":"tok-wendy"}"#).unwrap();
+        fs::write(
+            claude_sessions.join("1419566.json"),
+            serde_json::json!({
+                "pid": 1419566,
+                "name": "artificialhumanity-a1",
+                "nameSource": "derived",
+                "sessionId": "wendy-session-uuid",
+                "messagingSocketPath": sock_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let proj_dir = home
+            .join(".claude")
+            .join("projects")
+            .join("-home-lmcfarlin-Projects-Artificial-Humanity-ArtificialHumanity-io");
+        fs::create_dir_all(&proj_dir).unwrap();
+        // Login transcript with Claude Code attachment containing "You will be notified when it exits"
+        fs::write(
+            proj_dir.join("2d86ba53-a2a1-41e0-8ee9-88dc0acbb997.jsonl"),
+            r#"{"type":"attachment","attachment":{"type":"prompt_snapshot","systemPrompt":["You will be notified when it exits — do not poll its output file while waiting."]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("wendy-session-uuid.jsonl"),
+            concat!(
+                r#"{"type":"attachment","attachment":{"type":"prompt_snapshot","systemPrompt":["You will be notified when it exits."]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"You are Wendy and you are an assistant on the Website project."}}"#
+            ),
+        )
+        .unwrap();
+
+        let mut table = RouteTable::default();
+        // Pre-populate stale derived route key to verify it is evicted and not reused
+        table.upsert(
+            "lmcfarlin-e6",
+            VendorRoute::Claude {
+                pid: 1419565,
+                session_id: "2d86ba53-a2a1-41e0-8ee9-88dc0acbb997".into(),
+                socket_path: sock_path.clone(),
+                key_path: Some(key_path.clone()),
+            },
+            At::parse("2026-10-29T00:48:00.000Z").unwrap(),
+        );
+        table.discover_routes(Some(home), At::parse("2026-10-29T00:50:00.000Z").unwrap());
+
+        assert!(
+            table.get("lmcfarlin-e6").is_none(),
+            "derived session without transcript must not register as a persona"
+        );
+        assert!(
+            table.get("notified").is_none(),
+            "attachment prompt_snapshot 'You will be notified' must not resolve as a persona"
+        );
+        assert!(matches!(
+            table.get("wendy").map(|e| &e.route),
+            Some(VendorRoute::Claude {
+                pid: 1419566,
+                session_id,
+                ..
+            }) if session_id == "wendy-session-uuid"
         ));
     }
 }
