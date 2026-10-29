@@ -492,6 +492,7 @@ fn validate_agy_conversation_id(conversation_id: &str) -> Result<(), String> {
 }
 
 const DEFAULT_AGY_PLAN_MODEL: &str = "MODEL_PLACEHOLDER_M418";
+const MAX_AGY_RPC_BODY_BYTES: usize = 256 * 1024;
 
 fn revert_to_cascade_step_body(conversation_id: &str, plan_model: &str) -> String {
     serde_json::json!({
@@ -508,6 +509,45 @@ fn revert_to_cascade_step_body(conversation_id: &str, plan_model: &str) -> Strin
         },
     })
     .to_string()
+}
+
+fn read_agy_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        match reader.read_line(&mut size_line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let hex = size_line.trim().split(';').next().unwrap_or("").trim();
+        let Ok(chunk_len) = usize::from_str_radix(hex, 16) else {
+            break;
+        };
+        if chunk_len == 0 {
+            let mut trailer = String::new();
+            let _ = reader.read_line(&mut trailer);
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(out.len());
+        let to_read = chunk_len.min(remaining);
+        if to_read == 0 {
+            break;
+        }
+        let start = out.len();
+        out.resize(start + to_read, 0);
+        if reader.read_exact(&mut out[start..]).is_err() {
+            out.truncate(start);
+            break;
+        }
+        if chunk_len > to_read {
+            break;
+        }
+        let mut crlf = [0u8; 2];
+        if reader.read_exact(&mut crlf).is_err() {
+            break;
+        }
+    }
+    out
 }
 
 fn post_agy_connect_rpc(
@@ -547,6 +587,7 @@ fn post_agy_connect_rpc(
         .read_line(&mut status)
         .map_err(|err| format!("antigravity revert read from {host} failed: {err}"))?;
     let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
     loop {
         let mut line = String::new();
         match reader.read_line(&mut line) {
@@ -555,20 +596,33 @@ fn post_agy_connect_rpc(
                 if line == "\r\n" || line == "\n" {
                     break;
                 }
-                if let Some((name, value)) = line.split_once(':')
-                    && name.trim().eq_ignore_ascii_case("content-length")
-                {
-                    content_length = value.trim().parse::<usize>().ok();
+                if let Some((name, value)) = line.split_once(':') {
+                    let name = name.trim();
+                    let value = value.trim();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.parse::<usize>().ok();
+                    } else if name.eq_ignore_ascii_case("transfer-encoding")
+                        && value.to_ascii_lowercase().contains("chunked")
+                    {
+                        is_chunked = true;
+                    }
                 }
             }
             Err(_) => break,
         }
     }
-    let max_body = content_length.unwrap_or(4096).min(4096);
-    let mut resp_bytes = Vec::new();
-    if max_body > 0 {
-        let _ = reader.take(max_body as u64).read_to_end(&mut resp_bytes);
-    }
+    let resp_bytes = if is_chunked {
+        read_agy_chunked_body(&mut reader, MAX_AGY_RPC_BODY_BYTES)
+    } else {
+        let max_body = content_length
+            .unwrap_or(MAX_AGY_RPC_BODY_BYTES)
+            .min(MAX_AGY_RPC_BODY_BYTES);
+        let mut buf = Vec::new();
+        if max_body > 0 {
+            let _ = reader.take(max_body as u64).read_to_end(&mut buf);
+        }
+        buf
+    };
     let resp_body = String::from_utf8_lossy(&resp_bytes).into_owned();
     let code = status
         .split_whitespace()
@@ -619,7 +673,7 @@ fn post_revert_to_cascade_step(port: u16, csrf: &str, conversation_id: &str) -> 
             return Ok(());
         }
     }
-    let detail = resp_body.trim();
+    let detail: String = resp_body.trim().chars().take(512).collect();
     if detail.is_empty() {
         Err(format!("antigravity revert returned {status_line}"))
     } else {
@@ -1756,10 +1810,17 @@ mod tests {
                     }
                     let captured = format!("{headers}{}", String::from_utf8_lossy(&body));
                     let reason = if code == 200 { "OK" } else { "ERR" };
-                    let response = format!(
-                        "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
-                        resp_body.len()
-                    );
+                    let response = if let Some(chunk_payload) = resp_body.strip_prefix("CHUNKED:") {
+                        format!(
+                            "HTTP/1.1 {code} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{chunk_payload}\r\n0\r\n\r\n",
+                            chunk_payload.len()
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                            resp_body.len()
+                        )
+                    };
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -1863,11 +1924,13 @@ mod tests {
                 "{\"code\":\"unknown\",\"message\":\"plan model not specified\"}".into(),
             ))
             .unwrap();
+        let padding = "x".repeat(6000);
         status_tx
             .send((
                 200,
-                "{\"defaultOverrideModelConfig\":{\"modelOrAlias\":{\"model\":\"MODEL_PLACEHOLDER_M417\"}}}"
-                    .into(),
+                format!(
+                    "CHUNKED:{{\"clientModelConfigs\":[\"{padding}\"],\"defaultOverrideModelConfig\":{{\"modelOrAlias\":{{\"model\":\"MODEL_PLACEHOLDER_M417\"}}}}}}"
+                ),
             ))
             .unwrap();
         status_tx.send((200, "{}".into())).unwrap();
