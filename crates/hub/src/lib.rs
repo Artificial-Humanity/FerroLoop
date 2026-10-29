@@ -34,9 +34,10 @@ pub use auth::{
     session_state_slug, sha256_hex,
 };
 pub use discovery::{
-    DiscoveredSessionSummary, TranscriptToolCall, TranscriptTurn, WorkspaceArchScan, WorktreeDiff,
-    WorktreeFileStatus, WorktreeSummary, discover_sessions, discover_sessions_with_home,
-    is_transcript_busy, list_git_worktrees, parse_jsonl_transcript, read_session_transcript,
+    DiscoveredSessionSummary, SessionContextUsage, TranscriptToolCall, TranscriptTurn,
+    WorkspaceArchScan, WorktreeDiff, WorktreeFileStatus, WorktreeSummary, discover_sessions,
+    discover_sessions_with_home, is_transcript_busy, list_git_worktrees, parse_jsonl_transcript,
+    read_session_context_usage_with_home, read_session_transcript,
     read_session_transcript_with_home, read_worktree_diff, scan_cargo_architecture_conformance,
     scan_workspace_for_arch,
 };

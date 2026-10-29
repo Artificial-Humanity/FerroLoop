@@ -1069,12 +1069,20 @@ pub fn run_vendor_hook(
             },
         );
     } else if is_grok && !session_id.is_empty() {
+        let mut cap = persona.clone();
+        if let Some(first) = cap.get_mut(0..1) {
+            first.make_ascii_uppercase();
+        }
         record_caller_route(
             &hook_env,
             &persona,
             VendorRoute::Grok {
                 session_id,
                 cwd: Some(hook_cwd.clone()),
+                tmux_target: Some(format!("{cap}:grok")),
+                tmux_pane: std::env::var("TMUX_PANE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
             },
         );
     } else if is_codex && !session_id.is_empty() {

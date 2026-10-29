@@ -60,6 +60,13 @@ pub struct TranscriptTurn {
     pub created_at: Option<String>,
 }
 
+/// Server-measured context window token usage for a live vendor session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionContextUsage {
+    pub used_tokens: u64,
+    pub max_tokens: u64,
+}
+
 /// Summary of a Git worktree discovered via `git worktree list --porcelain` (spec §3.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeSummary {
@@ -190,7 +197,9 @@ pub fn discover_sessions_with_home(
                     tpath,
                 )
             }
-            VendorRoute::Grok { session_id, cwd } => {
+            VendorRoute::Grok {
+                session_id, cwd, ..
+            } => {
                 let tpath = home
                     .as_deref()
                     .and_then(|h| find_transcript_file_in_home(h, session_id));
@@ -267,6 +276,37 @@ fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String>
         return Some(agy.display().to_string());
     }
 
+    let muse = home
+        .join(".local")
+        .join("share")
+        .join("muse")
+        .join("sessions")
+        .join(session_id)
+        .join("session.jsonl");
+    if muse.is_file() {
+        return Some(muse.display().to_string());
+    }
+
+    let grok_sessions = home.join(".grok").join("sessions");
+    if grok_sessions.is_dir() {
+        let direct_chat = grok_sessions.join(session_id).join("chat_history.jsonl");
+        if direct_chat.is_file() {
+            return Some(direct_chat.display().to_string());
+        }
+        let direct_jsonl = grok_sessions.join(format!("{session_id}.jsonl"));
+        if direct_jsonl.is_file() {
+            return Some(direct_jsonl.display().to_string());
+        }
+        if let Ok(entries) = fs::read_dir(&grok_sessions) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join(session_id).join("chat_history.jsonl");
+                if candidate.is_file() {
+                    return Some(candidate.display().to_string());
+                }
+            }
+        }
+    }
+
     for sub in [
         home.join(".claude"),
         home.join(".codex"),
@@ -292,16 +332,136 @@ fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String>
             {
                 return Some(p.display().to_string());
             }
-            if p.file_name().and_then(|s| s.to_str()) == Some("session.jsonl")
-                && p.parent()
-                    .and_then(|parent| parent.file_name())
-                    .and_then(|s| s.to_str())
-                    == Some(session_id)
+            if matches!(
+                p.file_name().and_then(|s| s.to_str()),
+                Some("session.jsonl" | "chat_history.jsonl")
+            ) && p
+                .parent()
+                .and_then(|parent| parent.file_name())
+                .and_then(|s| s.to_str())
+                == Some(session_id)
             {
                 return Some(p.display().to_string());
             }
         }
     }
+    None
+}
+
+/// Read server-measured context window token usage for `session_id` when vendor session
+/// metadata (such as Grok `signals.json`/`summary.json` or Claude `message.usage`) is available.
+pub fn read_session_context_usage_with_home(
+    session_id: &str,
+    store: &RedbStore,
+    home_override: Option<&Path>,
+) -> Option<SessionContextUsage> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let sessions = discover_sessions_with_home(store, home_override);
+    let mut tpath_opt = sessions
+        .iter()
+        .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
+        .and_then(|s| s.transcript_path.clone());
+
+    if tpath_opt.is_none() {
+        let home = home_override
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
+        if let Some(ref h) = home {
+            tpath_opt = find_transcript_file_in_home(h, trimmed);
+        }
+    }
+
+    let tpath = PathBuf::from(tpath_opt?);
+    if tpath.file_name().and_then(|s| s.to_str()) == Some("chat_history.jsonl")
+        && let Some(dir) = tpath.parent()
+    {
+        let signals_val = fs::read_to_string(dir.join("signals.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        let summary_val = fs::read_to_string(dir.join("summary.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+        let usage_val = fs::read_to_string(dir.join("usage.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+        let used_tokens = signals_val
+            .as_ref()
+            .and_then(|v| v.get("contextTokensUsed").and_then(Value::as_u64))
+            .filter(|&n| n > 0)
+            .or_else(|| {
+                usage_val.as_ref().and_then(|v| {
+                    v.pointer("/session/totalTokens")
+                        .and_then(Value::as_u64)
+                        .filter(|&n| n > 0)
+                })
+            });
+        let max_tokens = signals_val
+            .as_ref()
+            .and_then(|v| v.get("contextWindowTokens").and_then(Value::as_u64))
+            .filter(|&n| n > 0)
+            .or_else(|| {
+                summary_val
+                    .as_ref()
+                    .and_then(|v| v.get("context_window").and_then(Value::as_u64))
+                    .filter(|&n| n > 0)
+            })
+            .unwrap_or(500_000);
+
+        if let Some(used_tokens) = used_tokens {
+            return Some(SessionContextUsage {
+                used_tokens,
+                max_tokens,
+            });
+        }
+    }
+
+    if tpath.to_string_lossy().contains(".claude")
+        && let Ok(raw) = fs::read_to_string(&tpath)
+    {
+        for line in raw.lines().rev() {
+            let trimmed_line = line.trim();
+            if trimmed_line.is_empty() || !trimmed_line.contains("\"usage\"") {
+                continue;
+            }
+            let Ok(val) = serde_json::from_str::<Value>(trimmed_line) else {
+                continue;
+            };
+            if val.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                continue;
+            }
+            if let Some(usage) = val.pointer("/message/usage") {
+                let input = usage
+                    .get("input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cache_create = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cache_read = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let output = usage
+                    .get("output_tokens")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let used_tokens = input + cache_create + cache_read + output;
+                if used_tokens > 0 {
+                    return Some(SessionContextUsage {
+                        used_tokens,
+                        max_tokens: 1_000_000,
+                    });
+                }
+            }
+        }
+    }
+
     None
 }
 
@@ -452,7 +612,9 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         } else if let Some(t) = obj.get("type").and_then(Value::as_str) {
             match t {
                 "USER_INPUT" | "user" | "human" => "user".to_string(),
-                "PLANNER_RESPONSE" | "assistant" | "model" | "result" => "assistant".to_string(),
+                "PLANNER_RESPONSE" | "assistant" | "model" | "result" | "reasoning" => {
+                    "assistant".to_string()
+                }
                 "GENERIC" | "TOOL_RESULT" | "tool_result" | "tool" => "tool".to_string(),
                 "SYSTEM" | "SYSTEM_MESSAGE" | "system" => "system".to_string(),
                 _ => {
@@ -500,6 +662,22 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             thinking_parts.push(th.to_string());
         }
 
+        if obj.get("type").and_then(Value::as_str) == Some("reasoning")
+            && let Some(summary_arr) = obj.get("summary").and_then(Value::as_array)
+        {
+            for item in summary_arr {
+                if let Some(s) = item.as_str() {
+                    if !s.trim().is_empty() {
+                        thinking_parts.push(s.to_string());
+                    }
+                } else if let Some(t) = item.get("text").and_then(Value::as_str)
+                    && !t.trim().is_empty()
+                {
+                    thinking_parts.push(t.to_string());
+                }
+            }
+        }
+
         if let Some(arr) = obj.get("tool_calls").and_then(Value::as_array) {
             for tc in arr {
                 if let Some(parsed) = parse_tool_call_item(tc) {
@@ -508,8 +686,21 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             }
         }
 
-        let content = content_parts.join("\n");
-        let (mut role, content) = normalize_system_turn(&role, &content);
+        let mut raw_joined = content_parts.join("\n");
+        let mut effective_role = role;
+        if effective_role == "user" {
+            let trimmed_raw = raw_joined.trim();
+            if obj.get("synthetic_reason").is_some()
+                || (trimmed_raw.starts_with("<user_info>") && trimmed_raw.ends_with("</user_info>"))
+                || (trimmed_raw.starts_with("<system-reminder>")
+                    && trimmed_raw.ends_with("</system-reminder>"))
+            {
+                effective_role = "system".to_string();
+            } else {
+                raw_joined = strip_grok_user_query_wrapper(&raw_joined);
+            }
+        }
+        let (mut role, content) = normalize_system_turn(&effective_role, &raw_joined);
         let thinking = if thinking_parts.is_empty() {
             None
         } else {
@@ -542,6 +733,25 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             continue;
         }
 
+        // Merge standalone reasoning turn (e.g. Grok `{"type":"reasoning","summary":[...]}`)
+        // into the immediately following assistant turn when that assistant turn has no thinking yet.
+        if role == "assistant"
+            && thinking.is_none()
+            && (!content.is_empty() || !tool_calls.is_empty())
+            && let Some(prev) = turns.last_mut()
+            && prev.role == "assistant"
+            && prev.content.is_empty()
+            && prev.tool_calls.is_empty()
+            && prev.thinking.is_some()
+        {
+            prev.content = content;
+            prev.tool_calls = tool_calls;
+            if prev.created_at.is_none() {
+                prev.created_at = created_at;
+            }
+            continue;
+        }
+
         let index = turns.len();
         turns.push(TranscriptTurn {
             index,
@@ -553,6 +763,23 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
         });
     }
     turns
+}
+
+fn strip_grok_user_query_wrapper(content: &str) -> String {
+    let trimmed = content.trim();
+    let after_notice = trimmed
+        .strip_prefix("The user sent a message while you were working:\n")
+        .or_else(|| trimmed.strip_prefix("The user sent a message while you were working:\r\n"))
+        .unwrap_or(trimmed)
+        .trim_start();
+    if let Some(inner) = after_notice.strip_prefix("<user_query>") {
+        let without_close = inner
+            .trim_end()
+            .strip_suffix("</user_query>")
+            .unwrap_or(inner);
+        return without_close.trim().to_string();
+    }
+    content.to_string()
 }
 
 /// Return `true` when the latest turn in `turns` indicates the agent session is actively working
@@ -1911,5 +2138,138 @@ mod tests {
         assert_eq!(turns[3].content, "Hello Sammy. Welcome to the team.");
         assert_eq!(turns[4].role, "tool");
         assert!(turns[4].content.contains("Showing lines 725-735"));
+    }
+
+    #[test]
+    fn grok_nested_transcript_discovery_normalization_and_context_usage() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let store = RedbStore::open(&home.join("store.redb")).unwrap();
+
+        let grok_session_dir = home
+            .join(".grok")
+            .join("sessions")
+            .join("%2Fhome%2Flmcfarlin%2FProjects%2FArtificial-Humanity")
+            .join("01a18538-6f1a-79c2-99d2-8e8540366c72");
+        fs::create_dir_all(&grok_session_dir).unwrap();
+
+        let jsonl = [
+            serde_json::json!({
+                "type": "system",
+                "content": "You are Grok 4.7 released by xAI."
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "content": [{"type": "text", "text": "<user_info>\nOS Version: linux\n</user_info>"}]
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "synthetic_reason": "system_reminder",
+                "content": [{"type": "text", "text": "<system-reminder>\nSkills available\n</system-reminder>"}]
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "prompt_index": 0,
+                "content": [{"type": "text", "text": "<user_query>\nYou are Wendy. Please read agent instruction files.\n</user_query>"}]
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "I need to read the agent instructions and register as Wendy."}],
+                "status": "completed"
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "assistant",
+                "content": "I'll read the workspace orientation and register as Wendy.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "name": "read_file",
+                        "arguments": "{\"target_file\":\"AGENTS.md\"}"
+                    }
+                ]
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "tool_result",
+                "tool_call_id": "call-1",
+                "content": "# Artificial Humanity workspace"
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "prompt_index": 1,
+                "content": [{"type": "text", "text": "The user sent a message while you were working:\n<user_query>\nAlso note that you are replacing a previous Wendy\n</user_query>"}]
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "assistant",
+                "content": "Wendy is registered and has reported to Wesley."
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        fs::write(grok_session_dir.join("chat_history.jsonl"), &jsonl).unwrap();
+        fs::write(
+            grok_session_dir.join("signals.json"),
+            serde_json::json!({
+                "contextTokensUsed": 47874,
+                "contextWindowTokens": 500000
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let sessions = discover_sessions_with_home(&store, Some(home));
+        let wendy_sess = sessions
+            .iter()
+            .find(|s| s.persona.as_deref() == Some("wendy"))
+            .expect("wendy grok session should be discovered");
+        assert_eq!(wendy_sess.adapter, "grok");
+        assert_eq!(wendy_sess.id, "01a18538-6f1a-79c2-99d2-8e8540366c72");
+
+        let turns = read_session_transcript_with_home("wendy", &store, Some(home));
+        assert_eq!(turns.len(), 8);
+        assert_eq!(turns[0].role, "system");
+        assert_eq!(turns[1].role, "system");
+        assert_eq!(turns[2].role, "system");
+        assert_eq!(turns[3].role, "user");
+        assert_eq!(
+            turns[3].content,
+            "You are Wendy. Please read agent instruction files."
+        );
+        assert_eq!(turns[4].role, "assistant");
+        assert_eq!(
+            turns[4].thinking.as_deref(),
+            Some("I need to read the agent instructions and register as Wendy.")
+        );
+        assert_eq!(
+            turns[4].content,
+            "I'll read the workspace orientation and register as Wendy."
+        );
+        assert_eq!(turns[4].tool_calls.len(), 1);
+        assert_eq!(turns[5].role, "tool");
+        assert_eq!(turns[6].role, "user");
+        assert_eq!(
+            turns[6].content,
+            "Also note that you are replacing a previous Wendy"
+        );
+        assert_eq!(turns[7].role, "assistant");
+        assert!(!is_transcript_busy(&turns));
+
+        let usage = read_session_context_usage_with_home("wendy", &store, Some(home))
+            .expect("grok context usage should be read from signals.json");
+        assert_eq!(
+            usage,
+            SessionContextUsage {
+                used_tokens: 47874,
+                max_tokens: 500000,
+            }
+        );
     }
 }

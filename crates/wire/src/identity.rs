@@ -51,6 +51,10 @@ pub enum VendorRoute {
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tmux_pane: Option<String>,
     },
     /// Used by deterministic integration tests to capture pushed deliveries without vendor binaries.
     Webhook { socket_path: PathBuf },
@@ -95,25 +99,39 @@ pub fn legacy_routes_path() -> Option<PathBuf> {
 }
 
 fn preserve_muse_tmux_fields(target_route: &mut VendorRoute, fallback_route: &VendorRoute) {
-    if let (
-        VendorRoute::Muse {
-            tmux_target: dst_target,
-            tmux_pane: dst_pane,
-            ..
-        },
-        VendorRoute::Muse {
-            tmux_target: src_target,
-            tmux_pane: src_pane,
-            ..
-        },
-    ) = (target_route, fallback_route)
-    {
-        if dst_target.is_none() {
-            *dst_target = src_target.clone();
+    match (target_route, fallback_route) {
+        (
+            VendorRoute::Muse {
+                tmux_target: dst_target,
+                tmux_pane: dst_pane,
+                ..
+            },
+            VendorRoute::Muse {
+                tmux_target: src_target,
+                tmux_pane: src_pane,
+                ..
+            },
+        )
+        | (
+            VendorRoute::Grok {
+                tmux_target: dst_target,
+                tmux_pane: dst_pane,
+                ..
+            },
+            VendorRoute::Grok {
+                tmux_target: src_target,
+                tmux_pane: src_pane,
+                ..
+            },
+        ) => {
+            if dst_target.is_none() {
+                *dst_target = src_target.clone();
+            }
+            if dst_pane.is_none() {
+                *dst_pane = src_pane.clone();
+            }
         }
-        if dst_pane.is_none() {
-            *dst_pane = src_pane.clone();
-        }
+        _ => {}
     }
 }
 
@@ -259,7 +277,7 @@ impl RouteTable {
         self.discover_agy_routes(&home, check_proc, &at);
         self.discover_codex_routes(&home, &at);
         self.discover_muse_routes(&home, home_override.is_some(), &at);
-        self.discover_grok_routes(&home, &at);
+        self.discover_grok_routes(&home, check_proc, &at);
     }
 
     fn discover_claude_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
@@ -602,27 +620,310 @@ impl RouteTable {
         }
     }
 
-    fn discover_grok_routes(&mut self, home: &Path, at: &At) {
-        let sessions_dir = home.join(".grok").join("sessions");
-        let Ok(read_dir) = fs::read_dir(&sessions_dir) else {
-            return;
-        };
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            let ext = path.extension().and_then(|s| s.to_str());
-            if !matches!(ext, Some("json") | Some("jsonl")) {
+    fn discover_grok_routes(&mut self, home: &Path, check_proc: bool, at: &At) {
+        let grok_dir = home.join(".grok");
+        let sessions_dir = grok_dir.join("sessions");
+
+        let mut active_sessions: BTreeMap<String, GrokActiveSession> = BTreeMap::new();
+        if let Ok(raw_active) = fs::read_to_string(grok_dir.join("active_sessions.json"))
+            && let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&raw_active)
+        {
+            for item in arr {
+                let Some(sid) = item
+                    .get("session_id")
+                    .or_else(|| item.get("sessionId"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let pid = item.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                if check_proc && pid > 0 && !Path::new(&format!("/proc/{pid}")).exists() {
+                    continue;
+                }
+                let cwd = item
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from);
+                let (env_persona, tmux_pane) = if check_proc && pid > 0 {
+                    read_grok_proc_env(pid)
+                } else {
+                    (None, None)
+                };
+                active_sessions.insert(
+                    sid.to_string(),
+                    GrokActiveSession {
+                        cwd,
+                        env_persona,
+                        tmux_pane,
+                    },
+                );
+            }
+        }
+
+        let mut nested_dirs: Vec<PathBuf> = Vec::new();
+        if let Ok(read_dir) = fs::read_dir(&sessions_dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path.join("chat_history.jsonl").is_file()
+                        || path.join("summary.json").is_file()
+                    {
+                        nested_dirs.push(path);
+                    } else if let Ok(sub_dir) = fs::read_dir(&path) {
+                        for sub_entry in sub_dir.flatten() {
+                            let sub_path = sub_entry.path();
+                            if sub_path.is_dir()
+                                && (sub_path.join("chat_history.jsonl").is_file()
+                                    || sub_path.join("summary.json").is_file())
+                            {
+                                nested_dirs.push(sub_path);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                let ext = path.extension().and_then(|s| s.to_str());
+                if !matches!(ext, Some("json") | Some("jsonl")) {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                let Some(persona) = scan_transcript_for_persona(&path, 50) else {
+                    continue;
+                };
+                let (session_id, cwd) = extract_session_id_and_cwd(&path, stem);
+                let (existing_target, existing_pane) = match self.entries.get(&persona) {
+                    Some(RouteEntry {
+                        route:
+                            VendorRoute::Grok {
+                                tmux_target,
+                                tmux_pane,
+                                ..
+                            },
+                        ..
+                    }) => (tmux_target.clone(), tmux_pane.clone()),
+                    _ => (None, None),
+                };
+                self.upsert(
+                    &persona,
+                    VendorRoute::Grok {
+                        session_id,
+                        cwd,
+                        tmux_target: existing_target,
+                        tmux_pane: existing_pane,
+                    },
+                    at.clone(),
+                );
+            }
+        }
+
+        let mut candidates: Vec<GrokCandidate> = Vec::new();
+
+        for dir in nested_dirs {
+            let Some(dir_sid) = dir.file_name().and_then(|s| s.to_str()).map(str::trim) else {
+                continue;
+            };
+            if dir_sid.is_empty() {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            let chat_path = dir.join("chat_history.jsonl");
+            let summary_path = dir.join("summary.json");
+            let (summary_sid, summary_cwd, summary_updated_ms, summary_persona) =
+                read_grok_summary_metadata(&summary_path);
+            let session_id = summary_sid.unwrap_or_else(|| dir_sid.to_string());
+            let active_meta = active_sessions.get(&session_id);
+            let is_active = active_meta.is_some();
+            let cwd = active_meta.and_then(|m| m.cwd.clone()).or(summary_cwd);
+            let tmux_pane = active_meta.and_then(|m| m.tmux_pane.clone());
+            let updated_ms = summary_updated_ms.unwrap_or_else(|| {
+                fs::metadata(&chat_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0)
+            });
+
+            let persona = active_meta
+                .and_then(|m| m.env_persona.clone())
+                .or_else(|| {
+                    chat_path
+                        .is_file()
+                        .then(|| scan_transcript_for_persona(&chat_path, 120))
+                        .flatten()
+                })
+                .or(summary_persona)
+                .or_else(|| {
+                    self.entries.values().find_map(|e| match &e.route {
+                        VendorRoute::Grok {
+                            session_id: existing_sid,
+                            ..
+                        } if existing_sid == &session_id => Some(e.persona.clone()),
+                        _ => None,
+                    })
+                });
+            let Some(persona) = persona else {
                 continue;
             };
-            let Some(persona) = scan_transcript_for_persona(&path, 50) else {
-                continue;
+            candidates.push(GrokCandidate {
+                is_active,
+                updated_ms,
+                persona,
+                session_id,
+                cwd,
+                tmux_pane,
+            });
+        }
+
+        // Sort ascending by `(is_active, updated_ms)` so active and newer sessions overwrite older ones.
+        candidates.sort_by(|a, b| {
+            a.is_active
+                .cmp(&b.is_active)
+                .then_with(|| a.updated_ms.cmp(&b.updated_ms))
+        });
+        for cand in candidates {
+            let (existing_target, existing_pane) = match self.entries.get(&cand.persona) {
+                Some(RouteEntry {
+                    route:
+                        VendorRoute::Grok {
+                            tmux_target,
+                            tmux_pane,
+                            ..
+                        },
+                    ..
+                }) => (tmux_target.clone(), tmux_pane.clone()),
+                _ => (None, None),
             };
-            let (session_id, cwd) = extract_session_id_and_cwd(&path, stem);
-            self.upsert(&persona, VendorRoute::Grok { session_id, cwd }, at.clone());
+            self.upsert(
+                &cand.persona,
+                VendorRoute::Grok {
+                    session_id: cand.session_id,
+                    cwd: cand.cwd,
+                    tmux_target: existing_target,
+                    tmux_pane: cand.tmux_pane.or(existing_pane),
+                },
+                at.clone(),
+            );
+        }
+
+        if check_proc {
+            for (persona, entry) in &mut self.entries {
+                if let VendorRoute::Grok { tmux_target, .. } = &mut entry.route
+                    && tmux_target.is_none()
+                {
+                    let mut cap = persona.clone();
+                    if let Some(first) = cap.get_mut(0..1) {
+                        first.make_ascii_uppercase();
+                    }
+                    *tmux_target = Some(format!("{cap}:grok"));
+                }
+            }
         }
     }
+}
+
+struct GrokActiveSession {
+    cwd: Option<PathBuf>,
+    env_persona: Option<String>,
+    tmux_pane: Option<String>,
+}
+
+struct GrokCandidate {
+    is_active: bool,
+    updated_ms: u64,
+    persona: String,
+    session_id: String,
+    cwd: Option<PathBuf>,
+    tmux_pane: Option<String>,
+}
+
+fn read_grok_proc_env(pid: u32) -> (Option<String>, Option<String>) {
+    let Ok(bytes) = fs::read(format!("/proc/{pid}/environ")) else {
+        return (None, None);
+    };
+    let mut env_persona = None;
+    let mut tmux_pane = None;
+    for entry in bytes.split(|&b| b == 0) {
+        let Ok(kv) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        if let Some(val) = kv
+            .strip_prefix("AGENT_PERSONA=")
+            .or_else(|| kv.strip_prefix("AGENT_NAME="))
+        {
+            if let Some(norm) = normalize_persona(val) {
+                env_persona = Some(norm);
+            }
+        } else if let Some(pane) = kv.strip_prefix("TMUX_PANE=") {
+            let trimmed = pane.trim();
+            if !trimmed.is_empty() {
+                tmux_pane = Some(trimmed.to_string());
+            }
+        }
+    }
+    (env_persona, tmux_pane)
+}
+
+fn read_grok_summary_metadata(
+    summary_path: &Path,
+) -> (Option<String>, Option<PathBuf>, Option<u64>, Option<String>) {
+    let Ok(raw) = fs::read_to_string(summary_path) else {
+        return (None, None, None, None);
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return (None, None, None, None);
+    };
+    let sid = val
+        .pointer("/info/id")
+        .or_else(|| val.get("id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    let cwd = val
+        .pointer("/info/cwd")
+        .or_else(|| val.get("cwd"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let updated_ms = val
+        .get("updated_at")
+        .or_else(|| val.get("last_active_at"))
+        .or_else(|| val.get("created_at"))
+        .and_then(|v| v.as_str())
+        .and_then(parse_flexible_at)
+        .map(|a| a.unix_millis());
+
+    let mut persona = None;
+    for field in ["session_summary", "generated_title", "last_turn_summary"] {
+        if let Some(text) = val.get(field).and_then(|v| v.as_str()) {
+            let trimmed = text.trim();
+            let first_word: String = trimmed
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            let rest = trimmed[first_word.len()..].to_ascii_lowercase();
+            if first_word
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+                && (rest.starts_with(" registers ")
+                    || rest.starts_with(" registered")
+                    || rest.starts_with(" online"))
+                && let Some(norm) = normalize_claude_session_name(&first_word)
+            {
+                persona = Some(norm);
+                break;
+            }
+        }
+    }
+    (sid, cwd, updated_ms, persona)
 }
 
 fn extract_session_id_and_cwd(path: &Path, fallback_stem: &str) -> (String, Option<PathBuf>) {
@@ -772,7 +1073,24 @@ fn parse_legacy_route_item(item: &serde_json::Value) -> Option<VendorRoute> {
                 .as_str()?
                 .to_string();
             let cwd = item.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from);
-            Some(VendorRoute::Grok { session_id, cwd })
+            let tmux_target = item
+                .get("tmux_target")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            let tmux_pane = item
+                .get("tmux_pane")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            Some(VendorRoute::Grok {
+                session_id,
+                cwd,
+                tmux_target,
+                tmux_pane,
+            })
         }
         "webhook" => {
             let socket_path = PathBuf::from(item.get("socket_path")?.as_str()?);
@@ -832,6 +1150,37 @@ pub fn normalize_claude_session_name(raw: &str) -> Option<String> {
     Some(norm)
 }
 
+fn extract_text_from_json_content(val: &serde_json::Value) -> Option<String> {
+    if let Some(s) = val.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(arr) = val.as_array() {
+        let mut parts = Vec::new();
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                if !s.is_empty() {
+                    parts.push(s.to_string());
+                }
+            } else if let Some(obj) = item.as_object() {
+                let item_type = obj.get("type").and_then(|v| v.as_str());
+                if matches!(item_type, None | Some("text" | "input_text"))
+                    && let Some(t) = obj
+                        .get("text")
+                        .or_else(|| obj.get("content"))
+                        .and_then(|v| v.as_str())
+                    && !t.is_empty()
+                {
+                    parts.push(t.to_string());
+                }
+            }
+        }
+        if !parts.is_empty() {
+            return Some(parts.join("\n"));
+        }
+    }
+    None
+}
+
 pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     for line in text.lines().take(max_lines) {
@@ -849,22 +1198,46 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
                 }
                 if val.get("isMeta").and_then(|v| v.as_bool()) == Some(true)
                     || val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true)
+                    || val.get("synthetic_reason").is_some()
                 {
                     continue;
                 }
                 let t = val.get("type").and_then(|v| v.as_str());
+                if matches!(t, Some("tool_result" | "TOOL_RESULT")) {
+                    if let Some(c) = val.get("content").and_then(extract_text_from_json_content)
+                        && let Some(reg_idx) = c.find("Registered ")
+                    {
+                        let after = &c[reg_idx + "Registered ".len()..];
+                        let token: String = after
+                            .chars()
+                            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '-' || *ch == '_')
+                            .collect();
+                        if after[token.len()..].starts_with(" <")
+                            && let Some(norm) = normalize_claude_session_name(&token)
+                        {
+                            return Some(norm);
+                        }
+                    }
+                    continue;
+                }
                 if !matches!(t, None | Some("USER_INPUT" | "user" | "human")) {
                     continue;
                 }
                 let Some(s) = val
                     .get("content")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| val.pointer("/message/content").and_then(|v| v.as_str()))
-                    .or_else(|| val.pointer("/payload/body").and_then(|v| v.as_str()))
+                    .and_then(extract_text_from_json_content)
+                    .or_else(|| {
+                        val.pointer("/message/content")
+                            .and_then(extract_text_from_json_content)
+                    })
+                    .or_else(|| {
+                        val.pointer("/payload/body")
+                            .and_then(extract_text_from_json_content)
+                    })
                 else {
                     continue;
                 };
-                s.to_string()
+                s
             } else {
                 line.to_string()
             };
@@ -919,6 +1292,7 @@ pub fn scan_transcript_for_persona(path: &Path, max_lines: usize) -> Option<Stri
                         | "pair"
                         | "connected"
                         | "not"
+                        | "replacing"
                 ) {
                     continue;
                 }
@@ -989,6 +1363,26 @@ pub fn capture_current_env_route() -> Option<VendorRoute> {
         return Some(VendorRoute::Grok {
             session_id,
             cwd: std::env::current_dir().ok(),
+            tmux_target: None,
+            tmux_pane: std::env::var("TMUX_PANE")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+        });
+    }
+    if std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
+        && let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+        && let Some((session_id, cwd, tmux_pane)) =
+            resolve_grok_pid_session(&home, std::process::id())
+    {
+        return Some(VendorRoute::Grok {
+            session_id,
+            cwd: cwd.or_else(|| std::env::current_dir().ok()),
+            tmux_target: None,
+            tmux_pane: tmux_pane.or_else(|| {
+                std::env::var("TMUX_PANE")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            }),
         });
     }
     None
@@ -1058,16 +1452,19 @@ fn resolve_persona_with_sources(
         return norm;
     }
 
-    if let Some(home) = get_env("HOME").map(PathBuf::from)
-        && let Some(sock) = get_env("CLAUDE_CODE_MESSAGING_SOCKET")
-    {
-        let sock_path = PathBuf::from(sock);
-        if let Some(pid) = sock_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .and_then(|s| s.parse::<u32>().ok())
-            && let Some(norm) = resolve_claude_pid_persona(&home, pid)
-        {
+    if let Some(home) = get_env("HOME").map(PathBuf::from) {
+        if let Some(sock) = get_env("CLAUDE_CODE_MESSAGING_SOCKET") {
+            let sock_path = PathBuf::from(sock);
+            if let Some(pid) = sock_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+                && let Some(norm) = resolve_claude_pid_persona(&home, pid)
+            {
+                return norm;
+            }
+        }
+        if let Some(norm) = resolve_grok_pid_persona(&home, std::process::id()) {
             return norm;
         }
     }
@@ -1235,6 +1632,77 @@ fn resolve_claude_pid_persona(home: &Path, start_pid: u32) -> Option<String> {
             }
         }
         pid = parent_pid_of(pid)?;
+    }
+    None
+}
+
+fn resolve_grok_pid_session(
+    home: &Path,
+    start_pid: u32,
+) -> Option<(String, Option<PathBuf>, Option<String>)> {
+    let active_path = home.join(".grok").join("active_sessions.json");
+    let raw = fs::read_to_string(active_path).ok()?;
+    let arr = serde_json::from_str::<Vec<serde_json::Value>>(&raw).ok()?;
+    let mut pid = start_pid;
+    for _ in 0..8 {
+        if pid <= 1 {
+            break;
+        }
+        for item in &arr {
+            let item_pid = item.get("pid").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            if item_pid == pid {
+                let sid = item
+                    .get("session_id")
+                    .or_else(|| item.get("sessionId"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())?
+                    .to_string();
+                let cwd = item
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from);
+                let (_env_persona, tmux_pane) = read_grok_proc_env(pid);
+                return Some((sid, cwd, tmux_pane));
+            }
+        }
+        pid = parent_pid_of(pid)?;
+    }
+    None
+}
+
+fn resolve_grok_pid_persona(home: &Path, start_pid: u32) -> Option<String> {
+    let (sid, _cwd, _pane) = resolve_grok_pid_session(home, start_pid)?;
+    let sessions_dir = home.join(".grok").join("sessions");
+    let Ok(read_dir) = fs::read_dir(&sessions_dir) else {
+        return None;
+    };
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let candidate_dir = if path.file_name().and_then(|s| s.to_str()) == Some(sid.as_str()) {
+            Some(path)
+        } else {
+            let nested = path.join(&sid);
+            nested.is_dir().then_some(nested)
+        };
+        if let Some(dir) = candidate_dir {
+            let chat_path = dir.join("chat_history.jsonl");
+            if chat_path.is_file()
+                && let Some(norm) = scan_transcript_for_persona(&chat_path, 120)
+            {
+                return Some(norm);
+            }
+            let summary_path = dir.join("summary.json");
+            let (_s, _c, _u, summary_persona) = read_grok_summary_metadata(&summary_path);
+            if summary_persona.is_some() {
+                return summary_persona;
+            }
+        }
     }
     None
 }
@@ -1734,6 +2202,87 @@ mod tests {
                 session_id,
                 ..
             }) if session_id == "wendy-session-uuid"
+        ));
+    }
+
+    #[test]
+    fn discover_grok_routes_resolves_nested_session_dir_and_active_sessions_json() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+
+        let grok_dir = home.join(".grok");
+        let nested_session_dir = grok_dir
+            .join("sessions")
+            .join("%2Fhome%2Flmcfarlin%2FProjects%2FArtificial-Humanity")
+            .join("01a18538-6f1a-79c2-99d2-8e8540366c72");
+        fs::create_dir_all(&nested_session_dir).unwrap();
+
+        fs::write(
+            grok_dir.join("active_sessions.json"),
+            serde_json::json!([
+                {
+                    "session_id": "01a18538-6f1a-79c2-99d2-8e8540366c72",
+                    "pid": 1535066,
+                    "cwd": "/home/lmcfarlin/Projects/Artificial-Humanity",
+                    "opened_at": "2026-10-29T01:13:50.916892837Z"
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        fs::write(
+            nested_session_dir.join("chat_history.jsonl"),
+            [
+                serde_json::json!({
+                    "type": "system",
+                    "content": "You are Grok 4.7 released by xAI."
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "user",
+                    "synthetic_reason": "system_reminder",
+                    "content": [{"type": "text", "text": "<system-reminder>\nYou are interactive.\n</system-reminder>"}]
+                })
+                .to_string(),
+                serde_json::json!({
+                    "type": "user",
+                    "prompt_index": 0,
+                    "content": [{"type": "text", "text": "<user_query>\nYou are Wendy. Please read agent instruction files in front of you.\n</user_query>"}]
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        fs::write(
+            nested_session_dir.join("summary.json"),
+            serde_json::json!({
+                "info": {
+                    "id": "01a18538-6f1a-79c2-99d2-8e8540366c72",
+                    "cwd": "/home/lmcfarlin/Projects/Artificial-Humanity"
+                },
+                "session_summary": "Wendy registers as Website assistant to Wesley",
+                "updated_at": "2026-10-29T01:18:31.323100755Z",
+                "current_model_id": "grok-4.7",
+                "context_window": 500000
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut table = RouteTable::default();
+        table.discover_routes(Some(home), At::parse("2026-10-29T01:20:00.000Z").unwrap());
+
+        assert!(matches!(
+            table.get("wendy").map(|e| &e.route),
+            Some(VendorRoute::Grok {
+                session_id,
+                cwd: Some(cwd),
+                ..
+            }) if session_id == "01a18538-6f1a-79c2-99d2-8e8540366c72"
+                && cwd == Path::new("/home/lmcfarlin/Projects/Artificial-Humanity")
         ));
     }
 }
