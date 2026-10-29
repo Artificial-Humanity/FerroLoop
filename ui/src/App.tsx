@@ -28,6 +28,7 @@ import {
   type PrReviewRequest,
   type PullRequestItem,
   type SessionContextUsage,
+  type SessionQuotaUsage,
   type QueuedOperatorPrompt,
   type TranscriptTurn,
   type WireInboxItem,
@@ -323,6 +324,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [isSessionBusy, setIsSessionBusy] = useState<boolean>(false);
   const [sessionContextUsage, setSessionContextUsage] =
     useState<SessionContextUsage | null>(null);
+  const [sessionQuotaUsage, setSessionQuotaUsage] =
+    useState<SessionQuotaUsage | null>(null);
   const optimisticPromptRef = useRef<OptimisticPrompt | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
   const [lastSeenAssistantTurnIndex, setLastSeenAssistantTurnIndex] =
@@ -481,6 +484,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
               recordTranscript(targetPersona, trRes.turns);
             }
             setSessionContextUsage(trRes.context_usage ?? null);
+            setSessionQuotaUsage(trRes.quota_usage ?? null);
             if (typeof trRes.is_busy === "boolean") {
               setIsSessionBusy(trRes.is_busy);
             }
@@ -600,6 +604,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setSessionQueue(trRes.queue ?? []);
           setIsSessionBusy(Boolean(trRes.is_busy));
           setSessionContextUsage(trRes.context_usage ?? null);
+          setSessionQuotaUsage(trRes.quota_usage ?? null);
         }
       }
     } finally {
@@ -758,9 +763,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       setTranscriptTurns([]);
       setSessionQueue([]);
       setIsSessionBusy(false);
+      setSessionQuotaUsage(null);
       return;
     }
     let cancelled = false;
+    setSessionQuotaUsage(null);
     apiClient
       .getSessionTranscript(targetId)
       .then((res) => {
@@ -770,6 +777,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setSessionQueue(res.queue ?? []);
           setIsSessionBusy(Boolean(res.is_busy));
           setSessionContextUsage(res.context_usage ?? null);
+          setSessionQuotaUsage(res.quota_usage ?? null);
         }
       })
       .catch(() => {
@@ -777,6 +785,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setTranscriptTurns([]);
           setSessionQueue([]);
           setIsSessionBusy(false);
+          setSessionQuotaUsage(null);
         }
       });
     return () => {
@@ -1080,6 +1089,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             sessionId={activeSession?.id ?? null}
             turns={transcriptTurns}
             contextUsage={sessionContextUsage}
+            quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
             isBusy={isSessionBusy}
             queue={sessionQueue}
             loading={loading}
@@ -1154,6 +1164,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 sessionId={activeSession?.id ?? null}
                 turns={transcriptTurns}
                 contextUsage={sessionContextUsage}
+                quotaUsage={sessionQuotaUsage ?? activeSession?.quota_usage ?? null}
                 isBusy={isSessionBusy}
                 queue={sessionQueue}
                 loading={loading}

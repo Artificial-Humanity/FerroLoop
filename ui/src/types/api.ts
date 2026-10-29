@@ -84,6 +84,19 @@ export interface AreaRecord {
   by?: string;
 }
 
+export interface QuotaWindowUsage {
+  used_percent: number;
+  window_minutes?: number | null;
+  resets_at_ms?: number | null;
+}
+
+export interface SessionQuotaUsage {
+  tier?: string | null;
+  primary_window?: QuotaWindowUsage | null;
+  secondary_window?: QuotaWindowUsage | null;
+  exhausted_reason?: string | null;
+}
+
 export interface DiscoveredSessionSummary {
   id: string;
   source: "route" | "attempt" | string;
@@ -94,7 +107,10 @@ export interface DiscoveredSessionSummary {
   cwd?: string | null;
   record_id?: string | null;
   transcript_path?: string | null;
+  quota_usage?: SessionQuotaUsage | null;
 }
+
+export type DiscoveredSession = DiscoveredSessionSummary;
 
 export interface AgentsResponse {
   agents: AgentRecord[];
@@ -178,6 +194,8 @@ export interface SessionTranscriptResponse {
   queue?: QueuedOperatorPrompt[];
   /** Server-measured context usage when the hub reports it. */
   context_usage?: SessionContextUsage | null;
+  /** Vendor account quota/allowance usage when reported by the adapter/hub. */
+  quota_usage?: SessionQuotaUsage | null;
 }
 
 export type TranscriptResponse = SessionTranscriptResponse;

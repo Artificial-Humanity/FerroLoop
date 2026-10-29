@@ -775,3 +775,105 @@ describe("ChatPane draft persistence", () => {
     );
   });
 });
+
+describe("ChatPane vendor account quota allowance badge", () => {
+  it("renders Codex plus tier with 5h session and 7d weekly allowance windows and renewal countdowns", () => {
+    const now = Date.now();
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="codex"
+        sessionId="sess-codex-01"
+        turns={[]}
+        quotaUsage={{
+          tier: "plus",
+          primary_window: {
+            used_percent: 2,
+            window_minutes: 300,
+            resets_at_ms: now + (3 * 60 + 14) * 60_000,
+          },
+          secondary_window: {
+            used_percent: 1,
+            window_minutes: 10_080,
+            resets_at_ms: now + (6 * 24 * 60 + 22 * 60) * 60_000,
+          },
+        }}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByTestId("quota-usage-badge");
+    expect(badge).not.toHaveAttribute("data-exhausted", "true");
+    expect(screen.getByTestId("quota-tier-chip")).toHaveTextContent("PLUS");
+    expect(screen.getByTestId("quota-primary-window")).toHaveTextContent("5h: 98% left");
+    expect(screen.getByTestId("quota-primary-window")).toHaveTextContent("renews in 3h 14m");
+    expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("7d: 99% left");
+    expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("renews in 6d 22h");
+  });
+
+  it("renders Grok SuperGrok tier with weekly allowance window", () => {
+    const now = Date.now();
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="grok"
+        sessionId="sess-grok-01"
+        turns={[]}
+        quotaUsage={{
+          tier: "SuperGrok",
+          secondary_window: {
+            used_percent: 15,
+            window_minutes: 10_080,
+            resets_at_ms: now + (4 * 24 * 60 + 5 * 60) * 60_000,
+          },
+        }}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByTestId("quota-usage-badge");
+    expect(badge).not.toHaveAttribute("data-exhausted", "true");
+    expect(screen.getByTestId("quota-tier-chip")).toHaveTextContent("SUPERGROK");
+    expect(screen.queryByTestId("quota-primary-window")).toBeNull();
+    expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("7d: 85% left");
+    expect(screen.getByTestId("quota-secondary-window")).toHaveTextContent("renews in 4d 5h");
+  });
+
+  it("highlights Muse 429 quota exhaustion with danger/coral styling and tooltip", () => {
+    const now = Date.now();
+    render(
+      <ChatPane
+        agentName="felicia"
+        agentDisplayName="Felicia"
+        adapter="muse"
+        sessionId="sess-muse-01"
+        turns={[]}
+        quotaUsage={{
+          tier: "muse",
+          primary_window: {
+            used_percent: 100,
+            window_minutes: 300,
+            resets_at_ms: now + 42 * 60_000,
+          },
+          exhausted_reason: "HTTP 429: quota exhausted, resets at 03:15 UTC",
+        }}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const badge = screen.getByTestId("quota-usage-badge");
+    expect(badge).toHaveAttribute("data-exhausted", "true");
+    expect(badge).toHaveClass("is-exhausted");
+    expect(badge).toHaveAttribute(
+      "title",
+      "HTTP 429: quota exhausted, resets at 03:15 UTC",
+    );
+    expect(screen.getByTestId("quota-primary-window")).toHaveTextContent("5h: 0% left");
+    expect(screen.getByTestId("quota-primary-window")).toHaveTextContent("renews in 42m");
+    expect(screen.getByTestId("quota-exhausted-alert")).toHaveTextContent(
+      "HTTP 429: quota exhausted, resets at 03:15 UTC",
+    );
+  });
+});
