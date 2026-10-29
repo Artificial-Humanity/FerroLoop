@@ -1,7 +1,7 @@
 //! Native vendor push dispatcher for Claude Code, Antigravity, Codex, and Webhook routes (spec §3.2).
 
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -185,6 +185,18 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
     }
 }
 
+fn run_status_with_etxtbsy_retry(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
+    for attempt in 0..5 {
+        match cmd.status() {
+            Err(err) if err.raw_os_error() == Some(26) && attempt < 4 => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+    cmd.status()
+}
+
 fn deliver_to_codex_route(
     thread_id: &str,
     cwd: Option<&PathBuf>,
@@ -214,7 +226,7 @@ fn deliver_to_codex_route(
         {
             cmd.current_dir(dir);
         }
-        match cmd.status() {
+        match run_status_with_etxtbsy_retry(&mut cmd) {
             Ok(status) if status.success() => return Ok(()),
             Ok(status) => {
                 return Err(format!("codex queue exited with {status}"));
@@ -268,8 +280,7 @@ fn deliver_to_muse_route(
     {
         cmd.current_dir(dir);
     }
-    let status = cmd
-        .status()
+    let status = run_status_with_etxtbsy_retry(&mut cmd)
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
     if !status.success() {
         return Err(format!("muse exec exited with {status}"));
@@ -323,8 +334,7 @@ fn deliver_to_grok_route(
     {
         cmd.current_dir(dir);
     }
-    let status = cmd
-        .status()
+    let status = run_status_with_etxtbsy_retry(&mut cmd)
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
     if !status.success() {
         return Err(format!("grok exited with {status}"));
@@ -376,8 +386,7 @@ fn deliver_to_agy_route(
     if !csrf.is_empty() {
         cmd.env("ANTIGRAVITY_CSRF_TOKEN", &csrf);
     }
-    let status = cmd
-        .status()
+    let status = run_status_with_etxtbsy_retry(&mut cmd)
         .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
     if !status.success() {
         return Err(format!("agy send-message exited with {status}"));
@@ -482,16 +491,75 @@ fn validate_agy_conversation_id(conversation_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn post_revert_to_cascade_step(port: u16, csrf: &str, conversation_id: &str) -> Result<(), String> {
-    let body = serde_json::json!({
+const DEFAULT_AGY_PLAN_MODEL: &str = "MODEL_PLACEHOLDER_M418";
+const MAX_AGY_RPC_BODY_BYTES: usize = 256 * 1024;
+
+fn revert_to_cascade_step_body(conversation_id: &str, plan_model: &str) -> String {
+    serde_json::json!({
         "cascadeId": conversation_id,
         "stepIndex": 0,
         "conversationOnly": true,
+        "overrideConfig": {
+            "plannerConfig": {
+                "planModel": plan_model,
+                "requestedModel": {
+                    "model": plan_model,
+                },
+            },
+        },
     })
-    .to_string();
+    .to_string()
+}
+
+fn read_agy_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let mut size_line = String::new();
+        match reader.read_line(&mut size_line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let hex = size_line.trim().split(';').next().unwrap_or("").trim();
+        let Ok(chunk_len) = usize::from_str_radix(hex, 16) else {
+            break;
+        };
+        if chunk_len == 0 {
+            let mut trailer = String::new();
+            let _ = reader.read_line(&mut trailer);
+            break;
+        }
+        let remaining = max_bytes.saturating_sub(out.len());
+        let to_read = chunk_len.min(remaining);
+        if to_read == 0 {
+            break;
+        }
+        let start = out.len();
+        out.resize(start + to_read, 0);
+        if reader.read_exact(&mut out[start..]).is_err() {
+            out.truncate(start);
+            break;
+        }
+        if chunk_len > to_read {
+            break;
+        }
+        let mut crlf = [0u8; 2];
+        if reader.read_exact(&mut crlf).is_err() {
+            break;
+        }
+    }
+    out
+}
+
+fn post_agy_connect_rpc(
+    port: u16,
+    csrf: &str,
+    procedure: &str,
+    body: &str,
+    timeout: Duration,
+) -> Result<(u16, String, String), String> {
     let host = format!("127.0.0.1:{port}");
     let request = format!(
-        "POST /exa.language_server_pb.LanguageServerService/RevertToCascadeStep HTTP/1.1\r\n\
+        "POST {procedure} HTTP/1.1\r\n\
          Host: {host}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
@@ -502,25 +570,117 @@ fn post_revert_to_cascade_step(port: u16, csrf: &str, conversation_id: &str) -> 
         body.len()
     );
     let target = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let mut stream = TcpStream::connect_timeout(&target, Duration::from_secs(5))
+    let mut stream = TcpStream::connect_timeout(&target, timeout)
         .map_err(|err| format!("antigravity revert connect to {host} failed: {err}"))?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(timeout))
         .map_err(|err| format!("antigravity revert read timeout failed: {err}"))?;
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+        .set_write_timeout(Some(timeout))
         .map_err(|err| format!("antigravity revert write timeout failed: {err}"))?;
     stream
         .write_all(request.as_bytes())
         .map_err(|err| format!("antigravity revert write to {host} failed: {err}"))?;
+    let mut reader = std::io::BufReader::new(stream);
     let mut status = String::new();
-    BufRead::read_line(&mut std::io::BufReader::new(stream), &mut status)
+    reader
+        .read_line(&mut status)
         .map_err(|err| format!("antigravity revert read from {host} failed: {err}"))?;
-    let code = status.split_whitespace().nth(1).unwrap_or("");
-    if code != "200" {
-        return Err(format!("antigravity revert returned {}", status.trim()));
+    let mut content_length: Option<usize> = None;
+    let mut is_chunked = false;
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {
+                if line == "\r\n" || line == "\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    let name = name.trim();
+                    let value = value.trim();
+                    if name.eq_ignore_ascii_case("content-length") {
+                        content_length = value.parse::<usize>().ok();
+                    } else if name.eq_ignore_ascii_case("transfer-encoding")
+                        && value.to_ascii_lowercase().contains("chunked")
+                    {
+                        is_chunked = true;
+                    }
+                }
+            }
+            Err(_) => break,
+        }
     }
-    Ok(())
+    let resp_bytes = if is_chunked {
+        read_agy_chunked_body(&mut reader, MAX_AGY_RPC_BODY_BYTES)
+    } else {
+        let max_body = content_length
+            .unwrap_or(MAX_AGY_RPC_BODY_BYTES)
+            .min(MAX_AGY_RPC_BODY_BYTES);
+        let mut buf = Vec::new();
+        if max_body > 0 {
+            let _ = reader.take(max_body as u64).read_to_end(&mut buf);
+        }
+        buf
+    };
+    let resp_body = String::from_utf8_lossy(&resp_bytes).into_owned();
+    let code = status
+        .split_whitespace()
+        .nth(1)
+        .and_then(|raw| raw.parse::<u16>().ok())
+        .unwrap_or(0);
+    Ok((code, status.trim().to_string(), resp_body))
+}
+
+fn fetch_agy_default_plan_model(port: u16, csrf: &str) -> Option<String> {
+    let (code, _, body) = post_agy_connect_rpc(
+        port,
+        csrf,
+        "/exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData",
+        "{}",
+        Duration::from_secs(2),
+    )
+    .ok()?;
+    if code != 200 {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+    val.get("defaultOverrideModelConfig")?
+        .get("modelOrAlias")?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+}
+
+fn post_revert_to_cascade_step(port: u16, csrf: &str, conversation_id: &str) -> Result<(), String> {
+    let procedure = "/exa.language_server_pb.LanguageServerService/RevertToCascadeStep";
+    let body = revert_to_cascade_step_body(conversation_id, DEFAULT_AGY_PLAN_MODEL);
+    let (mut code, mut status_line, mut resp_body) =
+        post_agy_connect_rpc(port, csrf, procedure, &body, Duration::from_secs(5))?;
+    if code == 200 {
+        return Ok(());
+    }
+    if resp_body.to_ascii_lowercase().contains("model")
+        && let Some(model) =
+            fetch_agy_default_plan_model(port, csrf).filter(|m| m != DEFAULT_AGY_PLAN_MODEL)
+    {
+        let retry_body = revert_to_cascade_step_body(conversation_id, &model);
+        (code, status_line, resp_body) =
+            post_agy_connect_rpc(port, csrf, procedure, &retry_body, Duration::from_secs(5))?;
+        if code == 200 {
+            return Ok(());
+        }
+    }
+    let detail: String = resp_body.trim().chars().take(512).collect();
+    if detail.is_empty() {
+        Err(format!("antigravity revert returned {status_line}"))
+    } else {
+        Err(format!(
+            "antigravity revert returned {status_line}: {detail}"
+        ))
+    }
 }
 
 fn truncate_agy_transcripts(conversation_id: &str) -> Result<(), String> {
@@ -1603,10 +1763,10 @@ mod tests {
             clear_or_reforge_session(&no_csrf, SessionResetMode::Clear, "owner", None).unwrap_err();
         assert!(csrf_err.contains("csrf token"), "{csrf_err}");
 
-        let (status_tx, status_rx) = mpsc::channel::<u16>();
+        let (status_tx, status_rx) = mpsc::channel::<(u16, String)>();
         let (req_tx, req_rx) = mpsc::channel::<String>();
         std::thread::spawn(move || {
-            while let Ok(code) = status_rx.recv() {
+            while let Ok((code, resp_body)) = status_rx.recv() {
                 // `agy_ls_address_listening` connects and drops before the POST.
                 // Skip that probe and answer the next request that carries headers.
                 loop {
@@ -1650,9 +1810,17 @@ mod tests {
                     }
                     let captured = format!("{headers}{}", String::from_utf8_lossy(&body));
                     let reason = if code == 200 { "OK" } else { "ERR" };
-                    let response = format!(
-                        "HTTP/1.1 {code} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    );
+                    let response = if let Some(chunk_payload) = resp_body.strip_prefix("CHUNKED:") {
+                        format!(
+                            "HTTP/1.1 {code} {reason}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{chunk_payload}\r\n0\r\n\r\n",
+                            chunk_payload.len()
+                        )
+                    } else {
+                        format!(
+                            "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                            resp_body.len()
+                        )
+                    };
                     stream
                         .set_write_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -1724,7 +1892,7 @@ mod tests {
             agentapi_exe: Some(bin),
         };
 
-        status_tx.send(200).unwrap();
+        status_tx.send((200, "{}".into())).unwrap();
         clear_or_reforge_session(&route, SessionResetMode::Clear, "owner", None).unwrap();
         let captured = req_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(captured.starts_with(
@@ -1737,12 +1905,52 @@ mod tests {
         assert_eq!(payload["cascadeId"], conversation_id);
         assert_eq!(payload["stepIndex"], 0);
         assert_eq!(payload["conversationOnly"], true);
+        assert_eq!(
+            payload["overrideConfig"]["plannerConfig"]["planModel"],
+            "MODEL_PLACEHOLDER_M418"
+        );
+        assert_eq!(
+            payload["overrideConfig"]["plannerConfig"]["requestedModel"]["model"],
+            "MODEL_PLACEHOLDER_M418"
+        );
         assert_eq!(fs::read_to_string(&transcript).unwrap(), step_zero);
         assert_eq!(fs::read_to_string(&full).unwrap(), "");
         assert!(!out.exists() || fs::read_to_string(&out).unwrap().is_empty());
 
         write_logs();
-        status_tx.send(200).unwrap();
+        status_tx
+            .send((
+                500,
+                "{\"code\":\"unknown\",\"message\":\"plan model not specified\"}".into(),
+            ))
+            .unwrap();
+        let padding = "x".repeat(6000);
+        status_tx
+            .send((
+                200,
+                format!(
+                    "CHUNKED:{{\"clientModelConfigs\":[\"{padding}\"],\"defaultOverrideModelConfig\":{{\"modelOrAlias\":{{\"model\":\"MODEL_PLACEHOLDER_M417\"}}}}}}"
+                ),
+            ))
+            .unwrap();
+        status_tx.send((200, "{}".into())).unwrap();
+        clear_or_reforge_session(&route, SessionResetMode::Clear, "owner", None).unwrap();
+        let _first = req_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let model_cfg_req = req_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(model_cfg_req.starts_with(
+            "POST /exa.language_server_pb.LanguageServerService/GetCascadeModelConfigData HTTP/1.1\r\n"
+        ));
+        let retry_req = req_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let retry_body = retry_req.split("\r\n\r\n").nth(1).expect("retry body");
+        let retry_payload: serde_json::Value = serde_json::from_str(retry_body).unwrap();
+        assert_eq!(
+            retry_payload["overrideConfig"]["plannerConfig"]["planModel"],
+            "MODEL_PLACEHOLDER_M417"
+        );
+        assert_eq!(fs::read_to_string(&transcript).unwrap(), step_zero);
+
+        write_logs();
+        status_tx.send((200, "{}".into())).unwrap();
         clear_or_reforge_session(
             &route,
             SessionResetMode::Reforge,
@@ -1759,10 +1967,16 @@ mod tests {
 
         write_logs();
         let before = fs::read_to_string(&transcript).unwrap();
-        status_tx.send(500).unwrap();
+        status_tx
+            .send((
+                500,
+                "{\"code\":\"internal\",\"message\":\"database locked\"}".into(),
+            ))
+            .unwrap();
         let failed =
             clear_or_reforge_session(&route, SessionResetMode::Clear, "owner", None).unwrap_err();
         assert!(failed.contains("500"), "{failed}");
+        assert!(failed.contains("database locked"), "{failed}");
         assert_eq!(fs::read_to_string(&transcript).unwrap(), before);
         drop(_bin_env);
         drop(_csrf_env);
