@@ -1,12 +1,18 @@
 //! Versioned `/api/v1/*` JSON REST API and static `FerroDeck` asset / SPA serving (spec §2.3, §3).
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 
-use fl_core::agent::AgentStatus;
+use fl_core::agent::{AgentRecord, AgentRole, AgentStatus};
 use fl_core::arch::{
     ArchitectureModel, DEFAULT_ARCH_MANIFEST_PATH, export_likec4_dsl, validate_architecture_model,
 };
@@ -54,7 +60,10 @@ use fl_gate::{
     handle_registry_v01_get, verify_inbound_bridge_webhook,
 };
 use fl_store::RedbStore;
-use fl_wire::dispatcher::{MAX_DELIVER, dispatch_operator_prompt_to_route, dispatch_to_route};
+use fl_wire::dispatcher::{
+    MAX_DELIVER, SessionResetMode, clear_or_reforge_session, dispatch_operator_prompt_to_route,
+    dispatch_to_route,
+};
 use fl_wire::identity::RouteTable;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2332,7 +2341,7 @@ fn handle_dynamic_api_routes(
         return HttpResponse::json(404, json!({ "error": "attachment not found" }));
     }
 
-    // /api/v1/sessions/:id/transcript, /api/v1/sessions/:id/prompt, or /api/v1/sessions/:id/queue
+    // /api/v1/sessions/:id/transcript, /prompt, /clear, or /queue
     if segments.len() == 5
         && segments[0] == "api"
         && segments[1] == "v1"
@@ -2399,6 +2408,9 @@ fn handle_dynamic_api_routes(
             }
             ("POST", "prompt") => {
                 return handle_post_session_prompt(state, authority, &session_id, req);
+            }
+            ("POST", "clear") => {
+                return handle_post_session_clear(state, authority, &session_id, req);
             }
             _ => {}
         }
@@ -2590,13 +2602,11 @@ fn route_matches_session_id(route: &fl_wire::identity::VendorRoute, raw_id: &str
     }
 }
 
-fn dispatch_operator_prompt_for_session(
+fn vendor_route_for_session(
     state: &HubState,
     persona: Option<&str>,
     fallback_session_id: &str,
-    sender_name: &str,
-    effective_body: &str,
-) -> Result<(), String> {
+) -> Result<fl_wire::identity::VendorRoute, String> {
     let route_override = state
         .config
         .home_override
@@ -2606,16 +2616,27 @@ fn dispatch_operator_prompt_for_session(
     routes.discover_routes(state.config.home_override.as_deref(), stamp::now());
     let lookup_key = persona.unwrap_or(fallback_session_id);
     if let Some(entry) = routes.get(lookup_key) {
-        return dispatch_operator_prompt_to_route(&entry.route, sender_name, effective_body);
+        return Ok(entry.route.clone());
     }
     if let Some(entry) = routes
         .entries
         .values()
         .find(|e| route_matches_session_id(&e.route, fallback_session_id))
     {
-        return dispatch_operator_prompt_to_route(&entry.route, sender_name, effective_body);
+        return Ok(entry.route.clone());
     }
     Err(format!("no active vendor route for `{lookup_key}`"))
+}
+
+fn dispatch_operator_prompt_for_session(
+    state: &HubState,
+    persona: Option<&str>,
+    fallback_session_id: &str,
+    sender_name: &str,
+    effective_body: &str,
+) -> Result<(), String> {
+    let route = vendor_route_for_session(state, persona, fallback_session_id)?;
+    dispatch_operator_prompt_to_route(&route, sender_name, effective_body)
 }
 
 /// Automatically drain and dispatch the next queued operator prompt for any session whose
@@ -3001,6 +3022,271 @@ fn handle_post_session_prompt(
     });
     state.broadcast("session", "prompt_sent", data.clone());
     HttpResponse::json(200, data)
+}
+
+thread_local! {
+    static HYDRATE_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+static HYDRATE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Serialize `FL_HUB_AGENT_HYDRATE_BIN` reads with tests that set it.
+/// Re-entrant on the same thread so a test can hold the lock across the handler.
+pub(crate) fn with_hydrate_lock<T>(body: impl FnOnce() -> T) -> T {
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            HYDRATE_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+
+    let outer = HYDRATE_LOCK_DEPTH.with(|depth| depth.get()) == 0;
+    let _guard = if outer {
+        Some(HYDRATE_LOCK.lock().unwrap_or_else(|err| err.into_inner()))
+    } else {
+        None
+    };
+    HYDRATE_LOCK_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _depth = DepthGuard;
+    body()
+}
+
+fn handle_post_session_clear(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    #[derive(Deserialize)]
+    struct ClearPayload {
+        mode: String,
+    }
+
+    let payload: ClearPayload = match req.json() {
+        Ok(payload) => payload,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let mode = match payload.mode.trim().to_ascii_lowercase().as_str() {
+        "clear" | "clear_only" => "clear",
+        "reforge" | "rehydrate" => "reforge",
+        _ => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": "mode must be \"clear\" or \"reforge\"" }),
+            );
+        }
+    };
+
+    let (canonical_id, persona) = resolve_session_target(state, session_id);
+    state.clear_session_prompt_queue(&canonical_id);
+    if session_id != canonical_id {
+        state.clear_session_prompt_queue(session_id);
+    }
+    if let Some(name) = persona.as_deref()
+        && name != canonical_id
+        && name != session_id
+    {
+        state.clear_session_prompt_queue(name);
+    }
+
+    let prompt = if mode == "reforge" {
+        let lookup = persona.as_deref().unwrap_or(canonical_id.as_str());
+        match build_reforge_prompt(state, lookup) {
+            Some(prompt) => Some(prompt),
+            None => {
+                return HttpResponse::json(
+                    404,
+                    json!({ "error": format!("no agent record for reforge of `{lookup}`") }),
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let route = match vendor_route_for_session(state, persona.as_deref(), &canonical_id) {
+        Ok(route) => route,
+        Err(e) => return HttpResponse::json(404, json!({ "error": e })),
+    };
+    let reset_mode = if mode == "reforge" {
+        SessionResetMode::Reforge
+    } else {
+        SessionResetMode::Clear
+    };
+    if let Err(e) = clear_or_reforge_session(
+        &route,
+        reset_mode,
+        authority.actor_name(),
+        prompt.as_deref(),
+    ) {
+        return HttpResponse::json(502, json!({ "error": e }));
+    }
+
+    let data = json!({
+        "ok": true,
+        "session_id": canonical_id,
+        "persona": persona,
+        "mode": mode,
+        "prompt": prompt,
+    });
+    state.broadcast("sessions", "session.cleared", data.clone());
+    HttpResponse::json(200, data)
+}
+
+fn build_reforge_prompt(state: &HubState, persona: &str) -> Option<String> {
+    if let Some(prompt) = reforge_prompt_from_hydrate(state, persona)
+        && !prompt.trim().is_empty()
+    {
+        return Some(prompt);
+    }
+    let agent = agent_record_for_persona(state, persona)?;
+    Some(canonical_reforge_prompt(
+        &agent.display_name,
+        &agent.project,
+        &reforge_role_label(&agent.role),
+    ))
+}
+
+fn agent_record_for_persona(state: &HubState, persona: &str) -> Option<AgentRecord> {
+    let store = state.open_store().ok()?;
+    let agents = store.list_agents(None, true).ok()?;
+    drop(store);
+    let key = persona.trim();
+    let mut matches: Vec<AgentRecord> = agents
+        .into_iter()
+        .filter(|agent| {
+            agent.name_key.eq_ignore_ascii_case(key) || agent.display_name.eq_ignore_ascii_case(key)
+        })
+        .collect();
+    matches.sort_by_key(|agent| agent.status != AgentStatus::Active);
+    matches.into_iter().next()
+}
+
+pub(crate) fn reforge_role_label(role: &AgentRole) -> String {
+    match role {
+        AgentRole::Lead => "lead".to_string(),
+        AgentRole::Assistant => "assistant".to_string(),
+        AgentRole::LabManager => "lab_manager".to_string(),
+        AgentRole::Custom(slug) => slug.clone(),
+    }
+}
+
+pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) -> String {
+    let name_lower = name.to_ascii_lowercase();
+    format!(
+        "Take the name of {name} and take up residence in {project}/ as the {role}.\n\
+         \n\
+         This session has just been reset (`/clear`) for clean-slate context hygiene. Perform your root startup hydration now:\n\
+         1. Read `.agents/AGENTS.md` and `.agents/REGISTRY.md`.\n\
+         2. Read your role file(s): `.agents/roles/{role}.md`.\n\
+         3. Read your project instruction files: `{project}/AGENTS.md`, `{project}/WORKFLOW.md`, `{project}/PERSONA.md`.\n\
+         4. Read your project's current working state note: `Notes/{project}/STATE.md`.\n\
+         5. Re-register your active session route so NATS and FerroDeck track this fresh session:\n\
+            ```bash\n\
+            AGENT_PERSONA={name_lower} agent-msg register {name} --project {project} --role {role} --replace\n\
+            ```\n\
+         6. Check and acknowledge any pending NATS messages:\n\
+            ```bash\n\
+            AGENT_PERSONA={name_lower} agent-msg read --ack\n\
+            ```\n\
+         \n\
+         Identity summary: `{name}` | Co-author trailer: `Co-authored-by: {name} <{name_lower}@artificialhumanity.io>`"
+    )
+}
+
+fn reforge_prompt_from_hydrate(state: &HubState, persona: &str) -> Option<String> {
+    with_hydrate_lock(|| {
+        let bin = hydrate_bin(state.config.home_override.as_deref())?;
+        let stdout = read_command_stdout(
+            &bin,
+            &[persona, "--print", "--json"],
+            Duration::from_secs(3),
+        )?;
+        let value = serde_json::from_str::<Value>(stdout.trim()).ok()?;
+        let obj = value.as_object()?;
+        // Only a case-insensitive display-name or persona key. Any other
+        // entry must not replace the canonical template.
+        for (key, item) in obj {
+            if key.eq_ignore_ascii_case(persona) {
+                return item.as_str().map(ToOwned::to_owned);
+            }
+        }
+        None
+    })
+}
+
+fn hydrate_bin(home_override: Option<&Path>) -> Option<PathBuf> {
+    if let Some(raw) = std::env::var_os("FL_HUB_AGENT_HYDRATE_BIN") {
+        let path = PathBuf::from(raw);
+        if !path.as_os_str().is_empty() {
+            return Some(path);
+        }
+    }
+    if home_override.is_some() {
+        return None;
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("agent-hydrate");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    let local = PathBuf::from(home)
+        .join(".local")
+        .join("bin")
+        .join("agent-hydrate");
+    local.is_file().then_some(local)
+}
+
+fn read_command_stdout(bin: &Path, args: &[&str], timeout: Duration) -> Option<String> {
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = thread::spawn(move || {
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(reader);
+                return None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                drop(reader);
+                return None;
+            }
+        }
+    };
+    // A descendant can keep stdout open after the child exits. Wait only
+    // until the original deadline, then drop the reader. Do not kill the group.
+    let remaining = timeout.saturating_sub(started.elapsed());
+    let output = match rx.recv_timeout(remaining) {
+        Ok(output) => output,
+        Err(_) => {
+            drop(reader);
+            return None;
+        }
+    };
+    reader.join().ok()?;
+    status.success().then_some(output)
 }
 
 fn handle_post_pr_review(

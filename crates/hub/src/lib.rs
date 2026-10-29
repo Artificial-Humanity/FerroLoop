@@ -254,6 +254,14 @@ impl HubState {
         Some((item, snapshot))
     }
 
+    /// Drop queued operator prompts and the in-flight marker for `session_key`.
+    /// A clear or reforge must not drain prompts that were waiting on the old context.
+    pub fn clear_session_prompt_queue(&self, session_key: &str) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard.queues.remove(session_key);
+        guard.in_flight.remove(session_key);
+    }
+
     pub fn remove_queued_prompt(
         &self,
         session_key: &str,
@@ -433,7 +441,7 @@ mod tests {
         StepDef, WorkflowDef, WorkflowRun,
     };
     use fl_exec::stamp;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
@@ -2072,5 +2080,432 @@ mod tests {
         assert_eq!(blank_json["symbols"].as_array().unwrap().len(), 0);
         assert_eq!(blank_json["tokens_saved_this_query"], 0);
         assert_eq!(blank_json["token_gain"]["queries_count"], 1, "{blank_json}");
+    }
+
+    fn install_webhook_route(home: &std::path::Path, persona: &str, socket: &std::path::Path) {
+        use fl_core::at::At;
+        use fl_wire::identity::{RouteTable, VendorRoute};
+
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            persona,
+            VendorRoute::Webhook {
+                socket_path: socket.to_path_buf(),
+            },
+            At::from_unix_millis(1),
+        );
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        routes.save(Some(&path)).unwrap();
+    }
+
+    fn collect_webhook_lines(
+        socket: std::path::PathBuf,
+        count: usize,
+    ) -> std::thread::JoinHandle<Vec<String>> {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            while lines.len() < count {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    continue;
+                }
+                lines.push(line);
+            }
+            lines
+        })
+    }
+
+    #[test]
+    fn session_clear_drops_queue_and_sends_clear() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        state.enqueue_session_prompt(
+            "felicia",
+            Some("felicia".into()),
+            "stale queued prompt".into(),
+            "stale queued prompt".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        state.mark_session_in_flight_from_turns("felicia", &[]);
+
+        let unauth = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                .with_json_body(&json!({ "mode": "clear" })),
+        );
+        assert_eq!(unauth.status, 401);
+        assert_eq!(state.session_queue("felicia").len(), 1);
+
+        let bad_mode = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({ "mode": "wipe" })),
+        );
+        assert_eq!(bad_mode.status, 400);
+        assert_eq!(state.session_queue("felicia").len(), 1);
+
+        let missing_route = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_json_body(&json!({ "mode": "clear" })),
+        );
+        assert_eq!(missing_route.status, 404);
+        assert!(state.session_queue("felicia").is_empty());
+        assert!(!state.is_session_busy_from_turns("felicia", &[]));
+
+        state.enqueue_session_prompt(
+            "felicia",
+            Some("felicia".into()),
+            "second stale prompt".into(),
+            "second stale prompt".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        let socket = tmp.path().join("felicia.sock");
+        install_webhook_route(tmp.path(), "felicia", &socket);
+        let lines = collect_webhook_lines(socket, 2);
+        let mut frames = state.subscribe();
+
+        let cleared = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({ "mode": "clear" })),
+        );
+        assert_eq!(
+            cleared.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&cleared.body)
+        );
+        let body = cleared.json_value().unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["session_id"], "webhook-felicia");
+        assert_eq!(body["persona"], "felicia");
+        assert_eq!(body["mode"], "clear");
+        assert!(body["prompt"].is_null());
+        assert!(state.session_queue("felicia").is_empty());
+
+        let frame = frames.try_recv().unwrap();
+        assert_eq!(frame.channel, "sessions");
+        assert_eq!(frame.event, "session.cleared");
+        assert_eq!(frame.data["mode"], "clear");
+
+        let alias = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                .with_header("Authorization", "Bearer peer-tok-secret")
+                .with_json_body(&json!({ "mode": "clear_only" })),
+        );
+        assert_eq!(alias.status, 200);
+        assert_eq!(alias.json_value().unwrap()["mode"], "clear");
+
+        let delivered = lines.join().unwrap();
+        for line in &delivered {
+            let value: Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["kind"], "operator_prompt");
+            assert_eq!(value["body"], "/clear");
+        }
+    }
+
+    #[test]
+    fn session_reforge_sends_canonical_prompt() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Felicia".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Scribe".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Custom("scribe".into()),
+                    extra_areas: vec![],
+                    create_area: false,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            api::reforge_role_label(&AgentRole::Custom("scribe".into())),
+            "scribe"
+        );
+        let expected = api::canonical_reforge_prompt("Felicia", "ferroloop", "assistant");
+        assert!(expected.contains("AGENT_PERSONA=felicia agent-msg register Felicia --project ferroloop --role assistant --replace"));
+        assert!(expected.contains("Co-authored-by: Felicia <felicia@artificialhumanity.io>"));
+        assert!(
+            api::canonical_reforge_prompt("Scribe", "ferroloop", "scribe")
+                .contains(".agents/roles/scribe.md")
+        );
+
+        state.enqueue_session_prompt(
+            "felicia",
+            Some("felicia".into()),
+            "do not send after reforge".into(),
+            "do not send after reforge".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        let socket = tmp.path().join("reforge.sock");
+        install_webhook_route(tmp.path(), "felicia", &socket);
+        let lines = collect_webhook_lines(socket, 2);
+        let mut frames = state.subscribe();
+
+        let resp = api::with_hydrate_lock(|| {
+            handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                    .with_header("Authorization", "Bearer owner-tok-secret")
+                    .with_json_body(&json!({ "mode": "reforge" })),
+            )
+        });
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["mode"], "reforge");
+        assert_eq!(body["persona"], "felicia");
+        assert_eq!(body["prompt"], expected);
+        assert!(state.session_queue("felicia").is_empty());
+
+        let frame = frames.try_recv().unwrap();
+        assert_eq!(frame.event, "session.cleared");
+        assert_eq!(frame.channel, "sessions");
+        assert_eq!(frame.data["prompt"], expected);
+
+        let delivered = lines.join().unwrap();
+        let first: Value = serde_json::from_str(&delivered[0]).unwrap();
+        let second: Value = serde_json::from_str(&delivered[1]).unwrap();
+        assert_eq!(first["body"], "/clear");
+        assert_eq!(second["body"], expected);
+
+        let alias = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/nobody/clear")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_json_body(&json!({ "mode": "rehydrate" })),
+        );
+        assert_eq!(alias.status, 404);
+    }
+
+    #[test]
+    fn session_reforge_uses_agent_hydrate_bin_when_set() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Felicia".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        let script = tmp.path().join("agent-hydrate");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"Felicia\":\"HYDRATE FROM BIN\"}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = tmp.path().join("hydrate.sock");
+        install_webhook_route(tmp.path(), "felicia", &socket);
+        let lines = collect_webhook_lines(socket, 2);
+
+        let resp = api::with_hydrate_lock(|| {
+            // SAFETY: the hydrate lock serializes writers of FL_HUB_AGENT_HYDRATE_BIN.
+            let previous = std::env::var_os("FL_HUB_AGENT_HYDRATE_BIN");
+            unsafe {
+                std::env::set_var("FL_HUB_AGENT_HYDRATE_BIN", &script);
+            }
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                    .with_header("Authorization", "Bearer owner-tok-secret")
+                    .with_json_body(&json!({ "mode": "rehydrate" })),
+            );
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("FL_HUB_AGENT_HYDRATE_BIN", value),
+                    None => std::env::remove_var("FL_HUB_AGENT_HYDRATE_BIN"),
+                }
+            }
+            resp
+        });
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["mode"], "reforge");
+        assert_eq!(body["prompt"], "HYDRATE FROM BIN");
+        let delivered = lines.join().unwrap();
+        let second: Value = serde_json::from_str(&delivered[1]).unwrap();
+        assert_eq!(second["body"], "HYDRATE FROM BIN");
+    }
+
+    #[test]
+    fn session_reforge_ignores_hydrate_prompt_for_other_persona() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Felicia".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        let expected = api::canonical_reforge_prompt("Felicia", "ferroloop", "assistant");
+        let script = tmp.path().join("agent-hydrate");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s\\n' '{\"Other\":\"WRONG\"}'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = tmp.path().join("hydrate-other.sock");
+        install_webhook_route(tmp.path(), "felicia", &socket);
+        let lines = collect_webhook_lines(socket, 2);
+
+        let resp = api::with_hydrate_lock(|| {
+            // SAFETY: the hydrate lock serializes writers of FL_HUB_AGENT_HYDRATE_BIN.
+            let previous = std::env::var_os("FL_HUB_AGENT_HYDRATE_BIN");
+            unsafe {
+                std::env::set_var("FL_HUB_AGENT_HYDRATE_BIN", &script);
+            }
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                    .with_header("Authorization", "Bearer owner-tok-secret")
+                    .with_json_body(&json!({ "mode": "reforge" })),
+            );
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("FL_HUB_AGENT_HYDRATE_BIN", value),
+                    None => std::env::remove_var("FL_HUB_AGENT_HYDRATE_BIN"),
+                }
+            }
+            resp
+        });
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["prompt"], expected);
+        assert!(!body["prompt"].as_str().unwrap().contains("WRONG"));
+        let delivered = lines.join().unwrap();
+        let second: Value = serde_json::from_str(&delivered[1]).unwrap();
+        assert_eq!(second["body"], expected);
+    }
+
+    #[test]
+    fn session_reforge_hydrate_returns_canonical_when_stdout_stays_open() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Felicia".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        let expected = api::canonical_reforge_prompt("Felicia", "ferroloop", "assistant");
+        let script = tmp.path().join("agent-hydrate");
+        fs::write(&script, "#!/bin/sh\nsleep 5 &\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = tmp.path().join("hydrate-hang.sock");
+        install_webhook_route(tmp.path(), "felicia", &socket);
+        let lines = collect_webhook_lines(socket, 2);
+
+        let started = std::time::Instant::now();
+        let resp = api::with_hydrate_lock(|| {
+            // SAFETY: the hydrate lock serializes writers of FL_HUB_AGENT_HYDRATE_BIN.
+            let previous = std::env::var_os("FL_HUB_AGENT_HYDRATE_BIN");
+            unsafe {
+                std::env::set_var("FL_HUB_AGENT_HYDRATE_BIN", &script);
+            }
+            let resp = handle_http_request(
+                &state,
+                &HttpRequest::new("POST", "/api/v1/sessions/felicia/clear")
+                    .with_header("Authorization", "Bearer owner-tok-secret")
+                    .with_json_body(&json!({ "mode": "reforge" })),
+            );
+            unsafe {
+                match previous {
+                    Some(value) => std::env::set_var("FL_HUB_AGENT_HYDRATE_BIN", value),
+                    None => std::env::remove_var("FL_HUB_AGENT_HYDRATE_BIN"),
+                }
+            }
+            resp
+        });
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(4500),
+            "reforge waited {elapsed:?} for a descendant holding hydrate stdout"
+        );
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["prompt"], expected);
+        let delivered = lines.join().unwrap();
+        let second: Value = serde_json::from_str(&delivered[1]).unwrap();
+        assert_eq!(second["body"], expected);
     }
 }
