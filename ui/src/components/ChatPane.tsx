@@ -5,7 +5,9 @@ import type {
   PromptRequest,
   PromptResponse,
   QueuedOperatorPrompt,
+  QuotaWindowUsage,
   SessionContextUsage,
+  SessionQuotaUsage,
   TranscriptTurn,
 } from "../types/api";
 import { ThinkingBlock } from "./ThinkingBlock";
@@ -101,6 +103,47 @@ export function formatTokenCount(value: number): string {
   return String(value);
 }
 
+export function hasQuotaUsageData(quota?: SessionQuotaUsage | null): boolean {
+  if (!quota) {
+    return false;
+  }
+  return (
+    Boolean(quota.tier && quota.tier.trim().length > 0) ||
+    quota.primary_window != null ||
+    quota.secondary_window != null ||
+    Boolean(quota.exhausted_reason && quota.exhausted_reason.trim().length > 0)
+  );
+}
+
+export function formatQuotaResetCountdown(
+  resetsAtMs?: number | null,
+  nowMs: number = Date.now(),
+): string | null {
+  if (resetsAtMs == null || !Number.isFinite(resetsAtMs)) {
+    return null;
+  }
+  const diffMs = resetsAtMs - nowMs;
+  if (diffMs <= 0) {
+    return "renews soon";
+  }
+  const totalMinutes = Math.max(1, Math.round(diffMs / 60_000));
+  if (totalMinutes >= 24 * 60) {
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    return hours > 0 ? `renews in ${days}d ${hours}h` : `renews in ${days}d`;
+  }
+  if (totalMinutes >= 60) {
+    const hours = Math.floor(totalMinutes / 60);
+    const mins = totalMinutes % 60;
+    return mins > 0 ? `renews in ${hours}h ${mins}m` : `renews in ${hours}h`;
+  }
+  return `renews in ${totalMinutes}m`;
+}
+
+export function formatQuotaWindowRemaining(window: QuotaWindowUsage): number {
+  return Math.max(0, Math.min(100, Math.round(100 - window.used_percent)));
+}
+
 /**
  * Identity of the transcript tail. The hub returns a fixed-size sliding
  * window, so turn *count* stays flat while new turns arrive; the tail key
@@ -194,6 +237,8 @@ export interface ChatPaneProps {
   turns?: TranscriptTurn[];
   /** Server-measured context usage; estimates apply when absent. */
   contextUsage?: SessionContextUsage | null;
+  /** Vendor account quota/allowance usage when reported by the adapter/hub. */
+  quotaUsage?: SessionQuotaUsage | null;
   isBusy?: boolean;
   queue?: QueuedOperatorPrompt[];
   loading?: boolean;
@@ -238,6 +283,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   sessionId,
   turns,
   contextUsage = null,
+  quotaUsage = null,
   isBusy,
   queue,
   loading = false,
@@ -260,6 +306,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [internalError, setInternalError] = React.useState<string | null>(null);
   const [internalContextUsage, setInternalContextUsage] =
     React.useState<SessionContextUsage | null>(null);
+  const [internalQuotaUsage, setInternalQuotaUsage] =
+    React.useState<SessionQuotaUsage | null>(null);
   const [compacting, setCompacting] = React.useState<boolean>(false);
   const [compactFeedback, setCompactFeedback] = React.useState<string | null>(null);
 
@@ -338,6 +386,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         contextUsage ?? internalContextUsage,
       ),
     [effectiveTurns, adapter, contextUsage, internalContextUsage],
+  );
+  const effectiveQuotaUsage = quotaUsage ?? internalQuotaUsage;
+  const showQuotaBadge = hasQuotaUsageData(effectiveQuotaUsage);
+  const quotaExhausted = Boolean(
+    effectiveQuotaUsage &&
+      ((effectiveQuotaUsage.exhausted_reason &&
+        effectiveQuotaUsage.exhausted_reason.trim().length > 0) ||
+        (effectiveQuotaUsage.primary_window?.used_percent ?? 0) >= 100 ||
+        (effectiveQuotaUsage.secondary_window?.used_percent ?? 0) >= 100),
   );
   const canCompact =
     contextEstimate.percent >= 50 &&
@@ -472,6 +529,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setInternalIsBusy(Boolean(response.is_busy));
       setInternalQueue(response.queue ?? []);
       setInternalContextUsage(response.context_usage ?? null);
+      setInternalQuotaUsage(response.quota_usage ?? null);
     } catch (err) {
       setInternalError(err instanceof Error ? err.message : "Failed to load transcript");
     } finally {
@@ -779,7 +837,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           flexWrap: "wrap",
         }}
       >
-        <div style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1 }}>
+        <div
+          className="chat-header-meta"
+          style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, flexWrap: "wrap" }}
+        >
           <input
             type="search"
             name="fd-transcript-filter"
@@ -858,6 +919,165 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               />
             </div>
           </div>
+          {showQuotaBadge && effectiveQuotaUsage && (
+            <div
+              data-testid="quota-usage-badge"
+              data-exhausted={quotaExhausted ? "true" : undefined}
+              className={`fd-badge fd-quota-badge${quotaExhausted ? " is-exhausted" : ""}`}
+              title={
+                effectiveQuotaUsage.exhausted_reason?.trim() ||
+                "Vendor account usage allowance"
+              }
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "8px",
+                padding: "3px 8px",
+                flexWrap: "wrap",
+                borderColor: quotaExhausted
+                  ? "var(--diff-del-border, rgba(239, 68, 68, 0.45))"
+                  : "var(--border-subtle)",
+                backgroundColor: quotaExhausted
+                  ? "var(--diff-del-bg, rgba(239, 68, 68, 0.14))"
+                  : "var(--bg-elevated)",
+                color: quotaExhausted ? "var(--diff-del-text, #FCA5A5)" : "var(--text-secondary)",
+              }}
+            >
+              {effectiveQuotaUsage.tier && effectiveQuotaUsage.tier.trim().length > 0 && (
+                <span
+                  data-testid="quota-tier-chip"
+                  style={{
+                    padding: "1px 5px",
+                    borderRadius: "3px",
+                    fontSize: "10px",
+                    fontWeight: 700,
+                    letterSpacing: "0.04em",
+                    backgroundColor: quotaExhausted
+                      ? "rgba(239, 68, 68, 0.2)"
+                      : "var(--accent-subtle)",
+                    color: quotaExhausted ? "var(--diff-del-text, #FCA5A5)" : "var(--accent-hover)",
+                    border: `1px solid ${
+                      quotaExhausted
+                        ? "rgba(239, 68, 68, 0.45)"
+                        : "var(--border-accent)"
+                    }`,
+                  }}
+                >
+                  {effectiveQuotaUsage.tier.trim().toUpperCase()}
+                </span>
+              )}
+              {effectiveQuotaUsage.primary_window && (() => {
+                const win = effectiveQuotaUsage.primary_window;
+                const remaining = formatQuotaWindowRemaining(win);
+                const resetLabel = formatQuotaResetCountdown(win.resets_at_ms);
+                const barColor =
+                  win.used_percent >= 100 || remaining <= 10
+                    ? "var(--status-danger)"
+                    : remaining <= 25
+                      ? "var(--status-stale)"
+                      : "var(--status-alive)";
+                return (
+                  <span
+                    data-testid="quota-primary-window"
+                    style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
+                  >
+                    <span>5h: {remaining}% left</span>
+                    <span
+                      role="progressbar"
+                      aria-label="5h session allowance remaining"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={remaining}
+                      style={{
+                        width: "36px",
+                        height: "5px",
+                        borderRadius: "3px",
+                        backgroundColor: "var(--bg-input)",
+                        border: "1px solid var(--border-subtle)",
+                        overflow: "hidden",
+                        display: "inline-block",
+                      }}
+                    >
+                      <span
+                        style={{
+                          display: "block",
+                          width: `${remaining}%`,
+                          height: "100%",
+                          backgroundColor: barColor,
+                        }}
+                      />
+                    </span>
+                    {resetLabel && (
+                      <span style={{ color: "var(--text-dim)", fontSize: "10.5px" }}>
+                        ({resetLabel})
+                      </span>
+                    )}
+                  </span>
+                );
+              })()}
+              {effectiveQuotaUsage.secondary_window && (() => {
+                const win = effectiveQuotaUsage.secondary_window;
+                const remaining = formatQuotaWindowRemaining(win);
+                const resetLabel = formatQuotaResetCountdown(win.resets_at_ms);
+                const barColor =
+                  win.used_percent >= 100 || remaining <= 10
+                    ? "var(--status-danger)"
+                    : remaining <= 25
+                      ? "var(--status-stale)"
+                      : "var(--status-alive)";
+                return (
+                  <span
+                    data-testid="quota-secondary-window"
+                    style={{ display: "inline-flex", alignItems: "center", gap: "5px", whiteSpace: "nowrap" }}
+                  >
+                    <span>7d: {remaining}% left</span>
+                    <span
+                      role="progressbar"
+                      aria-label="Weekly allowance remaining"
+                      aria-valuemin={0}
+                      aria-valuemax={100}
+                      aria-valuenow={remaining}
+                      style={{
+                        width: "36px",
+                        height: "5px",
+                        borderRadius: "3px",
+                        backgroundColor: "var(--bg-input)",
+                        border: "1px solid var(--border-subtle)",
+                        overflow: "hidden",
+                        display: "inline-block",
+                      }}
+                    >
+                      <span
+                        style={{
+                          display: "block",
+                          width: `${remaining}%`,
+                          height: "100%",
+                          backgroundColor: barColor,
+                        }}
+                      />
+                    </span>
+                    {resetLabel && (
+                      <span style={{ color: "var(--text-dim)", fontSize: "10.5px" }}>
+                        ({resetLabel})
+                      </span>
+                    )}
+                  </span>
+                );
+              })()}
+              {quotaExhausted && (
+                <span
+                  data-testid="quota-exhausted-alert"
+                  style={{
+                    fontWeight: 600,
+                    color: "var(--diff-del-text, #FCA5A5)",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  {effectiveQuotaUsage.exhausted_reason?.trim() || "Quota exhausted"}
+                </span>
+              )}
+            </div>
+          )}
           <button
             type="button"
             className={`fd-btn${canCompact ? " fd-btn-primary" : ""}`}

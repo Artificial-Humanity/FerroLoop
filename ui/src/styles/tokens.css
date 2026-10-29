@@ -295,6 +295,12 @@ body,
   color: var(--text-secondary);
 }
 
+.fd-quota-badge.is-exhausted {
+  border-color: var(--diff-del-border);
+  background-color: var(--diff-del-bg);
+  color: var(--diff-del-text);
+}
+
 .fd-dot {
   width: 8px;
   height: 8px;
