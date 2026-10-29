@@ -422,6 +422,28 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             continue;
         }
 
+        if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(t) = obj.get("type").and_then(Value::as_str)
+            && (t.starts_with("api-request")
+                || matches!(
+                    t,
+                    "attachment"
+                        | "queue-operation"
+                        | "last-prompt"
+                        | "file-history-snapshot"
+                        | "mode"
+                        | "permission-mode"
+                        | "atis-latch"
+                        | "bridge-session"
+                        | "ai-title"
+                        | "tools-used"
+                ))
+        {
+            continue;
+        }
+
         // Determine role from Antigravity (`type` / `source`), Claude (`type` / `message.role`), or generic (`role`).
         let role = if let Some(r) = obj.get("role").and_then(Value::as_str) {
             normalize_role(r)
@@ -494,6 +516,20 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
             Some(thinking_parts.join("\n"))
         };
 
+        if role == "user" {
+            let raw_content = obj
+                .get("content")
+                .or_else(|| val.pointer("/message/content"));
+            if let Some(arr) = raw_content.and_then(Value::as_array)
+                && !arr.is_empty()
+                && arr
+                    .iter()
+                    .all(|item| item.get("type").and_then(Value::as_str) == Some("tool_result"))
+            {
+                role = "tool".to_string();
+            }
+        }
+
         if role == "assistant"
             && content.trim_start().starts_with("Created At:")
             && thinking.is_none()
@@ -555,12 +591,32 @@ fn clean_sender_token(raw: &str) -> String {
 }
 
 fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
-    if role != "system" && !content.contains("<SYSTEM_MESSAGE>") {
+    if role != "system" && role != "user" {
+        return (role.to_string(), content.to_string());
+    }
+    let trimmed_content = content.trim();
+    let has_system_msg_block =
+        trimmed_content.starts_with("<SYSTEM_MESSAGE>") || content.contains("\n<SYSTEM_MESSAGE>");
+    let has_claude_peer_wrapper =
+        trimmed_content.starts_with("Another Claude session sent a message:");
+    let has_wire_or_operator_prefix = trimmed_content.starts_with("[Operator Prompt via FerroDeck")
+        || trimmed_content.starts_with("[Incoming NATS Message")
+        || trimmed_content.starts_with("[fl-wire ");
+    if role != "system"
+        && !has_system_msg_block
+        && !(role == "user" && (has_claude_peer_wrapper || has_wire_or_operator_prefix))
+    {
         return (role.to_string(), content.to_string());
     }
 
-    let mut inner = content.trim();
-    if content.contains("<SYSTEM_MESSAGE>") {
+    let mut inner = trimmed_content;
+    if let Some(rest) = inner.strip_prefix("Another Claude session sent a message:") {
+        inner = rest.trim();
+        if let Some(footer_idx) = inner.rfind("\n\nThis came from another Claude session") {
+            inner = inner[..footer_idx].trim();
+        }
+    }
+    if has_system_msg_block {
         let before_close = match content.rfind("</SYSTEM_MESSAGE>") {
             Some(close_idx) => &content[..close_idx],
             None => content,
@@ -569,8 +625,6 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
             inner = rest.trim();
         } else if let Some(idx) = before_close.find("\n<SYSTEM_MESSAGE>") {
             inner = before_close[idx + "\n<SYSTEM_MESSAGE>".len()..].trim();
-        } else if let Some(idx) = before_close.find("<SYSTEM_MESSAGE>") {
-            inner = before_close[idx + "<SYSTEM_MESSAGE>".len()..].trim();
         }
     }
 
@@ -626,7 +680,7 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
                     let key_lower = k.trim().to_ascii_lowercase();
                     if matches!(
                         key_lower.as_str(),
-                        "from" | "subject" | "timestamp" | "message id"
+                        "from" | "to" | "subject" | "timestamp" | "message id"
                     ) {
                         if key_lower == "from" {
                             sender = v.trim().to_string();
@@ -696,7 +750,7 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
         }
     }
 
-    if content.contains("<SYSTEM_MESSAGE>")
+    if (has_system_msg_block || has_claude_peer_wrapper)
         && !inner.starts_with("[Incoming NATS Message")
         && !inner.starts_with("[fl-wire ")
         && !inner.starts_with("[Subagent ")
@@ -747,6 +801,16 @@ fn extract_content_and_tools(
                             "tool_use" | "tool_call" => {
                                 if let Some(tc) = parse_tool_call_item(item) {
                                     tool_calls.push(tc);
+                                }
+                            }
+                            "tool_result" => {
+                                if let Some(nested) = map.get("content") {
+                                    extract_content_and_tools(
+                                        nested,
+                                        content_parts,
+                                        thinking_parts,
+                                        tool_calls,
+                                    );
                                 }
                             }
                             _ => {
@@ -1772,5 +1836,80 @@ mod tests {
                 .contains("Subscription quota exhausted")
         );
         assert!(!is_transcript_busy(&failed_turns));
+    }
+
+    #[test]
+    fn parse_jsonl_transcript_normalizes_claude_tool_results_and_uds_peer_messages() {
+        let jsonl = [
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_123",
+                            "content": [{"type": "text", "text": "MCP tool output here"}]
+                        }
+                    ]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "Another Claude session sent a message:\n[Incoming NATS Message — already acknowledged]\nTimestamp: 2026-10-29T00:55:00Z\nFrom: sonya\nTo: sammy\nMessage ID: urn:uuid:11111111-1111-1111-1111-111111111111\nSubject: Welcome\n\nHi Sammy, welcome to Claude Code!\n\nThis came from another Claude session — not typed by your user, but very likely working on their behalf."
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "Another Claude session sent a message:\n[Operator Prompt via FerroDeck — from lmcfarlin]\n\nPlease check the Sonora build.\n\nThis came from another Claude session — not typed by your user, but very likely working on their behalf."
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "Another Claude session sent a message:\nHello Sammy. Welcome to the team.\n\nThis came from another Claude session — not typed by your user, but very likely working on their behalf."
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "type": "api-request-blob",
+                "message": {
+                    "role": "system",
+                    "content": [{"type": "text", "text": "Internal cached system prompt blob"}]
+                }
+            })
+            .to_string(),
+            serde_json::json!({
+                "step_index": 4611,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "content": "Created At: 2026-10-29T01:03:12Z\nShowing lines 725-735\n728:     if content.contains(\"<SYSTEM_MESSAGE>\")\n734:         return (\"user\".to_string(), inner.to_string());"
+            })
+            .to_string(),
+        ]
+        .join("\n");
+
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0].role, "tool");
+        assert_eq!(turns[0].content, "MCP tool output here");
+        assert_eq!(turns[1].role, "wire:sonya");
+        assert_eq!(turns[1].content, "Hi Sammy, welcome to Claude Code!");
+        assert!(!turns[1].content.contains("Another Claude session"));
+        assert_eq!(turns[2].role, "user");
+        assert_eq!(turns[2].content, "Please check the Sonora build.");
+        assert!(!turns[2].content.contains("Another Claude session"));
+        assert_eq!(turns[3].role, "user");
+        assert_eq!(turns[3].content, "Hello Sammy. Welcome to the team.");
+        assert_eq!(turns[4].role, "tool");
+        assert!(turns[4].content.contains("Showing lines 725-735"));
     }
 }
