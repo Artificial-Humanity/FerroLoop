@@ -418,6 +418,29 @@ body,
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.6);
 }
 
+.fd-help-icon-btn {
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 50%;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.fd-ephemeral-help-popover {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-accent);
+  background-color: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.45;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
 /* Mobile Responsive */
 .fd-mobile-nav {
   display: none;

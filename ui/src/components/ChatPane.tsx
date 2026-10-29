@@ -1,6 +1,7 @@
 import React from "react";
 import type { HubApiClient } from "../api/client";
 import type {
+  ClearSessionMode,
   PromptAttachment,
   PromptRequest,
   PromptResponse,
@@ -310,6 +311,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     React.useState<SessionQuotaUsage | null>(null);
   const [compacting, setCompacting] = React.useState<boolean>(false);
   const [compactFeedback, setCompactFeedback] = React.useState<string | null>(null);
+  const [clearModalOpen, setClearModalOpen] = React.useState<boolean>(false);
+  const [clearHelpVisible, setClearHelpVisible] = React.useState<boolean>(false);
+  const [clearing, setClearing] = React.useState<boolean>(false);
+  const clearHelpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
   const [visibleTurnLimit, setVisibleTurnLimit] = React.useState<number>(100);
@@ -400,7 +405,100 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     contextEstimate.percent >= 50 &&
     Boolean(targetSessionOrAgent) &&
     !compacting &&
+    !clearing &&
     !submitting;
+  const canClear = Boolean(targetSessionOrAgent) && !clearing && !compacting && !submitting;
+
+  React.useEffect(() => {
+    return () => {
+      if (clearHelpTimerRef.current !== null) {
+        clearTimeout(clearHelpTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleOpenClearModal = () => {
+    if (!canClear) return;
+    if (clearHelpTimerRef.current !== null) {
+      clearTimeout(clearHelpTimerRef.current);
+      clearHelpTimerRef.current = null;
+    }
+    setClearHelpVisible(false);
+    setClearModalOpen(true);
+  };
+
+  const handleCloseClearModal = React.useCallback(() => {
+    if (clearHelpTimerRef.current !== null) {
+      clearTimeout(clearHelpTimerRef.current);
+      clearHelpTimerRef.current = null;
+    }
+    setClearHelpVisible(false);
+    setClearModalOpen(false);
+  }, []);
+
+  React.useEffect(() => {
+    handleCloseClearModal();
+  }, [targetSessionOrAgent, handleCloseClearModal]);
+
+  React.useEffect(() => {
+    if (!clearModalOpen) return;
+    const handleKeyDownEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !clearing) {
+        handleCloseClearModal();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDownEscape);
+    return () => window.removeEventListener("keydown", handleKeyDownEscape);
+  }, [clearModalOpen, clearing, handleCloseClearModal]);
+
+  const handleShowClearHelp = () => {
+    if (clearHelpTimerRef.current !== null) {
+      clearTimeout(clearHelpTimerRef.current);
+    }
+    setClearHelpVisible(true);
+    clearHelpTimerRef.current = setTimeout(() => {
+      setClearHelpVisible(false);
+      clearHelpTimerRef.current = null;
+    }, 5_000);
+  };
+
+  const handleClearOrReforge = async (mode: ClearSessionMode) => {
+    if (!targetSessionOrAgent || clearing) {
+      return;
+    }
+    setClearing(true);
+    setCompactFeedback(null);
+    setSubmitError(null);
+    try {
+      if (apiClient) {
+        await apiClient.clearSession(targetSessionOrAgent, mode);
+        if (turns === undefined) {
+          void fetchTranscript();
+        }
+        if (onRefresh) {
+          onRefresh();
+        }
+      } else if (onSendPrompt) {
+        await onSendPrompt(targetSessionOrAgent, {
+          prompt: "/clear",
+          subject: mode === "reforge" ? "Reforge Context" : "Clear Context",
+          urgency: "normal",
+          send_now: true,
+        });
+      } else {
+        throw new Error("No session route is configured for clearing.");
+      }
+      handleCloseClearModal();
+      setCompactFeedback(mode === "reforge" ? "Reforged session" : "Cleared context");
+    } catch (err) {
+      setSubmitError(
+        err instanceof Error ? err.message : `Failed to ${mode} session`,
+      );
+      handleCloseClearModal();
+    } finally {
+      setClearing(false);
+    }
+  };
 
   const handleCompactContext = async () => {
     if (!canCompact) {
@@ -1093,6 +1191,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >
             {compacting ? "Compacting..." : "Compact Context"}
           </button>
+          <button
+            type="button"
+            className="fd-btn"
+            data-testid="clear-context-btn"
+            disabled={!canClear}
+            title="Clear session context or reforge with registered agent identity"
+            onClick={handleOpenClearModal}
+            style={{ whiteSpace: "nowrap" }}
+          >
+            {clearing ? "Clearing..." : "Clear"}
+          </button>
           {compactFeedback && (
             <span
               role="status"
@@ -1591,6 +1700,122 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
         </div>
       </div>
+
+      {clearModalOpen && (
+        <div
+          className="fd-modal-backdrop"
+          onClick={handleCloseClearModal}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="clear-session-modal-title"
+            data-testid="clear-session-modal"
+            className="fd-modal"
+            onClick={(e) => e.stopPropagation()}
+            style={{ position: "relative", maxWidth: "420px" }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                marginBottom: "10px",
+              }}
+            >
+              <h3
+                id="clear-session-modal-title"
+                style={{
+                  margin: 0,
+                  fontSize: "15px",
+                  fontWeight: 600,
+                  color: "var(--text-primary)",
+                }}
+              >
+                Clear Session Context
+              </h3>
+              <button
+                type="button"
+                data-testid="clear-modal-help-btn"
+                aria-label="Help"
+                title="Explain Clear vs. Reforge"
+                className="fd-btn fd-help-icon-btn"
+                onClick={handleShowClearHelp}
+              >
+                ?
+              </button>
+            </div>
+
+            {clearHelpVisible && (
+              <div
+                role="note"
+                data-testid="clear-modal-help-popover"
+                className="fd-ephemeral-help-popover"
+              >
+                <div style={{ marginBottom: "6px" }}>
+                  <strong style={{ color: "var(--text-primary)" }}>Clear:</strong>{" "}
+                  Clears the agent&apos;s conversation context and leaves the session blank.
+                </div>
+                <div>
+                  <strong style={{ color: "var(--accent-hover)" }}>Reforge:</strong>{" "}
+                  Clears the agent&apos;s context and immediately re-primes the agent with its
+                  registered identity, project, and role prompt.
+                </div>
+              </div>
+            )}
+
+            <p
+              style={{
+                margin: "0 0 16px 0",
+                fontSize: "13px",
+                color: "var(--text-secondary)",
+                lineHeight: 1.5,
+              }}
+            >
+              Choose how to reset context for{" "}
+              <strong style={{ color: "var(--text-primary)" }}>{displayTarget}</strong>:
+            </p>
+
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: "8px",
+              }}
+            >
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="clear-modal-cancel-btn"
+                disabled={clearing}
+                onClick={handleCloseClearModal}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="fd-btn fd-btn-danger"
+                data-testid="clear-modal-clear-btn"
+                disabled={clearing}
+                onClick={() => void handleClearOrReforge("clear")}
+              >
+                Clear
+              </button>
+              <button
+                type="button"
+                className="fd-btn fd-btn-primary"
+                data-testid="clear-modal-reforge-btn"
+                disabled={clearing}
+                onClick={() => void handleClearOrReforge("reforge")}
+              >
+                Reforge
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 };
