@@ -194,7 +194,7 @@ fn agy_ls_port(addr: &str) -> Option<u16> {
 }
 
 /// True when `addr`'s TCP port accepts a connection on `127.0.0.1` within 50ms.
-fn agy_ls_address_listening(addr: &str) -> bool {
+pub fn agy_ls_address_listening(addr: &str) -> bool {
     let Some(port) = agy_ls_port(addr) else {
         return false;
     };
@@ -508,8 +508,13 @@ impl RouteTable {
                     let rest = &line[idx + "Language server listening on random port at ".len()..];
                     let port: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
                     if !port.is_empty() {
-                        shared_ls_addr = Some(format!("127.0.0.1:{port}"));
-                        break;
+                        let candidate = format!("127.0.0.1:{port}");
+                        // Offline temp-home discovery does not probe listeners.
+                        // Host discovery keeps scanning until a port accepts.
+                        if !check_proc || agy_ls_address_listening(&candidate) {
+                            shared_ls_addr = Some(candidate);
+                            break;
+                        }
                     }
                 }
             }
@@ -558,8 +563,12 @@ impl RouteTable {
                 ..
             } = &entry.route
             {
-                if shared_ls_addr.is_none() {
-                    shared_ls_addr = ls_address.clone();
+                if shared_ls_addr.is_none()
+                    && let Some(addr) = ls_address
+                        .as_ref()
+                        .filter(|addr| !check_proc || agy_ls_address_listening(addr))
+                {
+                    shared_ls_addr = Some(addr.clone());
                 }
                 if shared_csrf.is_none() {
                     shared_csrf = csrf_token.clone();
@@ -594,6 +603,12 @@ impl RouteTable {
             {
                 if shared_ls_addr.is_some() {
                     *ls_address = shared_ls_addr.clone();
+                } else if check_proc
+                    && ls_address
+                        .as_deref()
+                        .is_some_and(|addr| !agy_ls_address_listening(addr))
+                {
+                    *ls_address = None;
                 }
                 if shared_csrf.is_some() {
                     *csrf_token = shared_csrf.clone();
@@ -3486,5 +3501,52 @@ mod tests {
             }
             other => panic!("expected agy route, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn discover_agy_routes_ignores_dead_cli_log_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let agy_dir = home.join(".gemini").join("antigravity-cli");
+        fs::create_dir_all(agy_dir.join("brain")).unwrap();
+        // Reverse scan sees port 1 first. The HTTPS line stays skipped. The
+        // earlier HTTP line is the bound listener, so Step 1 wins over /proc.
+        fs::write(
+            agy_dir.join("cli.log"),
+            format!(
+                "Language server listening on random port at {live_port} for HTTP\n\
+                 Language server listening on random port at {live_port} for HTTPS\n\
+                 Language server listening on random port at 1 for HTTP\n"
+            ),
+        )
+        .unwrap();
+
+        let at = At::parse("2026-10-29T18:00:00.000Z").unwrap();
+        let mut table = RouteTable::default();
+        table.upsert(
+            "felicia",
+            VendorRoute::Agy {
+                conversation_id: "conv-felicia".into(),
+                ls_pid: None,
+                ls_address: Some("localhost:35867".into()),
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            at.clone(),
+        );
+        table.discover_agy_routes(home, true, &at);
+
+        match &table.get("felicia").unwrap().route {
+            VendorRoute::Agy { ls_address, .. } => {
+                assert_eq!(
+                    ls_address.as_deref(),
+                    Some(format!("127.0.0.1:{live_port}").as_str())
+                );
+            }
+            other => panic!("expected agy route, got {other:?}"),
+        }
+        drop(listener);
     }
 }

@@ -342,9 +342,21 @@ fn deliver_to_agy_route(
     let env_exe = std::env::var_os("ANTIGRAVITY_AGENTAPI_EXE").map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let exe = resolve_agy_exe(agentapi_exe.as_deref(), env_exe.as_deref(), home.as_deref());
+    // Mock binaries (`FL_WIRE_AGY_BIN`) may target a port with no listener.
+    // Otherwise a dead route port must not clobber a live language server.
+    let trust_unverified = std::env::var_os("FL_WIRE_AGY_BIN").is_some();
+    let accept = |addr: &str| {
+        !addr.is_empty() && (trust_unverified || crate::identity::agy_ls_address_listening(addr))
+    };
     let addr = ls_address
-        .clone()
-        .or_else(|| std::env::var("ANTIGRAVITY_LS_ADDRESS").ok())
+        .as_deref()
+        .filter(|addr| accept(addr))
+        .map(str::to_string)
+        .or_else(|| {
+            std::env::var("ANTIGRAVITY_LS_ADDRESS")
+                .ok()
+                .filter(|addr| accept(addr))
+        })
         .unwrap_or_default();
     let csrf = csrf_token
         .clone()
@@ -377,19 +389,24 @@ fn deliver_to_agy_route(
 /// sends that slash command through [`dispatch_operator_prompt_to_route`].
 /// Codex and Grok use `/new`. Claude, Muse, Antigravity, and Webhook use `/clear`.
 ///
-/// Reforge waits 2s after a tmux reset (skipped when `FL_WIRE_TMUX_BIN` is set)
-/// and then delivers `reforge_prompt` on the same route.
+/// Reforge requires a non-empty prompt before any tmux or vendor dispatch.
+/// It waits 2s after a tmux reset (skipped when `FL_WIRE_TMUX_BIN` is set)
+/// and then delivers that prompt on the same route.
 pub fn clear_or_reforge_session(
     route: &VendorRoute,
     mode: SessionResetMode,
     sender_name: &str,
     reforge_prompt: Option<&str>,
 ) -> Result<(), String> {
+    let prompt = if mode == SessionResetMode::Reforge {
+        Some(require_reforge_prompt(reforge_prompt)?)
+    } else {
+        None
+    };
     let slash = session_reset_slash(route);
     if let Some(target) = alive_tmux_reset_target(route) {
         send_tmux_reset_keys(&target, slash)?;
-        if mode == SessionResetMode::Reforge {
-            let prompt = require_reforge_prompt(reforge_prompt)?;
+        if let Some(prompt) = prompt {
             if std::env::var_os("FL_WIRE_TMUX_BIN").is_none() {
                 std::thread::sleep(Duration::from_millis(2000));
             }
@@ -398,8 +415,7 @@ pub fn clear_or_reforge_session(
         return Ok(());
     }
     dispatch_operator_prompt_to_route(route, sender_name, slash)?;
-    if mode == SessionResetMode::Reforge {
-        let prompt = require_reforge_prompt(reforge_prompt)?;
+    if let Some(prompt) = prompt {
         dispatch_operator_prompt_to_route(route, sender_name, prompt)?;
     }
     Ok(())
@@ -1256,6 +1272,79 @@ mod tests {
             .expect("operator prefix");
         assert!(slash_at < prefix_at);
         assert!(second.contains("reforge agy now"), "{second}");
+    }
+
+    #[test]
+    fn deliver_to_agy_skips_dead_ls_address_unless_mock_bin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("agy-env.txt");
+        let bin = tmp.path().join("fake-agy.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$ANTIGRAVITY_LS_ADDRESS\" >> \"{}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ls_address = Some("127.0.0.1:1".to_string());
+        let exe = Some(bin.clone());
+        deliver_to_agy_route("conv-felicia", &ls_address, &None, &exe, "title", "body").unwrap();
+
+        let recorded = fs::read_to_string(&out).unwrap();
+        assert!(
+            recorded.lines().all(|line| line != "127.0.0.1:1"),
+            "dead route address must not be forwarded, got {recorded:?}"
+        );
+
+        // SAFETY: restores FL_WIRE_AGY_BIN when the guard drops. A set mock
+        // binary may forward a language-server address that is not listening.
+        let _env = EnvGuard::set("FL_WIRE_AGY_BIN", &bin);
+        deliver_to_agy_route("conv-felicia", &ls_address, &None, &exe, "title", "body").unwrap();
+        drop(_env);
+
+        let recorded = fs::read_to_string(&out).unwrap();
+        assert_eq!(recorded.lines().last(), Some("127.0.0.1:1"));
+    }
+
+    #[test]
+    fn clear_or_reforge_rejects_blank_reforge_prompt_before_dispatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let out = tmp.path().join("agy-args.txt");
+        let bin = tmp.path().join("fake-agy.sh");
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let route = VendorRoute::Agy {
+            conversation_id: "conv-felicia".into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: Some(bin),
+        };
+        let missing = clear_or_reforge_session(&route, SessionResetMode::Reforge, "owner", None);
+        assert_eq!(missing.unwrap_err(), "missing reforge prompt");
+        let blank =
+            clear_or_reforge_session(&route, SessionResetMode::Reforge, "owner", Some("  "));
+        assert_eq!(blank.unwrap_err(), "missing reforge prompt");
+        let body = fs::read_to_string(&out).unwrap_or_default();
+        assert!(
+            body.is_empty(),
+            "vendor binary must not run when the reforge prompt is missing, got {body:?}"
+        );
     }
 
     struct EnvGuard {
