@@ -13,10 +13,13 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableHand
 use std::collections::BTreeSet;
 use std::path::Path;
 
+pub mod ferrostore;
 pub mod ferrowire;
 pub mod manifest;
 pub mod state;
 pub mod workflow;
+
+pub use ferrostore::{FerroStore, migrate_redb_to_ferrostore};
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 
