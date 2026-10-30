@@ -344,6 +344,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [backgroundTranscripts, setBackgroundTranscripts] = useState<
     Record<string, TranscriptTurn[]>
   >({});
+  const backgroundTranscriptsRef = useRef<Record<string, TranscriptTurn[]>>({});
+  backgroundTranscriptsRef.current = backgroundTranscripts;
   const backgroundStampRef = useRef<Record<string, string>>({});
 
   useEffect(() => {
@@ -366,6 +368,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       if (!key) {
         return;
       }
+      backgroundTranscriptsRef.current = {
+        ...backgroundTranscriptsRef.current,
+        [key]: turns,
+      };
       setBackgroundTranscripts((prev) =>
         prev[key] === turns ? prev : { ...prev, [key]: turns },
       );
@@ -471,6 +477,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       }
       refreshInFlightRef.current = true;
       try {
+        const requestedAgentName = selectedAgentNameRef.current;
+        const requestedAgentKey = requestedAgentName.trim().toLowerCase();
+        const requestedSessionId = selectedSessionIdRef.current;
         const sessRes = await apiClient.getSessions().catch(() => null);
         const list = sessRes?.sessions ?? [];
         if (sessRes) {
@@ -480,30 +489,38 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         const targetId =
           sessionOverride === null
             ? null
-            : (sessionOverride ?? selectedSessionId ?? selectedAgentName);
+            : (sessionOverride ?? requestedSessionId ?? requestedAgentName);
         if (targetId) {
           const trRes = await apiClient.getSessionTranscript(targetId).catch(() => null);
           if (trRes) {
+            const targetPersona =
+              list.find((session) => session.id === targetId)?.persona ??
+              (list.some(
+                (session) =>
+                  (session.persona ?? "").toLowerCase() ===
+                  targetId.toLowerCase(),
+              )
+                ? targetId
+                : requestedAgentKey);
             if (trRes.turns) {
-              applyTranscriptTurns(trRes.turns);
-              const targetPersona =
-                list.find((session) => session.id === targetId)?.persona ??
-                (list.some(
-                  (session) =>
-                    (session.persona ?? "").toLowerCase() ===
-                    targetId.toLowerCase(),
-                )
-                  ? targetId
-                  : selectedAgentName);
               recordTranscript(targetPersona, trRes.turns);
             }
-            setSessionContextUsage(trRes.context_usage ?? null);
-            setSessionQuotaUsage(trRes.quota_usage ?? null);
-            if (typeof trRes.is_busy === "boolean") {
-              setIsSessionBusy(trRes.is_busy);
-            }
-            if (Array.isArray(trRes.queue)) {
-              setSessionQueue(trRes.queue);
+            const stillSameTarget =
+              selectedAgentNameRef.current.trim().toLowerCase() === requestedAgentKey &&
+              selectedSessionIdRef.current === requestedSessionId &&
+              targetPersona.trim().toLowerCase() === selectedAgentNameRef.current.trim().toLowerCase();
+            if (stillSameTarget) {
+              if (trRes.turns) {
+                applyTranscriptTurns(trRes.turns);
+              }
+              setSessionContextUsage(trRes.context_usage ?? null);
+              setSessionQuotaUsage(trRes.quota_usage ?? null);
+              if (typeof trRes.is_busy === "boolean") {
+                setIsSessionBusy(trRes.is_busy);
+              }
+              if (Array.isArray(trRes.queue)) {
+                setSessionQueue(trRes.queue);
+              }
             }
           }
         }
@@ -620,20 +637,26 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
       const initialAgentName = selectedAgentNameRef.current;
       const initialKey = initialAgentName.trim().toLowerCase();
+      const initialSessionId = selectedSessionIdRef.current;
       const matchedSessionId =
-        selectedSessionIdRef.current ??
+        initialSessionId ??
         sessionsRes?.sessions?.find((s) => (s.persona ?? "").toLowerCase() === initialKey)?.id ??
         agentsRes?.routes?.find((r) => (r.persona ?? "").toLowerCase() === initialKey)?.id ??
         initialAgentName;
       if (matchedSessionId) {
         const trRes = await apiClient.getSessionTranscript(matchedSessionId).catch(() => null);
         if (trRes) {
-          applyTranscriptTurns(trRes.turns ?? []);
           recordTranscript(initialAgentName, trRes.turns ?? []);
-          setSessionQueue(trRes.queue ?? []);
-          setIsSessionBusy(Boolean(trRes.is_busy));
-          setSessionContextUsage(trRes.context_usage ?? null);
-          setSessionQuotaUsage(trRes.quota_usage ?? null);
+          if (
+            selectedAgentNameRef.current.trim().toLowerCase() === initialKey &&
+            selectedSessionIdRef.current === initialSessionId
+          ) {
+            applyTranscriptTurns(trRes.turns ?? []);
+            setSessionQueue(trRes.queue ?? []);
+            setIsSessionBusy(Boolean(trRes.is_busy));
+            setSessionContextUsage(trRes.context_usage ?? null);
+            setSessionQuotaUsage(trRes.quota_usage ?? null);
+          }
         }
       }
     } finally {
@@ -785,18 +808,38 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     );
   }, [sessions, routes, selectedSessionId, selectedAgent]);
 
+  const prevLoadedAgentKeyRef = useRef<string>("");
+
   // Load transcript when activeSession or selectedAgentName changes
   useEffect(() => {
+    const nextAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) {
+      prevLoadedAgentKeyRef.current = nextAgentKey;
       setTranscriptTurns([]);
       setSessionQueue([]);
       setIsSessionBusy(false);
+      setSessionContextUsage(null);
       setSessionQuotaUsage(null);
       return;
     }
     let cancelled = false;
-    setSessionQuotaUsage(null);
+    if (prevLoadedAgentKeyRef.current !== nextAgentKey) {
+      prevLoadedAgentKeyRef.current = nextAgentKey;
+      applyTranscriptTurns(
+        nextAgentKey ? (backgroundTranscriptsRef.current[nextAgentKey] ?? []) : [],
+      );
+      setSessionQueue([]);
+      setIsSessionBusy(false);
+      setSessionContextUsage(null);
+      setSessionQuotaUsage(null);
+    } else if (selectedSessionIdRef.current !== null) {
+      setTranscriptTurns([]);
+      setSessionQueue([]);
+      setIsSessionBusy(false);
+      setSessionContextUsage(null);
+      setSessionQuotaUsage(null);
+    }
     apiClient
       .getSessionTranscript(targetId)
       .then((res) => {
@@ -814,6 +857,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setTranscriptTurns([]);
           setSessionQueue([]);
           setIsSessionBusy(false);
+          setSessionContextUsage(null);
           setSessionQuotaUsage(null);
         }
       });
@@ -1017,16 +1061,18 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   const handleSpinUpSession = async (req: SpinUpSessionRequest) => {
     const res = await apiClient.spinUpSession(req);
+    if (res.persona) {
+      selectedAgentNameRef.current = res.persona;
+      setSelectedAgentName(res.persona);
+    }
+    if (res.session_id) {
+      selectedSessionIdRef.current = res.session_id;
+      setSelectedSessionId(res.session_id);
+    }
     await Promise.all([
       refreshWireAndRoster(),
       refreshSessionsAndTranscript(res.session_id),
     ]);
-    if (res.persona) {
-      setSelectedAgentName(res.persona);
-    }
-    if (res.session_id) {
-      setSelectedSessionId(res.session_id);
-    }
     return res;
   };
 
@@ -1237,8 +1283,19 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         unreadByAgent={unreadByAgent}
         selectedAgentName={selectedAgent?.name_key ?? null}
         onSelectAgent={(nameKey) => {
+          const nextKey = nameKey.trim().toLowerCase();
+          if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
+            selectedAgentNameRef.current = nameKey;
+            selectedSessionIdRef.current = null;
+            setTranscriptTurns(backgroundTranscriptsRef.current[nextKey] ?? []);
+            setSessionQueue([]);
+            setIsSessionBusy(false);
+            setSessionContextUsage(null);
+            setSessionQuotaUsage(null);
+          }
           setSelectedAgentName(nameKey);
           setSelectedSessionId(null);
+          setMobileRosterOpen(false);
         }}
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         isOpen={mobileRosterOpen}
@@ -1250,7 +1307,17 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           selectedAgent={selectedAgent}
           sessions={sessions.length > 0 ? sessions : routes}
           selectedSessionId={activeSession?.id ?? null}
-          onSelectSession={setSelectedSessionId}
+          onSelectSession={(sessionId) => {
+            if (sessionId !== selectedSessionIdRef.current) {
+              selectedSessionIdRef.current = sessionId;
+              setTranscriptTurns([]);
+              setSessionQueue([]);
+              setIsSessionBusy(false);
+              setSessionContextUsage(null);
+              setSessionQuotaUsage(null);
+            }
+            setSelectedSessionId(sessionId);
+          }}
           activeTab={activeTab}
           onSelectTab={handleSelectTab}
           splitView={splitView}
@@ -1272,6 +1339,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
           onOpenMobileRoster={() => setMobileRosterOpen((prev) => !prev)}
+          mobileSidebarOpen={mobileRosterOpen}
         />
 
         <main

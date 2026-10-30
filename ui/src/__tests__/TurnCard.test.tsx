@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { TurnCard } from "../components/TurnCard";
+import { stripAgyUserRequestWrapper, TurnCard } from "../components/TurnCard";
 import type { TranscriptTurn } from "../types/api";
 
 function turn(partial: Partial<TranscriptTurn> & { index: number }): TranscriptTurn {
@@ -156,5 +156,144 @@ describe("TurnCard directed assistant highlight", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
     expect(within(card).getByText(/729: && !inner\.starts_with/)).toBeInTheDocument();
+  });
+
+  it("strips Antigravity <USER_REQUEST> and <ADDITIONAL_METADATA> wrappers from operator turns", () => {
+    const raw = [
+      "<USER_REQUEST>",
+      "I'm sorry, Ferris, I accidentally clicked the stop execution button. Please continue",
+      "</USER_REQUEST>",
+      "<ADDITIONAL_METADATA>",
+      "The current local time is: 2026-10-29T18:44:28Z.",
+      "</ADDITIONAL_METADATA>",
+    ].join("\n");
+
+    expect(stripAgyUserRequestWrapper(raw)).toBe(
+      "I'm sorry, Ferris, I accidentally clicked the stop execution button. Please continue",
+    );
+
+    render(
+      <TurnCard
+        turn={turn({
+          index: 7,
+          role: "user",
+          content: raw,
+        })}
+      />,
+    );
+
+    const card = screen.getByTestId("turn-card-7");
+    expect(within(card).getByText("Operator")).toBeInTheDocument();
+    expect(
+      within(card).getByText(
+        /I'm sorry, Ferris, I accidentally clicked the stop execution button\. Please continue/,
+      ),
+    ).toBeInTheDocument();
+    expect(within(card).queryByText(/USER_REQUEST/)).toBeNull();
+    expect(within(card).queryByText(/ADDITIONAL_METADATA/)).toBeNull();
+    expect(within(card).queryByText(/The current local time is/)).toBeNull();
+  });
+
+  it("classifies [Notice] and <EPHEMERAL_MESSAGE> user turns as collapsed System turns instead of Operator", () => {
+    render(
+      <>
+        <TurnCard
+          turn={turn({
+            index: 8,
+            role: "user",
+            content:
+              "[Notice] All your subagents and background tasks have been stopped due to user force cancellation.",
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 9,
+            role: "user",
+            content:
+              "<EPHEMERAL_MESSAGE>\nSubagent wakeup notification.\n</EPHEMERAL_MESSAGE>",
+          })}
+        />
+      </>,
+    );
+
+    const noticeCard = screen.getByTestId("turn-card-8");
+    expect(within(noticeCard).getByText("System")).toBeInTheDocument();
+    expect(within(noticeCard).queryByText("Operator")).toBeNull();
+    const noticeToggle = within(noticeCard).getByTestId("turn-system-output-toggle-8");
+    expect(noticeToggle).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(noticeToggle);
+    expect(
+      within(noticeCard).getByText(/All your subagents and background tasks have been stopped/),
+    ).toBeInTheDocument();
+
+    const ephemeralCard = screen.getByTestId("turn-card-9");
+    expect(within(ephemeralCard).getByText("System")).toBeInTheDocument();
+    expect(within(ephemeralCard).queryByText("Operator")).toBeNull();
+    const ephemeralToggle = within(ephemeralCard).getByTestId(
+      "turn-system-output-toggle-9",
+    );
+    fireEvent.click(ephemeralToggle);
+    expect(
+      within(ephemeralCard).getByText(/Subagent wakeup notification\./),
+    ).toBeInTheDocument();
+    expect(within(ephemeralCard).queryByText(/EPHEMERAL_MESSAGE/)).toBeNull();
+  });
+
+  it("preserves <USER_REQUEST> inside assistant or tool turns and classifies [Notice] wrapped in <USER_REQUEST> as System", () => {
+    const assistantCodeSnippet = [
+      "<USER_REQUEST>",
+      "diff --git a/ui/src/components/TurnCard.tsx b/ui/src/components/TurnCard.tsx",
+      "</USER_REQUEST>",
+    ].join("\n");
+
+    const wrappedNotice = [
+      "<USER_REQUEST>",
+      "[Notice] All your subagents and background tasks have been stopped due to user force cancellation.",
+      "</USER_REQUEST>",
+      "<ADDITIONAL_METADATA>",
+      "The current local time is: 2026-10-30T16:00:00Z.",
+      "</ADDITIONAL_METADATA>",
+    ].join("\n");
+
+    expect(
+      stripAgyUserRequestWrapper("Here is a snippet:\n<USER_REQUEST>\nhello\n</USER_REQUEST>"),
+    ).toBe("Here is a snippet:\n<USER_REQUEST>\nhello\n</USER_REQUEST>");
+
+    render(
+      <>
+        <TurnCard
+          agentDisplayName="Ferris"
+          turn={turn({
+            index: 10,
+            role: "assistant",
+            content: assistantCodeSnippet,
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 11,
+            role: "user",
+            content: wrappedNotice,
+          })}
+        />
+      </>,
+    );
+
+    const assistantCard = screen.getByTestId("turn-card-10");
+    expect(within(assistantCard).getByText("Ferris")).toBeInTheDocument();
+    expect(within(assistantCard).getByText(/<USER_REQUEST>/)).toBeInTheDocument();
+    expect(within(assistantCard).getByText(/<\/USER_REQUEST>/)).toBeInTheDocument();
+
+    const wrappedNoticeCard = screen.getByTestId("turn-card-11");
+    expect(within(wrappedNoticeCard).getByText("System")).toBeInTheDocument();
+    expect(within(wrappedNoticeCard).queryByText("Operator")).toBeNull();
+    const toggle = within(wrappedNoticeCard).getByTestId("turn-system-output-toggle-11");
+    fireEvent.click(toggle);
+    expect(
+      within(wrappedNoticeCard).getByText(
+        /All your subagents and background tasks have been stopped/,
+      ),
+    ).toBeInTheDocument();
+    expect(within(wrappedNoticeCard).queryByText(/USER_REQUEST/)).toBeNull();
   });
 });

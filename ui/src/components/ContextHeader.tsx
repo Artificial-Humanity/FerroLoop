@@ -26,6 +26,7 @@ export interface ContextHeaderProps {
   onOpenPairingModal: () => void;
   onLogout?: () => void;
   onOpenMobileRoster?: () => void;
+  mobileSidebarOpen?: boolean;
 }
 
 export const COCKPIT_TABS: Array<{ id: CockpitTab; label: string }> = [
@@ -58,6 +59,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
   onOpenPairingModal,
   onLogout,
   onOpenMobileRoster,
+  mobileSidebarOpen = false,
 }) => {
   const agentSessions = React.useMemo(() => {
     if (!selectedAgent) return sessions;
@@ -83,10 +85,11 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
         {onOpenMobileRoster && (
           <button
             type="button"
-            className="fd-btn"
+            className={`fd-btn fd-mobile-sidebar-toggle${mobileSidebarOpen ? " fd-btn-active" : ""}`}
             onClick={onOpenMobileRoster}
             aria-label="Toggle Agent Roster"
-            data-testid="mobile-roster-toggle"
+            aria-expanded={mobileSidebarOpen}
+            data-testid="mobile-sidebar-toggle-btn"
           >
             ☰ Roster
           </button>
@@ -156,7 +159,8 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
       <div
         role="tablist"
         aria-label="Cockpit Modes"
-        style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}
+        data-testid="cockpit-tab-bar"
+        className="fd-tab-bar"
       >
         {COCKPIT_TABS.map((tab) => {
           const isActive = activeTab === tab.id;

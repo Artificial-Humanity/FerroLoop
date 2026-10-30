@@ -127,10 +127,10 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
 
       await waitFor(() => {
         expect(onSetSessionModel).toHaveBeenCalledWith("gemini-3.1-flash");
+        expect(screen.getByTestId("compact-feedback")).toHaveTextContent(
+          "Model: gemini-3.1-flash",
+        );
       });
-      expect(screen.getByTestId("compact-feedback")).toHaveTextContent(
-        "Model: gemini-3.1-flash",
-      );
     });
   });
 
