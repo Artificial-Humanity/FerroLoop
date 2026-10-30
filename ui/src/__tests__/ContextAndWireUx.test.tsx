@@ -253,6 +253,7 @@ describe("Compact Context button", () => {
     );
 
     expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/Context:/);
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
     const btn = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
     expect(btn).toBeDisabled();
     expect(btn.title).toMatch(/50%/);
@@ -296,7 +297,8 @@ describe("Compact Context button", () => {
       />,
     );
 
-    expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/\(51%\)/);
+    expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/51%/);
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
     const btn = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
     expect(btn).not.toBeDisabled();
 
@@ -333,6 +335,7 @@ describe("Compact Context button", () => {
       />,
     );
 
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
     fireEvent.click(screen.getByTestId("compact-context-btn"));
 
     await waitFor(() => {

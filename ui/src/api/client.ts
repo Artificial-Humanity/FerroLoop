@@ -293,12 +293,16 @@ export class HubApiClient {
   public async setSessionModel(
     sessionId: string,
     model: string,
+    thinkingLevel?: string | null,
   ): Promise<SetSessionModelResponse> {
     return this.request<SetSessionModelResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/model`,
       {
         method: "POST",
-        body: JSON.stringify({ model }),
+        body: JSON.stringify({
+          model,
+          ...(thinkingLevel ? { thinking_level: thinkingLevel } : {}),
+        }),
       },
     );
   }
@@ -786,9 +790,17 @@ export async function interruptSession(
 export async function setSessionModel(
   sessionId: string,
   model: string,
+  thinkingLevelOrClient?: string | null | HubApiClient,
   client?: HubApiClient,
 ): Promise<SetSessionModelResponse> {
-  return (client ?? new HubApiClient()).setSessionModel(sessionId, model);
+  if (thinkingLevelOrClient instanceof HubApiClient) {
+    return thinkingLevelOrClient.setSessionModel(sessionId, model);
+  }
+  return (client ?? new HubApiClient()).setSessionModel(
+    sessionId,
+    model,
+    thinkingLevelOrClient,
+  );
 }
 
 export async function bulkSessionAction(

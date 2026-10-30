@@ -71,39 +71,61 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
     });
   });
 
-  describe("Record 48 — Per-Agent Model Selector", () => {
-    it("offers vendor-specific model options and preserves custom session.model", () => {
+  describe("Records 48 & 57 — Per-Agent Model & Thinking Level Selector in AgentSettingsModal", () => {
+    it("offers accurate ai-lab-0 vendor model options, respects availableModels, and preserves custom session.model", () => {
       expect(getVendorModelOptions("claude")).toEqual([
-        "claude-opus-4-7",
-        "claude-sonnet-4-6",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
         "claude-haiku-4-5",
       ]);
       expect(getVendorModelOptions("antigravity")).toEqual([
-        "gemini-3.1-pro",
-        "gemini-3.1-flash",
-        "claude-sonnet-4-6",
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "gpt-oss-120b",
       ]);
       expect(getVendorModelOptions("agy")).toEqual([
-        "gemini-3.1-pro",
-        "gemini-3.1-flash",
-        "claude-sonnet-4-6",
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "gpt-oss-120b",
       ]);
-      expect(getVendorModelOptions("codex")).toEqual(["gpt-5.4", "o3"]);
-      expect(getVendorModelOptions("grok")).toEqual(["grok-4.7", "grok-4.7-fast"]);
+      expect(getVendorModelOptions("codex")).toEqual([
+        "gpt-6.1-terra",
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
+      ]);
+      expect(getVendorModelOptions("grok")).toEqual([
+        "grok-4.7",
+        "grok-4.7-build-fast",
+        "grok-4.6",
+        "grok-4.5",
+      ]);
       expect(getVendorModelOptions("muse")).toEqual(["muse-spark"]);
       expect(getVendorModelOptions("claude", "claude-custom-preview")).toEqual([
         "claude-custom-preview",
-        "claude-opus-4-7",
-        "claude-sonnet-4-6",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
         "claude-haiku-4-5",
       ]);
+      expect(
+        getVendorModelOptions("codex", "gpt-6.1-terra", [
+          "gpt-6.1-terra",
+          "gpt-6.1-sol",
+        ]),
+      ).toEqual(["gpt-6.1-terra", "gpt-6.1-sol"]);
     });
 
-    it("renders session-model-select in ChatPane header and calls onSetSessionModel on change", async () => {
+    it("renders session-model-select and session-thinking-select inside AgentSettingsModal and calls onSetSessionModel on change", async () => {
       const onSetSessionModel = vi.fn().mockResolvedValue({
         session_id: "sess-felix-01",
         vendor: "antigravity",
-        model: "gemini-3.1-flash",
+        model: "gemini-3.8-flash",
+        thinking_level: "xhigh",
         switched: true,
         method: "slash_model",
       });
@@ -113,22 +135,45 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
           agentName="felix"
           agentDisplayName="Felix"
           adapter="antigravity"
-          model="gemini-3.1-pro"
+          model="gemini-4-argon"
+          thinkingLevel="high"
           sessionId="sess-felix-01"
           turns={[]}
           onSetSessionModel={onSetSessionModel}
         />,
       );
 
-      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
-      expect(select.value).toBe("gemini-3.1-pro");
+      // Active model badge is shown in the decluttered ChatPane top bar
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        "antigravity · gemini-4-argon (high)",
+      );
 
-      fireEvent.change(select, { target: { value: "gemini-3.1-flash" } });
+      // Open AgentSettingsModal via chat-agent-settings-btn
+      fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+      expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
+
+      const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+      const thinkingSelect = screen.getByTestId(
+        "session-thinking-select",
+      ) as HTMLSelectElement;
+      expect(select.value).toBe("gemini-4-argon");
+      expect(thinkingSelect.value).toBe("high");
+
+      fireEvent.change(select, { target: { value: "gemini-3.8-flash" } });
 
       await waitFor(() => {
-        expect(onSetSessionModel).toHaveBeenCalledWith("gemini-3.1-flash");
+        expect(onSetSessionModel).toHaveBeenCalledWith("gemini-3.8-flash", "high");
         expect(screen.getByTestId("compact-feedback")).toHaveTextContent(
-          "Model: gemini-3.1-flash",
+          "Model: gemini-3.8-flash (high)",
+        );
+      });
+
+      fireEvent.change(thinkingSelect, { target: { value: "low" } });
+
+      await waitFor(() => {
+        expect(onSetSessionModel).toHaveBeenCalledWith("gemini-3.8-flash", "low");
+        expect(screen.getByTestId("compact-feedback")).toHaveTextContent(
+          "Model: gemini-3.8-flash (low)",
         );
       });
     });
@@ -171,10 +216,10 @@ describe("Track 1 FerroDeck+ Operator Controls UI (Records 47, 48, 44, 30)", () 
 
       await waitFor(() => {
         expect(onBulkSessionAction).toHaveBeenCalledWith("reforge");
+        expect(screen.getByTestId("bulk-action-result")).toHaveTextContent(
+          "Completed Reforge All: 4 / 4 sessions succeeded.",
+        );
       });
-      expect(screen.getByTestId("bulk-action-result")).toHaveTextContent(
-        "Completed Reforge All: 4 / 4 sessions succeeded.",
-      );
     });
 
     it("opens SettingsModal from ContextHeader settings-modal-btn in App", async () => {

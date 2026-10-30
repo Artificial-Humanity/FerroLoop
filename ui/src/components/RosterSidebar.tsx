@@ -14,6 +14,7 @@ export interface RosterSidebarProps {
   unreadByAgent: Record<string, number>;
   selectedAgentName: string | null;
   onSelectAgent: (nameKey: string) => void;
+  onOpenAgentSettings?: (nameKey: string) => void;
   onOpenSpinUpModal?: () => void;
   isOpen?: boolean;
   onClose?: () => void;
@@ -66,6 +67,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   unreadByAgent,
   selectedAgentName,
   onSelectAgent,
+  onOpenAgentSettings,
   onOpenSpinUpModal,
   isOpen = false,
   onClose,
@@ -303,13 +305,21 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                         : "fd-dot fd-dot-dead";
 
                   return (
-                    <button
+                    <div
                       key={record.id || record.name_key}
-                      type="button"
+                      role="button"
+                      tabIndex={0}
                       data-testid={`agent-row-${key}`}
                       onClick={() => {
                         onSelectAgent(record.name_key);
                         onClose?.();
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onSelectAgent(record.name_key);
+                          onClose?.();
+                        }
                       }}
                       style={{
                         width: "100%",
@@ -346,20 +356,44 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                           </span>
                         </div>
 
-                        {unreadCount > 0 && (
-                          <span
-                            data-testid={`unread-badge-${key}`}
-                            className="fd-badge"
+                        <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                          {unreadCount > 0 && (
+                            <span
+                              data-testid={`unread-badge-${key}`}
+                              className="fd-badge"
+                              style={{
+                                backgroundColor: "var(--accent-primary)",
+                                color: "#0A0D12",
+                                borderColor: "var(--accent-primary)",
+                                fontWeight: 700,
+                              }}
+                            >
+                              {unreadCount}
+                            </span>
+                          )}
+                          <button
+                            type="button"
+                            className="fd-btn"
+                            data-testid={`agent-settings-btn-${key}`}
+                            title={`Settings for ${record.display_name}`}
+                            aria-label={`Settings for ${record.display_name}`}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              onSelectAgent(record.name_key);
+                              onOpenAgentSettings?.(record.name_key);
+                              onClose?.();
+                            }}
                             style={{
-                              backgroundColor: "var(--accent-primary)",
-                              color: "#0A0D12",
-                              borderColor: "var(--accent-primary)",
-                              fontWeight: 700,
+                              padding: "1px 5px",
+                              fontSize: "11px",
+                              minHeight: "20px",
+                              lineHeight: 1,
+                              color: "var(--text-muted)",
                             }}
                           >
-                            {unreadCount}
-                          </span>
-                        )}
+                            ⚙
+                          </button>
+                        </div>
                       </div>
 
                       <div
@@ -383,7 +417,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
                           </span>
                         )}
                       </div>
-                    </button>
+                    </div>
                   );
                 })}
               </div>

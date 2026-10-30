@@ -894,7 +894,8 @@ describe("ChatPane Clear | Reforge modal and ephemeral ? help", () => {
         />,
       );
 
-      const clearBtn = screen.getByTestId("clear-context-btn");
+      fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+      const clearBtn = screen.getByTestId("open-clear-reforge-modal-btn");
       expect(clearBtn).not.toBeDisabled();
       fireEvent.click(clearBtn);
 
@@ -960,7 +961,8 @@ describe("ChatPane Clear | Reforge modal and ephemeral ? help", () => {
     );
 
     // 1. Clear mode
-    fireEvent.click(screen.getByTestId("clear-context-btn"));
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
     fireEvent.click(screen.getByTestId("clear-modal-clear-btn"));
 
     await waitFor(() => {
@@ -972,7 +974,8 @@ describe("ChatPane Clear | Reforge modal and ephemeral ? help", () => {
     expect(await screen.findByTestId("compact-feedback")).toHaveTextContent("Cleared context");
 
     // 2. Reforge mode
-    fireEvent.click(screen.getByTestId("clear-context-btn"));
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    fireEvent.click(screen.getByTestId("open-clear-reforge-modal-btn"));
     fireEvent.click(screen.getByTestId("clear-modal-reforge-btn"));
 
     await waitFor(() => {
@@ -1001,7 +1004,8 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
         />,
       );
 
-      const decommissionBtn = screen.getByTestId("decommission-session-btn");
+      fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+      const decommissionBtn = screen.getByTestId("open-decommission-modal-btn");
       expect(decommissionBtn).not.toBeDisabled();
       fireEvent.click(decommissionBtn);
 
@@ -1053,7 +1057,8 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
       />,
     );
 
-    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
     fireEvent.click(screen.getByTestId("decommission-prepare-btn"));
 
     await waitFor(() => {
@@ -1064,7 +1069,8 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
       "Prepared decommission",
     );
 
-    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
     fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
 
     await waitFor(() => {
@@ -1145,7 +1151,8 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
 
     transcriptCalls.length = 0;
 
-    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
     fireEvent.click(screen.getByTestId("decommission-prepare-btn"));
 
     await waitFor(() => {
@@ -1157,7 +1164,8 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
 
     transcriptCalls.length = 0;
 
-    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
     fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
 
     await waitFor(() => {
@@ -1170,5 +1178,77 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
       expect(screen.queryByText("Standalone transcript turn")).toBeNull();
     });
     expect(transcriptCalls).toEqual([]);
+  });
+});
+
+describe("Resizable chat composer (Record 57)", () => {
+  it("renders composer-resize-handle and resizes the textarea height within 72px..420px on mouse drag", () => {
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={[]}
+      />,
+    );
+
+    const handle = screen.getByTestId("composer-resize-handle");
+    const textarea = screen.getByLabelText("Message") as HTMLTextAreaElement;
+
+    expect(handle).toBeInTheDocument();
+    expect(textarea.style.height).toBe("80px");
+
+    // Drag upward by 60px (clientY: 400 -> 340 => 80 + 60 = 140px)
+    fireEvent.mouseDown(handle, { clientY: 400 });
+    fireEvent.mouseMove(window, { clientY: 340 });
+    fireEvent.mouseUp(window);
+    expect(textarea.style.height).toBe("140px");
+
+    // Drag upward beyond max (clientY: 400 -> 0 => clamped at 420px)
+    fireEvent.mouseDown(handle, { clientY: 400 });
+    fireEvent.mouseMove(window, { clientY: 0 });
+    fireEvent.mouseUp(window);
+    expect(textarea.style.height).toBe("420px");
+
+    // Drag downward beyond min (clientY: 100 -> 600 => clamped at 72px)
+    fireEvent.mouseDown(handle, { clientY: 100 });
+    fireEvent.mouseMove(window, { clientY: 600 });
+    fireEvent.mouseUp(window);
+    expect(textarea.style.height).toBe("72px");
+  });
+
+  it("resets selectedModel to opts[0] when switching from a Claude agent to an Antigravity agent with model={null}", () => {
+    const { rerender } = render(
+      <ChatPane
+        agentName="felicity"
+        agentDisplayName="Felicity"
+        adapter="claude"
+        model={null}
+        turns={[]}
+      />,
+    );
+
+    expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+      "claude · claude-opus-5-5 (high)",
+    );
+
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        model={null}
+        turns={[]}
+      />,
+    );
+
+    expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+      "antigravity · gemini-4-argon (high)",
+    );
+
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+    expect(select.value).toBe("gemini-4-argon");
   });
 });

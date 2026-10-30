@@ -269,6 +269,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
   const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
+  const [agentSettingsOpen, setAgentSettingsOpen] = useState<boolean>(false);
   const [nodes, setNodes] = useState<EnrolledNode[]>([]);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
 
@@ -1109,24 +1110,45 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     return res;
   };
 
-  const handleSetSessionModel = async (model: string) => {
+  const handleSetSessionModel = async (
+    model: string,
+    thinkingLevel?: string | null,
+  ) => {
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) {
       throw new Error("No active session selected to update model.");
     }
-    const res = await apiClient.setSessionModel(targetId, model);
+    const res = await apiClient.setSessionModel(targetId, model, thinkingLevel);
     const matchesTarget = (sess: DiscoveredSessionSummary) =>
       sess.id === targetId ||
       (sess.persona ?? "").toLowerCase() === targetId.toLowerCase();
     const updatedModel = res.model || model;
+    const updatedThinking =
+      res.thinking_level !== undefined ? res.thinking_level : thinkingLevel;
     setSessions((prev) =>
       prev.map((sess) =>
-        matchesTarget(sess) ? { ...sess, model: updatedModel } : sess,
+        matchesTarget(sess)
+          ? {
+              ...sess,
+              model: updatedModel,
+              ...(updatedThinking !== undefined
+                ? { thinking_level: updatedThinking }
+                : {}),
+            }
+          : sess,
       ),
     );
     setRoutes((prev) =>
       prev.map((sess) =>
-        matchesTarget(sess) ? { ...sess, model: updatedModel } : sess,
+        matchesTarget(sess)
+          ? {
+              ...sess,
+              model: updatedModel,
+              ...(updatedThinking !== undefined
+                ? { thinking_level: updatedThinking }
+                : {}),
+            }
+          : sess,
       ),
     );
     await refreshSessionsAndTranscript(targetId);
@@ -1241,8 +1263,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           <ChatPane
             agentName={selectedAgent?.name_key ?? null}
             agentDisplayName={selectedAgent?.display_name ?? null}
+            agentRole={selectedAgent?.role ?? null}
+            agentProject={selectedAgent?.project ?? null}
             adapter={activeSession?.adapter ?? null}
             model={activeSession?.model ?? null}
+            thinkingLevel={activeSession?.thinking_level ?? null}
+            availableModels={activeSession?.available_models ?? null}
             sessionId={activeSession?.id ?? null}
             turns={transcriptTurns}
             contextUsage={sessionContextUsage}
@@ -1251,6 +1277,13 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             queue={sessionQueue}
             loading={loading}
             wsConnected={wsConnected}
+            agentSettingsOpen={agentSettingsOpen}
+            onOpenAgentSettings={() => setAgentSettingsOpen(true)}
+            onCloseAgentSettings={() => setAgentSettingsOpen(false)}
+            onToggleArtifacts={() => {
+              setSplitView((prev) => !prev || secondaryTab !== "artifacts");
+              setSecondaryTab("artifacts");
+            }}
             onRefresh={() => void refreshSessionsAndTranscript()}
             onSendPrompt={handleSendPrompt}
             onSendQueuedNow={handleSendQueuedNow}
@@ -1296,6 +1329,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setSelectedAgentName(nameKey);
           setSelectedSessionId(null);
           setMobileRosterOpen(false);
+        }}
+        onOpenAgentSettings={() => {
+          if (!splitView && activeTab !== "chat") {
+            setActiveTab("chat");
+          }
+          setAgentSettingsOpen(true);
         }}
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         isOpen={mobileRosterOpen}
@@ -1351,8 +1390,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
               <ChatPane
                 agentName={selectedAgent?.name_key ?? null}
                 agentDisplayName={selectedAgent?.display_name ?? null}
+                agentRole={selectedAgent?.role ?? null}
+                agentProject={selectedAgent?.project ?? null}
                 adapter={activeSession?.adapter ?? null}
                 model={activeSession?.model ?? null}
+                thinkingLevel={activeSession?.thinking_level ?? null}
+                availableModels={activeSession?.available_models ?? null}
                 sessionId={activeSession?.id ?? null}
                 turns={transcriptTurns}
                 contextUsage={sessionContextUsage}
@@ -1361,6 +1404,13 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 queue={sessionQueue}
                 loading={loading}
                 wsConnected={wsConnected}
+                agentSettingsOpen={agentSettingsOpen}
+                onOpenAgentSettings={() => setAgentSettingsOpen(true)}
+                onCloseAgentSettings={() => setAgentSettingsOpen(false)}
+                onToggleArtifacts={() => {
+                  setSplitView((prev) => !prev || secondaryTab !== "artifacts");
+                  setSecondaryTab("artifacts");
+                }}
                 onRefresh={() => void refreshSessionsAndTranscript()}
                 onSendPrompt={handleSendPrompt}
                 onSendQueuedNow={handleSendQueuedNow}
