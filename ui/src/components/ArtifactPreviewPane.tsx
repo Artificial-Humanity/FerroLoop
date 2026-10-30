@@ -123,6 +123,8 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   const [viewMode, setViewMode] = useState<"rendered" | "source">("rendered");
   const [zoom, setZoom] = useState<ZoomPreset>("fit");
   const [artifactFilter, setArtifactFilter] = useState<ArtifactFilterMode>("user-docs");
+  const [pruning, setPruning] = useState<boolean>(false);
+  const [pruneStatus, setPruneStatus] = useState<string | null>(null);
 
   useEffect(() => {
     if (activePath !== undefined && activePath !== null) {
@@ -150,6 +152,17 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     [onSelectPath],
   );
 
+  const refreshSessionArtifacts = useCallback(async () => {
+    try {
+      const res = await apiClient.listSessionArtifacts(sessionId);
+      if (Array.isArray(res?.artifacts)) {
+        setSessionArtifacts(res.artifacts);
+      }
+    } catch {
+      // Ignore optional discovery errors
+    }
+  }, [apiClient, sessionId]);
+
   // Discover session artifacts from backend when sessionId changes
   useEffect(() => {
     let cancelled = false;
@@ -167,6 +180,41 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
       cancelled = true;
     };
   }, [apiClient, sessionId]);
+
+  const handlePruneDeadPaths = async () => {
+    if (pruning) return;
+    setPruning(true);
+    setPruneStatus(null);
+    try {
+      const res = await apiClient.pruneArtifacts(
+        sessionId ? { session_id: sessionId } : {},
+      );
+      const count =
+        res?.pruned_count ??
+        res?.pruned ??
+        (Array.isArray(res?.pruned_paths) ? res.pruned_paths.length : 0);
+      setPruneStatus(
+        `Pruned ${count} dead ${count === 1 ? "path" : "paths"}`,
+      );
+      await refreshSessionArtifacts();
+    } catch (err) {
+      setPruneStatus(
+        err instanceof Error ? err.message : "Failed to prune dead paths",
+      );
+    } finally {
+      setPruning(false);
+    }
+  };
+
+  const archivedItems = useMemo(
+    () => sessionArtifacts.filter((item) => item.status === "archived"),
+    [sessionArtifacts],
+  );
+
+  const archivedPathSet = useMemo(
+    () => new Set(archivedItems.map((item) => item.path.trim())),
+    [archivedItems],
+  );
 
   const turnPaths = useMemo(() => discoverArtifactsFromTurns(turns), [turns]);
 
@@ -517,6 +565,27 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             <option value="all">All Files</option>
           </select>
 
+          <button
+            type="button"
+            data-testid="prune-artifacts-btn"
+            className="fd-btn"
+            disabled={pruning}
+            onClick={() => void handlePruneDeadPaths()}
+            title="Prune dead worktree artifact references and archive surviving copies"
+          >
+            {pruning ? "Pruning..." : "Prune Dead Paths"}
+          </button>
+
+          {pruneStatus && (
+            <span
+              role="status"
+              data-testid="prune-artifacts-status"
+              className="fd-badge fd-mono"
+            >
+              {pruneStatus}
+            </span>
+          )}
+
           {quickSwitchPaths.length > 0 && (
             <select
               aria-label="Recent and discovered session artifacts"
@@ -541,15 +610,56 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
               </option>
               {quickSwitchPaths.map((p) => {
                 const label = p.split("/").pop() || p;
+                const isArchived = archivedPathSet.has(p);
                 return (
                   <option key={p} value={p}>
-                    {label} — {p}
+                    {label}
+                    {isArchived ? " [Archived]" : ""} — {p}
                   </option>
                 );
               })}
             </select>
           )}
         </form>
+
+        {archivedItems.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              flexWrap: "wrap",
+            }}
+          >
+            {archivedItems.map((item) => (
+              <button
+                key={item.path}
+                type="button"
+                className={`fd-btn${selectedPath === item.path ? " fd-btn-active" : ""}`}
+                onClick={() => handleSelectPath(item.path)}
+                title={
+                  item.original_path
+                    ? `Preserved from removed worktree (${item.original_path})`
+                    : `Preserved artifact (${item.path})`
+                }
+                style={{ fontSize: "11px", padding: "3px 8px" }}
+              >
+                <span className="fd-mono">{item.name}</span>
+                <span
+                  className="fd-badge"
+                  data-testid="artifact-archived-badge"
+                  style={{
+                    borderColor: "var(--border-accent)",
+                    backgroundColor: "var(--accent-subtle)",
+                    color: "var(--accent-hover)",
+                  }}
+                >
+                  Archived
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Main Preview Body */}

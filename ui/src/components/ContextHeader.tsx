@@ -25,6 +25,7 @@ export interface ContextHeaderProps {
   onlineNodesCount?: number;
   onOpenNodesModal?: () => void;
   onOpenSettingsModal?: () => void;
+  onOpenHelpModal?: (topic?: CockpitTab) => void;
   onOpenAgentSettings?: () => void;
   onOpenSpinUpModal?: () => void;
   onOpenPairingModal: () => void;
@@ -94,6 +95,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
   onlineNodesCount = 0,
   onOpenNodesModal,
   onOpenSettingsModal,
+  onOpenHelpModal,
   onOpenAgentSettings,
   onOpenSpinUpModal,
   onOpenPairingModal,
@@ -360,6 +362,17 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
                 Settings
               </button>
             )}
+
+            <button
+              type="button"
+              data-testid="context-help-btn"
+              aria-label="Open Contextual Help"
+              title="Contextual Help for current view"
+              className="fd-btn fd-help-icon-btn"
+              onClick={() => onOpenHelpModal?.(activeTab)}
+            >
+              ?
+            </button>
 
             <button
               type="button"
