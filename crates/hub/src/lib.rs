@@ -6,6 +6,7 @@ pub mod api;
 pub mod auth;
 mod direct_quota;
 pub mod discovery;
+pub mod lifecycle;
 pub mod nodes;
 pub mod terminal;
 pub mod ws;
@@ -2234,6 +2235,851 @@ mod tests {
             assert_eq!(value["kind"], "operator_prompt");
             assert_eq!(value["body"], "/clear");
         }
+    }
+
+    fn authed(method: &str, path: &str, token: &str, body: &Value) -> HttpRequest {
+        HttpRequest::new(method, path)
+            .with_header("Authorization", format!("Bearer {token}"))
+            .with_json_body(body)
+    }
+
+    fn spin_up_body(persona: &str) -> Value {
+        json!({
+            "persona": persona,
+            "project": "FerroLoop",
+            "role": "assistant",
+            "vendor": "claude",
+        })
+    }
+
+    fn spin_up(state: &HubState, body: &Value) -> HttpResponse {
+        handle_http_request(
+            state,
+            &authed("POST", "/api/v1/sessions/spin-up", "owner-tok-secret", body),
+        )
+    }
+
+    #[test]
+    fn spin_up_validates_registers_agent_and_persists_hosted_record() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let body = spin_up_body("felicity");
+
+        let unauth = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/spin-up").with_json_body(&body),
+        );
+        assert_eq!(unauth.status, 401);
+
+        let mut bad_cases: Vec<(&str, Value)> = Vec::new();
+        for (field, value) in [
+            ("persona", json!("")),
+            ("persona", json!("Felicity")),
+            ("persona", json!("fel icity")),
+            ("project", json!("  ")),
+            ("role", json!("owner")),
+            ("role", json!("")),
+            ("vendor", json!("gemini")),
+            ("vendor", json!("")),
+            ("node_id", json!("bad node")),
+        ] {
+            let mut bad = body.clone();
+            bad[field] = value;
+            bad_cases.push((field, bad));
+        }
+        for (field, bad) in bad_cases {
+            let resp = spin_up(&state, &bad);
+            assert_eq!(resp.status, 400, "{field}: {bad}");
+            assert!(
+                resp.json_value().unwrap()["error"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(field),
+                "{field}"
+            );
+        }
+        let not_json = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/spin-up")
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(not_json.status, 400);
+        // Nothing from the rejected requests reached the registry or the record list.
+        assert!(
+            state
+                .open_store()
+                .unwrap()
+                .list_agents(None, true)
+                .unwrap()
+                .is_empty()
+        );
+
+        let ok = spin_up(&state, &body);
+        assert_eq!(ok.status, 200, "{}", String::from_utf8_lossy(&ok.body));
+        let out = ok.json_value().unwrap();
+        assert_eq!(out["session_id"], "claude:felicity");
+        assert_eq!(out["persona"], "felicity");
+        assert_eq!(out["project"], "FerroLoop");
+        assert_eq!(out["role"], "assistant");
+        assert_eq!(out["vendor"], "claude");
+        assert!(out["model"].is_null());
+        assert_eq!(out["node_id"], "ai-lab-0");
+        assert_eq!(out["hosted"], true);
+        assert_eq!(out["status"], "running");
+        assert_eq!(out["tmux_target"], "Felicity:claude");
+        // No live route exists, so nothing took the hydration prompt.
+        assert_eq!(out["hydration_dispatched"], false);
+        assert!(out["prompt"].as_str().unwrap().starts_with(
+            "Take the name of Felicity and take up residence in FerroLoop/ as the assistant."
+        ));
+
+        {
+            let store = state.open_store().unwrap();
+            let agent = store.agent_by_name("felicity").unwrap().unwrap();
+            assert_eq!(agent.status, AgentStatus::Active);
+            assert_eq!(agent.role, AgentRole::Assistant);
+            assert_eq!(agent.project, "ferroloop");
+            assert!(store.get_area("ferroloop").unwrap().is_some());
+        }
+
+        // A Peer may spin up too (same gate as the session clear endpoint); the override fields stick.
+        let peer = handle_http_request(
+            &state,
+            &authed(
+                "POST",
+                "/api/v1/sessions/spin-up",
+                "peer-tok-secret",
+                &json!({
+                    "persona": "ada-2", "project": "FerroLoop", "role": "ui-developer",
+                    "vendor": "muse", "model": "muse-spark", "node_id": "ai-lab-1",
+                    "hosted": false, "cwd": tmp.path().display().to_string(),
+                }),
+            ),
+        );
+        assert_eq!(peer.status, 200, "{}", String::from_utf8_lossy(&peer.body));
+        let peer_out = peer.json_value().unwrap();
+        assert_eq!(peer_out["session_id"], "muse:ada-2");
+        assert_eq!(peer_out["model"], "muse-spark");
+        assert_eq!(peer_out["node_id"], "ai-lab-1");
+        assert_eq!(peer_out["hosted"], false);
+
+        let listed = handle_http_request(
+            &state,
+            &authed(
+                "GET",
+                "/api/v1/hosted-sessions",
+                "peer-tok-secret",
+                &json!({}),
+            ),
+        )
+        .json_value()
+        .unwrap();
+        let rec = &listed["sessions"][1];
+        assert_eq!(rec["session_id"], "muse:ada-2");
+        assert_eq!(rec["role"], "ui-developer");
+        assert_eq!(rec["status"], "running");
+        assert_eq!(rec["restart_policy"], "on-failure");
+        assert_eq!(rec["restart_count"], 0);
+        assert_eq!(rec["tmux_target"], "Ada-2:muse");
+        assert_eq!(rec["hydration_dispatched"], false);
+        assert!(rec["decommission_prepared_at_ms"].is_null());
+        assert!(rec["created_at_ms"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn decommission_prepare_then_teardown_cleans_every_trace() {
+        use fl_core::agent::AgentStatus;
+        use fl_core::store::AgentRegistry;
+        use fl_wire::identity::RouteTable;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("felicity")).status, 200);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let decommission = |token: Option<&str>, id: &str, body: Value| {
+            let req = HttpRequest::new("POST", format!("/api/v1/sessions/{id}/decommission"))
+                .with_json_body(&body);
+            let req = match token {
+                Some(t) => req.with_header("Authorization", format!("Bearer {t}")),
+                None => req,
+            };
+            handle_http_request(&state, &req)
+        };
+
+        assert_eq!(
+            decommission(None, "claude:felicity", json!({ "mode": "prepare" })).status,
+            401
+        );
+        for bad in [json!({ "mode": "wipe" }), json!({ "mode": "" }), json!({})] {
+            let resp = decommission(Some("owner-tok-secret"), "claude:felicity", bad);
+            assert_eq!(resp.status, 400);
+        }
+        // Rejected requests changed nothing.
+        let store_status = |name: &str| {
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name(name)
+                .unwrap()
+                .unwrap()
+                .status
+        };
+        assert_eq!(store_status("felicity"), AgentStatus::Active);
+
+        // Prepare with a live route: the handshake is delivered to it, not queued.
+        let socket = tmp.path().join("felicity.sock");
+        install_webhook_route(tmp.path(), "felicity", &socket);
+        let lines = collect_webhook_lines(socket, 1);
+        let prepared = decommission(
+            Some("owner-tok-secret"),
+            "claude%3Afelicity",
+            json!({ "mode": "prepare" }),
+        );
+        assert_eq!(
+            prepared.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&prepared.body)
+        );
+        let out = prepared.json_value().unwrap();
+        assert_eq!(out["session_id"], "claude:felicity");
+        assert_eq!(out["persona"], "felicity");
+        assert_eq!(out["mode"], "prepare");
+        assert_eq!(out["status"], "decommissioning");
+        assert_eq!(out["handshake_dispatched"], true);
+        assert_eq!(out["unregistered"], false);
+        assert_eq!(out["runtime_stopped"], false);
+        let prompt = out["prompt"].as_str().unwrap();
+        assert!(
+            prompt.contains("Notes/FerroLoop/STATE.md") && prompt.contains("agent-msg read --ack")
+        );
+        let delivered: Value = serde_json::from_str(&lines.join().unwrap()[0]).unwrap();
+        assert_eq!(delivered["kind"], "operator_prompt");
+        assert_eq!(delivered["body"], prompt);
+        assert!(state.session_queue("claude:felicity").is_empty());
+        assert_eq!(store_status("felicity"), AgentStatus::Active);
+
+        let record = |id: &str| {
+            let listed = handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap();
+            listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["session_id"] == id)
+                .cloned()
+                .unwrap()
+        };
+        let rec = record("claude:felicity");
+        assert_eq!(rec["status"], "decommissioning");
+        assert!(rec["decommission_prepared_at_ms"].as_u64().unwrap() > 0);
+
+        // Prepare without a route falls back to the session prompt queue.
+        let queued = decommission(
+            Some("peer-tok-secret"),
+            "claude:ada",
+            json!({ "mode": "prepare" }),
+        )
+        .json_value()
+        .unwrap();
+        assert_eq!(queued["handshake_dispatched"], false);
+        assert_eq!(state.session_queue("claude:ada").len(), 1);
+        assert_eq!(
+            state.session_queue("claude:ada")[0].prompt,
+            queued["prompt"].as_str().unwrap()
+        );
+
+        // Teardown: queue cleared, route gone, agent retired, record decommissioned.
+        state.enqueue_session_prompt(
+            "claude:felicity",
+            Some("felicity".into()),
+            "stale".into(),
+            "stale".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        state.enqueue_session_prompt(
+            "felicity",
+            Some("felicity".into()),
+            "stale too".into(),
+            "stale too".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        let torn = decommission(
+            Some("owner-tok-secret"),
+            "claude:felicity",
+            json!({ "mode": "teardown" }),
+        );
+        assert_eq!(torn.status, 200, "{}", String::from_utf8_lossy(&torn.body));
+        let out = torn.json_value().unwrap();
+        assert_eq!(out["session_id"], "claude:felicity");
+        assert_eq!(out["mode"], "teardown");
+        assert_eq!(out["status"], "decommissioned");
+        assert_eq!(out["handshake_dispatched"], false);
+        assert_eq!(out["unregistered"], true);
+        assert_eq!(out["runtime_stopped"], true);
+        assert!(out["prompt"].is_null());
+
+        assert!(state.session_queue("claude:felicity").is_empty());
+        assert!(state.session_queue("felicity").is_empty());
+        let routes_path = tmp.path().join(".cache/agent-bus/routes.json");
+        assert!(
+            RouteTable::load(Some(&routes_path))
+                .get("felicity")
+                .is_none()
+        );
+        assert_eq!(store_status("felicity"), AgentStatus::Retired);
+        let rec = record("claude:felicity");
+        assert_eq!(rec["status"], "decommissioned");
+        assert!(
+            rec["updated_at_ms"].as_u64().unwrap()
+                >= rec["decommission_prepared_at_ms"].as_u64().unwrap()
+        );
+        // The other session is untouched.
+        assert_eq!(store_status("ada"), AgentStatus::Active);
+        assert_eq!(record("claude:ada")["status"], "decommissioning");
+        assert_eq!(state.session_queue("claude:ada").len(), 1);
+    }
+
+    #[test]
+    fn decommission_of_an_unknown_session_prepare_404_teardown_ok() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let call = |mode: &str| {
+            handle_http_request(
+                &state,
+                &authed(
+                    "POST",
+                    "/api/v1/sessions/ghost/decommission",
+                    "owner-tok-secret",
+                    &json!({ "mode": mode }),
+                ),
+            )
+        };
+        assert_eq!(call("prepare").status, 404);
+        let torn = call("teardown");
+        assert_eq!(torn.status, 200);
+        assert_eq!(torn.json_value().unwrap()["session_id"], "ghost");
+    }
+
+    fn register_resident(
+        state: &HubState,
+        persona: &str,
+        role: fl_core::agent::AgentRole,
+        project: &str,
+    ) {
+        use fl_core::agent::RegisterAgentArgs;
+        use fl_core::store::AgentRegistry;
+        state
+            .open_store()
+            .unwrap()
+            .register_agent(RegisterAgentArgs {
+                display_name: persona[..1].to_ascii_uppercase() + &persona[1..],
+                email: Some(format!("{persona}@example.org")),
+                project: project.into(),
+                role,
+                extra_areas: vec!["notes".into()],
+                create_area: true,
+                replace: false,
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+    }
+
+    fn decommission_as(state: &HubState, token: &str, id: &str, mode: &str) -> HttpResponse {
+        handle_http_request(
+            state,
+            &authed(
+                "POST",
+                &format!("/api/v1/sessions/{id}/decommission"),
+                token,
+                &json!({ "mode": mode }),
+            ),
+        )
+    }
+
+    #[test]
+    fn spin_up_never_re_homes_a_resident_but_keeps_its_email_on_a_repeat() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        register_resident(&state, "jarvis", AgentRole::LabManager, "ferroloop");
+        register_resident(&state, "ada", AgentRole::Assistant, "ferroloop");
+        let agent = |name: &str| {
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name(name)
+                .unwrap()
+                .unwrap()
+        };
+        let jarvis = agent("jarvis");
+
+        // Nobody can spin up a resident's persona in another role or project: the Owner gets the
+        // 409 (a Peer is refused earlier, with 403; see the peer_spin_up_* test).
+        for (role, project) in [("assistant", "FerroLoop"), ("lab-manager", "Elsewhere")] {
+            let resp = handle_http_request(
+                &state,
+                &authed(
+                    "POST",
+                    "/api/v1/sessions/spin-up",
+                    "owner-tok-secret",
+                    &json!({
+                        "persona": "jarvis", "project": project, "role": role, "vendor": "claude",
+                    }),
+                ),
+            );
+            assert_eq!(resp.status, 409, "{role} {project}");
+        }
+        assert_eq!(agent("jarvis"), jarvis);
+        assert_eq!(agent("jarvis").status, AgentStatus::Active);
+        let listed = handle_http_request(
+            &state,
+            &authed(
+                "GET",
+                "/api/v1/hosted-sessions",
+                "owner-tok-secret",
+                &json!({}),
+            ),
+        )
+        .json_value()
+        .unwrap();
+        assert!(listed["sessions"].as_array().unwrap().is_empty());
+
+        // The same project and role is an idempotent re-spin that keeps email and extra areas.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let ada = agent("ada");
+        assert_eq!(ada.email, "ada@example.org");
+        assert_eq!(ada.extra_areas, ["notes"]);
+    }
+
+    #[test]
+    fn peer_spin_up_of_an_unmanaged_agent_is_403_and_cannot_unlock_teardown() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        register_resident(&state, "jarvis", AgentRole::LabManager, "ferroloop");
+        let jarvis = state
+            .open_store()
+            .unwrap()
+            .agent_by_name("jarvis")
+            .unwrap()
+            .unwrap();
+        let hosted_count = || {
+            handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let body = json!({
+            "persona": "jarvis", "project": "ferroloop", "role": "lab-manager", "vendor": "claude",
+        });
+        let spin_up_as = |token: &str| {
+            handle_http_request(
+                &state,
+                &authed("POST", "/api/v1/sessions/spin-up", token, &body),
+            )
+        };
+
+        let resp = spin_up_as("peer-tok-secret");
+        assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(hosted_count(), 0);
+
+        // The refused spin-up did not make it hosted, so the Peer still cannot retire it.
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", mode);
+            assert_eq!(
+                resp.status,
+                403,
+                "{mode}: {}",
+                String::from_utf8_lossy(&resp.body)
+            );
+        }
+        assert_eq!(hosted_count(), 0);
+        let after = state
+            .open_store()
+            .unwrap()
+            .agent_by_name("jarvis")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, jarvis);
+        assert_eq!(after.status, AgentStatus::Active);
+
+        // The Owner may host it; email and extra areas survive.
+        let resp = spin_up_as("owner-tok-secret");
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(hosted_count(), 1);
+        let hosted = state
+            .open_store()
+            .unwrap()
+            .agent_by_name("jarvis")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hosted.email, "jarvis@example.org");
+        assert_eq!(hosted.extra_areas, ["notes"]);
+    }
+
+    #[test]
+    fn peer_cannot_reach_a_reregistered_agent_through_its_stale_decommissioned_record() {
+        use fl_core::agent::{AgentRole, AgentStatus, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let torn = decommission_as(&state, "owner-tok-secret", "claude%3Aada", "teardown");
+        assert_eq!(torn.status, 200, "{}", String::from_utf8_lossy(&torn.body));
+        // The resident restarts and registers itself again, outside the lifecycle.
+        state
+            .open_store()
+            .unwrap()
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: Some("ada@example.org".into()),
+                project: "FerroLoop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: Vec::new(),
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "ada".into(),
+            })
+            .unwrap();
+        let agent = || {
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name("ada")
+                .unwrap()
+                .unwrap()
+        };
+        let hosted = || {
+            handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap()["sessions"]
+                .clone()
+        };
+        let agent_before = agent();
+        let hosted_before = hosted();
+        assert_eq!(agent_before.status, AgentStatus::Active);
+        assert_eq!(hosted_before[0]["status"], "decommissioned");
+
+        let resp = handle_http_request(
+            &state,
+            &authed(
+                "POST",
+                "/api/v1/sessions/spin-up",
+                "peer-tok-secret",
+                &spin_up_body("ada"),
+            ),
+        );
+        assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "peer-tok-secret", "claude%3Aada", mode);
+            assert_eq!(
+                resp.status,
+                403,
+                "{mode}: {}",
+                String::from_utf8_lossy(&resp.body)
+            );
+        }
+        assert_eq!(agent(), agent_before);
+        assert_eq!(hosted(), hosted_before);
+
+        // The Owner may still spin it up again.
+        let resp = spin_up(&state, &spin_up_body("ada"));
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(hosted()[0]["status"], "running");
+    }
+
+    #[test]
+    fn peer_teardown_needs_a_hosted_record_and_malformed_ids_are_400_without_side_effects() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        register_resident(&state, "jarvis", AgentRole::LabManager, "ferroloop");
+        state.enqueue_session_prompt(
+            "jarvis",
+            Some("jarvis".into()),
+            "queued".into(),
+            "queued".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        let socket = tmp.path().join("jarvis.sock");
+        install_webhook_route(tmp.path(), "jarvis", &socket);
+        let routes_path = tmp.path().join(".cache/agent-bus/routes.json");
+        let jarvis_is_untouched = || {
+            assert_eq!(state.session_queue("jarvis").len(), 1);
+            assert!(
+                fl_wire::identity::RouteTable::load(Some(&routes_path))
+                    .get("jarvis")
+                    .is_some()
+            );
+            let store = state.open_store().unwrap();
+            assert_eq!(
+                store.agent_by_name("jarvis").unwrap().unwrap().status,
+                AgentStatus::Active
+            );
+            drop(store);
+            let listed = handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap();
+            assert!(listed["sessions"].as_array().unwrap().is_empty());
+        };
+
+        // A Peer cannot adopt-and-retire a registered agent through an unmanaged id.
+        let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", "teardown");
+        assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
+        jarvis_is_untouched();
+
+        // Malformed persona ids are 400 for both phases, before any side effect.
+        state.enqueue_session_prompt(
+            "claude:Foo Bar",
+            None,
+            "queued".into(),
+            "queued".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "owner-tok-secret", "claude%3AFoo%20Bar", mode);
+            assert_eq!(resp.status, 400, "{mode}");
+        }
+        assert_eq!(state.session_queue("claude:Foo Bar").len(), 1);
+        jarvis_is_untouched();
+
+        // A Peer may tear down a hosted session; the Owner may adopt an unmanaged one.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        assert_eq!(
+            decommission_as(&state, "peer-tok-secret", "claude:ada", "teardown").status,
+            200
+        );
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:jarvis", "teardown").status,
+            200
+        );
+        let store = state.open_store().unwrap();
+        assert_eq!(
+            store.agent_by_name("jarvis").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+    }
+
+    #[test]
+    fn peer_prepare_of_an_unmanaged_session_is_403_and_cannot_unlock_teardown() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        register_resident(&state, "jarvis", AgentRole::LabManager, "ferroloop");
+        let hosted_count = || {
+            handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let jarvis_status = || {
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name("jarvis")
+                .unwrap()
+                .unwrap()
+                .status
+        };
+
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", mode);
+            assert_eq!(
+                resp.status,
+                403,
+                "{mode}: {}",
+                String::from_utf8_lossy(&resp.body)
+            );
+            assert_eq!(hosted_count(), 0, "{mode}");
+            assert_eq!(jarvis_status(), AgentStatus::Active, "{mode}");
+        }
+        assert!(state.session_queue("claude:jarvis").is_empty());
+
+        // The Owner may prepare (adopting the session); the Peer still cannot retire it.
+        let resp = decommission_as(&state, "owner-tok-secret", "claude%3Ajarvis", "prepare");
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(hosted_count(), 1);
+        assert_eq!(jarvis_status(), AgentStatus::Active);
+    }
+
+    #[test]
+    fn a_decommissioned_session_cannot_be_prepared_or_restarted() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:ada", "teardown").status,
+            200
+        );
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:ada", "prepare").status,
+            409
+        );
+        let restart = handle_http_request(
+            &state,
+            &authed(
+                "POST",
+                "/api/v1/hosted-sessions/claude:ada/restart",
+                "owner-tok-secret",
+                &json!({}),
+            ),
+        );
+        assert_eq!(restart.status, 409);
+        assert!(state.session_queue("claude:ada").is_empty());
+        let listed = handle_http_request(
+            &state,
+            &authed(
+                "GET",
+                "/api/v1/hosted-sessions",
+                "owner-tok-secret",
+                &json!({}),
+            ),
+        )
+        .json_value()
+        .unwrap();
+        assert_eq!(listed["sessions"][0]["status"], "decommissioned");
+        assert_eq!(listed["sessions"][0]["restart_count"], 0);
+        // Teardown stays repeatable.
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:ada", "teardown").status,
+            200
+        );
+    }
+
+    #[test]
+    fn hosted_sessions_list_sorted_and_restart_increments_count() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        for (persona, vendor) in [("zed", "codex"), ("ada", "muse"), ("bob", "claude")] {
+            let mut body = spin_up_body(persona);
+            body["vendor"] = json!(vendor);
+            assert_eq!(spin_up(&state, &body).status, 200);
+        }
+        let get = |token: Option<&str>| {
+            let req = HttpRequest::new("GET", "/api/v1/hosted-sessions");
+            let req = match token {
+                Some(t) => req.with_header("Authorization", format!("Bearer {t}")),
+                None => req,
+            };
+            handle_http_request(&state, &req)
+        };
+        assert_eq!(get(None).status, 401);
+        for token in ["owner-tok-secret", "peer-tok-secret"] {
+            let listed = get(Some(token)).json_value().unwrap();
+            let ids: Vec<&str> = listed["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["session_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["claude:bob", "codex:zed", "muse:ada"]);
+        }
+
+        let restart = |token: Option<&str>, id: &str| {
+            let req = HttpRequest::new("POST", format!("/api/v1/hosted-sessions/{id}/restart"));
+            let req = match token {
+                Some(t) => req.with_header("Authorization", format!("Bearer {t}")),
+                None => req,
+            };
+            handle_http_request(&state, &req)
+        };
+        assert_eq!(restart(None, "claude:bob").status, 401);
+        assert_eq!(restart(Some("peer-tok-secret"), "claude:bob").status, 403);
+        assert_eq!(
+            restart(Some("owner-tok-secret"), "claude:nobody").status,
+            404
+        );
+
+        let first = restart(Some("owner-tok-secret"), "claude%3Abob");
+        assert_eq!(
+            first.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&first.body)
+        );
+        let out = first.json_value().unwrap();
+        assert_eq!(out["session_id"], "claude:bob");
+        assert_eq!(out["restart_count"], 1);
+        assert_eq!(out["status"], "running");
+        assert!(
+            out["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("take up residence in FerroLoop/")
+        );
+        let second = restart(Some("owner-tok-secret"), "claude:bob")
+            .json_value()
+            .unwrap();
+        assert_eq!(second["restart_count"], 2);
+
+        let listed = get(Some("owner-tok-secret")).json_value().unwrap();
+        assert_eq!(listed["sessions"][0]["restart_count"], 2);
+        assert_eq!(listed["sessions"][1]["restart_count"], 0);
     }
 
     #[test]

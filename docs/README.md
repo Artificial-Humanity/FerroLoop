@@ -32,7 +32,7 @@ File naming in this directory follows
 
 In addition to the guides above, `fl --help` documents the full command surface:
 
-* `fl agent` — agent identity registry, coverage areas, heartbeat liveness, and `REGISTRY.md` rendering.
+* `fl agent` — agent identity registry, coverage areas, heartbeat liveness, `REGISTRY.md` rendering, and hosted session lifecycle (`spin-up`, two-phase `decommission`). The hub serves the same lifecycle at `POST /api/v1/sessions/spin-up`, `POST /api/v1/sessions/:id/decommission`, `GET /api/v1/hosted-sessions`, and `POST /api/v1/hosted-sessions/:id/restart`; hosted sessions persist as `hosted-session-*` workspace runtime entries.
 * `fl state` — scoped memory, handoffs, and runtime state with owner sensitivity redaction and `MEMORY.md` / `STATE.md` rendering.
 * `fl wire` — FerroWire agent-to-agent messaging, receipts, native vendor push dispatch, and WebSocket relay.
 * `fl github pr` — pull-request review and merge policy evaluation, structured review markers, and gated merges.
