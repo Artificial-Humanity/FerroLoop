@@ -90,6 +90,9 @@ export function stripAgyUserRequestWrapper(content: string): string {
   if (!content) {
     return "";
   }
+  if (!/^\s*<(?:USER_REQUEST|ADDITIONAL_METADATA|EPHEMERAL_MESSAGE)>/i.test(content)) {
+    return content;
+  }
   return content
     .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
     .replace(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi, (_full, inner: string) =>
@@ -103,14 +106,18 @@ export function stripAgyUserRequestWrapper(content: string): string {
     .trim();
 }
 
-export function extractTurnAttachments(content: string): {
+export function extractTurnAttachments(
+  content: string,
+  options?: { stripAgyWrapper?: boolean },
+): {
   cleanedContent: string;
   attachments: ParsedTurnAttachment[];
 } {
   if (!content) {
     return { cleanedContent: "", attachments: [] };
   }
-  const stripped = stripAgyUserRequestWrapper(content);
+  const shouldStrip = options?.stripAgyWrapper ?? true;
+  const stripped = shouldStrip ? stripAgyUserRequestWrapper(content) : content;
   const attachments: ParsedTurnAttachment[] = [];
   const attachmentRegex = /\[Attached file:\s*([^\])\n]+?)(?:\s+\(([^)\n]+)\))?\]/g;
   const cleanedContent = stripped
@@ -138,6 +145,11 @@ export const TurnCard: React.FC<TurnCardProps> = ({
 }) => {
   const roleNormalized = (turn.role || "assistant").toLowerCase();
   const trimmedStart = turn.content.trimStart();
+  const shouldStripAgyWrapper =
+    roleNormalized === "user" || roleNormalized === "system";
+  const strippedForNotice = shouldStripAgyWrapper
+    ? stripAgyUserRequestWrapper(turn.content).trimStart()
+    : trimmedStart;
   // Defensive: hub normalization can mislabel background task completions
   // as operator turns; the content shape is unambiguous tool output.
   const looksLikeBackgroundTaskOutput = /^Task id "[^"]+" finished with result:/i.test(
@@ -149,6 +161,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   // blocks arrive with role === "user" but represent system notices.
   const looksLikeSystemNotice =
     /^\[Notice\]\s/i.test(trimmedStart) ||
+    /^\[Notice\]\s/i.test(strippedForNotice) ||
     /^<EPHEMERAL_MESSAGE>/i.test(trimmedStart) ||
     (/^<SYSTEM_MESSAGE>/i.test(trimmedStart) &&
       !trimmedStart.includes("[Operator Prompt via FerroDeck"));
@@ -189,8 +202,11 @@ export const TurnCard: React.FC<TurnCardProps> = ({
           : agentDisplayName || "Assistant";
 
   const { cleanedContent, attachments } = React.useMemo(
-    () => extractTurnAttachments(turn.content),
-    [turn.content],
+    () =>
+      extractTurnAttachments(turn.content, {
+        stripAgyWrapper: shouldStripAgyWrapper,
+      }),
+    [turn.content, shouldStripAgyWrapper],
   );
 
   // Prose agent output addressed to the operator is the conversation's

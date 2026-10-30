@@ -477,36 +477,38 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       }
       refreshInFlightRef.current = true;
       try {
+        const requestedAgentName = selectedAgentNameRef.current;
+        const requestedAgentKey = requestedAgentName.trim().toLowerCase();
+        const requestedSessionId = selectedSessionIdRef.current;
         const sessRes = await apiClient.getSessions().catch(() => null);
         const list = sessRes?.sessions ?? [];
         if (sessRes) {
           setSessions(list);
         }
         await scanBackgroundTranscripts(list);
-        const requestedAgentKey = selectedAgentNameRef.current.trim().toLowerCase();
-        const requestedSessionId = selectedSessionIdRef.current;
         const targetId =
           sessionOverride === null
             ? null
-            : (sessionOverride ?? requestedSessionId ?? selectedAgentNameRef.current);
+            : (sessionOverride ?? requestedSessionId ?? requestedAgentName);
         if (targetId) {
           const trRes = await apiClient.getSessionTranscript(targetId).catch(() => null);
           if (trRes) {
+            const targetPersona =
+              list.find((session) => session.id === targetId)?.persona ??
+              (list.some(
+                (session) =>
+                  (session.persona ?? "").toLowerCase() ===
+                  targetId.toLowerCase(),
+              )
+                ? targetId
+                : requestedAgentKey);
             if (trRes.turns) {
-              const targetPersona =
-                list.find((session) => session.id === targetId)?.persona ??
-                (list.some(
-                  (session) =>
-                    (session.persona ?? "").toLowerCase() ===
-                    targetId.toLowerCase(),
-                )
-                  ? targetId
-                  : requestedAgentKey);
               recordTranscript(targetPersona, trRes.turns);
             }
             const stillSameTarget =
               selectedAgentNameRef.current.trim().toLowerCase() === requestedAgentKey &&
-              selectedSessionIdRef.current === requestedSessionId;
+              selectedSessionIdRef.current === requestedSessionId &&
+              targetPersona.trim().toLowerCase() === selectedAgentNameRef.current.trim().toLowerCase();
             if (stillSameTarget) {
               if (trRes.turns) {
                 applyTranscriptTurns(trRes.turns);
@@ -806,11 +808,14 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     );
   }, [sessions, routes, selectedSessionId, selectedAgent]);
 
+  const prevLoadedAgentKeyRef = useRef<string>("");
+
   // Load transcript when activeSession or selectedAgentName changes
   useEffect(() => {
     const nextAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
     const targetId = activeSession?.id || selectedAgent?.name_key;
     if (!targetId) {
+      prevLoadedAgentKeyRef.current = nextAgentKey;
       setTranscriptTurns([]);
       setSessionQueue([]);
       setIsSessionBusy(false);
@@ -819,14 +824,22 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       return;
     }
     let cancelled = false;
-    const cachedTurns = nextAgentKey
-      ? (backgroundTranscriptsRef.current[nextAgentKey] ?? [])
-      : [];
-    setTranscriptTurns(cachedTurns);
-    setSessionQueue([]);
-    setIsSessionBusy(false);
-    setSessionContextUsage(null);
-    setSessionQuotaUsage(null);
+    if (prevLoadedAgentKeyRef.current !== nextAgentKey) {
+      prevLoadedAgentKeyRef.current = nextAgentKey;
+      applyTranscriptTurns(
+        nextAgentKey ? (backgroundTranscriptsRef.current[nextAgentKey] ?? []) : [],
+      );
+      setSessionQueue([]);
+      setIsSessionBusy(false);
+      setSessionContextUsage(null);
+      setSessionQuotaUsage(null);
+    } else if (selectedSessionIdRef.current !== null) {
+      setTranscriptTurns([]);
+      setSessionQueue([]);
+      setIsSessionBusy(false);
+      setSessionContextUsage(null);
+      setSessionQuotaUsage(null);
+    }
     apiClient
       .getSessionTranscript(targetId)
       .then((res) => {
@@ -1048,16 +1061,18 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   const handleSpinUpSession = async (req: SpinUpSessionRequest) => {
     const res = await apiClient.spinUpSession(req);
+    if (res.persona) {
+      selectedAgentNameRef.current = res.persona;
+      setSelectedAgentName(res.persona);
+    }
+    if (res.session_id) {
+      selectedSessionIdRef.current = res.session_id;
+      setSelectedSessionId(res.session_id);
+    }
     await Promise.all([
       refreshWireAndRoster(),
       refreshSessionsAndTranscript(res.session_id),
     ]);
-    if (res.persona) {
-      setSelectedAgentName(res.persona);
-    }
-    if (res.session_id) {
-      setSelectedSessionId(res.session_id);
-    }
     return res;
   };
 

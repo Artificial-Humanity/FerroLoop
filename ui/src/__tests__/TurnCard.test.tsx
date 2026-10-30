@@ -238,4 +238,62 @@ describe("TurnCard directed assistant highlight", () => {
     ).toBeInTheDocument();
     expect(within(ephemeralCard).queryByText(/EPHEMERAL_MESSAGE/)).toBeNull();
   });
+
+  it("preserves <USER_REQUEST> inside assistant or tool turns and classifies [Notice] wrapped in <USER_REQUEST> as System", () => {
+    const assistantCodeSnippet = [
+      "<USER_REQUEST>",
+      "diff --git a/ui/src/components/TurnCard.tsx b/ui/src/components/TurnCard.tsx",
+      "</USER_REQUEST>",
+    ].join("\n");
+
+    const wrappedNotice = [
+      "<USER_REQUEST>",
+      "[Notice] All your subagents and background tasks have been stopped due to user force cancellation.",
+      "</USER_REQUEST>",
+      "<ADDITIONAL_METADATA>",
+      "The current local time is: 2026-10-30T16:00:00Z.",
+      "</ADDITIONAL_METADATA>",
+    ].join("\n");
+
+    expect(
+      stripAgyUserRequestWrapper("Here is a snippet:\n<USER_REQUEST>\nhello\n</USER_REQUEST>"),
+    ).toBe("Here is a snippet:\n<USER_REQUEST>\nhello\n</USER_REQUEST>");
+
+    render(
+      <>
+        <TurnCard
+          agentDisplayName="Ferris"
+          turn={turn({
+            index: 10,
+            role: "assistant",
+            content: assistantCodeSnippet,
+          })}
+        />
+        <TurnCard
+          turn={turn({
+            index: 11,
+            role: "user",
+            content: wrappedNotice,
+          })}
+        />
+      </>,
+    );
+
+    const assistantCard = screen.getByTestId("turn-card-10");
+    expect(within(assistantCard).getByText("Ferris")).toBeInTheDocument();
+    expect(within(assistantCard).getByText(/<USER_REQUEST>/)).toBeInTheDocument();
+    expect(within(assistantCard).getByText(/<\/USER_REQUEST>/)).toBeInTheDocument();
+
+    const wrappedNoticeCard = screen.getByTestId("turn-card-11");
+    expect(within(wrappedNoticeCard).getByText("System")).toBeInTheDocument();
+    expect(within(wrappedNoticeCard).queryByText("Operator")).toBeNull();
+    const toggle = within(wrappedNoticeCard).getByTestId("turn-system-output-toggle-11");
+    fireEvent.click(toggle);
+    expect(
+      within(wrappedNoticeCard).getByText(
+        /All your subagents and background tasks have been stopped/,
+      ),
+    ).toBeInTheDocument();
+    expect(within(wrappedNoticeCard).queryByText(/USER_REQUEST/)).toBeNull();
+  });
 });
