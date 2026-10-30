@@ -1312,12 +1312,12 @@ fn handle_post_wire_send(
         },
     };
 
-    let raw_sender = payload
-        .sender_name
-        .as_deref()
-        .or(payload.from.as_deref())
-        .unwrap_or_else(|| authority.actor_name());
-    let sender_name = validate_sender_name(raw_sender).unwrap_or_else(|_| "owner".to_string());
+    // A Peer can never send as the owner: `resolve_prompt_sender` rewrites an owner or unusable
+    // claim to the Peer's own authenticated name (or `peer`). An Owner keeps its claimed label.
+    let sender_name = resolve_prompt_sender(
+        authority,
+        payload.sender_name.as_deref().or(payload.from.as_deref()),
+    );
     let now = stamp::now();
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
@@ -3523,6 +3523,17 @@ fn resolve_prompt_sender(authority: &HubAuthority, claimed_by: Option<&str>) -> 
     }
 }
 
+/// The sender label of a prompt that arrives through an inbound bridge webhook. The webhook
+/// body is third-party text: the secret (or Owner auth) that admits the call says nothing about
+/// who wrote the message, so the label is never an owner name. An unusable label, or one that
+/// names the owner, becomes `bridge`.
+fn bridge_prompt_sender(claimed: &str) -> String {
+    match validate_sender_name(claimed) {
+        Ok(name) if !fl_wire::dispatcher::is_owner_sender(&name) => name,
+        _ => "bridge".to_string(),
+    }
+}
+
 thread_local! {
     static HYDRATE_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
@@ -5017,12 +5028,13 @@ fn handle_post_gate_bridge_webhook(
     match &plan.target {
         BridgeTarget::WireAgent { persona } => {
             let (canonical_id, target_persona) = resolve_session_target(state, persona);
-            let sender_label = event.sender_name.as_deref().unwrap_or(&event.sender_id);
+            let sender_label =
+                bridge_prompt_sender(event.sender_name.as_deref().unwrap_or(&event.sender_id));
             let delivery_res = dispatch_operator_prompt_for_session(
                 state,
                 target_persona.as_deref(),
                 &canonical_id,
-                sender_label,
+                &sender_label,
                 &plan.prompt_body,
             );
             state.mark_session_in_flight_released(&canonical_id);

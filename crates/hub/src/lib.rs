@@ -4713,6 +4713,122 @@ mod tests {
         assert_eq!(socket_from(&listener).as_deref(), Some("peer"));
     }
 
+    /// A bridge `bridge-hook` that admits any sender id and routes to `wire:felicity`.
+    fn install_wire_bridge(home: &std::path::Path) {
+        let dir = home.join(".config").join("fl").join("gate");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("bridge-hook.toml"),
+            r#"
+id = "bridge-hook"
+title = "Bridge hook"
+base_url = "http://127.0.0.1:1"
+allowed_hosts = ["127.0.0.1"]
+
+[[bridges]]
+id = "bridge-hook"
+kind = "webhook"
+allowed_user_ids = ["*"]
+default_target = "wire:felicity"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bridge_webhook_label_is_never_an_owner_name_so_it_is_never_pasted_into_a_pane() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let listener = install_claude_tmux_route(tmp.path(), "felicity");
+        install_wire_bridge(tmp.path());
+
+        // The webhook body is third-party text. Whatever name it claims, the prompt takes the
+        // peer-session socket under a non-owner label and never the pane.
+        let claims: [(&str, Option<&str>, &str); 6] = [
+            ("u1", Some("owner"), "bridge"),
+            ("u1", Some("OWNER"), "bridge"),
+            ("u1", Some("lmcfarlin"), "bridge"),
+            ("u1", Some("not a slug!"), "bridge"),
+            ("owner", None, "bridge"),
+            ("u1", Some("alice"), "alice"),
+        ];
+        for (sender_id, sender_name, expect) in claims {
+            tmux.forget();
+            let body = json!({
+                "bridge_id": "ignored",
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "channel_id": "chan",
+                "content": "do the thing",
+            });
+            let resp = call(
+                &state,
+                "POST",
+                "/api/v1/gate/bridges/bridge-hook/webhook",
+                OWNER,
+                &body,
+            );
+            assert_eq!(resp.status, 200, "{body}: {}", error_text(&resp));
+            assert_eq!(resp.json_value().unwrap()["delivered"], true, "{body}");
+            assert!(
+                !tmux.log().contains("paste-buffer"),
+                "{body}: a webhook prompt was pasted into the pane: {}",
+                tmux.log()
+            );
+            assert_eq!(socket_from(&listener).as_deref(), Some(expect), "{body}");
+        }
+    }
+
+    #[test]
+    fn wire_send_never_lets_a_peer_send_as_the_owner() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let send = |token: &str, agent: Option<&str>, body: Value| -> String {
+            let mut req = authed("POST", "/api/v1/wire/send", token, &body);
+            if let Some(agent) = agent {
+                req = req.with_header("X-Fl-Agent", agent);
+            }
+            let resp = handle_http_request(&state, &req);
+            assert_eq!(resp.status, 200, "{body}: {}", error_text(&resp));
+            resp.json_value().unwrap()["message"]["sender_name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let msg = |extra: Value| {
+            let mut body = json!({ "to": ["felicity"], "subject": "s", "body": "b" });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+
+        // A Peer claiming an owner name, or sending an unusable one, never becomes the owner.
+        for claim in ["owner", "OWNER", " lmcfarlin ", "not a slug!"] {
+            for key in ["sender_name", "from"] {
+                let got = send(PEER, None, msg(json!({ key: claim })));
+                assert_eq!(got, "peer", "{key}={claim:?}");
+                let got = send(PEER, Some("ferris"), msg(json!({ key: claim })));
+                assert_eq!(got, "ferris", "{key}={claim:?} as ferris");
+            }
+        }
+        assert_eq!(send(PEER, Some("owner"), msg(json!({}))), "peer");
+        // An honest Peer name is kept.
+        assert_eq!(send(PEER, None, msg(json!({ "from": "ferris" }))), "ferris");
+        // The Owner keeps its own label, and an unusable one falls back to `owner`.
+        assert_eq!(send(OWNER, None, msg(json!({}))), "lmcfarlin");
+        assert_eq!(
+            send(OWNER, None, msg(json!({ "sender_name": "owner" }))),
+            "owner"
+        );
+        assert_eq!(
+            send(OWNER, None, msg(json!({ "sender_name": "not a slug!" }))),
+            "owner"
+        );
+    }
+
     #[test]
     fn spin_up_refuses_the_owner_names_as_a_persona() {
         let tmp = TempDir::new().unwrap();

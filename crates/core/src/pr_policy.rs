@@ -585,13 +585,16 @@ pub fn authorize_agent_merge(
 /// Check every approving review that GitHub reports on `head_sha` for integrity: the review
 /// must carry a valid `fl-review` marker for an approving, active, authorized agent.
 ///
-/// A review whose marker records an earlier head (`marker.head_sha != head_sha`) is skipped.
-/// GitHub rewrites `commit_id` on older reviews when `origin/main` is merged into the pull
-/// request branch, so such a review looks like it is on `head_sha` while it was written for an
-/// earlier commit. Skipping it grants nothing: [`verify_merge_approvals`] counts an approval only
-/// when its marker names `head_sha`, and a pull request still needs one for `--require-approval`.
-/// A review with no readable marker, or with a marker for `head_sha` that is not an approval or
-/// not from an authorized agent, is still refused. The owner's own reviews are not checked.
+/// A review whose marker records an earlier head (`marker.head_sha != head_sha`) is accepted
+/// without further action, but only after every other check passed. GitHub rewrites `commit_id` on older reviews when
+/// `origin/main` is merged into the pull request branch, so such a review looks like it is on
+/// `head_sha` while it was written for an earlier commit. Skipping it grants nothing:
+/// [`verify_merge_approvals`] counts an approval only when its marker names `head_sha`, and a
+/// pull request still needs one for `--require-approval`. The head comparison is the last step (it is
+/// the only refusal a superseded marker escapes):
+/// a marker with a non-approving verdict, or from an unknown, inactive, wrong-role, co-author
+/// (self-review) or under-tier agent, is refused whichever head it names. A review with no
+/// readable marker is also refused. The owner's own reviews are not checked.
 pub fn verify_review_integrity(
     head_sha: &str,
     eval: &PrPolicyEvaluation,
@@ -619,10 +622,6 @@ pub fn verify_review_integrity(
             continue;
         }
         let marker = extract_review_marker(&review.body).ok_or_else(missing)?;
-        if marker.head_sha != head_sha {
-            // Superseded: written for an earlier head (see above).
-            continue;
-        }
         if marker.verdict != ReviewVerdict::Approved {
             return Err(missing());
         }
@@ -636,6 +635,9 @@ pub fn verify_review_integrity(
             });
         };
         authorize_agent_action(eval, agent)?;
+        // The head comparison is last, so it is the only refusal a superseded marker escapes.
+        // Nothing follows it in this loop, so a marker that names an earlier head and passed
+        // every check above needs no `continue`: it is accepted and skipped by falling through.
     }
     Ok(())
 }
@@ -1583,6 +1585,83 @@ Signed-off-by: Someone <someone@example.com>
                 Some(HEAD)
             )]),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn integrity_refuses_a_superseded_marker_that_fails_any_other_check() {
+        let mut agents = sample_roster();
+        let (ferris, felicia, kacey) = (agents[1].clone(), agents[2].clone(), agents[3].clone());
+        let eval = integrity_eval(&agents);
+        // A marker naming the old head, which GitHub reports on the new one.
+        let stale = |reviewer: &AgentRecord, verdict: ReviewVerdict| {
+            let state = if verdict == ReviewVerdict::Approved {
+                "APPROVED"
+            } else {
+                "CHANGES_REQUESTED"
+            };
+            marked_review(1, reviewer, state, verdict, OLD, Some(HEAD))
+        };
+        let check = |reviews: &[PrReviewSummary], agents: &[AgentRecord]| {
+            verify_review_integrity(HEAD, &eval, reviews, agents, DEFAULT_OWNER_LOGIN)
+        };
+
+        // An agent that is not on the roster.
+        let mut ghost = stale(&ferris, ReviewVerdict::Approved);
+        ghost.body = ghost.body.replace("\"ferris\"", "\"ghost\"");
+        assert_eq!(
+            check(&[ghost], &agents),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ghost".into()
+            })
+        );
+
+        // The wrong role for the named agent.
+        let mut wrong_role = stale(&ferris, ReviewVerdict::Approved);
+        wrong_role.body = wrong_role.body.replace("\"lead\"", "\"lab_manager\"");
+        assert_eq!(
+            check(&[wrong_role], &agents),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ferris".into()
+            })
+        );
+
+        // A co-author reviewing their own pull request.
+        assert_eq!(
+            check(&[stale(&felicia, ReviewVerdict::Approved)], &agents),
+            Err(PolicyRefusal::SelfReviewForbidden {
+                agent: "felicia".into()
+            })
+        );
+
+        // An agent below the required tier.
+        assert!(
+            matches!(
+                check(&[stale(&kacey, ReviewVerdict::Approved)], &agents),
+                Err(PolicyRefusal::InsufficientRole { .. })
+            ),
+            "{:?}",
+            check(&[stale(&kacey, ReviewVerdict::Approved)], &agents)
+        );
+
+        // A non-approving verdict, even though GitHub reports `APPROVED`.
+        let contradictory = marked_review(
+            1,
+            &ferris,
+            "APPROVED",
+            ReviewVerdict::ChangesRequested,
+            OLD,
+            Some(HEAD),
+        );
+        assert_eq!(check(&[contradictory], &agents), Err(missing()));
+
+        // A deactivated agent.
+        agents[1].status = AgentStatus::Retired;
+        assert_eq!(
+            check(&[stale(&ferris, ReviewVerdict::Approved)], &agents),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ferris".into()
+            })
         );
     }
 }
