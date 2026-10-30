@@ -10,6 +10,7 @@ mod direct_quota;
 pub mod discovery;
 pub mod lifecycle;
 pub mod nodes;
+mod records;
 pub mod session_actions;
 mod settings;
 pub mod terminal;
@@ -17,7 +18,7 @@ pub mod ws;
 
 use std::collections::BTreeMap;
 use std::ops::Deref;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -467,15 +468,21 @@ impl HubState {
     /// The returned [`HubStoreGuard`] holds `store_lock` for the store's whole
     /// lifetime, serializing concurrent in-process opens.
     pub fn open_store(&self) -> Result<HubStoreGuard<'_>, StoreError> {
+        self.open_store_at(&self.config.store_path)
+    }
+
+    /// [`HubState::open_store`] for another `.redb` file (a per-project store): the same retry
+    /// loop and the same `store_lock`, so every open the hub makes stays serialized.
+    pub fn open_store_at(&self, path: &Path) -> Result<HubStoreGuard<'_>, StoreError> {
         let guard = Some(self.store_lock.lock().unwrap_or_else(|e| e.into_inner()));
-        if let Some(parent) = self.config.store_path.parent()
+        if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut last_err = None;
         for attempt in 0..200 {
-            match RedbStore::open(&self.config.store_path) {
+            match RedbStore::open(path) {
                 Ok(store) => {
                     return Ok(HubStoreGuard {
                         store: Some(store),

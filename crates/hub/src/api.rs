@@ -89,6 +89,7 @@ use crate::nodes::{
     list_visible_nodes, local_hostname, mint_enroll_token, node_id_from_hostname, node_state_slug,
     node_token_matches, revoke_node, touch_node,
 };
+use crate::records;
 use crate::session_actions::{
     self, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, ModelOverride, route_vendor,
 };
@@ -231,6 +232,7 @@ fn status_reason(status: u16) -> &'static str {
         413 => "Payload Too Large",
         422 => "Unprocessable Entity",
         500 => "Internal Server Error",
+        503 => "Service Unavailable",
         _ => "OK",
     }
 }
@@ -489,6 +491,8 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET" | "HEAD", "/api/v1/artifacts/preview") => handle_get_artifact_preview(state, req),
         ("GET", "/api/v1/artifacts/list") => handle_get_artifacts_list(state, req),
         ("POST", "/api/v1/artifacts/prune") => handle_post_artifacts_prune(state, &authority, req),
+        ("GET", "/api/v1/records") => records::handle_get_records(state, req),
+        ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
         ("GET", "/api/v1/settings") => handle_get_settings(state),
         ("PUT", "/api/v1/settings") => handle_put_settings(state, &authority, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
@@ -2629,7 +2633,7 @@ fn handle_get_artifact_preview(state: &HubState, req: &HttpRequest) -> HttpRespo
 const MAX_ARTIFACT_LIST_ITEMS: usize = 50;
 
 /// The hub's home directory: the configured override, else `$HOME`.
-fn hub_home_dir(state: &HubState) -> Option<PathBuf> {
+pub(crate) fn hub_home_dir(state: &HubState) -> Option<PathBuf> {
     state
         .config
         .home_override
@@ -3300,6 +3304,17 @@ fn handle_dynamic_api_routes(
             return HttpResponse::bytes(200, mime_type_for_path(&path), bytes);
         }
         return HttpResponse::json(404, json!({ "error": "attachment not found" }));
+    }
+
+    // /api/v1/records/:id/move
+    if method == "POST"
+        && segments.len() == 5
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "records"
+        && segments[4] == "move"
+    {
+        return records::handle_post_record_move(state, authority, req, segments[3]);
     }
 
     // /api/v1/sessions/:id/transcript, /prompt, /clear, /decommission, or /queue
