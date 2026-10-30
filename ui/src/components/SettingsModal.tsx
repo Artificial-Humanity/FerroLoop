@@ -1,8 +1,10 @@
 import React, { useEffect, useState } from "react";
 import { HubApiClient } from "../api/client";
-import type {
-  BulkSessionAction,
-  BulkSessionActionResponse,
+import {
+  DEFAULT_HUB_SETTINGS,
+  type BulkSessionAction,
+  type BulkSessionActionResponse,
+  type HubSettings,
 } from "../types/api";
 
 export interface SettingsModalProps {
@@ -11,6 +13,7 @@ export interface SettingsModalProps {
   onBulkSessionAction?: (
     action: BulkSessionAction,
   ) => Promise<BulkSessionActionResponse>;
+  onSettingsUpdated?: (settings: HubSettings) => void;
   apiClient?: HubApiClient;
 }
 
@@ -33,8 +36,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   isOpen,
   onClose,
   onBulkSessionAction,
+  onSettingsUpdated,
   apiClient,
 }) => {
+  const [settings, setSettings] = useState<HubSettings>(DEFAULT_HUB_SETTINGS);
+  const [savingSettings, setSavingSettings] = useState(false);
+  const [settingsSaved, setSettingsSaved] = useState(false);
   const [armedAction, setArmedAction] = useState<BulkSessionAction | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -45,22 +52,61 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setArmedAction(null);
     setError(null);
     setLastResult(null);
-  }, [isOpen]);
+    setSettingsSaved(false);
+    if (!isOpen) {
+      return;
+    }
+    let cancelled = false;
+    const client = apiClient ?? new HubApiClient();
+    client
+      .getSettings()
+      .then((loaded) => {
+        if (!cancelled) {
+          setSettings(loaded);
+        }
+      })
+      .catch(() => {
+        // Keep DEFAULT_HUB_SETTINGS if endpoint is unreachable
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, apiClient]);
 
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !submitting) {
+      if (event.key === "Escape" && !submitting && !savingSettings) {
         onClose();
       }
     };
     window.addEventListener("keydown", handleKeyDownEscape);
     return () => window.removeEventListener("keydown", handleKeyDownEscape);
-  }, [isOpen, submitting, onClose]);
+  }, [isOpen, submitting, savingSettings, onClose]);
 
   if (!isOpen) {
     return null;
   }
+
+  const handleSaveSettings = async () => {
+    if (savingSettings) return;
+    setSavingSettings(true);
+    setError(null);
+    setSettingsSaved(false);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const updated = await client.updateSettings(settings);
+      setSettings(updated);
+      setSettingsSaved(true);
+      onSettingsUpdated?.(updated);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to save hub settings",
+      );
+    } finally {
+      setSavingSettings(false);
+    }
+  };
 
   const handleConfirmBulkAction = async () => {
     if (!armedAction || submitting) return;
@@ -93,7 +139,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     <div
       className="fd-modal-backdrop"
       onClick={() => {
-        if (!submitting) {
+        if (!submitting && !savingSettings) {
           onClose();
         }
       }}
@@ -105,14 +151,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         data-testid="settings-modal"
         className="fd-modal"
         onClick={(e) => e.stopPropagation()}
-        style={{ maxWidth: "540px" }}
+        style={{
+          maxWidth: "600px",
+          maxHeight: "88vh",
+          overflowY: "auto",
+          display: "flex",
+          flexDirection: "column",
+          gap: "12px",
+        }}
       >
         <div
           style={{
             display: "flex",
             alignItems: "center",
             justifyContent: "space-between",
-            marginBottom: "14px",
           }}
         >
           <h2 style={{ margin: 0, fontSize: "16px", fontWeight: 700 }}>
@@ -122,7 +174,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             type="button"
             className="fd-btn"
             onClick={onClose}
-            disabled={submitting}
+            disabled={submitting || savingSettings}
             aria-label="Close Settings Modal"
           >
             ✕
@@ -133,7 +185,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           <div
             role="alert"
             style={{
-              marginBottom: "12px",
               padding: "8px 10px",
               borderRadius: "var(--radius-md)",
               backgroundColor: "rgba(239, 68, 68, 0.14)",
@@ -146,13 +197,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         )}
 
+        {settingsSaved && (
+          <div
+            role="status"
+            data-testid="settings-saved-banner"
+            className="fd-card"
+            style={{
+              borderColor: "var(--diff-add-border)",
+              backgroundColor: "var(--diff-add-bg)",
+              color: "var(--diff-add-text)",
+              fontSize: "12px",
+              padding: "8px 12px",
+            }}
+          >
+            Settings saved successfully.
+          </div>
+        )}
+
         {lastResult && (
           <div
             role="status"
             data-testid="bulk-action-result"
             className="fd-card"
             style={{
-              marginBottom: "12px",
               borderColor: "var(--diff-add-border)",
               backgroundColor: "var(--diff-add-bg)",
               color: "var(--diff-add-text)",
@@ -184,6 +251,316 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
         )}
 
+        {/* Unified Settings Panel (Record 4) */}
+        <div
+          className="fd-card"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px",
+          }}
+        >
+          {/* Appearance & Theme */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "12px",
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <h3
+                style={{
+                  margin: 0,
+                  fontSize: "12.5px",
+                  fontWeight: 700,
+                  textTransform: "uppercase",
+                  letterSpacing: "0.04em",
+                }}
+              >
+                Appearance &amp; Theme
+              </h3>
+              <span style={{ fontSize: "11.5px", color: "var(--text-muted)" }}>
+                Choose the default color scheme for FerroDeck.
+              </span>
+            </div>
+            <select
+              aria-label="Theme Preference"
+              data-testid="settings-theme-select"
+              className="fd-select fd-mono"
+              value={settings.theme_preference}
+              onChange={(e) => {
+                setSettingsSaved(false);
+                setSettings((prev) => ({
+                  ...prev,
+                  theme_preference: e.target.value as HubSettings["theme_preference"],
+                }));
+              }}
+              style={{ fontSize: "12px", padding: "5px 10px" }}
+            >
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+              <option value="system">System</option>
+            </select>
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid var(--border-subtle)", margin: 0 }} />
+
+          {/* Subsystem Toggles */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+            <h3
+              style={{
+                margin: 0,
+                fontSize: "12.5px",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Subsystem Toggles
+            </h3>
+            <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "12.5px" }}>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-ferrogate"
+                  checked={settings.subsystems.ferrogate_enabled}
+                  onChange={(e) => {
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      subsystems: {
+                        ...prev.subsystems,
+                        ferrogate_enabled: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>FerroGate Vault &amp; Proxy</span>
+              </label>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-ferrostate"
+                  checked={settings.subsystems.ferrostate_enabled}
+                  onChange={(e) => {
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      subsystems: {
+                        ...prev.subsystems,
+                        ferrostate_enabled: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>FerroState Memory &amp; Index</span>
+              </label>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-ferrostep"
+                  checked={settings.subsystems.ferrostep_enabled}
+                  onChange={(e) => {
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      subsystems: {
+                        ...prev.subsystems,
+                        ferrostep_enabled: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>FerroStep Workflows</span>
+              </label>
+            </div>
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid var(--border-subtle)", margin: 0 }} />
+
+          {/* Notification Rules */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+            <h3
+              style={{
+                margin: 0,
+                fontSize: "12.5px",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Notification Rules
+            </h3>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: "6px", fontSize: "12.5px" }}>
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-notify-pr"
+                  checked={settings.notifications.notify_on_pr_review}
+                  onChange={(e) => {
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      notifications: {
+                        ...prev.notifications,
+                        notify_on_pr_review: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>PR Review Requests</span>
+              </label>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-notify-error"
+                  checked={settings.notifications.notify_on_session_error}
+                  onChange={(e) => {
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      notifications: {
+                        ...prev.notifications,
+                        notify_on_session_error: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>Session Errors</span>
+              </label>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-notify-wire"
+                  checked={settings.notifications.notify_on_wire_urgent}
+                  onChange={(e) => {
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      notifications: {
+                        ...prev.notifications,
+                        notify_on_wire_urgent: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>Urgent FerroWire Mail</span>
+              </label>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-notify-sound"
+                  checked={settings.notifications.sound_enabled}
+                  onChange={(e) => {
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      notifications: {
+                        ...prev.notifications,
+                        sound_enabled: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>Sound Alerts</span>
+              </label>
+            </div>
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid var(--border-subtle)", margin: 0 }} />
+
+          {/* Hub & Polling Connection */}
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            <h3
+              style={{
+                margin: 0,
+                fontSize: "12.5px",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Hub &amp; Polling Connection
+            </h3>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "12px",
+                flexWrap: "wrap",
+                fontSize: "12.5px",
+              }}
+            >
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  data-testid="toggle-auto-reconnect"
+                  checked={settings.hub_connection.auto_reconnect_ws}
+                  onChange={(e) => {
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      hub_connection: {
+                        ...prev.hub_connection,
+                        auto_reconnect_ws: e.target.checked,
+                      },
+                    }));
+                  }}
+                />
+                <span>Auto-reconnect WebSocket</span>
+              </label>
+
+              <label style={{ display: "inline-flex", alignItems: "center", gap: "6px" }}>
+                <span>Poll Interval (secs):</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={60}
+                  aria-label="Poll Interval (secs)"
+                  data-testid="input-poll-interval"
+                  className="fd-input fd-mono"
+                  value={settings.hub_connection.poll_interval_secs}
+                  onChange={(e) => {
+                    const parsed = Number(e.target.value);
+                    setSettingsSaved(false);
+                    setSettings((prev) => ({
+                      ...prev,
+                      hub_connection: {
+                        ...prev.hub_connection,
+                        poll_interval_secs:
+                          Number.isFinite(parsed) && parsed > 0 ? parsed : 1,
+                      },
+                    }));
+                  }}
+                  style={{ width: "68px", fontSize: "12px", padding: "4px 8px" }}
+                />
+              </label>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <button
+              type="button"
+              data-testid="save-settings-btn"
+              className="fd-btn fd-btn-primary"
+              disabled={savingSettings}
+              onClick={() => void handleSaveSettings()}
+            >
+              {savingSettings ? "Saving..." : "Save Settings"}
+            </button>
+          </div>
+        </div>
+
+        {/* Fleet Bulk Session Operations */}
         <div
           className="fd-card"
           style={{

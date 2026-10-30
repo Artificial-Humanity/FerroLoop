@@ -39,11 +39,64 @@ export interface ArtifactSummaryItem {
   ext: string;
   kind: ArtifactKind;
   size_bytes: number;
+  status?: "live" | "archived";
+  original_path?: string;
 }
 
 export interface ArtifactListResponse {
   artifacts: ArtifactSummaryItem[];
 }
+
+export interface PruneArtifactsRequest {
+  session_id?: string;
+  worktree_path?: string;
+}
+
+export interface PruneArtifactsResponse {
+  pruned_count?: number;
+  pruned?: number;
+  archived_count?: number;
+  remaining_count?: number;
+  pruned_paths?: string[];
+}
+
+export interface HubSettings {
+  theme_preference: "dark" | "light" | "system";
+  subsystems: {
+    ferrogate_enabled: boolean;
+    ferrostate_enabled: boolean;
+    ferrostep_enabled: boolean;
+  };
+  notifications: {
+    notify_on_pr_review: boolean;
+    notify_on_session_error: boolean;
+    notify_on_wire_urgent: boolean;
+    sound_enabled: boolean;
+  };
+  hub_connection: {
+    auto_reconnect_ws: boolean;
+    poll_interval_secs: number;
+  };
+}
+
+export const DEFAULT_HUB_SETTINGS: HubSettings = {
+  theme_preference: "dark",
+  subsystems: {
+    ferrogate_enabled: true,
+    ferrostate_enabled: true,
+    ferrostep_enabled: true,
+  },
+  notifications: {
+    notify_on_pr_review: true,
+    notify_on_session_error: true,
+    notify_on_wire_urgent: true,
+    sound_enabled: false,
+  },
+  hub_connection: {
+    auto_reconnect_ws: true,
+    poll_interval_secs: 3,
+  },
+};
 
 export type HubAuthority =
   | { tier: "owner"; login: string }
