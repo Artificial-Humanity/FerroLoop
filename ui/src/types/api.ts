@@ -4,13 +4,64 @@
 
 export type CockpitTab =
   | "chat"
+  | "mail"
   | "artifacts"
   | "git"
-  | "mail"
+  | "board"
   | "terminal"
   | "hub"
   | "gate"
   | "state";
+
+export type RecordState = "todo" | "doing" | "done";
+
+export interface ProjectRecordItem {
+  id: string;
+  handle?: number | null;
+  display_id: string;
+  project: string;
+  title: string;
+  state: RecordState;
+  area?: string | null;
+  tier?: string;
+  findings_open?: number;
+  findings_total?: number;
+}
+
+export interface RecordsBoardSummary {
+  todo_count: number;
+  doing_count: number;
+  done_count: number;
+  total_count: number;
+  completion_pct: number;
+  open_findings_count: number;
+  attempts_count: number;
+  total_cost_usd: number;
+}
+
+export interface RecordsListResponse {
+  project: string;
+  available_projects: string[];
+  records: ProjectRecordItem[];
+  summary: RecordsBoardSummary;
+}
+
+export interface CreateRecordRequest {
+  project?: string;
+  title: string;
+  area?: string;
+  state?: RecordState;
+}
+
+export interface CreateRecordResponse {
+  record: ProjectRecordItem;
+}
+
+export interface MoveRecordResponse {
+  ok: boolean;
+  outcome: string;
+  record: ProjectRecordItem;
+}
 
 export type ArtifactKind =
   | "markdown"

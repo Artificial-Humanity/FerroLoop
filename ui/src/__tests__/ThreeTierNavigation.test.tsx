@@ -15,19 +15,20 @@ import {
 } from "../types/api";
 
 describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
-  it("maps all 8 cockpit tabs to their corresponding tier (agent, project, system)", () => {
+  it("maps all 9 cockpit tabs to their corresponding tier (agent, project, system)", () => {
     const expectedTiers: Record<CockpitTab, "agent" | "project" | "system"> = {
       chat: "agent",
       mail: "agent",
       artifacts: "project",
       git: "project",
+      board: "project",
       terminal: "system",
       hub: "system",
       gate: "system",
       state: "system",
     };
 
-    expect(COCKPIT_TABS).toHaveLength(8);
+    expect(COCKPIT_TABS).toHaveLength(9);
     for (const tab of COCKPIT_TABS) {
       expect(getTabContextTier(tab.id)).toBe(expectedTiers[tab.id]);
     }
@@ -68,7 +69,7 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     );
 
     const tabBar = screen.getByTestId("cockpit-tab-bar");
-    expect(within(tabBar).getAllByRole("tab")).toHaveLength(8);
+    expect(within(tabBar).getAllByRole("tab")).toHaveLength(9);
 
     // Tier 1: Agent Context
     const agentNav = within(tabBar).getByTestId("tier-agent-nav");
@@ -87,6 +88,9 @@ describe("Record 56 — FerroDeck+ 3-Tier Navigation Hierarchy", () => {
     );
     expect(within(projectNav).getByRole("tab", { name: /^Artifacts$/i })).toBeInTheDocument();
     expect(within(projectNav).getByRole("tab", { name: /^Git & PRs$/i })).toBeInTheDocument();
+    expect(
+      within(projectNav).getByRole("tab", { name: /^Records & Board$/i }),
+    ).toBeInTheDocument();
 
     // Tier 3: System Context
     const systemNav = within(tabBar).getByTestId("tier-system-nav");

@@ -38,6 +38,7 @@ export const COCKPIT_TABS: Array<{ id: CockpitTab; label: string }> = [
   { id: "chat", label: "Chat" },
   { id: "artifacts", label: "Artifacts" },
   { id: "git", label: "Git & PRs" },
+  { id: "board", label: "Records & Board" },
   { id: "mail", label: "Wire Mail" },
   { id: "terminal", label: "Terminal" },
   { id: "hub", label: "Hub & Arch" },
@@ -53,6 +54,7 @@ export const AGENT_TIER_TABS: Array<{ id: CockpitTab; label: string }> = [
 export const PROJECT_TIER_TABS: Array<{ id: CockpitTab; label: string }> = [
   { id: "artifacts", label: "Artifacts" },
   { id: "git", label: "Git & PRs" },
+  { id: "board", label: "Records & Board" },
 ];
 
 export const SYSTEM_TIER_TABS: Array<{ id: CockpitTab; label: string }> = [
@@ -62,6 +64,10 @@ export const SYSTEM_TIER_TABS: Array<{ id: CockpitTab; label: string }> = [
   { id: "state", label: "FerroState" },
 ];
 
+export const AGENT_TABS = AGENT_TIER_TABS;
+export const PROJECT_TABS = PROJECT_TIER_TABS;
+export const SYSTEM_TABS = SYSTEM_TIER_TABS;
+
 export function getTabContextTier(tab: CockpitTab): ContextTier {
   switch (tab) {
     case "chat":
@@ -69,6 +75,7 @@ export function getTabContextTier(tab: CockpitTab): ContextTier {
       return "agent";
     case "artifacts":
     case "git":
+    case "board":
       return "project";
     case "terminal":
     case "hub":
