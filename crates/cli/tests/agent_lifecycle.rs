@@ -194,6 +194,49 @@ fn spin_up_of_a_second_lead_conflicts_and_changes_nothing() {
 }
 
 #[test]
+fn spin_up_of_an_active_agent_in_another_role_conflicts_and_changes_nothing() {
+    let env = Env::new();
+    env.spin_up("felicity", "assistant", "claude")
+        .assert()
+        .success();
+    env.spin_up("felicity", "ui-developer", "claude")
+        .assert()
+        .code(2)
+        .stderr(contains("already active"));
+    assert_eq!(env.roster(true).len(), 1);
+    assert_eq!(env.roster(true)[0]["role"], "assistant");
+    assert_eq!(env.hosted_records().len(), 1);
+}
+
+#[test]
+fn decommissioned_sessions_are_not_prepared_again() {
+    let env = Env::new();
+    env.spin_up("felicity", "assistant", "claude")
+        .assert()
+        .success();
+    let decommission = |mode: &str| {
+        let mut c = env.fl();
+        c.args([
+            "agent",
+            "decommission",
+            "claude:felicity",
+            "--mode",
+            mode,
+            "--by",
+            "owner",
+        ]);
+        c
+    };
+    decommission("teardown").assert().success();
+    decommission("prepare")
+        .assert()
+        .code(2)
+        .stderr(contains("is decommissioned"));
+    assert_eq!(env.hosted_records()[0]["status"], "decommissioned");
+    decommission("teardown").assert().success();
+}
+
+#[test]
 fn decommission_rejects_a_bad_mode_and_an_unknown_session() {
     let env = Env::new();
     env.spin_up("felicity", "assistant", "claude")

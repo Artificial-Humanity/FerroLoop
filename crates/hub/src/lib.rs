@@ -2576,6 +2576,227 @@ mod tests {
         assert_eq!(torn.json_value().unwrap()["session_id"], "ghost");
     }
 
+    fn register_resident(
+        state: &HubState,
+        persona: &str,
+        role: fl_core::agent::AgentRole,
+        project: &str,
+    ) {
+        use fl_core::agent::RegisterAgentArgs;
+        use fl_core::store::AgentRegistry;
+        state
+            .open_store()
+            .unwrap()
+            .register_agent(RegisterAgentArgs {
+                display_name: persona[..1].to_ascii_uppercase() + &persona[1..],
+                email: Some(format!("{persona}@example.org")),
+                project: project.into(),
+                role,
+                extra_areas: vec!["notes".into()],
+                create_area: true,
+                replace: false,
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+    }
+
+    fn decommission_as(state: &HubState, token: &str, id: &str, mode: &str) -> HttpResponse {
+        handle_http_request(
+            state,
+            &authed(
+                "POST",
+                &format!("/api/v1/sessions/{id}/decommission"),
+                token,
+                &json!({ "mode": mode }),
+            ),
+        )
+    }
+
+    #[test]
+    fn spin_up_never_re_homes_a_resident_but_keeps_its_email_on_a_repeat() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        register_resident(&state, "jarvis", AgentRole::LabManager, "ferroloop");
+        register_resident(&state, "ada", AgentRole::Assistant, "ferroloop");
+        let agent = |name: &str| {
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name(name)
+                .unwrap()
+                .unwrap()
+        };
+        let jarvis = agent("jarvis");
+
+        // A Peer cannot spin up a resident's persona in another role or project.
+        for (role, project) in [("assistant", "FerroLoop"), ("lab-manager", "Elsewhere")] {
+            let resp = handle_http_request(
+                &state,
+                &authed(
+                    "POST",
+                    "/api/v1/sessions/spin-up",
+                    "peer-tok-secret",
+                    &json!({
+                        "persona": "jarvis", "project": project, "role": role, "vendor": "claude",
+                    }),
+                ),
+            );
+            assert_eq!(resp.status, 409, "{role} {project}");
+        }
+        assert_eq!(agent("jarvis"), jarvis);
+        assert_eq!(agent("jarvis").status, AgentStatus::Active);
+        let listed = handle_http_request(
+            &state,
+            &authed(
+                "GET",
+                "/api/v1/hosted-sessions",
+                "owner-tok-secret",
+                &json!({}),
+            ),
+        )
+        .json_value()
+        .unwrap();
+        assert!(listed["sessions"].as_array().unwrap().is_empty());
+
+        // The same project and role is an idempotent re-spin that keeps email and extra areas.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let ada = agent("ada");
+        assert_eq!(ada.email, "ada@example.org");
+        assert_eq!(ada.extra_areas, ["notes"]);
+    }
+
+    #[test]
+    fn peer_teardown_needs_a_hosted_record_and_malformed_ids_are_400_without_side_effects() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        register_resident(&state, "jarvis", AgentRole::LabManager, "ferroloop");
+        state.enqueue_session_prompt(
+            "jarvis",
+            Some("jarvis".into()),
+            "queued".into(),
+            "queued".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        let socket = tmp.path().join("jarvis.sock");
+        install_webhook_route(tmp.path(), "jarvis", &socket);
+        let routes_path = tmp.path().join(".cache/agent-bus/routes.json");
+        let jarvis_is_untouched = || {
+            assert_eq!(state.session_queue("jarvis").len(), 1);
+            assert!(
+                fl_wire::identity::RouteTable::load(Some(&routes_path))
+                    .get("jarvis")
+                    .is_some()
+            );
+            let store = state.open_store().unwrap();
+            assert_eq!(
+                store.agent_by_name("jarvis").unwrap().unwrap().status,
+                AgentStatus::Active
+            );
+            drop(store);
+            let listed = handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap();
+            assert!(listed["sessions"].as_array().unwrap().is_empty());
+        };
+
+        // A Peer cannot adopt-and-retire a registered agent through an unmanaged id.
+        let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", "teardown");
+        assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
+        jarvis_is_untouched();
+
+        // Malformed persona ids are 400 for both phases, before any side effect.
+        state.enqueue_session_prompt(
+            "claude:Foo Bar",
+            None,
+            "queued".into(),
+            "queued".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "owner-tok-secret", "claude%3AFoo%20Bar", mode);
+            assert_eq!(resp.status, 400, "{mode}");
+        }
+        assert_eq!(state.session_queue("claude:Foo Bar").len(), 1);
+        jarvis_is_untouched();
+
+        // A Peer may tear down a hosted session; the Owner may adopt an unmanaged one.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        assert_eq!(
+            decommission_as(&state, "peer-tok-secret", "claude:ada", "teardown").status,
+            200
+        );
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:jarvis", "teardown").status,
+            200
+        );
+        let store = state.open_store().unwrap();
+        assert_eq!(
+            store.agent_by_name("jarvis").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+    }
+
+    #[test]
+    fn a_decommissioned_session_cannot_be_prepared_or_restarted() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:ada", "teardown").status,
+            200
+        );
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:ada", "prepare").status,
+            409
+        );
+        let restart = handle_http_request(
+            &state,
+            &authed(
+                "POST",
+                "/api/v1/hosted-sessions/claude:ada/restart",
+                "owner-tok-secret",
+                &json!({}),
+            ),
+        );
+        assert_eq!(restart.status, 409);
+        assert!(state.session_queue("claude:ada").is_empty());
+        let listed = handle_http_request(
+            &state,
+            &authed(
+                "GET",
+                "/api/v1/hosted-sessions",
+                "owner-tok-secret",
+                &json!({}),
+            ),
+        )
+        .json_value()
+        .unwrap();
+        assert_eq!(listed["sessions"][0]["status"], "decommissioned");
+        assert_eq!(listed["sessions"][0]["restart_count"], 0);
+        // Teardown stays repeatable.
+        assert_eq!(
+            decommission_as(&state, "owner-tok-secret", "claude:ada", "teardown").status,
+            200
+        );
+    }
+
     #[test]
     fn hosted_sessions_list_sorted_and_restart_increments_count() {
         let tmp = TempDir::new().unwrap();

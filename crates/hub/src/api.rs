@@ -3663,7 +3663,12 @@ fn handle_post_session_decommission(
     let result = match mode {
         DecommissionMode::Prepare => lifecycle::prepare_decommission(&*store, &env, &target, by),
         DecommissionMode::Teardown => {
-            lifecycle::teardown_session(&*store, &env, &target, by, |key| {
+            let caller = if authority.is_owner() {
+                lifecycle::Caller::Owner
+            } else {
+                lifecycle::Caller::Peer
+            };
+            lifecycle::teardown_session(&*store, &env, &target, by, caller, |key| {
                 state.clear_session_prompt_queue(key)
             })
         }

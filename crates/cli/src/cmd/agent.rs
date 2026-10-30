@@ -563,9 +563,14 @@ pub fn run<S: AgentRegistry + Handles + StateStore>(
                 DecommissionMode::Prepare => {
                     lifecycle::prepare_decommission(store, &env, &target, &by)
                 }
-                DecommissionMode::Teardown => {
-                    lifecycle::teardown_session(store, &env, &target, &by, |_| {})
-                }
+                DecommissionMode::Teardown => lifecycle::teardown_session(
+                    store,
+                    &env,
+                    &target,
+                    &by,
+                    lifecycle::Caller::Owner,
+                    |_| {},
+                ),
             }
             .map_err(lifecycle_failure)?;
             if json {

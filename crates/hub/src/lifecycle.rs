@@ -49,6 +49,8 @@ pub enum LifecycleError {
     Invalid(String),
     /// No such session or agent (404).
     NotFound(String),
+    /// The caller's authority does not cover the request (403).
+    Forbidden(String),
     /// The request conflicts with registry state (409).
     Conflict(String),
     /// The store failed (500).
@@ -60,6 +62,7 @@ impl LifecycleError {
         match self {
             Self::Invalid(_) => 400,
             Self::NotFound(_) => 404,
+            Self::Forbidden(_) => 403,
             Self::Conflict(_) => 409,
             Self::Store(_) => 500,
         }
@@ -69,9 +72,11 @@ impl LifecycleError {
 impl std::fmt::Display for LifecycleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Invalid(m) | Self::NotFound(m) | Self::Conflict(m) | Self::Store(m) => {
-                f.write_str(m)
-            }
+            Self::Invalid(m)
+            | Self::NotFound(m)
+            | Self::Forbidden(m)
+            | Self::Conflict(m)
+            | Self::Store(m) => f.write_str(m),
         }
     }
 }
@@ -318,22 +323,42 @@ pub fn list_hosted_sessions<S: StateStore>(
     Ok(records)
 }
 
-/// The record whose `session_id` or `persona` is one of `keys`; an exact `session_id` wins.
+/// Vendor and persona of a `vendor:persona` session id, when the vendor is a known one.
+fn split_vendor_id(id: &str) -> Option<(String, &str)> {
+    let (vendor, persona) = id.trim().split_once(':')?;
+    let vendor = vendor.to_ascii_lowercase();
+    SPIN_UP_VENDORS
+        .contains(&vendor.as_str())
+        .then_some((vendor, persona))
+}
+
+/// Whether `key` names `record`'s persona. A `vendor:persona` key only matches that vendor's
+/// record, so `codex:ada` never reaches `claude:ada`; any other key is a bare persona.
+fn persona_key_matches(record: &HostedSessionRecord, key: &str) -> bool {
+    match split_vendor_id(key) {
+        Some((vendor, persona)) => {
+            record.vendor == vendor && record.persona.eq_ignore_ascii_case(persona)
+        }
+        None => record.persona.eq_ignore_ascii_case(key.trim()),
+    }
+}
+
+/// The record whose `session_id` or `persona` is one of `keys`. An exact `session_id` match wins;
+/// the persona fallback applies only when no record matches exactly.
 pub fn find_hosted_session<S: StateStore>(
     store: &S,
     keys: &[&str],
 ) -> Result<Option<HostedSessionRecord>, LifecycleError> {
     let records = list_hosted_sessions(store)?;
-    let by_id = records
+    let exact = records
         .iter()
         .find(|r| keys.iter().any(|k| r.session_id == k.trim()));
     let by_persona = || {
-        records.iter().find(|r| {
-            keys.iter()
-                .any(|k| r.persona.eq_ignore_ascii_case(k.trim()))
-        })
+        records
+            .iter()
+            .find(|r| keys.iter().any(|k| persona_key_matches(r, k)))
     };
-    Ok(by_id.or_else(by_persona).cloned())
+    Ok(exact.or_else(by_persona).cloned())
 }
 
 fn now_ms() -> u64 {
@@ -398,15 +423,33 @@ fn register_spun_up_agent<S: AgentRegistry>(
             lead.display_name
         )));
     }
-    let resuming = store.agent_by_name(&v.persona)?.is_some();
+    // An existing agent keeps its email and extra areas. Only a retired agent, or an active one
+    // with the same project and role (a repeat spin-up), may be registered over: otherwise a
+    // spin-up under a resident's persona would re-home or de-role that resident.
+    let (email, extra_areas, replace) = match store.agent_by_name(&v.persona)? {
+        None => (None, Vec::new(), false),
+        Some(agent) => {
+            if agent.status == AgentStatus::Active
+                && (agent.project != project_key || agent.role != role)
+            {
+                return Err(LifecycleError::Conflict(format!(
+                    "agent `{}` is already active in project `{}` as {}",
+                    v.persona,
+                    agent.project,
+                    role_label_of(&agent.role)
+                )));
+            }
+            (Some(agent.email), agent.extra_areas, true)
+        }
+    };
     Ok(store.register_agent(RegisterAgentArgs {
         display_name: capitalize(&v.persona),
-        email: None,
+        email,
         project: project_key,
         role,
-        extra_areas: Vec::new(),
+        extra_areas,
         create_area: true,
-        replace: resuming,
+        replace,
         at: stamp::now(),
         by: by.to_string(),
     })?)
@@ -504,7 +547,10 @@ fn remove_routes(home_override: Option<&Path>, personas: &[&str], session_ids: &
     removed
 }
 
-/// Spin up a session: register the agent, open its tmux runtime, hydrate it, persist the record.
+/// Spin up a session: register the agent, persist its record, open its tmux runtime, hydrate it.
+///
+/// The record is written before tmux starts, so a runtime this call opens always has a record
+/// that teardown can find; the record is then updated with what actually started.
 pub fn spin_up<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -517,15 +563,12 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
     let session_id = format!("{}:{}", v.vendor, v.persona);
     let display = capitalize(&v.persona);
     let tmux_target = format!("{display}:{}", v.vendor);
-    let runtime_spawned =
-        v.hosted && env.spawn_runtime && spawn_tmux_runtime(&display, &v.vendor, v.cwd.as_deref());
     let prompt = prompt_for(&display, &v.project, &v.role);
-    let hydration_dispatched = deliver_prompt(env, &v.persona, &session_id, by, &prompt);
 
     let now = now_ms();
     let previous =
         find_hosted_session(store, &[&session_id])?.filter(|r| r.session_id == session_id);
-    let record = HostedSessionRecord {
+    let mut record = HostedSessionRecord {
         session_id: session_id.clone(),
         persona: v.persona.clone(),
         project: v.project.clone(),
@@ -539,13 +582,27 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
         restart_count: previous.as_ref().map_or(0, |r| r.restart_count),
         tmux_target: Some(tmux_target.clone()),
         cwd: v.cwd.clone(),
-        hydration_dispatched,
-        runtime_spawned: runtime_spawned || previous.as_ref().is_some_and(|r| r.runtime_spawned),
+        hydration_dispatched: false,
+        runtime_spawned: previous.as_ref().is_some_and(|r| r.runtime_spawned),
         created_at_ms: previous.as_ref().map_or(now, |r| r.created_at_ms),
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
     };
     persist_hosted_session(store, &record, by)?;
+
+    let spawned =
+        v.hosted && env.spawn_runtime && spawn_tmux_runtime(&display, &v.vendor, v.cwd.as_deref());
+    let hydration_dispatched = deliver_prompt(env, &v.persona, &session_id, by, &prompt);
+    record.runtime_spawned |= spawned;
+    record.hydration_dispatched = hydration_dispatched;
+    record.updated_at_ms = now_ms();
+    if let Err(e) = persist_hosted_session(store, &record, by) {
+        if spawned {
+            // The record cannot learn about this runtime, so teardown could never stop it.
+            kill_tmux_runtime(&display);
+        }
+        return Err(e);
+    }
 
     Ok(SpinUpResponse {
         session_id,
@@ -619,7 +676,13 @@ impl SessionTarget {
         let persona_guess = disc_persona
             .map(|p| p.rsplit(':').next().unwrap_or(&p).to_ascii_lowercase())
             .unwrap_or(derived);
-        let hosted = find_hosted_session(store, &[raw, &disc_id, &persona_guess])?;
+        // A `vendor:persona` id is exact: it never falls back to another vendor's record of the
+        // same persona, so the bare persona is not offered as a lookup key for it.
+        let mut keys = vec![raw, disc_id.as_str()];
+        if split_vendor_id(raw).is_none() {
+            keys.push(persona_guess.as_str());
+        }
+        let hosted = find_hosted_session(store, &keys)?;
         Ok(match hosted {
             Some(rec) => Self {
                 raw_id: raw.to_string(),
@@ -627,12 +690,20 @@ impl SessionTarget {
                 persona: rec.persona.clone(),
                 hosted: Some(rec),
             },
-            None => Self {
-                raw_id: raw.to_string(),
-                session_id: disc_id,
-                persona: persona_guess,
-                hosted: None,
-            },
+            None => {
+                // Reject a guess no agent can have, before anything looks it up or acts on it.
+                if validate_slug(&persona_guess).is_err() {
+                    return Err(LifecycleError::Invalid(format!(
+                        "session id `{raw}` does not name a valid persona"
+                    )));
+                }
+                Self {
+                    raw_id: raw.to_string(),
+                    session_id: disc_id,
+                    persona: persona_guess,
+                    hosted: None,
+                }
+            }
         })
     }
 
@@ -712,6 +783,9 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     target: &SessionTarget,
     by: &str,
 ) -> Result<DecommissionResponse, LifecycleError> {
+    if target.hosted.as_ref().is_some_and(is_decommissioned) {
+        return Err(decommissioned_conflict(&target.session_id));
+    }
     let Some((project, role)) = project_and_role(store, target)? else {
         return Err(LifecycleError::NotFound(format!(
             "no hosted session or agent record for `{}`",
@@ -746,17 +820,77 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     })
 }
 
+/// Who asks for a teardown. A session with no hosted record is adopted by the teardown, which
+/// retires whatever agent its id names, so only the owner may adopt one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    Owner,
+    Peer,
+}
+
+fn is_decommissioned(record: &HostedSessionRecord) -> bool {
+    record.status == STATUS_DECOMMISSIONED
+}
+
+fn decommissioned_conflict(session_id: &str) -> LifecycleError {
+    LifecycleError::Conflict(format!(
+        "hosted session `{session_id}` is decommissioned; spin it up again"
+    ))
+}
+
+/// `tmux` session name of a `Session:window` target.
+fn tmux_session_name(tmux_target: &str) -> &str {
+    tmux_target.split(':').next().unwrap_or(tmux_target)
+}
+
 /// Phase two: drop queued prompts and routes, stop the runtime this lifecycle started, retire
 /// the agent, and mark the record `decommissioned`. Safe to repeat.
 ///
-/// `clear_queue` is called with each id the session may be queued under.
+/// `caller` gates adopting a session that has no hosted record (owner only). `clear_queue` is
+/// called with each id the session may be queued under. Everything that can fail on a lookup
+/// runs before the first side effect.
 pub fn teardown_session<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     by: &str,
+    caller: Caller,
     mut clear_queue: impl FnMut(&str),
 ) -> Result<DecommissionResponse, LifecycleError> {
+    if target.hosted.is_none() && caller != Caller::Owner {
+        return Err(LifecycleError::Forbidden(format!(
+            "only Owner authority may decommission `{}`, which has no hosted session record",
+            target.raw_id
+        )));
+    }
+    let mut record = record_for_target(store, target)?;
+    let agent = store.agent_by_name(&target.persona)?;
+    // The tmux session name is the capitalised persona, so `claude:ada` and `codex:ada` share
+    // session `Ada`. Killing it would end the other, still-live session.
+    let sharing: Vec<HostedSessionRecord> = match record.tmux_target.as_deref() {
+        Some(tmux_target) => list_hosted_sessions(store)?
+            .into_iter()
+            .filter(|r| {
+                r.session_id != record.session_id
+                    && !is_decommissioned(r)
+                    && r.tmux_target.as_deref().map(tmux_session_name)
+                        == Some(tmux_session_name(tmux_target))
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    let shared_runtime = record.runtime_spawned && !sharing.is_empty();
+    if shared_runtime {
+        // The runtime stays up for the other sessions, so ownership of it moves to them: the
+        // last one torn down then stops it.
+        for mut other in sharing {
+            other.runtime_spawned = true;
+            other.updated_at_ms = now_ms();
+            persist_hosted_session(store, &other, by)?;
+        }
+        record.runtime_spawned = false;
+    }
+
     for key in target.keys() {
         clear_queue(key);
     }
@@ -766,16 +900,17 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
         &[target.session_id.as_str(), target.raw_id.as_str()],
     );
 
-    let mut record = record_for_target(store, target)?;
     let runtime_stopped = match (&record.tmux_target, record.runtime_spawned) {
         (Some(tmux_target), true) if env.spawn_runtime => {
-            kill_tmux_runtime(tmux_target.split(':').next().unwrap_or(tmux_target))
+            kill_tmux_runtime(tmux_session_name(tmux_target))
         }
+        // Still running for the sessions that share it: report that truthfully.
+        _ if shared_runtime => false,
         // Spawning is off, so no runtime was started in this run to stop.
         _ => true,
     };
 
-    if let Some(agent) = store.agent_by_name(&target.persona)?
+    if let Some(agent) = agent
         && agent.status == AgentStatus::Active
     {
         store.retire_agent(&agent.id, stamp::now(), by)?;
@@ -806,6 +941,7 @@ pub struct RestartResponse {
 }
 
 /// Count a restart: reopen a missing tmux session, redeliver the reforge prompt, mark running.
+/// A `decommissioned` session is refused (409); spin it up again instead.
 pub fn restart_hosted_session<S: StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -814,6 +950,10 @@ pub fn restart_hosted_session<S: StateStore>(
 ) -> Result<RestartResponse, LifecycleError> {
     let mut record = find_hosted_session(store, &[id])?
         .ok_or_else(|| LifecycleError::NotFound(format!("no hosted session `{id}`")))?;
+    if is_decommissioned(&record) {
+        // Its agent is retired; restarting would mark it running with no agent behind it.
+        return Err(decommissioned_conflict(&record.session_id));
+    }
     let display = capitalize(&record.persona);
     if record.hosted
         && env.spawn_runtime
@@ -1129,7 +1269,7 @@ mod tests {
 
         let target = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
         let mut cleared = Vec::new();
-        let out = teardown_session(&store, &env, &target, "owner", |k| {
+        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |k| {
             cleared.push(k.to_string())
         })
         .unwrap();
@@ -1148,7 +1288,7 @@ mod tests {
         let rec = find_hosted_session(&store, &["felicity"]).unwrap().unwrap();
         assert_eq!(rec.status, "decommissioned");
 
-        teardown_session(&store, &env, &target, "owner", |_| {}).unwrap();
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
     }
 
     #[test]
@@ -1162,7 +1302,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(target.persona, "ghost");
-        let out = teardown_session(&store, &env(&home), &target, "owner", |_| {}).unwrap();
+        let out =
+            teardown_session(&store, &env(&home), &target, "owner", Caller::Owner, |_| {}).unwrap();
         assert_eq!(out.session_id, "claude-abc");
         let rec = find_hosted_session(&store, &["claude-abc"])
             .unwrap()
@@ -1175,7 +1316,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_counts_and_revives_the_record() {
+    fn restart_counts_and_revives_a_prepared_record() {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
@@ -1187,11 +1328,12 @@ mod tests {
         )
         .unwrap();
         let target = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
-        teardown_session(&store, &env, &target, "owner", |_| {}).unwrap();
+        prepare_decommission(&store, &env, &target, "owner").unwrap();
 
         let out = restart_hosted_session(&store, &env, "claude:felicity", "owner").unwrap();
         assert_eq!(out.record.restart_count, 1);
         assert_eq!(out.record.status, "running");
+        assert_eq!(out.record.decommission_prepared_at_ms, None);
         assert!(out.prompt.contains("take up residence in FerroLoop/"));
         let out = restart_hosted_session(&store, &env, "felicity", "owner").unwrap();
         assert_eq!(out.record.restart_count, 2);
@@ -1200,6 +1342,365 @@ mod tests {
                 .unwrap_err()
                 .status(),
             404
+        );
+    }
+
+    fn decommissioned_felicity(store: &MemStore, env: &LifecycleEnv<'_>) -> SessionTarget {
+        spin_up(store, env, &req("felicity", "assistant", "claude"), "owner").unwrap();
+        let target = SessionTarget::resolve(store, "claude:felicity", None).unwrap();
+        teardown_session(store, env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        SessionTarget::resolve(store, "claude:felicity", None).unwrap()
+    }
+
+    #[test]
+    fn restart_and_prepare_of_a_decommissioned_session_conflict_and_change_nothing() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let target = decommissioned_felicity(&store, &env);
+        let before = find_hosted_session(&store, &["claude:felicity"]).unwrap();
+
+        let err = restart_hosted_session(&store, &env, "claude:felicity", "owner").unwrap_err();
+        assert!(matches!(err, LifecycleError::Conflict(_)), "{err}");
+        assert_eq!(err.status(), 409);
+        let err = prepare_decommission(&store, &env, &target, "owner").unwrap_err();
+        assert_eq!(err.status(), 409);
+
+        assert_eq!(
+            find_hosted_session(&store, &["claude:felicity"]).unwrap(),
+            before
+        );
+        assert_eq!(before.unwrap().status, "decommissioned");
+        assert_eq!(
+            store.agent_by_name("felicity").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+        // Teardown stays repeatable, and spin-up revives the session and its agent.
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+        )
+        .unwrap();
+        assert_eq!(
+            restart_hosted_session(&store, &env, "claude:felicity", "owner")
+                .unwrap()
+                .record
+                .status,
+            "running"
+        );
+    }
+
+    fn register(store: &MemStore, persona: &str, project: &str, role: AgentRole) {
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: capitalize(persona),
+                email: Some(format!("{persona}@example.org")),
+                project: project.into(),
+                role,
+                extra_areas: vec!["notes".into()],
+                create_area: true,
+                replace: false,
+                at: stamp::now(),
+                by: "owner".into(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn idempotent_respin_keeps_the_agents_email_and_extra_areas() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        register(&store, "felicity", "ferroloop", AgentRole::Assistant);
+        spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+        )
+        .unwrap();
+        let agent = store.agent_by_name("felicity").unwrap().unwrap();
+        assert_eq!(agent.email, "felicity@example.org");
+        assert_eq!(agent.extra_areas, ["notes"]);
+        assert_eq!(agent.status, AgentStatus::Active);
+
+        // A retired agent comes back in its new project, still with its email and extra areas.
+        store
+            .retire_agent(&agent.id, stamp::now(), "owner")
+            .unwrap();
+        let mut other = req("felicity", "ui-developer", "claude");
+        other.project = "elsewhere".into();
+        spin_up(&store, &env, &other, "owner").unwrap();
+        let agent = store.agent_by_name("felicity").unwrap().unwrap();
+        assert_eq!(
+            (agent.status, agent.project.as_str(), agent.email.as_str()),
+            (AgentStatus::Active, "elsewhere", "felicity@example.org")
+        );
+        assert_eq!(agent.extra_areas, ["notes"]);
+    }
+
+    #[test]
+    fn spin_up_of_an_active_agent_in_another_project_or_role_conflicts() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        register(&store, "jarvis", "ferroloop", AgentRole::LabManager);
+        let before = store.agent_by_name("jarvis").unwrap().unwrap();
+
+        let mut other_project = req("jarvis", "lab-manager", "claude");
+        other_project.project = "elsewhere".into();
+        for r in [
+            req("jarvis", "assistant", "claude"),
+            req("jarvis", "ui-developer", "codex"),
+            other_project,
+        ] {
+            let err = spin_up(&store, &env, &r, "peer").unwrap_err();
+            assert!(matches!(err, LifecycleError::Conflict(_)), "{err}");
+        }
+        assert_eq!(store.agent_by_name("jarvis").unwrap().unwrap(), before);
+        assert!(list_hosted_sessions(&store).unwrap().is_empty());
+        assert!(store.get_area("elsewhere").unwrap().is_none());
+    }
+
+    #[test]
+    fn respin_preserves_created_at_restart_count_and_runtime_ownership() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        let mut rec = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        rec.restart_count = 3;
+        rec.runtime_spawned = true;
+        rec.created_at_ms = 1;
+        persist_hosted_session(&store, &rec, "owner").unwrap();
+
+        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        let again = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                again.restart_count,
+                again.created_at_ms,
+                again.runtime_spawned
+            ),
+            (3, 1, true)
+        );
+        assert!(again.updated_at_ms > 1);
+    }
+
+    #[test]
+    fn peer_teardown_of_an_unmanaged_session_is_forbidden_and_changes_nothing() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        register(&store, "jarvis", "ferroloop", AgentRole::LabManager);
+        let routes = webhook_route_file(home.path(), "jarvis");
+        let target = SessionTarget::resolve(&store, "claude:jarvis", None).unwrap();
+        assert!(target.hosted.is_none());
+
+        let mut cleared = Vec::new();
+        let err = teardown_session(&store, &env, &target, "peer", Caller::Peer, |k| {
+            cleared.push(k.to_string())
+        })
+        .unwrap_err();
+        assert!(matches!(err, LifecycleError::Forbidden(_)), "{err}");
+        assert_eq!(err.status(), 403);
+        assert!(cleared.is_empty());
+        assert!(RouteTable::load(Some(&routes)).get("jarvis").is_some());
+        assert_eq!(
+            store.agent_by_name("jarvis").unwrap().unwrap().status,
+            AgentStatus::Active
+        );
+        assert!(list_hosted_sessions(&store).unwrap().is_empty());
+
+        // The owner may adopt it.
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(
+            store.agent_by_name("jarvis").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn peer_teardown_of_a_hosted_session_still_works() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(&store, &env, &req("ada", "assistant", "claude"), "peer").unwrap();
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &target, "peer", Caller::Peer, |_| {}).unwrap();
+        assert_eq!(out.status, "decommissioned");
+        assert_eq!(
+            store.agent_by_name("ada").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+    }
+
+    #[test]
+    fn a_malformed_session_id_is_rejected_before_any_side_effect() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let routes = webhook_route_file(home.path(), "ada");
+        for raw in ["claude:Foo Bar", "claude:", "a/b", "1abc"] {
+            let err = SessionTarget::resolve(&store, raw, None).unwrap_err();
+            assert!(matches!(err, LifecycleError::Invalid(_)), "{raw}: {err}");
+            assert_eq!(err.status(), 400);
+        }
+        let err = SessionTarget::resolve(
+            &store,
+            "claude-abc",
+            Some(("claude-abc".into(), Some("Bad Name".into()))),
+        )
+        .unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(RouteTable::load(Some(&routes)).get("ada").is_some());
+        assert!(list_hosted_sessions(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn teardown_lookup_failure_happens_before_side_effects() {
+        // A target built by hand with an unusable persona still fails before queues or routes change.
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let target = SessionTarget {
+            raw_id: "claude:Bad Name".into(),
+            session_id: "claude:Bad Name".into(),
+            persona: "bad name".into(),
+            hosted: None,
+        };
+        let mut cleared = Vec::new();
+        let err = teardown_session(&store, &env, &target, "owner", Caller::Owner, |k| {
+            cleared.push(k.to_string())
+        })
+        .unwrap_err();
+        assert_eq!(err.status(), 500);
+        assert!(cleared.is_empty());
+        assert!(list_hosted_sessions(&store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_vendor_qualified_id_never_matches_another_vendors_record() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+
+        let id_of = |raw: &str| {
+            SessionTarget::resolve(&store, raw, None)
+                .unwrap()
+                .hosted
+                .map(|r| r.session_id)
+        };
+        assert_eq!(id_of("claude:ada").as_deref(), Some("claude:ada"));
+        assert_eq!(id_of("ada").as_deref(), Some("claude:ada"));
+        assert_eq!(id_of("codex:ada"), None);
+        assert!(
+            find_hosted_session(&store, &["codex:ada"])
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            restart_hosted_session(&store, &env, "codex:ada", "owner")
+                .unwrap_err()
+                .status(),
+            404
+        );
+        // A discovered session of a vendor with a record still maps onto it by persona.
+        let found = SessionTarget::resolve(
+            &store,
+            "claude-abc",
+            Some(("claude-abc".into(), Some("Ada".into()))),
+        )
+        .unwrap();
+        assert_eq!(found.session_id, "claude:ada");
+
+        // With both vendors present each id resolves to its own record, and the exact id wins
+        // over a persona key listed before it.
+        spin_up(&store, &env, &req("ada", "assistant", "codex"), "owner").unwrap();
+        assert_eq!(id_of("codex:ada").as_deref(), Some("codex:ada"));
+        assert_eq!(id_of("claude:ada").as_deref(), Some("claude:ada"));
+        assert_eq!(
+            find_hosted_session(&store, &["ada", "codex:ada"])
+                .unwrap()
+                .unwrap()
+                .session_id,
+            "codex:ada"
+        );
+    }
+
+    #[test]
+    fn teardown_keeps_a_tmux_session_that_another_hosted_session_shares() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        spin_up(&store, &env, &req("ada", "assistant", "codex"), "owner").unwrap();
+        let set_spawned = |id: &str, spawned: bool| {
+            let mut rec = find_hosted_session(&store, &[id]).unwrap().unwrap();
+            rec.runtime_spawned = spawned;
+            persist_hosted_session(&store, &rec, "owner").unwrap();
+        };
+        let spawned = |id: &str| {
+            find_hosted_session(&store, &[id])
+                .unwrap()
+                .unwrap()
+                .runtime_spawned
+        };
+        // `claude:ada` opened the shared tmux session `Ada`.
+        set_spawned("claude:ada", true);
+
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(out.status, "decommissioned");
+        assert!(!out.runtime_stopped, "the shared session is still running");
+        // Ownership moved to the surviving session, which stops it in its turn.
+        assert!(!spawned("claude:ada") && spawned("codex:ada"));
+        assert_eq!(
+            find_hosted_session(&store, &["codex:ada"])
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
+
+        let target = SessionTarget::resolve(&store, "codex:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert!(out.runtime_stopped);
+        assert!(spawned("codex:ada"));
+    }
+
+    #[test]
+    fn teardown_stops_the_tmux_session_when_the_other_sharer_is_decommissioned() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        spin_up(&store, &env, &req("ada", "assistant", "codex"), "owner").unwrap();
+        let other = SessionTarget::resolve(&store, "codex:ada", None).unwrap();
+        teardown_session(&store, &env, &other, "owner", Caller::Owner, |_| {}).unwrap();
+        let mut rec = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        rec.runtime_spawned = true;
+        persist_hosted_session(&store, &rec, "owner").unwrap();
+
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        let out = teardown_session(&store, &env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        // Spawning is off in tests, so the stop is reported without a real `tmux` call.
+        assert!(out.runtime_stopped);
+        assert!(
+            find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap()
+                .runtime_spawned
         );
     }
 
