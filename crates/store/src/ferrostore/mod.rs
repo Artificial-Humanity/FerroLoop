@@ -1,14 +1,16 @@
-//! Document store and FerroMQ log in a `.fls` file.
+//! Document store and FerroMQ log in a `.fls` file, and a socket server.
 //! See `docs/ferrostore-spec.md`.
 
 mod doc;
 mod layout;
 mod migrate;
+mod server;
 mod state;
 mod traits_catalog;
 mod traits_state;
 mod traits_wire;
 mod traits_workflow;
+mod ws;
 
 #[cfg(test)]
 mod tests;
@@ -18,20 +20,22 @@ use layout::{
     HEADER_BYTES, Op, SLOT_LEN, Superblock, backend, corrupt, decode_snapshot, decode_wal,
     encode_frame, encode_snapshot, encode_superblock, parse_superblock,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use state::{
     DocState, MQ_HIGH_WATER_ID, apply_commit, apply_frames, commit_ops, mq_hw_collection,
     mq_message_collection, next_mq_seq, unread_mq,
 };
 
 pub use migrate::migrate_redb_to_ferrostore;
+pub use server::FerroStoreServer;
 pub use state::MqRecord;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
 
@@ -73,6 +77,7 @@ impl Drop for FlockGuard {
 enum Inner {
     Memory(Mutex<DocState>),
     Disk(Disk),
+    Remote(server::RemoteClient),
 }
 
 struct Disk {
@@ -128,10 +133,12 @@ impl Txn {
     }
 }
 
-/// Phase 1 document store and FerroMQ log.
+/// Document store and FerroMQ log.
 ///
 /// `mem://` keeps the map in this process. `file://` is a `.fls` container:
 /// two superblock slots, a copy-on-write snapshot, and a CRC32-framed WAL.
+/// `unix://` and `ws://` are clients of a [`FerroStoreServer`] and do not open the file.
+/// [`Self::auto`] is that client when the default socket is listening, and [`Self::open`] otherwise.
 pub struct FerroStore {
     inner: Inner,
     subs: Mutex<HashMap<String, Vec<Sender<MqRecord>>>>,
@@ -176,7 +183,32 @@ impl FerroStore {
         })
     }
 
-    /// `mem://`, `file://`, and the refused served-mode schemes.
+    /// If `default_socket_path_for_store(path)` accepts a Unix connection, return a client of that server.
+    /// Otherwise `open(path)` in embedded mode.
+    ///
+    /// The successful `UnixStream` is the client. It is not dropped in favor of a second connect.
+    /// A refused connect (nothing listening, or no socket file) is the embedded fallback, not an error.
+    /// `open` errors are still returned.
+    pub fn auto(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        let sock = default_socket_path_for_store(path);
+        match UnixStream::connect(&sock) {
+            Ok(stream) => {
+                let remote = server::client_from_unix(stream)?;
+                Ok(Self {
+                    inner: Inner::Remote(remote),
+                    subs: Mutex::new(HashMap::new()),
+                    label: sock.display().to_string(),
+                })
+            }
+            // Nothing listening, or the socket file is missing. Other connect
+            // errors stay errors. `open` errors are not swallowed.
+            Err(err) if refused_connect(&err) => Self::open(path),
+            Err(err) => Err(backend(format!("connect {}: {err}", sock.display()))),
+        }
+    }
+
+    /// `mem://`, `file://`, `unix://`, and `ws://`. `wss://` is recognized and refused.
     pub fn connect_uri(uri: &str) -> Result<Self, StoreError> {
         if uri == "mem://" || uri == "mem:///" {
             return Ok(Self::in_memory());
@@ -184,22 +216,44 @@ impl FerroStore {
         if let Some(rest) = uri.strip_prefix("file://") {
             return Self::open(file_uri_path(rest));
         }
-        if uri.starts_with("unix://") || uri.starts_with("ws://") || uri.starts_with("wss://") {
-            return Err(backend(
-                "Phase 2 serves unix socket and websocket transports; this build does not",
-            ));
+        if let Some(rest) = uri.strip_prefix("unix://") {
+            let path = file_uri_path(rest);
+            let remote = server::connect_unix(&path)?;
+            return Ok(Self {
+                inner: Inner::Remote(remote),
+                subs: Mutex::new(HashMap::new()),
+                label: path,
+            });
+        }
+        if uri.starts_with("wss://") {
+            return Err(backend("wss is not implemented"));
+        }
+        if let Some(rest) = uri.strip_prefix("ws://") {
+            let remote = server::connect_ws(rest)?;
+            return Ok(Self {
+                inner: Inner::Remote(remote),
+                subs: Mutex::new(HashMap::new()),
+                label: uri.to_string(),
+            });
         }
         Err(backend(format!("unknown FerroStore URI scheme in `{uri}`")))
     }
 
     pub fn checkpoint(&self) -> Result<(), StoreError> {
         match &self.inner {
+            Inner::Remote(remote) => remote.call_unit("checkpoint", json!({})),
             Inner::Memory(_) => Ok(()),
             Inner::Disk(disk) => checkpoint_disk(disk),
         }
     }
 
     pub fn put_doc(&self, collection: &str, id: &str, doc: &Value) -> Result<(), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_unit(
+                "put_doc",
+                json!({"collection": collection, "id": id, "doc": doc}),
+            );
+        }
         let collection = collection.to_string();
         let id = id.to_string();
         let doc = doc.clone();
@@ -216,6 +270,9 @@ impl FerroStore {
     }
 
     pub fn get_doc(&self, collection: &str, id: &str) -> Result<Option<Value>, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_option("get_doc", json!({"collection": collection, "id": id}));
+        }
         let state = self.read_state()?;
         Ok(state
             .docs
@@ -224,6 +281,9 @@ impl FerroStore {
     }
 
     pub fn delete_doc(&self, collection: &str, id: &str) -> Result<(), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_unit("delete_doc", json!({"collection": collection, "id": id}));
+        }
         let collection = collection.to_string();
         let id = id.to_string();
         self.commit(move |_| Ok((Op::Delete { collection, id }, ())))
@@ -235,6 +295,12 @@ impl FerroStore {
         field: &str,
         value: &str,
     ) -> Result<Vec<String>, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_strings(
+                "query_by_field",
+                json!({"collection": collection, "field": field, "value": value}),
+            );
+        }
         let state = self.read_state()?;
         Ok(state::query_by_field(&state, collection, field, value))
     }
@@ -245,6 +311,12 @@ impl FerroStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_pairs(
+                "search_bm25",
+                json!({"collection": collection, "query": query, "limit": limit}),
+            );
+        }
         let state = self.read_state()?;
         Ok(state::search_bm25(&state, collection, query, limit))
     }
@@ -252,6 +324,12 @@ impl FerroStore {
     /// Append one message. The returned sequence starts at 1 per topic and is
     /// not reused after that message document is deleted.
     pub fn publish_mq(&self, topic: &str, key: &str, payload: &Value) -> Result<u64, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_u64(
+                "publish_mq",
+                json!({"topic": topic, "key": key, "payload": payload}),
+            );
+        }
         let topic_owned = topic.to_string();
         let key_owned = key.to_string();
         let payload = payload.clone();
@@ -291,12 +369,24 @@ impl FerroStore {
         group: &str,
         limit: usize,
     ) -> Result<Vec<MqRecord>, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_records(
+                "poll_mq_group",
+                json!({"topic": topic, "group": group, "limit": limit}),
+            );
+        }
         let state = self.read_state()?;
         unread_mq(&state, topic, group, limit)
     }
 
     /// Record an ack. An unknown sequence is still stored.
     pub fn ack_mq(&self, topic: &str, group: &str, seq: u64) -> Result<(), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_unit(
+                "ack_mq",
+                json!({"topic": topic, "group": group, "seq": seq}),
+            );
+        }
         let topic = topic.to_string();
         let group = group.to_string();
         self.commit(move |_| {
@@ -313,6 +403,9 @@ impl FerroStore {
 
     /// Later publishes on this handle. History is not replayed.
     pub fn subscribe_mq(&self, topic: &str) -> Receiver<MqRecord> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.subscribe_topic(topic);
+        }
         let (tx, rx) = mpsc::channel();
         lock_mutex(&self.subs)
             .entry(topic.to_string())
@@ -337,6 +430,28 @@ impl FerroStore {
         match &self.inner {
             Inner::Memory(state) => Ok(lock_mutex(state).clone()),
             Inner::Disk(disk) => Ok(read_consistent(&disk.read)?.2),
+            Inner::Remote(remote) => remote.read_state(),
+        }
+    }
+
+    /// Compare-and-swap `ops` onto a store whose `last_seq` is still `expected_seq`.
+    ///
+    /// `Ok(false)` means the sequence moved and nothing was written. An empty `ops`
+    /// list that matches returns `Ok(true)` and does not advance `last_seq`. A
+    /// non-empty disk success is one WAL frame at `expected_seq + 1`. Remote
+    /// handles do not call this; the server's store is memory or disk.
+    fn commit_if_seq(&self, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
+        match &self.inner {
+            Inner::Memory(slot) => {
+                let mut state = lock_mutex(slot);
+                if state.last_seq != expected_seq {
+                    return Ok(false);
+                }
+                commit_ops(&mut state, ops)?;
+                Ok(true)
+            }
+            Inner::Disk(disk) => commit_if_seq_disk(disk, expected_seq, ops),
+            Inner::Remote(_) => Err(remote_unsupported()),
         }
     }
 
@@ -346,11 +461,28 @@ impl FerroStore {
     /// re-reads a consistent snapshot, then builds the transaction from that
     /// state. `Ok` with at least one op appends one WAL frame (`seq = last_seq + 1`)
     /// and publishes one superblock. `Err` or an empty op list writes nothing.
+    /// A remote handle compare-and-swaps those ops and runs `body` again when
+    /// `last_seq` changed. The body may run more than once only on a remote handle.
     fn with_write<T>(
         &self,
-        body: impl FnOnce(&mut Txn) -> Result<T, StoreError>,
+        mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         match &self.inner {
+            Inner::Remote(remote) => loop {
+                let state = remote.read_state()?;
+                let seq_base = state.last_seq;
+                let mut txn = Txn {
+                    docs: state.docs,
+                    ops: Vec::new(),
+                };
+                let result = body(&mut txn)?;
+                if txn.ops.is_empty() {
+                    return Ok(result);
+                }
+                if remote.commit_ops(seq_base, &txn.ops)? {
+                    return Ok(result);
+                }
+            },
             Inner::Memory(slot) => {
                 let mut state = lock_mutex(slot);
                 let mut txn = Txn {
@@ -370,6 +502,7 @@ impl FerroStore {
         build: impl FnOnce(&DocState) -> Result<(Op, T), StoreError>,
     ) -> Result<T, StoreError> {
         match &self.inner {
+            Inner::Remote(_) => Err(remote_unsupported()),
             Inner::Memory(slot) => {
                 let mut state = lock_mutex(slot);
                 let (op, extra) = build(&state)?;
@@ -392,6 +525,31 @@ impl FerroStore {
     }
 }
 
+fn remote_unsupported() -> StoreError {
+    backend("a remote FerroStore does not run a local transaction")
+}
+
+/// `dir/store.fls` -> `dir/store.fls.sock`.
+/// A path with no file name (`/` or `..`) -> that path joined with `ferrostore.sock`.
+pub fn default_socket_path_for_store(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    match path.file_name() {
+        Some(name) => {
+            let mut sock_name = name.to_os_string();
+            sock_name.push(".sock");
+            path.with_file_name(sock_name)
+        }
+        None => path.join("ferrostore.sock"),
+    }
+}
+
+fn refused_connect(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
+}
+
 fn file_uri_path(rest: &str) -> String {
     if rest.starts_with('/') {
         return rest.to_string();
@@ -405,9 +563,27 @@ fn file_uri_path(rest: &str) -> String {
     rest.to_string()
 }
 
+fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
+    let file = lock_mutex(&disk.write);
+    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
+    let (index, sb, state) = read_consistent(&file)?;
+    if state.last_seq != expected_seq {
+        return Ok(false);
+    }
+    if ops.is_empty() {
+        return Ok(true);
+    }
+    let seq = expected_seq
+        .checked_add(1)
+        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let frame = encode_frame(seq, ops)?;
+    append_frame(&file, index, &sb, &frame)?;
+    Ok(true)
+}
+
 fn with_write_disk<T>(
     disk: &Disk,
-    body: impl FnOnce(&mut Txn) -> Result<T, StoreError>,
+    mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;

@@ -1,11 +1,16 @@
 use super::layout::{self, Op, Superblock};
-use super::{FerroStore, file_uri_path, latest_superblock, write_slot};
+use super::{
+    FerroStore, FerroStoreServer, default_socket_path_for_store, file_uri_path, latest_superblock,
+    write_slot,
+};
 use fl_core::StoreError;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
+use std::thread;
 use std::time::Duration;
 
 fn temp_fls() -> (tempfile::TempDir, PathBuf) {
@@ -600,6 +605,399 @@ fn ferromq_redelivers_until_ack_and_subscribers_see_the_next_publish() {
     assert_eq!(store.publish_mq("orders", "k4", &json!(4)).unwrap(), 4);
 }
 
+fn must_not_unreachable<T>(result: Result<T, StoreError>) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            assert!(!matches!(err, StoreError::Unreachable { .. }), "{err}");
+            Err(err.to_string())
+        }
+    }
+}
+
+#[test]
+fn unix_socket_serves_concurrent_clients_without_opening_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("store.fls");
+    let sock = dir.path().join("store.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let uri = format!("unix://{}", sock.display());
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let uri = uri.clone();
+        handles.push(thread::spawn(move || {
+            let client = must_not_unreachable(FerroStore::connect_uri(&uri))?;
+            let id = format!("id-{i}");
+            must_not_unreachable(client.put_doc(
+                "docs",
+                &id,
+                &json!({"n": i, "name": format!("name{i}")}),
+            ))?;
+            let doc = must_not_unreachable(client.get_doc("docs", &id))?
+                .ok_or_else(|| format!("missing {id}"))?;
+            if doc["n"] != i {
+                return Err(format!("doc {id} was {doc}"));
+            }
+            Ok(())
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    let host_uri = format!("unix://localhost{}", sock.display());
+    let client = FerroStore::connect_uri(&host_uri).unwrap();
+    assert_eq!(
+        client.query_by_field("docs", "name", "name1").unwrap(),
+        vec!["id-1".to_string()]
+    );
+    let hits = client.search_bm25("docs", "name2", 10).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0].0, "id-2");
+    client.delete_doc("docs", "id-3").unwrap();
+    assert!(client.get_doc("docs", "id-3").unwrap().is_none());
+    client.checkpoint().unwrap();
+    client.with_read(|_| Ok(())).unwrap();
+    client.with_write(|_| Ok(())).unwrap();
+
+    assert_eq!(
+        server.store().get_doc("docs", "id-0").unwrap().unwrap()["n"],
+        0
+    );
+    assert_eq!(
+        server.store().get_doc("docs", "id-1").unwrap().unwrap()["name"],
+        "name1"
+    );
+    assert!(server.store().get_doc("docs", "id-3").unwrap().is_none());
+    drop(client);
+    drop(server);
+
+    let opened = FerroStore::open(&file).unwrap();
+    assert_eq!(opened.get_doc("docs", "id-0").unwrap().unwrap()["n"], 0);
+    assert_eq!(
+        opened.get_doc("docs", "id-1").unwrap().unwrap()["name"],
+        "name1"
+    );
+    assert_eq!(opened.get_doc("docs", "id-2").unwrap().unwrap()["n"], 2);
+    assert!(opened.get_doc("docs", "id-3").unwrap().is_none());
+}
+
+#[test]
+fn unix_socket_mq_subscribe_does_not_replay_and_ack_matches_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("store.fls");
+    let sock = dir.path().join("mq.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let uri = format!("unix://{}", sock.display());
+
+    let publisher = FerroStore::connect_uri(&uri).unwrap();
+    let early = publisher
+        .publish_mq("orders", "before", &json!({"n": 0}))
+        .unwrap();
+    assert_eq!(early, 1);
+
+    let client_a = FerroStore::connect_uri(&uri).unwrap();
+    let rx = client_a.subscribe_mq("orders");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "subscribe does not replay history"
+    );
+
+    let client_b = FerroStore::connect_uri(&uri).unwrap();
+    let seq = client_b
+        .publish_mq("orders", "k", &json!({"n": 1}))
+        .unwrap();
+    let rec = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(rec.seq, seq);
+    assert_eq!(rec.key, "k");
+    assert_eq!(rec.payload, json!({"n": 1}));
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+    let polled = client_a.poll_mq_group("orders", "g", 10).unwrap();
+    assert_eq!(polled.len(), 2);
+    assert_eq!(polled[0].seq, 1);
+    assert_eq!(polled[0].key, "before");
+    assert_eq!(polled[0].payload, json!({"n": 0}));
+    assert_eq!(polled[1].seq, seq);
+    assert_eq!(polled[1].key, "k");
+    assert_eq!(polled[1].payload, json!({"n": 1}));
+    assert_eq!(client_b.poll_mq_group("orders", "g", 10).unwrap().len(), 2);
+    client_a.ack_mq("orders", "g", 1).unwrap();
+    let after = client_a.poll_mq_group("orders", "g", 10).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].seq, seq);
+    assert_eq!(
+        client_a.poll_mq_group("orders", "other", 10).unwrap().len(),
+        2
+    );
+    assert!(client_a.poll_mq_group("orders", "g", 0).unwrap().is_empty());
+    client_a.ack_mq("orders", "g", seq).unwrap();
+    assert!(
+        client_a
+            .poll_mq_group("orders", "g", 10)
+            .unwrap()
+            .is_empty()
+    );
+    client_a.ack_mq("orders", "g", 99).unwrap();
+    assert!(
+        client_a
+            .poll_mq_group("orders", "g", 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(client_a);
+    drop(client_b);
+    drop(publisher);
+    drop(server);
+    let opened = FerroStore::open(&file).unwrap();
+    assert!(opened.poll_mq_group("orders", "g", 10).unwrap().is_empty());
+    assert_eq!(
+        opened.poll_mq_group("orders", "other", 10).unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn bind_unix_refuses_a_non_socket_and_drop_unlinks_its_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("not-a-socket");
+    std::fs::write(&file, b"file").unwrap();
+    let err = match FerroStoreServer::bind_unix(&file, FerroStore::in_memory()) {
+        Ok(_) => panic!("non-socket path was bound"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(file.is_file(), "a non-socket path is left in place");
+
+    let sock = dir.path().join("s.sock");
+    let stale = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    drop(stale);
+    assert!(sock.exists());
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    client.put_doc("c", "a", &json!(1)).unwrap();
+    assert_eq!(server.store().get_doc("c", "a").unwrap().unwrap(), json!(1));
+    drop(client);
+    drop(server);
+    assert!(!sock.exists());
+}
+
+#[test]
+fn unix_socket_get_doc_returns_stored_null_and_missing_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("null.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    client.put_doc("docs", "empty", &json!(null)).unwrap();
+    let stored = client.get_doc("docs", "empty");
+    assert!(
+        matches!(stored, Ok(Some(ref value)) if value.is_null()),
+        "{stored:?}"
+    );
+    let missing = client.get_doc("docs", "missing");
+    assert!(matches!(missing, Ok(None)), "{missing:?}");
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn unix_socket_subscribe_after_server_drop_is_disconnected() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("gone.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    drop(server);
+    let rx = client.subscribe_mq("orders");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(400)).unwrap_err(),
+        RecvTimeoutError::Disconnected
+    );
+}
+
+#[test]
+fn websocket_serves_concurrent_clients_without_opening_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("store.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    assert_ne!(server.local_addr().port(), 0);
+    let uri = format!("ws://{}", server.local_addr());
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let uri = uri.clone();
+        handles.push(thread::spawn(move || {
+            let client = must_not_unreachable(FerroStore::connect_uri(&uri))?;
+            let id = format!("id-{i}");
+            must_not_unreachable(client.put_doc(
+                "docs",
+                &id,
+                &json!({"n": i, "name": format!("name{i}")}),
+            ))?;
+            let doc = must_not_unreachable(client.get_doc("docs", &id))?
+                .ok_or_else(|| format!("missing {id}"))?;
+            if doc["n"] != i {
+                return Err(format!("doc {id} was {doc}"));
+            }
+            Ok(())
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    for i in 0..4 {
+        assert_eq!(
+            server
+                .store()
+                .get_doc("docs", &format!("id-{i}"))
+                .unwrap()
+                .unwrap()["n"],
+            i
+        );
+    }
+    drop(server);
+
+    let opened = FerroStore::open(&file).unwrap();
+    for i in 0..4 {
+        assert_eq!(
+            opened.get_doc("docs", &format!("id-{i}")).unwrap().unwrap()["n"],
+            i
+        );
+    }
+}
+
+#[test]
+fn websocket_mq_subscribe_does_not_replay_and_ack_matches_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("store.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let uri = format!("ws://{}", server.local_addr());
+
+    let publisher = FerroStore::connect_uri(&uri).unwrap();
+    let early = publisher
+        .publish_mq("orders", "before", &json!({"n": 0}))
+        .unwrap();
+    assert_eq!(early, 1);
+
+    let client_a = FerroStore::connect_uri(&uri).unwrap();
+    let rx = client_a.subscribe_mq("orders");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "subscribe does not replay history"
+    );
+
+    let client_b = FerroStore::connect_uri(&format!("{uri}/store")).unwrap();
+    let seq = client_b
+        .publish_mq("orders", "k", &json!({"n": 1}))
+        .unwrap();
+    let rec = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(rec.seq, seq);
+    assert_eq!(rec.key, "k");
+    assert_eq!(rec.payload, json!({"n": 1}));
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+    let polled = client_a.poll_mq_group("orders", "g", 10).unwrap();
+    assert_eq!(polled.len(), 2);
+    assert_eq!(polled[0].seq, 1);
+    assert_eq!(polled[0].key, "before");
+    assert_eq!(polled[0].payload, json!({"n": 0}));
+    assert_eq!(polled[1].seq, seq);
+    assert_eq!(polled[1].key, "k");
+    assert_eq!(polled[1].payload, json!({"n": 1}));
+    assert_eq!(client_b.poll_mq_group("orders", "g", 10).unwrap().len(), 2);
+    client_a.ack_mq("orders", "g", 1).unwrap();
+    let after = client_a.poll_mq_group("orders", "g", 10).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].seq, seq);
+    assert_eq!(
+        client_a.poll_mq_group("orders", "other", 10).unwrap().len(),
+        2
+    );
+    assert!(client_a.poll_mq_group("orders", "g", 0).unwrap().is_empty());
+    client_a.ack_mq("orders", "g", seq).unwrap();
+    assert!(
+        client_a
+            .poll_mq_group("orders", "g", 10)
+            .unwrap()
+            .is_empty()
+    );
+    client_a.ack_mq("orders", "g", 99).unwrap();
+    assert!(
+        client_a
+            .poll_mq_group("orders", "g", 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(client_a);
+    drop(client_b);
+    drop(publisher);
+    drop(server);
+    let opened = FerroStore::open(&file).unwrap();
+    assert!(opened.poll_mq_group("orders", "g", 10).unwrap().is_empty());
+    assert_eq!(
+        opened.poll_mq_group("orders", "other", 10).unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn websocket_get_doc_returns_stored_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("null.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("ws://{}/store", server.local_addr())).unwrap();
+    client.put_doc("docs", "empty", &json!(null)).unwrap();
+    let stored = client.get_doc("docs", "empty");
+    assert!(
+        matches!(stored, Ok(Some(ref value)) if value.is_null()),
+        "{stored:?}"
+    );
+    let missing = client.get_doc("docs", "missing");
+    assert!(matches!(missing, Ok(None)), "{missing:?}");
+    assert!(
+        server
+            .store()
+            .get_doc("docs", "empty")
+            .unwrap()
+            .unwrap()
+            .is_null()
+    );
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn websocket_subscribe_disconnects_when_the_server_drops() {
+    let server = FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+    let rx = client.subscribe_mq("orders");
+    drop(server);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap_err(),
+        RecvTimeoutError::Disconnected
+    );
+}
+
+#[test]
+fn unix_socket_subscribe_disconnects_when_the_server_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("live.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    let rx = client.subscribe_mq("orders");
+    drop(server);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(500)).unwrap_err(),
+        RecvTimeoutError::Disconnected
+    );
+}
+
 fn committed_frames(path: &Path) -> Vec<(u64, Vec<Op>)> {
     let file = File::open(path).unwrap();
     let sb = live(path);
@@ -735,20 +1133,56 @@ fn connect_uri_mem_and_file_and_refuses_other_schemes() {
     let reopened = FerroStore::connect_uri(&uri).unwrap();
     assert_eq!(reopened.get_doc("c", "rel").unwrap().unwrap()["ok"], true);
 
-    for uri in [
-        "unix:///tmp/ferro.sock",
-        "ws://127.0.0.1:9",
-        "wss://example.test/store",
-    ] {
+    for uri in ["ws://127.0.0.1:9", "ws://127.0.0.1:9/store"] {
         let err = match FerroStore::connect_uri(uri) {
-            Ok(_) => panic!("served uri {uri} was accepted"),
+            Ok(_) => panic!("closed ws port {uri} was accepted"),
             Err(err) => err,
         };
         let msg = err.to_string();
-        assert!(msg.contains("Phase 2"), "{uri}: {msg}");
+        assert!(matches!(err, StoreError::Backend(_)), "{uri}: {msg}");
         assert!(!msg.contains("unknown"), "{uri}: {msg}");
+        assert!(!msg.contains("Phase 2"), "{uri}: {msg}");
         assert!(!msg.contains("deferred"), "{uri}: {msg}");
     }
+    let wss = match FerroStore::connect_uri("wss://example.test/store") {
+        Ok(_) => panic!("wss uri was accepted"),
+        Err(err) => err,
+    };
+    let msg = wss.to_string();
+    assert!(matches!(wss, StoreError::Backend(_)), "{msg}");
+    assert!(msg.contains("wss"), "{msg}");
+    assert!(!msg.contains("unknown"), "{msg}");
+    assert!(!msg.contains("Phase 2"), "{msg}");
+    assert!(!msg.contains("deferred"), "{msg}");
+    let missing = match FerroStore::connect_uri("unix:///tmp/ferro.sock") {
+        Ok(_) => panic!("missing unix socket was accepted"),
+        Err(err) => err,
+    };
+    let msg = missing.to_string();
+    assert!(matches!(missing, StoreError::Backend(_)), "{msg}");
+    assert!(!msg.contains("unknown"), "{msg}");
+    assert!(!msg.contains("Phase 2"), "{msg}");
+    assert!(!msg.contains("deferred"), "{msg}");
+    let via_host = match FerroStore::connect_uri("unix://localhost/tmp/ferro.sock") {
+        Ok(_) => panic!("missing unix socket was accepted"),
+        Err(err) => err,
+    };
+    let msg = via_host.to_string();
+    assert!(msg.contains("/tmp/ferro.sock"), "{msg}");
+    assert!(!msg.contains("unknown"), "{msg}");
+    assert!(!msg.contains("Phase 2"), "{msg}");
+    let rel = format!("unix://ferrostore-missing-{}/x.sock", std::process::id());
+    let missing_rel = match FerroStore::connect_uri(&rel) {
+        Ok(_) => panic!("missing unix socket was accepted"),
+        Err(err) => err,
+    };
+    let msg = missing_rel.to_string();
+    assert!(
+        msg.contains(&format!("ferrostore-missing-{}/x.sock", std::process::id())),
+        "{msg}"
+    );
+    assert!(!msg.contains("unknown"), "{msg}");
+    assert!(!msg.contains("Phase 2"), "{msg}");
     for uri in ["", "http://example.test", "bogus", "mem://other"] {
         let err = match FerroStore::connect_uri(uri) {
             Ok(_) => panic!("uri {uri} was accepted"),
@@ -1454,4 +1888,395 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
         Some(&json!("two"))
     );
     assert_eq!(state.last_seq, 2);
+}
+
+#[test]
+fn default_socket_path_for_store_names_the_socket_beside_the_file() {
+    let path = default_socket_path_for_store("dir/store.fls");
+    assert_eq!(path, PathBuf::from("dir/store.fls.sock"));
+    assert!(path.ends_with("store.fls.sock"));
+    assert_eq!(path.parent(), Some(Path::new("dir")));
+    assert_eq!(
+        default_socket_path_for_store("/"),
+        PathBuf::from("/ferrostore.sock")
+    );
+    assert_eq!(
+        default_socket_path_for_store(".."),
+        PathBuf::from("../ferrostore.sock")
+    );
+}
+
+#[test]
+fn auto_uses_the_listening_socket_and_otherwise_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.fls");
+
+    {
+        let store = FerroStore::auto(&path).unwrap();
+        store.put_doc("docs", "local", &json!({"n": 1})).unwrap();
+    }
+    let opened = FerroStore::open(&path).unwrap();
+    assert_eq!(opened.get_doc("docs", "local").unwrap().unwrap()["n"], 1);
+    drop(opened);
+
+    // A socket file with nobody listening is a refused connect, not an error.
+    let sock = default_socket_path_for_store(&path);
+    drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+    {
+        let store = FerroStore::auto(&path).unwrap();
+        store.put_doc("docs", "stale", &json!({"n": 4})).unwrap();
+    }
+    let opened = FerroStore::open(&path).unwrap();
+    assert_eq!(opened.get_doc("docs", "stale").unwrap().unwrap()["n"], 4);
+    drop(opened);
+
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&path).unwrap()).unwrap();
+    let client = FerroStore::auto(&path).unwrap();
+    client.with_read(|_| Ok(())).unwrap();
+    client.put_doc("docs", "remote", &json!({"n": 2})).unwrap();
+    assert_eq!(
+        server.store().get_doc("docs", "remote").unwrap().unwrap()["n"],
+        2
+    );
+    drop(client);
+    drop(server);
+
+    let client = FerroStore::auto(&path).unwrap();
+    assert_eq!(client.get_doc("docs", "remote").unwrap().unwrap()["n"], 2);
+    client.put_doc("docs", "again", &json!({"n": 3})).unwrap();
+    drop(client);
+    let opened = FerroStore::open(&path).unwrap();
+    assert_eq!(opened.get_doc("docs", "again").unwrap().unwrap()["n"], 3);
+    assert_eq!(opened.get_doc("docs", "remote").unwrap().unwrap()["n"], 2);
+}
+
+fn exercise_store_traits(store: &FerroStore, tag: &str) {
+    use fl_core::agent::{AgentRole, AreaRecord, RegisterAgentArgs};
+    use fl_core::at::At;
+    use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+    use fl_core::ids::{WorkflowId, WorkflowRunId, seq_iri};
+    use fl_core::model::State;
+    use fl_core::state::{
+        HandoffEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+    };
+    use fl_core::store::{
+        AgentRegistry, Catalog, MessageStore, StateStore, Tracker, WorkflowStore,
+    };
+    use fl_core::workflow::{
+        AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS, DEFAULT_STEP_MAX_VISITS,
+        END_STEP, EdgeCondition, EdgeDef, JoinPolicy, StepCompletion, StepDef, WorkflowDef,
+        WorkflowRun,
+    };
+    use std::collections::BTreeMap;
+
+    let root = format!("/work/{tag}");
+    let project = store.add_project(&root).unwrap();
+    let loaded = store.get_project(&project).unwrap().expect("project");
+    assert_eq!(loaded.id, project);
+    assert_eq!(loaded.root, root);
+
+    let title = format!("title {tag}");
+    let record = store.add_record(&project, &title).unwrap();
+    store.set_record_state(&record, State::Doing).unwrap();
+    let got = store.get_record(&record).unwrap().expect("record");
+    assert_eq!(got.id, record);
+    assert_eq!(got.state, State::Doing);
+    assert_eq!(got.title, title);
+
+    let area_name = format!("area-{tag}");
+    store
+        .upsert_area(
+            AreaRecord::new(
+                &area_name,
+                Some(format!("{tag}/")),
+                "Agent orchestration",
+                At::from_unix_millis(1),
+                "owner",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let agent_name = format!("agent-{tag}");
+    let agent = store
+        .register_agent(RegisterAgentArgs {
+            display_name: agent_name.clone(),
+            email: None,
+            project: area_name.clone(),
+            role: AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(2),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let fetched = store.get_agent(&agent.id).unwrap().expect("agent");
+    assert_eq!(fetched.id, agent.id);
+    assert_eq!(fetched.display_name, agent_name);
+    assert_eq!(fetched.project, area_name);
+
+    let slug = format!("rule-{tag}");
+    let state = store
+        .upsert_state(UpsertStateArgs {
+            scope: StateScope::Workspace,
+            slug: slug.clone(),
+            sensitivity: SensitivityPatch::Inherit,
+            payload: StatePayload::Handoff(HandoffEntry {
+                summary: "v6".into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let got_state = store.get_state(&state.id).unwrap().expect("state");
+    assert_eq!(got_state.id, state.id);
+    assert_eq!(got_state.slug, slug);
+
+    let flow = format!("flow-{tag}");
+    let workflow = store
+        .upsert_workflow_def(WorkflowDef {
+            id: WorkflowId(seq_iri(900)),
+            project: project.clone(),
+            slug: flow.clone(),
+            title: format!("CI {tag}"),
+            start_step: "build".into(),
+            steps: vec![StepDef {
+                step_id: "build".into(),
+                title: "Build".into(),
+                prompt: "Run build.".into(),
+                assignee: AssigneeRule::Agent {
+                    name: "felicia".into(),
+                },
+                reviews_step: None,
+                require_different_vendor: false,
+                completion: StepCompletion::Ungated,
+                join_policy: JoinPolicy::All,
+                max_attempts: DEFAULT_STEP_MAX_ATTEMPTS,
+                max_visits: DEFAULT_STEP_MAX_VISITS,
+                budget_usd_micros: None,
+                max_tokens: None,
+                isolate_worktree: false,
+            }],
+            edges: vec![EdgeDef {
+                from_step: "build".into(),
+                to_step: END_STEP.into(),
+                on: EdgeCondition::Pass,
+            }],
+            max_total_steps: DEFAULT_MAX_TOTAL_STEPS,
+            budget_usd_micros: None,
+            max_tokens: None,
+            declared_keys: BTreeMap::new(),
+            authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            authored_by: "ferris".into(),
+        })
+        .unwrap();
+    let got_workflow = store
+        .get_workflow_def(&workflow.id)
+        .unwrap()
+        .expect("workflow");
+    assert_eq!(got_workflow.slug, flow);
+    assert_eq!(got_workflow.project, project);
+
+    let run = store
+        .create_workflow_run(
+            WorkflowRun::new(
+                WorkflowRunId(seq_iri(901)),
+                &got_workflow,
+                format!("CI run {tag}"),
+                At::from_unix_millis(20),
+                "ferris",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let got_run = store.get_workflow_run(&run.id).unwrap().expect("run");
+    assert_eq!(got_run.id, run.id);
+    assert_eq!(got_run.workflow_id, got_workflow.id);
+
+    let import_def = got_workflow.clone();
+    let import_run = got_run.clone();
+    store.import_workflow_def(import_def).unwrap();
+    store.import_workflow_run(import_run).unwrap();
+    assert_eq!(
+        store.get_workflow_def(&got_workflow.id).unwrap().as_ref(),
+        Some(&got_workflow)
+    );
+    assert_eq!(
+        store.get_workflow_run(&got_run.id).unwrap().as_ref(),
+        Some(&got_run)
+    );
+
+    let body = format!("Body {tag}");
+    let (message, _) = store
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: Some("ai-lab-0".into()),
+            to: WireAddress::AgentName(agent_name),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: format!("Hello {tag}"),
+            body: body.clone(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+    let got_message = store
+        .get_wire_message(&message.id)
+        .unwrap()
+        .expect("wire message");
+    assert_eq!(got_message.id, message.id);
+    assert_eq!(got_message.body, body);
+}
+
+fn assert_concurrent_increments(connect: impl Fn() -> FerroStore + Sync, path: &Path) {
+    const THREADS: u64 = 8;
+    thread::scope(|scope| {
+        for i in 0..THREADS {
+            let connect = &connect;
+            scope.spawn(move || {
+                let client = connect();
+                client
+                    .with_write(|txn| {
+                        let n = txn
+                            .get("counter", "n")
+                            .and_then(|doc| doc.as_u64())
+                            .unwrap_or(0);
+                        txn.put("counter", "n", json!(n + 1));
+                        txn.put("private", format!("t{i}"), json!(i));
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+        }
+    });
+
+    let client = connect();
+    assert_eq!(
+        client.get_doc("counter", "n").unwrap().unwrap(),
+        json!(THREADS)
+    );
+    for i in 0..THREADS {
+        assert_eq!(
+            client
+                .get_doc("private", &format!("t{i}"))
+                .unwrap()
+                .unwrap(),
+            json!(i)
+        );
+    }
+
+    let frames = committed_frames(path);
+    assert_eq!(
+        frames.len(),
+        usize::try_from(THREADS).unwrap(),
+        "{frames:?}"
+    );
+    let mut privates = BTreeMap::new();
+    for (i, (seq, ops)) in frames.iter().enumerate() {
+        let expect = i as u64 + 1;
+        assert_eq!(*seq, expect);
+        assert_eq!(ops.len(), 2, "seq {seq} was not one frame: {ops:?}");
+        match &ops[..] {
+            [
+                Op::Put {
+                    collection: counter_collection,
+                    id: counter_id,
+                    doc: counter,
+                },
+                Op::Put {
+                    collection: private_collection,
+                    id: private_id,
+                    doc: private,
+                },
+            ] => {
+                assert_eq!(counter_collection, "counter");
+                assert_eq!(counter_id, "n");
+                assert_eq!(counter, &json!(expect));
+                assert_eq!(private_collection, "private");
+                assert_eq!(private, &json!(private.as_u64().unwrap()));
+                assert!(
+                    privates
+                        .insert(private_id.clone(), private.clone())
+                        .is_none(),
+                    "duplicate {private_id}"
+                );
+            }
+            other => panic!("expected counter and private puts, got {other:?}"),
+        }
+    }
+    assert_eq!(privates.len(), usize::try_from(THREADS).unwrap());
+}
+
+#[test]
+fn store_traits_run_over_unix_ws_and_auto() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("traits.fls");
+    let sock = dir.path().join("traits.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    exercise_store_traits(&client, "unix");
+    drop(client);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("traits.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let port = server.local_addr().port();
+    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    exercise_store_traits(&client, "ws");
+    drop(client);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("traits.fls");
+    let server = FerroStoreServer::bind_unix(
+        default_socket_path_for_store(&path),
+        FerroStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    let client = FerroStore::auto(&path).unwrap();
+    exercise_store_traits(&client, "auto");
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn remote_with_write_commits_both_ops_in_one_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cas.fls");
+    let sock = dir.path().join("cas.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let uri = format!("unix://{}", sock.display());
+    assert_concurrent_increments(|| FerroStore::connect_uri(&uri).unwrap(), &file);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cas.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let port = server.local_addr().port();
+    let uri = format!("ws://127.0.0.1:{port}");
+    assert_concurrent_increments(|| FerroStore::connect_uri(&uri).unwrap(), &file);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cas.fls");
+    let server = FerroStoreServer::bind_unix(
+        default_socket_path_for_store(&path),
+        FerroStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    assert_concurrent_increments(|| FerroStore::auto(&path).unwrap(), &path);
+    drop(server);
 }

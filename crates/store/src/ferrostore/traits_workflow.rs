@@ -33,10 +33,11 @@ fn slug_id(
 }
 
 impl WorkflowStore for FerroStore {
-    fn upsert_workflow_def(&self, mut def: WorkflowDef) -> Result<WorkflowDef, StoreError> {
+    fn upsert_workflow_def(&self, def: WorkflowDef) -> Result<WorkflowDef, StoreError> {
         validate_workflow_def(&def).map_err(|e| StoreError::InvalidWorkflow(e.to_string()))?;
         let label = self.label.clone();
         self.with_write(|txn| {
+            let mut def = def.clone();
             let project = check_project(txn, &label, &def.project)?;
             if let Some(existing_id_str) = slug_id(txn, &project, &def.slug)? {
                 let existing_iri = Iri::parse(&existing_id_str).map_err(decode)?;
@@ -122,9 +123,10 @@ impl WorkflowStore for FerroStore {
         })
     }
 
-    fn create_workflow_run(&self, mut run: WorkflowRun) -> Result<WorkflowRun, StoreError> {
+    fn create_workflow_run(&self, run: WorkflowRun) -> Result<WorkflowRun, StoreError> {
         let label = self.label.clone();
         self.with_write(|txn| {
+            let mut run = run.clone();
             let project = check_project(txn, &label, &run.project)?;
             let workflow_id = WorkflowId(doc::resolve_if_kind(
                 txn,
@@ -151,9 +153,10 @@ impl WorkflowStore for FerroStore {
         })
     }
 
-    fn update_workflow_run(&self, mut run: WorkflowRun) -> Result<WorkflowRun, StoreError> {
+    fn update_workflow_run(&self, run: WorkflowRun) -> Result<WorkflowRun, StoreError> {
         let label = self.label.clone();
         self.with_write(|txn| {
+            let mut run = run.clone();
             let run_id = WorkflowRunId(doc::resolve_if_kind(
                 txn,
                 &label,
@@ -211,10 +214,11 @@ impl WorkflowStore for FerroStore {
         })
     }
 
-    fn import_workflow_def(&self, mut def: WorkflowDef) -> Result<(), StoreError> {
+    fn import_workflow_def(&self, def: WorkflowDef) -> Result<(), StoreError> {
         validate_workflow_def(&def).map_err(|e| StoreError::InvalidWorkflow(e.to_string()))?;
         let label = self.label.clone();
         self.with_write(|txn| {
+            let mut def = def.clone();
             let project = ProjectId(doc::resolve_if_kind(
                 txn,
                 &label,
@@ -265,9 +269,10 @@ impl WorkflowStore for FerroStore {
         })
     }
 
-    fn import_workflow_run(&self, mut run: WorkflowRun) -> Result<(), StoreError> {
+    fn import_workflow_run(&self, run: WorkflowRun) -> Result<(), StoreError> {
         let label = self.label.clone();
         self.with_write(|txn| {
+            let mut run = run.clone();
             let project = ProjectId(doc::resolve_if_kind(
                 txn,
                 &label,

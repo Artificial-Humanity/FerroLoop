@@ -294,7 +294,7 @@ impl Tracker for FerroStore {
                     record
                 })?;
             if !changed {
-                return Err(StoreError::NoSuchRecord(id));
+                return Err(StoreError::NoSuchRecord(id.clone()));
             }
             Ok(())
         })
@@ -302,6 +302,7 @@ impl Tracker for FerroStore {
 
     fn add_finding(&self, finding: Finding) -> Result<FindingId, StoreError> {
         self.with_write(|txn| {
+            let finding = finding.clone();
             doc::check_kind(txn, &self.label, finding.project.iri(), Kind::Project)?;
             let raise = finding.area.as_ref().map(|_| FORMAT_WITH_ROUTING);
             let id = doc::insert_in(txn, mint()?, Kind::Finding, FINDINGS, raise, |txn, id| {
@@ -331,6 +332,7 @@ impl Tracker for FerroStore {
         record: ForeignRecord,
     ) -> Result<FindingId, StoreError> {
         self.with_write(|txn| {
+            let finding = finding.clone();
             doc::check_kind(txn, &self.label, finding.project.iri(), Kind::Project)?;
             let held = doc::owns(txn, &self.label, record.id().iri())?;
             check_foreign_for_local(&record, held)?;
@@ -369,7 +371,7 @@ impl Tracker for FerroStore {
                 },
             )?;
             if !changed {
-                return Err(StoreError::NoSuchFinding(finding.id));
+                return Err(StoreError::NoSuchFinding(finding.id.clone()));
             }
             Ok(())
         })
@@ -409,7 +411,7 @@ impl Tracker for FerroStore {
         let primary = primary.clone();
         self.with_write(|txn| {
             if doc::get_json::<String>(txn, IDS, alias.as_str())?.is_some() {
-                return Err(StoreError::AlreadyExists(alias));
+                return Err(StoreError::AlreadyExists(alias.clone()));
             }
             let Some(wire) = doc::get_json::<String>(txn, IDS, primary.as_str())? else {
                 return Err(doc::not_owned(&self.label, &primary));
@@ -490,7 +492,7 @@ impl Escalations for FerroStore {
             doc::refuse_escalated(txn, &primary)?;
             if !matches!(kind, Kind::Record | Kind::Finding) {
                 return Err(StoreError::WrongKind {
-                    id,
+                    id: id.clone(),
                     expected: Kind::Record,
                     found: kind,
                 });
@@ -540,7 +542,7 @@ impl Escalations for FerroStore {
             };
             let tomb = Tombstone {
                 from: primary.clone(),
-                to,
+                to: to.clone(),
                 by: mark.by,
                 reason: mark.reason,
                 at_ms: mark.at_ms,
@@ -666,9 +668,9 @@ impl Outbox for FerroStore {
             match held {
                 Some(held) if held == id.as_str() => Ok(()),
                 Some(held) => Err(StoreError::CutoverChanged {
-                    node_id: repo,
+                    node_id: repo.clone(),
                     held: Iri::parse(&held).map_err(decode)?,
-                    found: id,
+                    found: id.clone(),
                 }),
                 None => {
                     doc::put_json(txn, LEDGER_CUTOVERS, &repo, &id.as_str())?;

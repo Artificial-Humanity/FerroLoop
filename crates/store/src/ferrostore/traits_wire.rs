@@ -217,14 +217,14 @@ impl MessageStore for FerroStore {
                 reply_to: args.reply_to.clone(),
                 correlation_id,
                 sender_id,
-                sender_name,
+                sender_name: sender_name.clone(),
                 sender_host: args.sender_host.clone(),
                 to: args.to.clone(),
                 kind: args.kind,
                 urgency: args.urgency,
                 durable,
-                subject,
-                body,
+                subject: subject.clone(),
+                body: body.clone(),
                 created_at: args.at.clone(),
                 deadline_at: args.deadline_at.clone(),
             };
@@ -371,7 +371,7 @@ impl MessageStore for FerroStore {
         let recipient = recipient.to_string();
         self.with_write(|txn| {
             if doc::get_json::<WireMessage>(txn, WIRE_MESSAGES, message_id.as_str())?.is_none() {
-                return Err(StoreError::MessageNotFound(message_id));
+                return Err(StoreError::MessageNotFound(message_id.clone()));
             }
             let (agent_id, name_key) = recipient_candidates(txn, &self.label, &recipient)?;
             let mut matched = None;
@@ -408,7 +408,7 @@ impl MessageStore for FerroStore {
                 attempts,
                 updated_at: at.clone(),
                 acked_at: if status == DeliveryStatus::Acked {
-                    Some(at)
+                    Some(at.clone())
                 } else {
                     None
                 },
