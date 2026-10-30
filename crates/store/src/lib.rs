@@ -19,7 +19,7 @@ pub mod manifest;
 pub mod state;
 pub mod workflow;
 
-pub use ferrostore::FerroStore;
+pub use ferrostore::{FerroStore, migrate_redb_to_ferrostore};
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 

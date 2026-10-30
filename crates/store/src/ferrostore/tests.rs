@@ -793,3 +793,347 @@ impl Drop for RemoveDir {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+fn gate_kind() -> fl_core::model::GateKind {
+    fl_core::model::GateKind::Command(fl_core::model::CommandSpec {
+        program: "true".into(),
+        args: vec![],
+        delivery: fl_core::model::PopulationDelivery::Args,
+        timeout_secs: 5,
+        pass_codes: vec![0],
+    })
+}
+
+fn gate_selector() -> fl_core::model::Selector {
+    fl_core::model::Selector::Glob {
+        pattern: "**/*.rs".into(),
+    }
+}
+
+fn redb_format(store: &crate::RedbStore) -> u64 {
+    use redb::ReadableDatabase;
+    let tx = store.db.begin_read().unwrap();
+    let meta = tx.open_table(crate::META).unwrap();
+    meta.get(crate::FORMAT_KEY)
+        .unwrap()
+        .expect("format version")
+        .value()
+}
+
+#[test]
+fn a_redb_store_migrates_into_ferrostore_without_reminting_ids() {
+    use fl_core::agent::{AgentRole, AreaRecord, RegisterAgentArgs};
+    use fl_core::at::At;
+    use fl_core::conformance::{entry_iri, sample_attempt, sample_record_run};
+    use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter};
+    use fl_core::finding::Finding;
+    use fl_core::ids::{Kind, RecordId, WorkflowId, WorkflowRunId, seq_iri};
+    use fl_core::model::{Regret, State, Transition};
+    use fl_core::split::{CachedSegment, LedgerCache};
+    use fl_core::state::{
+        HandoffEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+    };
+    use fl_core::store::{
+        AgentRegistry, Bindings, Catalog, Handles, Ledger, MessageStore, StateStore, Tracker,
+        WorkflowStore,
+    };
+    use fl_core::workflow::{
+        AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS, DEFAULT_STEP_MAX_VISITS,
+        END_STEP, EdgeCondition, EdgeDef, JoinPolicy, StepCompletion, StepDef, WorkflowDef,
+        WorkflowRun,
+    };
+    use std::collections::BTreeMap;
+
+    use crate::RedbStore;
+    use crate::migrate_redb_to_ferrostore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let redb = RedbStore::open(&dir.path().join("source.redb")).unwrap();
+    let project = redb.add_project("/work/app").unwrap();
+    let gate = redb
+        .add_gate(&project, "fmt", gate_kind(), gate_selector(), 1, "c1", "o")
+        .unwrap();
+    redb.add_transition(Transition {
+        project: project.clone(),
+        name: "ship".into(),
+        from: State::Review,
+        to: State::Done,
+        regret: Regret::High,
+        gates: vec![gate.clone()],
+    })
+    .unwrap();
+    let record = redb.add_record(&project, "keep this").unwrap();
+    redb.set_record_state(&record, State::Doing).unwrap();
+    let finding = redb
+        .add_finding(Finding::raise(
+            project.clone(),
+            record.clone(),
+            "reviewer",
+            "wrong on empty",
+        ))
+        .unwrap();
+    let alias = entry_iri(90);
+    redb.add_alias(record.iri(), alias.clone()).unwrap();
+    redb.append_gate_run(sample_record_run(1, &gate, Some(&record)))
+        .unwrap();
+    redb.append_attempt(sample_attempt(2, &project, &record))
+        .unwrap();
+
+    let area = AreaRecord::new(
+        "ferroloop",
+        Some("FerroLoop/".into()),
+        "Agent orchestration",
+        At::from_unix_millis(1),
+        "owner",
+    )
+    .unwrap();
+    redb.upsert_area(area).unwrap();
+    let agent = redb
+        .register_agent(RegisterAgentArgs {
+            display_name: "ferris".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(2),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let state = redb
+        .upsert_state(UpsertStateArgs {
+            scope: StateScope::Workspace,
+            slug: "rule".into(),
+            sensitivity: SensitivityPatch::Inherit,
+            payload: StatePayload::Handoff(HandoffEntry {
+                summary: "v6".into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+
+    let workflow = redb
+        .upsert_workflow_def(WorkflowDef {
+            id: WorkflowId(seq_iri(801)),
+            project: project.clone(),
+            slug: "ci-flow".into(),
+            title: "CI Flow".into(),
+            start_step: "build".into(),
+            steps: vec![StepDef {
+                step_id: "build".into(),
+                title: "Build".into(),
+                prompt: "Run build.".into(),
+                assignee: AssigneeRule::Agent {
+                    name: "felicia".into(),
+                },
+                reviews_step: None,
+                require_different_vendor: false,
+                completion: StepCompletion::Ungated,
+                join_policy: JoinPolicy::All,
+                max_attempts: DEFAULT_STEP_MAX_ATTEMPTS,
+                max_visits: DEFAULT_STEP_MAX_VISITS,
+                budget_usd_micros: None,
+                max_tokens: None,
+                isolate_worktree: false,
+            }],
+            edges: vec![EdgeDef {
+                from_step: "build".into(),
+                to_step: END_STEP.into(),
+                on: EdgeCondition::Pass,
+            }],
+            max_total_steps: DEFAULT_MAX_TOTAL_STEPS,
+            budget_usd_micros: None,
+            max_tokens: None,
+            declared_keys: BTreeMap::new(),
+            authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            authored_by: "ferris".into(),
+        })
+        .unwrap();
+    let workflow_run = redb
+        .create_workflow_run(
+            WorkflowRun::new(
+                WorkflowRunId(seq_iri(802)),
+                &workflow,
+                "CI Run 1",
+                At::from_unix_millis(100),
+                "ferris",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let (message, _) = redb
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: Some("ai-lab-0".into()),
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "Format 7 test".into(),
+            body: "Raise to 7".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+
+    let root = "0123456789abcdef0123456789abcdef01234567";
+    redb.set_ledger_root("R_1", root).unwrap();
+    let segment = CachedSegment {
+        oid: "o1".into(),
+        bytes: vec![0xff, 0xfe, 0xfd],
+        closed: false,
+    };
+    redb.remember(
+        "R_1",
+        "c1",
+        &[("runs/aa/1.jsonl".to_string(), segment.clone())],
+    )
+    .unwrap();
+
+    let version = redb_format(&redb);
+    let fls = dir.path().join("migrated.fls");
+    {
+        let ferro = FerroStore::open(&fls).unwrap();
+        migrate_redb_to_ferrostore(&redb, &ferro).unwrap();
+    }
+    let ferro = FerroStore::open(&fls).unwrap();
+
+    assert_eq!(
+        ferro.get_project(&project).unwrap(),
+        redb.get_project(&project).unwrap()
+    );
+    assert_eq!(
+        ferro.get_gate(&gate).unwrap(),
+        redb.get_gate(&gate).unwrap()
+    );
+    assert_eq!(
+        ferro.get_transition(&project, "ship").unwrap(),
+        redb.get_transition(&project, "ship").unwrap()
+    );
+    assert_eq!(
+        ferro.get_record(&record).unwrap(),
+        redb.get_record(&record).unwrap()
+    );
+    assert_eq!(
+        ferro.get_record(&record).unwrap().unwrap().state,
+        State::Doing
+    );
+    assert_eq!(
+        ferro
+            .get_record(&RecordId(alias.clone()))
+            .unwrap()
+            .unwrap()
+            .id,
+        record
+    );
+    assert_eq!(
+        ferro.get_finding(&finding).unwrap(),
+        redb.get_finding(&finding).unwrap()
+    );
+    assert_eq!(
+        ferro.gate_runs(&gate).unwrap(),
+        redb.gate_runs(&gate).unwrap()
+    );
+    assert_eq!(
+        ferro.attempts(&project).unwrap(),
+        redb.attempts(&project).unwrap()
+    );
+    assert_eq!(
+        ferro.get_area("ferroloop").unwrap(),
+        redb.get_area("ferroloop").unwrap()
+    );
+    assert_eq!(
+        ferro.get_agent(&agent.id).unwrap(),
+        redb.get_agent(&agent.id).unwrap()
+    );
+    assert_eq!(
+        ferro.get_state(&state.id).unwrap(),
+        redb.get_state(&state.id).unwrap()
+    );
+    assert_eq!(
+        ferro.get_workflow_def(&workflow.id).unwrap(),
+        redb.get_workflow_def(&workflow.id).unwrap()
+    );
+    assert_eq!(
+        ferro.get_workflow_run(&workflow_run.id).unwrap(),
+        redb.get_workflow_run(&workflow_run.id).unwrap()
+    );
+    assert_eq!(
+        ferro.get_wire_message(&message.id).unwrap(),
+        redb.get_wire_message(&message.id).unwrap()
+    );
+    let filter = WireFilter {
+        recipient: Some("ferris".into()),
+        ..WireFilter::default()
+    };
+    assert_eq!(
+        ferro.list_wire_inbox(&filter).unwrap(),
+        redb.list_wire_inbox(&filter).unwrap()
+    );
+    assert!(!ferro.list_wire_inbox(&filter).unwrap().is_empty());
+    assert_eq!(
+        ferro.cached("R_1", "runs/aa/1.jsonl").unwrap(),
+        Some(segment)
+    );
+    assert_eq!(ferro.ledger_root("R_1").unwrap().as_deref(), Some(root));
+    for (kind, id) in [
+        (Kind::Project, project.iri()),
+        (Kind::Record, record.iri()),
+        (Kind::Agent, agent.id.iri()),
+    ] {
+        let handle = redb.handle_of(kind, id).unwrap();
+        assert!(handle.is_some(), "{kind:?} has no handle");
+        assert_eq!(ferro.handle_of(kind, id).unwrap(), handle);
+    }
+    assert_eq!(
+        ferro.get_doc("meta", "format_version").unwrap(),
+        Some(json!(version))
+    );
+}
+
+#[test]
+fn migration_refuses_a_non_empty_store_and_an_empty_redb_stays_empty() {
+    use fl_core::store::{Catalog, StoreError};
+
+    use crate::RedbStore;
+    use crate::migrate_redb_to_ferrostore;
+
+    let dir = tempfile::tempdir().unwrap();
+    let redb = RedbStore::open(&dir.path().join("empty.redb")).unwrap();
+    let mem = FerroStore::in_memory();
+    migrate_redb_to_ferrostore(&redb, &mem).unwrap();
+    assert!(mem.list_projects().unwrap().is_empty());
+    let project = mem.add_project("/p").unwrap();
+    assert_eq!(mem.get_project(&project).unwrap().unwrap().root, "/p");
+    assert_eq!(mem.get_project(&project).unwrap().unwrap().id, project);
+
+    let occupied = FerroStore::in_memory();
+    occupied
+        .put_doc("docs", "kept", &json!({ "ok": true }))
+        .unwrap();
+    let err = migrate_redb_to_ferrostore(&redb, &occupied).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert_eq!(
+        occupied.get_doc("docs", "kept").unwrap(),
+        Some(json!({ "ok": true }))
+    );
+    assert!(occupied.list_projects().unwrap().is_empty());
+    assert!(
+        occupied
+            .get_doc("meta", "format_version")
+            .unwrap()
+            .is_none()
+    );
+}

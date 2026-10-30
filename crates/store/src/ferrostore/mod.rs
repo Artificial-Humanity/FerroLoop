@@ -3,6 +3,7 @@
 
 mod doc;
 mod layout;
+mod migrate;
 mod state;
 mod traits_catalog;
 mod traits_state;
@@ -20,6 +21,7 @@ use layout::{
 use serde_json::Value;
 use state::{DocState, apply_commit, apply_frames, commit_ops, next_mq_seq, unread_mq};
 
+pub use migrate::migrate_redb_to_ferrostore;
 pub use state::MqRecord;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
