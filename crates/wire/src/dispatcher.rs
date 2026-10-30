@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
@@ -52,21 +52,7 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
                 return Err(format!("claude pid {pid} is no longer running"));
             }
-            let resolved_key = key_path.clone().or_else(|| {
-                std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
-                    resolve_claude_key_path(&h.join(".claude").join("sessions"), *pid, socket_path)
-                })
-            });
-            let Some(kpath) = resolved_key else {
-                return Err(format!(
-                    "missing claude session key file for pid {pid} ({})",
-                    socket_path.display()
-                ));
-            };
-            let key_raw = fs::read_to_string(&kpath)
-                .map_err(|e| format!("failed to read {}: {e}", kpath.display()))?;
-            let key_json: serde_json::Value = serde_json::from_str(&key_raw)
-                .map_err(|e| format!("invalid JSON in {}: {e}", kpath.display()))?;
+            let (kpath, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref())?;
             let peer_token = key_json
                 .get("peerToken")
                 .and_then(|v| v.as_str())
@@ -511,11 +497,58 @@ fn revert_to_cascade_step_body(conversation_id: &str, plan_model: &str) -> Strin
     .to_string()
 }
 
+/// Longest accepted response status, header or chunk-size line.
+const MAX_AGY_HEADER_LINE_BYTES: u64 = 8 * 1024;
+/// Longest accepted response header section, status line included.
+const MAX_AGY_HEADER_SECTION_BYTES: usize = 64 * 1024;
+
+/// A [`TcpStream`] reader that fails with `TimedOut` once `deadline` has passed and never
+/// waits on one read for longer than the time left. `timeout` caps a single read.
+struct DeadlineReader {
+    inner: TcpStream,
+    deadline: Instant,
+    timeout: Duration,
+    expired: std::cell::Cell<bool>,
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            self.expired.set(true);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "antigravity response deadline exceeded",
+            ));
+        }
+        self.inner.set_read_timeout(Some(self.timeout.min(left)))?;
+        let result = self.inner.read(buf);
+        if result.is_err() && Instant::now() >= self.deadline {
+            self.expired.set(true);
+        }
+        result
+    }
+}
+
+/// Read one line of at most [`MAX_AGY_HEADER_LINE_BYTES`] into `line`. A longer line is an error.
+fn read_bounded_agy_line<R: BufRead>(reader: &mut R, line: &mut String) -> std::io::Result<usize> {
+    let read = (&mut *reader)
+        .take(MAX_AGY_HEADER_LINE_BYTES)
+        .read_line(line)?;
+    if read as u64 >= MAX_AGY_HEADER_LINE_BYTES && !line.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "antigravity response line is too long",
+        ));
+    }
+    Ok(read)
+}
+
 fn read_agy_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let mut size_line = String::new();
-        match reader.read_line(&mut size_line) {
+        match read_bounded_agy_line(reader, &mut size_line) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
@@ -557,6 +590,48 @@ fn post_agy_connect_rpc(
     body: &str,
     timeout: Duration,
 ) -> Result<(u16, String, String), String> {
+    post_agy_connect_rpc_limited(port, csrf, procedure, body, timeout, MAX_AGY_RPC_BODY_BYTES)
+}
+
+/// How many times `timeout` the whole call may take. `timeout` itself bounds one connect,
+/// read or write, so a peer that sends a byte per read would otherwise hold the caller.
+const AGY_RPC_DEADLINE_FACTOR: u32 = 4;
+
+/// POST a JSON body to the Antigravity language server on `127.0.0.1:port` and return
+/// `(status code, status line, body)`. `timeout` bounds the connect and each read or write,
+/// and the whole call must finish within [`AGY_RPC_DEADLINE_FACTOR`] times `timeout`. A
+/// status or header line over 8 KiB, or a header section over 64 KiB, is an error.
+/// The response body is cut off at `max_body_bytes`.
+pub fn post_agy_connect_rpc_limited(
+    port: u16,
+    csrf: &str,
+    procedure: &str,
+    body: &str,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<(u16, String, String), String> {
+    post_agy_connect_rpc_with_deadline(
+        port,
+        csrf,
+        procedure,
+        body,
+        timeout,
+        max_body_bytes,
+        timeout.saturating_mul(AGY_RPC_DEADLINE_FACTOR),
+    )
+}
+
+/// [`post_agy_connect_rpc_limited`] with an explicit overall time limit `overall`.
+fn post_agy_connect_rpc_with_deadline(
+    port: u16,
+    csrf: &str,
+    procedure: &str,
+    body: &str,
+    timeout: Duration,
+    max_body_bytes: usize,
+    overall: Duration,
+) -> Result<(u16, String, String), String> {
+    let deadline = Instant::now() + overall;
     let host = format!("127.0.0.1:{port}");
     let request = format!(
         "POST {procedure} HTTP/1.1\r\n\
@@ -581,18 +656,29 @@ fn post_agy_connect_rpc(
     stream
         .write_all(request.as_bytes())
         .map_err(|err| format!("antigravity revert write to {host} failed: {err}"))?;
-    let mut reader = std::io::BufReader::new(stream);
+    let mut reader = std::io::BufReader::new(DeadlineReader {
+        inner: stream,
+        deadline,
+        timeout,
+        expired: std::cell::Cell::new(false),
+    });
     let mut status = String::new();
-    reader
-        .read_line(&mut status)
+    read_bounded_agy_line(&mut reader, &mut status)
         .map_err(|err| format!("antigravity revert read from {host} failed: {err}"))?;
+    let mut header_bytes = status.len();
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
     loop {
         let mut line = String::new();
-        match reader.read_line(&mut line) {
+        match read_bounded_agy_line(&mut reader, &mut line) {
             Ok(0) => break,
-            Ok(_) => {
+            Ok(read) => {
+                header_bytes += read;
+                if header_bytes > MAX_AGY_HEADER_SECTION_BYTES {
+                    return Err(format!(
+                        "antigravity revert response headers from {host} are too long"
+                    ));
+                }
                 if line == "\r\n" || line == "\n" {
                     break;
                 }
@@ -608,21 +694,30 @@ fn post_agy_connect_rpc(
                     }
                 }
             }
+            Err(err) if reader.get_ref().expired.get() => {
+                return Err(format!("antigravity revert read from {host} failed: {err}"));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(format!("antigravity revert read from {host} failed: {err}"));
+            }
             Err(_) => break,
         }
     }
     let resp_bytes = if is_chunked {
-        read_agy_chunked_body(&mut reader, MAX_AGY_RPC_BODY_BYTES)
+        read_agy_chunked_body(&mut reader, max_body_bytes)
     } else {
-        let max_body = content_length
-            .unwrap_or(MAX_AGY_RPC_BODY_BYTES)
-            .min(MAX_AGY_RPC_BODY_BYTES);
+        let max_body = content_length.unwrap_or(max_body_bytes).min(max_body_bytes);
         let mut buf = Vec::new();
         if max_body > 0 {
-            let _ = reader.take(max_body as u64).read_to_end(&mut buf);
+            let _ = (&mut reader).take(max_body as u64).read_to_end(&mut buf);
         }
         buf
     };
+    if reader.get_ref().expired.get() {
+        return Err(format!(
+            "antigravity revert read from {host} exceeded its {overall:?} deadline"
+        ));
+    }
     let resp_body = String::from_utf8_lossy(&resp_bytes).into_owned();
     let code = status
         .split_whitespace()
@@ -844,6 +939,167 @@ fn send_tmux_reset_keys(target: &str, slash: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Method label of [`InterruptPlan::TmuxKey`].
+pub const INTERRUPT_METHOD_TMUX: &str = "tmux-send-keys";
+/// Method label of [`InterruptPlan::AgyCancel`].
+pub const INTERRUPT_METHOD_AGY: &str = "agy-cancel-cascade";
+
+/// The one tmux key an interrupt sends. `Escape` stops the turn that is running in every
+/// supported TUI (Claude Code, Codex, Grok and Muse all treat it as "stop generating") and
+/// does nothing harmful to an idle prompt. `C-c` is NOT used: at an idle prompt it clears the
+/// input, and a second one quits Claude Code and Codex, so a stray interrupt could kill the
+/// session. One key per interrupt also avoids the double-`Escape` rewind menu in Claude Code.
+const INTERRUPT_TMUX_KEY: &str = "Escape";
+
+const AGY_CANCEL_PROCEDURE: &str =
+    "/exa.language_server_pb.LanguageServerService/CancelCascadeInvocation";
+
+/// How [`run_interrupt`] will interrupt one route. Building the plan touches nothing
+/// outside this process, so a caller can plan and then decide whether to run it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptPlan {
+    /// Send `key` with `tmux send-keys` to the first live target of `targets`.
+    TmuxKey {
+        targets: Vec<String>,
+        key: &'static str,
+    },
+    /// Call `CancelCascadeInvocation` on the Antigravity language server.
+    AgyCancel {
+        conversation_id: String,
+        ls_address: Option<String>,
+        csrf_token: Option<String>,
+    },
+}
+
+impl InterruptPlan {
+    /// Stable label for the way the interrupt travels (`tmux-send-keys`, `agy-cancel-cascade`).
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::TmuxKey { .. } => INTERRUPT_METHOD_TMUX,
+            Self::AgyCancel { .. } => INTERRUPT_METHOD_AGY,
+        }
+    }
+}
+
+/// Plan an interrupt for `route`. Claude and Codex routes carry no tmux target, so a caller
+/// that knows the pane the CLI runs in (a hosted session record) passes it as `tmux_fallback`;
+/// Grok and Muse try their own pane and target first. A route with no way to interrupt it
+/// (a webhook route, or a tmux vendor with no target at all) is an error.
+pub fn plan_interrupt(
+    route: &VendorRoute,
+    tmux_fallback: Option<&str>,
+) -> Result<InterruptPlan, String> {
+    let own: [&Option<String>; 2] = match route {
+        VendorRoute::Grok {
+            tmux_pane,
+            tmux_target,
+            ..
+        } => [tmux_pane, tmux_target],
+        VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        } => [tmux_target, tmux_pane],
+        VendorRoute::Claude { .. } | VendorRoute::Codex { .. } => [&None, &None],
+        VendorRoute::Agy {
+            conversation_id,
+            ls_address,
+            csrf_token,
+            ..
+        } => {
+            validate_agy_conversation_id(conversation_id)?;
+            return Ok(InterruptPlan::AgyCancel {
+                conversation_id: conversation_id.clone(),
+                ls_address: ls_address.clone(),
+                csrf_token: csrf_token.clone(),
+            });
+        }
+        VendorRoute::Webhook { .. } => {
+            return Err("a webhook route cannot be interrupted".to_string());
+        }
+    };
+    let mut targets: Vec<String> = Vec::new();
+    for raw in own
+        .into_iter()
+        .map(|slot| slot.as_deref())
+        .chain(std::iter::once(tmux_fallback))
+    {
+        let Some(target) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        if !targets.iter().any(|seen| seen == target) {
+            targets.push(target.to_string());
+        }
+    }
+    if targets.is_empty() {
+        return Err("the route has no tmux target to send an interrupt to".to_string());
+    }
+    Ok(InterruptPlan::TmuxKey {
+        targets,
+        key: INTERRUPT_TMUX_KEY,
+    })
+}
+
+/// Run `plan`: the real `tmux send-keys`, or the real language-server call.
+pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
+    match plan {
+        InterruptPlan::TmuxKey { targets, key } => {
+            let target = targets
+                .iter()
+                .find(|t| tmux_target_alive(t))
+                .ok_or_else(|| "no live tmux target for the session".to_string())?;
+            let status = Command::new(tmux_bin())
+                .args(["send-keys", "-t", target, key])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|e| format!("failed to spawn tmux send-keys: {e}"))?;
+            if !status.success() {
+                return Err(format!("tmux send-keys {key} exited with {status}"));
+            }
+            Ok(())
+        }
+        InterruptPlan::AgyCancel {
+            conversation_id,
+            ls_address,
+            csrf_token,
+        } => {
+            let Some(addr) = agy_listening_address(ls_address) else {
+                return Err(agy_address_error(ls_address).replace("reset", "interrupt"));
+            };
+            let csrf = agy_csrf_token(csrf_token).ok_or_else(|| {
+                "antigravity interrupt needs a csrf token (route csrf_token or ANTIGRAVITY_CSRF_TOKEN)"
+                    .to_string()
+            })?;
+            if csrf.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+                return Err("antigravity interrupt csrf token is not a single header value".into());
+            }
+            let port = crate::identity::agy_ls_port(&addr).ok_or_else(|| {
+                format!("antigravity interrupt could not parse a port from {addr}")
+            })?;
+            let body = serde_json::json!({ "cascadeId": conversation_id }).to_string();
+            let (code, status_line, resp_body) = post_agy_connect_rpc(
+                port,
+                &csrf,
+                AGY_CANCEL_PROCEDURE,
+                &body,
+                Duration::from_secs(5),
+            )?;
+            if code == 200 {
+                return Ok(());
+            }
+            let detail: String = resp_body.trim().chars().take(512).collect();
+            if detail.is_empty() {
+                Err(format!("antigravity interrupt returned {status_line}"))
+            } else {
+                Err(format!(
+                    "antigravity interrupt returned {status_line}: {detail}"
+                ))
+            }
+        }
+    }
+}
+
 fn tmux_bin() -> PathBuf {
     std::env::var_os("FL_WIRE_TMUX_BIN")
         .map(PathBuf::from)
@@ -941,6 +1197,87 @@ fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `true` when `sender_name` names the owner (`owner`, or the owner's login `lmcfarlin`).
+///
+/// This is the gate that lets an operator prompt arrive as direct terminal input. The match is
+/// exact (case-insensitive, no trimming) so a padded name never passes. A caller that builds a
+/// sender name from anything a peer can influence must refuse these names first: see
+/// `HubAuthority::actor_name` in `fl-hub`.
+pub fn is_owner_sender(sender_name: &str) -> bool {
+    sender_name.eq_ignore_ascii_case("owner") || sender_name.eq_ignore_ascii_case("lmcfarlin")
+}
+
+/// The tmux pane id (`%<n>`) of a Claude session, read from the `tmux` field of its session key
+/// file (for example `"Felicia:@12.%12"`), when that pane is alive.
+///
+/// Only a pane id is accepted. A session or window name is not: `tmux -t <name>` resolves to
+/// whichever pane is active there, which need not be the pane Claude runs in.
+fn claude_live_tmux_pane(key_json: &serde_json::Value) -> Option<String> {
+    let raw = key_json.get("tmux")?.as_str()?.trim();
+    let pane = raw.rsplit('.').next()?;
+    let digits = pane.strip_prefix('%')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    tmux_target_alive(pane).then(|| pane.to_string())
+}
+
+/// The body pasted into a terminal for an operator prompt: the FerroDeck prefix, unless the body
+/// already carries it or is a slash command (a prefix would stop it being one).
+fn prefixed_operator_body(sender_name: &str, body: &str) -> String {
+    let trimmed = body.trim_start();
+    if body.starts_with("[Operator Prompt via FerroDeck") || trimmed.starts_with('/') {
+        body.to_string()
+    } else {
+        format!("[Operator Prompt via FerroDeck — from {sender_name}]\n\n{body}")
+    }
+}
+
+/// The session key file of a Claude route (its `key_path`, else the one under `~/.claude`)
+/// and its parsed JSON.
+fn read_claude_key(
+    pid: u32,
+    socket_path: &Path,
+    key_path: Option<&Path>,
+) -> Result<(PathBuf, serde_json::Value), String> {
+    let resolved_key = key_path.map(Path::to_path_buf).or_else(|| {
+        std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+            resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, socket_path)
+        })
+    });
+    let Some(kpath) = resolved_key else {
+        return Err(format!(
+            "missing claude session key file for pid {pid} ({})",
+            socket_path.display()
+        ));
+    };
+    let key_raw = fs::read_to_string(&kpath)
+        .map_err(|e| format!("failed to read {}: {e}", kpath.display()))?;
+    let key_json: serde_json::Value = serde_json::from_str(&key_raw)
+        .map_err(|e| format!("invalid JSON in {}: {e}", kpath.display()))?;
+    Ok((kpath, key_json))
+}
+
+/// The live tmux pane id (`%<n>`) a Claude route's session key file names, or `None` for any
+/// other vendor, a stopped process, an unreadable key file, or a pane that is not alive.
+/// An interrupt of a session the hub does not host uses it as the pane to send `Escape` to.
+pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
+    let VendorRoute::Claude {
+        pid,
+        socket_path,
+        key_path,
+        ..
+    } = route
+    else {
+        return None;
+    };
+    if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
+        return None;
+    }
+    let (_, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref()).ok()?;
+    claude_live_tmux_pane(&key_json)
+}
+
 pub fn dispatch_operator_prompt_to_route(
     route: &VendorRoute,
     sender_name: &str,
@@ -956,21 +1293,17 @@ pub fn dispatch_operator_prompt_to_route(
             if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
                 return Err(format!("claude pid {pid} is no longer running"));
             }
-            let resolved_key = key_path.clone().or_else(|| {
-                std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
-                    resolve_claude_key_path(&h.join(".claude").join("sessions"), *pid, socket_path)
-                })
-            });
-            let Some(kpath) = resolved_key else {
-                return Err(format!(
-                    "missing claude session key file for pid {pid} ({})",
-                    socket_path.display()
-                ));
-            };
-            let key_raw = fs::read_to_string(&kpath)
-                .map_err(|e| format!("failed to read {}: {e}", kpath.display()))?;
-            let key_json: serde_json::Value = serde_json::from_str(&key_raw)
-                .map_err(|e| format!("invalid JSON in {}: {e}", kpath.display()))?;
+            let (kpath, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref())?;
+            // The owner's own chat prompt is delivered as direct terminal input when the
+            // session runs in a live tmux pane. The peer-session socket below labels every
+            // message "came from another Claude session", which is wrong for the owner. Only
+            // an owner sender may take this path: it must stay out of reach of any caller
+            // that is merely authenticated as a peer.
+            if is_owner_sender(sender_name)
+                && let Some(pane) = claude_live_tmux_pane(&key_json)
+            {
+                return deliver_via_tmux_paste(&pane, &prefixed_operator_body(sender_name, body));
+            }
             let peer_token = key_json
                 .get("peerToken")
                 .and_then(|v| v.as_str())
@@ -1485,6 +1818,198 @@ mod tests {
         assert_eq!(wh_json["body"], "Inspect the UI");
     }
 
+    /// A fake tmux that logs its arguments, keeps `load-buffer` stdin, and answers
+    /// `display-message` with a pane id when `alive`, or fails when not.
+    fn write_fake_tmux(dir: &Path, alive: bool) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let out = dir.join("tmux.out");
+        let stdin_out = dir.join("tmux.stdin");
+        let bin = dir.join("fake-tmux.sh");
+        let display = if alive { "echo \"%12\"" } else { "exit 1" };
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  {display}\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
+                out.display(),
+                stdin_out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, out, stdin_out)
+    }
+
+    /// A Claude route whose mock socket records whether anything connected. The session key
+    /// file carries `tmux_field` (the raw `tmux` value) when it is `Some`.
+    fn claude_route_with_mock_socket(
+        dir: &Path,
+        tmux_field: Option<&str>,
+    ) -> (VendorRoute, UnixListener) {
+        let sock_path = dir.join("claude-tmux.sock");
+        let key_path = dir.join("0.key");
+        let key = match tmux_field {
+            Some(t) => serde_json::json!({ "peerToken": "tok-t", "tmux": t }),
+            None => serde_json::json!({ "peerToken": "tok-t" }),
+        };
+        fs::write(&key_path, key.to_string()).unwrap();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "s-tmux".into(),
+                socket_path: sock_path,
+                key_path: Some(key_path),
+            },
+            listener,
+        )
+    }
+
+    fn socket_frames(listener: &UnixListener) -> Option<Vec<String>> {
+        let (stream, _) = listener.accept().ok()?;
+        stream.set_nonblocking(false).unwrap();
+        let reader = std::io::BufReader::new(stream);
+        Some(reader.lines().take(2).map(|l| l.unwrap()).collect())
+    }
+
+    #[test]
+    fn claude_owner_prompt_with_live_tmux_pane_is_pasted_not_sent_to_the_peer_socket() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+
+        for sender in ["owner", "lmcfarlin", "Owner"] {
+            let _ = fs::remove_file(&tmux_out);
+            dispatch_operator_prompt_to_route(&route, sender, "Check the queue status").unwrap();
+            let cmds = fs::read_to_string(&tmux_out).unwrap();
+            assert!(
+                cmds.contains("display-message -p -t %12 #{pane_id}"),
+                "{cmds}"
+            );
+            assert!(cmds.contains("paste-buffer -d -b"), "{cmds}");
+            assert!(cmds.contains("-t %12"), "{cmds}");
+            assert!(cmds.contains("send-keys -t %12 Enter"), "{cmds}");
+            assert_eq!(
+                fs::read_to_string(&tmux_stdin).unwrap().trim(),
+                format!(
+                    "[Operator Prompt via FerroDeck — from {sender}]\n\nCheck the queue status"
+                )
+            );
+        }
+        assert!(
+            socket_frames(&listener).is_none(),
+            "the peer socket must receive nothing"
+        );
+    }
+
+    #[test]
+    fn claude_owner_slash_command_is_pasted_without_the_prefix() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, _tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+
+        dispatch_operator_prompt_to_route(&route, "owner", "/compact").unwrap();
+        assert_eq!(fs::read_to_string(&tmux_stdin).unwrap().trim(), "/compact");
+        assert!(socket_frames(&listener).is_none());
+    }
+
+    #[test]
+    fn claude_owner_prompt_without_a_usable_tmux_pane_uses_the_socket() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+
+        // No `tmux` field at all.
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), None);
+        dispatch_operator_prompt_to_route(&route, "owner", "no field").unwrap();
+        let frames = socket_frames(&listener).expect("socket path");
+        let user: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        assert_eq!(user["message"]["content"], "no field");
+        assert!(!tmux_out.exists(), "tmux must not be used without a field");
+        drop(listener);
+        let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+
+        // A `tmux` field naming a session, not a pane id: never used as a target.
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12"));
+        dispatch_operator_prompt_to_route(&route, "owner", "no pane id").unwrap();
+        assert!(socket_frames(&listener).is_some());
+        assert!(!tmux_out.exists());
+        drop(listener);
+        let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+
+        // A pane that is gone.
+        let (dead_bin, dead_out, _) = {
+            let dead_dir = tmp.path().join("dead");
+            fs::create_dir(&dead_dir).unwrap();
+            write_fake_tmux(&dead_dir, false)
+        };
+        let _dead_env = EnvGuard::set("FL_WIRE_TMUX_BIN", &dead_bin);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        dispatch_operator_prompt_to_route(&route, "owner", "dead pane").unwrap();
+        let frames = socket_frames(&listener).expect("socket path");
+        let user: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        assert_eq!(user["message"]["content"], "dead pane");
+        let cmds = fs::read_to_string(&dead_out).unwrap();
+        assert!(cmds.contains("display-message"), "{cmds}");
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+    }
+
+    #[test]
+    fn claude_non_owner_prompt_with_live_tmux_pane_uses_the_socket_not_tmux() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+
+        for sender in ["peer", "ferris", "jarvis", " owner", "owner2", "system"] {
+            let (route, listener) =
+                claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+            dispatch_operator_prompt_to_route(&route, sender, "from a peer").unwrap();
+            let frames = socket_frames(&listener).expect("socket path");
+            let user: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+            assert_eq!(user["from"], sender);
+            assert_eq!(user["message"]["content"], "from a peer");
+            assert!(!tmux_out.exists(), "sender `{sender}` must not reach tmux");
+            drop(listener);
+            let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+        }
+    }
+
+    #[test]
+    fn claude_tmux_pane_is_read_only_from_a_pane_id() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, _, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let pane = |v: serde_json::Value| claude_live_tmux_pane(&serde_json::json!({ "tmux": v }));
+        assert_eq!(pane("Felicity:@12.%12".into()).as_deref(), Some("%12"));
+        assert_eq!(pane("%7".into()).as_deref(), Some("%7"));
+        assert_eq!(pane("Felicity".into()), None);
+        assert_eq!(pane("Felicity:@12".into()), None);
+        assert_eq!(pane("Felicity:@12.%".into()), None);
+        assert_eq!(pane("Felicity:@12.%1;x".into()), None);
+        assert_eq!(pane(serde_json::json!(12)), None);
+        assert_eq!(claude_live_tmux_pane(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn is_owner_sender_matches_only_the_exact_owner_names() {
+        assert!(is_owner_sender("owner"));
+        assert!(is_owner_sender("OWNER"));
+        assert!(is_owner_sender("lmcfarlin"));
+        assert!(!is_owner_sender(" owner"));
+        assert!(!is_owner_sender("owner "));
+        assert!(!is_owner_sender("owner2"));
+        assert!(!is_owner_sender("peer"));
+        assert!(!is_owner_sender(""));
+    }
+
     #[test]
     fn clear_or_reforge_tmux_sends_reset_keys_then_prompt() {
         use std::os::unix::fs::PermissionsExt;
@@ -1544,6 +2069,194 @@ mod tests {
         let reset_at = log.find("send-keys -t muse:felicia /clear").unwrap();
         let paste_at = log.find("load-buffer -b fl-wire-muse-").unwrap();
         assert!(reset_at < paste_at);
+    }
+
+    #[test]
+    fn plan_interrupt_picks_targets_per_vendor_and_refuses_unreachable_routes() {
+        let grok = VendorRoute::Grok {
+            session_id: "gs".into(),
+            cwd: None,
+            tmux_target: Some("grok:felicia".into()),
+            tmux_pane: Some("%9".into()),
+        };
+        assert_eq!(
+            plan_interrupt(&grok, Some("Felicia:grok")).unwrap(),
+            InterruptPlan::TmuxKey {
+                targets: vec!["%9".into(), "grok:felicia".into(), "Felicia:grok".into()],
+                key: "Escape",
+            }
+        );
+        let muse = VendorRoute::Muse {
+            session_id: "ms".into(),
+            cwd: None,
+            tmux_target: Some("muse:felicia".into()),
+            tmux_pane: Some("muse:felicia".into()),
+        };
+        assert_eq!(
+            plan_interrupt(&muse, None).unwrap(),
+            InterruptPlan::TmuxKey {
+                targets: vec!["muse:felicia".into()],
+                key: "Escape",
+            }
+        );
+        let claude = VendorRoute::Claude {
+            pid: 0,
+            session_id: "cs".into(),
+            socket_path: PathBuf::from("/nonexistent.sock"),
+            key_path: None,
+        };
+        assert!(plan_interrupt(&claude, None).is_err());
+        assert!(plan_interrupt(&claude, Some("   ")).is_err());
+        let plan = plan_interrupt(&claude, Some("Felicia:claude")).unwrap();
+        assert_eq!(plan.method(), INTERRUPT_METHOD_TMUX);
+        let codex = VendorRoute::Codex {
+            thread_id: "t".into(),
+            cwd: None,
+        };
+        assert!(plan_interrupt(&codex, None).is_err());
+        let webhook = VendorRoute::Webhook {
+            socket_path: PathBuf::from("/nonexistent.sock"),
+        };
+        assert!(plan_interrupt(&webhook, Some("x:y")).is_err());
+        let bad_agy = VendorRoute::Agy {
+            conversation_id: "../etc".into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        assert!(plan_interrupt(&bad_agy, None).is_err());
+        let agy = VendorRoute::Agy {
+            conversation_id: "conv-1".into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        assert_eq!(
+            plan_interrupt(&agy, None).unwrap().method(),
+            INTERRUPT_METHOD_AGY
+        );
+    }
+
+    #[test]
+    fn run_interrupt_sends_one_escape_to_the_first_live_tmux_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let tmux_out = tmp.path().join("tmux.out");
+        let tmux_bin = tmp.path().join("fake-tmux.sh");
+        // `display-message` succeeds only for the live pane `%9`.
+        fs::write(
+            &tmux_bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  if [ \"$4\" = \"%9\" ]; then echo \"%9\"; else exit 1; fi\nfi\n",
+                tmux_out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let plan = InterruptPlan::TmuxKey {
+            targets: vec!["dead:pane".into(), "%9".into(), "other:pane".into()],
+            key: "Escape",
+        };
+        run_interrupt(&plan).unwrap();
+        let none_alive = InterruptPlan::TmuxKey {
+            targets: vec!["dead:pane".into()],
+            key: "Escape",
+        };
+        assert!(run_interrupt(&none_alive).is_err());
+        drop(_env);
+
+        let log = fs::read_to_string(&tmux_out).unwrap();
+        let sends: Vec<&str> = log.lines().filter(|l| l.starts_with("send-keys")).collect();
+        assert_eq!(sends, vec!["send-keys -t %9 Escape"], "{log}");
+        assert!(!log.contains("other:pane"), "{log}");
+        assert!(!log.contains("C-c"), "{log}");
+    }
+
+    #[test]
+    fn run_interrupt_calls_cancel_cascade_on_a_local_mock_language_server() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            // The first connection is `agy_ls_address_listening`'s probe; it sends nothing.
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let end = line == "\r\n";
+                    headers.push_str(&line);
+                    if end {
+                        break;
+                    }
+                }
+                if headers.is_empty() {
+                    continue;
+                }
+                let len = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.split_once(':').and_then(|(n, v)| {
+                            n.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+                req_tx
+                    .send(format!("{headers}{}", String::from_utf8_lossy(&body)))
+                    .unwrap();
+                break;
+            }
+        });
+
+        let plan = InterruptPlan::AgyCancel {
+            conversation_id: "conv-1".into(),
+            ls_address: Some(format!("127.0.0.1:{port}")),
+            csrf_token: Some("csrf-test".into()),
+        };
+        run_interrupt(&plan).unwrap();
+        let captured = req_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(captured.starts_with(
+            "POST /exa.language_server_pb.LanguageServerService/CancelCascadeInvocation HTTP/1.1\r\n"
+        ));
+        assert!(captured.contains("x-codeium-csrf-token: csrf-test\r\n"));
+        let payload: serde_json::Value =
+            serde_json::from_str(captured.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({ "cascadeId": "conv-1" }));
+
+        // A language server that is not running, or a missing token, is an error.
+        let no_token = InterruptPlan::AgyCancel {
+            conversation_id: "conv-1".into(),
+            ls_address: Some(format!("127.0.0.1:{port}")),
+            csrf_token: None,
+        };
+        let _guard = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _no_env = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        let _no_addr = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        assert!(run_interrupt(&no_token).is_err());
     }
 
     #[test]
@@ -2020,5 +2733,159 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Serve one loopback connection with `serve`, which gets the accepted stream after the
+    /// request has been read. Returns the port and the thread, which ends once `serve` returns.
+    fn spawn_raw_agy_stub(
+        serve: impl FnOnce(TcpStream) + Send + 'static,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            serve(stream);
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn agy_rpc_returns_a_normal_response_within_its_deadline() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            );
+        });
+        let (code, status, body) = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(1),
+            1024,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            (code, status.as_str(), body.as_str()),
+            (200, "HTTP/1.1 200 OK", "hello")
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn agy_rpc_gives_up_on_a_body_that_trickles_past_the_overall_deadline() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+            );
+            // One byte per 20 ms never trips the per-read timeout.
+            while stream.write_all(b"x").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let err = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(2),
+            8 * 1024 * 1024,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.contains("deadline"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn agy_rpc_gives_up_on_a_header_line_that_trickles_past_the_overall_deadline() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nX-Slow: ");
+            while stream.write_all(b"a").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let err = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(2),
+            1024,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.contains("failed"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn agy_rpc_refuses_an_endless_header_line() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nX-Endless: ");
+            let chunk = [b'a'; 4096];
+            while stream.write_all(&chunk).is_ok() {}
+        });
+        let started = Instant::now();
+        let err = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(5),
+            1024,
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn agy_rpc_refuses_an_oversized_header_section() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n");
+            // Each line is well under the line limit; together they pass the section limit.
+            let line = format!("X-Pad: {}\r\n", "a".repeat(1000));
+            while stream.write_all(line.as_bytes()).is_ok() {}
+        });
+        let err = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(5),
+            1024,
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(err.contains("headers"), "{err}");
+        assert!(err.contains("too long"), "{err}");
+        handle.join().unwrap();
     }
 }

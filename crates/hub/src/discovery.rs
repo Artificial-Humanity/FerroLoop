@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use fl_core::arch::{
     ArchConformanceReport, ArchitectureModel, PackageDep, SourceReference,
@@ -39,6 +41,17 @@ pub struct DiscoveredSessionSummary {
     /// persists one. Omitted for attempt rows and for vendors with no on-disk allowance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_usage: Option<SessionQuotaUsage>,
+    /// Model the vendor session runs, without the thinking-level suffix. Omitted for
+    /// attempt rows, for other adapters, and when no source names a model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort (`low`, `medium`, `high`, ...) when the vendor reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<String>,
+    /// Model ids a user can switch this session to. Empty for attempt rows and adapters
+    /// with no model choice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<String>,
 }
 
 /// Normalized tool invocation inside a [`TranscriptTurn`] (spec §3.2).
@@ -228,7 +241,30 @@ pub fn discover_sessions_from_snapshot(
     snap: &DiscoveryStoreSnapshot,
     home_override: Option<&Path>,
 ) -> Vec<DiscoveredSessionSummary> {
+    discover_sessions_impl(snap, home_override, true)
+}
+
+/// Discover sessions like [`discover_sessions_from_snapshot`], but leave `model`,
+/// `thinking_level` and `available_models` empty. For callers that only look a session up
+/// by `id`, `persona` or `source`: it never reads a model file or transcript tail and never
+/// calls a language server.
+pub fn discover_route_sessions_without_model_info(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Vec<DiscoveredSessionSummary> {
+    discover_sessions_impl(snap, home_override, false)
+}
+
+/// Shared body of [`discover_sessions_from_snapshot`]. `with_model_info` is false for
+/// callers that only look a session up by id, so they never read model files or wait on
+/// a language server.
+fn discover_sessions_impl(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+    with_model_info: bool,
+) -> Vec<DiscoveredSessionSummary> {
     let mut out = Vec::new();
+    let mut agy_endpoints: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     let mut seen_ids = BTreeSet::new();
 
     let route_override =
@@ -264,8 +300,15 @@ pub fn discover_sessions_from_snapshot(
                 ("claude", id, None, tpath)
             }
             VendorRoute::Agy {
-                conversation_id, ..
+                conversation_id,
+                ls_address,
+                csrf_token,
+                ..
             } => {
+                agy_endpoints.insert(
+                    conversation_id.clone(),
+                    (ls_address.clone(), csrf_token.clone()),
+                );
                 let tpath = home.as_deref().and_then(|h| {
                     let p = h
                         .join(".gemini")
@@ -336,6 +379,9 @@ pub fn discover_sessions_from_snapshot(
                 record_id: None,
                 transcript_path,
                 quota_usage: None,
+                model: None,
+                thinking_level: None,
+                available_models: Vec::new(),
             });
         }
     }
@@ -353,6 +399,9 @@ pub fn discover_sessions_from_snapshot(
                 record_id: Some(attempt.record_id.clone()),
                 transcript_path: None,
                 quota_usage: None,
+                model: None,
+                thinking_level: None,
+                available_models: Vec::new(),
             });
         }
     }
@@ -366,10 +415,684 @@ pub fn discover_sessions_from_snapshot(
                 session.transcript_path.as_deref(),
                 home_override,
             );
+            if with_model_info {
+                let endpoint = agy_endpoints.get(&session.id);
+                let info = session_model_info(
+                    &session.adapter,
+                    &session.id,
+                    session.transcript_path.as_deref(),
+                    home.as_deref(),
+                    endpoint.and_then(|(addr, _)| addr.as_deref()),
+                    endpoint.and_then(|(_, csrf)| csrf.as_deref()),
+                    agy_env_fallback_allowed(home_override),
+                );
+                session.model = info.model;
+                session.thinking_level = info.thinking_level;
+                session.available_models = info.available_models;
+            }
         }
     }
 
     out
+}
+
+// ---------------------------------------------------------------------------
+// Live model discovery (per-adapter model, thinking level, and selectable models)
+// ---------------------------------------------------------------------------
+
+const AGY_DEFAULT_MODELS: [&str; 5] = [
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "gpt-oss-120b",
+];
+const CLAUDE_MODELS: [&str; 3] = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"];
+const CODEX_DEFAULT_MODELS: [&str; 5] = [
+    "gpt-6.1-terra",
+    "gpt-6.1-sol",
+    "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
+];
+const GROK_DEFAULT_MODELS: [&str; 4] = ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
+const MUSE_MODEL: &str = "muse-spark";
+
+const AGY_LS_SERVICE: &str = "/exa.language_server_pb.LanguageServerService";
+/// Connect and per-read timeout for each language-server call.
+const AGY_RPC_TIMEOUT: Duration = Duration::from_secs(1);
+/// A trajectory grows with the conversation, so it gets a larger body cap than a reset call.
+const AGY_TRAJECTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Steps before the transcript's newest `step_index` that the tail-steps call still asks for.
+const AGY_STEPS_TAIL_MARGIN: u64 = 10;
+/// Newest bytes of an Antigravity transcript scanned for the last `step_index`.
+const AGY_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+const AGY_CACHE_TTL: Duration = Duration::from_secs(30);
+/// A failed or empty lookup is cached briefly so a dead server costs one attempt, not one per poll.
+const AGY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+const AGY_CACHE_MAX_ENTRIES: usize = 256;
+/// Newest bytes of a Claude transcript scanned for the latest `model`.
+const CLAUDE_TRANSCRIPT_TAIL_BYTES: u64 = 512 * 1024;
+
+/// Model fields for one discovered session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct SessionModelInfo {
+    model: Option<String>,
+    thinking_level: Option<String>,
+    available_models: Vec<String>,
+}
+
+fn owned_strings(list: &[&str]) -> Vec<String> {
+    list.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// Whether `ANTIGRAVITY_LS_ADDRESS` and `ANTIGRAVITY_CSRF_TOKEN` may supply a missing route
+/// value. Never with a home override (tests, hermetic runs) or with host discovery disabled,
+/// so those runs cannot reach the host's language server.
+fn agy_env_fallback_allowed(home_override: Option<&Path>) -> bool {
+    home_override.is_none() && std::env::var("FL_WIRE_DISABLE_HOST_DISCOVERY").as_deref() != Ok("1")
+}
+
+/// Model, thinking level and selectable models for a route session.
+/// Missing or malformed sources fall back silently; this never fails discovery.
+fn session_model_info(
+    adapter: &str,
+    session_id: &str,
+    transcript_path: Option<&str>,
+    home: Option<&Path>,
+    agy_ls_address: Option<&str>,
+    agy_csrf_token: Option<&str>,
+    agy_env_fallback: bool,
+) -> SessionModelInfo {
+    match adapter {
+        "antigravity" => agy_live_model_info_for_transcript(
+            agy_ls_address,
+            agy_csrf_token,
+            session_id,
+            transcript_path,
+            agy_env_fallback,
+        ),
+        "claude" => claude_model_info(transcript_path, home),
+        "codex" => codex_model_info(transcript_path, home),
+        "grok" => grok_model_info(transcript_path, home),
+        "muse" => SessionModelInfo {
+            model: Some(MUSE_MODEL.to_string()),
+            thinking_level: None,
+            available_models: vec![MUSE_MODEL.to_string()],
+        },
+        _ => SessionModelInfo::default(),
+    }
+}
+
+fn non_empty_str(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Largest config or cache file (`settings.json`, `config.toml`, `models_cache.json`,
+/// `summary.json`) read on a poll. A bigger file counts as unreadable.
+const MODEL_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// A whole file as UTF-8, or `None` when it is unreadable, not UTF-8, or longer than
+/// `max_bytes`. Never reads more than `max_bytes + 1` bytes, even from a special file.
+fn read_capped_string(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    let mut text = String::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= max_bytes).then_some(text)
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    serde_json::from_str(&read_capped_string(path, MODEL_FILE_MAX_BYTES)?).ok()
+}
+
+fn read_toml_file(path: &Path) -> Option<toml::Table> {
+    read_capped_string(path, MODEL_FILE_MAX_BYTES)?
+        .parse::<toml::Table>()
+        .ok()
+}
+
+fn toml_non_empty_str(table: &toml::Table, key: &str) -> Option<String> {
+    table
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+// --- Antigravity ------------------------------------------------------------
+
+/// One `clientModelConfigs[]` entry: the full model id (with thinking suffix) and the
+/// `MODEL_PLACEHOLDER_*` name that trajectory steps use for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgyConfiguredModel {
+    model_id: String,
+    placeholder: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgyModelConfig {
+    models: Vec<AgyConfiguredModel>,
+    default_placeholder: Option<String>,
+}
+
+/// Parse a `GetCascadeModelConfigData` response. `None` when it is not JSON or lists no model.
+fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
+    let val: Value = serde_json::from_str(body).ok()?;
+    let models: Vec<AgyConfiguredModel> = val
+        .get("clientModelConfigs")?
+        .as_array()?
+        .iter()
+        .filter_map(|entry| {
+            Some(AgyConfiguredModel {
+                model_id: non_empty_str(entry.get("modelId"))?,
+                placeholder: non_empty_str(entry.pointer("/modelOrAlias/model")),
+            })
+        })
+        .collect();
+    if models.is_empty() {
+        return None;
+    }
+    Some(AgyModelConfig {
+        models,
+        default_placeholder: non_empty_str(
+            val.pointer("/defaultOverrideModelConfig/modelOrAlias/model"),
+        ),
+    })
+}
+
+/// Latest `metadata.generatorModel` in the steps of a `GetCascadeTrajectory` response
+/// (`trajectory.steps`) or a `GetCascadeTrajectorySteps` response (`steps`, or
+/// `trajectory.steps`). A body cut off by the size cap is not valid JSON; the last
+/// `"generatorModel"` string in the text that did arrive is used then.
+fn parse_agy_generator_model(body: &str) -> Option<String> {
+    if let Ok(val) = serde_json::from_str::<Value>(body) {
+        return generator_model_from_json(&val);
+    }
+    const KEY: &str = "\"generatorModel\"";
+    let mut latest = None;
+    let mut rest = body;
+    while let Some(at) = rest.find(KEY) {
+        rest = &rest[at + KEY.len()..];
+        let after = rest.trim_start().strip_prefix(':').map(str::trim_start);
+        if let Some(value) = after.and_then(|a| a.strip_prefix('"'))
+            && let Some(end) = value.find('"')
+            && !value[..end].trim().is_empty()
+        {
+            latest = Some(value[..end].trim().to_string());
+        }
+    }
+    latest
+}
+
+fn generator_model_from_json(val: &Value) -> Option<String> {
+    val.pointer("/steps")
+        .or_else(|| val.pointer("/trajectory/steps"))?
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|step| non_empty_str(step.pointer("/metadata/generatorModel")))
+}
+
+/// [`parse_agy_generator_model`] for a body that must be complete. A `GetCascadeTrajectory`
+/// body cut off by the size cap holds the OLDEST steps, so its last `generatorModel` is a
+/// stale early model: a body that is not valid JSON names no model.
+fn parse_agy_complete_generator_model(body: &str) -> Option<String> {
+    generator_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
+}
+
+/// Split a trailing `-low`, `-medium` or `-high` off a model id. An id with no such suffix
+/// is returned whole with no thinking level.
+fn split_agy_thinking_suffix(model_id: &str) -> (String, Option<String>) {
+    for level in ["low", "medium", "high"] {
+        if let Some(base) = model_id.strip_suffix(&format!("-{level}"))
+            && !base.is_empty()
+        {
+            return (base.to_string(), Some(level.to_string()));
+        }
+    }
+    (model_id.to_string(), None)
+}
+
+/// Match a trajectory placeholder (then the config's default placeholder) against the
+/// configured models. `available_models` lists each base id once, in config order.
+fn resolve_agy_model_info(config: &AgyModelConfig, placeholder: Option<&str>) -> SessionModelInfo {
+    let mut available_models: Vec<String> = Vec::new();
+    for entry in &config.models {
+        let (base, _) = split_agy_thinking_suffix(&entry.model_id);
+        if !available_models.contains(&base) {
+            available_models.push(base);
+        }
+    }
+    let matched = [placeholder, config.default_placeholder.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|wanted| {
+            config
+                .models
+                .iter()
+                .find(|entry| entry.placeholder.as_deref() == Some(wanted))
+        });
+    let (model, thinking_level) = match matched {
+        Some(entry) => {
+            let (base, level) = split_agy_thinking_suffix(&entry.model_id);
+            (Some(base), level)
+        }
+        None => (None, None),
+    };
+    SessionModelInfo {
+        model,
+        thinking_level,
+        available_models,
+    }
+}
+
+fn offline_agy_model_info() -> SessionModelInfo {
+    SessionModelInfo {
+        model: None,
+        thinking_level: None,
+        available_models: owned_strings(&AGY_DEFAULT_MODELS),
+    }
+}
+
+type AgyCache<K, V> = Mutex<BTreeMap<K, (Instant, Option<V>)>>;
+
+static AGY_CONFIG_CACHE: AgyCache<u16, AgyModelConfig> = Mutex::new(BTreeMap::new());
+static AGY_PLACEHOLDER_CACHE: AgyCache<(u16, String), String> = Mutex::new(BTreeMap::new());
+
+/// `Some(entry)` while `key` has a live cache entry. A cached miss lives for the shorter
+/// negative TTL.
+fn agy_cache_get<K: Ord + Clone, V: Clone>(cache: &AgyCache<K, V>, key: &K) -> Option<Option<V>> {
+    agy_cache_get_with_ttls(cache, key, AGY_CACHE_TTL, AGY_NEGATIVE_CACHE_TTL)
+}
+
+/// [`agy_cache_get`] with explicit TTLs, so a test can expire an entry without waiting.
+fn agy_cache_get_with_ttls<K: Ord + Clone, V: Clone>(
+    cache: &AgyCache<K, V>,
+    key: &K,
+    ttl: Duration,
+    negative_ttl: Duration,
+) -> Option<Option<V>> {
+    let guard = cache.lock().unwrap_or_else(|err| err.into_inner());
+    let (at, value) = guard.get(key)?;
+    let ttl = if value.is_some() { ttl } else { negative_ttl };
+    (at.elapsed() < ttl).then(|| value.clone())
+}
+
+/// Drop every cached answer for `port`. The kernel can hand a stub's port to a later stub
+/// inside the TTL, and the stale entry would answer from the cache.
+#[cfg(test)]
+fn forget_agy_port_caches(port: u16) {
+    AGY_CONFIG_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .remove(&port);
+    AGY_PLACEHOLDER_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .retain(|(cached_port, _), _| *cached_port != port);
+}
+
+fn agy_cache_put<K: Ord, V>(cache: &AgyCache<K, V>, key: K, value: Option<V>) {
+    let mut guard = cache.lock().unwrap_or_else(|err| err.into_inner());
+    if guard.len() >= AGY_CACHE_MAX_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(key, (Instant::now(), value));
+}
+
+fn agy_rpc(port: u16, csrf: &str, method: &str, body: &str, max_bytes: usize) -> Option<String> {
+    let procedure = format!("{AGY_LS_SERVICE}/{method}");
+    let (code, _, resp) = fl_wire::dispatcher::post_agy_connect_rpc_limited(
+        port,
+        csrf,
+        &procedure,
+        body,
+        AGY_RPC_TIMEOUT,
+        max_bytes,
+    )
+    .ok()?;
+    (code == 200).then_some(resp)
+}
+
+fn agy_cached_model_config(port: u16, csrf: &str) -> Option<AgyModelConfig> {
+    if let Some(hit) = agy_cache_get(&AGY_CONFIG_CACHE, &port) {
+        return hit;
+    }
+    let config = agy_rpc(port, csrf, "GetCascadeModelConfigData", "{}", 1024 * 1024)
+        .and_then(|body| parse_agy_model_config(&body));
+    agy_cache_put(&AGY_CONFIG_CACHE, port, config.clone());
+    config
+}
+
+/// `step_index` of the newest complete JSON line in an Antigravity transcript tail.
+/// A cut-off first line or a half-written last line is not valid JSON and is skipped.
+fn agy_last_step_index(tail: &str) -> Option<u64> {
+    tail.lines().rev().find_map(|line| {
+        let val: Value = serde_json::from_str(line.trim()).ok()?;
+        val.get("step_index").and_then(Value::as_u64)
+    })
+}
+
+/// First step the tail-steps call asks for: [`AGY_STEPS_TAIL_MARGIN`] before the transcript's
+/// last `step_index`. 0 when the transcript is missing, unreadable or names no step, and
+/// for a conversation too short to need the tail call.
+fn agy_tail_step_offset(transcript_path: Option<&str>) -> u64 {
+    transcript_path
+        .and_then(|p| read_file_tail(Path::new(p), AGY_TRANSCRIPT_TAIL_BYTES))
+        .and_then(|tail| agy_last_step_index(&tail))
+        .map_or(0, |index| index.saturating_sub(AGY_STEPS_TAIL_MARGIN))
+}
+
+/// Latest generator model from `GetCascadeTrajectorySteps`, which returns only the newest
+/// steps. `None` when no tail offset is known, the call fails, or the steps name no model.
+fn agy_tail_generator_model(
+    port: u16,
+    csrf: &str,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> Option<String> {
+    let step_offset = agy_tail_step_offset(transcript_path);
+    if step_offset == 0 {
+        return None;
+    }
+    let body =
+        serde_json::json!({ "cascadeId": session_id, "stepOffset": step_offset }).to_string();
+    agy_rpc(
+        port,
+        csrf,
+        "GetCascadeTrajectorySteps",
+        &body,
+        AGY_TRAJECTORY_MAX_BYTES,
+    )
+    .and_then(|resp| parse_agy_generator_model(&resp))
+}
+
+fn agy_cached_generator_model(
+    port: u16,
+    csrf: &str,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> Option<String> {
+    let key = (port, session_id.to_string());
+    if let Some(hit) = agy_cache_get(&AGY_PLACEHOLDER_CACHE, &key) {
+        return hit;
+    }
+    // A long conversation's full trajectory can be tens of megabytes, so ask for the newest
+    // steps first. The full call runs only when that fast path finds no model.
+    let placeholder =
+        agy_tail_generator_model(port, csrf, session_id, transcript_path).or_else(|| {
+            let body = serde_json::json!({ "cascadeId": session_id }).to_string();
+            agy_rpc(
+                port,
+                csrf,
+                "GetCascadeTrajectory",
+                &body,
+                AGY_TRAJECTORY_MAX_BYTES,
+            )
+            .and_then(|resp| parse_agy_complete_generator_model(&resp))
+        });
+    agy_cache_put(&AGY_PLACEHOLDER_CACHE, key, placeholder.clone());
+    placeholder
+}
+
+/// Ask the Antigravity language server which model a conversation runs and which models it
+/// offers. The route's `ls_address` and `csrf_token` win; the environment fills a gap only
+/// when `env_fallback` is true. Any failure yields the offline defaults.
+///
+/// `transcript_path` is the session's Antigravity transcript; its last `step_index` lets the
+/// model lookup fetch only the newest steps.
+fn agy_live_model_info_for_transcript(
+    route_address: Option<&str>,
+    route_csrf: Option<&str>,
+    session_id: &str,
+    transcript_path: Option<&str>,
+    env_fallback: bool,
+) -> SessionModelInfo {
+    let from_env = |name: &str| {
+        env_fallback
+            .then(|| std::env::var(name).ok())
+            .flatten()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let clean = |v: Option<&str>| {
+        v.map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToOwned::to_owned)
+    };
+    let addresses: Vec<String> = [clean(route_address), from_env("ANTIGRAVITY_LS_ADDRESS")]
+        .into_iter()
+        .flatten()
+        .collect();
+    let Some(csrf) = clean(route_csrf).or_else(|| from_env("ANTIGRAVITY_CSRF_TOKEN")) else {
+        return offline_agy_model_info();
+    };
+    // The token goes into an HTTP header: refuse anything that is not one plain value.
+    if session_id.is_empty() || csrf.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return offline_agy_model_info();
+    }
+    let port = addresses.iter().find_map(|addr| {
+        let port = fl_wire::identity::agy_ls_port(addr)?;
+        let cached = agy_cache_get(&AGY_CONFIG_CACHE, &port).is_some();
+        (cached || fl_wire::identity::agy_ls_address_listening(addr)).then_some(port)
+    });
+    let Some(port) = port else {
+        return offline_agy_model_info();
+    };
+    let Some(config) = agy_cached_model_config(port, &csrf) else {
+        return offline_agy_model_info();
+    };
+    let placeholder = agy_cached_generator_model(port, &csrf, session_id, transcript_path);
+    resolve_agy_model_info(&config, placeholder.as_deref())
+}
+
+/// [`agy_live_model_info_for_transcript`] for a session with no known transcript.
+#[cfg(test)]
+fn agy_live_model_info(
+    route_address: Option<&str>,
+    route_csrf: Option<&str>,
+    session_id: &str,
+    env_fallback: bool,
+) -> SessionModelInfo {
+    agy_live_model_info_for_transcript(route_address, route_csrf, session_id, None, env_fallback)
+}
+
+// --- Claude -----------------------------------------------------------------
+
+/// Read at most the last `max_bytes` of a file as lossy UTF-8.
+fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    // `take` bounds the read even when the file grew after `metadata()` or is a special file.
+    file.take(max_bytes).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Latest `message.model` (or top-level `model`) in Claude transcript JSONL. Claude Code's
+/// `<synthetic>` placeholder is not a model name and is skipped.
+fn latest_claude_transcript_model(jsonl: &str) -> Option<String> {
+    jsonl.lines().rev().find_map(|line| {
+        let val: Value = serde_json::from_str(line.trim()).ok()?;
+        plain_bounded_str(val.pointer("/message/model"), MODEL_ID_MAX_CHARS)
+            .or_else(|| plain_bounded_str(val.get("model"), MODEL_ID_MAX_CHARS))
+            .filter(|model| !model.starts_with('<'))
+    })
+}
+
+fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
+    let from_transcript = transcript_path
+        .and_then(|p| read_file_tail(Path::new(p), CLAUDE_TRANSCRIPT_TAIL_BYTES))
+        .and_then(|tail| latest_claude_transcript_model(&tail));
+    let model = from_transcript.or_else(|| {
+        let settings = read_json_file(&home?.join(".claude").join("settings.json"))?;
+        plain_bounded_str(settings.get("model"), MODEL_ID_MAX_CHARS)
+    });
+    SessionModelInfo {
+        model,
+        thinking_level: None,
+        available_models: owned_strings(&CLAUDE_MODELS),
+    }
+}
+
+// --- Codex ------------------------------------------------------------------
+
+/// `models[].slug` entries whose `visibility` is `list`.
+fn codex_listed_models(cache: &Value) -> Vec<String> {
+    cache
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|models| {
+            models
+                .iter()
+                .filter(|m| m.get("visibility").and_then(Value::as_str) == Some("list"))
+                .filter_map(|m| non_empty_str(m.get("slug")))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Longest accepted per-session model id (Claude and Codex).
+const MODEL_ID_MAX_CHARS: usize = 128;
+/// Longest accepted per-session Codex reasoning effort.
+const CODEX_EFFORT_MAX_CHARS: usize = 32;
+
+/// A trimmed, non-empty, single-line string of at most `max_chars` characters with no
+/// control characters. Anything else is `None`.
+fn plain_bounded_str(value: Option<&Value>, max_chars: usize) -> Option<String> {
+    non_empty_str(value)
+        .filter(|s| s.chars().count() <= max_chars && !s.chars().any(char::is_control))
+}
+
+/// Per-session `(model, thinking_level)` from the newest Codex rollout lines. Each field is
+/// the most recent valid value, found independently: a later line may carry only one of them.
+/// The effort comes from `payload.effort`, else `payload.reasoning_effort`, else
+/// `payload.collaboration_mode.settings.reasoning_effort`. A cut-off first line of a tail
+/// is not valid JSON and is skipped like any other malformed line.
+fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
+    const EFFORT_POINTERS: [&str; 3] = [
+        "/payload/effort",
+        "/payload/reasoning_effort",
+        "/payload/collaboration_mode/settings/reasoning_effort",
+    ];
+    let (mut model, mut effort) = (None, None);
+    for line in jsonl.lines().rev() {
+        if model.is_some() && effort.is_some() {
+            break;
+        }
+        // Cheap prefilter: a line that names neither key cannot carry a value.
+        if !line.contains("\"model\"") && !line.contains("effort") {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if model.is_none() {
+            model = plain_bounded_str(val.pointer("/payload/model"), MODEL_ID_MAX_CHARS);
+        }
+        if effort.is_none() {
+            effort = EFFORT_POINTERS.iter().find_map(|pointer| {
+                plain_bounded_str(val.pointer(pointer), CODEX_EFFORT_MAX_CHARS)
+            });
+        }
+    }
+    (model, effort)
+}
+
+/// Model and thinking level of a Codex session. The session's rollout transcript names what
+/// the session runs; `~/.codex/config.toml` is only the default for a field the rollout
+/// does not carry.
+fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
+    let (session_model, session_effort) = transcript_path
+        .and_then(|p| read_file_tail(Path::new(p), CLAUDE_TRANSCRIPT_TAIL_BYTES))
+        .map(|tail| codex_rollout_settings(&tail))
+        .unwrap_or_default();
+    let codex_dir = home.map(|h| h.join(".codex"));
+    let config = codex_dir
+        .as_ref()
+        .and_then(|d| read_toml_file(&d.join("config.toml")));
+    let mut available_models = codex_dir
+        .as_ref()
+        .and_then(|d| read_json_file(&d.join("models_cache.json")))
+        .map(|cache| codex_listed_models(&cache))
+        .unwrap_or_default();
+    if available_models.is_empty() {
+        available_models = owned_strings(&CODEX_DEFAULT_MODELS);
+    }
+    SessionModelInfo {
+        model: session_model
+            .or_else(|| config.as_ref().and_then(|c| toml_non_empty_str(c, "model"))),
+        thinking_level: session_effort.or_else(|| {
+            config
+                .as_ref()
+                .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
+        }),
+        available_models,
+    }
+}
+
+// --- Grok -------------------------------------------------------------------
+
+/// Keys of the cache's `models` object whose `info.hidden` is not true.
+fn grok_visible_models(cache: &Value) -> Vec<String> {
+    cache
+        .get("models")
+        .and_then(Value::as_object)
+        .map(|models| {
+            models
+                .iter()
+                .filter(|(_, m)| m.pointer("/info/hidden").and_then(Value::as_bool) != Some(true))
+                .map(|(id, _)| id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn grok_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
+    let grok_dir = home.map(|h| h.join(".grok"));
+    let session_model = transcript_path
+        .map(Path::new)
+        .filter(|p| p.file_name().and_then(|n| n.to_str()) == Some("chat_history.jsonl"))
+        .and_then(Path::parent)
+        .and_then(|dir| read_json_file(&dir.join("summary.json")))
+        .and_then(|summary| non_empty_str(summary.get("current_model_id")));
+    let config = grok_dir
+        .as_ref()
+        .and_then(|d| read_toml_file(&d.join("config.toml")));
+    // The CLI writes these under `[models]`; accept them at the top level too.
+    let config_str = |key: &str| {
+        let models = config
+            .as_ref()?
+            .get("models")
+            .and_then(toml::Value::as_table);
+        models
+            .and_then(|t| toml_non_empty_str(t, key))
+            .or_else(|| toml_non_empty_str(config.as_ref()?, key))
+    };
+    let mut available_models = grok_dir
+        .as_ref()
+        .and_then(|d| read_json_file(&d.join("models_cache.json")))
+        .map(|cache| grok_visible_models(&cache))
+        .unwrap_or_default();
+    if available_models.is_empty() {
+        available_models = owned_strings(&GROK_DEFAULT_MODELS);
+    }
+    SessionModelInfo {
+        model: session_model.or_else(|| config_str("default")),
+        thinking_level: config_str("default_reasoning_effort"),
+        available_models,
+    }
 }
 
 fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String> {
@@ -963,7 +1686,7 @@ pub fn read_session_context_usage_from_snapshot(
         return None;
     }
 
-    let sessions = discover_sessions_from_snapshot(snap, home_override);
+    let sessions = discover_sessions_impl(snap, home_override, false);
     let mut tpath_opt = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -1190,7 +1913,7 @@ pub fn read_session_transcript_from_snapshot(
         return Vec::new();
     }
 
-    let sessions = discover_sessions_from_snapshot(snap, home_override);
+    let sessions = discover_sessions_impl(snap, home_override, false);
     for s in &sessions {
         if (s.id == trimmed || s.persona.as_deref() == Some(trimmed))
             && let Some(ref tpath) = s.transcript_path
@@ -1704,6 +2427,89 @@ fn strip_grok_user_query_wrapper(content: &str) -> String {
     content.to_string()
 }
 
+/// Wrapper tags Antigravity puts around operator and notice turns.
+const AGY_WRAPPER_TAGS: [&str; 3] = ["user_request", "additional_metadata", "ephemeral_message"];
+
+/// Strip Antigravity `<USER_REQUEST>`, `<ADDITIONAL_METADATA>` and `<EPHEMERAL_MESSAGE>` wrappers
+/// from a user turn. Mirrors the UI's `stripAgyUserRequestWrapper`.
+///
+/// Content that does not start with one of the three tags is returned unchanged, so a message
+/// that merely quotes a tag stays intact. Otherwise every `<ADDITIONAL_METADATA>` block is
+/// removed, every `<USER_REQUEST>` and `<EPHEMERAL_MESSAGE>` block is replaced by its trimmed
+/// inner text, runs of three or more newlines become two, and the result is trimmed.
+pub(crate) fn strip_agy_user_request_wrapper(content: &str) -> String {
+    if !starts_with_agy_wrapper_tag(content) {
+        return content.to_string();
+    }
+    let (without_metadata, _) =
+        replace_agy_blocks(content, "additional_metadata", |_| String::new());
+    let (without_request, _) = replace_agy_blocks(&without_metadata, "user_request", |inner| {
+        inner.trim().to_string()
+    });
+    let (unwrapped, _) = replace_agy_blocks(&without_request, "ephemeral_message", |inner| {
+        inner.trim().to_string()
+    });
+    collapse_blank_runs(&unwrapped).trim().to_string()
+}
+
+fn starts_with_agy_wrapper_tag(content: &str) -> bool {
+    let lowered = content.trim_start().to_ascii_lowercase();
+    AGY_WRAPPER_TAGS
+        .iter()
+        .any(|tag| lowered.starts_with(&format!("<{tag}>")))
+}
+
+/// True when the turn starts with an Antigravity wrapper tag and holds a complete
+/// `<EPHEMERAL_MESSAGE>` block: a system notice, not an operator message.
+fn is_agy_ephemeral_message(content: &str) -> bool {
+    starts_with_agy_wrapper_tag(content)
+        && replace_agy_blocks(content, "ephemeral_message", |_| String::new()).1
+}
+
+/// Replace each complete `<tag>...</tag>` block (ASCII case-insensitive, non-greedy) with
+/// `replace(inner)`. An opening tag with no closing tag is left as it is.
+fn replace_agy_blocks(text: &str, tag: &str, replace: impl Fn(&str) -> String) -> (String, bool) {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    // ASCII lowercasing keeps byte offsets, so indexes into `lowered` are valid in `text`.
+    let lowered = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut found = false;
+    while let Some(rel_open) = lowered[cursor..].find(&open) {
+        let open_at = cursor + rel_open;
+        let inner_at = open_at + open.len();
+        let Some(rel_close) = lowered[inner_at..].find(&close) else {
+            break;
+        };
+        let close_at = inner_at + rel_close;
+        out.push_str(&text[cursor..open_at]);
+        out.push_str(&replace(&text[inner_at..close_at]));
+        cursor = close_at + close.len();
+        found = true;
+    }
+    out.push_str(&text[cursor..]);
+    (out, found)
+}
+
+/// Collapse every run of three or more newlines into exactly two.
+fn collapse_blank_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            run += 1;
+            if run <= 2 {
+                out.push(ch);
+            }
+        } else {
+            run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Return `true` when the latest turn in `turns` indicates the agent session is actively working
 /// (e.g. a user/wire/tool/system turn is awaiting an assistant reply, or the latest assistant turn
 /// issued tool calls that have not yet produced a final text-only assistant turn).
@@ -1739,11 +2545,89 @@ fn clean_sender_token(raw: &str) -> String {
     s.to_string()
 }
 
+/// Openers of Claude Code transcript user turns that the harness, not the operator, wrote.
+/// A turn whose text starts with one is a system notice.
+const SYSTEM_NOTICE_OPENERS: [&str; 4] = [
+    "<task-notification>",
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+];
+/// Spellings of the `<agent-message ...>` open tag: plain, and backslash-escaped.
+const AGENT_MESSAGE_OPEN_TAGS: [&str; 2] = ["<agent-message", "<\\agent-message"];
+/// Spellings of the `</agent-message>` close tag: plain, and the two backslash-escaped forms.
+const AGENT_MESSAGE_CLOSE_TAGS: [&str; 3] = [
+    "</agent-message>",
+    "<\\/agent-message>",
+    "</\\agent-message>",
+];
+/// Last line of the boilerplate header in front of a subagent hand-back report.
+const SUBAGENT_REPORT_HEADER_END: &str = "The report follows:";
+/// The boilerplate header is short; a later occurrence of its last line is report text.
+const SUBAGENT_REPORT_HEADER_MAX_BYTES: usize = 1024;
+
+fn starts_with_system_notice_opener(text: &str) -> bool {
+    let text = text.trim_start();
+    SYSTEM_NOTICE_OPENERS
+        .iter()
+        .any(|opener| text.starts_with(opener))
+}
+
+/// The text after an `<agent-message ...>` open tag (either spelling), when `text` starts
+/// with one. The tag name must end at whitespace or `>`, so `<agent-messages>` is no tag.
+fn strip_agent_message_open_tag(text: &str) -> Option<&str> {
+    let text = text.trim_start();
+    AGENT_MESSAGE_OPEN_TAGS.iter().find_map(|tag| {
+        let rest = text.strip_prefix(tag)?;
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '>') {
+            return None;
+        }
+        Some(&rest[rest.find('>')? + 1..])
+    })
+}
+
+/// Whether `text` opens a subagent hand-back. The marker must be at the START of the
+/// text (after the optional `Another Claude session sent a message:` wrapper, which the
+/// caller strips first): an `<agent-message` open tag or a `[Subagent ` bracket. A
+/// marker anywhere later is ordinary prose, such as an operator quoting a hand-back, and
+/// never reclassifies the turn.
+fn starts_subagent_handback(text: &str) -> bool {
+    let text = text.trim_start();
+    strip_agent_message_open_tag(text).is_some() || text.starts_with("[Subagent ")
+}
+
+/// The report body of a subagent hand-back: the `<agent-message ...>` open tag, the
+/// `</agent-message>` close tag and the `[Subagent hand-back] ... The report follows:`
+/// header are removed. A header without its `The report follows:` line is kept.
+fn clean_subagent_handback(text: &str) -> String {
+    let mut body = text.trim();
+    if let Some(after_tag) = strip_agent_message_open_tag(body) {
+        body = after_tag.trim();
+    }
+    for tag in AGENT_MESSAGE_CLOSE_TAGS {
+        if let Some(before_tag) = body.strip_suffix(tag) {
+            body = before_tag.trim_end();
+            break;
+        }
+    }
+    if body.starts_with("[Subagent ")
+        && let Some(at) = body.find(SUBAGENT_REPORT_HEADER_END)
+        && at < SUBAGENT_REPORT_HEADER_MAX_BYTES
+    {
+        body = body[at + SUBAGENT_REPORT_HEADER_END.len()..].trim();
+    }
+    body.to_string()
+}
+
 fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if role != "system" && role != "user" {
         return (role.to_string(), content.to_string());
     }
+    let from_ephemeral = is_agy_ephemeral_message(content);
+    let unwrapped = strip_agy_user_request_wrapper(content);
+    let content = unwrapped.as_str();
     let trimmed_content = content.trim();
+    let is_notice = trimmed_content.starts_with("[Notice] ");
     let has_system_msg_block =
         trimmed_content.starts_with("<SYSTEM_MESSAGE>") || content.contains("\n<SYSTEM_MESSAGE>");
     let has_claude_peer_wrapper =
@@ -1751,9 +2635,15 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     let has_wire_or_operator_prefix = trimmed_content.starts_with("[Operator Prompt via FerroDeck")
         || trimmed_content.starts_with("[Incoming NATS Message")
         || trimmed_content.starts_with("[fl-wire ");
+    // Harness-written turns that Claude Code records with the `user` role.
+    let has_harness_opener = starts_with_system_notice_opener(trimmed_content)
+        || starts_subagent_handback(trimmed_content);
     if role != "system"
         && !has_system_msg_block
-        && !(role == "user" && (has_claude_peer_wrapper || has_wire_or_operator_prefix))
+        && !from_ephemeral
+        && !is_notice
+        && !(role == "user"
+            && (has_claude_peer_wrapper || has_wire_or_operator_prefix || has_harness_opener))
     {
         return (role.to_string(), content.to_string());
     }
@@ -1887,6 +2777,23 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
         return ("system".to_string(), body);
     }
 
+    // A Claude Code notice the harness wrote is a system turn, not an operator turn.
+    if starts_with_system_notice_opener(inner) {
+        return ("system".to_string(), inner.to_string());
+    }
+
+    // An async subagent hand-back is a wire turn from the subagent. Only `inner`, the
+    // text after the peer wrapper, is tested, and only at its start.
+    if starts_subagent_handback(inner) {
+        return ("wire:subagent".to_string(), clean_subagent_handback(inner));
+    }
+
+    // An Antigravity `[Notice]` or `<EPHEMERAL_MESSAGE>` is a system notice, never an
+    // operator message, even though the transcript labels it as a user turn.
+    if from_ephemeral || inner.starts_with("[Notice] ") {
+        return ("system".to_string(), inner.to_string());
+    }
+
     if !inner.starts_with("[Operator Prompt via FerroDeck")
         && !inner.starts_with("[Incoming NATS Message")
         && !inner.starts_with("[fl-wire ")
@@ -1902,7 +2809,6 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if (has_system_msg_block || has_claude_peer_wrapper)
         && !inner.starts_with("[Incoming NATS Message")
         && !inner.starts_with("[fl-wire ")
-        && !inner.starts_with("[Subagent ")
         && !inner.starts_with("[Task ")
     {
         return ("user".to_string(), inner.to_string());
@@ -2718,6 +3624,1628 @@ mod tests {
         );
         assert_eq!(role, "user");
         assert_eq!(content, "Direct prompt without prefix");
+    }
+
+    const HANDBACK_HEADER: &str = "[Subagent hand-back] The text below is the final report of a subagent this session delegated to (not user or external input). Treat the findings with appropriate weight, and continue the parent task.\n\nThe report follows:\n";
+
+    #[test]
+    fn normalize_system_turn_classifies_a_subagent_hand_back_as_wire_subagent() {
+        let plain = format!(
+            "Another Claude session sent a message:\n<agent-message from=\"acd87c17952de4c0a\">\n{HANDBACK_HEADER}Report body\n</agent-message>"
+        );
+        let (role, content) = normalize_system_turn("user", &plain);
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Report body");
+
+        // The backslash-escaped tag spelling gives the same turn.
+        let escaped = format!(
+            "Another Claude session sent a message:\n<\\agent-message from=\"acd87c17952de4c0a\">\n{HANDBACK_HEADER}Report body\n<\\/agent-message>"
+        );
+        let (role, content) = normalize_system_turn("user", &escaped);
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Report body");
+
+        // The peer-session footer after the close tag is dropped too.
+        let footed = format!(
+            "Another Claude session sent a message:\n<agent-message from=\"a\">\n{HANDBACK_HEADER}Report body\n</agent-message>\n\nThis came from another Claude session and is not user input."
+        );
+        let (role, content) = normalize_system_turn("user", &footed);
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Report body");
+
+        // Without the peer wrapper: tag plus header, bare header, and a bare tag.
+        let (role, content) = normalize_system_turn(
+            "user",
+            &format!(
+                "<agent-message from=\"a\">\n{HANDBACK_HEADER}Line one\n\nLine two\n</agent-message>"
+            ),
+        );
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Line one\n\nLine two");
+        let (role, content) =
+            normalize_system_turn("user", &format!("{HANDBACK_HEADER}Report body"));
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Report body");
+        let (role, content) = normalize_system_turn(
+            "user",
+            "<agent-message from=\"a\">Just text</agent-message>",
+        );
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Just text");
+
+        // A header with no `The report follows:` line is kept whole.
+        let (role, content) = normalize_system_turn("user", "[Subagent status] still running");
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "[Subagent status] still running");
+
+        // A report body that repeats the header's last line keeps it.
+        let (role, content) = normalize_system_turn(
+            "user",
+            &format!("{HANDBACK_HEADER}Intro\nThe report follows: more"),
+        );
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Intro\nThe report follows: more");
+    }
+
+    #[test]
+    fn normalize_system_turn_keeps_user_text_that_only_mentions_a_hand_back() {
+        for text in [
+            "Can you explain what the [Subagent hand-back] marker in the transcript means when the parent task continues?",
+            "Another Claude session sent a message:\nPlease note the [Subagent hand-back] text in the log above.",
+            "Quoting the tool: <agent-message from=\"a\"> was in the output.",
+            "<agent-messages> is not the tag",
+        ] {
+            let (role, content) = normalize_system_turn("user", text);
+            assert_eq!(role, "user", "{text}");
+            assert!(!content.is_empty());
+        }
+        // The peer-wrapped ordinary message loses only its wrapper.
+        let (role, content) = normalize_system_turn(
+            "user",
+            "Another Claude session sent a message:\nPlease note the [Subagent hand-back] text in the log above.",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(
+            content,
+            "Please note the [Subagent hand-back] text in the log above."
+        );
+    }
+
+    #[test]
+    fn normalize_system_turn_classifies_harness_notices_on_user_turns_as_system() {
+        for opener in [
+            "<task-notification>",
+            "<local-command-caveat>",
+            "<local-command-stdout>",
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+        ] {
+            let text = format!("{opener} something happened");
+            let (role, content) = normalize_system_turn("user", &text);
+            assert_eq!(role, "system", "{opener}");
+            assert_eq!(content, text);
+            // Leading whitespace is ignored, and a system-role turn stays system.
+            let (role, _) = normalize_system_turn("user", &format!("\n  {text}"));
+            assert_eq!(role, "system", "{opener}");
+            let (role, _) = normalize_system_turn("system", &text);
+            assert_eq!(role, "system", "{opener}");
+        }
+        // The opener must start the turn.
+        let (role, _) = normalize_system_turn("user", "see <task-notification> in the log");
+        assert_eq!(role, "user");
+    }
+
+    #[test]
+    fn strip_agy_user_request_wrapper_mirrors_the_ui_twin() {
+        let raw = "<USER_REQUEST>\nPlease continue\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-29T18:44:28Z.\n</ADDITIONAL_METADATA>";
+        assert_eq!(strip_agy_user_request_wrapper(raw), "Please continue");
+
+        // Metadata first, mixed case tags, and blank-line runs collapse to one blank line.
+        let raw = "<additional_metadata>\nx\n</additional_metadata>\n\n\n<User_Request>\n a\n\n\n\nb \n</User_Request>";
+        assert_eq!(strip_agy_user_request_wrapper(raw), "a\n\nb");
+
+        let raw = "<EPHEMERAL_MESSAGE>\n[Notice] stopped\n</EPHEMERAL_MESSAGE>";
+        assert_eq!(strip_agy_user_request_wrapper(raw), "[Notice] stopped");
+
+        // A tag that is not at the start is quoted text and stays intact.
+        let quoted = "Here is a snippet:\n<USER_REQUEST>\nhello\n</USER_REQUEST>";
+        assert_eq!(strip_agy_user_request_wrapper(quoted), quoted);
+        assert_eq!(strip_agy_user_request_wrapper(""), "");
+
+        // An unclosed tag is left alone rather than swallowing the rest.
+        assert_eq!(
+            strip_agy_user_request_wrapper("<USER_REQUEST>\nno close"),
+            "<USER_REQUEST>\nno close"
+        );
+    }
+
+    #[test]
+    fn parse_jsonl_transcript_strips_agy_wrapper_and_classifies_notices_as_system() {
+        let jsonl = [
+            serde_json::json!({
+                "step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": "<USER_REQUEST>\nPlease continue\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-29T18:44:28Z.\n</ADDITIONAL_METADATA>"
+            }),
+            serde_json::json!({
+                "step_index": 1, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": "<USER_REQUEST>\n[Notice] All your subagents and background tasks have been stopped.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>"
+            }),
+            serde_json::json!({
+                "step_index": 2, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": "<EPHEMERAL_MESSAGE>\nThe user rewound the conversation.\n</EPHEMERAL_MESSAGE>"
+            }),
+            serde_json::json!({
+                "step_index": 3, "type": "SYSTEM_MESSAGE", "source": "SYSTEM",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=system priority=MESSAGE_PRIORITY_HIGH content=[Notice] Background task finished\n</SYSTEM_MESSAGE>"
+            }),
+            serde_json::json!({
+                "step_index": 4, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": "Another Claude session sent a message:\nhello from a peer\n\nThis came from another Claude session"
+            }),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 5);
+        assert_eq!(
+            (turns[0].role.as_str(), turns[0].content.as_str()),
+            ("user", "Please continue")
+        );
+        assert_eq!(turns[1].role, "system");
+        assert_eq!(
+            turns[1].content,
+            "[Notice] All your subagents and background tasks have been stopped."
+        );
+        assert_eq!(turns[2].role, "system");
+        assert_eq!(turns[2].content, "The user rewound the conversation.");
+        assert_eq!(turns[3].role, "system");
+        assert_eq!(turns[3].content, "[Notice] Background task finished");
+        assert_eq!(turns[4].role, "user");
+        assert_eq!(turns[4].content, "hello from a peer");
+    }
+
+    // ----- live model discovery -------------------------------------------------
+
+    const AGY_CONFIG_FIXTURE: &str = r#"{
+        "clientModelConfigs": [
+            {"label":"Gemini 4 Argon (High)","modelId":"gemini-4-argon-high","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M417"}},
+            {"label":"Gemini 4 Argon (Low)","modelId":"gemini-4-argon-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M416"}},
+            {"label":"Gemini 3.8 Flash","modelId":"gemini-3.8-flash-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M420"}},
+            {"label":"Claude Opus 5.5","modelId":"claude-opus-5-5-low","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M430"}},
+            {"label":"GPT-OSS","modelId":"gpt-oss-120b-medium","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M440"}},
+            {"label":"Bare","modelId":"bare-model","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M450"}},
+            {"label":"No id","modelOrAlias":{"model":"MODEL_PLACEHOLDER_M999"}}
+        ],
+        "defaultOverrideModelConfig": {"modelOrAlias":{"model":"MODEL_PLACEHOLDER_M420"}}
+    }"#;
+
+    const AGY_TRAJECTORY_FIXTURE: &str = r#"{"trajectory":{"steps":[
+        {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},
+        {"metadata":{}},
+        {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M417"}},
+        {"type":"USER_INPUT"}
+    ]}}"#;
+
+    fn write_routes(home: &Path, entries: &[(&str, &str)]) {
+        let body: Vec<String> = entries
+            .iter()
+            .map(|(persona, route)| {
+                format!(
+                    r#""{persona}":{{"persona":"{persona}","updated_at":"2026-10-29T00:00:00.000Z","route":{route}}}"#
+                )
+            })
+            .collect();
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, format!(r#"{{"entries":{{{}}}}}"#, body.join(","))).unwrap();
+    }
+
+    fn discover_in(home: &Path) -> Vec<DiscoveredSessionSummary> {
+        let store = RedbStore::open(&home.join("store.redb")).unwrap();
+        discover_sessions_with_home(&store, Some(home))
+    }
+
+    fn session_for<'a>(
+        sessions: &'a [DiscoveredSessionSummary],
+        persona: &str,
+    ) -> &'a DiscoveredSessionSummary {
+        sessions
+            .iter()
+            .find(|s| s.persona.as_deref() == Some(persona))
+            .unwrap_or_else(|| panic!("no session for {persona}"))
+    }
+
+    fn strings(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn agy_thinking_suffix_splits_only_known_levels() {
+        assert_eq!(
+            split_agy_thinking_suffix("gemini-4-argon-high"),
+            ("gemini-4-argon".to_string(), Some("high".to_string()))
+        );
+        assert_eq!(
+            split_agy_thinking_suffix("gemini-3.8-flash-medium"),
+            ("gemini-3.8-flash".to_string(), Some("medium".to_string()))
+        );
+        assert_eq!(
+            split_agy_thinking_suffix("claude-opus-5-5-low"),
+            ("claude-opus-5-5".to_string(), Some("low".to_string()))
+        );
+        assert_eq!(
+            split_agy_thinking_suffix("bare-model"),
+            ("bare-model".to_string(), None)
+        );
+        assert_eq!(
+            split_agy_thinking_suffix("-high"),
+            ("-high".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn agy_config_and_trajectory_fixtures_resolve_the_live_model() {
+        let config = parse_agy_model_config(AGY_CONFIG_FIXTURE).expect("config parses");
+        assert_eq!(
+            config.models.len(),
+            6,
+            "an entry with no modelId is skipped"
+        );
+        let placeholder = parse_agy_generator_model(AGY_TRAJECTORY_FIXTURE);
+        assert_eq!(placeholder.as_deref(), Some("MODEL_PLACEHOLDER_M417"));
+
+        let info = resolve_agy_model_info(&config, placeholder.as_deref());
+        assert_eq!(info.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            info.available_models,
+            strings(&[
+                "gemini-4-argon",
+                "gemini-3.8-flash",
+                "claude-opus-5-5",
+                "gpt-oss-120b",
+                "bare-model"
+            ]),
+            "base ids are deduplicated in config order"
+        );
+
+        // No trajectory model falls back to the default override.
+        let info = resolve_agy_model_info(&config, None);
+        assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+        // An unknown placeholder falls back too.
+        let info = resolve_agy_model_info(&config, Some("MODEL_PLACEHOLDER_M000"));
+        assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"));
+        // A model with no thinking suffix keeps the whole id.
+        let info = resolve_agy_model_info(&config, Some("MODEL_PLACEHOLDER_M450"));
+        assert_eq!(info.model.as_deref(), Some("bare-model"));
+        assert_eq!(info.thinking_level, None);
+    }
+
+    #[test]
+    fn agy_parsers_reject_malformed_bodies_and_read_truncated_trajectories() {
+        assert!(parse_agy_model_config("not json").is_none());
+        assert!(parse_agy_model_config(r#"{"clientModelConfigs":[]}"#).is_none());
+        assert!(parse_agy_model_config(r#"{"other":1}"#).is_none());
+        assert!(
+            parse_agy_generator_model(r#"{"trajectory":{"steps":[{"metadata":{}}]}}"#).is_none()
+        );
+        assert!(parse_agy_generator_model(r#"{"trajectory":{}}"#).is_none());
+        // A body cut off by the size cap is invalid JSON; the last generatorModel that arrived wins.
+        let truncated = r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},{"metadata":{"generatorModel": "MODEL_PLACEHOLDER_M417"}},{"metadata":{"generatorMo"#;
+        assert_eq!(
+            parse_agy_generator_model(truncated).as_deref(),
+            Some("MODEL_PLACEHOLDER_M417")
+        );
+        assert!(parse_agy_generator_model("garbage").is_none());
+    }
+
+    #[test]
+    fn agy_without_a_reachable_language_server_lists_the_default_models() {
+        let offline = offline_agy_model_info();
+        assert_eq!(offline.model, None);
+        assert_eq!(offline.thinking_level, None);
+        assert_eq!(offline.available_models, strings(&AGY_DEFAULT_MODELS));
+        // No address, no csrf token, a dead port, and an unusable token all stay offline.
+        assert_eq!(agy_live_model_info(None, None, "c1", false), offline);
+        assert_eq!(
+            agy_live_model_info(Some("127.0.0.1:1"), Some("tok"), "c1", false),
+            offline
+        );
+        assert_eq!(
+            agy_live_model_info(Some("127.0.0.1:1"), Some("bad token"), "c1", false),
+            offline
+        );
+        assert_eq!(agy_live_model_info(None, Some("tok"), "c1", false), offline);
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        write_routes(
+            home,
+            &[(
+                "ferris",
+                r#"{"kind":"agy","conversation_id":"agy-offline-1"}"#,
+            )],
+        );
+        let sessions = discover_in(home);
+        let agy = session_for(&sessions, "ferris");
+        assert_eq!(agy.adapter, "antigravity");
+        assert_eq!(agy.model, None);
+        assert_eq!(agy.thinking_level, None);
+        assert_eq!(agy.available_models, strings(&AGY_DEFAULT_MODELS));
+    }
+
+    /// Serve canned Antigravity language-server replies on a loopback port. Records each
+    /// `(path, csrf header)` it sees. Stops when `stop` is set.
+    struct AgyStub {
+        port: u16,
+        seen: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+        /// `(path, request body)` for each request, in arrival order.
+        bodies: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        handle: std::thread::JoinHandle<()>,
+    }
+
+    impl AgyStub {
+        fn shutdown(self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.handle.join().unwrap();
+        }
+    }
+
+    fn spawn_agy_stub(config_body: &'static str, trajectory_body: &'static str) -> AgyStub {
+        spawn_agy_stub_with_steps(config_body, trajectory_body, "agy-live-1", None)
+    }
+
+    /// Like [`spawn_agy_stub`], and `steps` is the `(status, body)` it answers
+    /// `GetCascadeTrajectorySteps` with. `None` answers an empty object. Every cascade request
+    /// must name `cascade_id`.
+    fn spawn_agy_stub_with_steps(
+        config_body: &'static str,
+        trajectory_body: &'static str,
+        cascade_id: &'static str,
+        steps: Option<(u16, &'static str)>,
+    ) -> AgyStub {
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // The kernel may reuse a port within the cache TTL; drop answers cached for an
+        // earlier stub on it so this test sees every request it expects.
+        forget_agy_port_caches(port);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (seen_t, bodies_t, stop_t) =
+            (Arc::clone(&seen), Arc::clone(&bodies), Arc::clone(&stop));
+        let handle = std::thread::spawn(move || {
+            while !stop_t.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = listener.accept() else {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                if request_line.is_empty() {
+                    // The listening probe connects and hangs up without a request.
+                    continue;
+                }
+                let (mut csrf, mut len) = (String::new(), 0usize);
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("x-codeium-csrf-token") {
+                            csrf = value.trim().to_string();
+                        } else if name.eq_ignore_ascii_case("content-length") {
+                            len = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut req_body = vec![0u8; len];
+                reader.read_exact(&mut req_body).unwrap();
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let mut status = 200u16;
+                let reply = if path.ends_with("/GetCascadeModelConfigData") {
+                    config_body
+                } else if path.ends_with("/GetCascadeTrajectory") {
+                    assert!(
+                        String::from_utf8_lossy(&req_body).contains(cascade_id),
+                        "trajectory request names the cascade id"
+                    );
+                    trajectory_body
+                } else if path.ends_with("/GetCascadeTrajectorySteps") {
+                    assert!(
+                        String::from_utf8_lossy(&req_body).contains(cascade_id),
+                        "steps request names the cascade id"
+                    );
+                    match steps {
+                        Some((code, body)) => {
+                            status = code;
+                            body
+                        }
+                        None => "{}",
+                    }
+                } else {
+                    "{}"
+                };
+                bodies_t.lock().unwrap().push((
+                    path.clone(),
+                    String::from_utf8_lossy(&req_body).into_owned(),
+                ));
+                seen_t.lock().unwrap().push((path, csrf));
+                let mut stream = stream;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        AgyStub {
+            port,
+            seen,
+            bodies,
+            stop,
+            handle,
+        }
+    }
+
+    #[test]
+    fn agy_live_model_info_queries_a_local_stub_server_and_caches_the_answer() {
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, AGY_TRAJECTORY_FIXTURE);
+        let seen = std::sync::Arc::clone(&stub.seen);
+        let addr = format!("127.0.0.1:{}", stub.port);
+
+        let info = agy_live_model_info(Some(&addr), Some("stub-csrf"), "agy-live-1", false);
+        assert_eq!(info.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            info.available_models.first().map(String::as_str),
+            Some("gemini-4-argon")
+        );
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(
+            calls.len(),
+            2,
+            "one config call and one trajectory call: {calls:?}"
+        );
+        assert!(calls.iter().all(|(_, csrf)| csrf == "stub-csrf"));
+        assert!(
+            calls
+                .iter()
+                .any(|(p, _)| p.ends_with("/GetCascadeModelConfigData"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(p, _)| p.ends_with("/GetCascadeTrajectory"))
+        );
+
+        // The second poll is served from the cache: no new request reaches the server.
+        let again = agy_live_model_info(Some(&addr), Some("stub-csrf"), "agy-live-1", false);
+        assert_eq!(again, info);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+
+        // A full discovery pass through a route that names the stub resolves the same model.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        write_routes(
+            home,
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-live-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(home);
+        let agy = session_for(&sessions, "ferris");
+        assert_eq!(agy.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(agy.thinking_level.as_deref(), Some("high"));
+        assert_eq!(seen.lock().unwrap().len(), 2, "discovery reused the cache");
+
+        stub.shutdown();
+    }
+
+    const AGY_STEPS_FIXTURE: &str = r#"{"steps":[
+        {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},
+        {"metadata":{}},
+        {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M417"}},
+        {"type":"USER_INPUT"}
+    ]}"#;
+
+    #[test]
+    fn agy_steps_responses_parse_under_steps_and_trajectory_steps() {
+        assert_eq!(
+            parse_agy_generator_model(AGY_STEPS_FIXTURE).as_deref(),
+            Some("MODEL_PLACEHOLDER_M417")
+        );
+        assert_eq!(
+            parse_agy_generator_model(
+                r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M420"}}]}}"#
+            )
+            .as_deref(),
+            Some("MODEL_PLACEHOLDER_M420")
+        );
+        assert!(parse_agy_generator_model(r#"{"steps":[{"metadata":{}}]}"#).is_none());
+        assert!(parse_agy_generator_model(r#"{"steps":[]}"#).is_none());
+        assert!(parse_agy_generator_model("{}").is_none());
+    }
+
+    fn write_agy_transcript(dir: &Path, body: &str) -> String {
+        let path = dir.join("transcript.jsonl");
+        fs::write(&path, body).unwrap();
+        path.display().to_string()
+    }
+
+    #[test]
+    fn agy_step_offset_comes_from_the_last_transcript_line() {
+        let tmp = TempDir::new().unwrap();
+        let line = |n: u64| format!("{{\"step_index\":{n},\"type\":\"PLANNER_RESPONSE\"}}\n");
+
+        // The last line decides, minus the margin.
+        let path = write_agy_transcript(
+            tmp.path(),
+            &format!("{}{}{}", line(1), line(40), line(6768)),
+        );
+        assert_eq!(agy_tail_step_offset(Some(&path)), 6758);
+        // A young conversation saturates to 0, and so does one at exactly the margin.
+        let path = write_agy_transcript(tmp.path(), &format!("{}{}", line(0), line(4)));
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path = write_agy_transcript(tmp.path(), &line(10));
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path = write_agy_transcript(tmp.path(), &line(11));
+        assert_eq!(agy_tail_step_offset(Some(&path)), 1);
+        // No trailing newline, and a half-written last line is skipped for the one before it.
+        let path = write_agy_transcript(tmp.path(), line(200).trim_end());
+        assert_eq!(agy_tail_step_offset(Some(&path)), 190);
+        let path = write_agy_transcript(
+            tmp.path(),
+            &format!("{}{{\"step_index\":9999,\"ty", line(300)),
+        );
+        assert_eq!(agy_tail_step_offset(Some(&path)), 290);
+        // Only the newest bytes are read: a first line cut by the tail window is not used.
+        let big = "x".repeat(AGY_TRANSCRIPT_TAIL_BYTES as usize);
+        let path = write_agy_transcript(
+            tmp.path(),
+            &format!("{{\"step_index\":5000,\"pad\":\"{big}\"}}\n{}", line(70)),
+        );
+        assert_eq!(agy_tail_step_offset(Some(&path)), 60);
+
+        // Missing, unreadable, garbage, or index-less transcripts all give 0.
+        assert_eq!(agy_tail_step_offset(None), 0);
+        assert_eq!(agy_tail_step_offset(Some("/definitely/missing.jsonl")), 0);
+        assert_eq!(agy_tail_step_offset(tmp.path().to_str()), 0);
+        let path = write_agy_transcript(tmp.path(), "not json\n{broken\n");
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path = write_agy_transcript(tmp.path(), "{\"type\":\"USER_INPUT\"}\n");
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path =
+            write_agy_transcript(tmp.path(), "{\"step_index\":\"7\"}\n{\"step_index\":-5}\n");
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path = write_agy_transcript(tmp.path(), "");
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+    }
+
+    fn stub_paths(stub: &AgyStub) -> Vec<String> {
+        stub.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.rsplit('/').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn agy_live_model_uses_the_tail_steps_call_and_skips_the_full_trajectory() {
+        let tmp = TempDir::new().unwrap();
+        let transcript =
+            write_agy_transcript(tmp.path(), "{\"step_index\":6767}\n{\"step_index\":6768}\n");
+        let stub = spawn_agy_stub_with_steps(
+            AGY_CONFIG_FIXTURE,
+            // The full trajectory names a different model; it must never be asked.
+            r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M420"}}]}}"#,
+            "agy-steps-1",
+            Some((200, AGY_STEPS_FIXTURE)),
+        );
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let info = agy_live_model_info_for_transcript(
+            Some(&addr),
+            Some("stub-csrf"),
+            "agy-steps-1",
+            Some(&transcript),
+            false,
+        );
+        assert_eq!(info.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            stub_paths(&stub),
+            ["GetCascadeModelConfigData", "GetCascadeTrajectorySteps"],
+            "the full trajectory endpoint is not called"
+        );
+        let bodies = stub.bodies.lock().unwrap().clone();
+        let steps_body: Value = serde_json::from_str(&bodies[1].1).unwrap();
+        assert_eq!(
+            steps_body,
+            serde_json::json!({"cascadeId":"agy-steps-1","stepOffset":6758})
+        );
+
+        // The answer is cached: a second poll sends nothing.
+        let again = agy_live_model_info_for_transcript(
+            Some(&addr),
+            Some("stub-csrf"),
+            "agy-steps-1",
+            Some(&transcript),
+            false,
+        );
+        assert_eq!(again, info);
+        assert_eq!(stub.seen.lock().unwrap().len(), 2);
+        stub.shutdown();
+    }
+
+    #[test]
+    fn agy_live_model_falls_back_to_the_full_trajectory_when_the_tail_call_finds_no_model() {
+        let tmp = TempDir::new().unwrap();
+        let transcript = write_agy_transcript(tmp.path(), "{\"step_index\":500}\n");
+        let cases: [(&'static str, Option<(u16, &'static str)>); 4] = [
+            (
+                "agy-fb-empty",
+                Some((200, r#"{"steps":[{"metadata":{}}]}"#)),
+            ),
+            ("agy-fb-error", Some((500, r#"{"code":"internal"}"#))),
+            ("agy-fb-garbage", Some((200, "not json"))),
+            ("agy-fb-unknown", None),
+        ];
+        for (cascade, steps) in cases {
+            let stub = spawn_agy_stub_with_steps(
+                AGY_CONFIG_FIXTURE,
+                AGY_TRAJECTORY_FIXTURE,
+                cascade,
+                steps,
+            );
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let info = agy_live_model_info_for_transcript(
+                Some(&addr),
+                Some("stub-csrf"),
+                cascade,
+                Some(&transcript),
+                false,
+            );
+            assert_eq!(info.model.as_deref(), Some("gemini-4-argon"), "{cascade}");
+            assert_eq!(info.thinking_level.as_deref(), Some("high"), "{cascade}");
+            assert_eq!(
+                stub_paths(&stub),
+                [
+                    "GetCascadeModelConfigData",
+                    "GetCascadeTrajectorySteps",
+                    "GetCascadeTrajectory"
+                ],
+                "{cascade}: the tail call first, then the full trajectory"
+            );
+            stub.shutdown();
+        }
+    }
+
+    #[test]
+    fn agy_live_model_goes_straight_to_the_full_trajectory_without_a_step_offset() {
+        let tmp = TempDir::new().unwrap();
+        let young = write_agy_transcript(tmp.path(), "{\"step_index\":3}\n");
+        let garbage = tmp.path().join("garbage.jsonl");
+        fs::write(&garbage, "nope\n").unwrap();
+        let garbage = garbage.display().to_string();
+        let cases: [(&'static str, Option<&str>); 4] = [
+            ("agy-direct-young", Some(&young)),
+            ("agy-direct-garbage", Some(&garbage)),
+            ("agy-direct-missing", Some("/definitely/missing.jsonl")),
+            ("agy-direct-none", None),
+        ];
+        for (cascade, transcript) in cases {
+            let stub = spawn_agy_stub_with_steps(
+                AGY_CONFIG_FIXTURE,
+                AGY_TRAJECTORY_FIXTURE,
+                cascade,
+                // A steps answer exists but must never be asked for.
+                Some((
+                    200,
+                    r#"{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M420"}}]}"#,
+                )),
+            );
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let info = agy_live_model_info_for_transcript(
+                Some(&addr),
+                Some("stub-csrf"),
+                cascade,
+                transcript,
+                false,
+            );
+            assert_eq!(info.model.as_deref(), Some("gemini-4-argon"), "{cascade}");
+            assert_eq!(
+                stub_paths(&stub),
+                ["GetCascadeModelConfigData", "GetCascadeTrajectory"],
+                "{cascade}"
+            );
+            stub.shutdown();
+        }
+    }
+
+    #[test]
+    fn agy_discovery_passes_the_session_transcript_to_the_tail_steps_call() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let logs = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join("agy-disc-1")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("transcript.jsonl"), "{\"step_index\":900}\n").unwrap();
+        let stub = spawn_agy_stub_with_steps(
+            AGY_CONFIG_FIXTURE,
+            AGY_TRAJECTORY_FIXTURE,
+            "agy-disc-1",
+            Some((200, AGY_STEPS_FIXTURE)),
+        );
+        let addr = format!("127.0.0.1:{}", stub.port);
+        write_routes(
+            home,
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-disc-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(home);
+        let agy = session_for(&sessions, "ferris");
+        assert_eq!(agy.model.as_deref(), Some("gemini-4-argon"));
+        assert!(
+            !stub_paths(&stub).contains(&"GetCascadeTrajectory".to_string()),
+            "{:?}",
+            stub_paths(&stub)
+        );
+        stub.shutdown();
+    }
+
+    #[test]
+    fn route_discovery_without_model_info_never_reads_model_sources() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let project = home.join(".claude").join("projects").join("p");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "claude-lookup-sess-1";
+        fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5-5","content":"a"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"model":"sonnet"}"#,
+        )
+        .unwrap();
+        let stub = spawn_agy_stub_with_steps(
+            AGY_CONFIG_FIXTURE,
+            AGY_TRAJECTORY_FIXTURE,
+            "agy-lookup-1",
+            None,
+        );
+        let addr = format!("127.0.0.1:{}", stub.port);
+        write_routes(
+            home,
+            &[
+                (
+                    "kayla",
+                    &format!(
+                        r#"{{"kind":"claude","pid":1,"session_id":"{session_id}","socket_path":"{}"}}"#,
+                        home.join("c.sock").display()
+                    ),
+                ),
+                (
+                    "ferris",
+                    &format!(
+                        r#"{{"kind":"agy","conversation_id":"agy-lookup-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                    ),
+                ),
+            ],
+        );
+        let snap = DiscoveryStoreSnapshot::default();
+
+        // The lookup-only pass must not call the language server (the stub log stays
+        // empty) and must leave every model field empty even though the transcript,
+        // settings and stub all name a model.
+        let lookup = discover_route_sessions_without_model_info(&snap, Some(home));
+        assert!(
+            stub.seen.lock().unwrap().is_empty(),
+            "no language-server call: {:?}",
+            stub.seen.lock().unwrap()
+        );
+        assert_eq!(lookup.len(), 2);
+        for session in &lookup {
+            assert_eq!(session.model, None, "{}", session.id);
+            assert_eq!(session.thinking_level, None, "{}", session.id);
+            assert!(session.available_models.is_empty(), "{}", session.id);
+        }
+
+        let full = discover_sessions_from_snapshot(&snap, Some(home));
+        assert_eq!(
+            full.iter()
+                .map(|s| (&s.id, &s.persona, &s.source, &s.adapter))
+                .collect::<Vec<_>>(),
+            lookup
+                .iter()
+                .map(|s| (&s.id, &s.persona, &s.source, &s.adapter))
+                .collect::<Vec<_>>(),
+            "ids, personas, sources and adapters match the full discovery"
+        );
+        assert_eq!(
+            session_for(&full, "kayla").model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            session_for(&full, "ferris").model.as_deref(),
+            Some("gemini-4-argon")
+        );
+        assert!(
+            !stub.seen.lock().unwrap().is_empty(),
+            "the full discovery does call the language server"
+        );
+        stub.shutdown();
+    }
+
+    #[test]
+    fn agy_trajectory_cut_by_the_size_cap_names_no_model() {
+        // The first step names a model; padding pushes the body past the cap, so the
+        // client receives only the OLDEST steps. Their model is stale and must not be shown.
+        let pad = "a".repeat(AGY_TRAJECTORY_MAX_BYTES + 1024);
+        let body: &'static str = Box::leak(
+            format!(
+                r#"{{"trajectory":{{"steps":[{{"metadata":{{"generatorModel":"MODEL_PLACEHOLDER_M417"}}}},{{"pad":"{pad}"}}]}}}}"#
+            )
+            .into_boxed_str(),
+        );
+        assert!(body.len() > AGY_TRAJECTORY_MAX_BYTES);
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, body);
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let info = agy_live_model_info(Some(&addr), Some("stub-csrf"), "agy-live-1", false);
+        // M417 is gemini-4-argon; the config default (M420) is shown instead of it.
+        assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+        assert_eq!(
+            info.available_models.first().map(String::as_str),
+            Some("gemini-4-argon")
+        );
+        assert_eq!(
+            stub_paths(&stub),
+            ["GetCascadeModelConfigData", "GetCascadeTrajectory"]
+        );
+        stub.shutdown();
+
+        // The strict parser accepts a complete body and refuses a cut one.
+        assert_eq!(
+            parse_agy_complete_generator_model(AGY_TRAJECTORY_FIXTURE).as_deref(),
+            Some("MODEL_PLACEHOLDER_M417")
+        );
+        let cut = r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},{"metadata":{"generatorMo"#;
+        assert_eq!(parse_agy_complete_generator_model(cut), None);
+        assert_eq!(
+            parse_agy_generator_model(cut).as_deref(),
+            Some("MODEL_PLACEHOLDER_M416"),
+            "the lenient parser still reads a cut body for the tail-steps call"
+        );
+    }
+
+    #[test]
+    fn agy_stub_ports_start_with_no_cached_answers() {
+        // A cached answer for a port is dropped when a stub takes the port.
+        agy_cache_put(&AGY_CONFIG_CACHE, 4242, None);
+        agy_cache_put(&AGY_PLACEHOLDER_CACHE, (4242, "c".to_string()), None);
+        agy_cache_put(&AGY_PLACEHOLDER_CACHE, (4243, "c".to_string()), None);
+        forget_agy_port_caches(4242);
+        assert!(agy_cache_get(&AGY_CONFIG_CACHE, &4242).is_none());
+        assert!(agy_cache_get(&AGY_PLACEHOLDER_CACHE, &(4242, "c".to_string())).is_none());
+        assert!(agy_cache_get(&AGY_PLACEHOLDER_CACHE, &(4243, "c".to_string())).is_some());
+        forget_agy_port_caches(4243);
+    }
+
+    #[test]
+    fn agy_failed_lookup_is_cached_briefly_then_retried() {
+        let cache: AgyCache<u16, String> = Mutex::new(BTreeMap::new());
+        let (ttl, negative_ttl) = (Duration::from_secs(30), Duration::from_millis(60));
+        agy_cache_put(&cache, 1, None);
+        agy_cache_put(&cache, 2, Some("hit".to_string()));
+        assert_eq!(
+            agy_cache_get_with_ttls(&cache, &1, ttl, negative_ttl),
+            Some(None)
+        );
+        assert_eq!(
+            agy_cache_get_with_ttls(&cache, &2, ttl, negative_ttl),
+            Some(Some("hit".to_string()))
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            agy_cache_get_with_ttls(&cache, &1, ttl, negative_ttl),
+            None,
+            "the cached miss expired, so the lookup is retried"
+        );
+        assert_eq!(
+            agy_cache_get_with_ttls(&cache, &2, ttl, negative_ttl),
+            Some(Some("hit".to_string())),
+            "a hit lives for the longer TTL"
+        );
+
+        // Through a stub: a config that fails to parse is asked for once, then served
+        // from the negative cache.
+        let stub = spawn_agy_stub("not json", AGY_TRAJECTORY_FIXTURE);
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let offline = offline_agy_model_info();
+        for _ in 0..3 {
+            assert_eq!(
+                agy_live_model_info(Some(&addr), Some("stub-csrf"), "agy-live-1", false),
+                offline
+            );
+        }
+        assert_eq!(stub_paths(&stub), ["GetCascadeModelConfigData"]);
+        stub.shutdown();
+    }
+
+    #[test]
+    fn model_file_reads_are_capped() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("f.json");
+        let wrap = |pad: usize| format!(r#"{{"model":"x","pad":"{}"}}"#, "a".repeat(pad));
+        let overhead = wrap(0).len();
+        let cap = MODEL_FILE_MAX_BYTES as usize;
+
+        fs::write(&path, wrap(cap - overhead)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MODEL_FILE_MAX_BYTES);
+        assert!(read_json_file(&path).is_some(), "a file at the cap is read");
+        fs::write(&path, wrap(cap - overhead + 1)).unwrap();
+        assert!(
+            read_json_file(&path).is_none(),
+            "one byte over the cap is unreadable"
+        );
+
+        let toml_path = tmp.path().join("c.toml");
+        fs::write(
+            &toml_path,
+            format!("model = \"x\"\n# {}\n", "a".repeat(cap)),
+        )
+        .unwrap();
+        assert!(read_toml_file(&toml_path).is_none());
+        fs::write(&toml_path, "model = \"x\"\n").unwrap();
+        assert!(read_toml_file(&toml_path).is_some());
+
+        // Through discovery: an over-cap Codex cache and config fall back silently.
+        let codex = tmp.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("models_cache.json"),
+            format!(
+                r#"{{"models":[{{"slug":"big-model","visibility":"list"}}],"pad":"{}"}}"#,
+                "a".repeat(cap)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            codex.join("config.toml"),
+            format!("model = \"cfg-model\"\n# {}\n", "a".repeat(cap)),
+        )
+        .unwrap();
+        let info = codex_model_info(None, Some(tmp.path()));
+        assert_eq!(info.model, None);
+        assert_eq!(info.available_models, strings(&CODEX_DEFAULT_MODELS));
+
+        // The tail reader returns at most the last `max_bytes`.
+        let log = tmp.path().join("log.jsonl");
+        fs::write(&log, "0123456789").unwrap();
+        assert_eq!(read_file_tail(&log, 4).as_deref(), Some("6789"));
+        assert_eq!(read_file_tail(&log, 100).as_deref(), Some("0123456789"));
+    }
+
+    #[test]
+    fn claude_model_names_are_length_and_control_character_bounded() {
+        let line = |model: &str| {
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","model":model}})
+                .to_string()
+        };
+        let oversized = "m".repeat(MODEL_ID_MAX_CHARS + 1);
+        let at_limit = "m".repeat(MODEL_ID_MAX_CHARS);
+        // The newest valid name wins; an oversized or control-character one is skipped.
+        let transcript = [
+            line("claude-opus-5-5"),
+            line(&oversized),
+            line("bad\u{7}model"),
+            line("two\nlines"),
+        ]
+        .join("\n");
+        assert_eq!(
+            latest_claude_transcript_model(&transcript).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            latest_claude_transcript_model(&line(&at_limit)).as_deref(),
+            Some(at_limit.as_str())
+        );
+        assert_eq!(latest_claude_transcript_model(&line(&oversized)), None);
+        // The top-level `model` key is bounded the same way.
+        let top = serde_json::json!({"model": "x\u{1b}[31m"}).to_string();
+        assert_eq!(latest_claude_transcript_model(&top), None);
+
+        // settings.json is too.
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        for bad in [oversized.as_str(), "bad\u{7}model"] {
+            fs::write(
+                claude.join("settings.json"),
+                serde_json::json!({ "model": bad }).to_string(),
+            )
+            .unwrap();
+            assert_eq!(claude_model_info(None, Some(tmp.path())).model, None);
+        }
+        fs::write(claude.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+        assert_eq!(
+            claude_model_info(None, Some(tmp.path())).model.as_deref(),
+            Some("sonnet")
+        );
+    }
+
+    #[test]
+    fn claude_model_comes_from_the_latest_transcript_entry_then_settings() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let project = home.join(".claude").join("projects").join("p");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "claude-model-sess-1";
+        let transcript = [
+            r#"{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-5-5","content":"a"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5-5","content":"b"}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","model":"<synthetic>","content":"c"}}"#,
+            "not json at all",
+        ]
+        .join("\n");
+        fs::write(project.join(format!("{session_id}.jsonl")), transcript).unwrap();
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"model":"sonnet"}"#,
+        )
+        .unwrap();
+        write_routes(
+            home,
+            &[(
+                "kayla",
+                &format!(
+                    r#"{{"kind":"claude","pid":1,"session_id":"{session_id}","socket_path":"{}"}}"#,
+                    home.join("c.sock").display()
+                ),
+            )],
+        );
+        let sessions = discover_in(home);
+        let claude = session_for(&sessions, "kayla");
+        assert_eq!(claude.adapter, "claude");
+        assert_eq!(claude.model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(claude.thinking_level, None);
+        assert_eq!(claude.available_models, strings(&CLAUDE_MODELS));
+
+        // No transcript entry names a model: settings.json supplies it.
+        let info = claude_model_info(None, Some(home));
+        assert_eq!(info.model.as_deref(), Some("sonnet"));
+        assert_eq!(info.available_models, strings(&CLAUDE_MODELS));
+
+        // Malformed or missing settings never fail the lookup.
+        fs::write(home.join(".claude").join("settings.json"), "{ broken").unwrap();
+        assert_eq!(claude_model_info(None, Some(home)).model, None);
+        fs::remove_file(home.join(".claude").join("settings.json")).unwrap();
+        assert_eq!(claude_model_info(None, Some(home)).model, None);
+        assert_eq!(
+            claude_model_info(Some("/definitely/missing.jsonl"), None).available_models,
+            strings(&CLAUDE_MODELS)
+        );
+    }
+
+    #[test]
+    fn codex_model_reads_config_toml_and_the_listed_models_cache() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("config.toml"),
+            "model = \"gpt-6.1-terra\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        fs::write(
+            codex.join("models_cache.json"),
+            r#"{"models":[
+                {"slug":"gpt-6.1-sol","visibility":"list"},
+                {"slug":"gpt-internal","visibility":"hide"},
+                {"slug":"gpt-6.1-terra","visibility":"list"},
+                {"visibility":"list"}
+            ]}"#,
+        )
+        .unwrap();
+        write_routes(
+            home,
+            &[("katie", r#"{"kind":"codex","thread_id":"codex-model-1"}"#)],
+        );
+        let sessions = discover_in(home);
+        let codex_sess = session_for(&sessions, "katie");
+        assert_eq!(codex_sess.adapter, "codex");
+        assert_eq!(codex_sess.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(codex_sess.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            codex_sess.available_models,
+            strings(&["gpt-6.1-sol", "gpt-6.1-terra"])
+        );
+    }
+
+    #[test]
+    fn codex_model_falls_back_when_files_are_missing_or_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let missing = codex_model_info(None, Some(home));
+        assert_eq!(missing.model, None);
+        assert_eq!(missing.thinking_level, None);
+        assert_eq!(missing.available_models, strings(&CODEX_DEFAULT_MODELS));
+
+        let codex = home.join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(codex.join("config.toml"), "model = [unterminated").unwrap();
+        fs::write(codex.join("models_cache.json"), "{ nope").unwrap();
+        assert_eq!(codex_model_info(None, Some(home)), missing);
+
+        // A cache that lists nothing visible also falls back.
+        fs::write(
+            codex.join("models_cache.json"),
+            r#"{"models":[{"slug":"x","visibility":"hide"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_model_info(None, Some(home)).available_models,
+            strings(&CODEX_DEFAULT_MODELS)
+        );
+        assert_eq!(
+            codex_model_info(None, None).available_models,
+            strings(&CODEX_DEFAULT_MODELS)
+        );
+    }
+
+    /// A temp home whose `config.toml` defaults to `gpt-6.1-terra` at `high`.
+    fn codex_home_with_config() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let codex = tmp.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("config.toml"),
+            "model = \"gpt-6.1-terra\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// Write a rollout under the temp home and return its path.
+    fn write_codex_rollout(home: &Path, thread_id: &str, body: &str) -> String {
+        let dir = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("30");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-10-30T01-02-03-{thread_id}.jsonl"));
+        fs::write(&path, body).unwrap();
+        path.display().to_string()
+    }
+
+    fn codex_session_info(home: &Path, rollout_lines: &[&str]) -> SessionModelInfo {
+        let path = write_codex_rollout(home, "t-fixture", &rollout_lines.join("\n"));
+        codex_model_info(Some(&path), Some(home))
+    }
+
+    #[test]
+    fn codex_model_comes_from_the_session_rollout_before_config() {
+        let tmp = codex_home_with_config();
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"session_meta","payload":{"id":"t-fixture"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"low"}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+        assert_eq!(
+            info.available_models,
+            strings(&CODEX_DEFAULT_MODELS),
+            "the selectable models do not come from the rollout"
+        );
+    }
+
+    #[test]
+    fn codex_effort_falls_back_to_config_when_the_rollout_has_a_model_only() {
+        let tmp = codex_home_with_config();
+        let info = codex_session_info(
+            tmp.path(),
+            &[r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+        // An effort with no model keeps the config model.
+        let info = codex_session_info(
+            tmp.path(),
+            &[r#"{"type":"turn_context","payload":{"effort":"minimal"}}"#],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(info.thinking_level.as_deref(), Some("minimal"));
+    }
+
+    #[test]
+    fn codex_effort_pointers_are_honored_in_priority_order() {
+        let tmp = codex_home_with_config();
+        let effort = |line: &str| {
+            codex_session_info(tmp.path(), &[line])
+                .thinking_level
+                .unwrap()
+        };
+        assert_eq!(
+            effort(
+                r#"{"payload":{"effort":"low","reasoning_effort":"medium","collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}}"#
+            ),
+            "low"
+        );
+        assert_eq!(
+            effort(
+                r#"{"payload":{"reasoning_effort":"medium","collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}}"#
+            ),
+            "medium"
+        );
+        assert_eq!(
+            effort(
+                r#"{"payload":{"collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}}"#
+            ),
+            "xhigh"
+        );
+        // An unusable higher pointer yields to the next one on the same line.
+        assert_eq!(
+            effort(r#"{"payload":{"effort":"","reasoning_effort":"medium"}}"#),
+            "medium"
+        );
+        // Only the payload is read, not other top-level fields.
+        assert_eq!(effort(r#"{"effort":"low","model":"x"}"#), "high");
+    }
+
+    #[test]
+    fn codex_later_rollout_lines_win_field_by_field() {
+        let tmp = codex_home_with_config();
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"payload":{"model":"gpt-old","effort":"low"}}"#,
+                r#"{"payload":{"model":"gpt-6.1-sol"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count"}}"#,
+                r#"{"payload":{"effort":"medium"}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+        // The newer of two full lines wins both fields.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"payload":{"model":"gpt-a","effort":"low"}}"#,
+                r#"{"payload":{"model":"gpt-b","effort":"minimal"}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-b"));
+        assert_eq!(info.thinking_level.as_deref(), Some("minimal"));
+    }
+
+    #[test]
+    fn codex_rollout_tail_ignores_a_cut_first_line_and_malformed_lines() {
+        let tmp = codex_home_with_config();
+        let pad = |n: usize| "x".repeat(n);
+        let cut_line = |n: usize| {
+            format!(
+                r#"{{"pad":"{}","payload":{{"model":"gpt-cut","effort":"cut"}}}}"#,
+                pad(n)
+            )
+        };
+        let newest = r#"{"payload":{"reasoning_effort":"medium"}}"#;
+
+        // Control: a short file keeps its first line, so its model is used.
+        let path = write_codex_rollout(
+            tmp.path(),
+            "t-short",
+            &format!("{}\n{newest}\n", cut_line(10)),
+        );
+        let info = codex_model_info(Some(&path), Some(tmp.path()));
+        assert_eq!(info.model.as_deref(), Some("gpt-cut"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+
+        // A first line longer than the tail window is cut in the middle: its model is not
+        // read, so the config model stays.
+        let long = CLAUDE_TRANSCRIPT_TAIL_BYTES as usize;
+        let path = write_codex_rollout(
+            tmp.path(),
+            "t-long",
+            &format!("{}\n{newest}\n", cut_line(long)),
+        );
+        let info = codex_model_info(Some(&path), Some(tmp.path()));
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+
+        // Malformed lines, blank lines and wrongly typed values are skipped.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"payload":{"model":"gpt-6.1-sol","effort":"low"}}"#,
+                "this is not json but mentions \"model\" and effort",
+                r#"{"payload":{"model":"#,
+                "",
+                r#"{"payload":{"model":42,"effort":["high"]}}"#,
+                r#"[1,2,3]"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn codex_without_a_readable_rollout_uses_config() {
+        let tmp = codex_home_with_config();
+        let home = tmp.path();
+        let config = codex_model_info(None, Some(home));
+        assert_eq!(config.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(config.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            codex_model_info(Some("/definitely/missing.jsonl"), Some(home)),
+            config
+        );
+        // A directory is unreadable as a file, and an empty or binary file names nothing.
+        assert_eq!(codex_model_info(home.to_str(), Some(home)), config);
+        let empty = write_codex_rollout(home, "t-empty", "");
+        assert_eq!(codex_model_info(Some(&empty), Some(home)), config);
+        let binary = home.join("binary.jsonl");
+        fs::write(&binary, [0xff, 0xfe, 0x00, b'{', 0x80]).unwrap();
+        assert_eq!(codex_model_info(binary.to_str(), Some(home)), config);
+        // No config either: nothing is invented.
+        let bare = TempDir::new().unwrap();
+        let rollout = write_codex_rollout(bare.path(), "t-bare", "not json");
+        let info = codex_model_info(Some(&rollout), Some(bare.path()));
+        assert_eq!((info.model, info.thinking_level), (None, None));
+    }
+
+    #[test]
+    fn codex_rollout_values_are_validated_before_use() {
+        let tmp = codex_home_with_config();
+        let model_of = |model: &str, effort: &str| {
+            let line = serde_json::json!({"payload": {"model": model, "effort": effort}});
+            let info = codex_session_info(tmp.path(), &[&line.to_string()]);
+            (info.model.unwrap(), info.thinking_level.unwrap())
+        };
+        let config = ("gpt-6.1-terra".to_string(), "high".to_string());
+
+        // Oversized and control-character values are dropped, so config answers.
+        assert_eq!(model_of(&"m".repeat(129), &"e".repeat(33)), config);
+        assert_eq!(model_of("gpt\u{7}x", "lo\nw"), config);
+        assert_eq!(model_of("gpt\nsol", "lo\rw"), config);
+        assert_eq!(model_of("   ", "\t"), config);
+        // The bounds themselves are accepted, and surrounding whitespace is trimmed.
+        assert_eq!(
+            model_of(&"m".repeat(128), &"e".repeat(32)),
+            ("m".repeat(128), "e".repeat(32))
+        );
+        assert_eq!(
+            model_of("  gpt-6.1-sol ", " low "),
+            ("gpt-6.1-sol".to_string(), "low".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_discovery_reports_each_session_own_rollout_model() {
+        let tmp = codex_home_with_config();
+        let home = tmp.path();
+        write_codex_rollout(
+            home,
+            "codex-sol-thread",
+            r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"xhigh"}}"#,
+        );
+        write_codex_rollout(
+            home,
+            "codex-default-thread",
+            r#"{"type":"session_meta","payload":{"id":"codex-default-thread"}}"#,
+        );
+        write_routes(
+            home,
+            &[
+                ("sol", r#"{"kind":"codex","thread_id":"codex-sol-thread"}"#),
+                (
+                    "plain",
+                    r#"{"kind":"codex","thread_id":"codex-default-thread"}"#,
+                ),
+            ],
+        );
+        let sessions = discover_in(home);
+        let sol = session_for(&sessions, "sol");
+        assert_eq!(sol.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(sol.thinking_level.as_deref(), Some("xhigh"));
+        let plain = session_for(&sessions, "plain");
+        assert_eq!(plain.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(plain.thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn grok_model_prefers_the_session_summary_over_config_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let session_id = "grok-model-sess-1";
+        let dir = home
+            .join(".grok")
+            .join("sessions")
+            .join("%2Fhome%2Fx")
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("chat_history.jsonl"), "").unwrap();
+        fs::write(
+            dir.join("summary.json"),
+            r#"{"current_model_id":"grok-4.6","num_messages":3}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".grok").join("config.toml"),
+            "[models]\ndefault = \"grok-4.7\"\ndefault_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join(".grok").join("models_cache.json"),
+            r#"{"models":{
+                "grok-4.7":{"info":{"hidden":false}},
+                "grok-secret":{"info":{"hidden":true}},
+                "grok-4.7-build-fast":{"info":{}}
+            }}"#,
+        )
+        .unwrap();
+        write_routes(
+            home,
+            &[(
+                "wendy",
+                &format!(r#"{{"kind":"grok","session_id":"{session_id}"}}"#),
+            )],
+        );
+        let sessions = discover_in(home);
+        let grok = session_for(&sessions, "wendy");
+        assert_eq!(grok.adapter, "grok");
+        assert_eq!(grok.model.as_deref(), Some("grok-4.6"));
+        assert_eq!(grok.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            grok.available_models,
+            strings(&["grok-4.7", "grok-4.7-build-fast"]),
+            "hidden models are left out"
+        );
+
+        // Without a session summary the config default names the model.
+        fs::remove_file(dir.join("summary.json")).unwrap();
+        let sessions = discover_in(home);
+        assert_eq!(
+            session_for(&sessions, "wendy").model.as_deref(),
+            Some("grok-4.7")
+        );
+    }
+
+    #[test]
+    fn grok_model_falls_back_when_files_are_missing_or_malformed() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let missing = grok_model_info(None, Some(home));
+        assert_eq!(missing.model, None);
+        assert_eq!(missing.thinking_level, None);
+        assert_eq!(missing.available_models, strings(&GROK_DEFAULT_MODELS));
+
+        let grok = home.join(".grok");
+        let session = grok.join("sessions").join("p").join("s1");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(grok.join("config.toml"), "[models\nbroken").unwrap();
+        fs::write(grok.join("models_cache.json"), "[]").unwrap();
+        fs::write(session.join("summary.json"), "{ not json").unwrap();
+        let chat = session.join("chat_history.jsonl");
+        assert_eq!(
+            grok_model_info(chat.to_str(), Some(home)),
+            missing,
+            "malformed files fall back silently"
+        );
+
+        // Top-level config keys are accepted as well as `[models]`.
+        fs::write(
+            grok.join("config.toml"),
+            "default = \"grok-4.5\"\ndefault_reasoning_effort = \"low\"\n",
+        )
+        .unwrap();
+        let info = grok_model_info(chat.to_str(), Some(home));
+        assert_eq!(info.model.as_deref(), Some("grok-4.5"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn muse_and_other_adapters_report_fixed_or_empty_model_fields() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        write_routes(
+            home,
+            &[
+                (
+                    "muse-persona",
+                    r#"{"kind":"muse","session_id":"muse-model-1"}"#,
+                ),
+                (
+                    "hook",
+                    &format!(
+                        r#"{{"kind":"webhook","socket_path":"{}"}}"#,
+                        home.join("hook.sock").display()
+                    ),
+                ),
+            ],
+        );
+        let sessions = discover_in(home);
+        let muse = session_for(&sessions, "muse-persona");
+        assert_eq!(muse.model.as_deref(), Some("muse-spark"));
+        assert_eq!(muse.thinking_level, None);
+        assert_eq!(muse.available_models, strings(&["muse-spark"]));
+        let hook = session_for(&sessions, "hook");
+        assert_eq!(hook.model, None);
+        assert_eq!(hook.thinking_level, None);
+        assert!(hook.available_models.is_empty());
+        let json = serde_json::to_value(hook).unwrap();
+        assert!(json.get("model").is_none());
+        assert!(json.get("thinking_level").is_none());
+        assert!(json.get("available_models").is_none());
+        let muse_json = serde_json::to_value(muse).unwrap();
+        assert_eq!(muse_json["model"], "muse-spark");
+        assert_eq!(
+            muse_json["available_models"],
+            serde_json::json!(["muse-spark"])
+        );
+    }
+
+    #[test]
+    fn attempt_rows_carry_no_model_fields() {
+        let tmp = TempDir::new().unwrap();
+        let snap = DiscoveryStoreSnapshot {
+            registered_names: BTreeSet::new(),
+            attempts: vec![DiscoveryAttemptRow {
+                id: "attempt-1".into(),
+                adapter: "claude".into(),
+                status: "succeeded".into(),
+                updated_at: None,
+                cwd: "/tmp/x".into(),
+                record_id: "rec-1".into(),
+                record_str: "rec-1".into(),
+                output_excerpt: None,
+                created_at: None,
+            }],
+        };
+        let sessions = discover_sessions_from_snapshot(&snap, Some(tmp.path()));
+        let attempt = sessions.iter().find(|s| s.id == "attempt-1").unwrap();
+        assert_eq!(attempt.source, "attempt");
+        assert_eq!(attempt.model, None);
+        assert_eq!(attempt.thinking_level, None);
+        assert!(attempt.available_models.is_empty());
     }
 
     #[test]

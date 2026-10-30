@@ -4,10 +4,12 @@
 
 pub mod api;
 pub mod auth;
+pub mod commands;
 mod direct_quota;
 pub mod discovery;
 pub mod lifecycle;
 pub mod nodes;
+pub mod session_actions;
 pub mod terminal;
 pub mod ws;
 
@@ -148,6 +150,7 @@ pub struct HubState {
     pub ws_tx: broadcast::Sender<HubWsFrame>,
     store_lock: Arc<Mutex<()>>,
     prompt_queues: Arc<Mutex<PromptQueueState>>,
+    model_overrides: Arc<Mutex<BTreeMap<String, session_actions::ModelOverride>>>,
 }
 
 /// RAII guard holding a [`RedbStore`] together with the `store_lock` mutex for
@@ -190,7 +193,70 @@ impl HubState {
             ws_tx,
             store_lock: Arc::new(Mutex::new(())),
             prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
+            model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Remember the model an operator chose. `key` is the discovered session id when discovery
+    /// lists the session, else the lowercased persona: [`session_actions::apply_model_overrides`]
+    /// matches a summary on its id first and its persona second, so either key applies. The map
+    /// is in memory only: it is lost when the hub restarts, after which discovery reports what
+    /// the vendor session itself says, and an override is dropped by
+    /// [`HubState::clear_session_model_override`] when its session is cleared, reforged,
+    /// spun up again or torn down. `GET /api/v1/sessions` overlays it on every summary.
+    pub fn set_session_model_override(
+        &self,
+        session_id: &str,
+        model_override: session_actions::ModelOverride,
+    ) {
+        let mut guard = self
+            .model_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.insert(session_id.to_string(), model_override);
+    }
+
+    /// Drop the override recorded under `key`, or under its lowercased form (the persona key).
+    /// A session that is cleared, reforged, spun up or torn down no longer runs the model the
+    /// operator chose for its previous run, so the override must not mask what it reports now.
+    pub fn clear_session_model_override(&self, key: &str) {
+        let mut guard = self
+            .model_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.remove(key);
+        guard.remove(&key.to_ascii_lowercase());
+    }
+
+    pub fn session_model_override(
+        &self,
+        session_id: &str,
+    ) -> Option<session_actions::ModelOverride> {
+        let guard = self
+            .model_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.get(session_id).cloned()
+    }
+
+    /// Session summaries with the in-memory model overrides applied.
+    pub fn with_model_overrides(
+        &self,
+        mut sessions: Vec<DiscoveredSessionSummary>,
+    ) -> Vec<DiscoveredSessionSummary> {
+        let guard = self
+            .model_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_actions::apply_model_overrides(&mut sessions, &guard);
+        sessions
+    }
+
+    /// Forget the in-flight marker for `session_key`, so the session no longer reads as busy
+    /// because of a prompt the operator just interrupted. Queued prompts stay queued.
+    pub fn clear_session_in_flight(&self, session_key: &str) {
+        let mut guard = self.prompt_queues.lock().unwrap_or_else(|e| e.into_inner());
+        guard.in_flight.remove(session_key);
     }
 
     pub fn session_queue(&self, session_key: &str) -> Vec<QueuedOperatorPrompt> {
@@ -3799,5 +3865,1158 @@ mod tests {
             .unwrap()
             .clone();
         assert!(nodes.iter().any(|node| node["role"] == "hub"));
+    }
+
+    // ---- Track 1 session control: interrupt, model, bulk-action, commands -----------------
+
+    /// Add `route` for `persona` to the route table under `home` (keeps earlier entries).
+    fn install_route(home: &std::path::Path, persona: &str, route: fl_wire::identity::VendorRoute) {
+        use fl_core::at::At;
+        use fl_wire::identity::RouteTable;
+
+        let path = home.join(".cache").join("agent-bus").join("routes.json");
+        let mut routes = RouteTable::load(Some(&path));
+        routes.upsert(persona, route, At::from_unix_millis(1));
+        routes.save(Some(&path)).unwrap();
+    }
+
+    fn muse_route(session_id: &str, tmux_target: Option<&str>) -> fl_wire::identity::VendorRoute {
+        fl_wire::identity::VendorRoute::Muse {
+            session_id: session_id.into(),
+            cwd: None,
+            tmux_target: tmux_target.map(str::to_string),
+            tmux_pane: None,
+        }
+    }
+
+    fn webhook_route(socket: &std::path::Path) -> fl_wire::identity::VendorRoute {
+        fl_wire::identity::VendorRoute::Webhook {
+            socket_path: socket.to_path_buf(),
+        }
+    }
+
+    fn call(state: &HubState, method: &str, path: &str, token: &str, body: &Value) -> HttpResponse {
+        handle_http_request(state, &authed(method, path, token, body))
+    }
+
+    const OWNER: &str = "owner-tok-secret";
+    const PEER: &str = "peer-tok-secret";
+
+    fn error_text(resp: &HttpResponse) -> String {
+        resp.json_value().unwrap()["error"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn interrupt_endpoint_gates_resolves_and_reports_the_method() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        install_route(tmp.path(), "ada", muse_route("ms-ada", Some("muse:ada")));
+        let url = "/api/v1/sessions/ada/interrupt";
+
+        let unauth = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", url).with_json_body(&json!({})),
+        );
+        assert_eq!(unauth.status, 401);
+
+        let unknown = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/nobody/interrupt",
+            OWNER,
+            &json!({}),
+        );
+        assert_eq!(unknown.status, 404, "{}", error_text(&unknown));
+
+        // Mark the session busy, so the interrupt has a flag to clear.
+        state.mark_session_in_flight_from_turns("ms-ada", &[]);
+        assert!(state.is_session_busy_from_turns("ms-ada", &[]));
+        let mut frames = state.subscribe();
+
+        let ok = call(&state, "POST", url, OWNER, &json!({ "reason": "stuck" }));
+        assert_eq!(ok.status, 200, "{}", error_text(&ok));
+        assert_eq!(
+            ok.json_value().unwrap(),
+            json!({
+                "session_id": "ms-ada",
+                "interrupted": true,
+                "vendor": "muse",
+                "method": "noop-test",
+            })
+        );
+        assert!(!state.is_session_busy_from_turns("ms-ada", &[]));
+        let frame = frames.try_recv().unwrap();
+        assert_eq!(
+            (frame.channel.as_str(), frame.event.as_str()),
+            ("sessions", "session.interrupted")
+        );
+        assert_eq!(frame.data["reason"], "stuck");
+        assert_eq!(frame.data["persona"], "ada");
+
+        // `{}`, an empty body, a null reason, the canonical id and a Peer token all work.
+        for (token, target, req_body) in [
+            (PEER, "ada", Some(json!({}))),
+            (OWNER, "ms-ada", None),
+            (OWNER, "ada", Some(json!({ "reason": null }))),
+        ] {
+            let mut req = HttpRequest::new("POST", format!("/api/v1/sessions/{target}/interrupt"))
+                .with_header("Authorization", format!("Bearer {token}"));
+            if let Some(b) = &req_body {
+                req = req.with_json_body(b);
+            }
+            let resp = handle_http_request(&state, &req);
+            assert_eq!(resp.status, 200, "{target}: {}", error_text(&resp));
+            assert_eq!(resp.json_value().unwrap()["session_id"], "ms-ada");
+        }
+
+        let bad_reason = call(&state, "POST", url, OWNER, &json!({ "reason": 7 }));
+        assert_eq!(bad_reason.status, 400);
+        let bad_body = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", url)
+                .with_header("Authorization", "Bearer owner-tok-secret")
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(bad_body.status, 400);
+    }
+
+    #[test]
+    fn interrupt_endpoint_is_502_when_the_route_cannot_be_interrupted() {
+        use fl_wire::identity::VendorRoute;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        // A webhook route, a tmux vendor with no target, and a Claude route with no hosted pane.
+        install_route(
+            tmp.path(),
+            "hook",
+            webhook_route(&tmp.path().join("hook.sock")),
+        );
+        install_route(tmp.path(), "blind", muse_route("ms-blind", None));
+        install_route(
+            tmp.path(),
+            "grace",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "cs-grace".into(),
+                socket_path: tmp.path().join("grace.sock"),
+                key_path: Some(tmp.path().join("grace.key")),
+            },
+        );
+        for persona in ["hook", "blind", "grace"] {
+            let resp = call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{persona}/interrupt"),
+                OWNER,
+                &json!({}),
+            );
+            assert_eq!(resp.status, 502, "{persona}: {}", error_text(&resp));
+            assert!(!error_text(&resp).is_empty(), "{persona}");
+        }
+    }
+
+    #[test]
+    fn interrupt_endpoint_uses_the_key_file_pane_of_a_claude_session_the_hub_does_not_host() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let _listener = install_claude_tmux_route(tmp.path(), "felicity");
+        let post = |persona: &str| {
+            call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{persona}/interrupt"),
+                OWNER,
+                &json!({}),
+            )
+        };
+
+        // No hosted record, but the key file names a live pane: the interrupt has a target.
+        let resp = post("felicity");
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let data = resp.json_value().unwrap();
+        assert_eq!(data["vendor"], "claude");
+        assert_eq!(data["method"], "noop-test");
+        assert!(
+            tmux.log().contains("display-message -p -t %12"),
+            "{}",
+            tmux.log()
+        );
+
+        // A key file whose pane is a session name (not a `%n` pane id) or that is missing is
+        // still a 502.
+        fs::write(
+            tmp.path().join("felicity.key"),
+            json!({ "peerToken": "t", "tmux": "Felicity:@12" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(post("felicity").status, 502);
+        fs::remove_file(tmp.path().join("felicity.key")).unwrap();
+        assert_eq!(post("felicity").status, 502);
+    }
+
+    #[test]
+    fn interrupt_endpoint_finds_a_claude_pane_in_the_hosted_record_and_handles_antigravity() {
+        use fl_wire::identity::VendorRoute;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("felicity")).status, 200);
+        install_route(
+            tmp.path(),
+            "felicity",
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "cs-felicity".into(),
+                socket_path: tmp.path().join("felicity.sock"),
+                key_path: Some(tmp.path().join("felicity.key")),
+            },
+        );
+        install_route(
+            tmp.path(),
+            "agy-1",
+            VendorRoute::Agy {
+                conversation_id: "conv-1".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+        );
+        let claude = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/felicity/interrupt",
+            OWNER,
+            &json!({}),
+        );
+        assert_eq!(claude.status, 200, "{}", error_text(&claude));
+        let claude = claude.json_value().unwrap();
+        assert_eq!(claude["vendor"], "claude");
+        assert_eq!(claude["method"], "noop-test");
+        assert_eq!(claude["session_id"], "cs-felicity");
+
+        let agy = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/agy-1/interrupt",
+            OWNER,
+            &json!({}),
+        );
+        assert_eq!(agy.status, 200, "{}", error_text(&agy));
+        let agy = agy.json_value().unwrap();
+        assert_eq!(agy["vendor"], "antigravity");
+        assert_eq!(agy["method"], "noop-test");
+        assert_eq!(agy["session_id"], "conv-1");
+    }
+
+    #[test]
+    fn model_endpoint_validates_overrides_the_summary_and_dispatches_the_command() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let socket = tmp.path().join("felicia.sock");
+        install_route(tmp.path(), "felicia", webhook_route(&socket));
+        let lines = collect_webhook_lines(socket, 2);
+        let url = "/api/v1/sessions/felicia/model";
+
+        let unauth = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", url).with_json_body(&json!({ "model": "m" })),
+        );
+        assert_eq!(unauth.status, 401);
+
+        let too_long = "m".repeat(129);
+        for bad in [
+            json!({}),
+            json!({ "model": "" }),
+            json!({ "model": "   " }),
+            json!({ "model": "two\nlines" }),
+            json!({ "model": "tab\there" }),
+            json!({ "model": "esc\u{1b}[0m" }),
+            json!({ "model": too_long }),
+            json!({ "model": 5 }),
+            json!({ "model": "ok", "thinking_level": "extreme" }),
+            json!({ "model": "ok", "thinking_level": "" }),
+            json!({ "model": "ok", "thinking_level": 3 }),
+        ] {
+            let resp = call(&state, "POST", url, OWNER, &bad);
+            assert_eq!(resp.status, 400, "{bad}");
+        }
+        let unknown = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/nobody/model",
+            OWNER,
+            &json!({ "model": "gpt-6-sol" }),
+        );
+        assert_eq!(unknown.status, 404);
+        // Nothing from the rejected requests was recorded.
+        assert!(state.session_model_override("webhook-felicia").is_none());
+        assert!(state.session_model_override("nobody").is_none());
+
+        let mut frames = state.subscribe();
+        let ok = call(
+            &state,
+            "POST",
+            url,
+            OWNER,
+            &json!({ "model": "  claude-opus-5-5 ", "thinking_level": "HIGH" }),
+        );
+        assert_eq!(ok.status, 200, "{}", error_text(&ok));
+        assert_eq!(
+            ok.json_value().unwrap(),
+            json!({
+                "ok": true,
+                "session_id": "webhook-felicia",
+                "vendor": "webhook",
+                "model": "claude-opus-5-5",
+                "thinking_level": "high",
+                "switched": true,
+                "method": "operator-prompt",
+            })
+        );
+        let frame = frames.try_recv().unwrap();
+        assert_eq!(
+            (frame.channel.as_str(), frame.event.as_str()),
+            ("sessions", "session.model_changed")
+        );
+
+        // The override shows in the session list.
+        let listed = call(&state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+        let sessions = listed.json_value().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let felicia = sessions
+            .iter()
+            .find(|s| s["id"] == "webhook-felicia")
+            .unwrap();
+        assert_eq!(felicia["model"], "claude-opus-5-5");
+        assert_eq!(felicia["thinking_level"], "high");
+
+        // A Peer may switch too; no thinking level is `null`, and keeps the earlier level.
+        let peer = call(&state, "POST", url, PEER, &json!({ "model": "gpt-6-sol" }));
+        assert_eq!(peer.status, 200);
+        assert!(peer.json_value().unwrap()["thinking_level"].is_null());
+        let listed = call(&state, "GET", "/api/v1/sessions", PEER, &json!({}));
+        let sessions = listed.json_value().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let felicia = sessions
+            .iter()
+            .find(|s| s["id"] == "webhook-felicia")
+            .unwrap();
+        assert_eq!(felicia["model"], "gpt-6-sol");
+
+        // The CLI got `/model <id>` once per accepted call (the trimmed id, not the raw one).
+        let delivered = lines.join().unwrap();
+        let bodies: Vec<String> = delivered
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["body"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(bodies, vec!["/model claude-opus-5-5", "/model gpt-6-sol"]);
+    }
+
+    fn set_model(state: &HubState, target: &str, model: &str) {
+        let resp = call(
+            state,
+            "POST",
+            &format!("/api/v1/sessions/{target}/model"),
+            OWNER,
+            &json!({ "model": model }),
+        );
+        assert_eq!(resp.status, 200, "{target}: {}", error_text(&resp));
+    }
+
+    fn listed_model(state: &HubState, id: &str) -> Value {
+        let listed = call(state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+        let sessions = listed.json_value().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        sessions.iter().find(|s| s["id"] == id).unwrap()["model"].clone()
+    }
+
+    #[test]
+    fn model_override_applies_when_the_session_matches_by_persona_only() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        install_route(
+            tmp.path(),
+            "felicia",
+            webhook_route(&tmp.path().join("felicia.sock")),
+        );
+
+        // `Felicia` is not the discovered persona, so the request matches no summary, but it
+        // does find the route. The override is keyed by the lowercased persona and still shows.
+        set_model(&state, "Felicia", "model-a");
+        assert_eq!(
+            state.session_model_override("felicia").unwrap().model,
+            "model-a"
+        );
+        assert!(state.session_model_override("Felicia").is_none());
+        assert_eq!(listed_model(&state, "webhook-felicia"), "model-a");
+
+        // A hosted session with no route yet: the override waits under its persona, and shows
+        // as soon as discovery lists the session.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        set_model(&state, "claude:ada", "model-b");
+        assert_eq!(
+            state.session_model_override("ada").unwrap().model,
+            "model-b"
+        );
+        install_route(
+            tmp.path(),
+            "ada",
+            webhook_route(&tmp.path().join("ada.sock")),
+        );
+        assert_eq!(listed_model(&state, "webhook-ada"), "model-b");
+        // A session id match wins over a persona key.
+        state.set_session_model_override(
+            "webhook-ada",
+            session_actions::ModelOverride {
+                model: "model-c".into(),
+                thinking_level: None,
+            },
+        );
+        assert_eq!(listed_model(&state, "webhook-ada"), "model-c");
+    }
+
+    #[test]
+    fn model_override_is_dropped_on_reset_spin_up_and_teardown() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+
+        // Clear: the override of the discovered session id goes.
+        let socket = tmp.path().join("felicia.sock");
+        install_route(tmp.path(), "felicia", webhook_route(&socket));
+        // The webhook takes `/model model-a`, then `/clear`.
+        let lines = collect_webhook_lines(socket, 2);
+        set_model(&state, "felicia", "model-a");
+        assert!(state.session_model_override("webhook-felicia").is_some());
+        let cleared = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/felicia/clear",
+            OWNER,
+            &json!({ "mode": "clear" }),
+        );
+        assert_eq!(cleared.status, 200, "{}", error_text(&cleared));
+        lines.join().unwrap();
+        assert!(state.session_model_override("webhook-felicia").is_none());
+        assert_eq!(listed_model(&state, "webhook-felicia"), Value::Null);
+
+        // Spin-up again of a persona with an override waiting.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        set_model(&state, "claude:ada", "model-b");
+        assert!(state.session_model_override("ada").is_some());
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        assert!(state.session_model_override("ada").is_none());
+
+        // Teardown.
+        set_model(&state, "claude:ada", "model-c");
+        assert!(state.session_model_override("ada").is_some());
+        let torn = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/claude:ada/decommission",
+            OWNER,
+            &json!({ "mode": "teardown" }),
+        );
+        assert_eq!(torn.status, 200, "{}", error_text(&torn));
+        assert!(state.session_model_override("ada").is_none());
+        assert!(state.session_model_override("claude:ada").is_none());
+    }
+
+    #[test]
+    fn model_endpoint_is_override_only_without_a_deliverable_route_and_updates_the_hosted_record() {
+        use fl_wire::identity::VendorRoute;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+
+        // Antigravity is never sent a command; a dead webhook socket is a failed dispatch.
+        install_route(
+            tmp.path(),
+            "agy-1",
+            VendorRoute::Agy {
+                conversation_id: "conv-1".into(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+        );
+        install_route(
+            tmp.path(),
+            "dead",
+            webhook_route(&tmp.path().join("dead.sock")),
+        );
+        for (target, session, vendor) in [
+            ("agy-1", "conv-1", "antigravity"),
+            ("dead", "webhook-dead", "webhook"),
+        ] {
+            let resp = call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{target}/model"),
+                OWNER,
+                &json!({ "model": "gemini-4-argon" }),
+            );
+            assert_eq!(resp.status, 200, "{target}: {}", error_text(&resp));
+            let body = resp.json_value().unwrap();
+            assert_eq!(body["method"], "override-only", "{target}");
+            assert_eq!(body["session_id"], session);
+            assert_eq!(body["vendor"], vendor);
+            assert_eq!(body["switched"], true);
+            assert_eq!(
+                state.session_model_override(session).unwrap().model,
+                "gemini-4-argon"
+            );
+        }
+
+        // A hosted session with no live route: the record takes the model.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let before = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        assert!(before.json_value().unwrap()["sessions"][0]["model"].is_null());
+        let resp = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/claude:ada/model",
+            OWNER,
+            &json!({ "model": "claude-sonnet-5-5" }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["vendor"], "claude");
+        assert_eq!(body["method"], "override-only");
+        assert_eq!(body["session_id"], "claude:ada");
+        let after = call(&state, "GET", "/api/v1/hosted-sessions", OWNER, &json!({}));
+        let hosted = after.json_value().unwrap()["sessions"][0].clone();
+        assert_eq!(hosted["session_id"], "claude:ada");
+        assert_eq!(hosted["model"], "claude-sonnet-5-5");
+    }
+
+    #[test]
+    fn bulk_action_is_owner_only_validated_and_reports_each_session() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let url = "/api/v1/sessions/bulk-action";
+
+        let unauth = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", url).with_json_body(&json!({ "action": "clear" })),
+        );
+        assert_eq!(unauth.status, 401);
+        let peer = call(&state, "POST", url, PEER, &json!({ "action": "clear" }));
+        assert_eq!(peer.status, 403, "{}", error_text(&peer));
+        // Peer is refused before the body is read.
+        assert_eq!(
+            call(&state, "POST", url, PEER, &json!({ "action": "nope" })).status,
+            403
+        );
+        for bad in [
+            json!({ "action": "wipe" }),
+            json!({ "action": "" }),
+            json!({}),
+            json!({ "action": 4 }),
+        ] {
+            let resp = call(&state, "POST", url, OWNER, &bad);
+            assert_eq!(resp.status, 400, "{bad}");
+            // Reached the bulk handler, not a session-id route.
+            assert!(
+                !error_text(&resp).contains("session"),
+                "{}",
+                error_text(&resp)
+            );
+        }
+        let empty = call(&state, "POST", url, OWNER, &json!({ "action": "compact" }));
+        assert_eq!(
+            empty.json_value().unwrap(),
+            json!({ "action": "compact", "total": 0, "succeeded": 0, "results": [] })
+        );
+
+        // felicia has a listener; ada's socket does not exist, so every action fails for it.
+        let socket = tmp.path().join("felicia.sock");
+        install_route(tmp.path(), "felicia", webhook_route(&socket));
+        install_route(
+            tmp.path(),
+            "ada",
+            webhook_route(&tmp.path().join("ada.sock")),
+        );
+        {
+            let store = state.open_store().unwrap();
+            store
+                .register_agent(RegisterAgentArgs {
+                    display_name: "Felicia".into(),
+                    email: None,
+                    project: "ferroloop".into(),
+                    role: AgentRole::Assistant,
+                    extra_areas: vec![],
+                    create_area: true,
+                    replace: true,
+                    at: stamp::now(),
+                    by: "owner".into(),
+                })
+                .unwrap();
+        }
+        state.enqueue_session_prompt(
+            "webhook-felicia",
+            Some("felicia".into()),
+            "stale".into(),
+            "stale".into(),
+            "owner".into(),
+            Vec::new(),
+        );
+        let lines = collect_webhook_lines(socket, 4);
+
+        let check = |action: &str, ada_error_has: &str| {
+            let resp = call(&state, "POST", url, OWNER, &json!({ "action": action }));
+            assert_eq!(resp.status, 200, "{action}: {}", error_text(&resp));
+            let body = resp.json_value().unwrap();
+            assert_eq!(body["action"], action);
+            assert_eq!(body["total"], 2, "{body}");
+            assert_eq!(body["succeeded"], 1, "{body}");
+            let results = body["results"].as_array().unwrap();
+            assert_eq!(results.len(), 2);
+            let ok = results
+                .iter()
+                .find(|r| r["session_id"] == "webhook-felicia")
+                .unwrap();
+            assert_eq!(*ok, json!({ "session_id": "webhook-felicia", "ok": true }));
+            let failed = results
+                .iter()
+                .find(|r| r["session_id"] == "webhook-ada")
+                .unwrap();
+            assert_eq!(failed["ok"], false);
+            assert!(
+                failed["error"].as_str().unwrap().contains(ada_error_has),
+                "{action}: {failed}"
+            );
+        };
+        check("clear", "webhook socket");
+        // The clear dropped felicia's queue like the single-session endpoint does.
+        assert!(state.session_queue("webhook-felicia").is_empty());
+        check("compact", "webhook socket");
+        // Reforge needs an agent record: felicia has one, ada does not. (The hydrate lock
+        // keeps another test's FL_HUB_AGENT_HYDRATE_BIN out of this call.)
+        api::with_hydrate_lock(|| check("reforge", "no agent record"));
+
+        let delivered = lines.join().unwrap();
+        let bodies: Vec<String> = delivered
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["body"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(bodies[0], "/clear");
+        assert_eq!(bodies[1], "/compact");
+        assert_eq!(bodies[2], "/clear");
+        assert_eq!(
+            bodies[3],
+            api::canonical_reforge_prompt("Felicia", "ferroloop", "assistant")
+        );
+    }
+
+    #[test]
+    fn commands_endpoint_lists_builtins_and_workspace_skills_and_flows() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let root = tmp.path();
+        let skills = root.join(".agents/skills");
+        fs::create_dir_all(skills.join("alpha")).unwrap();
+        fs::write(
+            skills.join("alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: Alpha does a thing\n---\n# Alpha\n",
+        )
+        .unwrap();
+        fs::create_dir_all(skills.join("broken")).unwrap();
+        fs::write(skills.join("broken/SKILL.md"), "no frontmatter here").unwrap();
+        fs::create_dir_all(skills.join("unfenced")).unwrap();
+        fs::write(
+            skills.join("unfenced/SKILL.md"),
+            "intro\nname: unfenced\ndescription: x\n---\n",
+        )
+        .unwrap();
+        // A skill whose directory is a symlink to outside the workspace.
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(outside.path().join("evil")).unwrap();
+        fs::write(
+            outside.path().join("evil/SKILL.md"),
+            "---\nname: evil\ndescription: escaped\n---\n",
+        )
+        .unwrap();
+        symlink(outside.path().join("evil"), skills.join("evil")).unwrap();
+        fs::create_dir_all(root.join(".fl/flows")).unwrap();
+        fs::write(
+            root.join(".fl/flows/ship.toml"),
+            "title = \"Ship a change\"\nstart_step = \"a\"\n",
+        )
+        .unwrap();
+        fs::write(outside.path().join("leak.toml"), "title = \"leak\"\n").unwrap();
+        symlink(
+            outside.path().join("leak.toml"),
+            root.join(".fl/flows/leak.toml"),
+        )
+        .unwrap();
+
+        let unauth = handle_http_request(&state, &HttpRequest::new("GET", "/api/v1/commands"));
+        assert_eq!(unauth.status, 401);
+
+        for token in [OWNER, PEER] {
+            let resp = call(&state, "GET", "/api/v1/commands", token, &json!({}));
+            assert_eq!(resp.status, 200, "{}", error_text(&resp));
+            let commands = resp.json_value().unwrap()["commands"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let find = |kind: &str, name: &str| {
+                commands
+                    .iter()
+                    .find(|c| c["kind"] == kind && c["name"] == name)
+                    .cloned()
+            };
+            for name in ["compact", "clear", "model", "goal", "plan", "boost"] {
+                assert!(find("command", name).is_some(), "{name}");
+            }
+            for name in ["ultrareview", "code-review", "subagent-dev", "ste"] {
+                assert!(find("skill", name).is_some(), "{name}");
+            }
+            assert_eq!(
+                find("skill", "alpha").unwrap(),
+                json!({ "name": "alpha", "kind": "skill", "description": "Alpha does a thing" })
+            );
+            assert_eq!(
+                find("workflow", "ship").unwrap(),
+                json!({ "name": "ship", "kind": "workflow", "description": "Ship a change" })
+            );
+            assert!(find("skill", "broken").is_none());
+            assert!(find("skill", "unfenced").is_none());
+            assert!(find("skill", "evil").is_none());
+            assert!(find("workflow", "leak").is_none());
+            for c in &commands {
+                assert_eq!(c.as_object().unwrap().len(), 3, "{c}");
+                assert!(c["description"].is_string());
+            }
+            let keys: Vec<(String, String)> = commands
+                .iter()
+                .map(|c| {
+                    (
+                        c["kind"].as_str().unwrap().to_string(),
+                        c["name"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            let mut sorted = keys.clone();
+            sorted.sort();
+            assert_eq!(keys, sorted);
+        }
+    }
+
+    // ---- Operator prompts reach a terminal as direct input for the owner only -----------
+
+    static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `FL_WIRE_TMUX_BIN` at a fake tmux that records its arguments in `<dir>/tmux.out`
+    /// and reports every pane alive, then restores the variable on drop. Hold `TMUX_ENV_LOCK`.
+    struct FakeTmux {
+        out: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl FakeTmux {
+        fn install(dir: &std::path::Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let out = dir.join("tmux.out");
+            let bin = dir.join("fake-tmux.sh");
+            fs::write(
+                &bin,
+                format!(
+                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  echo \"%12\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > /dev/null\nfi\n",
+                    out.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            let prev = std::env::var_os("FL_WIRE_TMUX_BIN");
+            // SAFETY: callers hold TMUX_ENV_LOCK; the previous value is restored on drop.
+            unsafe { std::env::set_var("FL_WIRE_TMUX_BIN", &bin) };
+            Self { out, prev }
+        }
+
+        fn log(&self) -> String {
+            fs::read_to_string(&self.out).unwrap_or_default()
+        }
+
+        fn forget(&self) {
+            let _ = fs::remove_file(&self.out);
+        }
+    }
+
+    impl Drop for FakeTmux {
+        fn drop(&mut self) {
+            // SAFETY: see `install`.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("FL_WIRE_TMUX_BIN", v),
+                    None => std::env::remove_var("FL_WIRE_TMUX_BIN"),
+                }
+            }
+        }
+    }
+
+    /// A Claude route for `persona` whose key file names a tmux pane. The mock socket is
+    /// returned so a test can see whether the peer-session path was used.
+    fn install_claude_tmux_route(
+        home: &std::path::Path,
+        persona: &str,
+    ) -> std::os::unix::net::UnixListener {
+        use std::os::unix::net::UnixListener;
+
+        let sock = home.join(format!("{persona}.sock"));
+        let key = home.join(format!("{persona}.key"));
+        fs::write(
+            &key,
+            json!({ "peerToken": "tok-hub", "tmux": "Felicity:@12.%12" }).to_string(),
+        )
+        .unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        install_route(
+            home,
+            persona,
+            fl_wire::identity::VendorRoute::Claude {
+                pid: 0,
+                session_id: format!("cs-{persona}"),
+                socket_path: sock,
+                key_path: Some(key),
+            },
+        );
+        listener
+    }
+
+    /// The `from` of the peer-session user frame the socket received, if it received one.
+    fn socket_from(listener: &std::os::unix::net::UnixListener) -> Option<String> {
+        use std::io::{BufRead, BufReader};
+
+        let (stream, _) = listener.accept().ok()?;
+        stream.set_nonblocking(false).unwrap();
+        let lines: Vec<String> = BufReader::new(stream)
+            .lines()
+            .take(2)
+            .map(|l| l.unwrap())
+            .collect();
+        let user: Value = serde_json::from_str(&lines[1]).unwrap();
+        Some(user["from"].as_str().unwrap().to_string())
+    }
+
+    fn post_prompt(
+        state: &HubState,
+        persona: &str,
+        token: &str,
+        agent: Option<&str>,
+        body: &Value,
+    ) -> Value {
+        let mut req = authed(
+            "POST",
+            &format!("/api/v1/sessions/{persona}/prompt"),
+            token,
+            body,
+        );
+        if let Some(agent) = agent {
+            req = req.with_header("X-Fl-Agent", agent);
+        }
+        let resp = handle_http_request(state, &req);
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        resp.json_value().unwrap()
+    }
+
+    #[test]
+    fn owner_prompt_reaches_a_claude_tmux_pane_but_a_peer_never_does() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let listener = install_claude_tmux_route(tmp.path(), "felicity");
+
+        // The Owner token: pasted into the pane, nothing on the peer socket.
+        let sent = post_prompt(
+            &state,
+            "felicity",
+            OWNER,
+            None,
+            &json!({ "prompt": "hello from the owner", "send_now": true }),
+        );
+        assert_eq!(sent["delivered"], true, "{sent}");
+        assert_eq!(sent["by"], "lmcfarlin");
+        let log = tmux.log();
+        assert!(log.contains("paste-buffer -d -b"), "{log}");
+        assert!(log.contains("send-keys -t %12 Enter"), "{log}");
+        assert_eq!(socket_from(&listener), None, "owner prompt used the socket");
+
+        // A Peer token that claims to be the owner, however it spells the claim, takes the
+        // peer-session socket and never the pane.
+        let claims: [(Option<&str>, Value); 6] = [
+            (
+                None,
+                json!({ "send_now": true, "prompt": "p1", "by": "owner" }),
+            ),
+            (
+                None,
+                json!({ "send_now": true, "prompt": "p2", "by": "OWNER" }),
+            ),
+            (
+                None,
+                json!({ "send_now": true, "prompt": "p3", "by": " lmcfarlin " }),
+            ),
+            (
+                None,
+                json!({ "send_now": true, "prompt": "p4", "by": "not a slug!" }),
+            ),
+            (Some("owner"), json!({ "send_now": true, "prompt": "p5" })),
+            (
+                Some("lmcfarlin"),
+                json!({ "send_now": true, "prompt": "p6", "by": "owner" }),
+            ),
+        ];
+        for (agent, body) in claims {
+            tmux.forget();
+            let sent = post_prompt(&state, "felicity", PEER, agent, &body);
+            assert_eq!(sent["delivered"], true, "{body}: {sent}");
+            let by = sent["by"].as_str().unwrap().to_string();
+            assert!(
+                !fl_wire::dispatcher::is_owner_sender(&by),
+                "{body}: sender `{by}` is an owner name"
+            );
+            assert!(
+                !tmux.log().contains("paste-buffer"),
+                "{body}: a peer prompt was pasted into the pane: {}",
+                tmux.log()
+            );
+            assert_eq!(
+                socket_from(&listener).as_deref(),
+                Some(by.as_str()),
+                "{body}"
+            );
+        }
+
+        // A Peer with an honest name keeps its own label.
+        tmux.forget();
+        let sent = post_prompt(
+            &state,
+            "felicity",
+            PEER,
+            Some("ferris"),
+            &json!({ "send_now": true, "prompt": "p7" }),
+        );
+        assert_eq!(sent["by"], "ferris");
+        assert!(!tmux.log().contains("paste-buffer"));
+        assert_eq!(socket_from(&listener).as_deref(), Some("ferris"));
+    }
+
+    #[test]
+    fn peer_authority_never_resolves_to_an_owner_name() {
+        use crate::auth::HubAuthority;
+
+        for agent in ["owner", "OWNER", "lmcfarlin", " Owner "] {
+            let peer = HubAuthority::Peer {
+                agent: Some(agent.to_string()),
+            };
+            assert_eq!(peer.actor_name(), "peer", "{agent:?}");
+        }
+        let named = HubAuthority::Peer {
+            agent: Some("ferris".into()),
+        };
+        assert_eq!(named.actor_name(), "ferris");
+        assert_eq!(HubAuthority::Peer { agent: None }.actor_name(), "peer");
+        let owner = HubAuthority::Owner {
+            login: "lmcfarlin".into(),
+        };
+        assert_eq!(owner.actor_name(), "lmcfarlin");
+    }
+
+    #[test]
+    fn peer_spin_up_hydration_is_never_pasted_into_a_pane_even_as_owner_named_agent() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let listener = install_claude_tmux_route(tmp.path(), "felicity");
+
+        let mut req = authed(
+            "POST",
+            "/api/v1/sessions/spin-up",
+            PEER,
+            &spin_up_body("felicity"),
+        );
+        req = req.with_header("X-Fl-Agent", "owner");
+        let resp = handle_http_request(&state, &req);
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(resp.json_value().unwrap()["hydration_dispatched"], true);
+        assert!(
+            !tmux.log().contains("paste-buffer"),
+            "peer hydration was pasted: {}",
+            tmux.log()
+        );
+        assert_eq!(socket_from(&listener).as_deref(), Some("peer"));
+    }
+
+    /// A bridge `bridge-hook` that admits any sender id and routes to `wire:felicity`.
+    fn install_wire_bridge(home: &std::path::Path) {
+        let dir = home.join(".config").join("fl").join("gate");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("bridge-hook.toml"),
+            r#"
+id = "bridge-hook"
+title = "Bridge hook"
+base_url = "http://127.0.0.1:1"
+allowed_hosts = ["127.0.0.1"]
+
+[[bridges]]
+id = "bridge-hook"
+kind = "webhook"
+allowed_user_ids = ["*"]
+default_target = "wire:felicity"
+"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn bridge_webhook_label_is_never_an_owner_name_so_it_is_never_pasted_into_a_pane() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let listener = install_claude_tmux_route(tmp.path(), "felicity");
+        install_wire_bridge(tmp.path());
+
+        // The webhook body is third-party text. Whatever name it claims, the prompt takes the
+        // peer-session socket under a non-owner label and never the pane.
+        let claims: [(&str, Option<&str>, &str); 6] = [
+            ("u1", Some("owner"), "bridge"),
+            ("u1", Some("OWNER"), "bridge"),
+            ("u1", Some("lmcfarlin"), "bridge"),
+            ("u1", Some("not a slug!"), "bridge"),
+            ("owner", None, "bridge"),
+            ("u1", Some("alice"), "alice"),
+        ];
+        for (sender_id, sender_name, expect) in claims {
+            tmux.forget();
+            let body = json!({
+                "bridge_id": "ignored",
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "channel_id": "chan",
+                "content": "do the thing",
+            });
+            let resp = call(
+                &state,
+                "POST",
+                "/api/v1/gate/bridges/bridge-hook/webhook",
+                OWNER,
+                &body,
+            );
+            assert_eq!(resp.status, 200, "{body}: {}", error_text(&resp));
+            assert_eq!(resp.json_value().unwrap()["delivered"], true, "{body}");
+            assert!(
+                !tmux.log().contains("paste-buffer"),
+                "{body}: a webhook prompt was pasted into the pane: {}",
+                tmux.log()
+            );
+            assert_eq!(socket_from(&listener).as_deref(), Some(expect), "{body}");
+        }
+    }
+
+    #[test]
+    fn wire_send_never_lets_a_peer_send_as_the_owner() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let send = |token: &str, agent: Option<&str>, body: Value| -> String {
+            let mut req = authed("POST", "/api/v1/wire/send", token, &body);
+            if let Some(agent) = agent {
+                req = req.with_header("X-Fl-Agent", agent);
+            }
+            let resp = handle_http_request(&state, &req);
+            assert_eq!(resp.status, 200, "{body}: {}", error_text(&resp));
+            resp.json_value().unwrap()["message"]["sender_name"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let msg = |extra: Value| {
+            let mut body = json!({ "to": ["felicity"], "subject": "s", "body": "b" });
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            body
+        };
+
+        // A Peer claiming an owner name, or sending an unusable one, never becomes the owner.
+        for claim in ["owner", "OWNER", " lmcfarlin ", "not a slug!"] {
+            for key in ["sender_name", "from"] {
+                let got = send(PEER, None, msg(json!({ key: claim })));
+                assert_eq!(got, "peer", "{key}={claim:?}");
+                let got = send(PEER, Some("ferris"), msg(json!({ key: claim })));
+                assert_eq!(got, "ferris", "{key}={claim:?} as ferris");
+            }
+        }
+        assert_eq!(send(PEER, Some("owner"), msg(json!({}))), "peer");
+        // An honest Peer name is kept.
+        assert_eq!(send(PEER, None, msg(json!({ "from": "ferris" }))), "ferris");
+        // The Owner keeps its own label, and an unusable one falls back to `owner`.
+        assert_eq!(send(OWNER, None, msg(json!({}))), "lmcfarlin");
+        assert_eq!(
+            send(OWNER, None, msg(json!({ "sender_name": "owner" }))),
+            "owner"
+        );
+        assert_eq!(
+            send(OWNER, None, msg(json!({ "sender_name": "not a slug!" }))),
+            "owner"
+        );
+    }
+
+    #[test]
+    fn spin_up_refuses_the_owner_names_as_a_persona() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        for persona in ["owner", "lmcfarlin"] {
+            for token in [OWNER, PEER] {
+                let resp = call(
+                    &state,
+                    "POST",
+                    "/api/v1/sessions/spin-up",
+                    token,
+                    &spin_up_body(persona),
+                );
+                assert_eq!(resp.status, 400, "{persona}: {}", error_text(&resp));
+                assert!(
+                    error_text(&resp).contains("persona"),
+                    "{}",
+                    error_text(&resp)
+                );
+            }
+        }
     }
 }

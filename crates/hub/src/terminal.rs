@@ -300,7 +300,10 @@ impl TerminalManager {
                     if n == 0 {
                         break;
                     }
-                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let text = filter_bash_startup_noise(&String::from_utf8_lossy(&buf[..n]));
+                    if text.is_empty() {
+                        continue;
+                    }
                     if out_tx_stderr
                         .send(HubWsFrame {
                             channel: "terminal".to_string(),
@@ -544,5 +547,46 @@ fn resolve_command(command: Option<&Value>, extra_args: &[String]) -> (String, V
             }
         }
         _ => ("/bin/sh".to_string(), extra_args.to_vec()),
+    }
+}
+
+/// Drop the job-control warnings an interactive `bash -i` prints on stderr at startup.
+///
+/// The terminal spawns the shell with piped (non-PTY) stdio, so bash cannot take a terminal
+/// process group and prints two warnings that mean nothing to the operator. Every other line,
+/// including one that merely mentions a job, passes through unchanged.
+fn filter_bash_startup_noise(text: &str) -> String {
+    const NOISE: [&str; 2] = [
+        "cannot set terminal process group",
+        "no job control in this shell",
+    ];
+    text.split_inclusive('\n')
+        .filter(|line| !NOISE.iter().any(|needle| line.contains(needle)))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_bash_startup_noise;
+
+    #[test]
+    fn bash_startup_noise_lines_are_dropped() {
+        let noise = "bash: cannot set terminal process group (-1): Inappropriate ioctl for device\nbash: no job control in this shell\n";
+        assert_eq!(filter_bash_startup_noise(noise), "");
+        assert_eq!(
+            filter_bash_startup_noise("bash: no job control in this shell\n"),
+            ""
+        );
+    }
+
+    #[test]
+    fn ordinary_stderr_and_job_mentions_are_kept() {
+        let text = "ls: cannot access 'x': No such file or directory\n";
+        assert_eq!(filter_bash_startup_noise(text), text);
+        let job = "[1]+  Done   sleep 1 (job finished)\n";
+        assert_eq!(filter_bash_startup_noise(job), job);
+        let mixed = "bash: no job control in this shell\nreal error\n";
+        assert_eq!(filter_bash_startup_noise(mixed), "real error\n");
+        assert_eq!(filter_bash_startup_noise("no newline"), "no newline");
     }
 }

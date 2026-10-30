@@ -186,6 +186,12 @@ impl SpinUpRequest {
                 "must be a lowercase slug (a-z, 0-9, '-'; starts with a letter; at most 36 characters)",
             ));
         }
+        if fl_wire::dispatcher::is_owner_sender(&persona) {
+            return Err(invalid_field(
+                "persona",
+                "must not be the owner's name (`owner`, `lmcfarlin`)",
+            ));
+        }
         let project = self.project.trim().to_string();
         if project.is_empty() {
             return Err(invalid_field("project", "must not be empty"));
@@ -359,6 +365,24 @@ pub fn find_hosted_session<S: StateStore>(
             .find(|r| keys.iter().any(|k| persona_key_matches(r, k)))
     };
     Ok(exact.or_else(by_persona).cloned())
+}
+
+/// Record `model` on the hosted-session record that `keys` name (same lookup as
+/// [`find_hosted_session`]), so the record and a later restart agree with an operator's model
+/// switch. Returns the updated record, or `None` when no record matches.
+pub fn set_hosted_session_model<S: StateStore>(
+    store: &S,
+    keys: &[&str],
+    model: &str,
+    by: &str,
+) -> Result<Option<HostedSessionRecord>, LifecycleError> {
+    let Some(mut record) = find_hosted_session(store, keys)? else {
+        return Ok(None);
+    };
+    record.model = Some(model.to_string());
+    record.updated_at_ms = now_ms();
+    persist_hosted_session(store, &record, by)?;
+    Ok(Some(record))
 }
 
 fn now_ms() -> u64 {

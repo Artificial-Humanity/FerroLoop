@@ -582,6 +582,66 @@ pub fn authorize_agent_merge(
     authorize_agent_action(eval, caller)
 }
 
+/// Check every approving review that GitHub reports on `head_sha` for integrity: the review
+/// must carry a valid `fl-review` marker for an approving, active, authorized agent.
+///
+/// A review whose marker records an earlier head (`marker.head_sha != head_sha`) is accepted
+/// without further action, but only after every other check passed. GitHub rewrites `commit_id` on older reviews when
+/// `origin/main` is merged into the pull request branch, so such a review looks like it is on
+/// `head_sha` while it was written for an earlier commit. Skipping it grants nothing:
+/// [`verify_merge_approvals`] counts an approval only when its marker names `head_sha`, and a
+/// pull request still needs one for `--require-approval`. The head comparison is the last step (it is
+/// the only refusal a superseded marker escapes):
+/// a marker with a non-approving verdict, or from an unknown, inactive, wrong-role, co-author
+/// (self-review) or under-tier agent, is refused whichever head it names. A review with no
+/// readable marker is also refused. The owner's own reviews are not checked.
+pub fn verify_review_integrity(
+    head_sha: &str,
+    eval: &PrPolicyEvaluation,
+    reviews: &[PrReviewSummary],
+    agents: &[AgentRecord],
+    owner_login: &str,
+) -> Result<(), PolicyRefusal> {
+    let owner = if owner_login.trim().is_empty() {
+        DEFAULT_OWNER_LOGIN
+    } else {
+        owner_login.trim()
+    };
+    let missing = || PolicyRefusal::MissingValidApproval {
+        head_sha: head_sha.to_string(),
+    };
+    for review in reviews {
+        let on_head = review
+            .commit_id
+            .as_deref()
+            .is_none_or(|cid| cid == head_sha);
+        if !review.state.trim().eq_ignore_ascii_case("APPROVED")
+            || !on_head
+            || review.author_login.eq_ignore_ascii_case(owner)
+        {
+            continue;
+        }
+        let marker = extract_review_marker(&review.body).ok_or_else(missing)?;
+        if marker.verdict != ReviewVerdict::Approved {
+            return Err(missing());
+        }
+        let Some(agent) = agents.iter().find(|a| {
+            a.status == AgentStatus::Active
+                && a.name_key.eq_ignore_ascii_case(&marker.reviewer)
+                && a.role == marker.role
+        }) else {
+            return Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: marker.reviewer,
+            });
+        };
+        authorize_agent_action(eval, agent)?;
+        // The head comparison is last, so it is the only refusal a superseded marker escapes.
+        // Nothing follows it in this loop, so a marker that names an earlier head and passed
+        // every check above needs no `continue`: it is accepted and skipped by falling through.
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct FoldedReviewState {
     label: String,
@@ -1215,6 +1275,392 @@ Signed-off-by: Someone <someone@example.com>
             Err(PolicyRefusal::ProtectedPathRequiresOwner {
                 agent: "ferris".into(),
                 files: vec![".github/workflows/ci.yml".into()],
+            })
+        );
+    }
+
+    // ---- `verify_review_integrity`: superseded reviews ----------------------------------
+
+    const HEAD: &str = "head-new";
+    const OLD: &str = "head-old";
+
+    fn integrity_eval(agents: &[AgentRecord]) -> PrPolicyEvaluation {
+        evaluate_pr_policy(
+            "ferroloop",
+            &[PrCommitSummary {
+                sha: HEAD.into(),
+                author_login: Some("artificially-human".into()),
+                message: "feat: item\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
+                    .into(),
+            }],
+            &["crates/core/src/lib.rs".into()],
+            &[],
+            agents,
+            DEFAULT_OWNER_LOGIN,
+        )
+    }
+
+    /// A review by `reviewer` whose marker records `marker_head` and `verdict`, which GitHub
+    /// reports as `state` on `commit_id`.
+    fn marked_review(
+        id: u64,
+        reviewer: &AgentRecord,
+        state: &str,
+        verdict: ReviewVerdict,
+        marker_head: &str,
+        commit_id: Option<&str>,
+    ) -> PrReviewSummary {
+        let marker = FlReviewMarker {
+            reviewer: reviewer.name_key.clone(),
+            role: reviewer.role.clone(),
+            project: "ferroloop".into(),
+            head_sha: marker_head.into(),
+            verdict,
+            at: At::from_unix_millis(id * 1_000),
+        };
+        PrReviewSummary {
+            id,
+            author_login: "ferroloop-reviewer[bot]".into(),
+            state: state.into(),
+            body: format_review_body("review", &marker),
+            commit_id: commit_id.map(str::to_string),
+        }
+    }
+
+    fn missing() -> PolicyRefusal {
+        PolicyRefusal::MissingValidApproval {
+            head_sha: HEAD.into(),
+        }
+    }
+
+    /// What `fl github pr verify-ci --require-approval` decides: the integrity check, then a
+    /// valid approval on the head.
+    fn verify_ci_requiring_approval(
+        eval: &PrPolicyEvaluation,
+        reviews: &[PrReviewSummary],
+        agents: &[AgentRecord],
+    ) -> Result<String, PolicyRefusal> {
+        verify_review_integrity(HEAD, eval, reviews, agents, DEFAULT_OWNER_LOGIN)?;
+        verify_merge_approvals(HEAD, eval, reviews, agents, DEFAULT_OWNER_LOGIN)
+    }
+
+    #[test]
+    fn integrity_skips_a_superseded_review_but_a_head_approval_is_still_required() {
+        let agents = sample_roster();
+        let (ferris, jarvis) = (&agents[1], &agents[0]);
+        let eval = integrity_eval(&agents);
+
+        // Merging `origin/main` made GitHub report the round-1 reviews on the new head, while
+        // their markers still name the old one. Round 2 re-approves on the new head.
+        let round1_approval = marked_review(
+            1,
+            ferris,
+            "APPROVED",
+            ReviewVerdict::Approved,
+            OLD,
+            Some(HEAD),
+        );
+        let round1_changes = marked_review(
+            2,
+            ferris,
+            "CHANGES_REQUESTED",
+            ReviewVerdict::ChangesRequested,
+            OLD,
+            Some(HEAD),
+        );
+        let round2_approval = marked_review(
+            3,
+            ferris,
+            "APPROVED",
+            ReviewVerdict::Approved,
+            HEAD,
+            Some(HEAD),
+        );
+        let all = [round1_approval.clone(), round1_changes, round2_approval];
+        assert_eq!(
+            verify_review_integrity(HEAD, &eval, &all, &agents, DEFAULT_OWNER_LOGIN),
+            Ok(())
+        );
+        assert_eq!(
+            verify_ci_requiring_approval(&eval, &all, &agents),
+            Ok("ferris".to_string())
+        );
+
+        // A superseded approval alone is skipped by the integrity check, and it is not an
+        // approval of the head: `--require-approval` still fails.
+        let stale_only = [round1_approval];
+        assert_eq!(
+            verify_review_integrity(HEAD, &eval, &stale_only, &agents, DEFAULT_OWNER_LOGIN),
+            Ok(())
+        );
+        assert_eq!(
+            verify_ci_requiring_approval(&eval, &stale_only, &agents),
+            Err(missing())
+        );
+
+        // Another reviewer's approval of the head does not rescue a stale approval's author:
+        // it is the head approval that counts.
+        let stale_plus_other = [
+            stale_only[0].clone(),
+            marked_review(
+                4,
+                jarvis,
+                "APPROVED",
+                ReviewVerdict::Approved,
+                HEAD,
+                Some(HEAD),
+            ),
+        ];
+        assert_eq!(
+            verify_ci_requiring_approval(&eval, &stale_plus_other, &agents),
+            Ok("jarvis".to_string())
+        );
+    }
+
+    #[test]
+    fn integrity_still_fails_on_a_changes_requested_review_for_the_head() {
+        let agents = sample_roster();
+        let ferris = &agents[1];
+        let eval = integrity_eval(&agents);
+
+        // A head approval followed by a head-matching CHANGES_REQUESTED blocks the pull
+        // request, with or without a skipped superseded review before them.
+        let old_approval = marked_review(
+            1,
+            ferris,
+            "APPROVED",
+            ReviewVerdict::Approved,
+            OLD,
+            Some(HEAD),
+        );
+        let head_approval = marked_review(
+            2,
+            ferris,
+            "APPROVED",
+            ReviewVerdict::Approved,
+            HEAD,
+            Some(HEAD),
+        );
+        let head_changes = marked_review(
+            3,
+            ferris,
+            "CHANGES_REQUESTED",
+            ReviewVerdict::ChangesRequested,
+            HEAD,
+            Some(HEAD),
+        );
+        assert_eq!(
+            verify_ci_requiring_approval(
+                &eval,
+                &[old_approval, head_approval.clone(), head_changes],
+                &agents
+            ),
+            Err(missing())
+        );
+
+        // GitHub's `APPROVED` with a marker for the head that says `changes_requested` is a
+        // contradiction, and is refused by the integrity check itself.
+        let contradictory = marked_review(
+            4,
+            ferris,
+            "APPROVED",
+            ReviewVerdict::ChangesRequested,
+            HEAD,
+            Some(HEAD),
+        );
+        assert_eq!(
+            verify_review_integrity(HEAD, &eval, &[contradictory], &agents, DEFAULT_OWNER_LOGIN),
+            Err(missing())
+        );
+    }
+
+    #[test]
+    fn integrity_handles_missing_forged_and_unauthorized_markers_as_before() {
+        let agents = sample_roster();
+        let (jarvis, ferris, felicia) = (&agents[0], &agents[1], &agents[2]);
+        let eval = integrity_eval(&agents);
+        let check = |reviews: &[PrReviewSummary]| {
+            verify_review_integrity(HEAD, &eval, reviews, &agents, DEFAULT_OWNER_LOGIN)
+        };
+        let approval = |body: &str, author: &str, commit_id: Option<&str>| PrReviewSummary {
+            id: 9,
+            author_login: author.into(),
+            state: "APPROVED".into(),
+            body: body.into(),
+            commit_id: commit_id.map(str::to_string),
+        };
+
+        // No marker, and a marker that does not parse: refused, including after a skipped one.
+        let skipped = marked_review(
+            1,
+            ferris,
+            "APPROVED",
+            ReviewVerdict::Approved,
+            OLD,
+            Some(HEAD),
+        );
+        for body in [
+            "approved, trust me",
+            "<!-- fl-review: {not json} -->",
+            "<!-- fl-review: -->",
+        ] {
+            let forged = approval(body, "someone", Some(HEAD));
+            assert_eq!(
+                check(std::slice::from_ref(&forged)),
+                Err(missing()),
+                "{body}"
+            );
+            assert_eq!(check(&[skipped.clone(), forged]), Err(missing()), "{body}");
+        }
+        // A forged approval with no commit id is on the head too.
+        assert_eq!(
+            check(&[approval("no marker", "someone", None)]),
+            Err(missing())
+        );
+
+        // A marker for the head from an agent that is not on the roster, or has the wrong role.
+        let mut ghost = marked_review(
+            2,
+            ferris,
+            "APPROVED",
+            ReviewVerdict::Approved,
+            HEAD,
+            Some(HEAD),
+        );
+        ghost.body = ghost.body.replace("\"ferris\"", "\"ghost\"");
+        assert_eq!(
+            check(&[ghost]),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ghost".into()
+            })
+        );
+        let mut wrong_role = marked_review(
+            3,
+            ferris,
+            "APPROVED",
+            ReviewVerdict::Approved,
+            HEAD,
+            Some(HEAD),
+        );
+        wrong_role.body = wrong_role.body.replace("\"lead\"", "\"lab_manager\"");
+        assert_eq!(
+            check(&[wrong_role]),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ferris".into()
+            })
+        );
+
+        // A co-author approving the pull request, and an assistant below the required tier.
+        assert_eq!(
+            check(&[marked_review(
+                4,
+                felicia,
+                "APPROVED",
+                ReviewVerdict::Approved,
+                HEAD,
+                Some(HEAD)
+            )]),
+            Err(PolicyRefusal::SelfReviewForbidden {
+                agent: "felicia".into()
+            })
+        );
+
+        // The owner's own approval is not checked, a review on another commit is not on the
+        // head, and a valid approval passes.
+        assert_eq!(
+            check(&[approval("no marker", DEFAULT_OWNER_LOGIN, Some(HEAD))]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&[approval("no marker", "someone", Some("other-sha"))]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&[marked_review(
+                5,
+                jarvis,
+                "APPROVED",
+                ReviewVerdict::Approved,
+                HEAD,
+                Some(HEAD)
+            )]),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn integrity_refuses_a_superseded_marker_that_fails_any_other_check() {
+        let mut agents = sample_roster();
+        let (ferris, felicia, kacey) = (agents[1].clone(), agents[2].clone(), agents[3].clone());
+        let eval = integrity_eval(&agents);
+        // A marker naming the old head, which GitHub reports on the new one.
+        let stale = |reviewer: &AgentRecord, verdict: ReviewVerdict| {
+            let state = if verdict == ReviewVerdict::Approved {
+                "APPROVED"
+            } else {
+                "CHANGES_REQUESTED"
+            };
+            marked_review(1, reviewer, state, verdict, OLD, Some(HEAD))
+        };
+        let check = |reviews: &[PrReviewSummary], agents: &[AgentRecord]| {
+            verify_review_integrity(HEAD, &eval, reviews, agents, DEFAULT_OWNER_LOGIN)
+        };
+
+        // An agent that is not on the roster.
+        let mut ghost = stale(&ferris, ReviewVerdict::Approved);
+        ghost.body = ghost.body.replace("\"ferris\"", "\"ghost\"");
+        assert_eq!(
+            check(&[ghost], &agents),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ghost".into()
+            })
+        );
+
+        // The wrong role for the named agent.
+        let mut wrong_role = stale(&ferris, ReviewVerdict::Approved);
+        wrong_role.body = wrong_role.body.replace("\"lead\"", "\"lab_manager\"");
+        assert_eq!(
+            check(&[wrong_role], &agents),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ferris".into()
+            })
+        );
+
+        // A co-author reviewing their own pull request.
+        assert_eq!(
+            check(&[stale(&felicia, ReviewVerdict::Approved)], &agents),
+            Err(PolicyRefusal::SelfReviewForbidden {
+                agent: "felicia".into()
+            })
+        );
+
+        // An agent below the required tier.
+        assert!(
+            matches!(
+                check(&[stale(&kacey, ReviewVerdict::Approved)], &agents),
+                Err(PolicyRefusal::InsufficientRole { .. })
+            ),
+            "{:?}",
+            check(&[stale(&kacey, ReviewVerdict::Approved)], &agents)
+        );
+
+        // A non-approving verdict, even though GitHub reports `APPROVED`.
+        let contradictory = marked_review(
+            1,
+            &ferris,
+            "APPROVED",
+            ReviewVerdict::ChangesRequested,
+            OLD,
+            Some(HEAD),
+        );
+        assert_eq!(check(&[contradictory], &agents), Err(missing()));
+
+        // A deactivated agent.
+        agents[1].status = AgentStatus::Retired;
+        assert_eq!(
+            check(&[stale(&ferris, ReviewVerdict::Approved)], &agents),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ferris".into()
             })
         );
     }
