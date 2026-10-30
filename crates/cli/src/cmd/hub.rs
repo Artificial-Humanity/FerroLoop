@@ -1,5 +1,6 @@
-//! `fl hub` CLI subcommands (`serve`, `pair`, `token`, `status`) for running and
-//! managing the FerroLoop Hub daemon and `FerroDeck` web command center (spec §4.3).
+//! `fl hub` CLI subcommands (`serve`, `pair`, `token`, `status`, `init`,
+//! `enroll-token`, `join`, `nodes`) for running and managing the FerroLoop Hub
+//! daemon and `FerroDeck` web command center (spec §4.3).
 
 use std::fs;
 use std::io::Write;
@@ -9,9 +10,10 @@ use std::time::Duration;
 use clap::Subcommand;
 use fl_core::pr_policy::DEFAULT_OWNER_LOGIN;
 use fl_hub::{
-    DEFAULT_HUB_LISTEN, DEFAULT_PAIRING_TTL_SECS, DEFAULT_SESSION_TTL_SECS, HubServer,
-    HubServerConfig, generate_hex_token, mint_pairing_code_in_store, resolve_owner_token,
-    resolve_peer_token,
+    DEFAULT_HUB_LISTEN, DEFAULT_PAIRING_TTL_SECS, DEFAULT_SESSION_TTL_SECS, EnsureHubArgs,
+    HubServer, HubServerConfig, NodeView, detect_capabilities, ensure_hub_node, find_hub_node,
+    generate_hex_token, list_visible_nodes, local_hostname, mint_enroll_token,
+    mint_pairing_code_in_store, resolve_owner_token, resolve_peer_token,
 };
 use fl_store::RedbStore;
 use serde_json::{Value, json};
@@ -72,6 +74,62 @@ pub enum HubCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Write hub config, tokens, and the primary hub node.
+    Init {
+        /// TCP listen address (defaults to the configured address or `127.0.0.1:8420`).
+        #[arg(long)]
+        listen: Option<String>,
+        /// Hub node id (defaults to the existing hub node or the local hostname).
+        #[arg(long)]
+        name: Option<String>,
+        /// Write a user service unit for `fl hub serve` without starting it.
+        #[arg(long)]
+        service: bool,
+        /// Format output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Mint a one-time worker enrollment code in the workspace store.
+    EnrollToken {
+        /// Label included in the printed join command.
+        #[arg(long)]
+        label: Option<String>,
+        /// Base URL of the Hub server (defaults to `http://<listen>`).
+        #[arg(long)]
+        url: Option<String>,
+        /// Enrollment code time-to-live in seconds (defaults to 600).
+        #[arg(long, default_value_t = 600)]
+        ttl_secs: u64,
+        /// Format output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enroll this machine with a hub using a one-time code.
+    Join {
+        /// Base URL of the hub to join.
+        hub_url: String,
+        /// One-time enrollment code.
+        #[arg(long)]
+        token: String,
+        /// Node id (defaults to the local hostname).
+        #[arg(long)]
+        name: Option<String>,
+        /// Label stored on the enrolled node. Repeat to set more than one.
+        #[arg(long)]
+        label: Vec<String>,
+        /// Format output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// List hub and worker nodes from the store or a running hub.
+    Nodes {
+        /// Base URL of a running hub. Omit to read the local store.
+        #[arg(long)]
+        url: Option<String>,
+        /// Format output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub fn run(env: &StateEnv<'_>, cmd: HubCmd) -> Result<i32, (i32, String)> {
@@ -101,6 +159,26 @@ pub fn run(env: &StateEnv<'_>, cmd: HubCmd) -> Result<i32, (i32, String)> {
             json,
         } => cmd_token(env, generate, output.as_deref(), json),
         HubCmd::Status { url, json } => cmd_status(env, url, json),
+        HubCmd::Init {
+            listen,
+            name,
+            service,
+            json,
+        } => cmd_init(env, listen, name, service, json),
+        HubCmd::EnrollToken {
+            label,
+            url,
+            ttl_secs,
+            json,
+        } => cmd_enroll_token(env, label, url, ttl_secs, json),
+        HubCmd::Join {
+            hub_url,
+            token,
+            name,
+            label,
+            json,
+        } => cmd_join(hub_url, token, name, label, json),
+        HubCmd::Nodes { url, json } => cmd_nodes(env, url, json),
     }
 }
 
@@ -431,4 +509,622 @@ fn cmd_status(
         }
     }
     Ok(0)
+}
+
+fn now_ms() -> u64 {
+    fl_exec::stamp::now().unix_millis()
+}
+
+fn path_env() -> String {
+    std::env::var("PATH").unwrap_or_default()
+}
+
+fn absolute_path(cwd: &Path, path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn config_file_path() -> Result<PathBuf, (i32, String)> {
+    crate::config::path().ok_or_else(|| {
+        (
+            2,
+            "neither an absolute XDG_CONFIG_HOME nor HOME is set, so there is nowhere to write the hub config".to_string(),
+        )
+    })
+}
+
+fn http_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
+
+fn print_json(value: &Value) -> Result<(), (i32, String)> {
+    let text = serde_json::to_string_pretty(value)
+        .map_err(|e| (2, format!("failed to serialize JSON: {e}")))?;
+    println!("{text}");
+    Ok(())
+}
+
+fn configured_bearer(env: &StateEnv<'_>) -> Option<String> {
+    let owner_token_file = env
+        .cfg
+        .hub
+        .as_ref()
+        .and_then(|h| h.owner_token_file.as_deref());
+    let wire_token_file = env.cfg.wire.as_ref().and_then(|w| w.token_file.as_deref());
+    resolve_owner_token(owner_token_file).or_else(|| resolve_peer_token(wire_token_file))
+}
+
+fn ensure_table<'a>(
+    doc: &'a mut toml::Value,
+    key: &str,
+) -> Result<&'a mut toml::Table, (i32, String)> {
+    let root = doc
+        .as_table_mut()
+        .ok_or_else(|| (2, "fl config root is not a table".to_string()))?;
+    match root.get(key) {
+        Some(toml::Value::Table(_)) => {}
+        Some(_) => {
+            return Err((2, format!("`{key}` in the fl config is not a table")));
+        }
+        None => {
+            root.insert(key.to_string(), toml::Value::Table(toml::Table::new()));
+        }
+    }
+    match root.get_mut(key) {
+        Some(toml::Value::Table(table)) => Ok(table),
+        _ => Err((2, format!("`{key}` in the fl config is not a table"))),
+    }
+}
+
+fn put_string(table: &mut toml::Table, key: &str, value: String) {
+    table.insert(key.to_string(), toml::Value::String(value));
+}
+
+fn put_string_if_absent(table: &mut toml::Table, key: &str, value: String) {
+    if !table.contains_key(key) {
+        put_string(table, key, value);
+    }
+}
+
+fn restrict_secret_file(path: &Path) -> Result<(), (i32, String)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| (2, format!("{}: {e}", path.display())))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn ensure_secret_file(path: &Path) -> Result<(), (i32, String)> {
+    let keep = match fs::read_to_string(path) {
+        Ok(text) => !text.trim().is_empty(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err((2, format!("{}: {e}", path.display()))),
+    };
+    if keep {
+        return Ok(());
+    }
+    let token = generate_hex_token(32);
+    write_atomic_non_symlink(path, format!("{token}\n").as_bytes()).map_err(|e| (2, e))?;
+    restrict_secret_file(path)
+}
+
+fn load_config_value(path: &Path) -> Result<toml::Value, (i32, String)> {
+    let raw = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err((2, format!("{}: {e}", path.display()))),
+    };
+    if raw.trim().is_empty() {
+        return Ok(toml::Value::Table(toml::Table::new()));
+    }
+    toml::from_str(&raw).map_err(|e| (2, format!("{} is not valid toml: {e}", path.display())))
+}
+
+fn toml_string(value: &str) -> String {
+    toml::Value::String(value.to_string()).to_string()
+}
+
+fn existing_listen(doc: &toml::Value) -> Option<String> {
+    doc.get("hub")
+        .and_then(|hub| hub.get("listen"))
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|listen| !listen.is_empty())
+        .map(str::to_string)
+}
+
+fn cmd_init(
+    env: &StateEnv<'_>,
+    listen_flag: Option<String>,
+    name: Option<String>,
+    service: bool,
+    json_out: bool,
+) -> Result<i32, (i32, String)> {
+    let cfg_path = config_file_path()?;
+    if let Some(dir) = cfg_path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir).map_err(|e| (2, format!("{}: {e}", dir.display())))?;
+    }
+    let cfg_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+    let owner_token_path = cfg_dir.join("hub-owner.token");
+    let peer_token_path = cfg_dir.join("hub-peer.token");
+    ensure_secret_file(&owner_token_path)?;
+    ensure_secret_file(&peer_token_path)?;
+
+    let mut doc = load_config_value(&cfg_path)?;
+    let listen = listen_flag
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| existing_listen(&doc))
+        .unwrap_or_else(|| DEFAULT_HUB_LISTEN.to_string());
+    let store_path = absolute_path(env.cwd, resolve_hub_store_path(env));
+    {
+        let state = ensure_table(&mut doc, "state")?;
+        put_string(state, "store", store_path.display().to_string());
+    }
+    {
+        let hub = ensure_table(&mut doc, "hub")?;
+        put_string(hub, "listen", listen.clone());
+        put_string_if_absent(
+            hub,
+            "owner_token_file",
+            owner_token_path.display().to_string(),
+        );
+    }
+    {
+        let wire = ensure_table(&mut doc, "wire")?;
+        put_string_if_absent(wire, "token_file", peer_token_path.display().to_string());
+    }
+    let rendered = toml::to_string_pretty(&doc)
+        .map_err(|e| (2, format!("could not encode fl config: {e}")))?;
+    write_atomic_non_symlink(&cfg_path, rendered.as_bytes()).map_err(|e| (2, e))?;
+
+    let (node_id, info) = {
+        let store = open_hub_store_with_retry(&store_path)?;
+        let node_id = choose_hub_node_id(&store, name)?;
+        let record = ensure_hub_node(
+            &store,
+            EnsureHubArgs {
+                node_id: node_id.clone(),
+                display_name: node_id.clone(),
+                hostname: local_hostname(),
+                os: std::env::consts::OS.to_string(),
+                arch: std::env::consts::ARCH.to_string(),
+                listen_addr: Some(listen.clone()),
+                capabilities: detect_capabilities(&path_env()),
+                now_ms: now_ms(),
+            },
+        )
+        .map_err(|e| (2, e))?;
+        let info = mint_pairing_code_in_store(
+            &store,
+            &format!("http://{listen}"),
+            DEFAULT_PAIRING_TTL_SECS,
+        )
+        .map_err(|e| (2, e))?;
+        (record.node_id, info)
+    };
+    let service_file = if service {
+        Some(install_user_service(env.cwd)?)
+    } else {
+        None
+    };
+
+    if json_out {
+        print_json(&json!({
+            "node_id": node_id,
+            "listen": listen,
+            "store": store_path.display().to_string(),
+            "owner_token_file": owner_token_path.display().to_string(),
+            "peer_token_file": peer_token_path.display().to_string(),
+            "code": info.code,
+            "expires_at_ms": info.expires_at_ms,
+            "ttl_secs": info.ttl_secs,
+            "pair_url": info.pair_url,
+            "service_file": service_file.as_ref().map(|path| path.display().to_string()),
+        }))?;
+    } else {
+        println!("Node id:      {node_id}");
+        println!("Listen:       {listen}");
+        println!("Pairing code: {}", info.code);
+        println!("Pair URL:     {}", info.pair_url);
+    }
+    Ok(0)
+}
+
+fn choose_hub_node_id(store: &RedbStore, name: Option<String>) -> Result<String, (i32, String)> {
+    let existing = find_hub_node(store).map_err(|e| (2, e))?;
+    if let Some(requested) = name {
+        if let Some(hub) = existing
+            && hub.node_id != requested
+        {
+            return Err((
+                2,
+                format!(
+                    "hub node `{}` already exists and `--name` `{requested}` would create a second hub",
+                    hub.node_id
+                ),
+            ));
+        }
+        return Ok(requested);
+    }
+    if let Some(hub) = existing {
+        return Ok(hub.node_id);
+    }
+    Ok(local_hostname())
+}
+
+fn cmd_enroll_token(
+    env: &StateEnv<'_>,
+    label: Option<String>,
+    url: Option<String>,
+    ttl_secs: u64,
+    json_out: bool,
+) -> Result<i32, (i32, String)> {
+    let base_url = resolve_base_url(env, url);
+    let store_path = resolve_hub_store_path(env);
+    let store = open_hub_store_with_retry(&store_path)?;
+    let info =
+        mint_enroll_token(&store, label, ttl_secs, &base_url, now_ms()).map_err(|e| (2, e))?;
+    if json_out {
+        print_json(&json!({
+            "code": info.code,
+            "expires_at_ms": info.expires_at_ms,
+            "ttl_secs": info.ttl_secs,
+            "join_command": info.join_command,
+        }))?;
+    } else {
+        println!("{}", info.join_command);
+    }
+    Ok(0)
+}
+
+fn cmd_join(
+    hub_url: String,
+    token: String,
+    name: Option<String>,
+    labels: Vec<String>,
+    json_out: bool,
+) -> Result<i32, (i32, String)> {
+    let base_url = normalize_hub_url(&hub_url);
+    let node_id = name.unwrap_or_else(local_hostname);
+    let enroll_url = format!("{base_url}/api/v1/nodes/enroll");
+    let response = http_agent()
+        .post(&enroll_url)
+        .send_json(json!({
+            "code": token,
+            "node_id": node_id,
+            "display_name": node_id,
+            "hostname": local_hostname(),
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "listen_addr": null,
+            "capabilities": detect_capabilities(&path_env()),
+            "labels": labels,
+        }))
+        .map_err(|e| (1, format!("hub enroll request to {enroll_url} failed: {e}")))?;
+    let status = response.status().as_u16();
+    let body = response.into_body().read_to_string().unwrap_or_default();
+    if status != 200 {
+        return Err((1, format!("hub enroll failed (HTTP {status}): {body}")));
+    }
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|e| (1, format!("hub enroll returned invalid JSON: {e}: {body}")))?;
+    let node_token = parsed
+        .get("node_token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| (1, format!("hub enroll response missing node_token: {body}")))?
+        .to_string();
+    let enrolled_id = parsed
+        .get("node_id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(node_id.as_str())
+        .to_string();
+    let recorded_url = parsed
+        .get("hub_url")
+        .and_then(Value::as_str)
+        .filter(|url| !url.is_empty())
+        .unwrap_or(base_url.as_str())
+        .to_string();
+
+    let cfg_path = config_file_path()?;
+    let cfg_dir = cfg_path.parent().unwrap_or_else(|| Path::new("."));
+    if !cfg_dir.as_os_str().is_empty() {
+        fs::create_dir_all(cfg_dir).map_err(|e| (2, format!("{}: {e}", cfg_dir.display())))?;
+    }
+    let token_path = cfg_dir.join("hub-node.token");
+    let node_toml_path = cfg_dir.join("node.toml");
+    write_atomic_non_symlink(&token_path, format!("{node_token}\n").as_bytes())
+        .map_err(|e| (2, e))?;
+    restrict_secret_file(&token_path)?;
+    let node_toml = format!(
+        "hub_url = {}\nnode_id = {}\ntoken_file = {}\n",
+        toml_string(&recorded_url),
+        toml_string(&enrolled_id),
+        toml_string(&token_path.display().to_string()),
+    );
+    write_atomic_non_symlink(&node_toml_path, node_toml.as_bytes()).map_err(|e| (2, e))?;
+
+    if json_out {
+        print_json(&json!({
+            "node_id": enrolled_id,
+            "node_token": node_token,
+            "hub_url": recorded_url,
+            "token_file": token_path.display().to_string(),
+        }))?;
+    } else {
+        println!("Node id:    {enrolled_id}");
+        println!("Token file: {}", token_path.display());
+    }
+    Ok(0)
+}
+
+fn normalize_hub_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    }
+}
+
+fn cmd_nodes(
+    env: &StateEnv<'_>,
+    url: Option<String>,
+    json_out: bool,
+) -> Result<i32, (i32, String)> {
+    let nodes = if let Some(url) = url {
+        nodes_from_hub(env, url)?
+    } else {
+        nodes_from_store(env)?
+    };
+    if json_out {
+        print_json(&json!({ "nodes": nodes }))?;
+    } else {
+        for node in &nodes {
+            let node_id = node.get("node_id").and_then(Value::as_str).unwrap_or("");
+            let role = node.get("role").and_then(Value::as_str).unwrap_or("");
+            let status = node.get("status").and_then(Value::as_str).unwrap_or("");
+            let hostname = node.get("hostname").and_then(Value::as_str).unwrap_or("");
+            println!("{node_id} {role} {status} {hostname}");
+        }
+    }
+    Ok(0)
+}
+
+fn nodes_from_store(env: &StateEnv<'_>) -> Result<Vec<Value>, (i32, String)> {
+    let store_path = resolve_hub_store_path(env);
+    let store = open_hub_store_with_retry(&store_path)?;
+    let views = list_visible_nodes(&store, now_ms()).map_err(|e| (2, e))?;
+    Ok(views.iter().map(node_view_to_json).collect())
+}
+
+fn nodes_from_hub(env: &StateEnv<'_>, url: String) -> Result<Vec<Value>, (i32, String)> {
+    let base_url = resolve_base_url(env, Some(url));
+    let nodes_url = format!("{base_url}/api/v1/nodes");
+    let agent = http_agent();
+    let request = agent.get(&nodes_url);
+    let response = if let Some(token) = configured_bearer(env) {
+        request
+            .header("Authorization", &format!("Bearer {token}"))
+            .call()
+    } else {
+        request.call()
+    }
+    .map_err(|e| (1, format!("hub nodes request to {nodes_url} failed: {e}")))?;
+    let status = response.status().as_u16();
+    let body = response.into_body().read_to_string().unwrap_or_default();
+    if status != 200 {
+        return Err((
+            1,
+            format!("hub nodes request failed (HTTP {status}): {body}"),
+        ));
+    }
+    let parsed: Value = serde_json::from_str(&body)
+        .map_err(|e| (1, format!("hub nodes response was not JSON: {e}: {body}")))?;
+    let Some(list) = parsed.get("nodes").and_then(Value::as_array) else {
+        return Err((1, format!("hub nodes response has no nodes array: {body}")));
+    };
+    Ok(list.iter().map(node_value_to_json).collect())
+}
+
+fn node_view_to_json(view: &NodeView) -> Value {
+    json!({
+        "node_id": view.node_id,
+        "display_name": view.display_name,
+        "role": view.role,
+        "hostname": view.hostname,
+        "os": view.os,
+        "arch": view.arch,
+        "listen_addr": view.listen_addr,
+        "capabilities": view.capabilities,
+        "labels": view.labels,
+        "status": view.status,
+        "enrolled_at_ms": view.enrolled_at_ms,
+        "last_seen_at_ms": view.last_seen_at_ms,
+    })
+}
+
+fn node_field(value: &Value, key: &str) -> Value {
+    value.get(key).cloned().unwrap_or(Value::Null)
+}
+
+fn node_value_to_json(value: &Value) -> Value {
+    json!({
+        "node_id": node_field(value, "node_id"),
+        "display_name": node_field(value, "display_name"),
+        "role": node_field(value, "role"),
+        "hostname": node_field(value, "hostname"),
+        "os": node_field(value, "os"),
+        "arch": node_field(value, "arch"),
+        "listen_addr": node_field(value, "listen_addr"),
+        "capabilities": value.get("capabilities").cloned().unwrap_or_else(|| json!([])),
+        "labels": value.get("labels").cloned().unwrap_or_else(|| json!([])),
+        "status": node_field(value, "status"),
+        "enrolled_at_ms": node_field(value, "enrolled_at_ms"),
+        "last_seen_at_ms": node_field(value, "last_seen_at_ms"),
+    })
+}
+
+fn install_user_service(cwd: &Path) -> Result<PathBuf, (i32, String)> {
+    let path = user_service_path()?;
+    let exe = std::env::current_exe()
+        .map_err(|e| (2, format!("service file needs the current executable: {e}")))?;
+    let body = service_unit_text(&exe, cwd)?;
+    if let Some(dir) = path.parent()
+        && !dir.as_os_str().is_empty()
+    {
+        fs::create_dir_all(dir).map_err(|e| (2, format!("{}: {e}", dir.display())))?;
+    }
+    fs::write(&path, body).map_err(|e| (2, format!("{}: {e}", path.display())))?;
+    Ok(path)
+}
+
+fn user_service_path() -> Result<PathBuf, (i32, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
+        let Some(base) = base else {
+            return Err((
+                2,
+                "service file needs an absolute XDG_CONFIG_HOME or HOME".to_string(),
+            ));
+        };
+        Ok(base.join("systemd/user/ferroloop-hub.service"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return Err((2, "service file needs HOME".to_string()));
+        };
+        Ok(home.join("Library/LaunchAgents/io.artificialhumanity.ferroloop-hub.plist"))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Err((
+            2,
+            "service files are not supported on this operating system".to_string(),
+        ))
+    }
+}
+
+fn service_unit_text(exe: &Path, cwd: &Path) -> Result<String, (i32, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(systemd_unit(exe, cwd))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(launchd_plist(exe, cwd))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (exe, cwd);
+        Err((
+            2,
+            "service files are not supported on this operating system".to_string(),
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit(exe: &Path, cwd: &Path) -> String {
+    let exe = systemd_token(&exe.display().to_string());
+    let cwd = systemd_token(&cwd.display().to_string());
+    format!(
+        "[Unit]\n\
+         Description=FerroLoop Hub\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={exe} hub serve\n\
+         WorkingDirectory={cwd}\n\
+         \n\
+         [Install]\n\
+         WantedBy=default.target\n"
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_token(text: &str) -> String {
+    let needs_quotes = text.is_empty()
+        || text.chars().any(|ch| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    '"' | '\\' | '\'' | '$' | '`' | '#' | ';' | '&' | '|' | '<' | '>'
+                )
+        });
+    if !needs_quotes {
+        return text.to_string();
+    }
+    let mut quoted = String::from("\"");
+    for ch in text.chars() {
+        if matches!(ch, '\\' | '"' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist(exe: &Path, cwd: &Path) -> String {
+    let exe = xml_escape(&exe.display().to_string());
+    let cwd = xml_escape(&cwd.display().to_string());
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>io.artificialhumanity.ferroloop-hub</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{exe}</string>\n\
+         \t\t<string>hub</string>\n\
+         \t\t<string>serve</string>\n\
+         \t</array>\n\
+         \t<key>WorkingDirectory</key>\n\
+         \t<string>{cwd}</string>\n\
+         \t<key>RunAtLoad</key>\n\
+         \t<false/>\n\
+         </dict>\n\
+         </plist>\n"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
