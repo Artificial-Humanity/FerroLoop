@@ -361,6 +361,24 @@ pub fn find_hosted_session<S: StateStore>(
     Ok(exact.or_else(by_persona).cloned())
 }
 
+/// Record `model` on the hosted-session record that `keys` name (same lookup as
+/// [`find_hosted_session`]), so the record and a later restart agree with an operator's model
+/// switch. Returns the updated record, or `None` when no record matches.
+pub fn set_hosted_session_model<S: StateStore>(
+    store: &S,
+    keys: &[&str],
+    model: &str,
+    by: &str,
+) -> Result<Option<HostedSessionRecord>, LifecycleError> {
+    let Some(mut record) = find_hosted_session(store, keys)? else {
+        return Ok(None);
+    };
+    record.model = Some(model.to_string());
+    record.updated_at_ms = now_ms();
+    persist_hosted_session(store, &record, by)?;
+    Ok(Some(record))
+}
+
 fn now_ms() -> u64 {
     stamp::now().unix_millis()
 }
