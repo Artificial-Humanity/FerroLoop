@@ -456,6 +456,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const textareaRef = React.useRef<HTMLTextAreaElement | null>(null);
   const prevTargetRef = React.useRef<string>("");
   const prevWsConnectedRef = React.useRef<boolean>(Boolean(wsConnected));
   const prevTurnCountRef = React.useRef<number>(0);
@@ -646,7 +647,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       e.preventDefault();
       resizeCleanupRef.current?.();
       const startY = e.clientY;
-      const startHeight = composerHeight;
+      const startHeight = textareaRef.current?.offsetHeight || composerHeight;
       const handleMouseMove = (moveEvent: MouseEvent) => {
         const delta = startY - moveEvent.clientY;
         const nextHeight = Math.max(72, Math.min(420, startHeight + delta));
@@ -2208,6 +2209,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           )}
 
           <textarea
+            ref={textareaRef}
             rows={2}
             role="searchbox"
             name="fd-dispatch-command"

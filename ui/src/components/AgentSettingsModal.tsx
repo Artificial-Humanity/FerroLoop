@@ -88,6 +88,11 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
   const targetSessionOrAgent = sessionId || agentName || "";
   const modelOptions = getVendorModelOptions(adapter, selectedModel, availableModels);
   const effectiveThinking = (selectedThinkingLevel || "high").trim().toLowerCase();
+  const thinkingOptions: ReadonlyArray<{ value: string; label: string }> =
+    effectiveThinking &&
+    !THINKING_LEVEL_OPTIONS.some((opt) => opt.value === effectiveThinking)
+      ? [{ value: effectiveThinking, label: effectiveThinking }, ...THINKING_LEVEL_OPTIONS]
+      : THINKING_LEVEL_OPTIONS;
   const showQuota = hasQuotaUsageData(quotaUsage);
   const quotaExhausted = Boolean(
     quotaUsage &&
@@ -272,7 +277,7 @@ export const AgentSettingsModal: React.FC<AgentSettingsModalProps> = ({
               onChange={(e) => onChangeModelAndThinking(selectedModel, e.target.value)}
               style={{ width: "100%" }}
             >
-              {THINKING_LEVEL_OPTIONS.map((opt) => (
+              {thinkingOptions.map((opt) => (
                 <option key={opt.value} value={opt.value}>
                   {opt.label}
                 </option>
