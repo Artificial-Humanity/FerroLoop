@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
-pub use sync::{SyncAdapter, SyncBatch, SyncMode, SyncOp};
+pub use sync::{EnvelopeKind, RecordEnvelope, SyncAdapter, SyncBatch, SyncMode, SyncOp};
 pub use vector::{Fusion, KnowledgeHit, VectorHit, VectorMetric, VectorStorage};
 
 const LOCK_EX: i32 = 2;
@@ -609,6 +609,11 @@ impl FerroStore {
         limit: usize,
         ef: Option<u32>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        if let Some(adapter) = self.attached_adapter()
+            && let Some(hits) = cloud_hits(adapter.search_vectors(collection, values, limit, ef))
+        {
+            return Ok(hits);
+        }
         if let Inner::Remote(remote) = &self.inner {
             let mut params = serde_json::Map::new();
             params.insert("collection".into(), json!(collection));
@@ -639,6 +644,18 @@ impl FerroStore {
         limit: usize,
         fusion: Fusion,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        if let Some(adapter) = self.attached_adapter()
+            && let Some(hits) = cloud_hits(adapter.search_hybrid(
+                doc_collection,
+                vector_collection,
+                query,
+                values,
+                limit,
+                fusion,
+            ))
+        {
+            return Ok(hits);
+        }
         if let Inner::Remote(remote) = &self.inner {
             return vector::parse_hits(&remote.call(
                 "search_hybrid",
@@ -875,6 +892,11 @@ impl FerroStore {
 
     pub fn synced_seq(&self) -> u64 {
         lock_mutex(&self.sync).synced_seq
+    }
+
+    /// The attached adapter, cloned so no lock is held across a call into it.
+    fn attached_adapter(&self) -> Option<Arc<dyn SyncAdapter>> {
+        lock_mutex(&self.sync).adapter.clone()
     }
 
     /// Call `on_commit` for each pending batch, oldest first.
@@ -1584,6 +1606,21 @@ impl FerroStore {
         if senders.is_empty() {
             subs.remove(topic);
         }
+    }
+}
+
+/// Cloud offload decision for a search. `Some` is the answer. `None` means search locally.
+///
+/// `Ok(None)` is the adapter declining. `Err(_)` also falls back to the local
+/// index, so a cloud outage degrades a search and does not fail it. To make a
+/// cloud error fail the search instead, return it from here (change the return
+/// type to `Result<Option<..>, StoreError>` and use `?` at the two call sites).
+fn cloud_hits(
+    result: Result<Option<Vec<vector::VectorHit>>, StoreError>,
+) -> Option<Vec<(String, f64)>> {
+    match result {
+        Ok(Some(hits)) => Some(hits.into_iter().map(|hit| (hit.id, hit.score)).collect()),
+        Ok(None) | Err(_) => None,
     }
 }
 
