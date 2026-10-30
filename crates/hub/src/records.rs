@@ -9,22 +9,25 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
+use fl_core::escalation::Escalations;
 use fl_core::finding::FindingState;
 use fl_core::ids::{Kind, ProjectId, RecordId};
 use fl_core::iri::Iri;
 use fl_core::model::{Record, State};
-use fl_core::routing::area_name;
 use fl_core::store::{Catalog, Handles, Ledger, Roles, StoreError, Tracker};
 use fl_exec::population::ExecError;
 use fl_exec::record::{MoveOutcome, move_record};
+use fl_store::RedbStore;
+use fl_store::manifest::{ImportCheckError, ensure_import_current};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::api::{HttpRequest, HttpResponse, hub_home_dir, percent_decode};
 use crate::auth::HubAuthority;
-use crate::{HubState, HubStoreGuard};
+use crate::{HubState, HubStoreGuard, ProjectOpenError, ProjectStoreGuard};
 
 /// The project a request names when it names none.
 const DEFAULT_PROJECT: &str = "ferroloop";
@@ -91,21 +94,58 @@ fn store_unavailable() -> HttpResponse {
     error_json(503, "project store unavailable")
 }
 
-/// Open the store `slug` names: its own `.redb` when present, else the hub's store. Takes the
-/// same `store_lock` as every other open. Every failure is an answer, never a panic.
+/// The store a request works on: a project's own file, held on that file's lock alone, or the
+/// hub store, held on the hub-wide `store_lock`.
+enum OpenedStore<'a> {
+    Project(ProjectStoreGuard),
+    Hub(HubStoreGuard<'a>),
+}
+
+impl Deref for OpenedStore<'_> {
+    type Target = RedbStore;
+
+    fn deref(&self) -> &RedbStore {
+        match self {
+            OpenedStore::Project(s) => s,
+            OpenedStore::Hub(s) => s,
+        }
+    }
+}
+
+fn project_busy() -> HttpResponse {
+    error_json(503, "project busy")
+}
+
+/// Open the store `slug` names: its own `.redb` when present, else the hub's store. Every
+/// failure is an answer, never a panic.
+///
+/// A project's own file is serialised per path, not under the hub-wide `store_lock`, and the
+/// wait is bounded (about 2 s): a request that cannot get the file in time, because another
+/// request or a CLI process holds it, is a 503 `project busy`. A move runs gate commands (can
+/// take minutes) while it holds its project's file, so it blocks that project only.
+///
+/// The hub-store fallback (`config.store_path`, used when no `<slug>.redb` exists) is the
+/// dev/test case. It keeps the old behaviour: it takes `store_lock`, so a move there holds the
+/// hub-wide lock for the whole gate run.
 fn open_project_store<'a>(
     state: &'a HubState,
     slug: &str,
-) -> Result<HubStoreGuard<'a>, HttpResponse> {
+) -> Result<OpenedStore<'a>, HttpResponse> {
     let own = match hub_home_dir(state) {
         Some(home) => project_redb(&home, slug)?,
         None => None,
     };
-    let opened = match own {
-        Some(path) => state.open_store_at(&path),
-        None => state.open_store(),
-    };
-    opened.map_err(|_| store_unavailable())
+    match own {
+        Some(path) => match state.open_project_store_at(&path) {
+            Ok(store) => Ok(OpenedStore::Project(store)),
+            Err(ProjectOpenError::Busy) => Err(project_busy()),
+            Err(ProjectOpenError::Store(_)) => Err(store_unavailable()),
+        },
+        None => state
+            .open_store()
+            .map(OpenedStore::Hub)
+            .map_err(|_| store_unavailable()),
+    }
 }
 
 /// Every project this hub can show: each `<slug>.redb` beside the hub store (not `fl.redb`, not
@@ -137,6 +177,9 @@ fn store_error_response(err: &StoreError) -> HttpResponse {
         StoreError::NoSuchRecord(_)
         | StoreError::NotOwned { .. }
         | StoreError::WrongKind { .. } => error_json(404, "record not found"),
+        StoreError::Escalating { .. } | StoreError::Escalated { .. } => {
+            error_json(409, &err.to_string())
+        }
         _ => error_json(500, "store operation failed"),
     }
 }
@@ -241,6 +284,8 @@ fn summary_json(states: &[State], open_findings: u64, attempts: u64, cost_micros
     let count = |s: State| states.iter().filter(|&&x| x == s).count();
     let total = states.len();
     let done = count(State::Done);
+    // Review, needs_human and any other state the board has no column for.
+    let other = total - count(State::Todo) - count(State::Doing) - done;
     let pct = if total == 0 {
         0.0
     } else {
@@ -250,6 +295,7 @@ fn summary_json(states: &[State], open_findings: u64, attempts: u64, cost_micros
         "todo_count": count(State::Todo),
         "doing_count": count(State::Doing),
         "done_count": done,
+        "other_count": other,
         "total_count": total,
         "completion_pct": pct,
         "open_findings_count": open_findings,
@@ -339,15 +385,11 @@ pub(crate) fn handle_post_record(
             Err(e) => return bad_request(e),
         },
     };
-    let area = body
-        .area
-        .as_deref()
-        .map(str::trim)
-        .filter(|a| !a.is_empty());
-    if let Some(area) = area
-        && let Err(e) = area_name(area)
-    {
-        return bad_request(&e);
+    // ⚠ A record with an area raises the store's format (a one-way upgrade for every older fl)
+    // and the CLI makes it only after its routing checks (`ensure_routing_current`,
+    // `place_record`). The hub does neither, so it does not make one yet.
+    if body.area.as_deref().is_some_and(|a| !a.trim().is_empty()) {
+        return error_json(422, "area is not supported by the hub yet");
     }
 
     let created = {
@@ -355,7 +397,7 @@ pub(crate) fn handle_post_record(
             Ok(store) => store,
             Err(resp) => return resp,
         };
-        create_record(&*store, &slug, title, area, target)
+        create_record(&*store, &slug, title, target)
     };
     match created {
         Ok(record) => {
@@ -370,14 +412,13 @@ fn create_record<S: Catalog + Tracker + Handles>(
     store: &S,
     slug: &str,
     title: &str,
-    area: Option<&str>,
     target: State,
 ) -> Result<Value, StoreError> {
     let project = match store.list_projects()?.into_iter().next() {
         Some(p) => p.id,
         None => store.add_project(&format!("/workspace/{slug}"))?,
     };
-    let id = store.add_record_with_area(&project, title, area)?;
+    let id = store.add_record(&project, title)?;
     if target != State::Todo {
         store.set_record_state(&id, target)?;
     }
@@ -426,6 +467,10 @@ fn find_record(store: &(impl Tracker + Handles), id: &str) -> Result<Record, Htt
     match store.get_record(&record_id) {
         Ok(Some(record)) => Ok(record),
         Ok(None) => Err(error_json(404, "record not found")),
+        // A tombstoned record reads as `Escalated`: the move is refused, not a fault.
+        Err(e @ (StoreError::Escalating { .. } | StoreError::Escalated { .. })) => {
+            Err(refused(&e.to_string()))
+        }
         Err(e) => Err(store_error_response(&e)),
     }
 }
@@ -434,11 +479,50 @@ fn find_record(store: &(impl Tracker + Handles), id: &str) -> Result<Record, Htt
 fn exec_error_response(err: &ExecError) -> HttpResponse {
     let status = match err {
         ExecError::Unpublished(_) => 503,
-        ExecError::PublishRefused(_) => 409,
+        ExecError::PublishRefused(_) | ExecError::Escalation(_) => 409,
         ExecError::BadSelector(_) => 422,
         _ => 500,
     };
     HttpResponse::json(status, json!({ "ok": false, "error": err.to_string() }))
+}
+
+fn refused(message: &str) -> HttpResponse {
+    HttpResponse::json(409, json!({ "ok": false, "error": message }))
+}
+
+/// The CLI's marked-record guard (routing spec §3.3 step 1; `refuse_marked`): a record marked
+/// escalating, or already escalated, is not moved, and no gate runs for it.
+fn refuse_marked(store: &RedbStore, record: &Record) -> Result<(), HttpResponse> {
+    let iri = record.id.iri();
+    let fault = match (store.mark_of(iri), store.tombstone_of(iri)) {
+        (Err(e), _) | (_, Err(e)) => return Err(store_error_response(&e)),
+        (Ok(Some(_)), _) => {
+            let shown = match store.handle_of(Kind::Record, iri) {
+                Ok(Some(h)) => h.to_string(),
+                _ => iri.as_str().to_string(),
+            };
+            StoreError::Escalating {
+                id: iri.clone(),
+                to_finish: format!("fl record escalate {shown}"),
+            }
+        }
+        (_, Ok(Some(t))) => StoreError::Escalated {
+            from: iri.clone(),
+            to: t.to,
+        },
+        (Ok(None), Ok(None)) => return Ok(()),
+    };
+    Err(refused(&fault.to_string()))
+}
+
+/// The CLI's import check for a gated move (spec §4.5): a store that imported the project's
+/// manifest runs its gates only while the working tree still holds that manifest.
+fn refuse_stale_import(store: &RedbStore, record: &Record) -> Result<(), HttpResponse> {
+    match ensure_import_current(store, &record.project) {
+        Ok(()) => Ok(()),
+        Err(ImportCheckError::Store(e)) => Err(store_error_response(&e)),
+        Err(e) => Err(refused(&e.to_string())),
+    }
 }
 
 /// The record as the store holds it now, with its findings counted.
@@ -457,8 +541,17 @@ fn current_record_json<S: Tracker + Handles>(
 /// `POST /api/v1/records/:id/move` (Owner only): run the transitions that cover the move, then
 /// change the state. `:id` is a handle or an IRI; the project comes from the body or the query.
 ///
+/// The guards of `fl record move` that do not need the CLI's config run first, in its order: a
+/// marked or escalated record is refused before any gate runs, and so is a gated move on a
+/// stale manifest import. A record the project's board does not list is not found.
+///
+/// ⚠ Not done: the CLI's GitHub-ledger pre-flush (`preflight::check`) and its comment after the
+/// move. Whether a project is bound to a GitHub ledger is read from the CLI's config file,
+/// which the hub does not read, so the hub's move writes the local ledger only.
+///
 /// ⚠ A transition's gates run commands: the program each gate declares, with the project root
-/// as working directory, and `git` there. They run while this request holds the store lock.
+/// as working directory, and `git` there. They run while this request holds the project's
+/// store file (see [`open_project_store`]) and, for the hub-store fallback, the hub-wide lock.
 pub(crate) fn handle_post_record_move(
     state: &HubState,
     authority: &HubAuthority,
@@ -498,6 +591,22 @@ pub(crate) fn handle_post_record_move(
             Ok(record) => record,
             Err(resp) => return resp,
         };
+        // The board lists the store's first project; `find_record` finds a record of any.
+        match store.list_projects() {
+            Ok(projects) if projects.first().is_some_and(|p| p.id == record.project) => {}
+            Ok(_) => return error_json(404, "record not found"),
+            Err(e) => return store_error_response(&e),
+        }
+        if let Err(resp) = refuse_marked(&store, &record) {
+            return resp;
+        }
+        let gated = match store.list_transitions(&record.project) {
+            Ok(ts) => ts.iter().any(|t| t.from == record.state && t.to == target),
+            Err(e) => return store_error_response(&e),
+        };
+        if gated && let Err(resp) = refuse_stale_import(&store, &record) {
+            return resp;
+        }
         let outcome = match move_record(Roles::single(&*store), &record, target) {
             Err(e) => return exec_error_response(&e),
             Ok(report) => match report.outcome {
@@ -539,6 +648,7 @@ mod tests {
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Regret, Selector, Transition};
     use fl_store::RedbStore;
     use std::process::Command;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     fn test_state(tmp: &TempDir) -> HubState {
@@ -828,7 +938,8 @@ mod tests {
         assert_eq!(
             body["summary"],
             json!({
-                "todo_count": 0, "doing_count": 0, "done_count": 0, "total_count": 0,
+                "todo_count": 0, "doing_count": 0, "done_count": 0, "other_count": 0,
+                "total_count": 0,
                 "completion_pct": 0.0, "open_findings_count": 0, "attempts_count": 0,
                 "total_cost_usd": 0.0
             })
@@ -917,7 +1028,8 @@ mod tests {
         assert_eq!(
             body["summary"],
             json!({
-                "todo_count": 1, "doing_count": 1, "done_count": 1, "total_count": 3,
+                "todo_count": 1, "doing_count": 1, "done_count": 1, "other_count": 0,
+                "total_count": 3,
                 "completion_pct": 33.3, "open_findings_count": 2, "attempts_count": 2,
                 "total_cost_usd": 1.75
             })
@@ -1025,19 +1137,20 @@ mod tests {
     }
 
     #[test]
-    fn creating_a_record_in_doing_with_an_area_in_a_project_store() {
+    fn creating_a_record_in_doing_in_a_project_store_leaves_the_store_format_alone() {
         let tmp = TempDir::new().unwrap();
         let state = test_state(&tmp);
-        {
-            seed(&fl_dir(&tmp).join("foo.redb"), &[("existing", State::Todo)]);
-        }
-        let req = owner("POST", "/api/v1/records").with_json_body(
-            &json!({ "project": "FOO", "title": "board", "state": "doing", "area": " frontend " }),
-        );
+        let path = fl_dir(&tmp).join("foo.redb");
+        let format_before = {
+            let (store, _, _) = seed(&path, &[("existing", State::Todo)]);
+            store.format_version().unwrap()
+        };
+        let req = owner("POST", "/api/v1/records")
+            .with_json_body(&json!({ "project": "FOO", "title": "board", "state": "doing" }));
         let (status, body) = call(&state, &req);
         assert_eq!(status, 201, "{body}");
         assert_eq!(body["record"]["state"], "doing");
-        assert_eq!(body["record"]["area"], "frontend");
+        assert_eq!(body["record"]["area"], Value::Null);
         assert_eq!(body["record"]["project"], "foo");
         assert_eq!(body["record"]["handle"], 2);
         let (_, listed) = call(&state, &owner("GET", "/api/v1/records?project=foo"));
@@ -1050,6 +1163,50 @@ mod tests {
         let none = owner("POST", "/api/v1/records")
             .with_json_body(&json!({ "project": "foo", "title": "x", "area": "  " }));
         assert_eq!(call(&state, &none).1["record"]["area"], Value::Null);
+        // ⚠ Creating a record is not a format upgrade: an older fl still reads the store.
+        let store = RedbStore::open(&path).unwrap();
+        assert_eq!(store.format_version().unwrap(), format_before);
+    }
+
+    #[test]
+    fn a_create_with_an_area_is_a_422_and_writes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let path = fl_dir(&tmp).join("foo.redb");
+        let format_before = {
+            let (store, _, _) = seed(&path, &[("existing", State::Todo)]);
+            store.format_version().unwrap()
+        };
+        for area in ["frontend", " frontend ", "Bad Area", "a\u{0}b"] {
+            let req = owner("POST", "/api/v1/records").with_json_body(
+                &json!({ "project": "foo", "title": "board", "area": area, "state": "doing" }),
+            );
+            let (status, body) = call(&state, &req);
+            assert_eq!(status, 422, "{area:?}: {body}");
+            assert_eq!(
+                body,
+                json!({ "error": "area is not supported by the hub yet" })
+            );
+        }
+        let (_, listed) = call(&state, &owner("GET", "/api/v1/records?project=foo"));
+        assert_eq!(titles(&listed), vec!["existing"]);
+        let store = RedbStore::open(&path).unwrap();
+        assert_eq!(store.format_version().unwrap(), format_before);
+        assert!(format_before < Some(fl_store::FORMAT_WITH_ROUTING));
+    }
+
+    #[test]
+    fn a_record_stored_with_an_area_still_reads_back_with_it() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        {
+            let (store, project, _) = seed(&fl_dir(&tmp).join("foo.redb"), &[]);
+            store
+                .add_record_with_area(&project, "routed", Some("frontend"))
+                .unwrap();
+        }
+        let (_, listed) = call(&state, &owner("GET", "/api/v1/records?project=foo"));
+        assert_eq!(listed["records"][0]["area"], "frontend");
     }
 
     #[test]
@@ -1066,9 +1223,7 @@ mod tests {
             json!({ "title": "a\nb" }),
             json!({ "title": "t", "state": "review" }),
             json!({ "title": "t", "state": "bogus" }),
-            json!({ "title": "t", "area": "Bad Area" }),
-            json!({ "title": "t", "area": "a".repeat(33) }),
-            json!({ "title": "t", "area": "a\u{0}b" }),
+            json!({ "title": "t", "area": 5 }),
             json!({ "title": "t", "extra": 1 }),
             json!({ "title": 5 }),
             json!({ "title": null }),
@@ -1396,5 +1551,378 @@ mod tests {
         ] {
             assert!(decode_record_id(bad).is_err(), "{bad:?}");
         }
+    }
+    // --- the CLI's guards around a move -----------------------------------------------------
+
+    /// A gate program that leaves a file behind when it runs, and the file's path.
+    fn sentinel_gate(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let sentinel = dir.join("gate-ran");
+        let script = dir.join("gate.sh");
+        fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\nexit 0\n", sentinel.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        (script, sentinel)
+    }
+
+    fn mark(state: &HubState, id: &RecordId) {
+        state
+            .open_store()
+            .unwrap()
+            .mark(
+                id.iri(),
+                &fl_core::escalation::Mark {
+                    by: "tester".into(),
+                    reason: "test".into(),
+                    at_ms: 1,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_marked_record_is_a_409_before_any_gate_runs_and_keeps_its_state() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let repo = git_repo();
+        let scripts = tempfile::tempdir().unwrap();
+        let (script, sentinel) = sentinel_gate(scripts.path());
+        let id = gated_record(&state, repo.path(), &script.display().to_string());
+        mark(&state, &id);
+        let mut rx = state.subscribe();
+
+        let (status, body) = call(
+            &state,
+            &owner("POST", "/api/v1/records/1/move").with_json_body(&json!({ "to": "done" })),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["ok"], false);
+        let error = body["error"].as_str().unwrap();
+        assert!(error.contains("marked escalating"), "{error}");
+        assert!(error.contains("fl record escalate 1"), "{error}");
+        assert!(!sentinel.exists(), "a gate ran for a marked record");
+        assert_eq!(state_of(&state, &id), State::Todo);
+        assert!(
+            drain(&mut rx).is_empty(),
+            "a refused move broadcasts nothing"
+        );
+        {
+            let store = state.open_store().unwrap();
+            let project = store.list_projects().unwrap().remove(0).id;
+            assert!(
+                store.attempts(&project).unwrap().is_empty(),
+                "no evidence was written"
+            );
+        }
+
+        // Unmarked, the same move runs its gate and lands.
+        state.open_store().unwrap().unmark(id.iri()).unwrap();
+        let (status, body) = call(
+            &state,
+            &owner("POST", "/api/v1/records/1/move").with_json_body(&json!({ "to": "done" })),
+        );
+        assert_eq!(status, 200, "{body}");
+        assert!(sentinel.exists());
+    }
+
+    #[test]
+    fn an_escalated_record_is_a_409_before_any_gate_runs() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let repo = git_repo();
+        let scripts = tempfile::tempdir().unwrap();
+        let (script, sentinel) = sentinel_gate(scripts.path());
+        let id = gated_record(&state, repo.path(), &script.display().to_string());
+        mark(&state, &id);
+        {
+            let store = state.open_store().unwrap();
+            let to = Iri::parse("urn:uuid:00000000-0000-7000-8000-0000000000aa").unwrap();
+            store.tombstone(id.iri(), &to).unwrap();
+        }
+        let (status, body) = call(
+            &state,
+            &owner(
+                "POST",
+                &format!("/api/v1/records/{}/move", id.as_str().replace(':', "%3A")),
+            )
+            .with_json_body(&json!({ "to": "done" })),
+        );
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["error"].as_str().unwrap().contains("was escalated"),
+            "{body}"
+        );
+        assert!(!sentinel.exists(), "a gate ran for an escalated record");
+    }
+
+    #[test]
+    fn a_store_that_refuses_the_state_change_as_escalating_is_a_409_not_a_500() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let ids = seed_hub(&state, &[("one", State::Todo)]);
+        mark(&state, &ids[0]);
+        let store = state.open_store().unwrap();
+        let record = store.get_record(&ids[0]).unwrap().unwrap();
+        // The race the early guard cannot see: the mark lands after it, before the write.
+        let err = match move_record(Roles::single(&*store), &record, State::Done) {
+            Err(e) => e,
+            Ok(_) => panic!("a marked record moved"),
+        };
+        assert!(matches!(err, ExecError::Escalation(_)), "{err:?}");
+        let resp = exec_error_response(&err);
+        assert_eq!(resp.status, 409);
+        let body = resp.json_value().unwrap();
+        assert_eq!(body["ok"], false);
+        assert!(body["error"].as_str().unwrap().contains("escalating"));
+    }
+
+    /// A project whose manifest this store imported, with one passing gate on `todo` to `done`:
+    /// the path of the working tree, the project store, and the record's handle.
+    fn imported_project(tmp: &TempDir) -> (TempDir, PathBuf, fl_store::manifest::Manifest) {
+        let repo = git_repo();
+        let root = repo.path().display().to_string();
+        let head = fl_exec::git::Git::head(repo.path()).unwrap();
+        let author = RedbStore::open(&tmp.path().join("author.redb")).unwrap();
+        let project = author.add_project(&root).unwrap();
+        let gate = author
+            .add_gate(
+                &project,
+                "check",
+                GateKind::Command(CommandSpec {
+                    program: "true".into(),
+                    args: vec![],
+                    delivery: PopulationDelivery::Args,
+                    timeout_secs: 10,
+                    pass_codes: vec![0],
+                }),
+                Selector::Glob {
+                    pattern: "*.rs".into(),
+                },
+                1,
+                &head,
+                "tester",
+            )
+            .unwrap();
+        author
+            .add_transition(Transition {
+                project: project.clone(),
+                name: "launch".into(),
+                from: State::Todo,
+                to: State::Done,
+                regret: Regret::Low,
+                gates: vec![gate],
+            })
+            .unwrap();
+        let manifest = author.export_manifest(&project, "c1", 1, None).unwrap();
+        fs::create_dir_all(repo.path().join(".fl")).unwrap();
+        fs::write(
+            repo.path().join(fl_store::manifest::MANIFEST_PATH),
+            manifest.to_json(),
+        )
+        .unwrap();
+        let path = fl_dir(tmp).join("foo.redb");
+        let store = RedbStore::open(&path).unwrap();
+        store.import_manifest(&manifest, &root).unwrap();
+        store.add_record(&project, "imported").unwrap();
+        let newer = author.export_manifest(&project, "c2", 2, None).unwrap();
+        (repo, path, newer)
+    }
+
+    #[test]
+    fn a_gated_move_on_a_stale_manifest_import_is_a_409_and_runs_no_gate() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let (repo, path, newer) = imported_project(&tmp);
+        let mv = || {
+            call(
+                &state,
+                &owner("POST", "/api/v1/records/1/move?project=foo")
+                    .with_json_body(&json!({ "to": "done" })),
+            )
+        };
+        // The working tree's manifest is the imported one: the move runs.
+        let (status, body) = mv();
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["outcome"], "moved");
+
+        // Put the record back, then change the manifest under the store.
+        {
+            let store = RedbStore::open(&path).unwrap();
+            let record = store
+                .list_records(&store.list_projects().unwrap()[0].id)
+                .unwrap();
+            store.set_record_state(&record[0].id, State::Todo).unwrap();
+        }
+        fs::write(
+            repo.path().join(fl_store::manifest::MANIFEST_PATH),
+            newer.to_json(),
+        )
+        .unwrap();
+        let (status, body) = mv();
+        assert_eq!(status, 409, "{body}");
+        assert_eq!(body["ok"], false);
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("changed since this store imported it"),
+            "{body}"
+        );
+        {
+            let store = RedbStore::open(&path).unwrap();
+            let project = store.list_projects().unwrap().remove(0).id;
+            assert_eq!(store.list_records(&project).unwrap()[0].state, State::Todo);
+        }
+
+        // An ungated move on the same stale import is not held up by it.
+        let ungated = call(
+            &state,
+            &owner("POST", "/api/v1/records/1/move?project=foo")
+                .with_json_body(&json!({ "to": "doing" })),
+        );
+        assert_eq!(ungated.0, 200, "{}", ungated.1);
+    }
+
+    #[test]
+    fn a_record_of_another_project_in_the_store_is_not_found_to_move() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let ids = seed_hub(&state, &[("listed", State::Todo)]);
+        let other = {
+            let store = state.open_store().unwrap();
+            let other = store.add_project("/workspace/other").unwrap();
+            store.add_record(&other, "unlisted").unwrap()
+        };
+        let (_, listed) = call(&state, &owner("GET", "/api/v1/records"));
+        assert_eq!(titles(&listed), vec!["listed"]);
+
+        let target = format!(
+            "/api/v1/records/{}/move",
+            other.as_str().replace(':', "%3A")
+        );
+        let (status, body) = call(
+            &state,
+            &owner("POST", &target).with_json_body(&json!({ "to": "done" })),
+        );
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(state_of(&state, &other), State::Todo);
+        let (status, _) = call(
+            &state,
+            &owner("POST", "/api/v1/records/1/move").with_json_body(&json!({ "to": "done" })),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(state_of(&state, &ids[0]), State::Done);
+    }
+
+    #[test]
+    fn the_summary_counts_states_without_a_column_as_other() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        seed_hub(
+            &state,
+            &[
+                ("a", State::Todo),
+                ("b", State::Doing),
+                ("c", State::Done),
+                ("d", State::Review),
+                ("e", State::NeedsHuman),
+            ],
+        );
+        let (_, body) = call(&state, &owner("GET", "/api/v1/records"));
+        let s = &body["summary"];
+        assert_eq!(s["other_count"], 2);
+        assert_eq!(s["total_count"], 5);
+        let sum: u64 = ["todo_count", "doing_count", "done_count", "other_count"]
+            .iter()
+            .map(|k| s[k].as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, 5);
+    }
+
+    // --- bounded waits and per-project locks ------------------------------------------------
+
+    /// Generous: the budget is about 2 s, and the old behaviour was minutes.
+    const BOUND: Duration = Duration::from_secs(6);
+
+    #[test]
+    fn a_project_held_by_another_process_is_a_503_busy_within_a_bounded_time() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let path = fl_dir(&tmp).join("foo.redb");
+        let (_holder, _, _) = seed(&path, &[("x", State::Todo)]);
+        // `_holder` is open on the file, as a CLI process would be.
+        let started = Instant::now();
+        let (status, body) = call(&state, &peer("GET", "/api/v1/records?project=foo"));
+        assert!(started.elapsed() < BOUND, "took {:?}", started.elapsed());
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body, json!({ "error": "project busy" }));
+        let mv = owner("POST", "/api/v1/records/1/move?project=foo")
+            .with_json_body(&json!({ "to": "doing" }));
+        let started = Instant::now();
+        assert_eq!(call(&state, &mv).0, 503);
+        assert!(started.elapsed() < BOUND, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_project_whose_lock_is_held_is_a_503_busy_within_a_bounded_time() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let path = fl_dir(&tmp).join("foo.redb");
+        {
+            seed(&path, &[("x", State::Todo)]);
+        }
+        let held = state.open_project_store_at(&path).unwrap();
+        let started = Instant::now();
+        let (status, body) = call(&state, &owner("GET", "/api/v1/records?project=foo"));
+        assert!(started.elapsed() < BOUND, "took {:?}", started.elapsed());
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body, json!({ "error": "project busy" }));
+        drop(held);
+        assert_eq!(
+            call(&state, &owner("GET", "/api/v1/records?project=foo")).0,
+            200
+        );
+    }
+
+    #[test]
+    fn a_busy_project_does_not_block_another_project_or_the_hub_store() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let foo = fl_dir(&tmp).join("foo.redb");
+        {
+            seed(&foo, &[("foo-record", State::Todo)]);
+            seed(
+                &fl_dir(&tmp).join("bar.redb"),
+                &[("bar-record", State::Todo)],
+            );
+        }
+        seed_hub(&state, &[("hub-record", State::Todo)]);
+        // `foo` is held, as a long move on it would hold it.
+        let held = state.open_project_store_at(&foo).unwrap();
+        std::thread::scope(|scope| {
+            for (query, want) in [
+                ("/api/v1/records?project=bar", "bar-record"),
+                ("/api/v1/records", "hub-record"),
+            ] {
+                let state = &state;
+                let worker = scope.spawn(move || {
+                    let started = Instant::now();
+                    let (status, body) = call(state, &owner("GET", query));
+                    (started.elapsed(), status, titles(&body), want)
+                });
+                let (took, status, got, want) = worker.join().unwrap();
+                assert_eq!(status, 200, "{query}");
+                assert_eq!(got, vec![want], "{query}");
+                assert!(
+                    took < Duration::from_secs(1),
+                    "{query} waited {took:?} behind a held project"
+                );
+            }
+        });
+        drop(held);
     }
 }

@@ -471,13 +471,20 @@ fn routed_store_is_taken() -> StoreError {
 
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_retries(path, 200)
+    }
+
+    /// [`RedbStore::open`] with a bound on how long it waits for another holder of the file:
+    /// it retries an "already open" file `retries` times, 15 ms apart, then fails. `open` is
+    /// this with 200 retries (about 3 s).
+    pub fn open_with_retries(path: &Path, retries: u32) -> Result<Self, StoreError> {
         let label = path.display().to_string();
         let mut attempts = 0u32;
         let db = loop {
             match Database::create(path) {
                 Ok(db) => break db,
                 Err(e)
-                    if attempts < 200
+                    if attempts < retries
                         && (matches!(e, redb::DatabaseError::DatabaseAlreadyOpen)
                             || e.to_string().contains("Database already open")
                             || e.to_string().contains("Cannot acquire lock")) =>
@@ -915,6 +922,18 @@ impl RedbStore {
             ledger_root,
             self.routes(project)?,
         )
+    }
+
+    /// The format version the store file records, `None` for a file with no version key.
+    pub fn format_version(&self) -> Result<Option<u64>, StoreError> {
+        let tx = self.db.begin_read().map_err(backend)?;
+        let meta = match tx.open_table(META) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+            Err(e) => return Err(backend(e)),
+        };
+        let version = meta.get(FORMAT_KEY).map_err(backend)?.map(|v| v.value());
+        Ok(version)
     }
 
     /// Whether this store records any ledger root. An export that cannot
