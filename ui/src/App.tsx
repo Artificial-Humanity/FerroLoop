@@ -1375,6 +1375,13 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           onlineNodesCount={onlineNodesCount}
           onOpenNodesModal={() => setNodesModalOpen(true)}
           onOpenSettingsModal={() => setSettingsModalOpen(true)}
+          onOpenAgentSettings={() => {
+            if (!splitView && activeTab !== "chat") {
+              setActiveTab("chat");
+            }
+            setAgentSettingsOpen(true);
+          }}
+          onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
           onOpenMobileRoster={() => setMobileRosterOpen((prev) => !prev)}
