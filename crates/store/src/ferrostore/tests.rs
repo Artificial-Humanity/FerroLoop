@@ -3271,6 +3271,14 @@ fn exercise_vector_rpc(client: &FerroStore, file: &Path) {
             .unwrap()
             .is_empty()
     );
+    let missing = client
+        .search_vectors("missing", &[1.0, 0.0], 0, None)
+        .unwrap_err();
+    assert!(matches!(missing, StoreError::Backend(_)), "{missing}");
+    let missing_ef = client
+        .search_vectors("missing", &[1.0, 0.0], 3, Some(0))
+        .unwrap_err();
+    assert!(matches!(missing_ef, StoreError::Backend(_)), "{missing_ef}");
     let hybrid = client
         .search_hybrid(
             "notes",
@@ -4042,4 +4050,111 @@ fn zero_vector_cosine_is_zero_and_empty_limits_do_not_error() {
         .search_vectors("missing", &[0.0, 0.0], 1, None)
         .unwrap_err();
     assert!(err.to_string().contains("no vector collection"), "{err}");
+    let err = store
+        .search_vectors("missing", &[0.0, 0.0], 0, None)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("no vector collection"), "{err}");
+    let err = store
+        .search_vectors("missing", &[1.0, 0.0], 5, Some(0))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("no vector collection"), "{err}");
+}
+
+fn hnsw_record(id: &str, m: u32, values: &[f32], layer0: &[&str]) -> super::vector::VectorRecord {
+    let level = super::vector::vector_level(id, m);
+    let mut neighbors = vec![
+        layer0
+            .iter()
+            .map(|nid| (*nid).to_string())
+            .collect::<Vec<_>>(),
+    ];
+    neighbors.resize(usize::from(level) + 1, Vec::new());
+    super::vector::VectorRecord {
+        bytes: super::vector::quantize(VectorStorage::F32, values).unwrap(),
+        metadata: None,
+        level,
+        neighbors,
+    }
+}
+
+fn canonical_id(vectors: &BTreeMap<String, super::vector::VectorRecord>) -> String {
+    vectors
+        .iter()
+        .max_by(|(id_a, rec_a), (id_b, rec_b)| {
+            rec_a.level.cmp(&rec_b.level).then_with(|| id_b.cmp(id_a))
+        })
+        .map(|(id, _)| id.clone())
+        .unwrap()
+}
+
+#[test]
+fn validate_graph_rejects_a_live_entry_that_is_not_canonical() {
+    let m = 4;
+    let mut vectors = BTreeMap::new();
+    for (id, values) in [("a", [0.0_f32, 0.0]), ("b", [1.0, 0.0])] {
+        vectors.insert(id.to_string(), hnsw_record(id, m, &values, &[]));
+    }
+    let canonical = canonical_id(&vectors);
+    let other = vectors.keys().find(|id| *id != &canonical).unwrap().clone();
+    let mut col = super::vector::VectorCollection {
+        dim: 2,
+        storage: VectorStorage::F32,
+        metric: VectorMetric::L2,
+        m,
+        ef_construction: 8,
+        ef_search: 8,
+        entry: Some(other),
+        vectors,
+    };
+    let err = super::vector::validate_graph("emb", &col).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("corrupt"), "{err}");
+    col.entry = Some(canonical);
+    super::vector::validate_graph("emb", &col).unwrap();
+}
+
+fn l2_graph(order: &[&str]) -> super::vector::VectorCollection {
+    let m = 4;
+    // `b` and `m` are equally far from `o`; `a` is farther. Distance order is
+    // `b`, `m`, `a` (equal distance breaks ties by id).
+    let points = BTreeMap::from([
+        ("o", [0.0_f32, 0.0]),
+        ("a", [5.0, 0.0]),
+        ("b", [0.0, 1.0]),
+        ("m", [1.0, 0.0]),
+    ]);
+    let links: BTreeMap<&str, &[&str]> = BTreeMap::from([
+        ("o", order),
+        ("a", &["o"][..]),
+        ("b", &["o"][..]),
+        ("m", &["o"][..]),
+    ]);
+    let mut vectors = BTreeMap::new();
+    for id in ["o", "a", "b", "m"] {
+        vectors.insert(id.to_string(), hnsw_record(id, m, &points[id], links[id]));
+    }
+    let entry = Some(canonical_id(&vectors));
+    super::vector::VectorCollection {
+        dim: 2,
+        storage: VectorStorage::F32,
+        metric: VectorMetric::L2,
+        m,
+        ef_construction: 8,
+        ef_search: 8,
+        entry,
+        vectors,
+    }
+}
+
+#[test]
+fn validate_graph_rejects_neighbors_that_are_not_distance_then_id_ordered() {
+    let err = super::vector::validate_graph("emb", &l2_graph(&["m", "b", "a"])).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("corrupt"), "{err}");
+    let err = super::vector::validate_graph("emb", &l2_graph(&["a", "b", "m"])).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("corrupt"), "{err}");
+    super::vector::validate_graph("emb", &l2_graph(&["b", "m", "a"])).unwrap();
 }

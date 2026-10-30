@@ -609,9 +609,6 @@ impl FerroStore {
         ef: Option<u32>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
         if let Inner::Remote(remote) = &self.inner {
-            if limit == 0 || ef == Some(0) {
-                return Ok(Vec::new());
-            }
             let mut params = serde_json::Map::new();
             params.insert("collection".into(), json!(collection));
             params.insert("values".into(), vector::values_json(values)?);

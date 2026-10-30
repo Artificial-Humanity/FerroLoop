@@ -486,6 +486,28 @@ fn graph_distance(metric: VectorMetric, left: &[f32], right: &[f32]) -> f64 {
     }
 }
 
+/// Smaller graph distance, then lower id. The same order `sort_layer` writes.
+fn cmp_distance_then_id(
+    left_dist: f64,
+    left_id: &str,
+    right_dist: f64,
+    right_id: &str,
+) -> Ordering {
+    left_dist
+        .total_cmp(&right_dist)
+        .then_with(|| left_id.cmp(right_id))
+}
+
+/// Highest level, then lowest id. `max_by` treats a lower id as greater.
+fn canonical_entry(vectors: &BTreeMap<String, VectorRecord>) -> Option<String> {
+    vectors
+        .iter()
+        .max_by(|(id_a, rec_a), (id_b, rec_b)| {
+            rec_a.level.cmp(&rec_b.level).then_with(|| id_b.cmp(id_a))
+        })
+        .map(|(id, _)| id.clone())
+}
+
 #[derive(Clone)]
 struct Rank {
     dist: f64,
@@ -627,13 +649,7 @@ impl VectorCollection {
     }
 
     fn recompute_entry(&mut self) {
-        self.entry = self
-            .vectors
-            .iter()
-            .max_by(|(id_a, rec_a), (id_b, rec_b)| {
-                rec_a.level.cmp(&rec_b.level).then_with(|| id_b.cmp(id_a))
-            })
-            .map(|(id, _)| id.clone());
+        self.entry = canonical_entry(&self.vectors);
     }
 
     fn link_layer(
@@ -701,11 +717,7 @@ impl VectorCollection {
         for nid in current {
             ranked.push((self.pair_distance(&origin, &nid)?, nid));
         }
-        ranked.sort_by(|left, right| {
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
+        ranked.sort_by(|left, right| cmp_distance_then_id(left.0, &left.1, right.0, &right.1));
         ranked.dedup_by(|left, right| left.1 == right.1);
         let keep: Vec<String> = ranked
             .iter()
@@ -776,11 +788,7 @@ impl VectorCollection {
         for nid in current {
             ranked.push((self.pair_distance(&origin, &nid)?, nid));
         }
-        ranked.sort_by(|left, right| {
-            left.0
-                .total_cmp(&right.0)
-                .then_with(|| left.1.cmp(&right.1))
-        });
+        ranked.sort_by(|left, right| cmp_distance_then_id(left.0, &left.1, right.0, &right.1));
         let keep: Vec<String> = ranked.into_iter().map(|(_, nid)| nid).collect();
         if let Some(slot) = self
             .vectors
@@ -1038,6 +1046,9 @@ pub(super) fn validate_graph(name: &str, col: &VectorCollection) -> Result<(), S
     if !col.vectors.contains_key(entry) {
         return Err(corrupt("vector entry point is not live"));
     }
+    if col.entry.as_deref() != canonical_entry(&col.vectors).as_deref() {
+        return Err(corrupt("vector entry point is not canonical"));
+    }
     for (id, record) in &col.vectors {
         check_vector_id(id).map_err(corrupt)?;
         check_stored(col.storage, col.dim, &record.bytes).map_err(corrupt)?;
@@ -1049,6 +1060,7 @@ pub(super) fn validate_graph(name: &str, col: &VectorCollection) -> Result<(), S
                 "vector `{id}` layer count does not match its level"
             )));
         }
+        let origin = dequantize(col.storage, &record.bytes).map_err(corrupt)?;
         for (layer, nids) in record.neighbors.iter().enumerate() {
             if nids.len() > max_links(col.m, layer) {
                 return Err(corrupt(format!(
@@ -1080,6 +1092,25 @@ pub(super) fn validate_graph(name: &str, col: &VectorCollection) -> Result<(), S
                         "vector link `{id}` -> `{nid}` is not bidirectional"
                     )));
                 }
+            }
+            if nids.len() < 2 {
+                continue;
+            }
+            let mut previous: Option<(f64, &str)> = None;
+            for nid in nids {
+                let Some(other) = col.vectors.get(nid) else {
+                    return Err(corrupt(format!("vector neighbor `{nid}` is not live")));
+                };
+                let neighbor = dequantize(col.storage, &other.bytes).map_err(corrupt)?;
+                let dist = graph_distance(col.metric, &origin, &neighbor);
+                if let Some((prev_dist, prev_id)) = previous
+                    && cmp_distance_then_id(prev_dist, prev_id, dist, nid) != Ordering::Less
+                {
+                    return Err(corrupt(format!(
+                        "vector `{id}` neighbors on layer {layer} are not ordered by distance"
+                    )));
+                }
+                previous = Some((dist, nid.as_str()));
             }
         }
     }
