@@ -792,6 +792,182 @@ mod tests {
         assert_eq!(store.synced_seq(), 2);
     }
 
+    struct BlockingNotify {
+        calls: Mutex<Vec<u64>>,
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        early: Arc<(Mutex<bool>, Condvar)>,
+        fail_first: bool,
+        saw_first: AtomicBool,
+    }
+
+    impl SyncAdapter for BlockingNotify {
+        fn name(&self) -> &str {
+            "blocking-notify"
+        }
+
+        fn on_commit(&self, batch: &SyncBatch) -> Result<(), StoreError> {
+            let first = batch.seq == 1
+                && self
+                    .saw_first
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok();
+            if !first {
+                let (lock, _) = &*self.release;
+                if !*lock.lock().unwrap() {
+                    let (lock, cv) = &*self.early;
+                    *lock.lock().unwrap() = true;
+                    cv.notify_all();
+                }
+            }
+            self.calls.lock().unwrap().push(batch.seq);
+            if first {
+                {
+                    let (lock, cv) = &*self.entered;
+                    *lock.lock().unwrap() = true;
+                    cv.notify_all();
+                }
+                let (lock, cv) = &*self.release;
+                let mut guard = lock.lock().unwrap();
+                while !*guard {
+                    guard = cv.wait(guard).unwrap();
+                }
+                if self.fail_first {
+                    return Err(StoreError::Backend(
+                        "sync adapter rejected the batch".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct BlockingRig {
+        adapter: Arc<BlockingNotify>,
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    fn blocking_adapter(fail_first: bool) -> BlockingRig {
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let adapter = Arc::new(BlockingNotify {
+            calls: Mutex::new(Vec::new()),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            early: Arc::new((Mutex::new(false), Condvar::new())),
+            fail_first,
+            saw_first: AtomicBool::new(false),
+        });
+        BlockingRig {
+            adapter,
+            entered,
+            release,
+        }
+    }
+
+    fn wait_flag(pair: &Arc<(Mutex<bool>, Condvar)>) {
+        let (lock, cv) = &**pair;
+        let mut guard = lock.lock().unwrap();
+        while !*guard {
+            guard = cv.wait(guard).unwrap();
+        }
+    }
+
+    #[test]
+    fn write_through_second_put_returns_while_the_first_notify_is_blocked() {
+        let BlockingRig {
+            adapter,
+            entered,
+            release,
+        } = blocking_adapter(false);
+        let store = Arc::new(
+            FerroStore::in_memory()
+                .with_sync_adapter(
+                    SyncMode::WriteThrough,
+                    Arc::clone(&adapter) as Arc<dyn SyncAdapter>,
+                )
+                .unwrap(),
+        );
+        let first = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "a", &json!({"n": 1})).unwrap())
+        };
+        wait_flag(&entered);
+        let second = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "b", &json!({"n": 2})).unwrap())
+        };
+        second.join().unwrap();
+        assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1]);
+        {
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        first.join().unwrap();
+        assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1]);
+        assert_eq!(store.synced_seq(), 1);
+        assert_eq!(store.sync_flush().unwrap(), 2);
+        assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1, 2]);
+        assert_eq!(store.synced_seq(), 2);
+    }
+
+    #[test]
+    fn sync_flush_waits_out_a_blocked_notify_and_then_sends_the_failed_batch_first() {
+        let BlockingRig {
+            adapter,
+            entered,
+            release,
+        } = blocking_adapter(true);
+        let early = Arc::clone(&adapter.early);
+        let store = Arc::new(
+            FerroStore::in_memory()
+                .with_sync_adapter(
+                    SyncMode::WriteThrough,
+                    Arc::clone(&adapter) as Arc<dyn SyncAdapter>,
+                )
+                .unwrap(),
+        );
+        let first = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "a", &json!({"n": 1})))
+        };
+        wait_flag(&entered);
+        let second = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "b", &json!({"n": 2})).unwrap())
+        };
+        second.join().unwrap();
+        assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1]);
+        let flushed = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.sync_flush())
+        };
+        {
+            let (lock, cv) = &*early;
+            let guard = lock.lock().unwrap();
+            let (guard, status) = cv
+                .wait_timeout(guard, std::time::Duration::from_millis(250))
+                .unwrap();
+            assert!(
+                status.timed_out() && !*guard,
+                "flush called on_commit while an older notify was still in flight"
+            );
+        }
+        {
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        let err = first.join().unwrap().unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert_eq!(flushed.join().unwrap().unwrap(), 2);
+        assert_eq!(adapter.calls.lock().unwrap().as_slice(), &[1, 1, 2]);
+        assert_eq!(store.synced_seq(), 2);
+        assert_eq!(store.get_doc("docs", "b").unwrap(), Some(json!({"n": 2})));
+    }
+
     fn bad_second_batch() -> Vec<SyncBatch> {
         vec![
             SyncBatch {
@@ -842,6 +1018,54 @@ mod tests {
         let store = FerroStore::open(&path).unwrap();
         assert_eq!(store.get_doc("docs", "a").unwrap(), None);
         assert_eq!(store.read_state().unwrap().last_seq, 0);
+    }
+
+    #[test]
+    fn silent_two_batch_disk_apply_publishes_one_superblock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("epoch.fls");
+        let store = FerroStore::open(&path).unwrap();
+        let before = {
+            let file = std::fs::File::open(&path).unwrap();
+            super::super::latest_superblock(&file).unwrap().1.epoch
+        };
+        let fake = Arc::new(FakeSync::new());
+        store
+            .attach_sync_adapter(
+                SyncMode::WriteBehind,
+                Arc::clone(&fake) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+        *fake.pull.lock().unwrap() = vec![
+            SyncBatch {
+                seq: 1,
+                ops: vec![SyncOp::PutDoc {
+                    collection: "docs".into(),
+                    id: "a".into(),
+                    doc: json!({"n": 1}),
+                }],
+            },
+            SyncBatch {
+                seq: 2,
+                ops: vec![SyncOp::PutDoc {
+                    collection: "docs".into(),
+                    id: "b".into(),
+                    doc: json!({"n": 2}),
+                }],
+            },
+        ];
+        assert_eq!(store.sync_pull().unwrap(), 2);
+        let after = {
+            let file = std::fs::File::open(&path).unwrap();
+            super::super::latest_superblock(&file).unwrap().1.epoch
+        };
+        assert_eq!(after, before + 1);
+        drop(store);
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
+        assert_eq!(store.get_doc("docs", "b").unwrap(), Some(json!({"n": 2})));
+        assert_eq!(store.read_state().unwrap().last_seq, 2);
+        assert!(fake.commits().is_empty());
     }
 
     #[test]
