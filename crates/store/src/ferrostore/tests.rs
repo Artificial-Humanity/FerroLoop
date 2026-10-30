@@ -822,6 +822,174 @@ fn unix_socket_subscribe_after_server_drop_is_disconnected() {
 }
 
 #[test]
+fn websocket_serves_concurrent_clients_without_opening_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("store.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    assert_ne!(server.local_addr().port(), 0);
+    let uri = format!("ws://{}", server.local_addr());
+
+    let mut handles = Vec::new();
+    for i in 0..4 {
+        let uri = uri.clone();
+        handles.push(thread::spawn(move || {
+            let client = must_not_unreachable(FerroStore::connect_uri(&uri))?;
+            let id = format!("id-{i}");
+            must_not_unreachable(client.put_doc(
+                "docs",
+                &id,
+                &json!({"n": i, "name": format!("name{i}")}),
+            ))?;
+            let doc = must_not_unreachable(client.get_doc("docs", &id))?
+                .ok_or_else(|| format!("missing {id}"))?;
+            if doc["n"] != i {
+                return Err(format!("doc {id} was {doc}"));
+            }
+            Ok(())
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap().unwrap();
+    }
+
+    for i in 0..4 {
+        assert_eq!(
+            server
+                .store()
+                .get_doc("docs", &format!("id-{i}"))
+                .unwrap()
+                .unwrap()["n"],
+            i
+        );
+    }
+    drop(server);
+
+    let opened = FerroStore::open(&file).unwrap();
+    for i in 0..4 {
+        assert_eq!(
+            opened.get_doc("docs", &format!("id-{i}")).unwrap().unwrap()["n"],
+            i
+        );
+    }
+}
+
+#[test]
+fn websocket_mq_subscribe_does_not_replay_and_ack_matches_local() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("store.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let uri = format!("ws://{}", server.local_addr());
+
+    let publisher = FerroStore::connect_uri(&uri).unwrap();
+    let early = publisher
+        .publish_mq("orders", "before", &json!({"n": 0}))
+        .unwrap();
+    assert_eq!(early, 1);
+
+    let client_a = FerroStore::connect_uri(&uri).unwrap();
+    let rx = client_a.subscribe_mq("orders");
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "subscribe does not replay history"
+    );
+
+    let client_b = FerroStore::connect_uri(&format!("{uri}/store")).unwrap();
+    let seq = client_b
+        .publish_mq("orders", "k", &json!({"n": 1}))
+        .unwrap();
+    let rec = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(rec.seq, seq);
+    assert_eq!(rec.key, "k");
+    assert_eq!(rec.payload, json!({"n": 1}));
+    assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+    let polled = client_a.poll_mq_group("orders", "g", 10).unwrap();
+    assert_eq!(polled.len(), 2);
+    assert_eq!(polled[0].seq, 1);
+    assert_eq!(polled[0].key, "before");
+    assert_eq!(polled[0].payload, json!({"n": 0}));
+    assert_eq!(polled[1].seq, seq);
+    assert_eq!(polled[1].key, "k");
+    assert_eq!(polled[1].payload, json!({"n": 1}));
+    assert_eq!(client_b.poll_mq_group("orders", "g", 10).unwrap().len(), 2);
+    client_a.ack_mq("orders", "g", 1).unwrap();
+    let after = client_a.poll_mq_group("orders", "g", 10).unwrap();
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].seq, seq);
+    assert_eq!(
+        client_a.poll_mq_group("orders", "other", 10).unwrap().len(),
+        2
+    );
+    assert!(client_a.poll_mq_group("orders", "g", 0).unwrap().is_empty());
+    client_a.ack_mq("orders", "g", seq).unwrap();
+    assert!(
+        client_a
+            .poll_mq_group("orders", "g", 10)
+            .unwrap()
+            .is_empty()
+    );
+    client_a.ack_mq("orders", "g", 99).unwrap();
+    assert!(
+        client_a
+            .poll_mq_group("orders", "g", 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    drop(client_a);
+    drop(client_b);
+    drop(publisher);
+    drop(server);
+    let opened = FerroStore::open(&file).unwrap();
+    assert!(opened.poll_mq_group("orders", "g", 10).unwrap().is_empty());
+    assert_eq!(
+        opened.poll_mq_group("orders", "other", 10).unwrap().len(),
+        2
+    );
+}
+
+#[test]
+fn websocket_get_doc_returns_stored_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("null.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("ws://{}/store", server.local_addr())).unwrap();
+    client.put_doc("docs", "empty", &json!(null)).unwrap();
+    let stored = client.get_doc("docs", "empty");
+    assert!(
+        matches!(stored, Ok(Some(ref value)) if value.is_null()),
+        "{stored:?}"
+    );
+    let missing = client.get_doc("docs", "missing");
+    assert!(matches!(missing, Ok(None)), "{missing:?}");
+    assert!(
+        server
+            .store()
+            .get_doc("docs", "empty")
+            .unwrap()
+            .unwrap()
+            .is_null()
+    );
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn websocket_subscribe_disconnects_when_the_server_drops() {
+    let server = FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+    let rx = client.subscribe_mq("orders");
+    drop(server);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap_err(),
+        RecvTimeoutError::Disconnected
+    );
+}
+
+#[test]
 fn unix_socket_subscribe_disconnects_when_the_server_drops() {
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("live.sock");
@@ -970,16 +1138,27 @@ fn connect_uri_mem_and_file_and_refuses_other_schemes() {
     let reopened = FerroStore::connect_uri(&uri).unwrap();
     assert_eq!(reopened.get_doc("c", "rel").unwrap().unwrap()["ok"], true);
 
-    for uri in ["ws://127.0.0.1:9", "wss://example.test/store"] {
+    for uri in ["ws://127.0.0.1:9", "ws://127.0.0.1:9/store"] {
         let err = match FerroStore::connect_uri(uri) {
-            Ok(_) => panic!("served uri {uri} was accepted"),
+            Ok(_) => panic!("closed ws port {uri} was accepted"),
             Err(err) => err,
         };
         let msg = err.to_string();
-        assert!(msg.contains("Phase 2"), "{uri}: {msg}");
+        assert!(matches!(err, StoreError::Backend(_)), "{uri}: {msg}");
         assert!(!msg.contains("unknown"), "{uri}: {msg}");
+        assert!(!msg.contains("Phase 2"), "{uri}: {msg}");
         assert!(!msg.contains("deferred"), "{uri}: {msg}");
     }
+    let wss = match FerroStore::connect_uri("wss://example.test/store") {
+        Ok(_) => panic!("wss uri was accepted"),
+        Err(err) => err,
+    };
+    let msg = wss.to_string();
+    assert!(matches!(wss, StoreError::Backend(_)), "{msg}");
+    assert!(msg.contains("wss"), "{msg}");
+    assert!(!msg.contains("unknown"), "{msg}");
+    assert!(!msg.contains("Phase 2"), "{msg}");
+    assert!(!msg.contains("deferred"), "{msg}");
     let missing = match FerroStore::connect_uri("unix:///tmp/ferro.sock") {
         Ok(_) => panic!("missing unix socket was accepted"),
         Err(err) => err,

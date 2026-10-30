@@ -1,4 +1,4 @@
-//! Document store and FerroMQ log in a `.fls` file, and a unix socket server.
+//! Document store and FerroMQ log in a `.fls` file, and a socket server.
 //! See `docs/ferrostore-spec.md`.
 
 mod doc;
@@ -10,6 +10,7 @@ mod traits_catalog;
 mod traits_state;
 mod traits_wire;
 mod traits_workflow;
+mod ws;
 
 #[cfg(test)]
 mod tests;
@@ -135,7 +136,7 @@ impl Txn {
 ///
 /// `mem://` keeps the map in this process. `file://` is a `.fls` container:
 /// two superblock slots, a copy-on-write snapshot, and a CRC32-framed WAL.
-/// `unix://` is a client of a [`FerroStoreServer`] and does not open the file.
+/// `unix://` and `ws://` are clients of a [`FerroStoreServer`] and do not open the file.
 pub struct FerroStore {
     inner: Inner,
     subs: Mutex<HashMap<String, Vec<Sender<MqRecord>>>>,
@@ -180,7 +181,7 @@ impl FerroStore {
         })
     }
 
-    /// `mem://`, `file://`, `unix://`, and the refused websocket schemes.
+    /// `mem://`, `file://`, `unix://`, and `ws://`. `wss://` is recognized and refused.
     pub fn connect_uri(uri: &str) -> Result<Self, StoreError> {
         if uri == "mem://" || uri == "mem:///" {
             return Ok(Self::in_memory());
@@ -197,10 +198,16 @@ impl FerroStore {
                 label: path,
             });
         }
-        if uri.starts_with("ws://") || uri.starts_with("wss://") {
-            return Err(backend(
-                "Phase 2 serves unix socket and websocket transports; this build does not",
-            ));
+        if uri.starts_with("wss://") {
+            return Err(backend("wss is not implemented"));
+        }
+        if let Some(rest) = uri.strip_prefix("ws://") {
+            let remote = server::connect_ws(rest)?;
+            return Ok(Self {
+                inner: Inner::Remote(remote),
+                subs: Mutex::new(HashMap::new()),
+                label: uri.to_string(),
+            });
         }
         Err(backend(format!("unknown FerroStore URI scheme in `{uri}`")))
     }

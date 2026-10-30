@@ -1,7 +1,8 @@
-//! One `FerroStore` serving many clients over a Unix socket.
+//! One `FerroStore` serving many clients over a Unix socket or `ws://`.
 //!
-//! The server process is the only opener of the `.fls` file. Clients speak
-//! length-prefixed JSON and never take `flock`.
+//! The server process is the only opener of the `.fls` file. Unix clients
+//! speak length-prefixed JSON. WebSocket clients speak one JSON value per
+//! frame. Neither takes `flock`.
 
 use super::layout::backend;
 use super::{FerroStore, MqRecord, lock_mutex};
@@ -10,7 +11,7 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::Shutdown;
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use super::ws;
 
 const MAX_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,7 +33,7 @@ const FORWARD_PAUSE: Duration = Duration::from_millis(50);
 struct ServerState {
     store: Arc<FerroStore>,
     shutdown: AtomicBool,
-    conns: Mutex<HashMap<u64, UnixStream>>,
+    conns: Mutex<HashMap<u64, Box<dyn JsonIo>>>,
     next_conn: AtomicU64,
 }
 
@@ -45,11 +48,14 @@ impl Drop for ConnReg {
     }
 }
 
-/// Accept thread, shutdown flag, and the socket path this server bound.
+enum Bound {
+    Unix { path: PathBuf, inode: u64 },
+    Tcp { addr: SocketAddr },
+}
+
+/// Accept thread, shutdown flag, and the socket this server bound.
 pub struct FerroStoreServer {
-    path: PathBuf,
-    inode: u64,
-    unlink: bool,
+    bound: Bound,
     state: Arc<ServerState>,
     accept: Option<JoinHandle<()>>,
 }
@@ -78,31 +84,68 @@ impl FerroStoreServer {
                 return Err(backend(format!("stat {}: {err}", path.display())));
             }
         };
-        let state = Arc::new(ServerState {
-            store: Arc::new(store),
-            shutdown: AtomicBool::new(false),
-            conns: Mutex::new(HashMap::new()),
-            next_conn: AtomicU64::new(1),
-        });
+        let state = new_state(store);
         let accept_state = Arc::clone(&state);
+        let path_buf = path.to_path_buf();
         let accept = match thread::Builder::new()
             .name("fls-accept".to_string())
-            .spawn(move || accept_loop(listener, accept_state))
+            .spawn(move || accept_loop(move || poll_unix(&listener), accept_state))
         {
             Ok(handle) => handle,
             Err(err) => {
-                unlink_bound(path, inode);
+                unlink_bound(&path_buf, inode);
                 return Err(backend(format!("start accept thread: {err}")));
             }
         };
         Ok(Self {
-            path: path.to_path_buf(),
-            inode,
-            unlink: true,
+            bound: Bound::Unix {
+                path: path_buf,
+                inode,
+            },
             state,
             accept: Some(accept),
         })
     }
+
+    /// Listen on TCP, speak RFC 6455, and serve `store`. `127.0.0.1:0` must bind an ephemeral port.
+    pub fn bind_tcp(addr: impl ToSocketAddrs, store: FerroStore) -> Result<Self, StoreError> {
+        let listener =
+            TcpListener::bind(addr).map_err(|err| backend(format!("bind tcp: {err}")))?;
+        if let Err(err) = listener.set_nonblocking(true) {
+            return Err(backend(format!("set socket nonblocking: {err}")));
+        }
+        let local = listener
+            .local_addr()
+            .map_err(|err| backend(format!("tcp local address: {err}")))?;
+        let state = new_state(store);
+        let accept_state = Arc::clone(&state);
+        let accept = thread::Builder::new()
+            .name("fls-accept".to_string())
+            .spawn(move || accept_loop(move || poll_tcp(&listener), accept_state))
+            .map_err(|err| backend(format!("start accept thread: {err}")))?;
+        Ok(Self {
+            bound: Bound::Tcp { addr: local },
+            state,
+            accept: Some(accept),
+        })
+    }
+
+    /// The address actually bound (`127.0.0.1:<port>` for an ephemeral bind).
+    pub fn local_addr(&self) -> SocketAddr {
+        match &self.bound {
+            Bound::Tcp { addr } => *addr,
+            Bound::Unix { .. } => SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        }
+    }
+}
+
+fn new_state(store: FerroStore) -> Arc<ServerState> {
+    Arc::new(ServerState {
+        store: Arc::new(store),
+        shutdown: AtomicBool::new(false),
+        conns: Mutex::new(HashMap::new()),
+        next_conn: AtomicU64::new(1),
+    })
 }
 
 #[cfg(test)]
@@ -115,15 +158,23 @@ impl FerroStoreServer {
 impl Drop for FerroStoreServer {
     fn drop(&mut self) {
         // Stop accept and connection readers before joining. Unlink only the
-        // inode this server bound, so a replacement socket is left alone.
+        // inode a unix server bound, so a replacement socket is left alone.
+        // A tcp server has no filesystem path.
         self.state.shutdown.store(true, Ordering::SeqCst);
         shutdown_conns(&self.state);
-        let _ = UnixStream::connect(&self.path);
+        match &self.bound {
+            Bound::Unix { path, .. } => {
+                let _ = UnixStream::connect(path);
+            }
+            Bound::Tcp { addr } => {
+                let _ = TcpStream::connect_timeout(addr, Duration::from_millis(200));
+            }
+        }
         if let Some(handle) = self.accept.take() {
             let _ = handle.join();
         }
-        if self.unlink {
-            unlink_bound(&self.path, self.inode);
+        if let Bound::Unix { path, inode } = &self.bound {
+            unlink_bound(path, *inode);
         }
     }
 }
@@ -152,33 +203,45 @@ fn unlink_bound(path: &Path, inode: u64) {
 
 fn shutdown_conns(state: &ServerState) {
     let conns = std::mem::take(&mut *lock_mutex(&state.conns));
-    for (_, stream) in conns {
-        let _ = stream.shutdown(Shutdown::Both);
+    for (_, conn) in conns {
+        conn.shutdown_both();
     }
 }
 
-fn accept_loop(listener: UnixListener, state: Arc<ServerState>) {
+enum AcceptPoll {
+    Conn(Accepted),
+    Retry,
+    Wait,
+    Stop,
+}
+
+struct Accepted {
+    read: Box<dyn JsonIo>,
+    write: Box<dyn JsonIo>,
+    watch: Box<dyn JsonIo>,
+}
+
+fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
     let mut handlers = Vec::new();
     loop {
         reap(&mut handlers);
         if state.shutdown.load(Ordering::SeqCst) {
             break;
         }
-        match listener.accept() {
-            Ok((stream, _)) => {
+        match poll() {
+            AcceptPoll::Conn(accepted) => {
                 if state.shutdown.load(Ordering::SeqCst) {
-                    let _ = stream.shutdown(Shutdown::Both);
+                    accepted.watch.shutdown_both();
                     break;
                 }
-                let Ok(watch) = stream.try_clone() else {
-                    continue;
-                };
                 let id = state.next_conn.fetch_add(1, Ordering::Relaxed);
-                lock_mutex(&state.conns).insert(id, watch);
+                lock_mutex(&state.conns).insert(id, accepted.watch);
                 let conn_state = Arc::clone(&state);
+                let read = accepted.read;
+                let write = Arc::new(Mutex::new(accepted.write));
                 match thread::Builder::new()
                     .name("fls-conn".to_string())
-                    .spawn(move || serve_connection(stream, conn_state, id))
+                    .spawn(move || serve_connection(read, write, conn_state, id))
                 {
                     Ok(handle) => handlers.push(handle),
                     Err(_) => {
@@ -186,11 +249,9 @@ fn accept_loop(listener: UnixListener, state: Arc<ServerState>) {
                     }
                 }
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_PAUSE);
-            }
-            Err(err) if accept_again(&err) => {}
-            Err(_) => break,
+            AcceptPoll::Retry => {}
+            AcceptPoll::Wait => thread::sleep(ACCEPT_PAUSE),
+            AcceptPoll::Stop => break,
         }
     }
     state.shutdown.store(true, Ordering::SeqCst);
@@ -198,6 +259,66 @@ fn accept_loop(listener: UnixListener, state: Arc<ServerState>) {
     for handle in handlers {
         let _ = handle.join();
     }
+}
+
+fn poll_unix(listener: &UnixListener) -> AcceptPoll {
+    match listener.accept() {
+        Ok((stream, _)) => match unix_accepted(stream) {
+            Ok(accepted) => AcceptPoll::Conn(accepted),
+            Err(_) => AcceptPoll::Retry,
+        },
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => AcceptPoll::Wait,
+        Err(err) if accept_again(&err) => AcceptPoll::Retry,
+        Err(_) => AcceptPoll::Stop,
+    }
+}
+
+fn poll_tcp(listener: &TcpListener) -> AcceptPoll {
+    match listener.accept() {
+        Ok((stream, _)) => match tcp_accepted(stream) {
+            Ok(accepted) => AcceptPoll::Conn(accepted),
+            Err(_) => AcceptPoll::Retry,
+        },
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => AcceptPoll::Wait,
+        Err(err) if accept_again(&err) => AcceptPoll::Retry,
+        Err(_) => AcceptPoll::Stop,
+    }
+}
+
+fn unix_accepted(stream: UnixStream) -> Result<Accepted, StoreError> {
+    let write = stream
+        .try_clone()
+        .map_err(|err| backend(format!("clone unix stream: {err}")))?;
+    let watch = stream
+        .try_clone()
+        .map_err(|err| backend(format!("clone unix stream: {err}")))?;
+    Ok(Accepted {
+        read: Box::new(UnixIo(stream)),
+        write: Box::new(UnixIo(write)),
+        watch: Box::new(UnixIo(watch)),
+    })
+}
+
+fn tcp_accepted(stream: TcpStream) -> Result<Accepted, StoreError> {
+    stream
+        .set_nodelay(true)
+        .map_err(|err| backend(format!("set nodelay: {err}")))?;
+    // `O_NONBLOCK` is per file description and is shared by `try_clone`.
+    // Accepted sockets must block in the frame reader.
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| backend(format!("set socket blocking: {err}")))?;
+    let write = stream
+        .try_clone()
+        .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
+    let watch = stream
+        .try_clone()
+        .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
+    Ok(Accepted {
+        read: Box::new(WsIo::server(stream, true)),
+        write: Box::new(WsIo::server(write, false)),
+        watch: Box::new(WsIo::server(watch, false)),
+    })
 }
 
 fn accept_again(err: &io::Error) -> bool {
@@ -218,15 +339,19 @@ fn reap(handlers: &mut Vec<JoinHandle<()>>) {
     }
 }
 
-fn serve_connection(mut read: UnixStream, state: Arc<ServerState>, conn_id: u64) {
+fn serve_connection(
+    mut read: Box<dyn JsonIo>,
+    write: Arc<Mutex<Box<dyn JsonIo>>>,
+    state: Arc<ServerState>,
+    conn_id: u64,
+) {
     let _reg = ConnReg {
         state: Arc::clone(&state),
         id: conn_id,
     };
-    let Ok(writer) = read.try_clone() else {
+    if read.prepare().is_err() {
         return;
-    };
-    let write = Arc::new(Mutex::new(writer));
+    }
     let alive = Arc::new(AtomicBool::new(true));
     let mut subscribed = HashSet::new();
     let mut forwarders = Vec::new();
@@ -234,31 +359,42 @@ fn serve_connection(mut read: UnixStream, state: Arc<ServerState>, conn_id: u64)
         if state.shutdown.load(Ordering::SeqCst) {
             break;
         }
-        let frame = match read_frame(&mut read) {
-            Ok(frame) => frame,
+        let incoming = match read.read_value() {
+            Ok(incoming) => incoming,
             Err(_) => break,
         };
-        let Some(id) = frame.get("id").and_then(Value::as_u64) else {
-            break;
-        };
-        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
-        let result = if method == "subscribe_mq" {
-            subscribe_topic(
-                &state.store,
-                &params,
-                &write,
-                &alive,
-                &mut subscribed,
-                &mut forwarders,
-            )
-            .map(|()| Value::Null)
-        } else {
-            dispatch(&state.store, method, &params)
-        };
-        // An unknown method is an error response. The connection stays up.
-        if send_result(&write, id, result).is_err() {
-            break;
+        match incoming {
+            Incoming::Ping(payload) => {
+                let mut stream = lock_mutex(&write);
+                if stream.write_pong(&payload).is_err() {
+                    break;
+                }
+            }
+            Incoming::Close => break,
+            Incoming::Value(frame) => {
+                let Some(id) = frame.get("id").and_then(Value::as_u64) else {
+                    break;
+                };
+                let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+                let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
+                let result = if method == "subscribe_mq" {
+                    subscribe_topic(
+                        &state.store,
+                        &params,
+                        &write,
+                        &alive,
+                        &mut subscribed,
+                        &mut forwarders,
+                    )
+                    .map(|()| Value::Null)
+                } else {
+                    dispatch(&state.store, method, &params)
+                };
+                // An unknown method is an error response. The connection stays up.
+                if send_result(&write, id, result).is_err() {
+                    break;
+                }
+            }
         }
     }
     alive.store(false, Ordering::SeqCst);
@@ -270,7 +406,7 @@ fn serve_connection(mut read: UnixStream, state: Arc<ServerState>, conn_id: u64)
 fn subscribe_topic(
     store: &FerroStore,
     params: &Value,
-    write: &Arc<Mutex<UnixStream>>,
+    write: &Arc<Mutex<Box<dyn JsonIo>>>,
     alive: &Arc<AtomicBool>,
     subscribed: &mut HashSet<String>,
     forwarders: &mut Vec<JoinHandle<()>>,
@@ -296,7 +432,7 @@ fn subscribe_topic(
 fn forward_mq(
     rx: Receiver<MqRecord>,
     topic: String,
-    write: Arc<Mutex<UnixStream>>,
+    write: Arc<Mutex<Box<dyn JsonIo>>>,
     alive: Arc<AtomicBool>,
 ) {
     loop {
@@ -313,7 +449,7 @@ fn forward_mq(
                     }
                 });
                 let mut stream = lock_mutex(&write);
-                if write_frame(&mut stream, &frame).is_err() {
+                if stream.write_value(&frame).is_err() {
                     break;
                 }
             }
@@ -400,7 +536,7 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
 }
 
 fn send_result(
-    write: &Mutex<UnixStream>,
+    write: &Mutex<Box<dyn JsonIo>>,
     id: u64,
     result: Result<Value, StoreError>,
 ) -> Result<(), StoreError> {
@@ -409,7 +545,7 @@ fn send_result(
         Err(err) => json!({"id": id, "ok": false, "error": err.to_string()}),
     };
     let mut stream = lock_mutex(write);
-    write_frame(&mut stream, &body)
+    stream.write_value(&body)
 }
 
 fn record_value(record: MqRecord) -> Value {
@@ -446,6 +582,108 @@ fn param_value(params: &Value, key: &str) -> Result<Value, StoreError> {
         .ok_or_else(|| backend(format!("missing param `{key}`")))
 }
 
+enum Incoming {
+    Value(Value),
+    Ping(Vec<u8>),
+    Close,
+}
+
+trait JsonIo: Send {
+    fn prepare(&mut self) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn read_value(&mut self) -> Result<Incoming, StoreError>;
+
+    fn write_value(&mut self, value: &Value) -> Result<(), StoreError>;
+
+    fn write_pong(&mut self, _payload: &[u8]) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn shutdown_both(&self);
+}
+
+struct UnixIo(UnixStream);
+
+impl JsonIo for UnixIo {
+    fn read_value(&mut self) -> Result<Incoming, StoreError> {
+        Ok(Incoming::Value(read_frame(&mut self.0)?))
+    }
+
+    fn write_value(&mut self, value: &Value) -> Result<(), StoreError> {
+        write_frame(&mut self.0, value)
+    }
+
+    fn shutdown_both(&self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
+}
+
+struct WsIo {
+    stream: TcpStream,
+    client: bool,
+    handshake: bool,
+}
+
+impl WsIo {
+    fn client(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            client: true,
+            handshake: false,
+        }
+    }
+
+    fn server(stream: TcpStream, handshake: bool) -> Self {
+        Self {
+            stream,
+            client: false,
+            handshake,
+        }
+    }
+}
+
+impl JsonIo for WsIo {
+    fn prepare(&mut self) -> Result<(), StoreError> {
+        if !self.handshake {
+            return Ok(());
+        }
+        self.handshake = false;
+        ws::accept(&mut self.stream)
+    }
+
+    fn read_value(&mut self) -> Result<Incoming, StoreError> {
+        match ws::read_event(&mut self.stream, self.client)? {
+            ws::WsEvent::Data(payload) => {
+                let text =
+                    std::str::from_utf8(&payload).map_err(|_| backend("frame is not utf-8"))?;
+                let value = serde_json::from_str(text).map_err(|_| backend("frame is not json"))?;
+                Ok(Incoming::Value(value))
+            }
+            ws::WsEvent::Ping(payload) => Ok(Incoming::Ping(payload)),
+            ws::WsEvent::Close => Ok(Incoming::Close),
+        }
+    }
+
+    fn write_value(&mut self, value: &Value) -> Result<(), StoreError> {
+        let bytes =
+            serde_json::to_vec(value).map_err(|err| backend(format!("encode frame: {err}")))?;
+        if bytes.is_empty() || bytes.len() > ws::MAX_PAYLOAD {
+            return Err(backend("frame length is outside 1..=16MiB"));
+        }
+        ws::write_frame(&mut self.stream, self.client, 0x1, &bytes)
+    }
+
+    fn write_pong(&mut self, payload: &[u8]) -> Result<(), StoreError> {
+        ws::write_frame(&mut self.stream, self.client, 0xA, payload)
+    }
+
+    fn shutdown_both(&self) {
+        let _ = self.stream.shutdown(Shutdown::Both);
+    }
+}
+
 fn write_frame(stream: &mut UnixStream, value: &Value) -> Result<(), StoreError> {
     let bytes = serde_json::to_vec(value).map_err(|err| backend(format!("encode frame: {err}")))?;
     let len = u32::try_from(bytes.len()).map_err(|_| backend("frame length exceeds u32"))?;
@@ -471,7 +709,7 @@ fn read_frame(stream: &mut UnixStream) -> Result<Value, StoreError> {
 }
 
 struct RemoteShared {
-    write: Mutex<UnixStream>,
+    write: Mutex<Box<dyn JsonIo>>,
     pending: Mutex<HashMap<u64, Sender<Result<Value, String>>>>,
     next_id: AtomicU64,
     subs: Mutex<HashMap<String, Vec<Arc<Sender<MqRecord>>>>>,
@@ -496,7 +734,7 @@ impl RemoteClient {
         // response must not need this task to still hold the mutex.
         {
             let mut stream = lock_mutex(&self.shared.write);
-            if let Err(err) = write_frame(&mut stream, &request) {
+            if let Err(err) = stream.write_value(&request) {
                 lock_mutex(&self.shared.pending).remove(&id);
                 return Err(err);
             }
@@ -632,7 +870,7 @@ fn remove_subscriber(shared: &RemoteShared, topic: &str, tx: &Arc<Sender<MqRecor
 impl Drop for RemoteClient {
     fn drop(&mut self) {
         let stream = lock_mutex(&self.shared.write);
-        let _ = stream.shutdown(Shutdown::Both);
+        stream.shutdown_both();
         drop(stream);
         if let Some(handle) = lock_mutex(&self.reader).take() {
             let _ = handle.join();
@@ -646,8 +884,26 @@ pub(super) fn connect_unix(path: &str) -> Result<RemoteClient, StoreError> {
     let writer = stream
         .try_clone()
         .map_err(|err| backend(format!("clone unix stream: {err}")))?;
+    finish_client(Box::new(UnixIo(stream)), Box::new(UnixIo(writer)))
+}
+
+pub(super) fn connect_ws(rest: &str) -> Result<RemoteClient, StoreError> {
+    let stream = ws::connect(rest)?;
+    let writer = stream
+        .try_clone()
+        .map_err(|err| backend(format!("clone tcp stream: {err}")))?;
+    finish_client(
+        Box::new(WsIo::client(stream)),
+        Box::new(WsIo::client(writer)),
+    )
+}
+
+fn finish_client(
+    read: Box<dyn JsonIo>,
+    write: Box<dyn JsonIo>,
+) -> Result<RemoteClient, StoreError> {
     let shared = Arc::new(RemoteShared {
-        write: Mutex::new(writer),
+        write: Mutex::new(write),
         pending: Mutex::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         subs: Mutex::new(HashMap::new()),
@@ -655,7 +911,7 @@ pub(super) fn connect_unix(path: &str) -> Result<RemoteClient, StoreError> {
     let reader_shared = Arc::clone(&shared);
     let reader = thread::Builder::new()
         .name("fls-client".to_string())
-        .spawn(move || reader_loop(stream, reader_shared))
+        .spawn(move || reader_loop(read, reader_shared))
         .map_err(|err| backend(format!("start client reader: {err}")))?;
     Ok(RemoteClient {
         shared,
@@ -663,26 +919,39 @@ pub(super) fn connect_unix(path: &str) -> Result<RemoteClient, StoreError> {
     })
 }
 
-fn reader_loop(mut stream: UnixStream, shared: Arc<RemoteShared>) {
-    while let Ok(frame) = read_frame(&mut stream) {
-        if frame.get("id").is_none() && frame.get("method").and_then(Value::as_str) == Some("mq") {
-            deliver_push(&shared, &frame);
-            continue;
-        }
-        let Some(id) = frame.get("id").and_then(Value::as_u64) else {
-            continue;
-        };
-        let outcome = if frame.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(frame.get("result").cloned().unwrap_or(Value::Null))
-        } else {
-            let message = frame
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("FerroStore request failed");
-            Err(message.to_string())
-        };
-        if let Some(sender) = lock_mutex(&shared.pending).remove(&id) {
-            let _ = sender.send(outcome);
+fn reader_loop(mut stream: Box<dyn JsonIo>, shared: Arc<RemoteShared>) {
+    loop {
+        match stream.read_value() {
+            Ok(Incoming::Value(frame)) => {
+                if frame.get("id").is_none()
+                    && frame.get("method").and_then(Value::as_str) == Some("mq")
+                {
+                    deliver_push(&shared, &frame);
+                    continue;
+                }
+                let Some(id) = frame.get("id").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let outcome = if frame.get("ok").and_then(Value::as_bool) == Some(true) {
+                    Ok(frame.get("result").cloned().unwrap_or(Value::Null))
+                } else {
+                    let message = frame
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("FerroStore request failed");
+                    Err(message.to_string())
+                };
+                if let Some(sender) = lock_mutex(&shared.pending).remove(&id) {
+                    let _ = sender.send(outcome);
+                }
+            }
+            Ok(Incoming::Ping(payload)) => {
+                let mut write = lock_mutex(&shared.write);
+                if write.write_pong(&payload).is_err() {
+                    break;
+                }
+            }
+            Ok(Incoming::Close) | Err(_) => break,
         }
     }
     fail_pending(&shared, "FerroStore connection closed");
