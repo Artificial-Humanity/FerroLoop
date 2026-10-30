@@ -97,23 +97,28 @@ pub fn handle_tiered_registry_v01_get(
             ),
         );
     }
-    for adapter in adapters {
-        let listed = match adapter.list_servers() {
-            Ok(listed) => listed,
-            Err(err) => {
-                return (
-                    502,
-                    json!({
-                        "title": "Bad Gateway",
-                        "status": 502,
-                        "detail": err.to_string()
-                    }),
-                );
+    for rank in 0..3 {
+        for adapter in adapters
+            .iter()
+            .filter(|adapter| tier_rank(&adapter.tier()) == rank)
+        {
+            let listed = match adapter.list_servers() {
+                Ok(listed) => listed,
+                Err(err) => {
+                    return (
+                        502,
+                        json!({
+                            "title": "Bad Gateway",
+                            "status": 502,
+                            "detail": err.to_string()
+                        }),
+                    );
+                }
+            };
+            let tier = tier_label(&adapter.tier());
+            for item in listed {
+                push_unique(&mut entries, tag_entry(item, tier));
             }
-        };
-        let tier = tier_label(&adapter.tier());
-        for item in listed {
-            push_unique(&mut entries, tag_entry(item, tier));
         }
     }
     if let Some(tier) = query.get("tier") {
@@ -258,6 +263,14 @@ pub fn evaluate_edge_guard(
             secret: format!("edge-guard:{rule_id}"),
             reason,
         }),
+    }
+}
+
+fn tier_rank(tier: &RegistryTier) -> u8 {
+    match tier {
+        RegistryTier::LocalMachine => 0,
+        RegistryTier::MultiNodeHub => 1,
+        RegistryTier::CloudProvider { .. } => 2,
     }
 }
 
@@ -442,6 +455,23 @@ mod tests {
             .collect();
         assert_eq!(tiers, vec!["local", "local", "hub", "cloud"]);
         assert_eq!(body["servers"][0]["server"]["version"], "1.2.3");
+
+        let mut reversed = attached.clone();
+        reversed.reverse();
+        let (status, body) = handle_tiered_registry_v01_get(
+            "/v0.1/servers",
+            &BTreeMap::new(),
+            &[],
+            "http://127.0.0.1:8420",
+            &reversed,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["servers"][0]["server"]["name"],
+            "io.ferroloop.gate/shared"
+        );
+        assert_eq!(body["servers"][0]["server"]["version"], "9.9.9");
+        assert_eq!(body["servers"][0]["_meta"]["io.ferroloop.gate/tier"], "hub");
 
         let mut query = BTreeMap::new();
         query.insert("tier".into(), "cloud".into());
