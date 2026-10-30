@@ -98,6 +98,8 @@ struct SyncSlot {
     adapter: Option<Arc<dyn SyncAdapter>>,
     synced_seq: u64,
     pending: Vec<SyncBatch>,
+    /// One WriteThrough `on_commit` is running without holding this mutex.
+    notify_in_flight: bool,
 }
 
 struct Committed {
@@ -291,20 +293,6 @@ impl FerroStore {
         doc: &Value,
         silent: bool,
     ) -> Result<(), StoreError> {
-        let committed = self.capture_remote(|remote| {
-            remote.call_unit(
-                "put_doc",
-                json!({"collection": collection, "id": id, "doc": doc}),
-            )?;
-            Ok(vec![Op::Put {
-                collection: collection.to_string(),
-                id: id.to_string(),
-                doc: doc.clone(),
-            }])
-        })?;
-        if let Some(committed) = committed {
-            return after_commit(&self.sync, &committed, silent);
-        }
         let collection = collection.to_string();
         let id = id.to_string();
         let doc = doc.clone();
@@ -347,16 +335,6 @@ impl FerroStore {
     }
 
     pub fn delete_doc(&self, collection: &str, id: &str) -> Result<(), StoreError> {
-        let committed = self.capture_remote(|remote| {
-            remote.call_unit("delete_doc", json!({"collection": collection, "id": id}))?;
-            Ok(vec![Op::Delete {
-                collection: collection.to_string(),
-                id: id.to_string(),
-            }])
-        })?;
-        if let Some(committed) = committed {
-            return after_commit(&self.sync, &committed, false);
-        }
         let collection = collection.to_string();
         let id = id.to_string();
         self.commit(move |_| Ok((Op::Delete { collection, id }, ())), false)
@@ -396,23 +374,6 @@ impl FerroStore {
 
     /// Create a column table. An existing name is an error and writes nothing.
     pub fn create_column_table(&self, name: &str, columns: &[ColumnDef]) -> Result<(), StoreError> {
-        let committed = self.capture_remote(|remote| {
-            let defs = columns
-                .iter()
-                .map(columnar::column_def_json)
-                .collect::<Vec<_>>();
-            remote.call_unit(
-                "create_column_table",
-                json!({"name": name, "columns": defs}),
-            )?;
-            Ok(vec![Op::CreateColumnTable {
-                name: name.to_string(),
-                columns: columns.to_vec(),
-            }])
-        })?;
-        if let Some(committed) = committed {
-            return after_commit(&self.sync, &committed, false);
-        }
         let name = name.to_string();
         let columns = columns.to_vec();
         self.with_write(move |txn| {
@@ -438,34 +399,6 @@ impl FerroStore {
         name: &str,
         rows: &[Vec<ColumnValue>],
     ) -> Result<(), StoreError> {
-        let committed = self.capture_remote(|remote| {
-            let mut encoded = Vec::with_capacity(rows.len());
-            for row in rows {
-                let mut cells = Vec::with_capacity(row.len());
-                for cell in row {
-                    cells.push(columnar::cell_json(cell)?);
-                }
-                encoded.push(Value::Array(cells));
-            }
-            remote.call_unit("append_column_rows", json!({"name": name, "rows": encoded}))?;
-            if rows.is_empty() {
-                return Ok(Vec::new());
-            }
-            let state = remote.read_state()?;
-            let columns = state
-                .tables
-                .get(name)
-                .map(|table| table.columns.clone())
-                .ok_or_else(|| backend(format!("no column table `{name}`")))?;
-            let bytes = columnar::encode_row_group(&columns, rows)?;
-            Ok(vec![Op::AppendColumnGroup {
-                name: name.to_string(),
-                bytes,
-            }])
-        })?;
-        if let Some(committed) = committed {
-            return after_commit(&self.sync, &committed, false);
-        }
         let name = name.to_string();
         let rows = rows.to_vec();
         self.with_write(move |txn| {
@@ -557,32 +490,6 @@ impl FerroStore {
         ef_construction: u32,
         ef_search: u32,
     ) -> Result<(), StoreError> {
-        let committed = self.capture_remote(|remote| {
-            remote.call_unit(
-                "create_vector_collection",
-                json!({
-                    "name": name,
-                    "dim": dim,
-                    "storage": vector::storage_name(storage),
-                    "metric": vector::metric_name(metric),
-                    "m": m,
-                    "ef_construction": ef_construction,
-                    "ef_search": ef_search,
-                }),
-            )?;
-            Ok(vec![Op::CreateVectorCollection {
-                name: name.to_string(),
-                dim,
-                storage,
-                metric,
-                m,
-                ef_construction,
-                ef_search,
-            }])
-        })?;
-        if let Some(committed) = committed {
-            return after_commit(&self.sync, &committed, false);
-        }
         let name = name.to_string();
         self.with_write(move |txn| {
             vector::check_create(&name, dim, storage, m, ef_construction, ef_search)?;
@@ -612,32 +519,6 @@ impl FerroStore {
         values: &[f32],
         metadata: Option<&Value>,
     ) -> Result<(), StoreError> {
-        let committed = self.capture_remote(|remote| {
-            let mut params = serde_json::Map::new();
-            params.insert("collection".into(), json!(collection));
-            params.insert("id".into(), json!(id));
-            params.insert("values".into(), vector::values_json(values)?);
-            if let Some(metadata) = metadata {
-                params.insert("metadata".into(), metadata.clone());
-            }
-            remote.call_unit("upsert_vector", Value::Object(params))?;
-            let state = remote.read_state()?;
-            let storage = state
-                .vectors
-                .get(collection)
-                .map(|col| col.storage)
-                .ok_or_else(|| backend(format!("no vector collection `{collection}`")))?;
-            let bytes = vector::quantize(storage, values)?;
-            Ok(vec![Op::UpsertVector {
-                collection: collection.to_string(),
-                id: id.to_string(),
-                bytes,
-                metadata: metadata.cloned(),
-            }])
-        })?;
-        if let Some(committed) = committed {
-            return after_commit(&self.sync, &committed, false);
-        }
         let collection = collection.to_string();
         let id = id.to_string();
         let values = values.to_vec();
@@ -668,16 +549,6 @@ impl FerroStore {
 
     /// Delete one vector. A missing id still commits. A missing collection writes nothing.
     pub fn delete_vector(&self, collection: &str, id: &str) -> Result<(), StoreError> {
-        let committed = self.capture_remote(|remote| {
-            remote.call_unit("delete_vector", json!({"collection": collection, "id": id}))?;
-            Ok(vec![Op::DeleteVector {
-                collection: collection.to_string(),
-                id: id.to_string(),
-            }])
-        })?;
-        if let Some(committed) = committed {
-            return after_commit(&self.sync, &committed, false);
-        }
         let collection = collection.to_string();
         let id = id.to_string();
         self.with_write(move |txn| {
@@ -835,43 +706,38 @@ impl FerroStore {
     /// Append one message. The returned sequence starts at 1 per topic and is
     /// not reused after that message document is deleted.
     pub fn publish_mq(&self, topic: &str, key: &str, payload: &Value) -> Result<u64, StoreError> {
-        let published = if let Inner::Remote(remote) = &self.inner {
-            let mq_seq = remote.call_u64(
+        Ok(self.publish_mq_detail(topic, key, payload)?.0)
+    }
+
+    /// Message sequence and the store sequence captured under the document lock.
+    pub(super) fn publish_mq_detail(
+        &self,
+        topic: &str,
+        key: &str,
+        payload: &Value,
+    ) -> Result<(u64, u64), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            let value = remote.call(
                 "publish_mq",
                 json!({"topic": topic, "key": key, "payload": payload}),
             )?;
-            let store_seq = remote.read_state()?.last_seq;
-            Some((
-                mq_seq,
-                Committed {
+            let (mq_seq, store_seq) = parse_publish_result(&value)?;
+            after_commit(
+                &self.sync,
+                &Committed {
                     seq: store_seq,
-                    ops: vec![
-                        Op::Put {
-                            collection: mq_message_collection(topic),
-                            id: mq_seq.to_string(),
-                            doc: json!({"seq": mq_seq, "key": key, "payload": payload}),
-                        },
-                        Op::Put {
-                            collection: mq_hw_collection(topic),
-                            id: MQ_HIGH_WATER_ID.to_string(),
-                            doc: json!({"seq": mq_seq}),
-                        },
-                    ],
+                    ops: mq_publish_ops(topic, key, payload, mq_seq),
                 },
-            ))
-        } else {
-            None
-        };
-        if let Some((mq_seq, committed)) = published {
-            after_commit(&self.sync, &committed, false)?;
-            return Ok(mq_seq);
+                false,
+            )?;
+            return Ok((mq_seq, store_seq));
         }
         let topic_owned = topic.to_string();
         let key_owned = key.to_string();
         let payload = payload.clone();
         // One `with_write`: the message and the high-water share a WAL frame.
         // A crash must not persist either document alone.
-        let record = self.with_write(move |txn| {
+        let (record, store_seq) = self.with_write_outcome(move |txn| {
             let seq = next_mq_seq(&txn.docs, &topic_owned)?;
             let record = MqRecord {
                 seq,
@@ -894,8 +760,9 @@ impl FerroStore {
             );
             Ok(record)
         })?;
+        let store_seq = store_seq.ok_or_else(|| backend("publish_mq did not commit"))?;
         self.notify(topic, &record);
-        Ok(record.seq)
+        Ok((record.seq, store_seq))
     }
 
     /// Oldest messages for `topic` that `group` has not acked, without acking them.
@@ -917,20 +784,6 @@ impl FerroStore {
 
     /// Record an ack. An unknown sequence is still stored.
     pub fn ack_mq(&self, topic: &str, group: &str, seq: u64) -> Result<(), StoreError> {
-        let committed = self.capture_remote(|remote| {
-            remote.call_unit(
-                "ack_mq",
-                json!({"topic": topic, "group": group, "seq": seq}),
-            )?;
-            Ok(vec![Op::Put {
-                collection: format!("mq_ack:{topic}:{group}"),
-                id: seq.to_string(),
-                doc: json!({ "seq": seq }),
-            }])
-        })?;
-        if let Some(committed) = committed {
-            return after_commit(&self.sync, &committed, false);
-        }
         let topic = topic.to_string();
         let group = group.to_string();
         self.commit(
@@ -979,15 +832,14 @@ impl FerroStore {
     }
 
     /// Set `mode` and `adapter` when the pending buffer is empty.
-    pub fn with_sync_adapter(self, mode: SyncMode, adapter: Arc<dyn SyncAdapter>) -> Self {
-        {
-            let mut slot = lock_mutex(&self.sync);
-            if slot.pending.is_empty() {
-                slot.mode = Some(mode);
-                slot.adapter = Some(adapter);
-            }
-        }
-        self
+    /// Pending batches keep the current adapter.
+    pub fn with_sync_adapter(
+        self,
+        mode: SyncMode,
+        adapter: Arc<dyn SyncAdapter>,
+    ) -> Result<Self, StoreError> {
+        self.attach_sync_adapter(mode, adapter)?;
+        Ok(self)
     }
 
     /// Drop the adapter. A pending batch is an error and the adapter stays.
@@ -1088,6 +940,7 @@ impl FerroStore {
     /// list that matches returns `Ok(true)` and does not advance `last_seq`. A
     /// non-empty disk success is one WAL frame at `expected_seq + 1`. Ops that do
     /// not apply return `Err` and write nothing. A remote handle sends `commit_ops`.
+    #[cfg(test)]
     fn commit_if_seq(&self, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
         self.commit_if_seq_inner(expected_seq, ops, false)
     }
@@ -1130,7 +983,7 @@ impl FerroStore {
                 if ops.is_empty() {
                     return Ok(remote.read_state()?.last_seq == expected_seq);
                 }
-                if !remote.commit_ops(expected_seq, ops)? {
+                if !remote.commit_ops(expected_seq, ops, silent)? {
                     return Ok(false);
                 }
                 let seq = expected_seq
@@ -1160,8 +1013,17 @@ impl FerroStore {
     /// The sync adapter runs after that lock is released.
     fn with_write<T>(
         &self,
-        mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
+        body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        Ok(self.with_write_outcome(body)?.0)
+    }
+
+    /// Like [`Self::with_write`]. The sequence was taken before the document
+    /// mutex or disk flock was released. `None` means the body wrote no ops.
+    fn with_write_outcome<T>(
+        &self,
+        mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
+    ) -> Result<(T, Option<u64>), StoreError> {
         match &self.inner {
             Inner::Remote(remote) => {
                 let (result, committed) = loop {
@@ -1177,17 +1039,18 @@ impl FerroStore {
                     if txn.ops.is_empty() {
                         break (result, None);
                     }
-                    if remote.commit_ops(seq_base, &txn.ops)? {
+                    if remote.commit_ops(seq_base, &txn.ops, false)? {
                         let seq = seq_base
                             .checked_add(1)
                             .ok_or_else(|| backend("transaction sequence overflow"))?;
                         break (result, Some(Committed { seq, ops: txn.ops }));
                     }
                 };
+                let seq = committed.as_ref().map(|committed| committed.seq);
                 if let Some(committed) = committed {
                     after_commit(&self.sync, &committed, false)?;
                 }
-                Ok(result)
+                Ok((result, seq))
             }
             Inner::Memory(slot) => {
                 let (result, committed) = {
@@ -1211,17 +1074,19 @@ impl FerroStore {
                     };
                     (result, committed)
                 };
+                let seq = committed.as_ref().map(|committed| committed.seq);
                 if let Some(committed) = committed {
                     after_commit(&self.sync, &committed, false)?;
                 }
-                Ok(result)
+                Ok((result, seq))
             }
             Inner::Disk(disk) => {
                 let (result, committed) = with_write_disk(disk, body)?;
+                let seq = committed.as_ref().map(|committed| committed.seq);
                 if let Some(committed) = committed {
                     after_commit(&self.sync, &committed, false)?;
                 }
-                Ok(result)
+                Ok((result, seq))
             }
         }
     }
@@ -1232,7 +1097,21 @@ impl FerroStore {
         silent: bool,
     ) -> Result<T, StoreError> {
         match &self.inner {
-            Inner::Remote(_) => Err(remote_unsupported()),
+            Inner::Remote(remote) => {
+                let state = remote.read_state()?;
+                let (op, extra) = build(&state)?;
+                let mut expected = state.last_seq;
+                loop {
+                    if remote.commit_ops(expected, std::slice::from_ref(&op), silent)? {
+                        let seq = expected
+                            .checked_add(1)
+                            .ok_or_else(|| backend("transaction sequence overflow"))?;
+                        after_commit(&self.sync, &Committed { seq, ops: vec![op] }, silent)?;
+                        return Ok(extra);
+                    }
+                    expected = remote.read_state()?.last_seq;
+                }
+            }
             Inner::Memory(slot) => {
                 let (extra, committed) = {
                     let mut state = lock_mutex(slot);
@@ -1272,9 +1151,172 @@ impl FerroStore {
         };
         match adapter.fetch_document(collection, id)? {
             None => Ok(None),
-            Some(doc) => {
-                self.put_doc_inner(collection, id, &doc, true)?;
-                Ok(Some(doc))
+            Some(doc) => self.install_fetched_doc(collection, id, doc),
+        }
+    }
+
+    /// Silent put of a cache fill. Does not call `on_commit` or queue the batch.
+    fn install_fetched_doc(
+        &self,
+        collection: &str,
+        id: &str,
+        fetched: Value,
+    ) -> Result<Option<Value>, StoreError> {
+        let key = (collection.to_string(), id.to_string());
+        if let Inner::Remote(remote) = &self.inner {
+            if !lock_mutex(&self.sync).pending.is_empty() {
+                return remote.call_option("get_doc", json!({"collection": collection, "id": id}));
+            }
+            let value = remote.call(
+                "put_doc",
+                json!({
+                    "collection": collection,
+                    "id": id,
+                    "doc": fetched,
+                    "silent": true,
+                    "if_absent": true,
+                }),
+            )?;
+            let (wrote, doc, store_seq) = parse_if_absent(&value)?;
+            if let Some(store_seq) = store_seq {
+                let mut slot = lock_mutex(&self.sync);
+                if wrote && slot.pending.is_empty() && store_seq > slot.synced_seq {
+                    slot.synced_seq = store_seq;
+                }
+            }
+            return Ok(Some(doc));
+        }
+        let mut sync = lock_mutex(&self.sync);
+        match &self.inner {
+            Inner::Remote(_) => unreachable!("remote fill returned above"),
+            Inner::Memory(slot) => {
+                let mut state = lock_mutex(slot);
+                if !sync.pending.is_empty() {
+                    return Ok(state.docs.get(&key).cloned());
+                }
+                if let Some(existing) = state.docs.get(&key).cloned() {
+                    return Ok(Some(existing));
+                }
+                let op = Op::Put {
+                    collection: key.0.clone(),
+                    id: key.1.clone(),
+                    doc: fetched.clone(),
+                };
+                apply_commit(&mut state, op)?;
+                let seq = state.last_seq;
+                if sync.pending.is_empty() && seq > sync.synced_seq {
+                    sync.synced_seq = seq;
+                }
+                Ok(Some(fetched))
+            }
+            Inner::Disk(disk) => {
+                let file = lock_mutex(&disk.write);
+                let _locked = FlockGuard::acquire(file.as_raw_fd())?;
+                let (index, sb, state) = read_consistent(&file)?;
+                if !sync.pending.is_empty() {
+                    return Ok(state.docs.get(&key).cloned());
+                }
+                if let Some(existing) = state.docs.get(&key).cloned() {
+                    return Ok(Some(existing));
+                }
+                let op = Op::Put {
+                    collection: key.0.clone(),
+                    id: key.1.clone(),
+                    doc: fetched.clone(),
+                };
+                let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
+                let frame = encode_frame(seq, std::slice::from_ref(&op))?;
+                append_frame(&file, index, &sb, &frame)?;
+                if sync.pending.is_empty() && seq > sync.synced_seq {
+                    sync.synced_seq = seq;
+                }
+                Ok(Some(fetched))
+            }
+        }
+    }
+
+    /// Conditional put used by a remote cache fill. The document lock covers
+    /// the absence check and the write. `store_seq` is taken before that lock
+    /// is released.
+    fn put_if_absent(
+        &self,
+        collection: &str,
+        id: &str,
+        doc: &Value,
+        silent: bool,
+    ) -> Result<IfAbsent, StoreError> {
+        let key = (collection.to_string(), id.to_string());
+        match &self.inner {
+            Inner::Remote(_) => Err(backend(
+                "if_absent put is local to the store that owns the file",
+            )),
+            Inner::Memory(slot) => {
+                let committed = {
+                    let mut state = lock_mutex(slot);
+                    if let Some(existing) = state.docs.get(&key).cloned() {
+                        return Ok(IfAbsent {
+                            wrote: false,
+                            doc: existing,
+                            store_seq: None,
+                        });
+                    }
+                    let op = Op::Put {
+                        collection: key.0.clone(),
+                        id: key.1.clone(),
+                        doc: doc.clone(),
+                    };
+                    apply_commit(&mut state, op.clone())?;
+                    (state.last_seq, op)
+                };
+                after_commit(
+                    &self.sync,
+                    &Committed {
+                        seq: committed.0,
+                        ops: vec![committed.1],
+                    },
+                    silent,
+                )?;
+                Ok(IfAbsent {
+                    wrote: true,
+                    doc: doc.clone(),
+                    store_seq: Some(committed.0),
+                })
+            }
+            Inner::Disk(disk) => {
+                let committed = {
+                    let file = lock_mutex(&disk.write);
+                    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
+                    let (index, sb, state) = read_consistent(&file)?;
+                    if let Some(existing) = state.docs.get(&key).cloned() {
+                        return Ok(IfAbsent {
+                            wrote: false,
+                            doc: existing,
+                            store_seq: None,
+                        });
+                    }
+                    let op = Op::Put {
+                        collection: key.0,
+                        id: key.1,
+                        doc: doc.clone(),
+                    };
+                    let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
+                    let frame = encode_frame(seq, std::slice::from_ref(&op))?;
+                    append_frame(&file, index, &sb, &frame)?;
+                    (seq, op)
+                };
+                after_commit(
+                    &self.sync,
+                    &Committed {
+                        seq: committed.0,
+                        ops: vec![committed.1],
+                    },
+                    silent,
+                )?;
+                Ok(IfAbsent {
+                    wrote: true,
+                    doc: doc.clone(),
+                    store_seq: Some(committed.0),
+                })
             }
         }
     }
@@ -1297,54 +1339,49 @@ impl FerroStore {
     }
 
     fn apply_inbound(&self, batches: Vec<SyncBatch>) -> Result<u64, StoreError> {
+        self.apply_sync_batches(batches, true)
+    }
+
+    /// Dry-run every batch, then publish them in one critical section.
+    /// `silent` does not call `on_commit`. An empty list returns `synced_seq`.
+    fn apply_sync_batches(&self, batches: Vec<SyncBatch>, silent: bool) -> Result<u64, StoreError> {
         if batches.is_empty() {
             return Ok(self.synced_seq());
         }
-        self.require_sync_idle()?;
-        let mut expect = self.read_state()?.last_seq;
-        for batch in &batches {
-            expect = expect
-                .checked_add(1)
-                .ok_or_else(|| backend("transaction sequence overflow"))?;
-            if batch.seq != expect || batch.ops.is_empty() {
-                return Err(backend(format!(
-                    "sync batch sequence {} is not the next commit {expect}",
-                    batch.seq
-                )));
+        if let Inner::Remote(remote) = &self.inner {
+            self.require_sync_idle()?;
+            let seq = remote.apply_sync_batches(&batches, silent)?;
+            let mut slot = lock_mutex(&self.sync);
+            if slot.pending.is_empty() && seq > slot.synced_seq {
+                slot.synced_seq = seq;
             }
+            return Ok(seq);
         }
-        self.require_sync_idle()?;
-        for batch in batches {
-            let seq = batch
-                .seq
-                .checked_sub(1)
-                .ok_or_else(|| backend("sync batch sequence is zero"))?;
-            let ops = batch
-                .ops
-                .into_iter()
-                .map(SyncOp::into_op)
-                .collect::<Vec<_>>();
-            if !self.commit_if_seq_inner(seq, &ops, true)? {
-                return Err(backend("sync batch was not applied"));
+        let mut slot = lock_mutex(&self.sync);
+        if !slot.pending.is_empty() {
+            return Err(backend(
+                "cannot apply sync batches while commits are pending",
+            ));
+        }
+        let (seq, prepared) = publish_sync_batches(&self.inner, &batches)?;
+        if silent {
+            if seq > slot.synced_seq {
+                slot.synced_seq = seq;
             }
+            return Ok(seq);
         }
-        Ok(self.synced_seq())
-    }
-
-    /// `Some` when this handle is remote: the RPC already ran. `None` is local.
-    fn capture_remote(
-        &self,
-        call: impl FnOnce(&server::RemoteClient) -> Result<Vec<Op>, StoreError>,
-    ) -> Result<Option<Committed>, StoreError> {
-        let Inner::Remote(remote) = &self.inner else {
-            return Ok(None);
-        };
-        let ops = call(remote)?;
-        if ops.is_empty() {
-            return Ok(Some(Committed { seq: 0, ops }));
+        drop(slot);
+        for batch in prepared {
+            after_commit(
+                &self.sync,
+                &Committed {
+                    seq: batch.seq,
+                    ops: batch.ops,
+                },
+                false,
+            )?;
         }
-        let seq = remote.read_state()?.last_seq;
-        Ok(Some(Committed { seq, ops }))
+        Ok(seq)
     }
 
     fn notify(&self, topic: &str, record: &MqRecord) {
@@ -1359,8 +1396,133 @@ impl FerroStore {
     }
 }
 
-fn remote_unsupported() -> StoreError {
-    backend("a remote FerroStore does not run a local transaction")
+struct IfAbsent {
+    wrote: bool,
+    doc: Value,
+    store_seq: Option<u64>,
+}
+
+fn parse_publish_result(value: &Value) -> Result<(u64, u64), StoreError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| backend("publish_mq result is not an object"))?;
+    let seq = obj
+        .get("seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| backend("publish_mq result is missing seq"))?;
+    let store_seq = obj
+        .get("store_seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| backend("publish_mq result is missing store_seq"))?;
+    Ok((seq, store_seq))
+}
+
+fn parse_if_absent(value: &Value) -> Result<(bool, Value, Option<u64>), StoreError> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| backend("put_doc if_absent result is not an object"))?;
+    let wrote = obj
+        .get("wrote")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| backend("put_doc if_absent result is missing wrote"))?;
+    let doc = obj
+        .get("doc")
+        .cloned()
+        .ok_or_else(|| backend("put_doc if_absent result is missing doc"))?;
+    if !wrote {
+        return Ok((false, doc, None));
+    }
+    let store_seq = obj
+        .get("store_seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| backend("put_doc if_absent result is missing store_seq"))?;
+    Ok((true, doc, Some(store_seq)))
+}
+
+fn mq_publish_ops(topic: &str, key: &str, payload: &Value, mq_seq: u64) -> Vec<Op> {
+    vec![
+        Op::Put {
+            collection: mq_message_collection(topic),
+            id: mq_seq.to_string(),
+            doc: json!({"seq": mq_seq, "key": key, "payload": payload}),
+        },
+        Op::Put {
+            collection: mq_hw_collection(topic),
+            id: MQ_HIGH_WATER_ID.to_string(),
+            doc: json!({"seq": mq_seq}),
+        },
+    ]
+}
+
+struct PreparedBatch {
+    seq: u64,
+    ops: Vec<Op>,
+}
+
+fn prepare_sync_batches(
+    state: &DocState,
+    batches: &[SyncBatch],
+) -> Result<(DocState, Vec<PreparedBatch>), StoreError> {
+    let mut scratch = state.clone();
+    let mut expect = state.last_seq;
+    let mut prepared = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let next = expect
+            .checked_add(1)
+            .ok_or_else(|| backend("transaction sequence overflow"))?;
+        if batch.seq != next || batch.ops.is_empty() {
+            return Err(backend(format!(
+                "sync batch sequence {} is not the next commit {next}",
+                batch.seq
+            )));
+        }
+        let ops = batch
+            .ops
+            .iter()
+            .cloned()
+            .map(SyncOp::into_op)
+            .collect::<Vec<_>>();
+        scratch = stage_ops(scratch, &ops)?;
+        expect = next;
+        prepared.push(PreparedBatch {
+            seq: batch.seq,
+            ops,
+        });
+    }
+    Ok((scratch, prepared))
+}
+
+fn publish_sync_batches(
+    inner: &Inner,
+    batches: &[SyncBatch],
+) -> Result<(u64, Vec<PreparedBatch>), StoreError> {
+    match inner {
+        Inner::Remote(_) => Err(backend(
+            "a remote FerroStore does not publish sync batches locally",
+        )),
+        Inner::Memory(slot) => {
+            let mut state = lock_mutex(slot);
+            let (next, prepared) = prepare_sync_batches(&state, batches)?;
+            let seq = next.last_seq;
+            *state = next;
+            Ok((seq, prepared))
+        }
+        Inner::Disk(disk) => {
+            let file = lock_mutex(&disk.write);
+            let _locked = FlockGuard::acquire(file.as_raw_fd())?;
+            let (mut index, mut sb, state) = read_consistent(&file)?;
+            let (next, prepared) = prepare_sync_batches(&state, batches)?;
+            let mut frames = Vec::with_capacity(prepared.len());
+            for batch in &prepared {
+                frames.push(encode_frame(batch.seq, &batch.ops)?);
+            }
+            for frame in &frames {
+                sb = append_frame(&file, index, &sb, frame)?;
+                index ^= 1;
+            }
+            Ok((next.last_seq, prepared))
+        }
+    }
 }
 
 fn hybrid_params(
@@ -1510,7 +1672,14 @@ fn after_commit(
             return Ok(());
         };
         match slot.mode {
-            Some(SyncMode::WriteThrough) => adapter,
+            Some(SyncMode::WriteThrough) => {
+                if !slot.pending.is_empty() || slot.notify_in_flight {
+                    slot.pending.push(batch);
+                    return Ok(());
+                }
+                slot.notify_in_flight = true;
+                adapter
+            }
             Some(SyncMode::WriteBehind | SyncMode::LocalCache | SyncMode::CloudPreCache) => {
                 slot.pending.push(batch);
                 return Ok(());
@@ -1518,17 +1687,18 @@ fn after_commit(
             None => return Ok(()),
         }
     };
-    match adapter.on_commit(&batch) {
+    let result = adapter.on_commit(&batch);
+    let mut slot = lock_mutex(sync);
+    slot.notify_in_flight = false;
+    match result {
         Ok(()) => {
-            let mut slot = lock_mutex(sync);
             if batch.seq > slot.synced_seq {
                 slot.synced_seq = batch.seq;
             }
             Ok(())
         }
         Err(err) => {
-            let mut slot = lock_mutex(sync);
-            slot.pending.push(batch);
+            slot.pending.insert(0, batch);
             Err(err)
         }
     }
@@ -1586,7 +1756,7 @@ fn append_frame(
     index: usize,
     sb: &Superblock,
     frame: &[u8],
-) -> Result<(), StoreError> {
+) -> Result<Superblock, StoreError> {
     let frame_len = u64::try_from(frame.len()).map_err(|_| backend("wal frame exceeds u64"))?;
     let at = sb
         .wal_offset
@@ -1610,7 +1780,7 @@ fn append_frame(
     };
     write_slot(file, index ^ 1, &new_sb)?;
     file.sync_all().map_err(io_err)?;
-    Ok(())
+    Ok(new_sb)
 }
 
 fn init_empty(file: &File) -> Result<(), StoreError> {

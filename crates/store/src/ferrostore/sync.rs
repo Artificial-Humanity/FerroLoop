@@ -12,11 +12,13 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SyncOp {
+    #[serde(rename = "put")]
     PutDoc {
         collection: String,
         id: String,
         doc: Value,
     },
+    #[serde(rename = "delete")]
     DeleteDoc {
         collection: String,
         id: String,
@@ -247,10 +249,11 @@ fn de_metadata<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Valu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ferrostore::FerroStore;
+    use crate::ferrostore::{FerroStore, FerroStoreServer};
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::thread;
 
     fn assert_roundtrip(op: Op) {
         let sync = SyncOp::from_op(&op);
@@ -382,8 +385,14 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_value(&batch).unwrap(),
-            json!({"seq": 3, "ops": [{"op": "delete_doc", "collection": "docs", "id": "a"}]})
+            json!({"seq": 3, "ops": [{"op": "delete", "collection": "docs", "id": "a"}]})
         );
+        let put = SyncOp::PutDoc {
+            collection: "docs".into(),
+            id: "a".into(),
+            doc: json!({"n": 1}),
+        };
+        assert_eq!(serde_json::to_value(&put).unwrap()["op"], "put");
     }
 
     struct FakeSync {
@@ -447,7 +456,8 @@ mod tests {
     fn attach(mode: SyncMode) -> (FerroStore, Arc<FakeSync>) {
         let fake = Arc::new(FakeSync::new());
         let store = FerroStore::in_memory()
-            .with_sync_adapter(mode, Arc::clone(&fake) as Arc<dyn SyncAdapter>);
+            .with_sync_adapter(mode, Arc::clone(&fake) as Arc<dyn SyncAdapter>)
+            .unwrap();
         (store, fake)
     }
 
@@ -663,13 +673,405 @@ mod tests {
 
     #[test]
     fn default_adapter_methods_pull_prewarm_and_miss() {
-        let store = FerroStore::in_memory().with_sync_adapter(
-            SyncMode::LocalCache,
-            Arc::new(NameOnly) as Arc<dyn SyncAdapter>,
-        );
+        let store = FerroStore::in_memory()
+            .with_sync_adapter(
+                SyncMode::LocalCache,
+                Arc::new(NameOnly) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
         assert_eq!(store.sync_pull().unwrap(), store.synced_seq());
         assert_eq!(store.sync_prewarm(&["docs"]).unwrap(), store.synced_seq());
         assert_eq!(store.synced_seq(), 0);
         assert_eq!(store.get_doc("docs", "missing").unwrap(), None);
+    }
+
+    #[test]
+    fn failed_write_through_queues_the_next_commit_until_flush() {
+        let (store, fake) = attach(SyncMode::WriteThrough);
+        fake.fail.store(true, Ordering::SeqCst);
+        let err = store.put_doc("docs", "a", &json!({"n": 1})).unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
+        assert!(fake.commits().is_empty());
+        assert_eq!(store.synced_seq(), 0);
+
+        fake.fail.store(false, Ordering::SeqCst);
+        store.put_doc("docs", "b", &json!({"n": 2})).unwrap();
+        assert!(
+            fake.commits().is_empty(),
+            "a later commit is queued, not delivered"
+        );
+        assert_eq!(store.get_doc("docs", "b").unwrap(), Some(json!({"n": 2})));
+        assert_eq!(store.synced_seq(), 0);
+
+        assert_eq!(store.sync_flush().unwrap(), 2);
+        assert_eq!(
+            fake.commits()
+                .iter()
+                .map(|batch| batch.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(store.synced_seq(), 2);
+
+        store.put_doc("docs", "c", &json!({"n": 3})).unwrap();
+        assert_eq!(fake.commits().len(), 3);
+        assert_eq!(fake.commits()[2].seq, 3);
+        assert_eq!(store.synced_seq(), 3);
+    }
+
+    struct HoldFirst {
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        commits: Mutex<Vec<u64>>,
+    }
+
+    impl SyncAdapter for HoldFirst {
+        fn name(&self) -> &str {
+            "hold-first"
+        }
+
+        fn on_commit(&self, batch: &SyncBatch) -> Result<(), StoreError> {
+            if batch.seq == 1 {
+                {
+                    let (lock, cv) = &*self.entered;
+                    *lock.lock().unwrap() = true;
+                    cv.notify_all();
+                }
+                let (lock, cv) = &*self.release;
+                let mut guard = lock.lock().unwrap();
+                while !*guard {
+                    guard = cv.wait(guard).unwrap();
+                }
+            }
+            self.commits.lock().unwrap().push(batch.seq);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_through_in_flight_queues_the_next_commit() {
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let adapter = Arc::new(HoldFirst {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            commits: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(
+            FerroStore::in_memory()
+                .with_sync_adapter(
+                    SyncMode::WriteThrough,
+                    Arc::clone(&adapter) as Arc<dyn SyncAdapter>,
+                )
+                .unwrap(),
+        );
+        let worker = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "a", &json!({"n": 1})).unwrap())
+        };
+        {
+            let (lock, cv) = &*entered;
+            let mut guard = lock.lock().unwrap();
+            while !*guard {
+                guard = cv.wait(guard).unwrap();
+            }
+        }
+        store.put_doc("docs", "b", &json!({"n": 2})).unwrap();
+        assert!(adapter.commits.lock().unwrap().is_empty());
+        {
+            let (lock, cv) = &*release;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+        worker.join().unwrap();
+        assert_eq!(adapter.commits.lock().unwrap().as_slice(), &[1]);
+        assert_eq!(store.synced_seq(), 1);
+        assert_eq!(store.sync_flush().unwrap(), 2);
+        assert_eq!(adapter.commits.lock().unwrap().as_slice(), &[1, 2]);
+        assert_eq!(store.synced_seq(), 2);
+    }
+
+    fn bad_second_batch() -> Vec<SyncBatch> {
+        vec![
+            SyncBatch {
+                seq: 1,
+                ops: vec![SyncOp::PutDoc {
+                    collection: "docs".into(),
+                    id: "a".into(),
+                    doc: json!({"n": 1}),
+                }],
+            },
+            SyncBatch {
+                seq: 2,
+                ops: vec![SyncOp::DeleteVector {
+                    collection: "missing".into(),
+                    id: "x".into(),
+                }],
+            },
+        ]
+    }
+
+    #[test]
+    fn multi_batch_pull_with_a_bad_later_op_writes_nothing() {
+        let (store, fake) = attach(SyncMode::WriteBehind);
+        *fake.pull.lock().unwrap() = bad_second_batch();
+        assert!(matches!(
+            store.sync_pull().unwrap_err(),
+            StoreError::Backend(_)
+        ));
+        assert_eq!(store.get_doc("docs", "a").unwrap(), None);
+        assert_eq!(store.synced_seq(), 0);
+        assert_eq!(store.read_state().unwrap().last_seq, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pull.fls");
+        let store = FerroStore::open(&path).unwrap();
+        store
+            .attach_sync_adapter(
+                SyncMode::WriteBehind,
+                Arc::clone(&fake) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.sync_pull().unwrap_err(),
+            StoreError::Backend(_)
+        ));
+        assert_eq!(store.synced_seq(), 0);
+        drop(store);
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(store.get_doc("docs", "a").unwrap(), None);
+        assert_eq!(store.read_state().unwrap().last_seq, 0);
+    }
+
+    #[test]
+    fn with_sync_adapter_while_pending_keeps_the_original_adapter() {
+        let original = Arc::new(FakeSync::new());
+        let store = FerroStore::in_memory()
+            .with_sync_adapter(
+                SyncMode::WriteBehind,
+                Arc::clone(&original) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+        store.put_doc("docs", "a", &json!({"n": 1})).unwrap();
+        let replacement = Arc::new(FakeSync::new());
+        let err = store
+            .attach_sync_adapter(
+                SyncMode::WriteThrough,
+                Arc::clone(&replacement) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref message) if message == "cannot attach a sync adapter while batches are pending"),
+            "{err}"
+        );
+        assert_eq!(store.sync_mode(), Some(SyncMode::WriteBehind));
+        assert_eq!(store.synced_seq(), 0);
+        assert_eq!(store.sync_flush().unwrap(), 1);
+        assert_eq!(original.commits().len(), 1);
+        assert_eq!(original.commits()[0].seq, 1);
+        assert!(replacement.commits().is_empty());
+
+        let original = Arc::new(FakeSync::new());
+        let store = FerroStore::in_memory()
+            .with_sync_adapter(
+                SyncMode::WriteBehind,
+                Arc::clone(&original) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+        store.put_doc("docs", "b", &json!({"n": 2})).unwrap();
+        let failed = store.with_sync_adapter(
+            SyncMode::CloudPreCache,
+            Arc::new(FakeSync::new()) as Arc<dyn SyncAdapter>,
+        );
+        let err = match failed {
+            Ok(_) => panic!("attached a sync adapter while batches are pending"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, StoreError::Backend(ref message) if message == "cannot attach a sync adapter while batches are pending"),
+            "{err}"
+        );
+    }
+
+    struct FetchThenPut {
+        put: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+        fetches: AtomicUsize,
+    }
+
+    impl SyncAdapter for FetchThenPut {
+        fn name(&self) -> &str {
+            "fetch-then-put"
+        }
+
+        fn on_commit(&self, _batch: &SyncBatch) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        fn fetch_document(&self, _: &str, _: &str) -> Result<Option<Value>, StoreError> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            if let Some(put) = self.put.lock().unwrap().as_ref() {
+                put();
+            }
+            Ok(Some(json!({"stale": true})))
+        }
+    }
+
+    fn assert_fill_keeps_the_callback_put(store: FerroStore) {
+        let fetch = Arc::new(FetchThenPut {
+            put: Mutex::new(None),
+            fetches: AtomicUsize::new(0),
+        });
+        let store = store
+            .with_sync_adapter(
+                SyncMode::LocalCache,
+                Arc::clone(&fetch) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+        let addr = &store as *const FerroStore as usize;
+        // `get_doc` calls `fetch_document` on this stack, before `store` moves.
+        *fetch.put.lock().unwrap() = Some(Box::new(move || {
+            let store = unsafe { &*(addr as *const FerroStore) };
+            store.put_doc("docs", "a", &json!({"fresh": true})).unwrap();
+        }));
+        assert_eq!(
+            store.get_doc("docs", "a").unwrap(),
+            Some(json!({"fresh": true}))
+        );
+        assert_eq!(
+            store.get_doc("docs", "a").unwrap(),
+            Some(json!({"fresh": true}))
+        );
+        assert_eq!(fetch.fetches.load(Ordering::SeqCst), 1);
+        store.put_doc("docs", "n", &Value::Null).unwrap();
+        let before = fetch.fetches.load(Ordering::SeqCst);
+        assert_eq!(store.get_doc("docs", "n").unwrap(), Some(Value::Null));
+        assert_eq!(fetch.fetches.load(Ordering::SeqCst), before);
+    }
+
+    #[test]
+    fn cache_fill_does_not_overwrite_a_document_inserted_during_fetch() {
+        assert_fill_keeps_the_callback_put(FerroStore::in_memory());
+        let dir = tempfile::tempdir().unwrap();
+        assert_fill_keeps_the_callback_put(FerroStore::open(dir.path().join("fill.fls")).unwrap());
+    }
+
+    #[test]
+    fn remote_put_doc_reports_the_commit_seq_not_a_later_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("seq.sock");
+        let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+        let uri = format!("unix://{}", sock.display());
+        let client = FerroStore::connect_uri(&uri).unwrap();
+        let fake = Arc::new(FakeSync::new());
+        client
+            .attach_sync_adapter(
+                SyncMode::WriteThrough,
+                Arc::clone(&fake) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+        client.put_doc("docs", "a", &json!({"n": 1})).unwrap();
+        assert_eq!(fake.commits()[0].seq, 1);
+        assert_eq!(server.store().read_state().unwrap().last_seq, 1);
+
+        let other = FerroStore::connect_uri(&uri).unwrap();
+        other.put_doc("docs", "c", &json!({"n": 9})).unwrap();
+        client.put_doc("docs", "b", &json!({"n": 2})).unwrap();
+        assert_eq!(
+            fake.commits()
+                .iter()
+                .map(|batch| batch.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(server.store().read_state().unwrap().last_seq, 3);
+        drop(other);
+        drop(client);
+        drop(server);
+    }
+
+    #[test]
+    fn remote_silent_fill_pull_and_prewarm_skip_the_server_adapter() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("silent.sock");
+        let server_fake = Arc::new(FakeSync::new());
+        let server_store = FerroStore::in_memory();
+        server_store
+            .attach_sync_adapter(
+                SyncMode::WriteThrough,
+                Arc::clone(&server_fake) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+        let server = FerroStoreServer::bind_unix(&sock, server_store).unwrap();
+        let uri = format!("unix://{}", sock.display());
+        let client = FerroStore::connect_uri(&uri).unwrap();
+        let client_fake = Arc::new(FakeSync::new());
+        client
+            .attach_sync_adapter(
+                SyncMode::WriteThrough,
+                Arc::clone(&client_fake) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+        client.put_doc("docs", "loud", &json!({"n": 1})).unwrap();
+        assert_eq!(server_fake.commits().len(), 1);
+        assert_eq!(server_fake.commits()[0].seq, 1);
+        assert_eq!(client_fake.commits().len(), 1);
+        client.detach_sync_adapter().unwrap();
+        client
+            .attach_sync_adapter(
+                SyncMode::LocalCache,
+                Arc::clone(&client_fake) as Arc<dyn SyncAdapter>,
+            )
+            .unwrap();
+
+        *client_fake.fetch.lock().unwrap() = Some(json!({"cached": true}));
+        let server_commits = server_fake.commits().len();
+        assert_eq!(
+            client.get_doc("docs", "cached").unwrap(),
+            Some(json!({"cached": true}))
+        );
+        assert_eq!(server_fake.commits().len(), server_commits);
+        assert_eq!(
+            server.store().get_doc("docs", "cached").unwrap(),
+            Some(json!({"cached": true}))
+        );
+        assert_eq!(client_fake.commits().len(), 1);
+
+        let next = server.store().read_state().unwrap().last_seq + 1;
+        *client_fake.pull.lock().unwrap() = vec![SyncBatch {
+            seq: next,
+            ops: vec![SyncOp::PutDoc {
+                collection: "docs".into(),
+                id: "pulled".into(),
+                doc: json!({"from": "pull"}),
+            }],
+        }];
+        assert_eq!(client.sync_pull().unwrap(), next);
+        assert_eq!(server_fake.commits().len(), server_commits);
+        assert_eq!(
+            server.store().get_doc("docs", "pulled").unwrap(),
+            Some(json!({"from": "pull"}))
+        );
+        assert_eq!(client.synced_seq(), next);
+
+        let warm = next + 1;
+        *client_fake.prewarm.lock().unwrap() = vec![SyncBatch {
+            seq: warm,
+            ops: vec![SyncOp::PutDoc {
+                collection: "docs".into(),
+                id: "warm".into(),
+                doc: json!({"from": "prewarm"}),
+            }],
+        }];
+        assert_eq!(client.sync_prewarm(&["docs"]).unwrap(), warm);
+        assert_eq!(server_fake.commits().len(), server_commits);
+        assert_eq!(
+            server.store().get_doc("docs", "warm").unwrap(),
+            Some(json!({"from": "prewarm"}))
+        );
+        assert_eq!(client.synced_seq(), warm);
+        assert_eq!(client_fake.commits().len(), 1);
+        drop(client);
+        drop(server);
     }
 }
