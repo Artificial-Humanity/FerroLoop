@@ -6,6 +6,7 @@ pub mod api;
 pub mod auth;
 mod direct_quota;
 pub mod discovery;
+pub mod nodes;
 pub mod terminal;
 pub mod ws;
 
@@ -41,6 +42,12 @@ pub use discovery::{
     list_git_worktrees, parse_jsonl_transcript, read_session_context_usage_with_home,
     read_session_quota_usage_with_home, read_session_transcript, read_session_transcript_with_home,
     read_worktree_diff, scan_cargo_architecture_conformance, scan_workspace_for_arch,
+};
+pub use nodes::{
+    EnrollFail, EnrollTokenInfo, EnrollWorker, EnrolledWorker, EnsureHubArgs, HeartbeatFail,
+    HeartbeatUpdate, NodeRecord, NodeView, RevokeFail, detect_capabilities, enroll_worker,
+    ensure_hub_node, find_hub_node, list_visible_nodes, local_hostname, mint_enroll_token,
+    node_status, node_token_matches, revoke_node, touch_node,
 };
 pub use terminal::{TerminalManager, TerminalSession};
 pub use ws::{HubServer, HubWsClient, compute_accept_key, try_parse_ws_frame};
