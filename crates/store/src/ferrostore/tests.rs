@@ -2395,6 +2395,81 @@ fn bad_width_and_a_second_create_write_nothing() {
 }
 
 #[test]
+fn a_column_frame_that_does_not_apply_leaves_the_document_and_seq() {
+    let duplicate = || {
+        let create = Op::CreateColumnTable {
+            name: "t".into(),
+            columns: int_column(),
+        };
+        vec![create.clone(), create]
+    };
+    let exercise = |store: &FerroStore| {
+        store
+            .put_doc("docs", "a", &json!({ "kept": true }))
+            .unwrap();
+        let seq = store.read_state().unwrap().last_seq;
+        let err = store.commit_if_seq(seq, &duplicate()).unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert_eq!(
+            store.get_doc("docs", "a").unwrap(),
+            Some(json!({ "kept": true }))
+        );
+        assert_eq!(store.read_state().unwrap().last_seq, seq);
+        let empty = Op::CreateColumnTable {
+            name: String::new(),
+            columns: int_column(),
+        };
+        let err = store.commit_if_seq(seq, &[empty]).unwrap_err();
+        assert!(err.to_string().contains("empty"), "{err}");
+        assert_eq!(store.read_state().unwrap().last_seq, seq);
+        assert_eq!(
+            store.get_doc("docs", "a").unwrap(),
+            Some(json!({ "kept": true }))
+        );
+        store.create_column_table("t", &int_column()).unwrap();
+        assert_eq!(store.read_state().unwrap().last_seq, seq + 1);
+        assert!(store.scan_column_table("t", &[]).unwrap().rows.is_empty());
+    };
+
+    exercise(&FerroStore::in_memory());
+
+    let (_dir, path) = temp_fls();
+    let seq = {
+        let store = FerroStore::open(&path).unwrap();
+        store
+            .put_doc("docs", "a", &json!({ "kept": true }))
+            .unwrap();
+        let seq = store.read_state().unwrap().last_seq;
+        let frames = committed_frames(&path).len();
+        let err = store.commit_if_seq(seq, &duplicate()).unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)), "{err}");
+        assert_eq!(
+            store.get_doc("docs", "a").unwrap(),
+            Some(json!({ "kept": true }))
+        );
+        assert_eq!(store.read_state().unwrap().last_seq, seq);
+        assert_eq!(committed_frames(&path).len(), frames);
+        seq
+    };
+    {
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_doc("docs", "a").unwrap(),
+            Some(json!({ "kept": true }))
+        );
+        assert_eq!(store.read_state().unwrap().last_seq, seq);
+        store.create_column_table("t", &int_column()).unwrap();
+        assert!(store.scan_column_table("t", &[]).unwrap().rows.is_empty());
+    }
+    let store = FerroStore::open(&path).unwrap();
+    assert_eq!(
+        store.get_doc("docs", "a").unwrap(),
+        Some(json!({ "kept": true }))
+    );
+    assert!(store.scan_column_table("t", &[]).unwrap().rows.is_empty());
+}
+
+#[test]
 fn column_rows_survive_reopen_and_a_version_2_checkpoint() {
     let (_dir, path) = temp_fls();
     {

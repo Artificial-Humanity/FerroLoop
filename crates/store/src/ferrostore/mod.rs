@@ -25,7 +25,7 @@ use layout::{
 use serde_json::{Value, json};
 use state::{
     DocState, MQ_HIGH_WATER_ID, apply_commit, apply_frames, commit_ops, mq_hw_collection,
-    mq_message_collection, next_mq_seq, unread_mq,
+    mq_message_collection, next_mq_seq, stage_ops, unread_mq,
 };
 
 pub use columnar::{
@@ -572,8 +572,9 @@ impl FerroStore {
     ///
     /// `Ok(false)` means the sequence moved and nothing was written. An empty `ops`
     /// list that matches returns `Ok(true)` and does not advance `last_seq`. A
-    /// non-empty disk success is one WAL frame at `expected_seq + 1`. Remote
-    /// handles do not call this; the server's store is memory or disk.
+    /// non-empty disk success is one WAL frame at `expected_seq + 1`. Ops that do
+    /// not apply return `Err` and write nothing. Remote handles do not call this;
+    /// the server's store is memory or disk.
     fn commit_if_seq(&self, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
         match &self.inner {
             Inner::Memory(slot) => {
@@ -709,9 +710,7 @@ fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<bool
     if ops.is_empty() {
         return Ok(true);
     }
-    let seq = expected_seq
-        .checked_add(1)
-        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let seq = stage_ops(state, ops)?.last_seq;
     let frame = encode_frame(seq, ops)?;
     append_frame(&file, index, &sb, &frame)?;
     Ok(true)
@@ -724,7 +723,7 @@ fn with_write_disk<T>(
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
     let (index, sb, state) = read_consistent(&file)?;
-    let seq_base = state.last_seq;
+    let baseline = state.clone();
     let mut txn = Txn {
         docs: state.docs,
         tables: state.tables,
@@ -734,9 +733,7 @@ fn with_write_disk<T>(
     if txn.ops.is_empty() {
         return Ok(result);
     }
-    let seq = seq_base
-        .checked_add(1)
-        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let seq = stage_ops(baseline, &txn.ops)?.last_seq;
     let frame = encode_frame(seq, &txn.ops)?;
     append_frame(&file, index, &sb, &frame)?;
     Ok(result)
@@ -750,10 +747,7 @@ fn commit_disk<T>(
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
     let (index, sb, state) = read_consistent(&file)?;
     let (op, extra) = build(&state)?;
-    let seq = state
-        .last_seq
-        .checked_add(1)
-        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
     let frame = encode_frame(seq, std::slice::from_ref(&op))?;
     append_frame(&file, index, &sb, &frame)?;
     Ok(extra)

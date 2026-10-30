@@ -39,19 +39,26 @@ pub(super) fn apply_commit(state: &mut DocState, op: Op) -> Result<(), StoreErro
 }
 
 /// Apply every op, then advance `last_seq` by one. An empty list writes nothing.
+/// `state` is replaced only when every op applies.
 pub(super) fn commit_ops(state: &mut DocState, ops: &[Op]) -> Result<(), StoreError> {
     if ops.is_empty() {
         return Ok(());
     }
+    *state = stage_ops(state.clone(), ops)?;
+    Ok(())
+}
+
+/// Owned copy of `state` after every op applies. `last_seq` is one past `state`.
+pub(super) fn stage_ops(mut state: DocState, ops: &[Op]) -> Result<DocState, StoreError> {
     let seq = state
         .last_seq
         .checked_add(1)
         .ok_or_else(|| backend("transaction sequence overflow"))?;
     for op in ops {
-        apply_op(state, op)?;
+        apply_op(&mut state, op)?;
     }
     state.last_seq = seq;
-    Ok(())
+    Ok(state)
 }
 
 pub(super) fn apply_frames(
@@ -112,6 +119,7 @@ fn apply_op(state: &mut DocState, op: &Op) -> Result<(), StoreError> {
             state.docs.remove(&(collection.clone(), id.clone()));
         }
         Op::CreateColumnTable { name, columns } => {
+            reject_empty_table(name)?;
             if state.tables.contains_key(name) {
                 return Err(corrupt(format!("column table `{name}` already exists")));
             }
@@ -124,11 +132,19 @@ fn apply_op(state: &mut DocState, op: &Op) -> Result<(), StoreError> {
             );
         }
         Op::AppendColumnGroup { name, bytes } => {
+            reject_empty_table(name)?;
             let Some(table) = state.tables.get_mut(name) else {
                 return Err(corrupt(format!("append to missing column table `{name}`")));
             };
             table.groups.push(bytes.clone());
         }
+    }
+    Ok(())
+}
+
+fn reject_empty_table(name: &str) -> Result<(), StoreError> {
+    if name.is_empty() {
+        return Err(corrupt("column table name is empty"));
     }
     Ok(())
 }
