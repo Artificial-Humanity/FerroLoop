@@ -57,8 +57,23 @@ pub(super) fn apply_frames(
     snapshot_seq: u64,
     frames: &[(u64, Vec<Op>)],
 ) -> Result<(), StoreError> {
+    let mut previous = None;
     let mut expect = snapshot_seq;
     for (seq, _) in frames {
+        if *seq == 0 {
+            return Err(corrupt("wal sequence is zero"));
+        }
+        if let Some(prev) = previous
+            && *seq <= prev
+        {
+            return Err(corrupt(format!(
+                "wal sequence is not strictly increasing: previous {prev}, found {seq}"
+            )));
+        }
+        previous = Some(*seq);
+        if *seq <= snapshot_seq {
+            continue;
+        }
         expect = expect
             .checked_add(1)
             .ok_or_else(|| corrupt("transaction sequence overflow"))?;
@@ -69,6 +84,9 @@ pub(super) fn apply_frames(
         }
     }
     for (seq, ops) in frames {
+        if *seq <= snapshot_seq {
+            continue;
+        }
         for op in ops {
             apply_op(state, op);
         }

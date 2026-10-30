@@ -534,14 +534,28 @@ fn init_empty(file: &File) -> Result<(), StoreError> {
     Ok(())
 }
 
-// No valid slot yet. Publish slot 0 only when the file is empty or no longer
-// than the header. A longer file is not a torn create and is not rewritten.
+// No valid slot yet. Publish slot 0 only for an empty file, or when every byte
+// already in a file no longer than the header is zero. A non-zero short file
+// is not rewritten, and neither is a longer file.
 fn ensure_superblock(file: &File) -> Result<(), StoreError> {
     if parsed_superblock(file)?.is_some() {
         return Ok(());
     }
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
-    if parsed_superblock(file)?.is_some() || file.metadata().map_err(io_err)?.len() > HEADER_BYTES {
+    if parsed_superblock(file)?.is_some() {
+        return Ok(());
+    }
+    let len = file.metadata().map_err(io_err)?.len();
+    if len > HEADER_BYTES {
+        return Ok(());
+    }
+    if len == 0 {
+        return init_empty(file);
+    }
+    let n = usize::try_from(len).map_err(|_| backend("short file length exceeds usize"))?;
+    let mut buf = vec![0u8; n];
+    file.read_exact_at(&mut buf, 0).map_err(io_err)?;
+    if buf.iter().any(|byte| *byte != 0) {
         return Ok(());
     }
     init_empty(file)

@@ -1231,3 +1231,227 @@ fn migration_refuses_a_non_empty_store_and_an_empty_redb_stays_empty() {
             .is_none()
     );
 }
+
+#[test]
+fn nonzero_short_file_is_not_initialized() {
+    let (_dir, path) = temp_fls();
+    {
+        let file = File::create(&path).unwrap();
+        file.write_all_at(&[0x01], 0).unwrap();
+        file.sync_all().unwrap();
+    }
+    let err = match FerroStore::open(&path) {
+        Ok(_) => panic!("open initialized a one-byte non-zero file"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(
+        matches!(err, StoreError::Backend(_)) && msg.contains("no valid FerroStore superblock"),
+        "{msg}"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 1);
+    let file = File::open(&path).unwrap();
+    let mut buf = [0u8; 1];
+    file.read_exact_at(&mut buf, 0).unwrap();
+    assert_eq!(buf, [0x01]);
+
+    let (_dir, path) = temp_fls();
+    {
+        FerroStore::open(&path).unwrap();
+    }
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+    let created = slots(&path);
+    assert!(created[0].is_some());
+    assert!(created[1].is_none());
+    corrupt_live_crc(&path);
+    assert!(slots(&path).iter().all(Option::is_none));
+    let file = File::open(&path).unwrap();
+    let mut before = [0u8; 8192];
+    file.read_exact_at(&mut before, 0).unwrap();
+    drop(file);
+    let err = match FerroStore::open(&path) {
+        Ok(_) => panic!("open rewrote a header whose live crc was torn"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(
+        matches!(err, StoreError::Backend(_)) && msg.contains("no valid FerroStore superblock"),
+        "{msg}"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+    let file = File::open(&path).unwrap();
+    let mut after = [0u8; 8192];
+    file.read_exact_at(&mut after, 0).unwrap();
+    assert_eq!(after, before);
+
+    let (_dir, path) = temp_fls();
+    {
+        let file = File::create(&path).unwrap();
+        file.write_all_at(&[0x00], 0).unwrap();
+        file.sync_all().unwrap();
+    }
+    FerroStore::open(&path).unwrap();
+    assert_eq!(slots(&path)[0].unwrap().epoch, 1);
+    assert!(slots(&path)[1].is_none());
+}
+
+#[test]
+fn parse_superblock_rejects_epoch_zero_and_illegal_extents() {
+    let legal = Superblock {
+        epoch: 1,
+        snapshot_offset: 8192,
+        snapshot_length: 0,
+        wal_offset: 8192,
+        wal_length: 0,
+        snapshot_seq: 0,
+    };
+    assert_eq!(
+        layout::parse_superblock(&layout::encode_superblock(&legal)),
+        Some(legal)
+    );
+
+    let mut epoch_zero = legal;
+    epoch_zero.epoch = 0;
+    assert!(layout::parse_superblock(&layout::encode_superblock(&epoch_zero)).is_none());
+
+    let mut snapshot_short = legal;
+    snapshot_short.snapshot_offset = 8191;
+    assert!(layout::parse_superblock(&layout::encode_superblock(&snapshot_short)).is_none());
+
+    let mut wal_inside_header = legal;
+    wal_inside_header.wal_offset = 0;
+    wal_inside_header.wal_length = 0;
+    assert!(layout::parse_superblock(&layout::encode_superblock(&wal_inside_header)).is_none());
+
+    let mut snapshot_wraps = legal;
+    snapshot_wraps.snapshot_offset = 8192;
+    snapshot_wraps.snapshot_length = u64::MAX;
+    assert!(layout::parse_superblock(&layout::encode_superblock(&snapshot_wraps)).is_none());
+
+    let mut wal_wraps = legal;
+    wal_wraps.wal_offset = 8192;
+    wal_wraps.wal_length = u64::MAX;
+    assert!(layout::parse_superblock(&layout::encode_superblock(&wal_wraps)).is_none());
+}
+
+#[test]
+fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
+    let put = |id: &str| Op::Put {
+        collection: "docs".into(),
+        id: id.into(),
+        doc: json!(id),
+    };
+    let assert_corrupt = |err: StoreError| {
+        let msg = err.to_string();
+        assert!(
+            matches!(err, StoreError::Backend(_)) && msg.contains("corrupt"),
+            "{msg}"
+        );
+    };
+
+    let mut state = super::state::DocState::at_seq(0);
+    let err = super::state::apply_frames(&mut state, 0, &[(0, vec![put("zero")])]).unwrap_err();
+    assert_corrupt(err);
+    assert!(state.docs.is_empty());
+    assert_eq!(state.last_seq, 0);
+
+    let mut state = super::state::DocState::at_seq(10);
+    state
+        .docs
+        .insert(("docs".into(), "kept".into()), json!("kept"));
+    let err = super::state::apply_frames(
+        &mut state,
+        10,
+        &[(9, vec![put("down")]), (8, vec![put("lower")])],
+    )
+    .unwrap_err();
+    assert_corrupt(err);
+    assert_eq!(
+        state.docs.get(&("docs".into(), "kept".into())),
+        Some(&json!("kept"))
+    );
+    assert_eq!(state.docs.len(), 1);
+    assert_eq!(state.last_seq, 10);
+
+    let mut state = super::state::DocState::at_seq(10);
+    state
+        .docs
+        .insert(("docs".into(), "kept".into()), json!("kept"));
+    let err = super::state::apply_frames(
+        &mut state,
+        10,
+        &[(8, vec![put("dup")]), (8, vec![put("again")])],
+    )
+    .unwrap_err();
+    assert_corrupt(err);
+    assert_eq!(
+        state.docs.get(&("docs".into(), "kept".into())),
+        Some(&json!("kept"))
+    );
+    assert_eq!(state.docs.len(), 1);
+    assert_eq!(state.last_seq, 10);
+
+    let mut state = super::state::DocState::at_seq(2);
+    state
+        .docs
+        .insert(("docs".into(), "kept".into()), json!("kept"));
+    super::state::apply_frames(
+        &mut state,
+        2,
+        &[
+            (1, vec![put("skip-a")]),
+            (2, vec![put("skip-b")]),
+            (3, vec![put("new")]),
+        ],
+    )
+    .unwrap();
+    assert_eq!(
+        state.docs.get(&("docs".into(), "kept".into())),
+        Some(&json!("kept"))
+    );
+    assert_eq!(
+        state.docs.get(&("docs".into(), "new".into())),
+        Some(&json!("new"))
+    );
+    assert!(!state.docs.contains_key(&("docs".into(), "skip-a".into())));
+    assert!(!state.docs.contains_key(&("docs".into(), "skip-b".into())));
+    assert_eq!(state.last_seq, 3);
+
+    let mut state = super::state::DocState::at_seq(5);
+    super::state::apply_frames(
+        &mut state,
+        5,
+        &[(3, vec![put("old")]), (4, vec![put("older")])],
+    )
+    .unwrap();
+    assert!(state.docs.is_empty());
+    assert_eq!(state.last_seq, 5);
+
+    let mut state = super::state::DocState::at_seq(5);
+    let err = super::state::apply_frames(
+        &mut state,
+        5,
+        &[(4, vec![put("skip")]), (7, vec![put("gap")])],
+    )
+    .unwrap_err();
+    assert_corrupt(err);
+    assert!(state.docs.is_empty());
+    assert_eq!(state.last_seq, 5);
+
+    let mut state = super::state::DocState::at_seq(0);
+    super::state::apply_frames(
+        &mut state,
+        0,
+        &[(1, vec![put("one")]), (2, vec![put("two")])],
+    )
+    .unwrap();
+    assert_eq!(
+        state.docs.get(&("docs".into(), "one".into())),
+        Some(&json!("one"))
+    );
+    assert_eq!(
+        state.docs.get(&("docs".into(), "two".into())),
+        Some(&json!("two"))
+    );
+    assert_eq!(state.last_seq, 2);
+}

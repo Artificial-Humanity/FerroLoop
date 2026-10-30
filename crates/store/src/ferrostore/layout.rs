@@ -79,12 +79,25 @@ pub(super) fn parse_superblock(buf: &[u8]) -> Option<Superblock> {
     if buf[64..].iter().any(|byte| *byte != 0) {
         return None;
     }
+    let epoch = u64_at(buf, 12)?;
+    let snapshot_offset = u64_at(buf, 24)?;
+    let snapshot_length = u64_at(buf, 32)?;
+    let wal_offset = u64_at(buf, 40)?;
+    let wal_length = u64_at(buf, 48)?;
+    if epoch == 0
+        || snapshot_offset < HEADER_BYTES
+        || wal_offset < HEADER_BYTES
+        || snapshot_offset.checked_add(snapshot_length).is_none()
+        || wal_offset.checked_add(wal_length).is_none()
+    {
+        return None;
+    }
     Some(Superblock {
-        epoch: u64_at(buf, 12)?,
-        snapshot_offset: u64_at(buf, 24)?,
-        snapshot_length: u64_at(buf, 32)?,
-        wal_offset: u64_at(buf, 40)?,
-        wal_length: u64_at(buf, 48)?,
+        epoch,
+        snapshot_offset,
+        snapshot_length,
+        wal_offset,
+        wal_length,
         snapshot_seq: u64_at(buf, 56)?,
     })
 }
