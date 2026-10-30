@@ -34,7 +34,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
 
@@ -137,6 +138,7 @@ impl Txn {
 /// `mem://` keeps the map in this process. `file://` is a `.fls` container:
 /// two superblock slots, a copy-on-write snapshot, and a CRC32-framed WAL.
 /// `unix://` and `ws://` are clients of a [`FerroStoreServer`] and do not open the file.
+/// [`Self::auto`] is that client when the default socket is listening, and [`Self::open`] otherwise.
 pub struct FerroStore {
     inner: Inner,
     subs: Mutex<HashMap<String, Vec<Sender<MqRecord>>>>,
@@ -179,6 +181,31 @@ impl FerroStore {
             subs: Mutex::new(HashMap::new()),
             label: path.display().to_string(),
         })
+    }
+
+    /// If `default_socket_path_for_store(path)` accepts a Unix connection, return a client of that server.
+    /// Otherwise `open(path)` in embedded mode.
+    ///
+    /// The successful `UnixStream` is the client. It is not dropped in favor of a second connect.
+    /// A refused connect (nothing listening, or no socket file) is the embedded fallback, not an error.
+    /// `open` errors are still returned.
+    pub fn auto(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref();
+        let sock = default_socket_path_for_store(path);
+        match UnixStream::connect(&sock) {
+            Ok(stream) => {
+                let remote = server::client_from_unix(stream)?;
+                Ok(Self {
+                    inner: Inner::Remote(remote),
+                    subs: Mutex::new(HashMap::new()),
+                    label: sock.display().to_string(),
+                })
+            }
+            // Nothing listening, or the socket file is missing. Other connect
+            // errors stay errors. `open` errors are not swallowed.
+            Err(err) if refused_connect(&err) => Self::open(path),
+            Err(err) => Err(backend(format!("connect {}: {err}", sock.display()))),
+        }
     }
 
     /// `mem://`, `file://`, `unix://`, and `ws://`. `wss://` is recognized and refused.
@@ -466,6 +493,27 @@ impl FerroStore {
 
 fn remote_unsupported() -> StoreError {
     backend("a remote FerroStore does not run a local transaction")
+}
+
+/// `dir/store.fls` -> `dir/store.fls.sock`.
+/// A path with no file name (`/` or `..`) -> that path joined with `ferrostore.sock`.
+pub fn default_socket_path_for_store(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    match path.file_name() {
+        Some(name) => {
+            let mut sock_name = name.to_os_string();
+            sock_name.push(".sock");
+            path.with_file_name(sock_name)
+        }
+        None => path.join("ferrostore.sock"),
+    }
+}
+
+fn refused_connect(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+    )
 }
 
 fn file_uri_path(rest: &str) -> String {

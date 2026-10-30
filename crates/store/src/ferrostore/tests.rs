@@ -1,5 +1,8 @@
 use super::layout::{self, Op, Superblock};
-use super::{FerroStore, FerroStoreServer, file_uri_path, latest_superblock, write_slot};
+use super::{
+    FerroStore, FerroStoreServer, default_socket_path_for_store, file_uri_path, latest_superblock,
+    write_slot,
+};
 use fl_core::StoreError;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -1893,4 +1896,68 @@ fn apply_frames_skips_snapshot_prefix_and_rejects_bad_seqs() {
         Some(&json!("two"))
     );
     assert_eq!(state.last_seq, 2);
+}
+
+#[test]
+fn default_socket_path_for_store_names_the_socket_beside_the_file() {
+    let path = default_socket_path_for_store("dir/store.fls");
+    assert_eq!(path, PathBuf::from("dir/store.fls.sock"));
+    assert!(path.ends_with("store.fls.sock"));
+    assert_eq!(path.parent(), Some(Path::new("dir")));
+    assert_eq!(
+        default_socket_path_for_store("/"),
+        PathBuf::from("/ferrostore.sock")
+    );
+    assert_eq!(
+        default_socket_path_for_store(".."),
+        PathBuf::from("../ferrostore.sock")
+    );
+}
+
+#[test]
+fn auto_uses_the_listening_socket_and_otherwise_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.fls");
+
+    {
+        let store = FerroStore::auto(&path).unwrap();
+        store.put_doc("docs", "local", &json!({"n": 1})).unwrap();
+    }
+    let opened = FerroStore::open(&path).unwrap();
+    assert_eq!(opened.get_doc("docs", "local").unwrap().unwrap()["n"], 1);
+    drop(opened);
+
+    // A socket file with nobody listening is a refused connect, not an error.
+    let sock = default_socket_path_for_store(&path);
+    drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+    {
+        let store = FerroStore::auto(&path).unwrap();
+        store.put_doc("docs", "stale", &json!({"n": 4})).unwrap();
+    }
+    let opened = FerroStore::open(&path).unwrap();
+    assert_eq!(opened.get_doc("docs", "stale").unwrap().unwrap()["n"], 4);
+    drop(opened);
+
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&path).unwrap()).unwrap();
+    let client = FerroStore::auto(&path).unwrap();
+    let err = match client.with_read(|_| Ok(())) {
+        Ok(()) => panic!("auto opened the file beside a listening socket"),
+        Err(err) => err,
+    };
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    client.put_doc("docs", "remote", &json!({"n": 2})).unwrap();
+    assert_eq!(
+        server.store().get_doc("docs", "remote").unwrap().unwrap()["n"],
+        2
+    );
+    drop(client);
+    drop(server);
+
+    let client = FerroStore::auto(&path).unwrap();
+    assert_eq!(client.get_doc("docs", "remote").unwrap().unwrap()["n"], 2);
+    client.put_doc("docs", "again", &json!({"n": 3})).unwrap();
+    drop(client);
+    let opened = FerroStore::open(&path).unwrap();
+    assert_eq!(opened.get_doc("docs", "again").unwrap().unwrap()["n"], 3);
+    assert_eq!(opened.get_doc("docs", "remote").unwrap().unwrap()["n"], 2);
 }

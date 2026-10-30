@@ -881,6 +881,10 @@ impl Drop for RemoteClient {
 pub(super) fn connect_unix(path: &str) -> Result<RemoteClient, StoreError> {
     let stream =
         UnixStream::connect(path).map_err(|err| backend(format!("connect {path}: {err}")))?;
+    client_from_unix(stream)
+}
+
+pub(super) fn client_from_unix(stream: UnixStream) -> Result<RemoteClient, StoreError> {
     let writer = stream
         .try_clone()
         .map_err(|err| backend(format!("clone unix stream: {err}")))?;

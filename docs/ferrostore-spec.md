@@ -1,6 +1,6 @@
 # FerroStore
 
-FerroStore is the phase 1 storage engine. It keeps an object/document collection and a FerroMQ log in one `.fls` file, or entirely in memory. Later phases add network serving, columnar storage, and vector search; this version does not implement them.
+FerroStore keeps an object/document collection and a FerroMQ log in one `.fls` file, or entirely in memory. Phase 2 serves that store over a Unix socket or `ws://`. Columnar storage and vector search are later phases; this version does not implement them.
 
 Integers on disk are little-endian. The CRC-32 is ISO-HDLC: polynomial `0xEDB88320`, init `0xFFFFFFFF`, xorout `0xFFFFFFFF` (the reflected zlib polynomial). A checksum covers the bytes named below and nothing else.
 
@@ -144,10 +144,54 @@ Phase 1 implements two of the four native models.
 | `file:///tmp/x.fls` | `open` of absolute `/tmp/x.fls` |
 | `file://localhost/tmp/x.fls` | `open` of absolute `/tmp/x.fls` |
 | `file://rel/x.fls` | `open` of relative `rel/x.fls` |
-| `unix://...`, `ws://...`, `wss://...` | `StoreError::Backend` whose message contains `Phase 2` and does not say the scheme is unknown |
+| `unix:///tmp/x.sock`, `unix://localhost/tmp/x.sock` | Client of absolute `/tmp/x.sock`. Served |
+| `unix://rel/x.sock` | Client of relative `rel/x.sock`. Served |
+| `ws://127.0.0.1:9`, `ws://127.0.0.1:9/store` | Client of that WebSocket endpoint. Served |
+| `wss://...` | `StoreError::Backend`. The message names `wss` and does not say the scheme is unknown |
 | Anything else, including `""` and `http://` | `StoreError::Backend` whose message contains `unknown` and does not describe the scheme as deferred |
 
-`file://` paths are not percent-decoded. Only the host `localhost` is stripped; any other non-empty host is part of a relative path.
+`file://` and `unix://` paths are not percent-decoded. Only the host `localhost` is stripped; any other non-empty host is part of a relative path. A failed `unix://` or `ws://` connect is `StoreError::Backend`. It is not an unknown scheme.
+
+## Served mode
+
+Phase 2 is this served mode. The process that binds a `FerroStoreServer` is the only opener of the `.fls` file. Clients do not take `flock` and do not open the file.
+
+A Unix frame is a 4-byte big-endian length followed by that many bytes of UTF-8 JSON. The length is `1..=16MiB` (`16 * 1024 * 1024`). A length of zero or a longer payload is an error.
+
+A WebSocket message is one JSON object in one RFC 6455 frame. Client frames are masked. Server frames are not. The payload has no length prefix. The JSON payload is `1..=16MiB`. `wss://` is recognized and refused with a message that does not say the scheme is unknown.
+
+Each call is one JSON object:
+
+```json
+{"id": 1, "method": "put_doc", "params": {}}
+```
+
+`id` is an integer chosen by the client. Success is `{"id": 1, "ok": true, "result": ...}`. Failure is `{"id": 1, "ok": false, "error": "..."}`.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `put_doc` | `collection`, `id`, `doc` | `null` |
+| `get_doc` | `collection`, `id` | `null` when the id is missing. A present value, including JSON `null`, is `{"doc": <value>}` |
+| `delete_doc` | `collection`, `id` | `null` |
+| `query_by_field` | `collection`, `field`, `value` | array of id strings |
+| `search_bm25` | `collection`, `query`, `limit` | array of `[id, score]` |
+| `publish_mq` | `topic`, `key`, `payload` | the sequence number |
+| `poll_mq_group` | `topic`, `group`, `limit` | array of `{"seq", "key", "payload"}` |
+| `ack_mq` | `topic`, `group`, `seq` | `null` |
+| `checkpoint` | none | `null` |
+| `subscribe_mq` | `topic` | `null`, then push frames |
+
+`subscribe_mq` does not replay history. A later publish on that topic is pushed on the same connection as a frame with no `id`:
+
+```json
+{"method": "mq", "params": {"topic": "orders", "record": {"seq": 1, "key": "k", "payload": {}}}}
+```
+
+## Auto
+
+`default_socket_path_for_store(path)` appends `.sock` to the file name. `dir/store.fls` is `dir/store.fls.sock`. A path with no file name (`/` or `..`) is that path joined with `ferrostore.sock`.
+
+`FerroStore::auto(path)` connects to that socket. When the connect is accepted, the handle is a client of that server, and that connection is the client: it does not connect again. A refused connect — nothing listening, or the socket file missing — opens `path` in embedded mode and is not an error. An error from `open` is still returned.
 
 ## Documents
 
@@ -196,10 +240,8 @@ Subscribers are in-process only: a `Mutex<Vec<Sender<MqRecord>>>` map. `publish_
 
 Phase 1 (Record 14) is this engine: the `.fls` container, `mem://`, `file://`, the document store, and FerroMQ.
 
-Phase 2 (Record 13) is served mode: Unix-socket and WebSocket RPC, and the auto-broker. `unix://`, `ws://`, and `wss://` are recognized and refused until then.
+Phase 2 (Record 13) is served mode: Unix-socket and WebSocket RPC, and `FerroStore::auto`. `unix://` and `ws://` are served. `wss://` is recognized and refused.
 
-Phase 3 is the columnar model (row groups, RLE/delta, zone maps).
+Phase 3 is the columnar model (row groups, RLE/delta, zone maps). It is not implemented.
 
-Phase 4 is the vector model (`f32` / `f16` / `i8` embeddings, HNSW, hybrid BM25+vector).
-
-This crate does not implement phases 2–4.
+Phase 4 is the vector model (`f32` / `f16` / `i8` embeddings, HNSW, hybrid BM25+vector). It is not implemented.

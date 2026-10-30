@@ -19,7 +19,9 @@ pub mod manifest;
 pub mod state;
 pub mod workflow;
 
-pub use ferrostore::{FerroStore, FerroStoreServer, migrate_redb_to_ferrostore};
+pub use ferrostore::{
+    FerroStore, FerroStoreServer, default_socket_path_for_store, migrate_redb_to_ferrostore,
+};
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};
 
