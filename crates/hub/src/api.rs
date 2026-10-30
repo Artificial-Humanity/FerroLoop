@@ -717,6 +717,32 @@ fn authorize_node_heartbeat<'a>(
     }
 }
 
+fn ensure_primary_hub(state: &HubState, store: &RedbStore, now_ms: u64) -> Result<(), String> {
+    let (node_id, display_name) = match find_hub_node(store)? {
+        Some(hub) => (hub.node_id, hub.display_name),
+        None => {
+            let hostname = local_hostname();
+            (hostname.clone(), hostname)
+        }
+    };
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let listen_addr = (!state.config.listen.is_empty()).then(|| state.config.listen.clone());
+    ensure_hub_node(
+        store,
+        EnsureHubArgs {
+            node_id,
+            display_name,
+            hostname: local_hostname(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            listen_addr,
+            capabilities: detect_capabilities(&path_env),
+            now_ms,
+        },
+    )?;
+    Ok(())
+}
+
 fn handle_post_node_enroll(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let body = match json_object_body(req) {
         Ok(body) => body,
@@ -729,6 +755,9 @@ fn handle_post_node_enroll(state: &HubState, req: &HttpRequest) -> HttpResponse 
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
     };
+    if let Err(err) = ensure_primary_hub(state, &store, stamp::now().unix_millis()) {
+        return HttpResponse::json(500, json!({ "error": err }));
+    }
     match enroll_worker(&store, worker) {
         Ok(enrolled) => HttpResponse::json(
             200,
@@ -818,29 +847,7 @@ fn handle_get_nodes(state: &HubState) -> HttpResponse {
         return store_open_failure();
     };
     let now_ms = stamp::now().unix_millis();
-    let (node_id, display_name) = match find_hub_node(&store) {
-        Ok(Some(hub)) => (hub.node_id, hub.display_name),
-        Ok(None) => {
-            let hostname = local_hostname();
-            (hostname.clone(), hostname)
-        }
-        Err(err) => return HttpResponse::json(500, json!({ "error": err })),
-    };
-    let path_env = std::env::var("PATH").unwrap_or_default();
-    let listen_addr = (!state.config.listen.is_empty()).then(|| state.config.listen.clone());
-    if let Err(err) = ensure_hub_node(
-        &store,
-        EnsureHubArgs {
-            node_id,
-            display_name,
-            hostname: local_hostname(),
-            os: std::env::consts::OS.to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-            listen_addr,
-            capabilities: detect_capabilities(&path_env),
-            now_ms,
-        },
-    ) {
+    if let Err(err) = ensure_primary_hub(state, &store, now_ms) {
         return HttpResponse::json(500, json!({ "error": err }));
     }
     match list_visible_nodes(&store, now_ms) {

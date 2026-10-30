@@ -2574,8 +2574,59 @@ mod tests {
             hub["listen_addr"].as_str(),
             Some(state.config.listen.as_str())
         );
+        assert_eq!(hub["hostname"], local_hostname());
+        assert_eq!(hub["os"], std::env::consts::OS);
+        assert_eq!(hub["arch"], std::env::consts::ARCH);
+        assert!(hub["capabilities"].is_array());
         let hub_id = hub["node_id"].as_str().unwrap().to_string();
         assert_eq!(owner_json["nodes"].as_array().unwrap().len(), 1);
+
+        let hub_code_resp = http_call(&state, "POST", "/api/v1/nodes/enroll-token", owner, None);
+        assert_eq!(
+            hub_code_resp.status,
+            200,
+            "{}",
+            response_text(&hub_code_resp)
+        );
+        let hub_code = hub_code_resp.json_value().unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let over_hub = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&json!({
+                "code": hub_code,
+                "node_id": hub_id,
+                "display_name": "Not the hub",
+                "hostname": "worker-host",
+                "os": "linux",
+                "arch": "x86_64"
+            })),
+        );
+        assert_eq!(over_hub.status, 400, "{}", response_text(&over_hub));
+        let spare_after_hub = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&json!({
+                "code": hub_code,
+                "node_id": "worker-after-hub",
+                "display_name": "After Hub",
+                "hostname": "worker-host",
+                "os": "linux",
+                "arch": "x86_64"
+            })),
+        );
+        assert_eq!(
+            spare_after_hub.status,
+            200,
+            "{}",
+            response_text(&spare_after_hub)
+        );
 
         let peer_list = http_call(&state, "GET", "/api/v1/nodes", peer, None);
         assert_eq!(peer_list.status, 200, "{}", response_text(&peer_list));
@@ -2633,6 +2684,10 @@ mod tests {
         assert_eq!(enrolled.status, 200, "{}", response_text(&enrolled));
         let enrolled_json = enrolled.json_value().unwrap();
         assert_eq!(enrolled_json["node_id"], "worker-a");
+        assert_eq!(
+            enrolled_json["hub_url"],
+            format!("http://{}", state.config.listen)
+        );
         let node_token = enrolled_json["node_token"].as_str().unwrap().to_string();
         assert!(!node_token.is_empty());
 
@@ -2680,6 +2735,33 @@ mod tests {
         let beat_json = beat.json_value().unwrap();
         assert_eq!(beat_json["node_id"], "worker-a");
         assert_eq!(beat_json["status"], "online");
+        assert!(beat_json["last_seen_at_ms"].as_u64().unwrap() > 0);
+
+        let owner_beat = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/worker-a/heartbeat",
+            owner,
+            None,
+        );
+        assert_eq!(owner_beat.status, 200, "{}", response_text(&owner_beat));
+        let peer_beat = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/worker-a/heartbeat",
+            peer,
+            None,
+        );
+        assert_eq!(peer_beat.status, 200, "{}", response_text(&peer_beat));
+
+        let missing_beat = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/missing-node/heartbeat",
+            owner,
+            None,
+        );
+        assert_eq!(missing_beat.status, 404, "{}", response_text(&missing_beat));
 
         let after_beat = http_call(&state, "GET", "/api/v1/nodes", owner, None);
         let after_nodes = after_beat.json_value().unwrap()["nodes"]
@@ -2795,5 +2877,80 @@ mod tests {
         );
         assert_eq!(expired.status, 401, "{}", response_text(&expired));
         assert!(response_text(&expired).contains("expired"));
+
+        let wrong_code = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&json!({
+                "code": "not-a-real-code",
+                "node_id": "worker-bad-code",
+                "display_name": "Bad Code",
+                "hostname": "worker-host",
+                "os": "linux",
+                "arch": "x86_64"
+            })),
+        );
+        assert_eq!(wrong_code.status, 401, "{}", response_text(&wrong_code));
+        assert!(response_text(&wrong_code).contains("invalid"));
+    }
+
+    #[test]
+    fn http_enroll_local_hostname_before_get_rejects_and_keeps_code() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let owner = Some("owner-tok-secret");
+        let minted = http_call(&state, "POST", "/api/v1/nodes/enroll-token", owner, None);
+        assert_eq!(minted.status, 200, "{}", response_text(&minted));
+        let code = minted.json_value().unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let host_id = local_hostname();
+        let rejected = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&json!({
+                "code": code,
+                "node_id": host_id,
+                "display_name": "Taken Host",
+                "hostname": "worker-host",
+                "os": "linux",
+                "arch": "x86_64"
+            })),
+        );
+        assert_eq!(rejected.status, 400, "{}", response_text(&rejected));
+
+        let spare_id = if host_id.eq_ignore_ascii_case("worker-after-host") {
+            "worker-after-host-b"
+        } else {
+            "worker-after-host"
+        };
+        let enrolled = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&json!({
+                "code": code,
+                "node_id": spare_id,
+                "display_name": "Spare Worker",
+                "hostname": "worker-host",
+                "os": "linux",
+                "arch": "x86_64"
+            })),
+        );
+        assert_eq!(enrolled.status, 200, "{}", response_text(&enrolled));
+
+        let listed = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+        assert_eq!(listed.status, 200, "{}", response_text(&listed));
+        let nodes = listed.json_value().unwrap()["nodes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(nodes.iter().any(|node| node["role"] == "hub"));
     }
 }
