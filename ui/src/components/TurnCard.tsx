@@ -82,6 +82,27 @@ export interface ParsedTurnAttachment {
   isImage: boolean;
 }
 
+/**
+ * Strip Antigravity web/mobile `<USER_REQUEST>` and `<ADDITIONAL_METADATA>` wrappers
+ * (and `<EPHEMERAL_MESSAGE>` outer tags) so operator and notice turns render cleanly.
+ */
+export function stripAgyUserRequestWrapper(content: string): string {
+  if (!content) {
+    return "";
+  }
+  return content
+    .replace(/<ADDITIONAL_METADATA>[\s\S]*?<\/ADDITIONAL_METADATA>/gi, "")
+    .replace(/<USER_REQUEST>([\s\S]*?)<\/USER_REQUEST>/gi, (_full, inner: string) =>
+      inner.trim(),
+    )
+    .replace(
+      /<EPHEMERAL_MESSAGE>([\s\S]*?)<\/EPHEMERAL_MESSAGE>/gi,
+      (_full, inner: string) => inner.trim(),
+    )
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export function extractTurnAttachments(content: string): {
   cleanedContent: string;
   attachments: ParsedTurnAttachment[];
@@ -89,9 +110,10 @@ export function extractTurnAttachments(content: string): {
   if (!content) {
     return { cleanedContent: "", attachments: [] };
   }
+  const stripped = stripAgyUserRequestWrapper(content);
   const attachments: ParsedTurnAttachment[] = [];
   const attachmentRegex = /\[Attached file:\s*([^\])\n]+?)(?:\s+\(([^)\n]+)\))?\]/g;
-  const cleanedContent = content
+  const cleanedContent = stripped
     .replace(attachmentRegex, (_full, rawPath: string, rawUrl?: string) => {
       const path = rawPath.trim();
       const url = rawUrl ? rawUrl.trim() : undefined;
@@ -115,29 +137,38 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   onOpenArtifact,
 }) => {
   const roleNormalized = (turn.role || "assistant").toLowerCase();
+  const trimmedStart = turn.content.trimStart();
   // Defensive: hub normalization can mislabel background task completions
   // as operator turns; the content shape is unambiguous tool output.
   const looksLikeBackgroundTaskOutput = /^Task id "[^"]+" finished with result:/i.test(
-    turn.content.trimStart(),
+    trimmedStart,
   );
   // Defensive: raw system/code snippet dumps can be mislabeled as user turns.
-  const looksLikeSystemCodeDump = /^"\)\r?\n\d+:\s/.test(turn.content.trimStart());
+  const looksLikeSystemCodeDump = /^"\)\r?\n\d+:\s/.test(trimmedStart);
+  // Defensive: Antigravity [Notice], <EPHEMERAL_MESSAGE>, and non-operator <SYSTEM_MESSAGE>
+  // blocks arrive with role === "user" but represent system notices.
+  const looksLikeSystemNotice =
+    /^\[Notice\]\s/i.test(trimmedStart) ||
+    /^<EPHEMERAL_MESSAGE>/i.test(trimmedStart) ||
+    (/^<SYSTEM_MESSAGE>/i.test(trimmedStart) &&
+      !trimmedStart.includes("[Operator Prompt via FerroDeck"));
   const isUser =
     roleNormalized === "user" &&
     !looksLikeBackgroundTaskOutput &&
-    !looksLikeSystemCodeDump;
+    !looksLikeSystemCodeDump &&
+    !looksLikeSystemNotice;
   const isWire = roleNormalized.startsWith("wire:");
   const wireSender = isWire ? turn.role.slice(5) : null;
   const isSystem =
     roleNormalized === "system" ||
-    (roleNormalized === "user" && looksLikeSystemCodeDump);
+    (roleNormalized === "user" && (looksLikeSystemCodeDump || looksLikeSystemNotice));
   const isToolOutput =
     roleNormalized === "tool" ||
     looksLikeBackgroundTaskOutput ||
     (!isUser &&
       !isSystem &&
       !isWire &&
-      turn.content.trimStart().startsWith("Created At:") &&
+      trimmedStart.startsWith("Created At:") &&
       (!turn.tool_calls || turn.tool_calls.length === 0));
 
   const [toolOutputExpanded, setToolOutputExpanded] = React.useState(false);

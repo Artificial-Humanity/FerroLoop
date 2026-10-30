@@ -695,3 +695,174 @@ describe("App theme toggle", () => {
     unmount();
   });
 });
+
+describe("Agent switch transcript isolation", () => {
+  it("immediately clears/swaps previous agent turns on switch and ignores stale in-flight poll responses", async () => {
+    let resolvePendingFerrisPoll = null as ((res: Response) => void) | null;
+    let resolvePendingJarvisFetch = null as ((res: Response) => void) | null;
+    let holdFerrisPoll = false;
+    let holdJarvisFetch = false;
+
+    const fetchImpl = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (body: unknown) =>
+        Promise.resolve(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+
+      if (url.includes("/api/v1/auth/session")) {
+        return json({
+          authenticated: true,
+          authority: { tier: "owner", login: "lmcfarlin" },
+        });
+      }
+      if (url.includes("/api/v1/sessions") && !url.includes("/transcript")) {
+        return json({
+          sessions: [
+            {
+              id: "sess-ferris",
+              source: "route",
+              adapter: "claude",
+              persona: "ferris",
+              status: "active",
+              updated_at: "t1",
+            },
+            {
+              id: "sess-jarvis",
+              source: "route",
+              adapter: "claude",
+              persona: "jarvis",
+              status: "active",
+              updated_at: "t1",
+            },
+          ],
+        });
+      }
+      if (url.includes("/sess-ferris/transcript") || url.includes("/ferris/transcript")) {
+        if (!holdFerrisPoll) {
+          return json({
+            session_id: "sess-ferris",
+            turns: [
+              turn({
+                index: 1,
+                role: "assistant",
+                content: "Ferris initial message that must disappear on switch.",
+              }),
+            ],
+            is_busy: false,
+            queue: [],
+          });
+        }
+        return new Promise<Response>((resolve) => {
+          resolvePendingFerrisPoll = resolve;
+        });
+      }
+      if (url.includes("/sess-jarvis/transcript") || url.includes("/jarvis/transcript")) {
+        if (!holdJarvisFetch) {
+          return json({
+            session_id: "sess-jarvis",
+            turns: [],
+            is_busy: false,
+            queue: [],
+          });
+        }
+        return new Promise<Response>((resolve) => {
+          resolvePendingJarvisFetch = resolve;
+        });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    // Wait for Ferris's initial message and Refresh button to render
+    expect(
+      await screen.findByText(/Ferris initial message that must disappear on switch\./),
+    ).toBeInTheDocument();
+    const refreshBtn = await screen.findByRole("button", { name: /^Refresh$/i });
+
+    // Hold subsequent Ferris poll and Jarvis fetch
+    holdFerrisPoll = true;
+    holdJarvisFetch = true;
+
+    // Trigger a Refresh while on Ferris (starts an in-flight Ferris poll)
+    fireEvent.click(refreshBtn);
+    await waitFor(() => {
+      expect(resolvePendingFerrisPoll).not.toBeNull();
+    });
+
+    // Switch to Jarvis while Jarvis's transcript fetch and Ferris's poll are still pending
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+
+    // Immediately upon switching to Jarvis, Ferris's message is no longer visible
+    expect(
+      screen.queryByText(/Ferris initial message that must disappear on switch\./),
+    ).toBeNull();
+
+    // Now resolve the stale in-flight Ferris poll — it must NOT overwrite Jarvis's view
+    if (resolvePendingFerrisPoll) {
+      resolvePendingFerrisPoll(
+        new Response(
+          JSON.stringify({
+            session_id: "sess-ferris",
+            turns: [
+              turn({
+                index: 2,
+                role: "assistant",
+                content: "Stale Ferris poll turn that must not leak into Jarvis.",
+              }),
+            ],
+            is_busy: false,
+            queue: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+    }
+
+    // Resolve Jarvis's transcript fetch
+    await waitFor(() => {
+      expect(resolvePendingJarvisFetch).not.toBeNull();
+    });
+    resolvePendingJarvisFetch!(
+      new Response(
+        JSON.stringify({
+          session_id: "sess-jarvis",
+          turns: [
+            turn({
+              index: 1,
+              role: "assistant",
+              content: "Jarvis lab manager transcript turn.",
+            }),
+          ],
+          is_busy: false,
+          queue: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    expect(
+      await screen.findByText(/Jarvis lab manager transcript turn\./),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/Stale Ferris poll turn that must not leak into Jarvis\./),
+    ).toBeNull();
+
+    unmount();
+  });
+});
