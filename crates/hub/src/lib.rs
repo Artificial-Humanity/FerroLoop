@@ -5389,6 +5389,134 @@ default_target = "wire:felicity"
         assert!(managed[0].ends_with("-ok.md"));
     }
 
+    #[test]
+    fn a_later_session_id_cannot_retag_a_listed_artifact_and_attachments_stay_untagged() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let brain = tmp.path().join(".gemini/antigravity-cli/brain");
+        fs::create_dir_all(brain.join("sess-a")).unwrap();
+        fs::create_dir_all(brain.join("sess-b")).unwrap();
+        fs::write(brain.join("sess-a/plan.md"), "# plan").unwrap();
+        // sess-b can reach the same file (a link inside the allowed brain root).
+        std::os::unix::fs::symlink("../sess-a/plan.md", brain.join("sess-b/plan.md")).unwrap();
+        fs::create_dir_all(tmp.path().join("attachments")).unwrap();
+        fs::write(tmp.path().join("attachments/shared.md"), "# shared").unwrap();
+
+        let list_as = |sid: &str| {
+            let resp = call(
+                &state,
+                "GET",
+                &format!("/api/v1/artifacts/list?session_id={sid}"),
+                PEER,
+                &json!({}),
+            );
+            assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        };
+        let session_of = |name: &str| {
+            crate::artifacts::Registry::load(&artifacts_root_of(&tmp))
+                .entries
+                .into_iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("no entry for {name}"))
+                .session_id
+        };
+        list_as("sess-a");
+        let first = session_of("plan.md");
+        assert!(
+            first.as_deref().is_some_and(|s| s.contains("sess-a")),
+            "{first:?}"
+        );
+        assert_eq!(
+            session_of("shared.md"),
+            None,
+            "attachments belong to no session"
+        );
+        list_as("sess-b");
+        assert_eq!(session_of("plan.md"), first, "first owner is kept");
+        assert_eq!(session_of("shared.md"), None);
+    }
+
+    #[test]
+    fn prune_with_a_missing_worktree_archives_nothing_from_paths() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let elsewhere = tmp.path().join("elsewhere.md");
+        fs::write(&elsewhere, "# elsewhere").unwrap();
+        let named = elsewhere.display().to_string();
+        let gone = tmp.path().join("wt-gone").display().to_string();
+
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": gone, "paths": [named] }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let out = resp.json_value().unwrap();
+        assert_eq!(out["archived_count"], 0, "{out}");
+        assert!(managed_files(&tmp).is_empty());
+        assert!(
+            crate::artifacts::Registry::load(&artifacts_root_of(&tmp))
+                .entries
+                .is_empty()
+        );
+
+        // With no worktree named, the same path is archived.
+        assert_eq!(
+            prune(&state, OWNER, &json!({ "paths": [named] })).status,
+            200
+        );
+        assert_eq!(managed_files(&tmp).len(), 1);
+    }
+
+    #[test]
+    fn prune_skips_a_current_copy_and_caps_the_files_per_call() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("keep.md"), "# keep").unwrap();
+        let wt_arg = wt.display().to_string();
+        let body =
+            json!({ "worktree_path": wt_arg, "paths": [wt.join("keep.md").display().to_string()] });
+        assert_eq!(prune(&state, OWNER, &body).status, 200);
+        let dir = crate::artifacts::managed_dir(&artifacts_root_of(&tmp));
+        let copy = dir.join(&managed_files(&tmp)[0]);
+        let first = fs::metadata(&copy).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(prune(&state, OWNER, &body).status, 200);
+        assert_eq!(
+            fs::metadata(&copy).unwrap().modified().unwrap(),
+            first,
+            "not copied again"
+        );
+        // The registry still records the copy.
+        let reg = crate::artifacts::Registry::load(&artifacts_root_of(&tmp));
+        assert!(reg.entries[0].managed_path.is_some());
+
+        let many = tmp.path().join("many");
+        fs::create_dir_all(&many).unwrap();
+        let paths: Vec<String> = (0..205)
+            .map(|i| {
+                let f = many.join(format!("n{i}.md"));
+                fs::write(&f, format!("# {i}")).unwrap();
+                f.display().to_string()
+            })
+            .collect();
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": many.display().to_string(), "paths": paths }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        // 1 from the first call plus at most 200 more.
+        assert_eq!(
+            managed_files(&tmp).len(),
+            201,
+            "{}",
+            managed_files(&tmp).len()
+        );
+    }
+
     fn teardown_body(body: &mut Value, cwd: &std::path::Path) {
         body["cwd"] = json!(cwd.display().to_string());
     }

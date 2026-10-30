@@ -2846,13 +2846,17 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
             }
             ids
         });
+        // Files in the shared attachments dir belong to no session.
+        let attachments = fs::canonicalize(attachments_dir(state)).ok();
         let outcome = artifacts::with_registry(&root, |registry| {
             for (canon, size) in &live {
-                registry.upsert(artifact_entry(
-                    canon,
-                    *size,
-                    canonical_session_id.as_deref(),
-                ));
+                let shared = attachments.as_ref().is_some_and(|a| canon.starts_with(a));
+                let tag = if shared {
+                    None
+                } else {
+                    canonical_session_id.as_deref()
+                };
+                registry.upsert(artifact_entry(canon, *size, tag));
             }
             registry.reconcile(&artifacts::managed_dir(&root), session_ids.as_deref())
         });
@@ -2884,10 +2888,16 @@ struct ArtifactPreservation {
     session_ids: Vec<String>,
 }
 
+/// Most files one `preserve_artifacts` call copies.
+const MAX_PRESERVE_TARGETS: usize = 200;
+
 /// Copy the plan's user-facing files into the managed dir and record the copies in the registry.
 /// Every file, tracked or named, is vetted again here (the registry file is only a hint), so
-/// nothing forbidden, symlinked out of its scope, or outside the allowed roots is copied.
-/// Returns how many files were copied; failures are logged and skipped.
+/// nothing forbidden, symlinked out of its scope, or outside the allowed roots is copied; the
+/// copy itself refuses a symlink and vets the path it opened (see `archive_file`). The copies are
+/// made outside the registry lock, which is taken once at the end. A copy that is already
+/// current is not made again, and one call handles at most `MAX_PRESERVE_TARGETS` files.
+/// Returns how many files now have a managed copy; failures are logged and skipped.
 fn preserve_artifacts(state: &HubState, root: &Path, plan: &ArtifactPreservation) -> usize {
     let allowed_roots = allowed_artifact_roots(state);
     let wanted = |canon: &Path, size: u64| {
@@ -2897,6 +2907,9 @@ fn preserve_artifacts(state: &HubState, root: &Path, plan: &ArtifactPreservation
 
     let mut fresh: Vec<(PathBuf, u64)> = Vec::new();
     for cand in &plan.candidates {
+        if fresh.len() >= MAX_PRESERVE_TARGETS {
+            break;
+        }
         if let Some((canon, meta)) = vet_artifact_file(&allowed_roots, cand)
             && wanted(&canon, meta.len())
             && !fresh.iter().any(|(p, _)| *p == canon)
@@ -2905,7 +2918,7 @@ fn preserve_artifacts(state: &HubState, root: &Path, plan: &ArtifactPreservation
         }
     }
 
-    let mut targets: BTreeSet<PathBuf> = fresh.iter().map(|(p, _)| p.clone()).collect();
+    let mut targets: Vec<PathBuf> = fresh.iter().map(|(p, _)| p.clone()).collect();
     if !plan.scope.is_empty() {
         let tracked: Vec<String> = artifacts::with_registry(root, |registry| {
             registry
@@ -2921,12 +2934,36 @@ fn preserve_artifacts(state: &HubState, root: &Path, plan: &ArtifactPreservation
                 .collect()
         });
         for path in tracked {
+            if targets.len() >= MAX_PRESERVE_TARGETS {
+                break;
+            }
             if let Some((canon, meta)) = vet_artifact_file(&allowed_roots, Path::new(&path))
                 && canon == Path::new(&path)
                 && wanted(&canon, meta.len())
+                && !targets.contains(&canon)
             {
-                targets.insert(canon);
+                targets.push(canon);
             }
+        }
+    }
+
+    // The vetting again, on the path the opened file resolves to.
+    let still_vetted = |resolved: &Path| {
+        vet_artifact_file(&allowed_roots, resolved)
+            .is_some_and(|(canon, meta)| canon == resolved && wanted(&canon, meta.len()))
+    };
+    let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for canon in targets {
+        if let Some(dest) = artifacts::current_managed_copy(root, &canon) {
+            copies.push((canon, dest));
+            continue;
+        }
+        match artifacts::archive_file(root, &canon, &still_vetted) {
+            Ok(dest) => copies.push((canon, dest)),
+            Err(err) => eprintln!(
+                "fl-hub: could not archive artifact {}: {err}",
+                canon.display()
+            ),
         }
     }
 
@@ -2934,29 +2971,22 @@ fn preserve_artifacts(state: &HubState, root: &Path, plan: &ArtifactPreservation
         for (canon, size) in &fresh {
             registry.upsert(artifact_entry(canon, *size, plan.session_tag.as_deref()));
         }
-        let mut copied = 0;
-        for canon in &targets {
-            match artifacts::archive_file(root, canon) {
-                Ok(dest) => {
-                    let canon_str = canon.display().to_string();
-                    if let Some(entry) = registry
-                        .entries
-                        .iter_mut()
-                        .find(|e| e.canonical_path == canon_str)
-                    {
-                        entry.managed_path = Some(dest.display().to_string());
-                        entry.updated_at_ms = artifacts::now_ms();
-                    }
-                    copied += 1;
+        for (canon, dest) in &copies {
+            let canon_str = canon.display().to_string();
+            if let Some(entry) = registry
+                .entries
+                .iter_mut()
+                .find(|e| e.canonical_path == canon_str)
+            {
+                let dest_str = dest.display().to_string();
+                if entry.managed_path.as_deref() != Some(dest_str.as_str()) {
+                    entry.managed_path = Some(dest_str);
+                    entry.updated_at_ms = artifacts::now_ms();
                 }
-                Err(err) => eprintln!(
-                    "fl-hub: could not archive artifact {}: {err}",
-                    canon.display()
-                ),
             }
         }
-        copied
-    })
+    });
+    copies.len()
 }
 
 /// Canonical dirs a session's artifacts live in: its recorded cwd (none when that is gone), else
@@ -3103,9 +3133,13 @@ fn handle_post_artifacts_prune(
 
     let allowed_roots = allowed_artifact_roots(state);
     let mut scope: Vec<PathBuf> = Vec::new();
+    // A worktree that was named but is gone gives no scope, and an empty scope would let `paths`
+    // be archived from anywhere, so nothing is archived then (the prune below still runs).
+    let mut worktree_missing = false;
     if !worktree_raw.is_empty() {
         match resolve_prune_worktree(state, &allowed_roots, &worktree_raw) {
-            Ok(found) => scope.extend(found),
+            Ok(Some(found)) => scope.push(found),
+            Ok(None) => worktree_missing = true,
             Err(resp) => return resp,
         }
     }
@@ -3155,16 +3189,18 @@ fn handle_post_artifacts_prune(
         session_tag = Some(canonical);
     }
 
-    preserve_artifacts(
-        state,
-        &root,
-        &ArtifactPreservation {
-            candidates,
-            scope,
-            session_tag,
-            session_ids,
-        },
-    );
+    if !worktree_missing {
+        preserve_artifacts(
+            state,
+            &root,
+            &ArtifactPreservation {
+                candidates,
+                scope,
+                session_tag,
+                session_ids,
+            },
+        );
+    }
     let outcome = artifacts::with_registry(&root, |registry| {
         registry.reconcile(&artifacts::managed_dir(&root), None)
     });

@@ -30,6 +30,7 @@ sha2 = "0.10"
 ureq = { version = "3.4", features = ["json"] }
 ring = "0.17"
 base64 = "0.22"
+libc = "0.2"
 tiny_http = "0.12"
 toml_edit = "0.25"
 indexmap = { version = "2.14", features = ["serde"] }

@@ -6,11 +6,12 @@
 //! with the API handlers, which call in here only with paths they already checked.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -28,6 +29,10 @@ const ARCHIVE_EXTS: &[&str] = &[
 ];
 
 const MAX_MANAGED_NAME_LEN: usize = 120;
+
+/// A leftover `.tmp-*` file in `managed/` is swept once it is older than this, so a concurrent
+/// archive that is still writing one is never disturbed.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// One registry lock for the whole process: every read-modify-write goes through it.
 static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
@@ -113,8 +118,9 @@ impl Registry {
         write_atomic(&registry_path(root), &bytes)
     }
 
-    /// Insert or refresh the entry for `entry.canonical_path`. The archived copy and the session
-    /// stay unless the new entry carries a session.
+    /// Insert or refresh the entry for `entry.canonical_path`. The archived copy stays, and so
+    /// does an existing session: the first owner keeps the entry, a later caller cannot retag it.
+    /// An entry with no session takes the new entry's session.
     pub(crate) fn upsert(&mut self, mut entry: ArtifactEntry) {
         match self
             .entries
@@ -123,7 +129,7 @@ impl Registry {
         {
             Some(existing) => {
                 entry.managed_path = existing.managed_path.take();
-                if entry.session_id.is_none() {
+                if existing.session_id.is_some() {
                     entry.session_id = existing.session_id.take();
                 }
                 *existing = entry;
@@ -254,20 +260,95 @@ pub(crate) fn managed_file_name(canonical: &Path) -> String {
     format!("{prefix}-{}", sanitize_file_name(name))
 }
 
-/// Copy `canonical` into the managed dir under root `root`; returns the copy's path. The caller
-/// has already vetted `canonical`. The copy is refused when the file is over the size cap.
-pub(crate) fn archive_file(root: &Path, canonical: &Path) -> io::Result<PathBuf> {
+/// Open `canonical` for reading without following a symlink at its last component.
+fn open_nofollow(canonical: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(canonical)
+}
+
+/// Where an open file really is now (Linux: the `/proc/self/fd` link). A parent directory that was
+/// swapped for a symlink after vetting shows up here, which `O_NOFOLLOW` alone does not catch.
+#[cfg(target_os = "linux")]
+fn resolved_path_of(file: &fs::File) -> io::Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Copy at most `MAX_ARCHIVE_BYTES` from `src` to a new file at `tmp`. A longer source is an
+/// error, reached after reading one byte past the cap, never the whole source.
+fn copy_capped(src: impl Read, tmp: &Path) -> io::Result<()> {
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    let copied = io::copy(&mut src.take(MAX_ARCHIVE_BYTES + 1), &mut out)?;
+    if copied > MAX_ARCHIVE_BYTES {
+        return Err(io::Error::other("artifact exceeds the archive size cap"));
+    }
+    Ok(())
+}
+
+/// Remove `.tmp-*` files in `dir` older than `STALE_TEMP_AGE` (left by a crashed archive).
+fn sweep_stale_temps(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let stale = entry.file_name().to_string_lossy().starts_with(".tmp-")
+            && entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE_TEMP_AGE);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// The managed copy of `canonical` when it is already current: same size as the original and not
+/// older than it. Such a file need not be copied again.
+pub(crate) fn current_managed_copy(root: &Path, canonical: &Path) -> Option<PathBuf> {
+    let dest = managed_dir(root).join(managed_file_name(canonical));
+    let src = fs::metadata(canonical).ok()?;
+    let copy = fs::metadata(&dest).ok()?;
+    (copy.is_file() && copy.len() == src.len() && copy.modified().ok()? >= src.modified().ok()?)
+        .then_some(dest)
+}
+
+/// Copy `canonical` into the managed dir under root `root`; returns the copy's path.
+///
+/// The caller vetted `canonical` earlier, but a session can write its worktree, so the path may
+/// have changed since. The source is opened without following a symlink, must be a regular file
+/// within the size cap, and the path the open handle resolves to must pass `recheck` (the
+/// caller's vetting, run again). The copy reads at most the cap plus one byte.
+pub(crate) fn archive_file(
+    root: &Path,
+    canonical: &Path,
+    recheck: &dyn Fn(&Path) -> bool,
+) -> io::Result<PathBuf> {
     let dir = managed_dir(root);
     fs::create_dir_all(&dir)?;
+    sweep_stale_temps(&dir);
+    let src = open_nofollow(canonical)?;
+    #[cfg(target_os = "linux")]
+    if !recheck(&resolved_path_of(&src)?) {
+        return Err(io::Error::other("artifact no longer passes vetting"));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = recheck;
+    let meta = src.metadata()?;
+    if !meta.is_file() || meta.len() > MAX_ARCHIVE_BYTES {
+        return Err(io::Error::other(
+            "artifact is not a regular file within the archive size cap",
+        ));
+    }
     let dest = dir.join(managed_file_name(canonical));
     let tmp = temp_path_beside(&dest);
-    let copied = fs::copy(canonical, &tmp).and_then(|len| {
-        if len > MAX_ARCHIVE_BYTES {
-            Err(io::Error::other("artifact exceeds the archive size cap"))
-        } else {
-            fs::rename(&tmp, &dest)
-        }
-    });
+    let copied = copy_capped(src, &tmp).and_then(|()| fs::rename(&tmp, &dest));
     if copied.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -348,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn upsert_keeps_the_managed_copy_and_the_session_unless_replaced() {
+    fn upsert_keeps_the_managed_copy_and_the_first_session_owner() {
         let mut reg = Registry::default();
         let mut first = entry(Path::new("/x/a.md"), Some("s1"));
         first.managed_path = Some("/m/copy".into());
@@ -357,8 +438,15 @@ mod tests {
         assert_eq!(reg.entries.len(), 1);
         assert_eq!(reg.entries[0].managed_path.as_deref(), Some("/m/copy"));
         assert_eq!(reg.entries[0].session_id.as_deref(), Some("s1"));
+        // A later caller cannot retag an entry that already has an owner.
         reg.upsert(entry(Path::new("/x/a.md"), Some("s2")));
-        assert_eq!(reg.entries[0].session_id.as_deref(), Some("s2"));
+        assert_eq!(reg.entries[0].session_id.as_deref(), Some("s1"));
+        // An untagged entry takes the first session that claims it.
+        reg.upsert(entry(Path::new("/x/b.md"), None));
+        reg.upsert(entry(Path::new("/x/b.md"), Some("s3")));
+        assert_eq!(reg.entries[1].session_id.as_deref(), Some("s3"));
+        reg.upsert(entry(Path::new("/x/b.md"), Some("s4")));
+        assert_eq!(reg.entries[1].session_id.as_deref(), Some("s3"));
     }
 
     #[test]
@@ -397,7 +485,7 @@ mod tests {
         let gone_kept = tmp.path().join("gone-kept.md");
         let gone_lost = tmp.path().join("gone-lost.md");
         fs::write(&live, "l").unwrap();
-        let copy = archive_file(&root, &live).unwrap();
+        let copy = archive_file(&root, &live, &|_| true).unwrap();
         let mut kept = entry(&gone_kept, Some("s1"));
         kept.managed_path = Some(copy.display().to_string());
         // A managed path outside the managed dir never counts, even when it exists.
@@ -426,17 +514,146 @@ mod tests {
         let root = data_root(tmp.path());
         let src = tmp.path().join("pic.png");
         fs::write(&src, b"png-bytes").unwrap();
-        let dest = archive_file(&root, &src).unwrap();
+        let dest = archive_file(&root, &src, &|_| true).unwrap();
         assert_eq!(fs::read(&dest).unwrap(), b"png-bytes");
         assert!(dest.starts_with(managed_dir(&root)));
         let big = tmp.path().join("big.png");
         fs::write(&big, vec![0u8; MAX_ARCHIVE_BYTES as usize + 1]).unwrap();
-        assert!(archive_file(&root, &big).is_err());
+        assert!(archive_file(&root, &big, &|_| true).is_err());
         let names: Vec<_> = fs::read_dir(managed_dir(&root))
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert_eq!(names.len(), 1, "no temp file left behind: {names:?}");
+    }
+
+    fn managed_names(root: &Path) -> Vec<String> {
+        fs::read_dir(managed_dir(root))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn archive_file_refuses_a_symlink_at_the_source_path() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let secret = tmp.path().join("secret.txt");
+        fs::write(&secret, "TOKEN=1").unwrap();
+        // A vetted report.md swapped for a link to a sensitive file after the vet.
+        let link = tmp.path().join("report.md");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        assert!(archive_file(&root, &link, &|_| true).is_err());
+        assert!(
+            managed_names(&root).is_empty(),
+            "{:?}",
+            managed_names(&root)
+        );
+    }
+
+    #[test]
+    fn archive_file_refuses_a_link_to_a_forbidden_looking_file_and_a_failed_recheck() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let env = tmp.path().join(".env");
+        fs::write(&env, "TOKEN=1").unwrap();
+        let link = tmp.path().join("notes.md");
+        std::os::unix::fs::symlink(&env, &link).unwrap();
+        let not_forbidden = |p: &Path| p.file_name().is_some_and(|n| n != ".env");
+        assert!(archive_file(&root, &link, &not_forbidden).is_err());
+        assert!(managed_names(&root).is_empty());
+
+        // A regular file whose resolved path fails the caller's vetting is not copied either, and
+        // the callback sees the path the open handle resolved to.
+        let real = fs::canonicalize(tmp.path()).unwrap().join("real.md");
+        fs::write(&real, "# ok").unwrap();
+        let seen = Mutex::new(Vec::new());
+        let record_and_refuse = |p: &Path| {
+            seen.lock().unwrap().push(p.to_path_buf());
+            false
+        };
+        assert!(archive_file(&root, &real, &record_and_refuse).is_err());
+        assert_eq!(*seen.lock().unwrap(), std::slice::from_ref(&real));
+        assert!(managed_names(&root).is_empty());
+        assert!(archive_file(&root, &real, &|_| true).is_ok());
+    }
+
+    #[test]
+    fn a_source_that_grows_past_the_cap_is_refused_after_reading_one_byte_too_many() {
+        let tmp = TempDir::new().unwrap();
+        let tmp_file = tmp.path().join(".tmp-grow");
+        // An endless source: the copy must stop at cap + 1 bytes, not read it all.
+        let endless = io::repeat(7);
+        let err = copy_capped(endless, &tmp_file).unwrap_err();
+        assert!(err.to_string().contains("size cap"), "{err}");
+        assert_eq!(
+            fs::metadata(&tmp_file).unwrap().len(),
+            MAX_ARCHIVE_BYTES + 1
+        );
+        // And through archive_file: refused, nothing left in managed/.
+        let root = data_root(tmp.path());
+        let big = tmp.path().join("big.pdf");
+        fs::write(&big, vec![0u8; MAX_ARCHIVE_BYTES as usize + 1]).unwrap();
+        assert!(archive_file(&root, &big, &|_| true).is_err());
+        assert!(managed_names(&root).is_empty());
+        // Exactly at the cap is fine.
+        let exact = tmp.path().join("exact.pdf");
+        fs::write(&exact, vec![0u8; MAX_ARCHIVE_BYTES as usize]).unwrap();
+        assert!(archive_file(&root, &exact, &|_| true).is_ok());
+    }
+
+    #[test]
+    fn archive_sweeps_only_stale_temp_files() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let dir = managed_dir(&root);
+        fs::create_dir_all(&dir).unwrap();
+        let old = dir.join(".tmp-1-1");
+        let fresh = dir.join(".tmp-2-2");
+        let keep = dir.join("0000-kept.md");
+        for f in [&old, &fresh, &keep] {
+            fs::write(f, "x").unwrap();
+        }
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        for f in [&old, &keep] {
+            fs::File::options()
+                .write(true)
+                .open(f)
+                .unwrap()
+                .set_modified(two_hours_ago)
+                .unwrap();
+        }
+        let src = tmp.path().join("a.md");
+        fs::write(&src, "# a").unwrap();
+        archive_file(&root, &src, &|_| true).unwrap();
+        assert!(!old.exists(), "stale temp swept");
+        assert!(fresh.exists(), "recent temp left for a concurrent archive");
+        assert!(keep.exists(), "only .tmp-* files are swept");
+    }
+
+    #[test]
+    fn current_managed_copy_needs_equal_size_and_a_copy_not_older_than_the_source() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let src = tmp.path().join("a.md");
+        fs::write(&src, "# a").unwrap();
+        assert!(current_managed_copy(&root, &src).is_none());
+        let dest = archive_file(&root, &src, &|_| true).unwrap();
+        assert_eq!(current_managed_copy(&root, &src), Some(dest.clone()));
+        fs::write(&src, "# longer").unwrap();
+        assert!(current_managed_copy(&root, &src).is_none(), "size differs");
+        fs::write(&src, "# b").unwrap();
+        let later = SystemTime::now() + Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert!(current_managed_copy(&root, &src).is_none(), "source newer");
     }
 }
