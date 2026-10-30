@@ -533,8 +533,14 @@ pub fn run<S: AgentRegistry + Handles + StateStore>(
                 hosted: Some(hosted),
                 cwd,
             };
-            let out = lifecycle::spin_up(store, &LifecycleEnv::new(None), &req, &by)
-                .map_err(lifecycle_failure)?;
+            let out = lifecycle::spin_up(
+                store,
+                &LifecycleEnv::new(None),
+                &req,
+                &by,
+                lifecycle::Caller::Owner,
+            )
+            .map_err(lifecycle_failure)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
             } else {

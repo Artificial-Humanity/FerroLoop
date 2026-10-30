@@ -3601,6 +3601,14 @@ fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
     LifecycleEnv::new(state.config.home_override.as_deref())
 }
 
+fn caller_of(authority: &HubAuthority) -> lifecycle::Caller {
+    if authority.is_owner() {
+        lifecycle::Caller::Owner
+    } else {
+        lifecycle::Caller::Peer
+    }
+}
+
 fn handle_post_session_spin_up(
     state: &HubState,
     authority: &HubAuthority,
@@ -3618,6 +3626,7 @@ fn handle_post_session_spin_up(
         &lifecycle_env(state),
         &payload,
         authority.actor_name(),
+        caller_of(authority),
     ) {
         Ok(out) => {
             let data = serde_json::to_value(&out).unwrap_or_default();
@@ -3660,11 +3669,7 @@ fn handle_post_session_decommission(
         Ok(target) => target,
         Err(e) => return lifecycle_error_response(&e),
     };
-    let caller = if authority.is_owner() {
-        lifecycle::Caller::Owner
-    } else {
-        lifecycle::Caller::Peer
-    };
+    let caller = caller_of(authority);
     let result = match mode {
         DecommissionMode::Prepare => {
             lifecycle::prepare_decommission(&*store, &env, &target, by, caller)

@@ -551,23 +551,43 @@ fn remove_routes(home_override: Option<&Path>, personas: &[&str], session_ids: &
 ///
 /// The record is written before tmux starts, so a runtime this call opens always has a record
 /// that teardown can find; the record is then updated with what actually started.
+///
+/// `caller` gates hosting an unmanaged agent: an Active agent with no hosted record for this
+/// session becomes hosted by the spin-up, after which a peer's teardown would be allowed, so
+/// only the owner may do it. A peer may still spin up a new or retired persona, or re-spin a
+/// session that already has a hosted record.
 pub fn spin_up<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     req: &SpinUpRequest,
     by: &str,
+    caller: Caller,
 ) -> Result<SpinUpResponse, LifecycleError> {
     let v = req.validate()?;
+    let session_id = format!("{}:{}", v.vendor, v.persona);
+    let previous =
+        find_hosted_session(store, &[&session_id])?.filter(|r| r.session_id == session_id);
+    // Order: this gate runs first, before the Lead and project/role Conflict checks in
+    // `register_spun_up_agent`, because a refusal here reveals nothing about the agent's
+    // project or role. It sits before every side effect.
+    if caller != Caller::Owner
+        && previous.is_none()
+        && store
+            .agent_by_name(&v.persona)?
+            .is_some_and(|a| a.status == AgentStatus::Active)
+    {
+        return Err(LifecycleError::Forbidden(format!(
+            "only Owner authority may spin up `{}`, an active agent with no hosted session record",
+            v.persona
+        )));
+    }
     register_spun_up_agent(store, &v, by)?;
 
-    let session_id = format!("{}:{}", v.vendor, v.persona);
     let display = capitalize(&v.persona);
     let tmux_target = format!("{display}:{}", v.vendor);
     let prompt = prompt_for(&display, &v.project, &v.role);
 
     let now = now_ms();
-    let previous =
-        find_hosted_session(store, &[&session_id])?.filter(|r| r.session_id == session_id);
     let mut record = HostedSessionRecord {
         session_id: session_id.clone(),
         persona: v.persona.clone(),
@@ -840,8 +860,9 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     })
 }
 
-/// Who asks for a teardown. A session with no hosted record is adopted by the teardown, which
-/// retires whatever agent its id names, so only the owner may adopt one.
+/// Who asks for a spin-up or teardown. A session with no hosted record is adopted by a teardown,
+/// which retires whatever agent its id names, and an Active agent with no hosted record is
+/// adopted by a spin-up, so only the owner may adopt one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
     Owner,
@@ -1130,7 +1151,14 @@ mod tests {
         let home = TempDir::new().unwrap();
         let env = env(&home);
         for (persona, vendor) in [("zed", "codex"), ("ada", "muse"), ("bob", "claude")] {
-            spin_up(&store, &env, &req(persona, "assistant", vendor), "owner").unwrap();
+            spin_up(
+                &store,
+                &env,
+                &req(persona, "assistant", vendor),
+                "owner",
+                Caller::Owner,
+            )
+            .unwrap();
         }
         let listed = list_hosted_sessions(&store).unwrap();
         let ids: Vec<&str> = listed.iter().map(|r| r.session_id.as_str()).collect();
@@ -1169,6 +1197,7 @@ mod tests {
             &env,
             &req("felicity", "ui-developer", "claude"),
             "owner",
+            Caller::Owner,
         )
         .unwrap();
         assert_eq!(out.session_id, "claude:felicity");
@@ -1189,6 +1218,7 @@ mod tests {
             &env,
             &req("felicity", "ui-developer", "claude"),
             "owner",
+            Caller::Owner,
         )
         .unwrap();
         assert_eq!(again.session_id, out.session_id);
@@ -1200,12 +1230,33 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        spin_up(&store, &env, &req("ferris", "lead", "claude"), "owner").unwrap();
-        let err = spin_up(&store, &env, &req("felix", "lead", "claude"), "owner").unwrap_err();
+        spin_up(
+            &store,
+            &env,
+            &req("ferris", "lead", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let err = spin_up(
+            &store,
+            &env,
+            &req("felix", "lead", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap_err();
         assert_eq!(err.status(), 409);
         assert!(store.agent_by_name("felix").unwrap().is_none());
         // The sitting Lead may be spun up again.
-        spin_up(&store, &env, &req("ferris", "lead", "codex"), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ferris", "lead", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1239,6 +1290,7 @@ mod tests {
             &env,
             &req("felicity", "assistant", "claude"),
             "owner",
+            Caller::Owner,
         )
         .unwrap();
         let routes = webhook_route_file(home.path(), "felicity");
@@ -1284,6 +1336,7 @@ mod tests {
             &env,
             &req("felicity", "assistant", "claude"),
             "owner",
+            Caller::Owner,
         )
         .unwrap();
         webhook_route_file(home.path(), "felicity");
@@ -1346,6 +1399,7 @@ mod tests {
             &env,
             &req("felicity", "assistant", "claude"),
             "owner",
+            Caller::Owner,
         )
         .unwrap();
         let target = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
@@ -1367,7 +1421,14 @@ mod tests {
     }
 
     fn decommissioned_felicity(store: &MemStore, env: &LifecycleEnv<'_>) -> SessionTarget {
-        spin_up(store, env, &req("felicity", "assistant", "claude"), "owner").unwrap();
+        spin_up(
+            store,
+            env,
+            &req("felicity", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
         let target = SessionTarget::resolve(store, "claude:felicity", None).unwrap();
         teardown_session(store, env, &target, "owner", Caller::Owner, |_| {}).unwrap();
         SessionTarget::resolve(store, "claude:felicity", None).unwrap()
@@ -1403,6 +1464,7 @@ mod tests {
             &env,
             &req("felicity", "assistant", "claude"),
             "owner",
+            Caller::Owner,
         )
         .unwrap();
         assert_eq!(
@@ -1441,6 +1503,7 @@ mod tests {
             &env,
             &req("felicity", "assistant", "claude"),
             "owner",
+            Caller::Owner,
         )
         .unwrap();
         let agent = store.agent_by_name("felicity").unwrap().unwrap();
@@ -1454,7 +1517,7 @@ mod tests {
             .unwrap();
         let mut other = req("felicity", "ui-developer", "claude");
         other.project = "elsewhere".into();
-        spin_up(&store, &env, &other, "owner").unwrap();
+        spin_up(&store, &env, &other, "owner", Caller::Owner).unwrap();
         let agent = store.agent_by_name("felicity").unwrap().unwrap();
         assert_eq!(
             (agent.status, agent.project.as_str(), agent.email.as_str()),
@@ -1478,7 +1541,9 @@ mod tests {
             req("jarvis", "ui-developer", "codex"),
             other_project,
         ] {
-            let err = spin_up(&store, &env, &r, "peer").unwrap_err();
+            // The owner reaches the conflict check; a peer is refused earlier (Forbidden), which
+            // is covered by the peer_spin_up_* tests.
+            let err = spin_up(&store, &env, &r, "owner", Caller::Owner).unwrap_err();
             assert!(matches!(err, LifecycleError::Conflict(_)), "{err}");
         }
         assert_eq!(store.agent_by_name("jarvis").unwrap().unwrap(), before);
@@ -1486,12 +1551,116 @@ mod tests {
         assert!(store.get_area("elsewhere").unwrap().is_none());
     }
 
+    fn assert_unmanaged_agent_untouched<S: AgentRegistry + StateStore>(
+        store: &S,
+        before: &AgentRecord,
+    ) {
+        assert_eq!(&store.agent_by_name("jarvis").unwrap().unwrap(), before);
+        assert!(list_hosted_sessions(store).unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_spin_up_of_an_unmanaged_active_agent_is_forbidden_and_changes_nothing() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        // A live webhook route for jarvis: any prompt delivery would connect to this socket.
+        webhook_route_file(home.path(), "jarvis");
+        let listener =
+            std::os::unix::net::UnixListener::bind(home.path().join("none.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        register(&store, "jarvis", "ferroloop", AgentRole::LabManager);
+        let before = store.agent_by_name("jarvis").unwrap().unwrap();
+
+        // Same project and role: without the gate this is the idempotent re-spin that hosts it.
+        let mut same = req("jarvis", "lab-manager", "claude");
+        same.project = "ferroloop".into();
+        for r in [same, req("jarvis", "assistant", "codex")] {
+            let err = spin_up(&store, &env, &r, "peer", Caller::Peer).unwrap_err();
+            assert!(matches!(err, LifecycleError::Forbidden(_)), "{err}");
+            assert_eq!(err.status(), 403);
+        }
+        assert_unmanaged_agent_untouched(&store, &before);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "no prompt may be delivered"
+        );
+
+        // The owner may host it, and keeps its email and extra areas.
+        let mut same = req("jarvis", "lab-manager", "claude");
+        same.project = "ferroloop".into();
+        let out = spin_up(&store, &env, &same, "owner", Caller::Owner).unwrap();
+        assert_eq!(out.session_id, "claude:jarvis");
+        assert!(
+            listener.accept().is_ok(),
+            "the owner's spin-up delivers the prompt"
+        );
+        let after = store.agent_by_name("jarvis").unwrap().unwrap();
+        assert_eq!(after.status, AgentStatus::Active);
+        assert_eq!(after.email, before.email);
+        assert_eq!(after.extra_areas, before.extra_areas);
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn peer_spin_up_still_works_for_new_retired_and_already_hosted_personas() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+
+        // A persona with no agent record.
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "peer",
+            Caller::Peer,
+        )
+        .unwrap();
+        // A re-spin of a session that already has a hosted record.
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "peer",
+            Caller::Peer,
+        )
+        .unwrap();
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+
+        // A retired agent, whether or not it was ever hosted.
+        register(&store, "bob", "ferroloop", AgentRole::Assistant);
+        let bob = store.agent_by_name("bob").unwrap().unwrap();
+        store.retire_agent(&bob.id, stamp::now(), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("bob", "assistant", "claude"),
+            "peer",
+            Caller::Peer,
+        )
+        .unwrap();
+        assert_eq!(
+            store.agent_by_name("bob").unwrap().unwrap().status,
+            AgentStatus::Active
+        );
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 2);
+    }
+
     #[test]
     fn respin_preserves_created_at_restart_count_and_runtime_ownership() {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
         let mut rec = find_hosted_session(&store, &["claude:ada"])
             .unwrap()
             .unwrap();
@@ -1500,7 +1669,14 @@ mod tests {
         rec.created_at_ms = 1;
         persist_hosted_session(&store, &rec, "owner").unwrap();
 
-        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
         let again = find_hosted_session(&store, &["claude:ada"])
             .unwrap()
             .unwrap();
@@ -1554,7 +1730,14 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        spin_up(&store, &env, &req("ada", "assistant", "claude"), "peer").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "peer",
+            Caller::Peer,
+        )
+        .unwrap();
         let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
         let out = teardown_session(&store, &env, &target, "peer", Caller::Peer, |_| {}).unwrap();
         assert_eq!(out.status, "decommissioned");
@@ -1605,7 +1788,14 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        spin_up(&store, &env, &req("ada", "assistant", "claude"), "peer").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "peer",
+            Caller::Peer,
+        )
+        .unwrap();
         let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
         let out = prepare_decommission(&store, &env, &target, "peer", Caller::Peer).unwrap();
         assert_eq!(out.status, "decommissioning");
@@ -1617,7 +1807,14 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
         let target = SessionTarget::resolve(
             &store,
             "claude:ada",
@@ -1701,7 +1898,14 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
 
         let id_of = |raw: &str| {
             SessionTarget::resolve(&store, raw, None)
@@ -1734,7 +1938,14 @@ mod tests {
 
         // With both vendors present each id resolves to its own record, and the exact id wins
         // over a persona key listed before it.
-        spin_up(&store, &env, &req("ada", "assistant", "codex"), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
         assert_eq!(id_of("codex:ada").as_deref(), Some("codex:ada"));
         assert_eq!(id_of("claude:ada").as_deref(), Some("claude:ada"));
         assert_eq!(
@@ -1751,8 +1962,22 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
-        spin_up(&store, &env, &req("ada", "assistant", "codex"), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
         let set_spawned = |id: &str, spawned: bool| {
             let mut rec = find_hosted_session(&store, &[id]).unwrap().unwrap();
             rec.runtime_spawned = spawned;
@@ -1792,8 +2017,22 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let env = env(&home);
-        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
-        spin_up(&store, &env, &req("ada", "assistant", "codex"), "owner").unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "codex"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
         let other = SessionTarget::resolve(&store, "codex:ada", None).unwrap();
         teardown_session(&store, &env, &other, "owner", Caller::Owner, |_| {}).unwrap();
         let mut rec = find_hosted_session(&store, &["claude:ada"])

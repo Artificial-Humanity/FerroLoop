@@ -2632,14 +2632,15 @@ mod tests {
         };
         let jarvis = agent("jarvis");
 
-        // A Peer cannot spin up a resident's persona in another role or project.
+        // Nobody can spin up a resident's persona in another role or project: the Owner gets the
+        // 409 (a Peer is refused earlier, with 403; see the peer_spin_up_* test).
         for (role, project) in [("assistant", "FerroLoop"), ("lab-manager", "Elsewhere")] {
             let resp = handle_http_request(
                 &state,
                 &authed(
                     "POST",
                     "/api/v1/sessions/spin-up",
-                    "peer-tok-secret",
+                    "owner-tok-secret",
                     &json!({
                         "persona": "jarvis", "project": project, "role": role, "vendor": "claude",
                     }),
@@ -2667,6 +2668,84 @@ mod tests {
         let ada = agent("ada");
         assert_eq!(ada.email, "ada@example.org");
         assert_eq!(ada.extra_areas, ["notes"]);
+    }
+
+    #[test]
+    fn peer_spin_up_of_an_unmanaged_agent_is_403_and_cannot_unlock_teardown() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        register_resident(&state, "jarvis", AgentRole::LabManager, "ferroloop");
+        let jarvis = state
+            .open_store()
+            .unwrap()
+            .agent_by_name("jarvis")
+            .unwrap()
+            .unwrap();
+        let hosted_count = || {
+            handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let body = json!({
+            "persona": "jarvis", "project": "ferroloop", "role": "lab-manager", "vendor": "claude",
+        });
+        let spin_up_as = |token: &str| {
+            handle_http_request(
+                &state,
+                &authed("POST", "/api/v1/sessions/spin-up", token, &body),
+            )
+        };
+
+        let resp = spin_up_as("peer-tok-secret");
+        assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(hosted_count(), 0);
+
+        // The refused spin-up did not make it hosted, so the Peer still cannot retire it.
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", mode);
+            assert_eq!(
+                resp.status,
+                403,
+                "{mode}: {}",
+                String::from_utf8_lossy(&resp.body)
+            );
+        }
+        assert_eq!(hosted_count(), 0);
+        let after = state
+            .open_store()
+            .unwrap()
+            .agent_by_name("jarvis")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, jarvis);
+        assert_eq!(after.status, AgentStatus::Active);
+
+        // The Owner may host it; email and extra areas survive.
+        let resp = spin_up_as("owner-tok-secret");
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(hosted_count(), 1);
+        let hosted = state
+            .open_store()
+            .unwrap()
+            .agent_by_name("jarvis")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hosted.email, "jarvis@example.org");
+        assert_eq!(hosted.extra_areas, ["notes"]);
     }
 
     #[test]
