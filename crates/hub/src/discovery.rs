@@ -2485,6 +2485,80 @@ fn clean_sender_token(raw: &str) -> String {
     s.to_string()
 }
 
+/// Openers of Claude Code transcript user turns that the harness, not the operator, wrote.
+/// A turn whose text starts with one is a system notice.
+const SYSTEM_NOTICE_OPENERS: [&str; 4] = [
+    "<task-notification>",
+    "<local-command-caveat>",
+    "<local-command-stdout>",
+    "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+];
+/// Spellings of the `<agent-message ...>` open tag: plain, and backslash-escaped.
+const AGENT_MESSAGE_OPEN_TAGS: [&str; 2] = ["<agent-message", "<\\agent-message"];
+/// Spellings of the `</agent-message>` close tag: plain, and the two backslash-escaped forms.
+const AGENT_MESSAGE_CLOSE_TAGS: [&str; 3] = [
+    "</agent-message>",
+    "<\\/agent-message>",
+    "</\\agent-message>",
+];
+/// Last line of the boilerplate header in front of a subagent hand-back report.
+const SUBAGENT_REPORT_HEADER_END: &str = "The report follows:";
+/// The boilerplate header is short; a later occurrence of its last line is report text.
+const SUBAGENT_REPORT_HEADER_MAX_BYTES: usize = 1024;
+
+fn starts_with_system_notice_opener(text: &str) -> bool {
+    let text = text.trim_start();
+    SYSTEM_NOTICE_OPENERS
+        .iter()
+        .any(|opener| text.starts_with(opener))
+}
+
+/// The text after an `<agent-message ...>` open tag (either spelling), when `text` starts
+/// with one. The tag name must end at whitespace or `>`, so `<agent-messages>` is no tag.
+fn strip_agent_message_open_tag(text: &str) -> Option<&str> {
+    let text = text.trim_start();
+    AGENT_MESSAGE_OPEN_TAGS.iter().find_map(|tag| {
+        let rest = text.strip_prefix(tag)?;
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '>') {
+            return None;
+        }
+        Some(&rest[rest.find('>')? + 1..])
+    })
+}
+
+/// Whether `text` opens a subagent hand-back. The marker must be at the START of the
+/// text (after the optional `Another Claude session sent a message:` wrapper, which the
+/// caller strips first): an `<agent-message` open tag or a `[Subagent ` bracket. A
+/// marker anywhere later is ordinary prose, such as an operator quoting a hand-back, and
+/// never reclassifies the turn.
+fn starts_subagent_handback(text: &str) -> bool {
+    let text = text.trim_start();
+    strip_agent_message_open_tag(text).is_some() || text.starts_with("[Subagent ")
+}
+
+/// The report body of a subagent hand-back: the `<agent-message ...>` open tag, the
+/// `</agent-message>` close tag and the `[Subagent hand-back] ... The report follows:`
+/// header are removed. A header without its `The report follows:` line is kept.
+fn clean_subagent_handback(text: &str) -> String {
+    let mut body = text.trim();
+    if let Some(after_tag) = strip_agent_message_open_tag(body) {
+        body = after_tag.trim();
+    }
+    for tag in AGENT_MESSAGE_CLOSE_TAGS {
+        if let Some(before_tag) = body.strip_suffix(tag) {
+            body = before_tag.trim_end();
+            break;
+        }
+    }
+    if body.starts_with("[Subagent ")
+        && let Some(at) = body.find(SUBAGENT_REPORT_HEADER_END)
+        && at < SUBAGENT_REPORT_HEADER_MAX_BYTES
+    {
+        body = body[at + SUBAGENT_REPORT_HEADER_END.len()..].trim();
+    }
+    body.to_string()
+}
+
 fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if role != "system" && role != "user" {
         return (role.to_string(), content.to_string());
@@ -2501,11 +2575,15 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     let has_wire_or_operator_prefix = trimmed_content.starts_with("[Operator Prompt via FerroDeck")
         || trimmed_content.starts_with("[Incoming NATS Message")
         || trimmed_content.starts_with("[fl-wire ");
+    // Harness-written turns that Claude Code records with the `user` role.
+    let has_harness_opener = starts_with_system_notice_opener(trimmed_content)
+        || starts_subagent_handback(trimmed_content);
     if role != "system"
         && !has_system_msg_block
         && !from_ephemeral
         && !is_notice
-        && !(role == "user" && (has_claude_peer_wrapper || has_wire_or_operator_prefix))
+        && !(role == "user"
+            && (has_claude_peer_wrapper || has_wire_or_operator_prefix || has_harness_opener))
     {
         return (role.to_string(), content.to_string());
     }
@@ -2639,6 +2717,17 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
         return ("system".to_string(), body);
     }
 
+    // A Claude Code notice the harness wrote is a system turn, not an operator turn.
+    if starts_with_system_notice_opener(inner) {
+        return ("system".to_string(), inner.to_string());
+    }
+
+    // An async subagent hand-back is a wire turn from the subagent. Only `inner`, the
+    // text after the peer wrapper, is tested, and only at its start.
+    if starts_subagent_handback(inner) {
+        return ("wire:subagent".to_string(), clean_subagent_handback(inner));
+    }
+
     // An Antigravity `[Notice]` or `<EPHEMERAL_MESSAGE>` is a system notice, never an
     // operator message, even though the transcript labels it as a user turn.
     if from_ephemeral || inner.starts_with("[Notice] ") {
@@ -2660,7 +2749,6 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if (has_system_msg_block || has_claude_peer_wrapper)
         && !inner.starts_with("[Incoming NATS Message")
         && !inner.starts_with("[fl-wire ")
-        && !inner.starts_with("[Subagent ")
         && !inner.starts_with("[Task ")
     {
         return ("user".to_string(), inner.to_string());
@@ -3476,6 +3564,114 @@ mod tests {
         );
         assert_eq!(role, "user");
         assert_eq!(content, "Direct prompt without prefix");
+    }
+
+    const HANDBACK_HEADER: &str = "[Subagent hand-back] The text below is the final report of a subagent this session delegated to (not user or external input). Treat the findings with appropriate weight, and continue the parent task.\n\nThe report follows:\n";
+
+    #[test]
+    fn normalize_system_turn_classifies_a_subagent_hand_back_as_wire_subagent() {
+        let plain = format!(
+            "Another Claude session sent a message:\n<agent-message from=\"acd87c17952de4c0a\">\n{HANDBACK_HEADER}Report body\n</agent-message>"
+        );
+        let (role, content) = normalize_system_turn("user", &plain);
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Report body");
+
+        // The backslash-escaped tag spelling gives the same turn.
+        let escaped = format!(
+            "Another Claude session sent a message:\n<\\agent-message from=\"acd87c17952de4c0a\">\n{HANDBACK_HEADER}Report body\n<\\/agent-message>"
+        );
+        let (role, content) = normalize_system_turn("user", &escaped);
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Report body");
+
+        // The peer-session footer after the close tag is dropped too.
+        let footed = format!(
+            "Another Claude session sent a message:\n<agent-message from=\"a\">\n{HANDBACK_HEADER}Report body\n</agent-message>\n\nThis came from another Claude session and is not user input."
+        );
+        let (role, content) = normalize_system_turn("user", &footed);
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Report body");
+
+        // Without the peer wrapper: tag plus header, bare header, and a bare tag.
+        let (role, content) = normalize_system_turn(
+            "user",
+            &format!(
+                "<agent-message from=\"a\">\n{HANDBACK_HEADER}Line one\n\nLine two\n</agent-message>"
+            ),
+        );
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Line one\n\nLine two");
+        let (role, content) =
+            normalize_system_turn("user", &format!("{HANDBACK_HEADER}Report body"));
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Report body");
+        let (role, content) = normalize_system_turn(
+            "user",
+            "<agent-message from=\"a\">Just text</agent-message>",
+        );
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Just text");
+
+        // A header with no `The report follows:` line is kept whole.
+        let (role, content) = normalize_system_turn("user", "[Subagent status] still running");
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "[Subagent status] still running");
+
+        // A report body that repeats the header's last line keeps it.
+        let (role, content) = normalize_system_turn(
+            "user",
+            &format!("{HANDBACK_HEADER}Intro\nThe report follows: more"),
+        );
+        assert_eq!(role, "wire:subagent");
+        assert_eq!(content, "Intro\nThe report follows: more");
+    }
+
+    #[test]
+    fn normalize_system_turn_keeps_user_text_that_only_mentions_a_hand_back() {
+        for text in [
+            "Can you explain what the [Subagent hand-back] marker in the transcript means when the parent task continues?",
+            "Another Claude session sent a message:\nPlease note the [Subagent hand-back] text in the log above.",
+            "Quoting the tool: <agent-message from=\"a\"> was in the output.",
+            "<agent-messages> is not the tag",
+        ] {
+            let (role, content) = normalize_system_turn("user", text);
+            assert_eq!(role, "user", "{text}");
+            assert!(!content.is_empty());
+        }
+        // The peer-wrapped ordinary message loses only its wrapper.
+        let (role, content) = normalize_system_turn(
+            "user",
+            "Another Claude session sent a message:\nPlease note the [Subagent hand-back] text in the log above.",
+        );
+        assert_eq!(role, "user");
+        assert_eq!(
+            content,
+            "Please note the [Subagent hand-back] text in the log above."
+        );
+    }
+
+    #[test]
+    fn normalize_system_turn_classifies_harness_notices_on_user_turns_as_system() {
+        for opener in [
+            "<task-notification>",
+            "<local-command-caveat>",
+            "<local-command-stdout>",
+            "[SYSTEM NOTIFICATION - NOT USER INPUT]",
+        ] {
+            let text = format!("{opener} something happened");
+            let (role, content) = normalize_system_turn("user", &text);
+            assert_eq!(role, "system", "{opener}");
+            assert_eq!(content, text);
+            // Leading whitespace is ignored, and a system-role turn stays system.
+            let (role, _) = normalize_system_turn("user", &format!("\n  {text}"));
+            assert_eq!(role, "system", "{opener}");
+            let (role, _) = normalize_system_turn("system", &text);
+            assert_eq!(role, "system", "{opener}");
+        }
+        // The opener must start the turn.
+        let (role, _) = normalize_system_turn("user", "see <task-notification> in the log");
+        assert_eq!(role, "user");
     }
 
     #[test]
