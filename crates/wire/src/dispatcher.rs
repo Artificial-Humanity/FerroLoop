@@ -856,6 +856,167 @@ fn send_tmux_reset_keys(target: &str, slash: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Method label of [`InterruptPlan::TmuxKey`].
+pub const INTERRUPT_METHOD_TMUX: &str = "tmux-send-keys";
+/// Method label of [`InterruptPlan::AgyCancel`].
+pub const INTERRUPT_METHOD_AGY: &str = "agy-cancel-cascade";
+
+/// The one tmux key an interrupt sends. `Escape` stops the turn that is running in every
+/// supported TUI (Claude Code, Codex, Grok and Muse all treat it as "stop generating") and
+/// does nothing harmful to an idle prompt. `C-c` is NOT used: at an idle prompt it clears the
+/// input, and a second one quits Claude Code and Codex, so a stray interrupt could kill the
+/// session. One key per interrupt also avoids the double-`Escape` rewind menu in Claude Code.
+const INTERRUPT_TMUX_KEY: &str = "Escape";
+
+const AGY_CANCEL_PROCEDURE: &str =
+    "/exa.language_server_pb.LanguageServerService/CancelCascadeInvocation";
+
+/// How [`run_interrupt`] will interrupt one route. Building the plan touches nothing
+/// outside this process, so a caller can plan and then decide whether to run it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterruptPlan {
+    /// Send `key` with `tmux send-keys` to the first live target of `targets`.
+    TmuxKey {
+        targets: Vec<String>,
+        key: &'static str,
+    },
+    /// Call `CancelCascadeInvocation` on the Antigravity language server.
+    AgyCancel {
+        conversation_id: String,
+        ls_address: Option<String>,
+        csrf_token: Option<String>,
+    },
+}
+
+impl InterruptPlan {
+    /// Stable label for the way the interrupt travels (`tmux-send-keys`, `agy-cancel-cascade`).
+    pub fn method(&self) -> &'static str {
+        match self {
+            Self::TmuxKey { .. } => INTERRUPT_METHOD_TMUX,
+            Self::AgyCancel { .. } => INTERRUPT_METHOD_AGY,
+        }
+    }
+}
+
+/// Plan an interrupt for `route`. Claude and Codex routes carry no tmux target, so a caller
+/// that knows the pane the CLI runs in (a hosted session record) passes it as `tmux_fallback`;
+/// Grok and Muse try their own pane and target first. A route with no way to interrupt it
+/// (a webhook route, or a tmux vendor with no target at all) is an error.
+pub fn plan_interrupt(
+    route: &VendorRoute,
+    tmux_fallback: Option<&str>,
+) -> Result<InterruptPlan, String> {
+    let own: [&Option<String>; 2] = match route {
+        VendorRoute::Grok {
+            tmux_pane,
+            tmux_target,
+            ..
+        } => [tmux_pane, tmux_target],
+        VendorRoute::Muse {
+            tmux_target,
+            tmux_pane,
+            ..
+        } => [tmux_target, tmux_pane],
+        VendorRoute::Claude { .. } | VendorRoute::Codex { .. } => [&None, &None],
+        VendorRoute::Agy {
+            conversation_id,
+            ls_address,
+            csrf_token,
+            ..
+        } => {
+            validate_agy_conversation_id(conversation_id)?;
+            return Ok(InterruptPlan::AgyCancel {
+                conversation_id: conversation_id.clone(),
+                ls_address: ls_address.clone(),
+                csrf_token: csrf_token.clone(),
+            });
+        }
+        VendorRoute::Webhook { .. } => {
+            return Err("a webhook route cannot be interrupted".to_string());
+        }
+    };
+    let mut targets: Vec<String> = Vec::new();
+    for raw in own
+        .into_iter()
+        .map(|slot| slot.as_deref())
+        .chain(std::iter::once(tmux_fallback))
+    {
+        let Some(target) = raw.map(str::trim).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        if !targets.iter().any(|seen| seen == target) {
+            targets.push(target.to_string());
+        }
+    }
+    if targets.is_empty() {
+        return Err("the route has no tmux target to send an interrupt to".to_string());
+    }
+    Ok(InterruptPlan::TmuxKey {
+        targets,
+        key: INTERRUPT_TMUX_KEY,
+    })
+}
+
+/// Run `plan`: the real `tmux send-keys`, or the real language-server call.
+pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
+    match plan {
+        InterruptPlan::TmuxKey { targets, key } => {
+            let target = targets
+                .iter()
+                .find(|t| tmux_target_alive(t))
+                .ok_or_else(|| "no live tmux target for the session".to_string())?;
+            let status = Command::new(tmux_bin())
+                .args(["send-keys", "-t", target, key])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map_err(|e| format!("failed to spawn tmux send-keys: {e}"))?;
+            if !status.success() {
+                return Err(format!("tmux send-keys {key} exited with {status}"));
+            }
+            Ok(())
+        }
+        InterruptPlan::AgyCancel {
+            conversation_id,
+            ls_address,
+            csrf_token,
+        } => {
+            let Some(addr) = agy_listening_address(ls_address) else {
+                return Err(agy_address_error(ls_address).replace("reset", "interrupt"));
+            };
+            let csrf = agy_csrf_token(csrf_token).ok_or_else(|| {
+                "antigravity interrupt needs a csrf token (route csrf_token or ANTIGRAVITY_CSRF_TOKEN)"
+                    .to_string()
+            })?;
+            if csrf.chars().any(|ch| ch.is_control() || ch.is_whitespace()) {
+                return Err("antigravity interrupt csrf token is not a single header value".into());
+            }
+            let port = crate::identity::agy_ls_port(&addr).ok_or_else(|| {
+                format!("antigravity interrupt could not parse a port from {addr}")
+            })?;
+            let body = serde_json::json!({ "cascadeId": conversation_id }).to_string();
+            let (code, status_line, resp_body) = post_agy_connect_rpc(
+                port,
+                &csrf,
+                AGY_CANCEL_PROCEDURE,
+                &body,
+                Duration::from_secs(5),
+            )?;
+            if code == 200 {
+                return Ok(());
+            }
+            let detail: String = resp_body.trim().chars().take(512).collect();
+            if detail.is_empty() {
+                Err(format!("antigravity interrupt returned {status_line}"))
+            } else {
+                Err(format!(
+                    "antigravity interrupt returned {status_line}: {detail}"
+                ))
+            }
+        }
+    }
+}
+
 fn tmux_bin() -> PathBuf {
     std::env::var_os("FL_WIRE_TMUX_BIN")
         .map(PathBuf::from)
@@ -1556,6 +1717,194 @@ mod tests {
         let reset_at = log.find("send-keys -t muse:felicia /clear").unwrap();
         let paste_at = log.find("load-buffer -b fl-wire-muse-").unwrap();
         assert!(reset_at < paste_at);
+    }
+
+    #[test]
+    fn plan_interrupt_picks_targets_per_vendor_and_refuses_unreachable_routes() {
+        let grok = VendorRoute::Grok {
+            session_id: "gs".into(),
+            cwd: None,
+            tmux_target: Some("grok:felicia".into()),
+            tmux_pane: Some("%9".into()),
+        };
+        assert_eq!(
+            plan_interrupt(&grok, Some("Felicia:grok")).unwrap(),
+            InterruptPlan::TmuxKey {
+                targets: vec!["%9".into(), "grok:felicia".into(), "Felicia:grok".into()],
+                key: "Escape",
+            }
+        );
+        let muse = VendorRoute::Muse {
+            session_id: "ms".into(),
+            cwd: None,
+            tmux_target: Some("muse:felicia".into()),
+            tmux_pane: Some("muse:felicia".into()),
+        };
+        assert_eq!(
+            plan_interrupt(&muse, None).unwrap(),
+            InterruptPlan::TmuxKey {
+                targets: vec!["muse:felicia".into()],
+                key: "Escape",
+            }
+        );
+        let claude = VendorRoute::Claude {
+            pid: 0,
+            session_id: "cs".into(),
+            socket_path: PathBuf::from("/nonexistent.sock"),
+            key_path: None,
+        };
+        assert!(plan_interrupt(&claude, None).is_err());
+        assert!(plan_interrupt(&claude, Some("   ")).is_err());
+        let plan = plan_interrupt(&claude, Some("Felicia:claude")).unwrap();
+        assert_eq!(plan.method(), INTERRUPT_METHOD_TMUX);
+        let codex = VendorRoute::Codex {
+            thread_id: "t".into(),
+            cwd: None,
+        };
+        assert!(plan_interrupt(&codex, None).is_err());
+        let webhook = VendorRoute::Webhook {
+            socket_path: PathBuf::from("/nonexistent.sock"),
+        };
+        assert!(plan_interrupt(&webhook, Some("x:y")).is_err());
+        let bad_agy = VendorRoute::Agy {
+            conversation_id: "../etc".into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        assert!(plan_interrupt(&bad_agy, None).is_err());
+        let agy = VendorRoute::Agy {
+            conversation_id: "conv-1".into(),
+            ls_pid: None,
+            ls_address: None,
+            csrf_token: None,
+            agentapi_exe: None,
+        };
+        assert_eq!(
+            plan_interrupt(&agy, None).unwrap().method(),
+            INTERRUPT_METHOD_AGY
+        );
+    }
+
+    #[test]
+    fn run_interrupt_sends_one_escape_to_the_first_live_tmux_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let tmux_out = tmp.path().join("tmux.out");
+        let tmux_bin = tmp.path().join("fake-tmux.sh");
+        // `display-message` succeeds only for the live pane `%9`.
+        fs::write(
+            &tmux_bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  if [ \"$4\" = \"%9\" ]; then echo \"%9\"; else exit 1; fi\nfi\n",
+                tmux_out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tmux_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let plan = InterruptPlan::TmuxKey {
+            targets: vec!["dead:pane".into(), "%9".into(), "other:pane".into()],
+            key: "Escape",
+        };
+        run_interrupt(&plan).unwrap();
+        let none_alive = InterruptPlan::TmuxKey {
+            targets: vec!["dead:pane".into()],
+            key: "Escape",
+        };
+        assert!(run_interrupt(&none_alive).is_err());
+        drop(_env);
+
+        let log = fs::read_to_string(&tmux_out).unwrap();
+        let sends: Vec<&str> = log.lines().filter(|l| l.starts_with("send-keys")).collect();
+        assert_eq!(sends, vec!["send-keys -t %9 Escape"], "{log}");
+        assert!(!log.contains("other:pane"), "{log}");
+        assert!(!log.contains("C-c"), "{log}");
+    }
+
+    #[test]
+    fn run_interrupt_calls_cancel_cascade_on_a_local_mock_language_server() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            // The first connection is `agy_ls_address_listening`'s probe; it sends nothing.
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    let end = line == "\r\n";
+                    headers.push_str(&line);
+                    if end {
+                        break;
+                    }
+                }
+                if headers.is_empty() {
+                    continue;
+                }
+                let len = headers
+                    .lines()
+                    .find_map(|l| {
+                        l.split_once(':').and_then(|(n, v)| {
+                            n.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                    )
+                    .unwrap();
+                req_tx
+                    .send(format!("{headers}{}", String::from_utf8_lossy(&body)))
+                    .unwrap();
+                break;
+            }
+        });
+
+        let plan = InterruptPlan::AgyCancel {
+            conversation_id: "conv-1".into(),
+            ls_address: Some(format!("127.0.0.1:{port}")),
+            csrf_token: Some("csrf-test".into()),
+        };
+        run_interrupt(&plan).unwrap();
+        let captured = req_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(captured.starts_with(
+            "POST /exa.language_server_pb.LanguageServerService/CancelCascadeInvocation HTTP/1.1\r\n"
+        ));
+        assert!(captured.contains("x-codeium-csrf-token: csrf-test\r\n"));
+        let payload: serde_json::Value =
+            serde_json::from_str(captured.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(payload, serde_json::json!({ "cascadeId": "conv-1" }));
+
+        // A language server that is not running, or a missing token, is an error.
+        let no_token = InterruptPlan::AgyCancel {
+            conversation_id: "conv-1".into(),
+            ls_address: Some(format!("127.0.0.1:{port}")),
+            csrf_token: None,
+        };
+        let _guard = AGY_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let _no_env = EnvGuard::remove("ANTIGRAVITY_CSRF_TOKEN");
+        let _no_addr = EnvGuard::remove("ANTIGRAVITY_LS_ADDRESS");
+        assert!(run_interrupt(&no_token).is_err());
     }
 
     #[test]
