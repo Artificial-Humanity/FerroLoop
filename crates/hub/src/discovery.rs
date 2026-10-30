@@ -452,6 +452,10 @@ const AGY_LS_SERVICE: &str = "/exa.language_server_pb.LanguageServerService";
 const AGY_RPC_TIMEOUT: Duration = Duration::from_secs(1);
 /// A trajectory grows with the conversation, so it gets a larger body cap than a reset call.
 const AGY_TRAJECTORY_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Steps before the transcript's newest `step_index` that the tail-steps call still asks for.
+const AGY_STEPS_TAIL_MARGIN: u64 = 10;
+/// Newest bytes of an Antigravity transcript scanned for the last `step_index`.
+const AGY_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
 const AGY_CACHE_TTL: Duration = Duration::from_secs(30);
 /// A failed or empty lookup is cached briefly so a dead server costs one attempt, not one per poll.
 const AGY_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -490,9 +494,13 @@ fn session_model_info(
     agy_env_fallback: bool,
 ) -> SessionModelInfo {
     match adapter {
-        "antigravity" => {
-            agy_live_model_info(agy_ls_address, agy_csrf_token, session_id, agy_env_fallback)
-        }
+        "antigravity" => agy_live_model_info_for_transcript(
+            agy_ls_address,
+            agy_csrf_token,
+            session_id,
+            transcript_path,
+            agy_env_fallback,
+        ),
         "claude" => claude_model_info(transcript_path, home),
         "codex" => codex_model_info(transcript_path, home),
         "grok" => grok_model_info(transcript_path, home),
@@ -571,13 +579,15 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
     })
 }
 
-/// Latest `trajectory.steps[].metadata.generatorModel` in a `GetCascadeTrajectory` response.
-/// A body cut off by the size cap is not valid JSON; the last `"generatorModel"` string in
-/// the text that did arrive is used then.
+/// Latest `metadata.generatorModel` in the steps of a `GetCascadeTrajectory` response
+/// (`trajectory.steps`) or a `GetCascadeTrajectorySteps` response (`steps`, or
+/// `trajectory.steps`). A body cut off by the size cap is not valid JSON; the last
+/// `"generatorModel"` string in the text that did arrive is used then.
 fn parse_agy_generator_model(body: &str) -> Option<String> {
     if let Ok(val) = serde_json::from_str::<Value>(body) {
         return val
-            .pointer("/trajectory/steps")?
+            .pointer("/steps")
+            .or_else(|| val.pointer("/trajectory/steps"))?
             .as_array()?
             .iter()
             .rev()
@@ -703,20 +713,73 @@ fn agy_cached_model_config(port: u16, csrf: &str) -> Option<AgyModelConfig> {
     config
 }
 
-fn agy_cached_generator_model(port: u16, csrf: &str, session_id: &str) -> Option<String> {
+/// `step_index` of the newest complete JSON line in an Antigravity transcript tail.
+/// A cut-off first line or a half-written last line is not valid JSON and is skipped.
+fn agy_last_step_index(tail: &str) -> Option<u64> {
+    tail.lines().rev().find_map(|line| {
+        let val: Value = serde_json::from_str(line.trim()).ok()?;
+        val.get("step_index").and_then(Value::as_u64)
+    })
+}
+
+/// First step the tail-steps call asks for: [`AGY_STEPS_TAIL_MARGIN`] before the transcript's
+/// last `step_index`. 0 when the transcript is missing, unreadable or names no step, and
+/// for a conversation too short to need the tail call.
+fn agy_tail_step_offset(transcript_path: Option<&str>) -> u64 {
+    transcript_path
+        .and_then(|p| read_file_tail(Path::new(p), AGY_TRANSCRIPT_TAIL_BYTES))
+        .and_then(|tail| agy_last_step_index(&tail))
+        .map_or(0, |index| index.saturating_sub(AGY_STEPS_TAIL_MARGIN))
+}
+
+/// Latest generator model from `GetCascadeTrajectorySteps`, which returns only the newest
+/// steps. `None` when no tail offset is known, the call fails, or the steps name no model.
+fn agy_tail_generator_model(
+    port: u16,
+    csrf: &str,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> Option<String> {
+    let step_offset = agy_tail_step_offset(transcript_path);
+    if step_offset == 0 {
+        return None;
+    }
+    let body =
+        serde_json::json!({ "cascadeId": session_id, "stepOffset": step_offset }).to_string();
+    agy_rpc(
+        port,
+        csrf,
+        "GetCascadeTrajectorySteps",
+        &body,
+        AGY_TRAJECTORY_MAX_BYTES,
+    )
+    .and_then(|resp| parse_agy_generator_model(&resp))
+}
+
+fn agy_cached_generator_model(
+    port: u16,
+    csrf: &str,
+    session_id: &str,
+    transcript_path: Option<&str>,
+) -> Option<String> {
     let key = (port, session_id.to_string());
     if let Some(hit) = agy_cache_get(&AGY_PLACEHOLDER_CACHE, &key) {
         return hit;
     }
-    let body = serde_json::json!({ "cascadeId": session_id }).to_string();
-    let placeholder = agy_rpc(
-        port,
-        csrf,
-        "GetCascadeTrajectory",
-        &body,
-        AGY_TRAJECTORY_MAX_BYTES,
-    )
-    .and_then(|resp| parse_agy_generator_model(&resp));
+    // A long conversation's full trajectory can be tens of megabytes, so ask for the newest
+    // steps first. The full call runs only when that fast path finds no model.
+    let placeholder =
+        agy_tail_generator_model(port, csrf, session_id, transcript_path).or_else(|| {
+            let body = serde_json::json!({ "cascadeId": session_id }).to_string();
+            agy_rpc(
+                port,
+                csrf,
+                "GetCascadeTrajectory",
+                &body,
+                AGY_TRAJECTORY_MAX_BYTES,
+            )
+            .and_then(|resp| parse_agy_generator_model(&resp))
+        });
     agy_cache_put(&AGY_PLACEHOLDER_CACHE, key, placeholder.clone());
     placeholder
 }
@@ -724,10 +787,14 @@ fn agy_cached_generator_model(port: u16, csrf: &str, session_id: &str) -> Option
 /// Ask the Antigravity language server which model a conversation runs and which models it
 /// offers. The route's `ls_address` and `csrf_token` win; the environment fills a gap only
 /// when `env_fallback` is true. Any failure yields the offline defaults.
-fn agy_live_model_info(
+///
+/// `transcript_path` is the session's Antigravity transcript; its last `step_index` lets the
+/// model lookup fetch only the newest steps.
+fn agy_live_model_info_for_transcript(
     route_address: Option<&str>,
     route_csrf: Option<&str>,
     session_id: &str,
+    transcript_path: Option<&str>,
     env_fallback: bool,
 ) -> SessionModelInfo {
     let from_env = |name: &str| {
@@ -764,8 +831,19 @@ fn agy_live_model_info(
     let Some(config) = agy_cached_model_config(port, &csrf) else {
         return offline_agy_model_info();
     };
-    let placeholder = agy_cached_generator_model(port, &csrf, session_id);
+    let placeholder = agy_cached_generator_model(port, &csrf, session_id, transcript_path);
     resolve_agy_model_info(&config, placeholder.as_deref())
+}
+
+/// [`agy_live_model_info_for_transcript`] for a session with no known transcript.
+#[cfg(test)]
+fn agy_live_model_info(
+    route_address: Option<&str>,
+    route_csrf: Option<&str>,
+    session_id: &str,
+    env_fallback: bool,
+) -> SessionModelInfo {
+    agy_live_model_info_for_transcript(route_address, route_csrf, session_id, None, env_fallback)
 }
 
 // --- Claude -----------------------------------------------------------------
@@ -3648,6 +3726,8 @@ mod tests {
     struct AgyStub {
         port: u16,
         seen: std::sync::Arc<Mutex<Vec<(String, String)>>>,
+        /// `(path, request body)` for each request, in arrival order.
+        bodies: std::sync::Arc<Mutex<Vec<(String, String)>>>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         handle: std::thread::JoinHandle<()>,
     }
@@ -3660,6 +3740,18 @@ mod tests {
     }
 
     fn spawn_agy_stub(config_body: &'static str, trajectory_body: &'static str) -> AgyStub {
+        spawn_agy_stub_with_steps(config_body, trajectory_body, "agy-live-1", None)
+    }
+
+    /// Like [`spawn_agy_stub`], and `steps` is the `(status, body)` it answers
+    /// `GetCascadeTrajectorySteps` with. `None` answers an empty object. Every cascade request
+    /// must name `cascade_id`.
+    fn spawn_agy_stub_with_steps(
+        config_body: &'static str,
+        trajectory_body: &'static str,
+        cascade_id: &'static str,
+        steps: Option<(u16, &'static str)>,
+    ) -> AgyStub {
         use std::io::{BufRead, BufReader, Read, Write};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -3667,8 +3759,10 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let (seen_t, stop_t) = (Arc::clone(&seen), Arc::clone(&stop));
+        let (seen_t, bodies_t, stop_t) =
+            (Arc::clone(&seen), Arc::clone(&bodies), Arc::clone(&stop));
         let handle = std::thread::spawn(move || {
             while !stop_t.load(Ordering::SeqCst) {
                 let Ok((stream, _)) = listener.accept() else {
@@ -3705,22 +3799,39 @@ mod tests {
                     .nth(1)
                     .unwrap_or("")
                     .to_string();
+                let mut status = 200u16;
                 let reply = if path.ends_with("/GetCascadeModelConfigData") {
                     config_body
                 } else if path.ends_with("/GetCascadeTrajectory") {
                     assert!(
-                        String::from_utf8_lossy(&req_body).contains("agy-live-1"),
+                        String::from_utf8_lossy(&req_body).contains(cascade_id),
                         "trajectory request names the cascade id"
                     );
                     trajectory_body
+                } else if path.ends_with("/GetCascadeTrajectorySteps") {
+                    assert!(
+                        String::from_utf8_lossy(&req_body).contains(cascade_id),
+                        "steps request names the cascade id"
+                    );
+                    match steps {
+                        Some((code, body)) => {
+                            status = code;
+                            body
+                        }
+                        None => "{}",
+                    }
                 } else {
                     "{}"
                 };
+                bodies_t.lock().unwrap().push((
+                    path.clone(),
+                    String::from_utf8_lossy(&req_body).into_owned(),
+                ));
                 seen_t.lock().unwrap().push((path, csrf));
                 let mut stream = stream;
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
                     reply.len()
                 );
             }
@@ -3728,6 +3839,7 @@ mod tests {
         AgyStub {
             port,
             seen,
+            bodies,
             stop,
             handle,
         }
@@ -3787,6 +3899,267 @@ mod tests {
         assert_eq!(agy.thinking_level.as_deref(), Some("high"));
         assert_eq!(seen.lock().unwrap().len(), 2, "discovery reused the cache");
 
+        stub.shutdown();
+    }
+
+    const AGY_STEPS_FIXTURE: &str = r#"{"steps":[
+        {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},
+        {"metadata":{}},
+        {"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M417"}},
+        {"type":"USER_INPUT"}
+    ]}"#;
+
+    #[test]
+    fn agy_steps_responses_parse_under_steps_and_trajectory_steps() {
+        assert_eq!(
+            parse_agy_generator_model(AGY_STEPS_FIXTURE).as_deref(),
+            Some("MODEL_PLACEHOLDER_M417")
+        );
+        assert_eq!(
+            parse_agy_generator_model(
+                r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M420"}}]}}"#
+            )
+            .as_deref(),
+            Some("MODEL_PLACEHOLDER_M420")
+        );
+        assert!(parse_agy_generator_model(r#"{"steps":[{"metadata":{}}]}"#).is_none());
+        assert!(parse_agy_generator_model(r#"{"steps":[]}"#).is_none());
+        assert!(parse_agy_generator_model("{}").is_none());
+    }
+
+    fn write_agy_transcript(dir: &Path, body: &str) -> String {
+        let path = dir.join("transcript.jsonl");
+        fs::write(&path, body).unwrap();
+        path.display().to_string()
+    }
+
+    #[test]
+    fn agy_step_offset_comes_from_the_last_transcript_line() {
+        let tmp = TempDir::new().unwrap();
+        let line = |n: u64| format!("{{\"step_index\":{n},\"type\":\"PLANNER_RESPONSE\"}}\n");
+
+        // The last line decides, minus the margin.
+        let path = write_agy_transcript(
+            tmp.path(),
+            &format!("{}{}{}", line(1), line(40), line(6768)),
+        );
+        assert_eq!(agy_tail_step_offset(Some(&path)), 6758);
+        // A young conversation saturates to 0, and so does one at exactly the margin.
+        let path = write_agy_transcript(tmp.path(), &format!("{}{}", line(0), line(4)));
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path = write_agy_transcript(tmp.path(), &line(10));
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path = write_agy_transcript(tmp.path(), &line(11));
+        assert_eq!(agy_tail_step_offset(Some(&path)), 1);
+        // No trailing newline, and a half-written last line is skipped for the one before it.
+        let path = write_agy_transcript(tmp.path(), line(200).trim_end());
+        assert_eq!(agy_tail_step_offset(Some(&path)), 190);
+        let path = write_agy_transcript(
+            tmp.path(),
+            &format!("{}{{\"step_index\":9999,\"ty", line(300)),
+        );
+        assert_eq!(agy_tail_step_offset(Some(&path)), 290);
+        // Only the newest bytes are read: a first line cut by the tail window is not used.
+        let big = "x".repeat(AGY_TRANSCRIPT_TAIL_BYTES as usize);
+        let path = write_agy_transcript(
+            tmp.path(),
+            &format!("{{\"step_index\":5000,\"pad\":\"{big}\"}}\n{}", line(70)),
+        );
+        assert_eq!(agy_tail_step_offset(Some(&path)), 60);
+
+        // Missing, unreadable, garbage, or index-less transcripts all give 0.
+        assert_eq!(agy_tail_step_offset(None), 0);
+        assert_eq!(agy_tail_step_offset(Some("/definitely/missing.jsonl")), 0);
+        assert_eq!(agy_tail_step_offset(tmp.path().to_str()), 0);
+        let path = write_agy_transcript(tmp.path(), "not json\n{broken\n");
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path = write_agy_transcript(tmp.path(), "{\"type\":\"USER_INPUT\"}\n");
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path =
+            write_agy_transcript(tmp.path(), "{\"step_index\":\"7\"}\n{\"step_index\":-5}\n");
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+        let path = write_agy_transcript(tmp.path(), "");
+        assert_eq!(agy_tail_step_offset(Some(&path)), 0);
+    }
+
+    fn stub_paths(stub: &AgyStub) -> Vec<String> {
+        stub.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, _)| p.rsplit('/').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn agy_live_model_uses_the_tail_steps_call_and_skips_the_full_trajectory() {
+        let tmp = TempDir::new().unwrap();
+        let transcript =
+            write_agy_transcript(tmp.path(), "{\"step_index\":6767}\n{\"step_index\":6768}\n");
+        let stub = spawn_agy_stub_with_steps(
+            AGY_CONFIG_FIXTURE,
+            // The full trajectory names a different model; it must never be asked.
+            r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M420"}}]}}"#,
+            "agy-steps-1",
+            Some((200, AGY_STEPS_FIXTURE)),
+        );
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let info = agy_live_model_info_for_transcript(
+            Some(&addr),
+            Some("stub-csrf"),
+            "agy-steps-1",
+            Some(&transcript),
+            false,
+        );
+        assert_eq!(info.model.as_deref(), Some("gemini-4-argon"));
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            stub_paths(&stub),
+            ["GetCascadeModelConfigData", "GetCascadeTrajectorySteps"],
+            "the full trajectory endpoint is not called"
+        );
+        let bodies = stub.bodies.lock().unwrap().clone();
+        let steps_body: Value = serde_json::from_str(&bodies[1].1).unwrap();
+        assert_eq!(
+            steps_body,
+            serde_json::json!({"cascadeId":"agy-steps-1","stepOffset":6758})
+        );
+
+        // The answer is cached: a second poll sends nothing.
+        let again = agy_live_model_info_for_transcript(
+            Some(&addr),
+            Some("stub-csrf"),
+            "agy-steps-1",
+            Some(&transcript),
+            false,
+        );
+        assert_eq!(again, info);
+        assert_eq!(stub.seen.lock().unwrap().len(), 2);
+        stub.shutdown();
+    }
+
+    #[test]
+    fn agy_live_model_falls_back_to_the_full_trajectory_when_the_tail_call_finds_no_model() {
+        let tmp = TempDir::new().unwrap();
+        let transcript = write_agy_transcript(tmp.path(), "{\"step_index\":500}\n");
+        let cases: [(&'static str, Option<(u16, &'static str)>); 4] = [
+            (
+                "agy-fb-empty",
+                Some((200, r#"{"steps":[{"metadata":{}}]}"#)),
+            ),
+            ("agy-fb-error", Some((500, r#"{"code":"internal"}"#))),
+            ("agy-fb-garbage", Some((200, "not json"))),
+            ("agy-fb-unknown", None),
+        ];
+        for (cascade, steps) in cases {
+            let stub = spawn_agy_stub_with_steps(
+                AGY_CONFIG_FIXTURE,
+                AGY_TRAJECTORY_FIXTURE,
+                cascade,
+                steps,
+            );
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let info = agy_live_model_info_for_transcript(
+                Some(&addr),
+                Some("stub-csrf"),
+                cascade,
+                Some(&transcript),
+                false,
+            );
+            assert_eq!(info.model.as_deref(), Some("gemini-4-argon"), "{cascade}");
+            assert_eq!(info.thinking_level.as_deref(), Some("high"), "{cascade}");
+            assert_eq!(
+                stub_paths(&stub),
+                [
+                    "GetCascadeModelConfigData",
+                    "GetCascadeTrajectorySteps",
+                    "GetCascadeTrajectory"
+                ],
+                "{cascade}: the tail call first, then the full trajectory"
+            );
+            stub.shutdown();
+        }
+    }
+
+    #[test]
+    fn agy_live_model_goes_straight_to_the_full_trajectory_without_a_step_offset() {
+        let tmp = TempDir::new().unwrap();
+        let young = write_agy_transcript(tmp.path(), "{\"step_index\":3}\n");
+        let garbage = tmp.path().join("garbage.jsonl");
+        fs::write(&garbage, "nope\n").unwrap();
+        let garbage = garbage.display().to_string();
+        let cases: [(&'static str, Option<&str>); 4] = [
+            ("agy-direct-young", Some(&young)),
+            ("agy-direct-garbage", Some(&garbage)),
+            ("agy-direct-missing", Some("/definitely/missing.jsonl")),
+            ("agy-direct-none", None),
+        ];
+        for (cascade, transcript) in cases {
+            let stub = spawn_agy_stub_with_steps(
+                AGY_CONFIG_FIXTURE,
+                AGY_TRAJECTORY_FIXTURE,
+                cascade,
+                // A steps answer exists but must never be asked for.
+                Some((
+                    200,
+                    r#"{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M420"}}]}"#,
+                )),
+            );
+            let addr = format!("127.0.0.1:{}", stub.port);
+            let info = agy_live_model_info_for_transcript(
+                Some(&addr),
+                Some("stub-csrf"),
+                cascade,
+                transcript,
+                false,
+            );
+            assert_eq!(info.model.as_deref(), Some("gemini-4-argon"), "{cascade}");
+            assert_eq!(
+                stub_paths(&stub),
+                ["GetCascadeModelConfigData", "GetCascadeTrajectory"],
+                "{cascade}"
+            );
+            stub.shutdown();
+        }
+    }
+
+    #[test]
+    fn agy_discovery_passes_the_session_transcript_to_the_tail_steps_call() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let logs = home
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("brain")
+            .join("agy-disc-1")
+            .join(".system_generated")
+            .join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("transcript.jsonl"), "{\"step_index\":900}\n").unwrap();
+        let stub = spawn_agy_stub_with_steps(
+            AGY_CONFIG_FIXTURE,
+            AGY_TRAJECTORY_FIXTURE,
+            "agy-disc-1",
+            Some((200, AGY_STEPS_FIXTURE)),
+        );
+        let addr = format!("127.0.0.1:{}", stub.port);
+        write_routes(
+            home,
+            &[(
+                "ferris",
+                &format!(
+                    r#"{{"kind":"agy","conversation_id":"agy-disc-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                ),
+            )],
+        );
+        let sessions = discover_in(home);
+        let agy = session_for(&sessions, "ferris");
+        assert_eq!(agy.model.as_deref(), Some("gemini-4-argon"));
+        assert!(
+            !stub_paths(&stub).contains(&"GetCascadeTrajectory".to_string()),
+            "{:?}",
+            stub_paths(&stub)
+        );
         stub.shutdown();
     }
 
