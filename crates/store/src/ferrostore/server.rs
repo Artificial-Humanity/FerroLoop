@@ -7,6 +7,7 @@
 use super::columnar;
 use super::layout::{Op, backend};
 use super::state::DocState;
+use super::vector;
 use super::{FerroStore, MqRecord, lock_mutex};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
@@ -573,6 +574,91 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
                 &store.gate_run_rollup(gate.as_ref())?,
             ))
         }
+        "create_vector_collection" => {
+            store.create_vector_collection(
+                param_str(params, "name")?,
+                param_u32(params, "dim")?,
+                vector::storage_from_name(param_str(params, "storage")?)?,
+                vector::metric_from_name(param_str(params, "metric")?)?,
+                param_u32(params, "m")?,
+                param_u32(params, "ef_construction")?,
+                param_u32(params, "ef_search")?,
+            )?;
+            Ok(Value::Null)
+        }
+        "upsert_vector" => {
+            let values = vector::parse_values(
+                params
+                    .get("values")
+                    .ok_or_else(|| backend("missing param `values`"))?,
+            )?;
+            let metadata = params.get("metadata");
+            store.upsert_vector(
+                param_str(params, "collection")?,
+                param_str(params, "id")?,
+                &values,
+                metadata,
+            )?;
+            Ok(Value::Null)
+        }
+        "delete_vector" => {
+            store.delete_vector(param_str(params, "collection")?, param_str(params, "id")?)?;
+            Ok(Value::Null)
+        }
+        "get_vector" => {
+            match store.get_vector(param_str(params, "collection")?, param_str(params, "id")?)? {
+                Some((values, metadata)) => vector::vector_get_json(&values, &metadata),
+                None => Ok(Value::Null),
+            }
+        }
+        "search_vectors" => vector::hits_json(
+            &store.search_vectors(
+                param_str(params, "collection")?,
+                &vector::parse_values(
+                    params
+                        .get("values")
+                        .ok_or_else(|| backend("missing param `values`"))?,
+                )?,
+                param_usize(params, "limit")?,
+                optional_u32(params, "ef")?,
+            )?,
+        ),
+        "search_hybrid" => vector::hits_json(
+            &store.search_hybrid(
+                param_str(params, "doc_collection")?,
+                param_str(params, "vector_collection")?,
+                param_str(params, "query")?,
+                &vector::parse_values(
+                    params
+                        .get("values")
+                        .ok_or_else(|| backend("missing param `values`"))?,
+                )?,
+                param_usize(params, "limit")?,
+                vector::fusion_from_json(
+                    params
+                        .get("fusion")
+                        .ok_or_else(|| backend("missing param `fusion`"))?,
+                )?,
+            )?,
+        ),
+        "search_knowledge" => vector::knowledge_json(
+            &store.search_knowledge(
+                param_str(params, "doc_collection")?,
+                param_str(params, "vector_collection")?,
+                param_str(params, "query")?,
+                &vector::parse_values(
+                    params
+                        .get("values")
+                        .ok_or_else(|| backend("missing param `values`"))?,
+                )?,
+                param_usize(params, "limit")?,
+                vector::fusion_from_json(
+                    params
+                        .get("fusion")
+                        .ok_or_else(|| backend("missing param `fusion`"))?,
+                )?,
+            )?,
+        ),
         "read_state" => Ok(doc_state_value(&store.read_state()?)),
         "commit_ops" => {
             let expected_seq = param_u64(params, "expected_seq")?;
@@ -628,6 +714,25 @@ fn param_usize(params: &Value, key: &str) -> Result<usize, StoreError> {
         .map_err(|_| backend(format!("param `{key}` does not fit")))
 }
 
+fn param_u32(params: &Value, key: &str) -> Result<u32, StoreError> {
+    u32::try_from(param_u64(params, key)?)
+        .map_err(|_| backend(format!("param `{key}` does not fit")))
+}
+
+fn optional_u32(params: &Value, key: &str) -> Result<Option<u32>, StoreError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(value) => {
+            let number = value
+                .as_u64()
+                .ok_or_else(|| backend(format!("missing integer param `{key}`")))?;
+            let number = u32::try_from(number)
+                .map_err(|_| backend(format!("param `{key}` does not fit")))?;
+            Ok(Some(number))
+        }
+    }
+}
+
 fn param_value(params: &Value, key: &str) -> Result<Value, StoreError> {
     params
         .get(key)
@@ -651,6 +756,7 @@ fn doc_state_value(state: &DocState) -> Value {
         "last_seq": state.last_seq,
         "docs": docs,
         "tables": columnar::tables_json(&state.tables),
+        "vectors": vector::vectors_json(&state.vectors),
     })
 }
 
@@ -677,9 +783,14 @@ fn parse_doc_state(value: &Value) -> Result<DocState, StoreError> {
         None => BTreeMap::new(),
         Some(tables) => columnar::parse_tables(tables)?,
     };
+    let vectors = match value.get("vectors") {
+        None => BTreeMap::new(),
+        Some(vectors) => vector::parse_vectors(vectors)?,
+    };
     Ok(DocState {
         docs,
         tables,
+        vectors,
         last_seq,
     })
 }
@@ -733,6 +844,48 @@ fn op_value(op: &Op) -> Value {
             "name": name,
             "bytes": bytes.iter().copied().map(Value::from).collect::<Vec<_>>(),
         }),
+        Op::CreateVectorCollection {
+            name,
+            dim,
+            storage,
+            metric,
+            m,
+            ef_construction,
+            ef_search,
+        } => json!({
+            "op": "create_vector_collection",
+            "name": name,
+            "dim": dim,
+            "storage": vector::storage_name(*storage),
+            "metric": vector::metric_name(*metric),
+            "m": m,
+            "ef_construction": ef_construction,
+            "ef_search": ef_search,
+        }),
+        Op::UpsertVector {
+            collection,
+            id,
+            bytes,
+            metadata,
+        } => {
+            let mut item = serde_json::Map::new();
+            item.insert("op".into(), json!("upsert_vector"));
+            item.insert("collection".into(), json!(collection));
+            item.insert("id".into(), json!(id));
+            item.insert(
+                "bytes".into(),
+                Value::Array(bytes.iter().copied().map(Value::from).collect()),
+            );
+            if let Some(metadata) = metadata {
+                item.insert("metadata".into(), metadata.clone());
+            }
+            Value::Object(item)
+        }
+        Op::DeleteVector { collection, id } => json!({
+            "op": "delete_vector",
+            "collection": collection,
+            "id": id,
+        }),
     }
 }
 
@@ -782,6 +935,32 @@ fn parse_op(value: &Value) -> Result<Op, StoreError> {
                     .get("bytes")
                     .ok_or_else(|| backend("append_column_group op is missing bytes"))?,
             )?,
+        }),
+        "create_vector_collection" => Ok(Op::CreateVectorCollection {
+            name: param_str(value, "name")?.to_string(),
+            dim: param_u32(value, "dim")?,
+            storage: vector::storage_from_name(param_str(value, "storage")?)?,
+            metric: vector::metric_from_name(param_str(value, "metric")?)?,
+            m: param_u32(value, "m")?,
+            ef_construction: param_u32(value, "ef_construction")?,
+            ef_search: param_u32(value, "ef_search")?,
+        }),
+        "upsert_vector" => {
+            let metadata = value.get("metadata").cloned();
+            Ok(Op::UpsertVector {
+                collection: param_str(value, "collection")?.to_string(),
+                id: param_str(value, "id")?.to_string(),
+                bytes: columnar::parse_bytes(
+                    value
+                        .get("bytes")
+                        .ok_or_else(|| backend("upsert_vector op is missing bytes"))?,
+                )?,
+                metadata,
+            })
+        }
+        "delete_vector" => Ok(Op::DeleteVector {
+            collection: param_str(value, "collection")?.to_string(),
+            id: param_str(value, "id")?.to_string(),
         }),
         other => Err(backend(format!("unknown op `{other}`"))),
     }
@@ -1325,6 +1504,7 @@ mod tests {
         let state = DocState {
             docs,
             tables,
+            vectors: BTreeMap::new(),
             last_seq: 4,
         };
         let parsed = parse_doc_state(&doc_state_value(&state)).unwrap();
@@ -1379,5 +1559,92 @@ mod tests {
             }
             other => panic!("ops did not round-trip: {other:?}"),
         }
+    }
+
+    #[test]
+    fn vector_ops_round_trip_absent_and_null_metadata() {
+        let ops = [
+            Op::CreateVectorCollection {
+                name: "emb".into(),
+                dim: 2,
+                storage: vector::VectorStorage::F16,
+                metric: vector::VectorMetric::L2,
+                m: 4,
+                ef_construction: 8,
+                ef_search: 9,
+            },
+            Op::UpsertVector {
+                collection: "emb".into(),
+                id: "a".into(),
+                bytes: vec![0, 60],
+                metadata: None,
+            },
+            Op::UpsertVector {
+                collection: "emb".into(),
+                id: "b".into(),
+                bytes: vec![1, 2],
+                metadata: Some(Value::Null),
+            },
+            Op::DeleteVector {
+                collection: "emb".into(),
+                id: "a".into(),
+            },
+        ];
+        let encoded = Value::Array(ops.iter().map(op_value).collect());
+        let again = parse_ops(&encoded).unwrap();
+        match &again[..] {
+            [
+                Op::CreateVectorCollection {
+                    name,
+                    dim,
+                    storage,
+                    metric,
+                    m,
+                    ef_construction,
+                    ef_search,
+                },
+                Op::UpsertVector {
+                    id,
+                    bytes: absent_bytes,
+                    metadata: absent,
+                    ..
+                },
+                Op::UpsertVector {
+                    id: present,
+                    metadata: present_meta,
+                    ..
+                },
+                Op::DeleteVector { id: deleted, .. },
+            ] => {
+                assert_eq!(name, "emb");
+                assert_eq!(*dim, 2);
+                assert_eq!(*storage, vector::VectorStorage::F16);
+                assert_eq!(*metric, vector::VectorMetric::L2);
+                assert_eq!(*m, 4);
+                assert_eq!(*ef_construction, 8);
+                assert_eq!(*ef_search, 9);
+                assert_eq!(id, "a");
+                assert!(absent.is_none());
+                assert_eq!(absent_bytes, &[0, 60]);
+                assert_eq!(present, "b");
+                assert_eq!(present_meta, &Some(Value::Null));
+                assert_eq!(deleted, "a");
+            }
+            other => panic!("vector ops did not round-trip: {other:?}"),
+        }
+        let absent_meta = encoded
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "a")
+            .unwrap();
+        assert!(absent_meta.get("metadata").is_none());
+        let present_meta = encoded
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == "b")
+            .unwrap();
+        assert!(present_meta.get("metadata").unwrap().is_null());
     }
 }

@@ -1,8 +1,8 @@
 use super::layout::{self, Op, Superblock};
 use super::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnType, ColumnValue, FerroStore,
-    FerroStoreServer, GateRunRollup, default_socket_path_for_store, file_uri_path,
-    latest_superblock, write_slot,
+    FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit, VectorMetric, VectorStorage,
+    default_socket_path_for_store, file_uri_path, latest_superblock, write_slot,
 };
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId, RecordId, seq_iri};
@@ -10,7 +10,7 @@ use fl_core::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
 use fl_core::store::Ledger;
 use fl_core::verdict::Verdict;
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -1663,6 +1663,12 @@ fn migration_refuses_a_non_empty_store_and_an_empty_redb_stays_empty() {
     tabular.create_column_table("t", &int_column()).unwrap();
     let err = migrate_redb_to_ferrostore(&redb, &tabular).unwrap_err();
     assert!(err.to_string().contains("column table"), "{err}");
+    let vectors = FerroStore::in_memory();
+    vectors
+        .create_vector_collection("emb", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap();
+    let err = migrate_redb_to_ferrostore(&redb, &vectors).unwrap_err();
+    assert!(err.to_string().contains("vector collection"), "{err}");
     assert_eq!(
         occupied.get_doc("docs", "kept").unwrap(),
         Some(json!({ "ok": true }))
@@ -2937,5 +2943,1437 @@ fn a_version_2_snapshot_with_no_tables_or_a_bad_group_is_corrupt() {
     assert!(err.to_string().contains("corrupt"), "{err}");
 
     let v1 = layout::encode_snapshot(1, &docs).unwrap();
-    assert!(layout::decode_snapshot(&v1).unwrap().tables.is_empty());
+    let decoded = layout::decode_snapshot(&v1).unwrap();
+    assert!(decoded.tables.is_empty());
+    assert!(decoded.vectors.is_empty());
+}
+
+fn snapshot_bytes(path: &Path) -> Vec<u8> {
+    let sb = live(path);
+    let file = File::open(path).unwrap();
+    let mut buf = vec![0u8; usize::try_from(sb.snapshot_length).unwrap()];
+    if !buf.is_empty() {
+        file.read_exact_at(&mut buf, sb.snapshot_offset).unwrap();
+    }
+    buf
+}
+
+fn nn_vector(index: usize) -> Vec<f32> {
+    let center = index % 4;
+    let mut values = vec![0.0; 8];
+    values[center] = 1.0;
+    values[4 + (index % 4)] = 0.05 + 0.01 * (index as f32);
+    values
+}
+
+fn cosine_score(left: &[f32], right: &[f32]) -> f64 {
+    let dot: f64 = left
+        .iter()
+        .zip(right)
+        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+        .sum();
+    let left_norm = left
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    let right_norm = right
+        .iter()
+        .map(|value| f64::from(*value) * f64::from(*value))
+        .sum::<f64>()
+        .sqrt();
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm * right_norm)
+    }
+}
+
+fn brute_cosine(stored: &[(String, Vec<f32>)], query: &[f32], limit: usize) -> Vec<(String, f64)> {
+    let mut scored: Vec<(String, f64)> = stored
+        .iter()
+        .map(|(id, values)| (id.clone(), cosine_score(values, query)))
+        .collect();
+    scored.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    scored.truncate(limit);
+    scored
+}
+
+fn rrf_scores(bm25: &[(String, f64)], vectors: &[(String, f64)], k: u32) -> Vec<(String, f64)> {
+    let mut scores: BTreeMap<String, f64> = BTreeMap::new();
+    for (rank, (id, _)) in bm25.iter().enumerate() {
+        *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (f64::from(k) + rank as f64 + 1.0);
+    }
+    for (rank, (id, _)) in vectors.iter().enumerate() {
+        *scores.entry(id.clone()).or_insert(0.0) += 1.0 / (f64::from(k) + rank as f64 + 1.0);
+    }
+    let mut fused: Vec<(String, f64)> = scores.into_iter().collect();
+    fused.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    fused
+}
+
+fn normalize_hits(hits: &[(String, f64)]) -> BTreeMap<String, f64> {
+    if hits.is_empty() {
+        return BTreeMap::new();
+    }
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for (_, score) in hits {
+        min = min.min(*score);
+        max = max.max(*score);
+    }
+    let mut out = BTreeMap::new();
+    for (id, score) in hits {
+        let norm = if max == min {
+            1.0
+        } else {
+            (score - min) / (max - min)
+        };
+        out.insert(id.clone(), norm);
+    }
+    out
+}
+
+fn weighted_scores(
+    bm25: &[(String, f64)],
+    vectors: &[(String, f64)],
+    bm25_weight: f64,
+    vector_weight: f64,
+) -> Vec<(String, f64)> {
+    let left = normalize_hits(bm25);
+    let right = normalize_hits(vectors);
+    let mut ids = BTreeSet::new();
+    ids.extend(left.keys().cloned());
+    ids.extend(right.keys().cloned());
+    let mut fused: Vec<(String, f64)> = ids
+        .into_iter()
+        .map(|id| {
+            let score = bm25_weight * left.get(&id).copied().unwrap_or(0.0)
+                + vector_weight * right.get(&id).copied().unwrap_or(0.0);
+            (id, score)
+        })
+        .collect();
+    fused.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    fused
+}
+
+fn nan_f32_pair() -> Vec<u8> {
+    let mut bytes = 1.0f32.to_le_bytes().to_vec();
+    bytes.extend_from_slice(&f32::NAN.to_le_bytes());
+    bytes
+}
+
+fn assert_vector_rejects_write_nothing(store: &FerroStore) {
+    store
+        .create_vector_collection("emb", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap();
+    store
+        .create_vector_collection("half", 2, VectorStorage::F16, VectorMetric::L2, 4, 8, 8)
+        .unwrap();
+    store.upsert_vector("emb", "ok", &[1.0, 0.0], None).unwrap();
+    let seq = store.read_state().unwrap().last_seq;
+    let err = store.upsert_vector("emb", "bad", &[1.0], None).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .upsert_vector("emb", "bad", &[f32::NAN, 0.0], None)
+        .unwrap_err();
+    assert!(err.to_string().contains("not finite"), "{err}");
+    let err = store
+        .upsert_vector("emb", "bad", &[f32::INFINITY, 0.0], None)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .upsert_vector("emb", "", &[1.0, 0.0], None)
+        .unwrap_err();
+    assert!(err.to_string().contains("vector id is empty"), "{err}");
+    let err = store
+        .upsert_vector("emb", "a\0b", &[1.0, 0.0], None)
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid vector id"), "{err}");
+    let err = store
+        .create_vector_collection("emb", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    let err = store
+        .create_vector_collection("tiny", 2, VectorStorage::F32, VectorMetric::Cosine, 1, 8, 8)
+        .unwrap_err();
+    assert!(err.to_string().contains("M is out of range"), "{err}");
+    let err = store
+        .create_vector_collection("", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("vector collection name is empty"),
+        "{err}"
+    );
+    let err = store
+        .create_vector_collection("a/b", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("invalid vector collection name"),
+        "{err}"
+    );
+    let err = store
+        .upsert_vector("half", "wide", &[100_000.0, 0.0], None)
+        .unwrap_err();
+    assert!(err.to_string().contains("out of range"), "{err}");
+    let err = store
+        .upsert_vector("missing", "a", &[1.0, 0.0], None)
+        .unwrap_err();
+    assert!(err.to_string().contains("no vector collection"), "{err}");
+    let err = store.delete_vector("missing", "a").unwrap_err();
+    assert!(err.to_string().contains("no vector collection"), "{err}");
+    assert_eq!(store.read_state().unwrap().last_seq, seq);
+    assert_eq!(
+        store.get_vector("emb", "ok").unwrap().unwrap().0,
+        vec![1.0, 0.0]
+    );
+    assert!(store.get_vector("emb", "bad").unwrap().is_none());
+    assert!(!store.read_state().unwrap().vectors.contains_key("tiny"));
+}
+
+fn exercise_delete(store: &FerroStore) {
+    store
+        .create_vector_collection("emb", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap();
+    store
+        .upsert_vector("emb", "keep", &[1.0, 0.0], None)
+        .unwrap();
+    store
+        .upsert_vector("emb", "drop", &[0.0, 1.0], None)
+        .unwrap();
+    let before = store.search_vectors("emb", &[0.0, 1.0], 5, None).unwrap();
+    assert_eq!(before[0].0, "drop");
+    store.delete_vector("emb", "drop").unwrap();
+    let after = store.search_vectors("emb", &[0.0, 1.0], 5, None).unwrap();
+    assert!(after.iter().all(|(id, _)| id != "drop"));
+    assert_eq!(after[0].0, "keep");
+    let seq = store.read_state().unwrap().last_seq;
+    store.delete_vector("emb", "missing").unwrap();
+    assert_eq!(store.read_state().unwrap().last_seq, seq + 1);
+    store
+        .upsert_vector("emb", "drop", &[0.0, 1.0], None)
+        .unwrap();
+    let back = store.search_vectors("emb", &[0.0, 1.0], 5, None).unwrap();
+    assert_eq!(back[0].0, "drop");
+    assert!(back.iter().all(|(_, score)| score.is_finite()));
+}
+
+fn exercise_bad_batch(store: &FerroStore) -> u64 {
+    store
+        .put_doc("docs", "earlier", &json!({ "kept": true }))
+        .unwrap();
+    store
+        .create_vector_collection("emb", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap();
+    let seq = store.read_state().unwrap().last_seq;
+    let err = store
+        .commit_if_seq(
+            seq,
+            &[
+                Op::Put {
+                    collection: "docs".into(),
+                    id: "later".into(),
+                    doc: json!({ "no": true }),
+                },
+                Op::UpsertVector {
+                    collection: "emb".into(),
+                    id: "bad".into(),
+                    bytes: nan_f32_pair(),
+                    metadata: None,
+                },
+            ],
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert_eq!(store.read_state().unwrap().last_seq, seq);
+    assert_eq!(
+        store.get_doc("docs", "earlier").unwrap(),
+        Some(json!({ "kept": true }))
+    );
+    assert!(store.get_doc("docs", "later").unwrap().is_none());
+    assert!(store.get_vector("emb", "bad").unwrap().is_none());
+    seq
+}
+
+fn exercise_vector_rpc(client: &FerroStore, file: &Path) {
+    client
+        .create_vector_collection(
+            "emb",
+            2,
+            VectorStorage::F32,
+            VectorMetric::Cosine,
+            4,
+            16,
+            16,
+        )
+        .unwrap();
+    client
+        .put_doc("notes", "both", &json!({ "text": "alpha widget" }))
+        .unwrap();
+    client
+        .upsert_vector("emb", "both", &[1.0, 0.0], Some(&json!({ "k": 1 })))
+        .unwrap();
+    client
+        .upsert_vector("emb", "only", &[0.2, 0.8], None)
+        .unwrap();
+    client
+        .upsert_vector(
+            "emb",
+            "null-meta",
+            &[0.0, 1.0],
+            Some(&serde_json::Value::Null),
+        )
+        .unwrap();
+    let (values, metadata) = client.get_vector("emb", "both").unwrap().unwrap();
+    assert_eq!(values, vec![1.0, 0.0]);
+    assert_eq!(metadata, Some(json!({ "k": 1 })));
+    assert!(client.get_vector("emb", "missing").unwrap().is_none());
+    assert!(
+        client
+            .get_vector("emb", "only")
+            .unwrap()
+            .unwrap()
+            .1
+            .is_none()
+    );
+    assert_eq!(
+        client.get_vector("emb", "null-meta").unwrap().unwrap().1,
+        Some(serde_json::Value::Null)
+    );
+    let found = client.search_vectors("emb", &[1.0, 0.0], 3, None).unwrap();
+    assert_eq!(found[0].0, "both");
+    assert_eq!(found[0].1, 1.0);
+    assert!(found.iter().all(|(_, score)| score.is_finite()));
+    assert!(
+        client
+            .search_vectors("emb", &[1.0, 0.0], 0, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        client
+            .search_vectors("emb", &[1.0, 0.0], 3, Some(0))
+            .unwrap()
+            .is_empty()
+    );
+    let missing = client
+        .search_vectors("missing", &[1.0, 0.0], 0, None)
+        .unwrap_err();
+    assert!(matches!(missing, StoreError::Backend(_)), "{missing}");
+    let missing_ef = client
+        .search_vectors("missing", &[1.0, 0.0], 3, Some(0))
+        .unwrap_err();
+    assert!(matches!(missing_ef, StoreError::Backend(_)), "{missing_ef}");
+    let hybrid = client
+        .search_hybrid(
+            "notes",
+            "emb",
+            "alpha",
+            &[1.0, 0.0],
+            5,
+            Fusion::Rrf { k: 60 },
+        )
+        .unwrap();
+    assert_eq!(hybrid[0].0, "both");
+    let knowledge = client
+        .search_knowledge(
+            "notes",
+            "emb",
+            "alpha",
+            &[1.0, 0.0],
+            5,
+            Fusion::Rrf { k: 60 },
+        )
+        .unwrap();
+    let both = knowledge.iter().find(|hit| hit.id == "both").unwrap();
+    assert_eq!(both.metadata, Some(json!({ "k": 1 })));
+    assert_eq!(both.doc, Some(json!({ "text": "alpha widget" })));
+    let only = knowledge.iter().find(|hit| hit.id == "only").unwrap();
+    assert!(only.metadata.is_none());
+    assert!(only.doc.is_none());
+    assert!(knowledge.iter().all(|hit| hit.score.is_finite()));
+    let rrf = Fusion::Rrf { k: 60 };
+    assert!(
+        client
+            .search_hybrid("notes", "emb", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        client
+            .search_knowledge("notes", "emb", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        client
+            .search_hybrid("no-such-docs", "emb", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap()
+            .is_empty()
+    );
+    for search in [
+        client
+            .search_hybrid("notes", "missing", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap_err(),
+        client
+            .search_knowledge("notes", "missing", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap_err(),
+        client
+            .search_hybrid("notes", "emb", "alpha", &[1.0], 0, rrf)
+            .unwrap_err(),
+        client
+            .search_knowledge("notes", "emb", "alpha", &[1.0], 0, rrf)
+            .unwrap_err(),
+        client
+            .search_hybrid(
+                "notes",
+                "emb",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 0 },
+            )
+            .unwrap_err(),
+        client
+            .search_knowledge(
+                "notes",
+                "emb",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 0 },
+            )
+            .unwrap_err(),
+    ] {
+        assert!(matches!(search, StoreError::Backend(_)), "{search}");
+    }
+    let remote = client.read_state().unwrap();
+    let disk = FerroStore::open(file).unwrap().read_state().unwrap();
+    assert_eq!(remote.vectors, disk.vectors);
+    assert_eq!(remote.docs, disk.docs);
+    assert_eq!(remote.last_seq, disk.last_seq);
+    assert!(remote.vectors["emb"].entry.is_some());
+    assert!(
+        remote.vectors["emb"]
+            .vectors
+            .values()
+            .any(|record| record.neighbors.iter().any(|layer| !layer.is_empty()))
+    );
+}
+
+#[test]
+fn f32_f16_and_i8_vectors_round_trip_search_and_share_a_document_name() {
+    let store = FerroStore::in_memory();
+    store
+        .create_vector_collection("f32", 4, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap();
+    store
+        .upsert_vector("f32", "near", &[1.0, 0.0, 0.0, 0.0], None)
+        .unwrap();
+    store
+        .upsert_vector("f32", "far", &[0.0, 1.0, 0.0, 0.0], None)
+        .unwrap();
+    store
+        .upsert_vector("f32", "a/b", &[0.0, 0.0, 1.0, 0.0], None)
+        .unwrap();
+    store
+        .put_doc("f32", "near", &json!({ "from": "doc" }))
+        .unwrap();
+    assert_eq!(
+        store.get_doc("f32", "near").unwrap(),
+        Some(json!({ "from": "doc" }))
+    );
+    assert_eq!(
+        store.get_vector("f32", "near").unwrap().unwrap().0,
+        vec![1.0, 0.0, 0.0, 0.0]
+    );
+    assert!(store.get_vector("f32", "missing").unwrap().is_none());
+    let hits = store
+        .search_vectors("f32", &[1.0, 0.0, 0.0, 0.0], 3, None)
+        .unwrap();
+    assert_eq!(hits[0].0, "near");
+    assert_eq!(hits[0].1, 1.0);
+    assert!(hits.iter().any(|(id, score)| id == "far" && *score == 0.0));
+    assert!(hits.iter().all(|(_, score)| score.is_finite()));
+
+    store
+        .create_vector_collection("f16", 3, VectorStorage::F16, VectorMetric::L2, 4, 8, 8)
+        .unwrap();
+    store
+        .upsert_vector("f16", "near", &[1.0, 0.5, -2.0], None)
+        .unwrap();
+    store
+        .upsert_vector("f16", "far", &[0.5, 0.5, 0.5], None)
+        .unwrap();
+    assert_eq!(
+        store.get_vector("f16", "near").unwrap().unwrap().0,
+        vec![1.0, 0.5, -2.0]
+    );
+    assert_eq!(
+        store.get_vector("f16", "far").unwrap().unwrap().0,
+        vec![0.5, 0.5, 0.5]
+    );
+    let hits = store
+        .search_vectors("f16", &[1.0, 0.5, -2.0], 2, None)
+        .unwrap();
+    assert_eq!(hits[0], ("near".into(), 1.0));
+    assert!(hits[1].1 < 1.0);
+
+    store
+        .create_vector_collection(
+            "i8",
+            4,
+            VectorStorage::I8,
+            VectorMetric::DotProduct,
+            4,
+            8,
+            8,
+        )
+        .unwrap();
+    store
+        .upsert_vector("i8", "near", &[10.0, 0.0, 0.0, 0.0], None)
+        .unwrap();
+    store
+        .upsert_vector("i8", "round", &[1.5, -1.5, 200.0, -200.0], None)
+        .unwrap();
+    store
+        .upsert_vector("i8", "bounds", &[-128.0, 127.0, 0.0, -1.0], None)
+        .unwrap();
+    assert_eq!(
+        store.get_vector("i8", "near").unwrap().unwrap().0,
+        vec![10.0, 0.0, 0.0, 0.0]
+    );
+    assert_eq!(
+        store.get_vector("i8", "round").unwrap().unwrap().0,
+        vec![2.0, -2.0, 127.0, -128.0]
+    );
+    assert_eq!(
+        store.get_vector("i8", "bounds").unwrap().unwrap().0,
+        vec![-128.0, 127.0, 0.0, -1.0]
+    );
+    let hits = store
+        .search_vectors("i8", &[10.0, 0.0, 0.0, 0.0], 3, None)
+        .unwrap();
+    assert_eq!(hits[0].0, "near");
+    assert_eq!(hits[0].1, 100.0);
+    assert!(hits.iter().all(|(_, score)| score.is_finite()));
+}
+
+#[test]
+fn i8_quantize_rounds_half_away_from_zero_and_saturates() {
+    let bytes =
+        super::vector::quantize(VectorStorage::I8, &[0.49999997, -0.49999997, 127.5, -128.5])
+            .unwrap();
+    assert_eq!(
+        super::vector::dequantize(VectorStorage::I8, &bytes).unwrap(),
+        vec![0.0, 0.0, 127.0, -128.0]
+    );
+}
+
+#[test]
+fn hnsw_top5_matches_brute_force_cosine() {
+    let store = FerroStore::in_memory();
+    store
+        .create_vector_collection("nn", 8, VectorStorage::F32, VectorMetric::Cosine, 8, 32, 20)
+        .unwrap();
+    let mut stored = Vec::new();
+    for index in 0..20 {
+        let id = format!("v{index:02}");
+        let values = nn_vector(index);
+        store.upsert_vector("nn", &id, &values, None).unwrap();
+        stored.push((id, values));
+    }
+    let query = nn_vector(0);
+    let hits = store.search_vectors("nn", &query, 5, None).unwrap();
+    let brute = brute_cosine(&stored, &query, 5);
+    assert_eq!(hits, brute);
+    assert_eq!(hits.len(), 5);
+    assert_eq!(hits[0].0, "v00");
+    assert_eq!(hits[0].1, 1.0);
+    assert!(hits.iter().all(|(_, score)| score.is_finite()));
+    assert_eq!(
+        store.search_vectors("nn", &query, 5, Some(20)).unwrap(),
+        hits
+    );
+}
+
+#[test]
+fn bad_vector_ops_write_nothing_on_memory_and_disk() {
+    let mem = FerroStore::in_memory();
+    assert_vector_rejects_write_nothing(&mem);
+    assert_eq!(mem.read_state().unwrap().last_seq, 3);
+
+    let (_dir, path) = temp_fls();
+    {
+        let store = FerroStore::open(&path).unwrap();
+        assert_vector_rejects_write_nothing(&store);
+        assert_eq!(store.read_state().unwrap().last_seq, 3);
+        assert_eq!(committed_frames(&path).len(), 3);
+    }
+    let store = FerroStore::open(&path).unwrap();
+    assert_eq!(
+        store.get_vector("emb", "ok").unwrap().unwrap().0,
+        vec![1.0, 0.0]
+    );
+    assert!(store.get_vector("half", "wide").unwrap().is_none());
+    assert!(store.get_vector("emb", "bad").unwrap().is_none());
+    assert_eq!(store.read_state().unwrap().last_seq, 3);
+}
+
+#[test]
+fn delete_of_a_missing_vector_commits_and_search_omits_it() {
+    exercise_delete(&FerroStore::in_memory());
+
+    let (_dir, path) = temp_fls();
+    {
+        let store = FerroStore::open(&path).unwrap();
+        exercise_delete(&store);
+    }
+    let store = FerroStore::open(&path).unwrap();
+    let hits = store.search_vectors("emb", &[0.0, 1.0], 5, None).unwrap();
+    assert_eq!(hits[0].0, "drop");
+    assert!(hits.iter().all(|(id, _)| id != "missing"));
+}
+
+#[test]
+fn vector_metadata_absent_and_json_null_round_trip() {
+    let store = FerroStore::in_memory();
+    store
+        .create_vector_collection(
+            "emb",
+            2,
+            VectorStorage::F32,
+            VectorMetric::DotProduct,
+            4,
+            8,
+            8,
+        )
+        .unwrap();
+    store
+        .upsert_vector("emb", "absent", &[1.0, 0.0], None)
+        .unwrap();
+    store
+        .upsert_vector("emb", "null", &[0.0, 1.0], Some(&serde_json::Value::Null))
+        .unwrap();
+    assert_eq!(store.get_vector("emb", "absent").unwrap().unwrap().1, None);
+    assert_eq!(
+        store.get_vector("emb", "null").unwrap().unwrap().1,
+        Some(serde_json::Value::Null)
+    );
+
+    let (_dir, path) = temp_fls();
+    {
+        let store = FerroStore::open(&path).unwrap();
+        store
+            .create_vector_collection(
+                "emb",
+                2,
+                VectorStorage::F32,
+                VectorMetric::DotProduct,
+                4,
+                8,
+                8,
+            )
+            .unwrap();
+        store
+            .upsert_vector("emb", "absent", &[1.0, 0.0], None)
+            .unwrap();
+        store
+            .upsert_vector("emb", "null", &[0.0, 1.0], Some(&serde_json::Value::Null))
+            .unwrap();
+        let frames = committed_frames(&path);
+        let upserts: Vec<&Op> = frames
+            .iter()
+            .flat_map(|(_, ops)| ops)
+            .filter(|op| matches!(op, Op::UpsertVector { .. }))
+            .collect();
+        assert!(upserts.iter().any(|op| matches!(
+            op,
+            Op::UpsertVector {
+                id,
+                metadata: None,
+                ..
+            } if id == "absent"
+        )));
+        assert!(upserts.iter().any(|op| matches!(
+            op,
+            Op::UpsertVector {
+                id,
+                metadata: Some(serde_json::Value::Null),
+                ..
+            } if id == "null"
+        )));
+    }
+    let store = FerroStore::open(&path).unwrap();
+    assert_eq!(store.get_vector("emb", "absent").unwrap().unwrap().1, None);
+    assert_eq!(
+        store.get_vector("emb", "null").unwrap().unwrap().1,
+        Some(serde_json::Value::Null)
+    );
+}
+
+#[test]
+fn vector_checkpoint_is_version_3_and_older_snapshots_still_open() {
+    let (_dir, path) = temp_fls();
+    {
+        let store = FerroStore::open(&path).unwrap();
+        store
+            .put_doc("docs", "a", &json!({ "text": "alpha" }))
+            .unwrap();
+        store.checkpoint().unwrap();
+        assert_eq!(snapshot_version(&path), 1);
+        let state = store.read_state().unwrap();
+        assert!(state.tables.is_empty());
+        assert!(state.vectors.is_empty());
+        assert_eq!(
+            snapshot_bytes(&path),
+            layout::encode_snapshot(state.last_seq, &state.docs).unwrap()
+        );
+    }
+    {
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(
+            store.get_doc("docs", "a").unwrap(),
+            Some(json!({ "text": "alpha" }))
+        );
+        assert_eq!(snapshot_version(&path), 1);
+        store.create_column_table("t", &int_column()).unwrap();
+        store.append_column_rows("t", &ints(&[4, 5])).unwrap();
+        store.checkpoint().unwrap();
+        assert_eq!(snapshot_version(&path), 2);
+    }
+    let hits = {
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(
+            store.scan_column_table("t", &[]).unwrap().rows,
+            ints(&[4, 5])
+        );
+        store
+            .create_vector_collection(
+                "empty",
+                2,
+                VectorStorage::F32,
+                VectorMetric::Cosine,
+                4,
+                8,
+                8,
+            )
+            .unwrap();
+        store
+            .create_vector_collection("emb", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+            .unwrap();
+        store
+            .put_doc("emb", "doc-only", &json!({ "n": 1 }))
+            .unwrap();
+        store
+            .upsert_vector("emb", "near", &[1.0, 0.0], Some(&json!({ "m": true })))
+            .unwrap();
+        store
+            .upsert_vector("emb", "far", &[0.0, 1.0], Some(&serde_json::Value::Null))
+            .unwrap();
+        let hits = store.search_vectors("emb", &[1.0, 0.0], 2, None).unwrap();
+        assert_eq!(hits[0].0, "near");
+        store.checkpoint().unwrap();
+        assert_eq!(snapshot_version(&path), 3);
+        assert_eq!(live(&path).wal_length, 0);
+        hits
+    };
+    let store = FerroStore::open(&path).unwrap();
+    assert_eq!(
+        store.get_doc("docs", "a").unwrap(),
+        Some(json!({ "text": "alpha" }))
+    );
+    assert_eq!(
+        store.get_doc("emb", "doc-only").unwrap(),
+        Some(json!({ "n": 1 }))
+    );
+    assert_eq!(
+        store.scan_column_table("t", &[]).unwrap().rows,
+        ints(&[4, 5])
+    );
+    assert_eq!(
+        store.search_vectors("emb", &[1.0, 0.0], 2, None).unwrap(),
+        hits
+    );
+    assert!(
+        store
+            .search_vectors("empty", &[1.0, 0.0], 2, None)
+            .unwrap()
+            .is_empty()
+    );
+    let (values, metadata) = store.get_vector("emb", "near").unwrap().unwrap();
+    assert_eq!(values, vec![1.0, 0.0]);
+    assert_eq!(metadata, Some(json!({ "m": true })));
+    assert_eq!(
+        store.get_vector("emb", "far").unwrap().unwrap().1,
+        Some(serde_json::Value::Null)
+    );
+    let state = store.read_state().unwrap();
+    assert!(state.vectors["empty"].entry.is_none());
+    assert!(state.vectors["empty"].vectors.is_empty());
+    assert!(state.vectors["emb"].entry.is_some());
+}
+
+#[test]
+fn a_bad_vector_op_in_a_batch_does_not_publish() {
+    exercise_bad_batch(&FerroStore::in_memory());
+
+    let (_dir, path) = temp_fls();
+    let seq = {
+        let store = FerroStore::open(&path).unwrap();
+        let seq = exercise_bad_batch(&store);
+        assert_eq!(committed_frames(&path).len(), 2);
+        assert_eq!(store.read_state().unwrap().last_seq, seq);
+        seq
+    };
+    let store = FerroStore::open(&path).unwrap();
+    assert_eq!(
+        store.get_doc("docs", "earlier").unwrap(),
+        Some(json!({ "kept": true }))
+    );
+    assert!(store.get_doc("docs", "later").unwrap().is_none());
+    assert!(store.get_vector("emb", "bad").unwrap().is_none());
+    assert_eq!(store.read_state().unwrap().last_seq, seq);
+}
+
+#[test]
+fn vector_rpc_works_over_unix_and_ws() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("vecs.fls");
+    let sock = dir.path().join("vecs.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    exercise_vector_rpc(&client, &file);
+
+    let raw = super::server::connect_unix(&sock.display().to_string()).unwrap();
+    let base = json!({
+        "doc_collection": "notes",
+        "vector_collection": "emb",
+        "query": "alpha",
+        "values": [1.0, 0.0],
+        "limit": 5,
+    });
+    let mut with_default = base.clone();
+    with_default["fusion"] = json!({ "method": "rrf" });
+    let mut with_k = base.clone();
+    with_k["fusion"] = json!({ "method": "rrf", "k": 60 });
+    assert_eq!(
+        raw.call("search_hybrid", with_default).unwrap(),
+        raw.call("search_hybrid", with_k).unwrap()
+    );
+    let mut bad_k = base;
+    bad_k["fusion"] = json!({ "method": "rrf", "k": 0 });
+    let err = raw.call("search_hybrid", bad_k).unwrap_err();
+    assert!(err.to_string().contains("k"), "{err}");
+
+    let seq = client.read_state().unwrap().last_seq;
+    let err = raw
+        .call(
+            "commit_ops",
+            json!({
+                "expected_seq": seq,
+                "ops": [{
+                    "op": "upsert_vector",
+                    "collection": "missing",
+                    "id": "a",
+                    "bytes": [0, 0, 128, 63]
+                }]
+            }),
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert_eq!(client.read_state().unwrap().last_seq, seq);
+
+    let bytes: Vec<u64> = 0.5f32
+        .to_le_bytes()
+        .into_iter()
+        .chain(0.25f32.to_le_bytes())
+        .map(u64::from)
+        .collect();
+    assert_eq!(
+        raw.call(
+            "commit_ops",
+            json!({
+                "expected_seq": seq,
+                "ops": [
+                    {
+                        "op": "upsert_vector",
+                        "collection": "emb",
+                        "id": "from-bytes",
+                        "bytes": bytes,
+                        "metadata": null
+                    },
+                    {
+                        "op": "delete_vector",
+                        "collection": "emb",
+                        "id": "does-not-exist"
+                    }
+                ]
+            }),
+        )
+        .unwrap(),
+        json!(true)
+    );
+    let (values, metadata) = client.get_vector("emb", "from-bytes").unwrap().unwrap();
+    assert_eq!(values, vec![0.5, 0.25]);
+    assert_eq!(metadata, Some(serde_json::Value::Null));
+    let seq = client.read_state().unwrap().last_seq;
+    assert_eq!(
+        raw.call(
+            "commit_ops",
+            json!({
+                "expected_seq": seq,
+                "ops": [{
+                    "op": "create_vector_collection",
+                    "name": "extra",
+                    "dim": 2,
+                    "storage": "i8",
+                    "metric": "dot",
+                    "m": 4,
+                    "ef_construction": 8,
+                    "ef_search": 8
+                }]
+            }),
+        )
+        .unwrap(),
+        json!(true)
+    );
+    client
+        .upsert_vector("extra", "q", &[1.0, -1.0], None)
+        .unwrap();
+    assert_eq!(
+        client.get_vector("extra", "q").unwrap().unwrap().0,
+        vec![1.0, -1.0]
+    );
+    drop(client);
+    drop(raw);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("vecs.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let port = server.local_addr().port();
+    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    exercise_vector_rpc(&client, &file);
+    let knowledge: Vec<KnowledgeHit> = client
+        .search_knowledge(
+            "notes",
+            "emb",
+            "---",
+            &[1.0, 0.0],
+            5,
+            Fusion::Weighted {
+                bm25: 0.0,
+                vector: 1.0,
+            },
+        )
+        .unwrap();
+    assert!(
+        knowledge
+            .iter()
+            .any(|hit| hit.id == "both" && hit.doc.is_some())
+    );
+    assert!(
+        knowledge
+            .iter()
+            .any(|hit| hit.id == "only" && hit.doc.is_none())
+    );
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn hybrid_and_knowledge_fusion_orders_one_sided_ids() {
+    let store = FerroStore::in_memory();
+    store
+        .create_vector_collection(
+            "notes",
+            2,
+            VectorStorage::F32,
+            VectorMetric::Cosine,
+            4,
+            16,
+            16,
+        )
+        .unwrap();
+    store
+        .put_doc("notes", "both", &json!({ "text": "alpha alpha" }))
+        .unwrap();
+    store
+        .put_doc("notes", "alpha-doc", &json!({ "text": "alpha" }))
+        .unwrap();
+    store
+        .put_doc("notes", "other", &json!({ "text": "zzzz" }))
+        .unwrap();
+    store
+        .upsert_vector(
+            "notes",
+            "both",
+            &[1.0, 0.0],
+            Some(&json!({ "side": "both" })),
+        )
+        .unwrap();
+    store
+        .upsert_vector(
+            "notes",
+            "vec-only",
+            &[0.9, 0.1],
+            Some(&json!({ "side": "vec" })),
+        )
+        .unwrap();
+    store
+        .upsert_vector("notes", "far", &[0.0, 1.0], None)
+        .unwrap();
+
+    let bm25 = store.search_bm25("notes", "alpha", 10).unwrap();
+    assert_eq!(
+        bm25.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec!["both", "alpha-doc"]
+    );
+    let vectors = store
+        .search_vectors("notes", &[1.0, 0.0], 10, None)
+        .unwrap();
+    assert_eq!(
+        vectors
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["both", "vec-only", "far"]
+    );
+    let rrf = Fusion::Rrf { k: 60 };
+    let hybrid = store
+        .search_hybrid("notes", "notes", "alpha", &[1.0, 0.0], 10, rrf)
+        .unwrap();
+    assert_eq!(hybrid, rrf_scores(&bm25, &vectors, 60));
+    assert_eq!(
+        hybrid.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        vec!["both", "alpha-doc", "vec-only", "far"]
+    );
+    let weighted = Fusion::Weighted {
+        bm25: 1.0,
+        vector: 1.0,
+    };
+    assert_eq!(
+        store
+            .search_hybrid("notes", "notes", "alpha", &[1.0, 0.0], 10, weighted)
+            .unwrap(),
+        weighted_scores(&bm25, &vectors, 1.0, 1.0)
+    );
+    let vector_only = Fusion::Weighted {
+        bm25: 0.0,
+        vector: 1.0,
+    };
+    let vector_order = store
+        .search_hybrid("notes", "notes", "alpha", &[1.0, 0.0], 10, vector_only)
+        .unwrap();
+    assert_eq!(vector_order, weighted_scores(&bm25, &vectors, 0.0, 1.0));
+    assert!(vector_order.iter().any(|(id, _)| id == "alpha-doc"));
+    assert!(vector_order.iter().any(|(id, _)| id == "vec-only"));
+
+    let zbm = store.search_bm25("notes", "zzzz", 10).unwrap();
+    assert_eq!(zbm.len(), 1);
+    let zhybrid = store
+        .search_hybrid(
+            "notes",
+            "notes",
+            "zzzz",
+            &[1.0, 0.0],
+            10,
+            Fusion::Weighted {
+                bm25: 1.0,
+                vector: 0.0,
+            },
+        )
+        .unwrap();
+    assert_eq!(zhybrid, weighted_scores(&zbm, &vectors, 1.0, 0.0));
+    assert_eq!(zhybrid[0].0, "other");
+    assert_eq!(zhybrid[0].1, 1.0);
+
+    assert_eq!(
+        store
+            .search_hybrid("notes", "notes", "---", &[1.0, 0.0], 10, rrf)
+            .unwrap(),
+        rrf_scores(&[], &vectors, 60)
+    );
+    assert!(
+        store
+            .search_hybrid("notes", "notes", "", &[1.0, 0.0], 10, rrf)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == "both")
+    );
+    assert!(
+        store
+            .search_hybrid(
+                "notes",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 60 },
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_hybrid(
+                "no-such-docs",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 60 },
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_knowledge(
+                "notes",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 60 },
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let err = store
+        .search_hybrid(
+            "notes",
+            "missing",
+            "alpha",
+            &[1.0, 0.0],
+            0,
+            Fusion::Rrf { k: 60 },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .search_hybrid("notes", "notes", "alpha", &[1.0], 0, Fusion::Rrf { k: 60 })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .search_hybrid(
+            "notes",
+            "notes",
+            "alpha",
+            &[1.0, 0.0],
+            0,
+            Fusion::Rrf { k: 0 },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .search_knowledge(
+            "notes",
+            "notes",
+            "alpha",
+            &[1.0, 0.0],
+            0,
+            Fusion::Rrf { k: 0 },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .search_hybrid(
+            "notes",
+            "notes",
+            "alpha",
+            &[1.0, 0.0],
+            5,
+            Fusion::Rrf { k: 0 },
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("k"), "{err}");
+    let err = store
+        .search_hybrid(
+            "notes",
+            "notes",
+            "alpha",
+            &[1.0, 0.0],
+            5,
+            Fusion::Weighted {
+                bm25: f64::MAX,
+                vector: f64::MAX,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert_eq!(
+        store
+            .search_hybrid(
+                "notes",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                10,
+                Fusion::Weighted {
+                    bm25: f64::MAX,
+                    vector: 0.0,
+                },
+            )
+            .unwrap(),
+        weighted_scores(&bm25, &vectors, f64::MAX, 0.0)
+    );
+    assert_eq!(
+        store
+            .search_hybrid(
+                "notes",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                10,
+                Fusion::Weighted {
+                    bm25: 0.0,
+                    vector: f64::MAX,
+                },
+            )
+            .unwrap(),
+        weighted_scores(&bm25, &vectors, 0.0, f64::MAX)
+    );
+    let err = store
+        .search_hybrid(
+            "notes",
+            "notes",
+            "alpha",
+            &[1.0, 0.0],
+            5,
+            Fusion::Weighted {
+                bm25: 0.0,
+                vector: 0.0,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+
+    let knowledge = store
+        .search_knowledge("notes", "notes", "alpha", &[1.0, 0.0], 10, rrf)
+        .unwrap();
+    assert_eq!(
+        knowledge
+            .iter()
+            .map(|hit| hit.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["both", "alpha-doc", "vec-only", "far"]
+    );
+    let both = knowledge.iter().find(|hit| hit.id == "both").unwrap();
+    assert_eq!(both.doc, Some(json!({ "text": "alpha alpha" })));
+    assert_eq!(both.metadata, Some(json!({ "side": "both" })));
+    assert_eq!(both.score, hybrid[0].1);
+    let alpha = knowledge.iter().find(|hit| hit.id == "alpha-doc").unwrap();
+    assert!(alpha.metadata.is_none());
+    assert_eq!(alpha.doc, Some(json!({ "text": "alpha" })));
+    let only = knowledge.iter().find(|hit| hit.id == "vec-only").unwrap();
+    assert!(only.doc.is_none());
+    assert_eq!(only.metadata, Some(json!({ "side": "vec" })));
+    let far = knowledge.iter().find(|hit| hit.id == "far").unwrap();
+    assert!(far.doc.is_none());
+    assert!(far.metadata.is_none());
+    assert!(knowledge.iter().all(|hit| hit.score.is_finite()));
+}
+
+#[test]
+fn zero_vector_cosine_is_zero_and_empty_limits_do_not_error() {
+    let store = FerroStore::in_memory();
+    store
+        .create_vector_collection("z", 2, VectorStorage::F32, VectorMetric::Cosine, 4, 8, 8)
+        .unwrap();
+    store
+        .upsert_vector("z", "origin", &[0.0, 0.0], None)
+        .unwrap();
+    store.upsert_vector("z", "axis", &[1.0, 0.0], None).unwrap();
+    assert_eq!(
+        store.search_vectors("z", &[0.0, 0.0], 5, None).unwrap(),
+        vec![("axis".into(), 0.0), ("origin".into(), 0.0)]
+    );
+    let hits = store.search_vectors("z", &[1.0, 0.0], 5, None).unwrap();
+    assert_eq!(hits.iter().find(|(id, _)| id == "origin").unwrap().1, 0.0);
+    assert_eq!(hits[0].0, "axis");
+    assert!(
+        store
+            .search_vectors("z", &[0.0, 0.0], 0, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_vectors("z", &[1.0, 0.0], 5, Some(0))
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .create_vector_collection(
+            "empty",
+            2,
+            VectorStorage::F32,
+            VectorMetric::Cosine,
+            4,
+            8,
+            8,
+        )
+        .unwrap();
+    assert!(
+        store
+            .search_vectors("empty", &[1.0, 0.0], 0, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_vectors("empty", &[1.0, 0.0], 5, Some(0))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_vectors("empty", &[1.0, 0.0], 5, None)
+            .unwrap()
+            .is_empty()
+    );
+    for (limit, ef) in [(0_usize, None), (5, Some(0))] {
+        let wrong = store.search_vectors("z", &[1.0], limit, ef).unwrap_err();
+        assert!(matches!(wrong, StoreError::Backend(_)), "{wrong}");
+        let non_finite = store
+            .search_vectors("z", &[f32::NAN, 0.0], limit, ef)
+            .unwrap_err();
+        assert!(matches!(non_finite, StoreError::Backend(_)), "{non_finite}");
+        let empty_wrong = store
+            .search_vectors("empty", &[1.0], limit, ef)
+            .unwrap_err();
+        assert!(
+            matches!(empty_wrong, StoreError::Backend(_)),
+            "{empty_wrong}"
+        );
+    }
+    let err = store
+        .search_vectors("missing", &[0.0, 0.0], 1, None)
+        .unwrap_err();
+    assert!(err.to_string().contains("no vector collection"), "{err}");
+    let err = store
+        .search_vectors("missing", &[0.0, 0.0], 0, None)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("no vector collection"), "{err}");
+    let err = store
+        .search_vectors("missing", &[1.0, 0.0], 5, Some(0))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("no vector collection"), "{err}");
+}
+
+fn hnsw_record(id: &str, m: u32, values: &[f32], layer0: &[&str]) -> super::vector::VectorRecord {
+    let level = super::vector::vector_level(id, m);
+    let mut neighbors = vec![
+        layer0
+            .iter()
+            .map(|nid| (*nid).to_string())
+            .collect::<Vec<_>>(),
+    ];
+    neighbors.resize(usize::from(level) + 1, Vec::new());
+    super::vector::VectorRecord {
+        bytes: super::vector::quantize(VectorStorage::F32, values).unwrap(),
+        metadata: None,
+        level,
+        neighbors,
+    }
+}
+
+fn canonical_id(vectors: &BTreeMap<String, super::vector::VectorRecord>) -> String {
+    vectors
+        .iter()
+        .max_by(|(id_a, rec_a), (id_b, rec_b)| {
+            rec_a.level.cmp(&rec_b.level).then_with(|| id_b.cmp(id_a))
+        })
+        .map(|(id, _)| id.clone())
+        .unwrap()
+}
+
+#[test]
+fn validate_graph_rejects_a_live_entry_that_is_not_canonical() {
+    let m = 4;
+    let mut vectors = BTreeMap::new();
+    for (id, values) in [("a", [0.0_f32, 0.0]), ("b", [1.0, 0.0])] {
+        vectors.insert(id.to_string(), hnsw_record(id, m, &values, &[]));
+    }
+    let canonical = canonical_id(&vectors);
+    let other = vectors.keys().find(|id| *id != &canonical).unwrap().clone();
+    let mut col = super::vector::VectorCollection {
+        dim: 2,
+        storage: VectorStorage::F32,
+        metric: VectorMetric::L2,
+        m,
+        ef_construction: 8,
+        ef_search: 8,
+        entry: Some(other),
+        vectors,
+    };
+    let err = super::vector::validate_graph("emb", &col).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("corrupt"), "{err}");
+    col.entry = Some(canonical);
+    super::vector::validate_graph("emb", &col).unwrap();
+}
+
+fn l2_graph(order: &[&str]) -> super::vector::VectorCollection {
+    let m = 4;
+    // `b` and `m` are equally far from `o`; `a` is farther. Distance order is
+    // `b`, `m`, `a` (equal distance breaks ties by id).
+    let points = BTreeMap::from([
+        ("o", [0.0_f32, 0.0]),
+        ("a", [5.0, 0.0]),
+        ("b", [0.0, 1.0]),
+        ("m", [1.0, 0.0]),
+    ]);
+    let links: BTreeMap<&str, &[&str]> = BTreeMap::from([
+        ("o", order),
+        ("a", &["o"][..]),
+        ("b", &["o"][..]),
+        ("m", &["o"][..]),
+    ]);
+    let mut vectors = BTreeMap::new();
+    for id in ["o", "a", "b", "m"] {
+        vectors.insert(id.to_string(), hnsw_record(id, m, &points[id], links[id]));
+    }
+    let entry = Some(canonical_id(&vectors));
+    super::vector::VectorCollection {
+        dim: 2,
+        storage: VectorStorage::F32,
+        metric: VectorMetric::L2,
+        m,
+        ef_construction: 8,
+        ef_search: 8,
+        entry,
+        vectors,
+    }
+}
+
+#[test]
+fn validate_graph_rejects_neighbors_that_are_not_distance_then_id_ordered() {
+    let err = super::vector::validate_graph("emb", &l2_graph(&["m", "b", "a"])).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("corrupt"), "{err}");
+    let err = super::vector::validate_graph("emb", &l2_graph(&["a", "b", "m"])).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("corrupt"), "{err}");
+    super::vector::validate_graph("emb", &l2_graph(&["b", "m", "a"])).unwrap();
 }

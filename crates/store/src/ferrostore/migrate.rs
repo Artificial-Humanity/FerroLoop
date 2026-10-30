@@ -27,9 +27,9 @@ macro_rules! copy_rows {
 
 pub fn migrate_redb_to_ferrostore(redb: &RedbStore, ferro: &FerroStore) -> Result<(), StoreError> {
     ferro.with_write(|txn| {
-        if !txn.docs.is_empty() || !txn.tables.is_empty() {
+        if !txn.docs.is_empty() || !txn.tables.is_empty() || !txn.vectors.is_empty() {
             return Err(backend(
-                "refusing to migrate into a FerroStore that already holds a document or a column table",
+                "refusing to migrate into a FerroStore that already holds a document, a column table, or a vector collection",
             ));
         }
         copy_tables(redb, txn)
