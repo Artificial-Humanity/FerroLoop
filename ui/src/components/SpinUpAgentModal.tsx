@@ -59,6 +59,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    setError(null);
     if (!isOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !submitting) {

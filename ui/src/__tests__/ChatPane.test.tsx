@@ -1076,6 +1076,7 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
     unmount();
 
     const decommCalls: Array<{ url: string; body: unknown }> = [];
+    const transcriptCalls: string[] = [];
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url === "/api/v1/sessions/sess-kacey-01/decommission" && init?.method === "POST") {
@@ -1094,6 +1095,36 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
       }
+      if (url.includes("/api/v1/sessions/sess-kacey-01/transcript")) {
+        transcriptCalls.push(url);
+        return new Response(
+          JSON.stringify({
+            turns: [
+              {
+                index: 0,
+                role: "assistant",
+                content: "Standalone transcript turn",
+                thinking: null,
+                tool_calls: [],
+              },
+            ],
+            is_busy: true,
+            queue: [
+              {
+                id: "qp-1",
+                session_id: "sess-kacey-01",
+                persona: "kacey",
+                prompt: "Queued item",
+                effective_body: "Queued item",
+                by: "owner",
+                attachments: [],
+                created_at: "2026-10-30T15:00:00Z",
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return new Response(JSON.stringify({}), { status: 200 });
     });
     const apiClient = new HubApiClient({
@@ -1106,10 +1137,13 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
         agentDisplayName="Kacey"
         adapter="claude"
         sessionId="sess-kacey-01"
-        turns={[]}
         apiClient={apiClient}
       />,
     );
+
+    expect(await screen.findByText("Standalone transcript turn")).toBeInTheDocument();
+
+    transcriptCalls.length = 0;
 
     fireEvent.click(screen.getByTestId("decommission-session-btn"));
     fireEvent.click(screen.getByTestId("decommission-prepare-btn"));
@@ -1119,5 +1153,22 @@ describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
         { url: "/api/v1/sessions/sess-kacey-01/decommission", body: { mode: "prepare" } },
       ]);
     });
+    expect(transcriptCalls.length).toBeGreaterThan(0);
+
+    transcriptCalls.length = 0;
+
+    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+
+    await waitFor(() => {
+      expect(decommCalls).toEqual([
+        { url: "/api/v1/sessions/sess-kacey-01/decommission", body: { mode: "prepare" } },
+        { url: "/api/v1/sessions/sess-kacey-01/decommission", body: { mode: "teardown" } },
+      ]);
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("Standalone transcript turn")).toBeNull();
+    });
+    expect(transcriptCalls).toEqual([]);
   });
 });

@@ -71,6 +71,109 @@ describe("SpinUpAgentModal", () => {
     expect(onClose).toHaveBeenCalled();
   });
 
+  it("clears validation/API errors when closed and reopened", async () => {
+    const onClose = vi.fn();
+    const { rerender } = render(<SpinUpAgentModal isOpen onClose={onClose} />);
+
+    fireEvent.click(screen.getByTestId("spin-up-submit-btn"));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/persona name/i);
+
+    rerender(<SpinUpAgentModal isOpen={false} onClose={onClose} />);
+    rerender(<SpinUpAgentModal isOpen onClose={onClose} />);
+
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("clears transcript state and avoids re-fetching torn-down session transcript in App on teardown", async () => {
+    const transcriptFetches: string[] = [];
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+
+      if (url.includes("/api/v1/auth/session")) {
+        return json({
+          authenticated: true,
+          authority: { tier: "owner", login: "lmcfarlin" },
+        });
+      }
+      if (url.endsWith("/api/v1/sessions")) {
+        return json({
+          sessions: [
+            {
+              id: "sess-ferris-live",
+              persona: "ferris",
+              adapter: "claude",
+              status: "running",
+            },
+          ],
+        });
+      }
+      if (url.includes("/api/v1/sessions/") && url.endsWith("/transcript")) {
+        transcriptFetches.push(url);
+        return json({
+          turns: [
+            {
+              index: 0,
+              role: "assistant",
+              content: "Active session turn before teardown",
+              thinking: null,
+              tool_calls: [],
+            },
+          ],
+          is_busy: true,
+        });
+      }
+      if (url.endsWith("/api/v1/sessions/sess-ferris-live/decommission") && method === "POST") {
+        return json({
+          session_id: "sess-ferris-live",
+          persona: "ferris",
+          mode: "teardown",
+          status: "decommissioned",
+          unregistered: true,
+          runtime_stopped: true,
+        });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    expect(
+      await screen.findByText("Active session turn before teardown"),
+    ).toBeInTheDocument();
+
+    transcriptFetches.length = 0;
+
+    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByText("Active session turn before teardown"),
+      ).toBeNull();
+    });
+    expect(transcriptFetches).toEqual([]);
+
+    unmount();
+  });
+
   it("opens from the sidebar + Spin Up button in App and dispatches POST /api/v1/sessions/spin-up", async () => {
     const spinUpCalls: unknown[] = [];
 

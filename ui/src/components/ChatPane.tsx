@@ -574,7 +574,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         await onDecommissionSession(mode);
       } else if (apiClient) {
         await apiClient.decommissionSession(targetSessionOrAgent, mode);
-        if (turns === undefined) {
+        if (mode === "teardown") {
+          setInternalTurns([]);
+          setInternalQueue([]);
+          setInternalIsBusy(false);
+        } else if (turns === undefined) {
           void fetchTranscript();
         }
         if (onRefresh) {

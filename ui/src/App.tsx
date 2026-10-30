@@ -474,7 +474,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setSessions(list);
         }
         await scanBackgroundTranscripts(list);
-        const targetId = sessionOverride ?? selectedSessionId ?? selectedAgentName;
+        const targetId =
+          sessionOverride === null
+            ? null
+            : (sessionOverride ?? selectedSessionId ?? selectedAgentName);
         if (targetId) {
           const trRes = await apiClient.getSessionTranscript(targetId).catch(() => null);
           if (trRes) {
@@ -1030,6 +1033,15 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       throw new Error("No active session selected to decommission.");
     }
     const res = await apiClient.decommissionSession(targetId, mode);
+    if (mode === "teardown") {
+      setSelectedSessionId(null);
+      selectedSessionIdRef.current = null;
+      setTranscriptTurns([]);
+      setSessionQueue([]);
+      setIsSessionBusy(false);
+      setSessionContextUsage(null);
+      setSessionQuotaUsage(null);
+    }
     await Promise.all([
       refreshWireAndRoster(),
       refreshSessionsAndTranscript(mode === "teardown" ? null : targetId),
