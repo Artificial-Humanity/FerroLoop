@@ -79,6 +79,9 @@ use crate::discovery::{
     read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
     snapshot_discovery_store,
 };
+use crate::lifecycle::{
+    self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
+};
 use crate::nodes::{
     EnrollFail, EnrollWorker, EnsureHubArgs, HeartbeatFail, HeartbeatUpdate, NodeRecord, NodeView,
     RevokeFail, detect_capabilities, enroll_worker, ensure_hub_node, find_hub_node,
@@ -458,6 +461,8 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
             };
             handle_post_state(&store, &authority, req)
         }
+        ("POST", "/api/v1/sessions/spin-up") => handle_post_session_spin_up(state, &authority, req),
+        ("GET", "/api/v1/hosted-sessions") => handle_get_hosted_sessions(state),
         ("POST", "/api/v1/state/checkpoint") => {
             handle_post_state_checkpoint(state, &authority, req)
         }
@@ -2777,7 +2782,7 @@ fn handle_dynamic_api_routes(
         return HttpResponse::json(404, json!({ "error": "attachment not found" }));
     }
 
-    // /api/v1/sessions/:id/transcript, /prompt, /clear, or /queue
+    // /api/v1/sessions/:id/transcript, /prompt, /clear, /decommission, or /queue
     if segments.len() == 5
         && segments[0] == "api"
         && segments[1] == "v1"
@@ -2848,8 +2853,22 @@ fn handle_dynamic_api_routes(
             ("POST", "clear") => {
                 return handle_post_session_clear(state, authority, &session_id, req);
             }
+            ("POST", "decommission") => {
+                return handle_post_session_decommission(state, authority, &session_id, req);
+            }
             _ => {}
         }
+    }
+
+    // /api/v1/hosted-sessions/:id/restart
+    if segments.len() == 5
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "hosted-sessions"
+        && segments[4] == "restart"
+        && method == "POST"
+    {
+        return handle_post_hosted_session_restart(state, authority, &percent_decode(segments[3]));
     }
 
     // /api/v1/sessions/:id/queue/:prompt_id or /api/v1/sessions/:id/queue/:prompt_id/send-now
@@ -3023,7 +3042,10 @@ fn resolve_session_target_from_snapshot(
     (trimmed.to_string(), Some(trimmed.to_ascii_lowercase()))
 }
 
-fn route_matches_session_id(route: &fl_wire::identity::VendorRoute, raw_id: &str) -> bool {
+pub(crate) fn route_matches_session_id(
+    route: &fl_wire::identity::VendorRoute,
+    raw_id: &str,
+) -> bool {
     let trimmed = raw_id.trim();
     match route {
         fl_wire::identity::VendorRoute::Claude { session_id, .. } => {
@@ -3053,25 +3075,17 @@ fn vendor_route_for_session(
     persona: Option<&str>,
     fallback_session_id: &str,
 ) -> Result<fl_wire::identity::VendorRoute, String> {
-    let route_override = state
-        .config
-        .home_override
-        .as_ref()
-        .map(|h| h.join(".cache").join("agent-bus").join("routes.json"));
-    let mut routes = RouteTable::load(route_override.as_deref());
-    routes.discover_routes(state.config.home_override.as_deref(), stamp::now());
-    let lookup_key = persona.unwrap_or(fallback_session_id);
-    if let Some(entry) = routes.get(lookup_key) {
-        return Ok(entry.route.clone());
-    }
-    if let Some(entry) = routes
-        .entries
-        .values()
-        .find(|e| route_matches_session_id(&e.route, fallback_session_id))
-    {
-        return Ok(entry.route.clone());
-    }
-    Err(format!("no active vendor route for `{lookup_key}`"))
+    crate::lifecycle::find_route(
+        state.config.home_override.as_deref(),
+        persona,
+        fallback_session_id,
+    )
+    .ok_or_else(|| {
+        format!(
+            "no active vendor route for `{}`",
+            persona.unwrap_or(fallback_session_id)
+        )
+    })
 }
 
 fn dispatch_operator_prompt_for_session(
@@ -3579,6 +3593,152 @@ fn handle_post_session_clear(
     HttpResponse::json(200, data)
 }
 
+fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
+    HttpResponse::json(err.status(), json!({ "error": err.to_string() }))
+}
+
+fn lifecycle_env(state: &HubState) -> LifecycleEnv<'_> {
+    LifecycleEnv::new(state.config.home_override.as_deref())
+}
+
+fn handle_post_session_spin_up(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let payload: SpinUpRequest = match req.json() {
+        Ok(payload) => payload,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match lifecycle::spin_up(
+        &*store,
+        &lifecycle_env(state),
+        &payload,
+        authority.actor_name(),
+    ) {
+        Ok(out) => {
+            let data = serde_json::to_value(&out).unwrap_or_default();
+            state.broadcast("sessions", "session.spun_up", data.clone());
+            HttpResponse::json(200, data)
+        }
+        Err(e) => lifecycle_error_response(&e),
+    }
+}
+
+fn handle_post_session_decommission(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    #[derive(Deserialize)]
+    struct DecommissionPayload {
+        #[serde(default)]
+        mode: String,
+    }
+
+    let payload: DecommissionPayload = match req.json() {
+        Ok(payload) => payload,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let mode = match DecommissionMode::parse(&payload.mode) {
+        Ok(mode) => mode,
+        Err(e) => return lifecycle_error_response(&e),
+    };
+
+    // Resolve before taking the store guard: discovery opens the store itself.
+    let discovered = resolve_session_target(state, session_id);
+    let by = authority.actor_name();
+    let env = lifecycle_env(state);
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let target = match SessionTarget::resolve(&*store, session_id, Some(discovered)) {
+        Ok(target) => target,
+        Err(e) => return lifecycle_error_response(&e),
+    };
+    let result = match mode {
+        DecommissionMode::Prepare => lifecycle::prepare_decommission(&*store, &env, &target, by),
+        DecommissionMode::Teardown => {
+            lifecycle::teardown_session(&*store, &env, &target, by, |key| {
+                state.clear_session_prompt_queue(key)
+            })
+        }
+    };
+    let out = match result {
+        Ok(out) => out,
+        Err(e) => return lifecycle_error_response(&e),
+    };
+    if let (DecommissionMode::Prepare, false, Some(prompt)) =
+        (mode, out.handshake_dispatched, out.prompt.as_ref())
+    {
+        // No live route took the handshake: leave it on the session queue for the next idle turn.
+        let (_, queue) = state.enqueue_session_prompt(
+            &target.session_id,
+            Some(target.persona.clone()),
+            prompt.clone(),
+            prompt.clone(),
+            by.to_string(),
+            Vec::new(),
+        );
+        state.broadcast(
+            "session",
+            "queue_updated",
+            json!({
+                "session_id": target.session_id,
+                "persona": target.persona,
+                "is_busy": true,
+                "queue": queue,
+            }),
+        );
+    }
+    let data = serde_json::to_value(&out).unwrap_or_default();
+    state.broadcast("sessions", "session.decommission", data.clone());
+    HttpResponse::json(200, data)
+}
+
+fn handle_get_hosted_sessions(state: &HubState) -> HttpResponse {
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match lifecycle::list_hosted_sessions(&*store) {
+        Ok(sessions) => HttpResponse::json(200, json!({ "sessions": sessions })),
+        Err(e) => lifecycle_error_response(&e),
+    }
+}
+
+fn handle_post_hosted_session_restart(
+    state: &HubState,
+    authority: &HubAuthority,
+    id: &str,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may restart a hosted session" }),
+        );
+    }
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match lifecycle::restart_hosted_session(
+        &*store,
+        &lifecycle_env(state),
+        id,
+        authority.actor_name(),
+    ) {
+        Ok(out) => {
+            let data = serde_json::to_value(&out).unwrap_or_default();
+            state.broadcast("sessions", "session.restarted", data.clone());
+            HttpResponse::json(200, data)
+        }
+        Err(e) => lifecycle_error_response(&e),
+    }
+}
+
 fn build_reforge_prompt(state: &HubState, persona: &str) -> Option<String> {
     if let Some(prompt) = reforge_prompt_from_hydrate(state, persona)
         && !prompt.trim().is_empty()
@@ -3637,6 +3797,37 @@ pub(crate) fn canonical_reforge_prompt(name: &str, project: &str, role: &str) ->
             ```\n\
          \n\
          Identity summary: `{name}` | Co-author trailer: `Co-authored-by: {name} <{name_lower}@artificialhumanity.io>`"
+    )
+}
+
+/// Prompt that tells an agent it is being prepared for decommission and must save and hand off
+/// its work. `role` is a [`reforge_role_label`] value; a Lead hands off to `jarvis`.
+pub(crate) fn synthesize_decommission_prompt(name: &str, project: &str, role: &str) -> String {
+    let name_lower = name.to_ascii_lowercase();
+    let recipient = match role {
+        "lead" => "`jarvis`".to_string(),
+        "lab_manager" => "the owner".to_string(),
+        _ => format!(
+            "the {project} Lead (`fl agent roster --project {project}` names it; use that lowercase name below)"
+        ),
+    };
+    let to = if role == "lead" { "jarvis" } else { "<lead>" };
+    format!(
+        "{name}, you are being prepared for decommission. This session will be shut down after you finish; do not start new work. Complete these steps now:\n\
+         1. Save unsaved progress, findings and your handoff in `Notes/{project}/STATE.md` and in FerroState (`fl state handoff set` for the handoff, `fl state checkpoint` for the git checkpoint).\n\
+         2. Commit and push your work, or clean up your temp worktrees and branches (`git worktree remove`, `git branch -d`). Leave nothing only on this session's disk.\n\
+         3. Send a final handoff to {recipient} over both channels:\n\
+            ```bash\n\
+            fl wire send {to} \"{name} decommission handoff\" \"<what is done, open, and where it lives>\" --from {name_lower}\n\
+            AGENT_PERSONA={name_lower} agent-msg send {to} \"{name} decommission handoff\" \"<same summary>\"\n\
+            ```\n\
+         4. Acknowledge the remaining inbox messages:\n\
+            ```bash\n\
+            fl wire read --ack\n\
+            AGENT_PERSONA={name_lower} agent-msg read --ack\n\
+            ```\n\
+         \n\
+         Reply `decommission-ready` when all four steps are done. Identity summary: `{name}` | Project: `{project}` | Role: `{role}`"
     )
 }
 
