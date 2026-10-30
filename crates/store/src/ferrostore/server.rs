@@ -4,10 +4,13 @@
 //! speak length-prefixed JSON. WebSocket clients speak one JSON value per
 //! frame. Neither takes `flock`.
 
+use super::columnar;
 use super::layout::{Op, backend};
 use super::state::DocState;
 use super::{FerroStore, MqRecord, lock_mutex};
 use fl_core::StoreError;
+use fl_core::ids::{GateId, ProjectId};
+use fl_core::iri::Iri;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -532,6 +535,44 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
             store.checkpoint()?;
             Ok(Value::Null)
         }
+        "create_column_table" => {
+            let columns = columnar::parse_columns(
+                params
+                    .get("columns")
+                    .ok_or_else(|| backend("missing param `columns`"))?,
+            )?;
+            store.create_column_table(param_str(params, "name")?, &columns)?;
+            Ok(Value::Null)
+        }
+        "append_column_rows" => {
+            let rows = columnar::parse_rows(
+                params
+                    .get("rows")
+                    .ok_or_else(|| backend("missing param `rows`"))?,
+            )?;
+            store.append_column_rows(param_str(params, "name")?, &rows)?;
+            Ok(Value::Null)
+        }
+        "scan_column_table" => {
+            let filters = columnar::parse_filters(
+                params
+                    .get("filters")
+                    .ok_or_else(|| backend("missing param `filters`"))?,
+            )?;
+            columnar::scan_json(&store.scan_column_table(param_str(params, "name")?, &filters)?)
+        }
+        "attempt_rollup" => {
+            let project = optional_project(params)?;
+            Ok(columnar::attempt_rollup_json(
+                &store.attempt_rollup(project.as_ref())?,
+            ))
+        }
+        "gate_run_rollup" => {
+            let gate = optional_gate(params)?;
+            Ok(columnar::gate_rollup_json(
+                &store.gate_run_rollup(gate.as_ref())?,
+            ))
+        }
         "read_state" => Ok(doc_state_value(&store.read_state()?)),
         "commit_ops" => {
             let expected_seq = param_u64(params, "expected_seq")?;
@@ -609,6 +650,7 @@ fn doc_state_value(state: &DocState) -> Value {
     json!({
         "last_seq": state.last_seq,
         "docs": docs,
+        "tables": columnar::tables_json(&state.tables),
     })
 }
 
@@ -631,7 +673,37 @@ fn parse_doc_state(value: &Value) -> Result<DocState, StoreError> {
             .ok_or_else(|| backend("read_state doc is missing doc"))?;
         docs.insert((collection, id), doc);
     }
-    Ok(DocState { docs, last_seq })
+    let tables = match value.get("tables") {
+        None => BTreeMap::new(),
+        Some(tables) => columnar::parse_tables(tables)?,
+    };
+    Ok(DocState {
+        docs,
+        tables,
+        last_seq,
+    })
+}
+
+fn optional_project(params: &Value) -> Result<Option<ProjectId>, StoreError> {
+    match params.get("project") {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            let iri = Iri::parse(text).map_err(backend)?;
+            Ok(Some(ProjectId(iri)))
+        }
+        _ => Err(backend("missing project param")),
+    }
+}
+
+fn optional_gate(params: &Value) -> Result<Option<GateId>, StoreError> {
+    match params.get("gate") {
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => {
+            let iri = Iri::parse(text).map_err(backend)?;
+            Ok(Some(GateId(iri)))
+        }
+        _ => Err(backend("missing gate param")),
+    }
 }
 
 fn op_value(op: &Op) -> Value {
@@ -651,6 +723,16 @@ fn op_value(op: &Op) -> Value {
             "collection": collection,
             "id": id,
         }),
+        Op::CreateColumnTable { name, columns } => json!({
+            "op": "create_column_table",
+            "name": name,
+            "columns": columns.iter().map(columnar::column_def_json).collect::<Vec<_>>(),
+        }),
+        Op::AppendColumnGroup { name, bytes } => json!({
+            "op": "append_column_group",
+            "name": name,
+            "bytes": bytes.iter().copied().map(Value::from).collect::<Vec<_>>(),
+        }),
     }
 }
 
@@ -666,8 +748,6 @@ fn parse_op(value: &Value) -> Result<Op, StoreError> {
         .get("op")
         .and_then(Value::as_str)
         .ok_or_else(|| backend("op is missing op"))?;
-    let collection = param_str(value, "collection")?.to_string();
-    let id = param_str(value, "id")?.to_string();
     match kind {
         "put" => {
             let doc = value
@@ -675,12 +755,34 @@ fn parse_op(value: &Value) -> Result<Op, StoreError> {
                 .cloned()
                 .ok_or_else(|| backend("put op is missing doc"))?;
             Ok(Op::Put {
-                collection,
-                id,
+                collection: param_str(value, "collection")?.to_string(),
+                id: param_str(value, "id")?.to_string(),
                 doc,
             })
         }
-        "delete" => Ok(Op::Delete { collection, id }),
+        "delete" => Ok(Op::Delete {
+            collection: param_str(value, "collection")?.to_string(),
+            id: param_str(value, "id")?.to_string(),
+        }),
+        "create_column_table" => {
+            let columns = columnar::parse_columns(
+                value
+                    .get("columns")
+                    .ok_or_else(|| backend("create_column_table op is missing columns"))?,
+            )?;
+            Ok(Op::CreateColumnTable {
+                name: param_str(value, "name")?.to_string(),
+                columns,
+            })
+        }
+        "append_column_group" => Ok(Op::AppendColumnGroup {
+            name: param_str(value, "name")?.to_string(),
+            bytes: columnar::parse_bytes(
+                value
+                    .get("bytes")
+                    .ok_or_else(|| backend("append_column_group op is missing bytes"))?,
+            )?,
+        }),
         other => Err(backend(format!("unknown op `{other}`"))),
     }
 }
@@ -1192,5 +1294,90 @@ mod tests {
         );
         drop(client);
         drop(server);
+    }
+
+    #[test]
+    fn read_state_and_ops_round_trip_column_tables_and_a_null_document() {
+        use super::columnar::{self, ColumnDef, ColumnTable, ColumnType, ColumnValue};
+        let columns = vec![ColumnDef {
+            name: "n".into(),
+            ty: ColumnType::Int64,
+        }];
+        let blob = columnar::encode_row_group(
+            &columns,
+            &[
+                vec![ColumnValue::Int64(3)],
+                vec![ColumnValue::Null],
+                vec![ColumnValue::Int64(4)],
+            ],
+        )
+        .unwrap();
+        let mut tables = BTreeMap::new();
+        tables.insert(
+            "t".into(),
+            ColumnTable {
+                columns: columns.clone(),
+                groups: vec![blob.clone()],
+            },
+        );
+        let mut docs = BTreeMap::new();
+        docs.insert(("c".into(), "id".into()), Value::Null);
+        let state = DocState {
+            docs,
+            tables,
+            last_seq: 4,
+        };
+        let parsed = parse_doc_state(&doc_state_value(&state)).unwrap();
+        assert_eq!(parsed.last_seq, 4);
+        assert_eq!(
+            parsed.docs.get(&("c".into(), "id".into())),
+            Some(&Value::Null)
+        );
+        assert_eq!(parsed.tables.get("t").unwrap().groups, vec![blob.clone()]);
+        assert_eq!(parsed.tables.get("t").unwrap().columns, columns);
+
+        let ops = [
+            Op::CreateColumnTable {
+                name: "t".into(),
+                columns: columns.clone(),
+            },
+            Op::AppendColumnGroup {
+                name: "t".into(),
+                bytes: blob,
+            },
+            Op::Put {
+                collection: "c".into(),
+                id: "id".into(),
+                doc: Value::Null,
+            },
+            Op::Delete {
+                collection: "c".into(),
+                id: "gone".into(),
+            },
+        ];
+        let encoded = Value::Array(ops.iter().map(op_value).collect());
+        let again = parse_ops(&encoded).unwrap();
+        match &again[..] {
+            [
+                Op::CreateColumnTable {
+                    name,
+                    columns: cols,
+                },
+                Op::AppendColumnGroup {
+                    name: appended,
+                    bytes,
+                },
+                Op::Put { doc, .. },
+                Op::Delete { id, .. },
+            ] => {
+                assert_eq!(name, "t");
+                assert_eq!(cols, &columns);
+                assert_eq!(appended, "t");
+                assert_eq!(bytes, &state.tables.get("t").unwrap().groups[0]);
+                assert_eq!(doc, &Value::Null);
+                assert_eq!(id, "gone");
+            }
+            other => panic!("ops did not round-trip: {other:?}"),
+        }
     }
 }

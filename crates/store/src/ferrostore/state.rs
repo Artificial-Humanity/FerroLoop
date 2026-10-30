@@ -1,6 +1,7 @@
 //! Document map, top-level field index, Okapi BM25, and FerroMQ views.
 //! Indexes are derived from documents; they are not part of the log.
 
+use super::columnar::ColumnTable;
 use super::layout::{Op, backend, corrupt};
 use fl_core::StoreError;
 use serde_json::Value;
@@ -12,14 +13,15 @@ const BM25_B: f64 = 0.75;
 #[derive(Clone, Debug, Default)]
 pub(super) struct DocState {
     pub(super) docs: BTreeMap<(String, String), Value>,
+    pub(super) tables: BTreeMap<String, ColumnTable>,
     pub(super) last_seq: u64,
 }
 
 impl DocState {
     pub(super) fn at_seq(seq: u64) -> Self {
         Self {
-            docs: BTreeMap::new(),
             last_seq: seq,
+            ..Self::default()
         }
     }
 }
@@ -46,7 +48,7 @@ pub(super) fn commit_ops(state: &mut DocState, ops: &[Op]) -> Result<(), StoreEr
         .checked_add(1)
         .ok_or_else(|| backend("transaction sequence overflow"))?;
     for op in ops {
-        apply_op(state, op);
+        apply_op(state, op)?;
     }
     state.last_seq = seq;
     Ok(())
@@ -88,14 +90,14 @@ pub(super) fn apply_frames(
             continue;
         }
         for op in ops {
-            apply_op(state, op);
+            apply_op(state, op)?;
         }
         state.last_seq = *seq;
     }
     Ok(())
 }
 
-fn apply_op(state: &mut DocState, op: &Op) {
+fn apply_op(state: &mut DocState, op: &Op) -> Result<(), StoreError> {
     match op {
         Op::Put {
             collection,
@@ -109,7 +111,26 @@ fn apply_op(state: &mut DocState, op: &Op) {
         Op::Delete { collection, id } => {
             state.docs.remove(&(collection.clone(), id.clone()));
         }
+        Op::CreateColumnTable { name, columns } => {
+            if state.tables.contains_key(name) {
+                return Err(corrupt(format!("column table `{name}` already exists")));
+            }
+            state.tables.insert(
+                name.clone(),
+                ColumnTable {
+                    columns: columns.clone(),
+                    groups: Vec::new(),
+                },
+            );
+        }
+        Op::AppendColumnGroup { name, bytes } => {
+            let Some(table) = state.tables.get_mut(name) else {
+                return Err(corrupt(format!("append to missing column table `{name}`")));
+            };
+            table.groups.push(bytes.clone());
+        }
     }
+    Ok(())
 }
 
 pub(super) fn query_by_field(

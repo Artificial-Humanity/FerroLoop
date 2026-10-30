@@ -1,9 +1,14 @@
 use super::layout::{self, Op, Superblock};
 use super::{
-    FerroStore, FerroStoreServer, default_socket_path_for_store, file_uri_path, latest_superblock,
-    write_slot,
+    AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnType, ColumnValue, FerroStore,
+    FerroStoreServer, GateRunRollup, default_socket_path_for_store, file_uri_path,
+    latest_superblock, write_slot,
 };
 use fl_core::StoreError;
+use fl_core::ids::{GateId, ProjectId, RecordId, seq_iri};
+use fl_core::log::{Attempt, AttemptStatus, GateRun, PathsTouched};
+use fl_core::store::Ledger;
+use fl_core::verdict::Verdict;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -2278,5 +2283,308 @@ fn remote_with_write_commits_both_ops_in_one_frame() {
     )
     .unwrap();
     assert_concurrent_increments(|| FerroStore::auto(&path).unwrap(), &path);
+    drop(server);
+}
+
+fn int_column() -> Vec<ColumnDef> {
+    vec![ColumnDef {
+        name: "n".into(),
+        ty: ColumnType::Int64,
+    }]
+}
+
+fn eq_int(value: i64) -> ColumnFilter {
+    ColumnFilter {
+        column: "n".into(),
+        predicate: ColumnPredicate::Eq(ColumnValue::Int64(value)),
+    }
+}
+
+fn ints(values: &[i64]) -> Vec<Vec<ColumnValue>> {
+    values
+        .iter()
+        .copied()
+        .map(|value| vec![ColumnValue::Int64(value)])
+        .collect()
+}
+
+fn snapshot_version(path: &Path) -> u32 {
+    let sb = live(path);
+    assert!(sb.snapshot_length > 0);
+    let file = File::open(path).unwrap();
+    let mut buf = [0u8; 4];
+    file.read_exact_at(&mut buf, sb.snapshot_offset + 8)
+        .unwrap();
+    u32::from_le_bytes(buf)
+}
+
+#[test]
+fn scan_skips_a_row_group_only_when_the_zone_map_excludes_it() {
+    let store = FerroStore::in_memory();
+    store.create_column_table("t", &int_column()).unwrap();
+    store.append_column_rows("t", &ints(&[1, 2, 3])).unwrap();
+    store.append_column_rows("t", &ints(&[10, 11, 12])).unwrap();
+
+    let hit = store.scan_column_table("t", &[eq_int(10)]).unwrap();
+    assert_eq!(hit.row_groups_total, 2);
+    assert_eq!(hit.row_groups_skipped, 1);
+    assert_eq!(hit.rows, ints(&[10]));
+
+    let miss = store.scan_column_table("t", &[eq_int(100)]).unwrap();
+    assert_eq!(miss.row_groups_total, 2);
+    assert_eq!(miss.row_groups_skipped, 2);
+    assert!(miss.rows.is_empty());
+
+    let overlap = FerroStore::in_memory();
+    overlap.create_column_table("t", &int_column()).unwrap();
+    overlap.append_column_rows("t", &ints(&[1, 100])).unwrap();
+    let inside = overlap.scan_column_table("t", &[eq_int(50)]).unwrap();
+    assert_eq!(inside.row_groups_total, 1);
+    assert_eq!(inside.row_groups_skipped, 0);
+    assert!(inside.rows.is_empty());
+
+    let err = store
+        .scan_column_table(
+            "t",
+            &[ColumnFilter {
+                column: "missing".into(),
+                predicate: ColumnPredicate::Eq(ColumnValue::Int64(1)),
+            }],
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .scan_column_table(
+            "t",
+            &[ColumnFilter {
+                column: "n".into(),
+                predicate: ColumnPredicate::Eq(ColumnValue::TimestampMs(1)),
+            }],
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+}
+
+#[test]
+fn bad_width_and_a_second_create_write_nothing() {
+    let (_dir, path) = temp_fls();
+    let store = FerroStore::open(&path).unwrap();
+    store.create_column_table("t", &int_column()).unwrap();
+    store.append_column_rows("t", &ints(&[7])).unwrap();
+    let frames = committed_frames(&path).len();
+    assert_eq!(frames, 2);
+
+    let err = store
+        .append_column_rows("t", &[vec![ColumnValue::Int64(1), ColumnValue::Int64(2)]])
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .append_column_rows("t", &[vec![ColumnValue::Utf8("no".into())]])
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    store.append_column_rows("t", &[]).unwrap();
+    let err = store.create_column_table("t", &int_column()).unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .append_column_rows("missing", &ints(&[1]))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+
+    assert_eq!(committed_frames(&path).len(), frames);
+    assert_eq!(store.scan_column_table("t", &[]).unwrap().rows, ints(&[7]));
+}
+
+#[test]
+fn column_rows_survive_reopen_and_a_version_2_checkpoint() {
+    let (_dir, path) = temp_fls();
+    {
+        let store = FerroStore::open(&path).unwrap();
+        store.put_doc("docs", "a", &json!(1)).unwrap();
+        store.checkpoint().unwrap();
+        assert_eq!(snapshot_version(&path), 1);
+        store.create_column_table("t", &int_column()).unwrap();
+        store.append_column_rows("t", &ints(&[1, 2, 3])).unwrap();
+        store.append_column_rows("t", &ints(&[10])).unwrap();
+    }
+    {
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!(1)));
+        let scan = store.scan_column_table("t", &[eq_int(10)]).unwrap();
+        assert_eq!(scan.rows, ints(&[10]));
+        assert_eq!(scan.row_groups_total, 2);
+        assert_eq!(scan.row_groups_skipped, 1);
+        store.checkpoint().unwrap();
+        assert_eq!(snapshot_version(&path), 2);
+        assert_eq!(live(&path).wal_length, 0);
+    }
+    let store = FerroStore::open(&path).unwrap();
+    assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!(1)));
+    assert_eq!(
+        store.scan_column_table("t", &[]).unwrap().rows,
+        ints(&[1, 2, 3, 10])
+    );
+}
+
+fn exercise_served_columns(store: &FerroStore) {
+    store.create_column_table("t", &int_column()).unwrap();
+    store.append_column_rows("t", &ints(&[1, 2])).unwrap();
+    store.append_column_rows("t", &ints(&[9, 10])).unwrap();
+    let scan = store.scan_column_table("t", &[eq_int(9)]).unwrap();
+    assert_eq!(scan.row_groups_total, 2);
+    assert_eq!(scan.row_groups_skipped, 1);
+    assert_eq!(scan.rows, ints(&[9]));
+    let miss = store.scan_column_table("t", &[eq_int(100)]).unwrap();
+    assert_eq!(miss.row_groups_skipped, 2);
+    assert!(miss.rows.is_empty());
+    store.put_doc("docs", "kept", &json!(null)).unwrap();
+    assert_eq!(store.get_doc("docs", "kept").unwrap(), Some(json!(null)));
+    assert!(store.get_doc("docs", "missing").unwrap().is_none());
+}
+
+#[test]
+fn served_column_scan_works_over_unix_and_ws_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cols.fls");
+    let sock = dir.path().join("cols.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    exercise_served_columns(&client);
+    drop(client);
+    drop(server);
+    let reopened = FerroStore::open(&file).unwrap();
+    assert_eq!(
+        reopened.scan_column_table("t", &[eq_int(9)]).unwrap().rows,
+        ints(&[9])
+    );
+    assert_eq!(reopened.get_doc("docs", "kept").unwrap(), Some(json!(null)));
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cols.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let port = server.local_addr().port();
+    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    exercise_served_columns(&client);
+    drop(client);
+    drop(server);
+    let reopened = FerroStore::open(&file).unwrap();
+    let scan = reopened.scan_column_table("t", &[eq_int(9)]).unwrap();
+    assert_eq!(scan.row_groups_total, 2);
+    assert_eq!(scan.row_groups_skipped, 1);
+    assert_eq!(scan.rows, ints(&[9]));
+}
+
+fn sample_attempt(
+    project: ProjectId,
+    cost: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+    duration_ms: u64,
+) -> Attempt {
+    Attempt {
+        id: None,
+        at: None,
+        project,
+        record: RecordId(seq_iri(9)),
+        adapter: "claude".into(),
+        status: AttemptStatus::Completed,
+        duration_ms,
+        tokens_in,
+        tokens_out,
+        cost_usd_micros: cost,
+        paths_touched: PathsTouched::Listed(vec![]),
+        output_excerpt: None,
+    }
+}
+
+fn sample_run(gate: GateId, pass: bool, duration_ms: u64, cost_usd_micros: u64) -> GateRun {
+    GateRun {
+        id: None,
+        at: None,
+        gate,
+        record: None,
+        commit: "abc".into(),
+        verdict: Verdict::from_predicate(pass, 1),
+        population: 1,
+        output_excerpt: None,
+        duration_ms,
+        cost_usd_micros,
+    }
+}
+
+fn assert_rollups(store: &FerroStore) {
+    let project_a = ProjectId(seq_iri(1));
+    let project_b = ProjectId(seq_iri(2));
+    let gate_a = GateId(seq_iri(3));
+    let gate_b = GateId(seq_iri(4));
+    store
+        .append_attempt(sample_attempt(project_a.clone(), 10, 1, 2, 3))
+        .unwrap();
+    store
+        .append_attempt(sample_attempt(project_b.clone(), 100, 4, 5, 6))
+        .unwrap();
+    store
+        .append_gate_run(sample_run(gate_a.clone(), true, 7, 8))
+        .unwrap();
+    store
+        .append_gate_run(sample_run(gate_b.clone(), false, 9, 10))
+        .unwrap();
+
+    assert_eq!(
+        store.attempt_rollup(None).unwrap(),
+        AttemptRollup {
+            count: 2,
+            cost_usd_micros: 110,
+            tokens_in: 5,
+            tokens_out: 7,
+            duration_ms: 9,
+        }
+    );
+    assert_eq!(
+        store.attempt_rollup(Some(&project_a)).unwrap(),
+        AttemptRollup {
+            count: 1,
+            cost_usd_micros: 10,
+            tokens_in: 1,
+            tokens_out: 2,
+            duration_ms: 3,
+        }
+    );
+    assert_eq!(store.attempt_rollup(Some(&project_b)).unwrap().count, 1);
+    assert_eq!(
+        store.gate_run_rollup(None).unwrap(),
+        GateRunRollup {
+            pass: 1,
+            fail: 1,
+            error: 0,
+            duration_ms: 16,
+            cost_usd_micros: 18,
+        }
+    );
+    assert_eq!(
+        store.gate_run_rollup(Some(&gate_a)).unwrap(),
+        GateRunRollup {
+            pass: 1,
+            fail: 0,
+            error: 0,
+            duration_ms: 7,
+            cost_usd_micros: 8,
+        }
+    );
+    assert_eq!(store.gate_run_rollup(Some(&gate_b)).unwrap().fail, 1);
+    assert_eq!(store.gate_run_rollup(Some(&gate_b)).unwrap().pass, 0);
+}
+
+#[test]
+fn attempt_and_gate_rollups_match_hand_sums_locally_and_over_unix() {
+    assert_rollups(&FerroStore::in_memory());
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("roll.fls");
+    let sock = dir.path().join("roll.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    assert_rollups(&client);
+    drop(client);
     drop(server);
 }
