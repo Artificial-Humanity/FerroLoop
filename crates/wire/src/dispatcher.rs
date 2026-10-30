@@ -557,6 +557,20 @@ fn post_agy_connect_rpc(
     body: &str,
     timeout: Duration,
 ) -> Result<(u16, String, String), String> {
+    post_agy_connect_rpc_limited(port, csrf, procedure, body, timeout, MAX_AGY_RPC_BODY_BYTES)
+}
+
+/// POST a JSON body to the Antigravity language server on `127.0.0.1:port` and return
+/// `(status code, status line, body)`. `timeout` bounds the connect and each read or write.
+/// The response body is cut off at `max_body_bytes`.
+pub fn post_agy_connect_rpc_limited(
+    port: u16,
+    csrf: &str,
+    procedure: &str,
+    body: &str,
+    timeout: Duration,
+    max_body_bytes: usize,
+) -> Result<(u16, String, String), String> {
     let host = format!("127.0.0.1:{port}");
     let request = format!(
         "POST {procedure} HTTP/1.1\r\n\
@@ -612,11 +626,9 @@ fn post_agy_connect_rpc(
         }
     }
     let resp_bytes = if is_chunked {
-        read_agy_chunked_body(&mut reader, MAX_AGY_RPC_BODY_BYTES)
+        read_agy_chunked_body(&mut reader, max_body_bytes)
     } else {
-        let max_body = content_length
-            .unwrap_or(MAX_AGY_RPC_BODY_BYTES)
-            .min(MAX_AGY_RPC_BODY_BYTES);
+        let max_body = content_length.unwrap_or(max_body_bytes).min(max_body_bytes);
         let mut buf = Vec::new();
         if max_body > 0 {
             let _ = reader.take(max_body as u64).read_to_end(&mut buf);

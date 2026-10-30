@@ -170,7 +170,8 @@ pub fn resolve_agy_exe(
     PathBuf::from("agy")
 }
 
-pub(crate) fn agy_ls_port(addr: &str) -> Option<u16> {
+/// Port of a language-server address (`host:port`, `[v6]:port`, or a bare port).
+pub fn agy_ls_port(addr: &str) -> Option<u16> {
     let addr = addr.trim();
     if addr.is_empty() {
         return None;
