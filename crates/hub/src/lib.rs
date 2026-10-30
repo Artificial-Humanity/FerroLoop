@@ -2526,4 +2526,274 @@ mod tests {
         let second: Value = serde_json::from_str(&delivered[1]).unwrap();
         assert_eq!(second["body"], expected);
     }
+
+    fn http_call(
+        state: &HubState,
+        method: &str,
+        path: &str,
+        bearer: Option<&str>,
+        body: Option<&Value>,
+    ) -> HttpResponse {
+        let mut req = HttpRequest::new(method, path);
+        if let Some(token) = bearer {
+            req = req.with_header("Authorization", format!("Bearer {token}"));
+        }
+        if let Some(body) = body {
+            req = req.with_json_body(body);
+        }
+        handle_http_request(state, &req)
+    }
+
+    fn response_text(resp: &HttpResponse) -> String {
+        String::from_utf8_lossy(&resp.body).into_owned()
+    }
+
+    #[test]
+    fn http_nodes_enrollment_heartbeat_and_revoke() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let owner = Some("owner-tok-secret");
+        let peer = Some("peer-tok-secret");
+
+        let unauth = http_call(&state, "GET", "/api/v1/nodes", None, None);
+        assert_eq!(unauth.status, 401, "{}", response_text(&unauth));
+
+        let owner_list = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+        assert_eq!(owner_list.status, 200, "{}", response_text(&owner_list));
+        let owner_raw = response_text(&owner_list);
+        assert!(!owner_raw.contains("token_hash"), "{owner_raw}");
+        let owner_json = owner_list.json_value().unwrap();
+        let hub = owner_json["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["role"].as_str() == Some("hub"))
+            .expect("hub node");
+        assert_eq!(hub["status"], "online");
+        assert_eq!(
+            hub["listen_addr"].as_str(),
+            Some(state.config.listen.as_str())
+        );
+        let hub_id = hub["node_id"].as_str().unwrap().to_string();
+        assert_eq!(owner_json["nodes"].as_array().unwrap().len(), 1);
+
+        let peer_list = http_call(&state, "GET", "/api/v1/nodes", peer, None);
+        assert_eq!(peer_list.status, 200, "{}", response_text(&peer_list));
+
+        let peer_mint = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll-token",
+            peer,
+            Some(&json!({ "label": "mac", "ttl_secs": 600 })),
+        );
+        assert_eq!(peer_mint.status, 403, "{}", response_text(&peer_mint));
+        assert!(response_text(&peer_mint).contains("owner authority required"));
+
+        let labeled = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll-token",
+            owner,
+            Some(&json!({ "label": "mac", "ttl_secs": 600 })),
+        );
+        assert_eq!(labeled.status, 200, "{}", response_text(&labeled));
+        let labeled_json = labeled.json_value().unwrap();
+        let labeled_code = labeled_json["code"].as_str().unwrap().to_string();
+        let join_command = labeled_json["join_command"].as_str().unwrap();
+        assert!(join_command.contains("fl hub join"), "{join_command}");
+        assert!(join_command.contains("--token"), "{join_command}");
+        assert!(join_command.contains(&labeled_code), "{join_command}");
+        assert!(join_command.contains("--label"), "{join_command}");
+
+        let blank = http_call(&state, "POST", "/api/v1/nodes/enroll-token", owner, None);
+        assert_eq!(blank.status, 200, "{}", response_text(&blank));
+        let blank_json = blank.json_value().unwrap();
+        assert_eq!(blank_json["ttl_secs"], 600);
+        let blank_code = blank_json["code"].as_str().unwrap().to_string();
+
+        let worker_body = json!({
+            "code": blank_code,
+            "node_id": "worker-a",
+            "display_name": "Worker A",
+            "hostname": "worker-host",
+            "os": "linux",
+            "arch": "x86_64",
+            "listen_addr": null,
+            "capabilities": ["git", "tmux"],
+            "labels": ["bench"]
+        });
+        let enrolled = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&worker_body),
+        );
+        assert_eq!(enrolled.status, 200, "{}", response_text(&enrolled));
+        let enrolled_json = enrolled.json_value().unwrap();
+        assert_eq!(enrolled_json["node_id"], "worker-a");
+        let node_token = enrolled_json["node_token"].as_str().unwrap().to_string();
+        assert!(!node_token.is_empty());
+
+        let again = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&worker_body),
+        );
+        assert_eq!(again.status, 409, "{}", response_text(&again));
+        assert!(response_text(&again).contains("already used"));
+
+        let listed = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+        assert_eq!(listed.status, 200, "{}", response_text(&listed));
+        assert!(!response_text(&listed).contains("token_hash"));
+        let listed_nodes = listed.json_value().unwrap()["nodes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(listed_nodes.iter().any(|node| node["node_id"] == hub_id));
+        let worker = listed_nodes
+            .iter()
+            .find(|node| node["node_id"] == "worker-a")
+            .expect("enrolled worker");
+        assert_eq!(worker["capabilities"], json!(["git", "tmux"]));
+
+        let node_get = http_call(
+            &state,
+            "GET",
+            "/api/v1/nodes",
+            Some(node_token.as_str()),
+            None,
+        );
+        assert_eq!(node_get.status, 401, "{}", response_text(&node_get));
+
+        let beat = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/worker-a/heartbeat",
+            Some(node_token.as_str()),
+            Some(&json!({ "capabilities": ["muse"] })),
+        );
+        assert_eq!(beat.status, 200, "{}", response_text(&beat));
+        let beat_json = beat.json_value().unwrap();
+        assert_eq!(beat_json["node_id"], "worker-a");
+        assert_eq!(beat_json["status"], "online");
+
+        let after_beat = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+        let after_nodes = after_beat.json_value().unwrap()["nodes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let worker = after_nodes
+            .iter()
+            .find(|node| node["node_id"] == "worker-a")
+            .expect("worker after heartbeat");
+        assert_eq!(worker["capabilities"], json!(["muse"]));
+
+        let wrong = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/worker-a/heartbeat",
+            Some("not-the-token"),
+            None,
+        );
+        assert_eq!(wrong.status, 401, "{}", response_text(&wrong));
+
+        let deny_hub = http_call(
+            &state,
+            "DELETE",
+            &format!("/api/v1/nodes/{hub_id}"),
+            owner,
+            None,
+        );
+        assert_eq!(deny_hub.status, 400, "{}", response_text(&deny_hub));
+        assert!(response_text(&deny_hub).contains("hub"));
+        let still = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+        let still_nodes = still.json_value().unwrap()["nodes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(still_nodes.iter().any(|node| node["node_id"] == hub_id));
+
+        let removed = http_call(&state, "DELETE", "/api/v1/nodes/worker-a", owner, None);
+        assert_eq!(removed.status, 200, "{}", response_text(&removed));
+        let removed_json = removed.json_value().unwrap();
+        assert_eq!(removed_json["revoked"], true);
+        assert_eq!(removed_json["node_id"], "worker-a");
+        let hidden = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+        let hidden_nodes = hidden.json_value().unwrap()["nodes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(
+            hidden_nodes
+                .iter()
+                .all(|node| node["node_id"] != "worker-a")
+        );
+        assert!(hidden_nodes.iter().any(|node| node["node_id"] == hub_id));
+
+        let revoked_beat = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/worker-a/heartbeat",
+            Some(node_token.as_str()),
+            None,
+        );
+        assert_eq!(revoked_beat.status, 403, "{}", response_text(&revoked_beat));
+        assert!(response_text(&revoked_beat).contains("revoked"));
+
+        let second_body = json!({
+            "code": labeled_code,
+            "node_id": "worker-b",
+            "display_name": "Worker B",
+            "hostname": "other-host",
+            "os": "linux",
+            "arch": "aarch64",
+            "capabilities": ["git"],
+            "labels": ["edge"]
+        });
+        let second = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&second_body),
+        );
+        assert_eq!(second.status, 200, "{}", response_text(&second));
+        let peer_delete = http_call(&state, "DELETE", "/api/v1/nodes/worker-b", peer, None);
+        assert_eq!(peer_delete.status, 403, "{}", response_text(&peer_delete));
+        assert!(response_text(&peer_delete).contains("owner authority required"));
+        let kept = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+        let kept_nodes = kept.json_value().unwrap()["nodes"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(kept_nodes.iter().any(|node| node["node_id"] == "worker-b"));
+
+        let expired_code = {
+            let store = state.open_store().unwrap();
+            mint_enroll_token(&store, None, 60, "http://127.0.0.1:9", 0)
+                .unwrap()
+                .code
+        };
+        let expired_body = json!({
+            "code": expired_code,
+            "node_id": "worker-expired",
+            "display_name": "Expired",
+            "hostname": "old-host",
+            "os": "linux",
+            "arch": "x86_64"
+        });
+        let expired = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&expired_body),
+        );
+        assert_eq!(expired.status, 401, "{}", response_text(&expired));
+        assert!(response_text(&expired).contains("expired"));
+    }
 }

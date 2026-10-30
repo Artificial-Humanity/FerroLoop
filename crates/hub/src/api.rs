@@ -70,14 +70,20 @@ use serde_json::{Value, json};
 
 use crate::HubStoreGuard;
 use crate::auth::{
-    HubAuthority, extract_bearer_token, extract_session_cookie, format_logout_set_cookie,
-    format_session_set_cookie,
+    HubAuthority, constant_time_eq, extract_bearer_token, extract_session_cookie,
+    format_logout_set_cookie, format_session_set_cookie, sha256_hex,
 };
 use crate::discovery::{
     DiscoveryStoreSnapshot, discover_sessions_from_snapshot, list_git_worktrees,
     read_session_context_usage_from_snapshot, read_session_quota_usage_with_home,
     read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
     snapshot_discovery_store,
+};
+use crate::nodes::{
+    EnrollFail, EnrollWorker, EnsureHubArgs, HeartbeatFail, HeartbeatUpdate, NodeRecord, NodeView,
+    RevokeFail, detect_capabilities, enroll_worker, ensure_hub_node, find_hub_node,
+    list_visible_nodes, local_hostname, mint_enroll_token, node_token_matches, revoke_node,
+    touch_node,
 };
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
 
@@ -336,6 +342,19 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         return handle_auth_pair(state, req);
     }
 
+    // Public worker enrollment. A one-time code is the credential.
+    if method == "POST" && path == "/api/v1/nodes/enroll" {
+        return handle_post_node_enroll(state, req);
+    }
+
+    // Worker heartbeat stays outside the general gate. A node bearer is not an
+    // owner token and must not authenticate any other route.
+    if method == "POST"
+        && let Some(raw_id) = node_heartbeat_segment(path)
+    {
+        return handle_post_node_heartbeat(state, req, raw_id);
+    }
+
     // 2b. Unauthenticated local MCP Registry v0.1 (`GET /api/v1/gate/registry/v0.1/...`).
     if (method == "GET" || method == "HEAD") && path.starts_with("/api/v1/gate/registry/") {
         let subpath = path.trim_start_matches("/api/v1/gate/registry");
@@ -459,6 +478,8 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
         ("POST", "/api/v1/gate/call") => handle_post_gate_call(state, &authority, req),
         ("POST", "/api/v1/gate/mcp") => handle_post_gate_mcp(state, &authority, None, req),
+        ("GET", "/api/v1/nodes") => handle_get_nodes(state),
+        ("POST", "/api/v1/nodes/enroll-token") => handle_post_enroll_token(state, &authority, req),
         _ => handle_dynamic_api_routes(state, &authority, req),
     }
 }
@@ -472,6 +493,434 @@ fn store_open_failure() -> HttpResponse {
 
 fn open_store_response(state: &HubState) -> Result<HubStoreGuard<'_>, ()> {
     state.open_store().map_err(|_| ())
+}
+
+fn hub_url_for_request(state: &HubState, req: &HttpRequest) -> String {
+    if let Some(host) = req.headers.get("host").map(|host| host.trim())
+        && !host.is_empty()
+        && !host.contains(' ')
+        && !host.contains('/')
+    {
+        if host.starts_with("http://") || host.starts_with("https://") {
+            return host.to_string();
+        }
+        return format!("http://{host}");
+    }
+    let listen = state.config.listen.trim_end_matches('/');
+    format!("http://{listen}")
+}
+
+fn json_object_body(req: &HttpRequest) -> Result<Value, HttpResponse> {
+    if req.body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(json!({}));
+    }
+    let value: Value = serde_json::from_slice(&req.body).map_err(|err| {
+        HttpResponse::json(400, json!({ "error": format!("invalid JSON body: {err}") }))
+    })?;
+    if !value.is_object() {
+        return Err(HttpResponse::json(
+            400,
+            json!({ "error": "JSON body must be an object" }),
+        ));
+    }
+    Ok(value)
+}
+
+fn json_string(body: &Value, key: &str) -> Result<String, String> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+fn json_string_items(key: &str, items: &[Value]) -> Result<Vec<String>, String> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(value) = item.as_str() else {
+            return Err(format!("`{key}` must be an array of strings"));
+        };
+        out.push(value.to_string());
+    }
+    Ok(out)
+}
+
+fn json_string_array(body: &Value, key: &str) -> Result<Vec<String>, String> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => json_string_items(key, items),
+        Some(_) => Err(format!("`{key}` must be an array of strings")),
+    }
+}
+
+fn json_optional_string_array(body: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match body.get(key) {
+        None => Ok(None),
+        Some(Value::Array(items)) => Ok(Some(json_string_items(key, items)?)),
+        Some(_) => Err(format!("`{key}` must be an array of strings")),
+    }
+}
+
+fn json_listen_addr(body: &Value) -> Result<Option<String>, String> {
+    match body.get("listen_addr") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err("`listen_addr` must be a string or null".to_string()),
+    }
+}
+
+fn json_optional_string(body: &Value, key: &str) -> Result<Option<String>, String> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+fn json_u64_or(body: &Value, key: &str, default: u64) -> Result<u64, String> {
+    match body.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("`{key}` must be a number")),
+    }
+}
+
+fn node_view_json(view: &NodeView) -> Value {
+    json!({
+        "node_id": view.node_id,
+        "display_name": view.display_name,
+        "role": view.role,
+        "hostname": view.hostname,
+        "os": view.os,
+        "arch": view.arch,
+        "listen_addr": view.listen_addr,
+        "capabilities": view.capabilities,
+        "labels": view.labels,
+        "status": view.status,
+        "enrolled_at_ms": view.enrolled_at_ms,
+        "last_seen_at_ms": view.last_seen_at_ms,
+    })
+}
+
+fn decode_node_id(raw_id: &str) -> Result<String, HttpResponse> {
+    let decoded = percent_decode(raw_id);
+    if raw_id.is_empty()
+        || raw_id == "."
+        || raw_id == ".."
+        || raw_id.contains('/')
+        || raw_id.contains('\\')
+        || decoded.is_empty()
+        || decoded == "."
+        || decoded == ".."
+        || decoded.contains('/')
+        || decoded.contains('\\')
+    {
+        return Err(HttpResponse::json(
+            400,
+            json!({ "error": "invalid node id" }),
+        ));
+    }
+    Ok(decoded)
+}
+
+fn node_heartbeat_segment(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/api/v1/nodes/")?;
+    let (raw_id, tail) = rest.split_once('/')?;
+    (tail == "heartbeat").then_some(raw_id)
+}
+
+/// Same slug as `nodes::node_state_slug`. Heartbeat reads the row after
+/// `node_token_matches` returns false for a revoked worker.
+fn stored_node_slug(node_id: &str) -> Option<String> {
+    if node_id.is_empty() {
+        return None;
+    }
+    let mut tail = String::new();
+    for ch in node_id.trim().chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == '-' || lower == '_' {
+            tail.push(lower);
+        }
+        if tail.len() >= 48 {
+            break;
+        }
+    }
+    if tail.is_empty() {
+        return None;
+    }
+    let slug = format!("hub-node-{tail}");
+    if slug.starts_with("hub-node-enroll-") {
+        return None;
+    }
+    Some(slug)
+}
+
+fn revoked_node_bearer_matches(
+    store: &RedbStore,
+    node_id: &str,
+    bearer: &str,
+) -> Result<bool, String> {
+    let Some(slug) = stored_node_slug(node_id) else {
+        return Ok(false);
+    };
+    let Some(entry) = store
+        .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(false);
+    };
+    if !entry.sensitive {
+        return Ok(false);
+    }
+    let StatePayload::Runtime(runtime) = entry.payload else {
+        return Ok(false);
+    };
+    let Ok(record) = serde_json::from_value::<NodeRecord>(runtime.value) else {
+        return Ok(false);
+    };
+    if !record.revoked {
+        return Ok(false);
+    }
+    let Some(token_hash) = record.token_hash.as_deref() else {
+        return Ok(false);
+    };
+    Ok(constant_time_eq(&sha256_hex(bearer), token_hash))
+}
+
+fn authorize_node_heartbeat<'a>(
+    state: &'a HubState,
+    req: &HttpRequest,
+    node_id: &str,
+) -> Result<HubStoreGuard<'a>, HttpResponse> {
+    let authenticated = authenticate_api_request(state, req).is_ok();
+    let store = match open_store_response(state) {
+        Ok(store) => store,
+        Err(()) => return Err(store_open_failure()),
+    };
+    if authenticated {
+        return Ok(store);
+    }
+    let bearer = req
+        .headers
+        .get("authorization")
+        .and_then(|header| extract_bearer_token(header))
+        .unwrap_or_default();
+    match node_token_matches(&store, node_id, &bearer) {
+        Ok(true) => Ok(store),
+        Ok(false) => match revoked_node_bearer_matches(&store, node_id, &bearer) {
+            Ok(true) => Ok(store),
+            Ok(false) => Err(HttpResponse::json(401, json!({ "error": "unauthorized" }))),
+            Err(err) => Err(HttpResponse::json(500, json!({ "error": err }))),
+        },
+        Err(err) => Err(HttpResponse::json(500, json!({ "error": err }))),
+    }
+}
+
+fn handle_post_node_enroll(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let worker = match enroll_request_from_body(&body) {
+        Ok(worker) => worker,
+        Err(error) => return HttpResponse::json(400, json!({ "error": error })),
+    };
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match enroll_worker(&store, worker) {
+        Ok(enrolled) => HttpResponse::json(
+            200,
+            json!({
+                "node_id": enrolled.node_id,
+                "node_token": enrolled.node_token,
+                "hub_url": hub_url_for_request(state, req),
+            }),
+        ),
+        Err(EnrollFail::Invalid) => {
+            HttpResponse::json(401, json!({ "error": "invalid enrollment code" }))
+        }
+        Err(EnrollFail::Expired) => {
+            HttpResponse::json(401, json!({ "error": "enrollment code expired" }))
+        }
+        Err(EnrollFail::Used) => {
+            HttpResponse::json(409, json!({ "error": "enrollment code already used" }))
+        }
+        Err(EnrollFail::Rejected(msg)) => HttpResponse::json(400, json!({ "error": msg })),
+        Err(EnrollFail::Store(err)) => HttpResponse::json(500, json!({ "error": err })),
+    }
+}
+
+fn enroll_request_from_body(body: &Value) -> Result<EnrollWorker, String> {
+    Ok(EnrollWorker {
+        code: json_string(body, "code")?,
+        node_id: json_string(body, "node_id")?,
+        display_name: json_string(body, "display_name")?,
+        hostname: json_string(body, "hostname")?,
+        os: json_string(body, "os")?,
+        arch: json_string(body, "arch")?,
+        listen_addr: json_listen_addr(body)?,
+        capabilities: json_string_array(body, "capabilities")?,
+        labels: json_string_array(body, "labels")?,
+        now_ms: stamp::now().unix_millis(),
+    })
+}
+
+fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str) -> HttpResponse {
+    let node_id = match decode_node_id(raw_id) {
+        Ok(node_id) => node_id,
+        Err(resp) => return resp,
+    };
+    let store = match authorize_node_heartbeat(state, req, &node_id) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let capabilities = match json_optional_string_array(&body, "capabilities") {
+        Ok(capabilities) => capabilities,
+        Err(error) => return HttpResponse::json(400, json!({ "error": error })),
+    };
+    let labels = match json_optional_string_array(&body, "labels") {
+        Ok(labels) => labels,
+        Err(error) => return HttpResponse::json(400, json!({ "error": error })),
+    };
+    match touch_node(
+        &store,
+        HeartbeatUpdate {
+            node_id,
+            capabilities,
+            labels,
+            now_ms: stamp::now().unix_millis(),
+        },
+    ) {
+        Ok(view) => HttpResponse::json(
+            200,
+            json!({
+                "node_id": view.node_id,
+                "status": view.status,
+                "last_seen_at_ms": view.last_seen_at_ms,
+            }),
+        ),
+        Err(HeartbeatFail::NotFound) => {
+            HttpResponse::json(404, json!({ "error": "node not found" }))
+        }
+        Err(HeartbeatFail::Revoked) => HttpResponse::json(403, json!({ "error": "node revoked" })),
+        Err(HeartbeatFail::Store(err)) => HttpResponse::json(500, json!({ "error": err })),
+    }
+}
+
+fn handle_get_nodes(state: &HubState) -> HttpResponse {
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    let now_ms = stamp::now().unix_millis();
+    let (node_id, display_name) = match find_hub_node(&store) {
+        Ok(Some(hub)) => (hub.node_id, hub.display_name),
+        Ok(None) => {
+            let hostname = local_hostname();
+            (hostname.clone(), hostname)
+        }
+        Err(err) => return HttpResponse::json(500, json!({ "error": err })),
+    };
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let listen_addr = (!state.config.listen.is_empty()).then(|| state.config.listen.clone());
+    if let Err(err) = ensure_hub_node(
+        &store,
+        EnsureHubArgs {
+            node_id,
+            display_name,
+            hostname: local_hostname(),
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            listen_addr,
+            capabilities: detect_capabilities(&path_env),
+            now_ms,
+        },
+    ) {
+        return HttpResponse::json(500, json!({ "error": err }));
+    }
+    match list_visible_nodes(&store, now_ms) {
+        Ok(nodes) => {
+            let nodes: Vec<Value> = nodes.iter().map(node_view_json).collect();
+            HttpResponse::json(200, json!({ "nodes": nodes }))
+        }
+        Err(err) => HttpResponse::json(500, json!({ "error": err })),
+    }
+}
+
+fn handle_post_enroll_token(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(403, json!({ "error": "owner authority required" }));
+    }
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let label = match json_optional_string(&body, "label") {
+        Ok(label) => label,
+        Err(error) => return HttpResponse::json(400, json!({ "error": error })),
+    };
+    let ttl_secs = match json_u64_or(&body, "ttl_secs", 600) {
+        Ok(ttl_secs) => ttl_secs,
+        Err(error) => return HttpResponse::json(400, json!({ "error": error })),
+    };
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match mint_enroll_token(
+        &store,
+        label,
+        ttl_secs,
+        &hub_url_for_request(state, req),
+        stamp::now().unix_millis(),
+    ) {
+        Ok(info) => HttpResponse::json(
+            200,
+            json!({
+                "code": info.code,
+                "expires_at_ms": info.expires_at_ms,
+                "ttl_secs": info.ttl_secs,
+                "join_command": info.join_command,
+            }),
+        ),
+        Err(err) => HttpResponse::json(500, json!({ "error": err })),
+    }
+}
+
+fn handle_delete_node(state: &HubState, authority: &HubAuthority, raw_id: &str) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(403, json!({ "error": "owner authority required" }));
+    }
+    let node_id = match decode_node_id(raw_id) {
+        Ok(node_id) => node_id,
+        Err(resp) => return resp,
+    };
+    let Ok(store) = open_store_response(state) else {
+        return store_open_failure();
+    };
+    match revoke_node(&store, &node_id) {
+        Ok(record) => HttpResponse::json(
+            200,
+            json!({
+                "revoked": true,
+                "node_id": record.node_id,
+            }),
+        ),
+        Err(RevokeFail::NotFound) => HttpResponse::json(404, json!({ "error": "node not found" })),
+        Err(RevokeFail::IsHub) => HttpResponse::json(
+            400,
+            json!({ "error": "cannot revoke the primary hub node" }),
+        ),
+        Err(RevokeFail::Store(err)) => HttpResponse::json(500, json!({ "error": err })),
+    }
 }
 
 fn authenticate_api_request(
@@ -2553,6 +3002,16 @@ fn handle_dynamic_api_routes(
             let bridge_id = percent_decode(segments[4]);
             return handle_post_gate_bridge_webhook(state, authority, &bridge_id, req);
         }
+    }
+
+    // /api/v1/nodes/:id — after sessions and attachments so those prefixes win.
+    if segments.len() == 4
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "nodes"
+        && method == "DELETE"
+    {
+        return handle_delete_node(state, authority, segments[3]);
     }
 
     HttpResponse::json(404, json!({ "error": "not found" }))
