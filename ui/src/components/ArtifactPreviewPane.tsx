@@ -25,6 +25,30 @@ export interface ArtifactPreviewPaneProps {
 }
 
 type ZoomPreset = "fit" | 50 | 100 | 150 | 200;
+export type ArtifactFilterMode = "user-docs" | "all";
+
+const USER_DOC_EXTENSIONS = new Set([
+  ".md",
+  ".markdown",
+  ".mmd",
+  ".mermaid",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".webp",
+  ".gif",
+  ".svg",
+  ".pdf",
+]);
+
+export function isUserFacingArtifactPath(rawPath: string): boolean {
+  const clean = rawPath.trim().split(/[?#]/)[0].toLowerCase();
+  const dotIdx = clean.lastIndexOf(".");
+  if (dotIdx < 0) {
+    return false;
+  }
+  return USER_DOC_EXTENSIONS.has(clean.slice(dotIdx));
+}
 
 export function formatArtifactKindLabel(kind: ArtifactKind): string {
   switch (kind) {
@@ -98,6 +122,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"rendered" | "source">("rendered");
   const [zoom, setZoom] = useState<ZoomPreset>("fit");
+  const [artifactFilter, setArtifactFilter] = useState<ArtifactFilterMode>("user-docs");
 
   useEffect(() => {
     if (activePath !== undefined && activePath !== null) {
@@ -145,7 +170,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
 
   const turnPaths = useMemo(() => discoverArtifactsFromTurns(turns), [turns]);
 
-  const quickSwitchPaths = useMemo(() => {
+  const allDiscoveredPaths = useMemo(() => {
     const all: string[] = [];
     const seen = new Set<string>();
     const add = (p: string) => {
@@ -161,6 +186,13 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     sessionArtifacts.forEach((item) => add(item.path));
     return all;
   }, [selectedPath, recentPaths, turnPaths, sessionArtifacts]);
+
+  const quickSwitchPaths = useMemo(() => {
+    if (artifactFilter === "all") {
+      return allDiscoveredPaths;
+    }
+    return allDiscoveredPaths.filter((p) => isUserFacingArtifactPath(p));
+  }, [allDiscoveredPaths, artifactFilter]);
 
   // Auto-select the most recent discovered artifact if none is selected yet
   useEffect(() => {
@@ -473,12 +505,30 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             {loading ? "Loading..." : "Load"}
           </button>
 
+          <select
+            aria-label="Artifact filter mode"
+            data-testid="artifact-filter-select"
+            className="fd-select fd-mono"
+            value={artifactFilter}
+            onChange={(e) => setArtifactFilter(e.target.value as ArtifactFilterMode)}
+            style={{ fontSize: "11px", padding: "5px 8px" }}
+          >
+            <option value="user-docs">User Documents &amp; Media</option>
+            <option value="all">All Files</option>
+          </select>
+
           {quickSwitchPaths.length > 0 && (
             <select
               aria-label="Recent and discovered session artifacts"
               data-testid="artifact-quick-switcher"
               className="fd-select fd-mono"
-              value={selectedPath && !selectedPath.startsWith("mermaid://") ? selectedPath : ""}
+              value={
+                selectedPath &&
+                !selectedPath.startsWith("mermaid://") &&
+                quickSwitchPaths.includes(selectedPath)
+                  ? selectedPath
+                  : ""
+              }
               onChange={(e) => {
                 if (e.target.value) {
                   handleSelectPath(e.target.value);

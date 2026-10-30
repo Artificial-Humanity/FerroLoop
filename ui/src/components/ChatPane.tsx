@@ -17,36 +17,53 @@ import {
   type SlashCommandEntry,
   type TranscriptTurn,
 } from "../types/api";
+import { AgentSettingsModal } from "./AgentSettingsModal";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { TurnCard } from "./TurnCard";
 
 export function getVendorModelOptions(
   adapter?: string | null,
   currentModel?: string | null,
+  availableModels?: string[] | null,
 ): string[] {
   const normalized = (adapter ?? "").trim().toLowerCase();
   let base: string[];
-  if (normalized === "claude" || normalized.startsWith("claude-")) {
-    base = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"];
+  if (Array.isArray(availableModels) && availableModels.length > 0) {
+    base = [...availableModels];
   } else if (
     normalized === "antigravity" ||
     normalized === "agy" ||
     normalized === "argon" ||
     normalized === "gemini"
   ) {
-    base = ["gemini-3.1-pro", "gemini-3.1-flash", "claude-sonnet-4-6"];
+    base = [
+      "gemini-4-argon",
+      "gemini-3.8-flash",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+      "gpt-oss-120b",
+    ];
+  } else if (normalized === "claude" || normalized.startsWith("claude-")) {
+    base = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"];
   } else if (normalized === "codex" || normalized.startsWith("codex-")) {
-    base = ["gpt-5.4", "o3"];
+    base = [
+      "gpt-6.1-terra",
+      "gpt-6.1-sol",
+      "gpt-6-astra",
+      "gpt-6-sol",
+      "gpt-6-luna",
+    ];
   } else if (normalized === "grok" || normalized.startsWith("grok-")) {
-    base = ["grok-4.7", "grok-4.7-fast"];
+    base = ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"];
   } else if (normalized === "muse" || normalized.startsWith("muse-")) {
     base = ["muse-spark"];
   } else {
     base = [
-      "claude-opus-4-7",
-      "claude-sonnet-4-6",
-      "gemini-3.1-pro",
-      "gpt-5.4",
+      "gemini-4-argon",
+      "gemini-3.8-flash",
+      "claude-opus-5-5",
+      "claude-sonnet-5-5",
+      "gpt-6.1-terra",
       "grok-4.7",
       "muse-spark",
     ];
@@ -277,8 +294,12 @@ function clearSessionDraft(targetKey: string): void {
 export interface ChatPaneProps {
   agentName?: string | null;
   agentDisplayName?: string | null;
+  agentRole?: string | null;
+  agentProject?: string | null;
   adapter?: string | null;
   model?: string | null;
+  thinkingLevel?: string | null;
+  availableModels?: string[] | null;
   sessionId?: string | null;
   turns?: TranscriptTurn[];
   /** Server-measured context usage; estimates apply when absent. */
@@ -291,6 +312,10 @@ export interface ChatPaneProps {
   error?: string | null;
   wsConnected?: boolean;
   slashCommands?: SlashCommandEntry[];
+  agentSettingsOpen?: boolean;
+  onOpenAgentSettings?: () => void;
+  onCloseAgentSettings?: () => void;
+  onToggleArtifacts?: () => void;
   onRefresh?: () => void;
   onSendPrompt?: (
     targetSessionOrAgentId: string,
@@ -305,6 +330,7 @@ export interface ChatPaneProps {
   onInterruptSession?: () => Promise<InterruptSessionResponse | unknown> | void;
   onSetSessionModel?: (
     model: string,
+    thinkingLevel?: string | null,
   ) => Promise<SetSessionModelResponse | unknown> | void;
   onOpenArtifact?: (pathOrUrl: string) => void;
   apiClient?: HubApiClient;
@@ -333,8 +359,12 @@ function fileToPromptAttachment(file: File): Promise<PromptAttachment> {
 export const ChatPane: React.FC<ChatPaneProps> = ({
   agentName,
   agentDisplayName,
+  agentRole = null,
+  agentProject = null,
   adapter,
   model = null,
+  thinkingLevel = null,
+  availableModels = null,
   sessionId,
   turns,
   contextUsage = null,
@@ -345,6 +375,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   error = null,
   wsConnected = false,
   slashCommands,
+  agentSettingsOpen,
+  onOpenAgentSettings,
+  onCloseAgentSettings,
+  onToggleArtifacts,
   onRefresh,
   onSendPrompt,
   onSendQueuedNow,
@@ -369,6 +403,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     React.useState<SessionQuotaUsage | null>(null);
   const [compacting, setCompacting] = React.useState<boolean>(false);
   const [compactFeedback, setCompactFeedback] = React.useState<string | null>(null);
+  const [internalAgentSettingsOpen, setInternalAgentSettingsOpen] =
+    React.useState<boolean>(false);
   const [clearModalOpen, setClearModalOpen] = React.useState<boolean>(false);
   const [clearHelpVisible, setClearHelpVisible] = React.useState<boolean>(false);
   const [clearing, setClearing] = React.useState<boolean>(false);
@@ -381,6 +417,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [interrupting, setInterrupting] = React.useState<boolean>(false);
   const interruptTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const [switchingModel, setSwitchingModel] = React.useState<boolean>(false);
+  const [composerHeight, setComposerHeight] = React.useState<number>(80);
+  const resizeCleanupRef = React.useRef<(() => void) | null>(null);
   const [internalSlashCommands, setInternalSlashCommands] =
     React.useState<SlashCommandEntry[]>(DEFAULT_SLASH_COMMANDS);
   const [slashMenuDismissed, setSlashMenuDismissed] = React.useState<boolean>(false);
@@ -418,6 +456,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const textareaRef = React.useRef<HTMLTextAreaElement | null>(null);
   const prevTargetRef = React.useRef<string>("");
   const prevWsConnectedRef = React.useRef<boolean>(Boolean(wsConnected));
   const prevTurnCountRef = React.useRef<number>(0);
@@ -485,12 +524,24 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const canInterrupt =
     Boolean(targetSessionOrAgent) && !interrupting && !decommissioning && !clearing;
 
-  const modelOptions = React.useMemo(
-    () => getVendorModelOptions(adapter, model),
-    [adapter, model],
-  );
+  const effectiveAgentSettingsOpen = agentSettingsOpen ?? internalAgentSettingsOpen;
+  const handleOpenAgentSettings = React.useCallback(() => {
+    setInternalAgentSettingsOpen(true);
+    onOpenAgentSettings?.();
+  }, [onOpenAgentSettings]);
+  const handleCloseAgentSettings = React.useCallback(() => {
+    setInternalAgentSettingsOpen(false);
+    onCloseAgentSettings?.();
+  }, [onCloseAgentSettings]);
+
   const [selectedModel, setSelectedModel] = React.useState<string>(
-    () => (model && model.trim()) || getVendorModelOptions(adapter, model)[0] || "",
+    () =>
+      (model && model.trim()) ||
+      getVendorModelOptions(adapter, model, availableModels)[0] ||
+      "",
+  );
+  const [selectedThinkingLevel, setSelectedThinkingLevel] = React.useState<string>(
+    () => (thinkingLevel && thinkingLevel.trim().toLowerCase()) || "high",
   );
 
   React.useEffect(() => {
@@ -498,10 +549,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (trimmed) {
       setSelectedModel(trimmed);
     } else {
-      const opts = getVendorModelOptions(adapter, model);
+      const opts = getVendorModelOptions(adapter, model, availableModels);
       setSelectedModel((prev) => (opts.includes(prev) ? prev : opts[0] ?? ""));
     }
-  }, [model, adapter, targetSessionOrAgent]);
+  }, [model, adapter, availableModels, targetSessionOrAgent]);
+
+  React.useEffect(() => {
+    const trimmedThinking = (thinkingLevel ?? "").trim().toLowerCase();
+    if (trimmedThinking) {
+      setSelectedThinkingLevel(trimmedThinking);
+    } else {
+      setSelectedThinkingLevel("high");
+    }
+  }, [thinkingLevel, targetSessionOrAgent]);
 
   React.useEffect(() => {
     if (slashCommands) {
@@ -578,8 +638,32 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (interruptTimerRef.current !== null) {
         clearTimeout(interruptTimerRef.current);
       }
+      resizeCleanupRef.current?.();
     };
   }, []);
+
+  const handleComposerResizeStart = React.useCallback(
+    (e: React.MouseEvent<HTMLDivElement>) => {
+      e.preventDefault();
+      resizeCleanupRef.current?.();
+      const startY = e.clientY;
+      const startHeight = textareaRef.current?.offsetHeight || composerHeight;
+      const handleMouseMove = (moveEvent: MouseEvent) => {
+        const delta = startY - moveEvent.clientY;
+        const nextHeight = Math.max(72, Math.min(420, startHeight + delta));
+        setComposerHeight(nextHeight);
+      };
+      const handleMouseUp = () => {
+        window.removeEventListener("mousemove", handleMouseMove);
+        window.removeEventListener("mouseup", handleMouseUp);
+        resizeCleanupRef.current = null;
+      };
+      window.addEventListener("mousemove", handleMouseMove);
+      window.addEventListener("mouseup", handleMouseUp);
+      resizeCleanupRef.current = handleMouseUp;
+    },
+    [composerHeight],
+  );
 
   const disarmInterrupt = React.useCallback(() => {
     if (interruptTimerRef.current !== null) {
@@ -635,9 +719,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     }
   };
 
-  const handleChangeModel = async (nextModel: string) => {
+  const handleChangeModelAndThinking = async (
+    nextModel: string,
+    nextThinkingLevel?: string,
+  ) => {
     const prevModel = selectedModel;
+    const prevThinking = selectedThinkingLevel;
+    const effectiveThinking = (nextThinkingLevel ?? selectedThinkingLevel ?? "high")
+      .trim()
+      .toLowerCase();
     setSelectedModel(nextModel);
+    setSelectedThinkingLevel(effectiveThinking);
     if (!targetSessionOrAgent || !nextModel || switchingModel) {
       return;
     }
@@ -646,18 +738,23 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setSubmitError(null);
     try {
       if (onSetSessionModel) {
-        await onSetSessionModel(nextModel);
+        await onSetSessionModel(nextModel, effectiveThinking);
       } else if (apiClient) {
-        await apiClient.setSessionModel(targetSessionOrAgent, nextModel);
+        await apiClient.setSessionModel(
+          targetSessionOrAgent,
+          nextModel,
+          effectiveThinking,
+        );
         if (onRefresh) {
           onRefresh();
         }
       } else {
         throw new Error("No session route is configured for switching model.");
       }
-      setCompactFeedback(`Model: ${nextModel}`);
+      setCompactFeedback(`Model: ${nextModel} (${effectiveThinking})`);
     } catch (err) {
       setSelectedModel(prevModel);
+      setSelectedThinkingLevel(prevThinking);
       setSubmitError(
         err instanceof Error ? err.message : "Failed to switch model",
       );
@@ -1341,13 +1438,27 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >
             {effectiveIsBusy ? "Busy · Working" : "Idle"}
           </span>
+          <span
+            className="fd-badge fd-mono"
+            data-testid="chat-active-model-badge"
+            title="Click to configure model, thinking level, or session lifecycle"
+            onClick={handleOpenAgentSettings}
+            style={{ cursor: "pointer" }}
+          >
+            {adapter ? `${adapter} · ` : ""}
+            {selectedModel}
+            {selectedThinkingLevel ? ` (${selectedThinkingLevel})` : ""}
+          </span>
           <div
             data-testid="context-level-meter"
+            title="Click to open Agent Settings & Context Lifecycle"
+            onClick={handleOpenAgentSettings}
             style={{
               display: "flex",
               alignItems: "center",
               gap: "8px",
               minWidth: "190px",
+              cursor: "pointer",
             }}
           >
             <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
@@ -1543,21 +1654,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               )}
             </div>
           )}
-          <select
-            aria-label="Session Model"
-            data-testid="session-model-select"
-            className="fd-select fd-mono"
-            disabled={!targetSessionOrAgent || switchingModel}
-            value={selectedModel}
-            onChange={(e) => void handleChangeModel(e.target.value)}
-            style={{ fontSize: "11px", padding: "4px 8px" }}
-          >
-            {modelOptions.map((opt) => (
-              <option key={opt} value={opt}>
-                {opt}
-              </option>
-            ))}
-          </select>
           {interruptArmed ? (
             <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
               <button
@@ -1594,43 +1690,6 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               {interrupting ? "Stopping..." : "Stop"}
             </button>
           )}
-          <button
-            type="button"
-            className={`fd-btn${canCompact ? " fd-btn-primary" : ""}`}
-            data-testid="compact-context-btn"
-            disabled={!canCompact}
-            title={
-              contextEstimate.percent >= 50
-                ? "Snapshot a FerroState checkpoint, then send /compact to the session"
-                : "Available when context reaches 50%"
-            }
-            onClick={() => void handleCompactContext()}
-            style={{ whiteSpace: "nowrap" }}
-          >
-            {compacting ? "Compacting..." : "Compact Context"}
-          </button>
-          <button
-            type="button"
-            className="fd-btn"
-            data-testid="clear-context-btn"
-            disabled={!canClear}
-            title="Clear session context or reforge with registered agent identity"
-            onClick={handleOpenClearModal}
-            style={{ whiteSpace: "nowrap" }}
-          >
-            {clearing ? "Clearing..." : "Clear"}
-          </button>
-          <button
-            type="button"
-            className="fd-btn fd-btn-danger"
-            data-testid="decommission-session-btn"
-            disabled={!canDecommission}
-            title="Prepare graceful decommission handshake or tear down session immediately"
-            onClick={handleOpenDecommissionModal}
-            style={{ whiteSpace: "nowrap" }}
-          >
-            {decommissioning ? "Decommissioning..." : "Decommission"}
-          </button>
           {compactFeedback && (
             <span
               role="status"
@@ -1644,6 +1703,27 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+          {onToggleArtifacts && (
+            <button
+              type="button"
+              className="fd-btn"
+              data-testid="chat-artifacts-toggle-btn"
+              onClick={onToggleArtifacts}
+              title="Toggle Artifacts preview panel"
+            >
+              Artifacts
+            </button>
+          )}
+          <button
+            type="button"
+            className="fd-btn"
+            data-testid="chat-agent-settings-btn"
+            aria-label="Agent Settings"
+            title="Agent Settings (Model, Thinking Level, Context & Lifecycle)"
+            onClick={handleOpenAgentSettings}
+          >
+            ⚙ Settings
+          </button>
           {(onRefresh || apiClient) && (
             <button
               type="button"
@@ -1771,6 +1851,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         role="region"
         aria-label="Message Composer"
         data-testid="prompt-composer"
+        className="fd-composer"
         onDragOver={(e) => e.preventDefault()}
         onDrop={(e) => {
           if (e.dataTransfer?.files?.length) {
@@ -1787,6 +1868,32 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           gap: "8px",
         }}
       >
+        <div
+          data-testid="composer-resize-handle"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="Resize message composer"
+          title="Drag up or down to resize prompt composer"
+          onMouseDown={handleComposerResizeStart}
+          style={{
+            height: "8px",
+            margin: "-6px 0 2px 0",
+            cursor: "ns-resize",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            userSelect: "none",
+          }}
+        >
+          <div
+            style={{
+              width: "36px",
+              height: "3px",
+              borderRadius: "2px",
+              backgroundColor: "var(--border-subtle)",
+            }}
+          />
+        </div>
         {submitError && (
           <div
             role="alert"
@@ -2102,6 +2209,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           )}
 
           <textarea
+            ref={textareaRef}
             rows={2}
             role="searchbox"
             name="fd-dispatch-command"
@@ -2117,7 +2225,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             aria-autocomplete="none"
             aria-label="Message"
             placeholder={`Send a message to ${displayTarget}... (Ctrl+Enter to submit, paste or attach files)`}
-            className="fd-textarea"
+            className="fd-textarea fd-prompt-input"
             value={promptText}
             onChange={(e) => setPromptText(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -2125,8 +2233,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             style={{
               width: "100%",
               resize: "vertical",
-              minHeight: "56px",
-              maxHeight: "180px",
+              height: `${composerHeight}px`,
+              minHeight: "72px",
+              maxHeight: "420px",
               border: "none",
               outline: "none",
               backgroundColor: "transparent",
@@ -2436,6 +2545,35 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
         </div>
       )}
+
+      <AgentSettingsModal
+        isOpen={effectiveAgentSettingsOpen}
+        onClose={handleCloseAgentSettings}
+        agentName={agentName}
+        agentDisplayName={agentDisplayName}
+        agentRole={agentRole}
+        agentProject={agentProject}
+        adapter={adapter}
+        sessionId={sessionId}
+        selectedModel={selectedModel}
+        selectedThinkingLevel={selectedThinkingLevel}
+        availableModels={availableModels}
+        switchingModel={switchingModel}
+        onChangeModelAndThinking={(nextModel, nextThinking) =>
+          void handleChangeModelAndThinking(nextModel, nextThinking)
+        }
+        contextEstimate={contextEstimate}
+        quotaUsage={effectiveQuotaUsage}
+        canCompact={canCompact}
+        compacting={compacting}
+        onCompactContext={() => void handleCompactContext()}
+        canClear={canClear}
+        clearing={clearing}
+        onOpenClearModal={handleOpenClearModal}
+        canDecommission={canDecommission}
+        decommissioning={decommissioning}
+        onOpenDecommissionModal={handleOpenDecommissionModal}
+      />
     </section>
   );
 };

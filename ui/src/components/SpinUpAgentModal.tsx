@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { HubApiClient } from "../api/client";
+import { getVendorModelOptions } from "./ChatPane";
 import type {
   EnrolledNode,
   SpinUpSessionRequest,
@@ -334,6 +335,7 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
               <input
                 id="fd-spin-up-model"
                 type="text"
+                list="fd-spin-up-model-options"
                 name="fd-spin-up-model"
                 autoComplete="off"
                 autoCorrect="off"
@@ -344,12 +346,17 @@ export const SpinUpAgentModal: React.FC<SpinUpAgentModalProps> = ({
                 data-form-type="other"
                 data-testid="spin-up-model-input"
                 className="fd-input fd-mono"
-                placeholder="e.g. claude-sonnet-4-6"
+                placeholder="e.g. gemini-4-argon, claude-opus-5-5"
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
                 disabled={submitting}
                 style={{ width: "100%" }}
               />
+              <datalist id="fd-spin-up-model-options">
+                {getVendorModelOptions(vendor).map((opt) => (
+                  <option key={opt} value={opt} />
+                ))}
+              </datalist>
             </div>
           </div>
 
