@@ -105,6 +105,15 @@ struct SyncSlot {
     notify_owner: Option<ThreadId>,
 }
 
+impl SyncSlot {
+    /// No queued batch and no `on_commit` running. A batch that a notify owns is
+    /// in neither `pending` nor `synced_seq` until the notify returns, so a check
+    /// of `pending` alone would call that window idle.
+    fn is_idle(&self) -> bool {
+        self.pending.is_empty() && !self.notify_in_flight
+    }
+}
+
 struct Committed {
     seq: u64,
     ops: Vec<Op>,
@@ -851,7 +860,7 @@ impl FerroStore {
         adapter: Arc<dyn SyncAdapter>,
     ) -> Result<(), StoreError> {
         let mut slot = lock_mutex(&self.sync);
-        if !slot.pending.is_empty() {
+        if !slot.is_idle() {
             return Err(backend(
                 "cannot attach a sync adapter while batches are pending",
             ));
@@ -876,7 +885,7 @@ impl FerroStore {
     /// `synced_seq` is kept.
     pub fn detach_sync_adapter(&self) -> Result<(), StoreError> {
         let mut slot = lock_mutex(&self.sync);
-        if !slot.pending.is_empty() {
+        if !slot.is_idle() {
             return Err(backend(
                 "cannot detach a sync adapter while batches are pending",
             ));
@@ -892,6 +901,11 @@ impl FerroStore {
 
     pub fn synced_seq(&self) -> u64 {
         lock_mutex(&self.sync).synced_seq
+    }
+
+    /// `true` while a batch is queued or an `on_commit` call is running.
+    pub fn has_pending_sync(&self) -> bool {
+        !lock_mutex(&self.sync).is_idle()
     }
 
     /// The attached adapter, cloned so no lock is held across a call into it.
@@ -1249,7 +1263,7 @@ impl FerroStore {
         let adapter = {
             let slot = lock_mutex(&self.sync);
             match slot.mode {
-                Some(SyncMode::LocalCache | SyncMode::CloudPreCache) if slot.pending.is_empty() => {
+                Some(SyncMode::LocalCache | SyncMode::CloudPreCache) if slot.is_idle() => {
                     slot.adapter.clone()
                 }
                 _ => None,
@@ -1277,7 +1291,7 @@ impl FerroStore {
         let key = (collection.to_string(), id.to_string());
         let _gate = lock_mutex(&self.commit_gate);
         if let Inner::Remote(remote) = &self.inner {
-            if !lock_mutex(&self.sync).pending.is_empty() {
+            if !lock_mutex(&self.sync).is_idle() {
                 drop(_gate);
                 return remote.call_option("get_doc", json!({"collection": collection, "id": id}));
             }
@@ -1294,7 +1308,7 @@ impl FerroStore {
             let (wrote, doc, store_seq) = parse_if_absent(&value)?;
             if let Some(store_seq) = store_seq {
                 let mut slot = lock_mutex(&self.sync);
-                if wrote && slot.pending.is_empty() && store_seq > slot.synced_seq {
+                if wrote && slot.is_idle() && store_seq > slot.synced_seq {
                     slot.synced_seq = store_seq;
                 }
             }
@@ -1305,7 +1319,7 @@ impl FerroStore {
             Inner::Memory(slot) => {
                 let mut state = lock_mutex(slot);
                 let mut sync = lock_mutex(&self.sync);
-                if !sync.pending.is_empty() {
+                if !sync.is_idle() {
                     return Ok(state.docs.get(&key).cloned());
                 }
                 if let Some(existing) = state.docs.get(&key).cloned() {
@@ -1318,7 +1332,7 @@ impl FerroStore {
                 };
                 apply_commit(&mut state, op)?;
                 let seq = state.last_seq;
-                if sync.pending.is_empty() && seq > sync.synced_seq {
+                if sync.is_idle() && seq > sync.synced_seq {
                     sync.synced_seq = seq;
                 }
                 Ok(Some(fetched))
@@ -1328,7 +1342,7 @@ impl FerroStore {
                 let _locked = FlockGuard::acquire(file.as_raw_fd())?;
                 let (index, sb, state) = read_consistent(&file)?;
                 let mut sync = lock_mutex(&self.sync);
-                if !sync.pending.is_empty() {
+                if !sync.is_idle() {
                     return Ok(state.docs.get(&key).cloned());
                 }
                 if let Some(existing) = state.docs.get(&key).cloned() {
@@ -1342,7 +1356,7 @@ impl FerroStore {
                 let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
                 let frame = encode_frame(seq, std::slice::from_ref(&op))?;
                 append_frame(&file, index, &sb, &frame)?;
-                if sync.pending.is_empty() && seq > sync.synced_seq {
+                if sync.is_idle() && seq > sync.synced_seq {
                     sync.synced_seq = seq;
                 }
                 Ok(Some(fetched))
@@ -1456,7 +1470,7 @@ impl FerroStore {
     }
 
     fn require_sync_idle(&self) -> Result<(), StoreError> {
-        if lock_mutex(&self.sync).pending.is_empty() {
+        if lock_mutex(&self.sync).is_idle() {
             Ok(())
         } else {
             Err(backend(
@@ -1485,7 +1499,7 @@ impl FerroStore {
                 self.require_sync_idle()?;
                 let seq = remote.apply_sync_batches(&batches, silent)?;
                 let mut slot = lock_mutex(&self.sync);
-                if slot.pending.is_empty() && seq > slot.synced_seq {
+                if slot.is_idle() && seq > slot.synced_seq {
                     slot.synced_seq = seq;
                 }
                 seq
@@ -1494,7 +1508,7 @@ impl FerroStore {
         }
         let (seq, flush) = {
             let _gate = lock_mutex(&self.commit_gate);
-            if !lock_mutex(&self.sync).pending.is_empty() {
+            if !lock_mutex(&self.sync).is_idle() {
                 return Err(backend(
                     "cannot apply sync batches while commits are pending",
                 ));
@@ -1502,7 +1516,7 @@ impl FerroStore {
             let (seq, prepared) = publish_sync_batches(&self.inner, &batches)?;
             if silent {
                 let mut slot = lock_mutex(&self.sync);
-                if slot.pending.is_empty() && seq > slot.synced_seq {
+                if slot.is_idle() && seq > slot.synced_seq {
                     slot.synced_seq = seq;
                 }
                 return Ok(seq);
@@ -1541,7 +1555,7 @@ impl FerroStore {
         };
         let mut slot = lock_mutex(&self.sync);
         if silent {
-            if slot.pending.is_empty() && batch.seq > slot.synced_seq {
+            if slot.is_idle() && batch.seq > slot.synced_seq {
                 slot.synced_seq = batch.seq;
             }
             return None;
@@ -1549,7 +1563,7 @@ impl FerroStore {
         let adapter = slot.adapter.clone()?;
         match slot.mode {
             Some(SyncMode::WriteThrough) => {
-                if !slot.pending.is_empty() || slot.notify_in_flight {
+                if !slot.is_idle() {
                     slot.pending.push(batch);
                     None
                 } else {

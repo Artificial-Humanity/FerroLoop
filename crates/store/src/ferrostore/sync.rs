@@ -2565,4 +2565,135 @@ mod tests {
                 .is_none()
         );
     }
+
+    fn within(pair: &Arc<(Mutex<bool>, Condvar)>, what: &str) {
+        let (lock, cv) = &**pair;
+        let guard = lock.lock().unwrap();
+        let (guard, status) = cv
+            .wait_timeout_while(guard, std::time::Duration::from_secs(10), |set| !*set)
+            .unwrap();
+        assert!(
+            !status.timed_out() && *guard,
+            "timed out waiting for {what}"
+        );
+    }
+
+    fn open(pair: &Arc<(Mutex<bool>, Condvar)>) {
+        let (lock, cv) = &**pair;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+
+    fn bounded_in_flight_rig() -> (Arc<FerroStore>, BlockingRig) {
+        let rig = blocking_adapter(false);
+        let store = Arc::new(
+            FerroStore::in_memory()
+                .with_sync_adapter(
+                    SyncMode::WriteThrough,
+                    Arc::clone(&rig.adapter) as Arc<dyn SyncAdapter>,
+                )
+                .unwrap(),
+        );
+        (store, rig)
+    }
+
+    #[test]
+    fn has_pending_sync_is_true_while_a_notify_is_in_flight() {
+        let (store, rig) = bounded_in_flight_rig();
+        assert!(!store.has_pending_sync());
+        let writer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "a", &json!({"n": 1})).unwrap())
+        };
+        within(&rig.entered, "on_commit to start");
+        // The batch is neither pending nor synced yet: only the flag shows it.
+        assert!(store.has_pending_sync());
+        assert_eq!(store.synced_seq(), 0);
+        open(&rig.release);
+        writer.join().unwrap();
+        assert!(!store.has_pending_sync());
+        assert_eq!(store.synced_seq(), 1);
+    }
+
+    #[test]
+    fn attach_and_detach_refuse_while_a_notify_is_in_flight() {
+        let (store, rig) = bounded_in_flight_rig();
+        let writer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "a", &json!({"n": 1})).unwrap())
+        };
+        within(&rig.entered, "on_commit to start");
+        let other: Arc<dyn SyncAdapter> = Arc::new(FakeSync::new());
+        let err = store
+            .attach_sync_adapter(SyncMode::WriteBehind, other)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Backend(m) if m == "cannot attach a sync adapter while batches are pending"),
+            "{err}"
+        );
+        let err = store.detach_sync_adapter().unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Backend(m) if m == "cannot detach a sync adapter while batches are pending"),
+            "{err}"
+        );
+        assert_eq!(store.sync_mode(), Some(SyncMode::WriteThrough));
+        open(&rig.release);
+        writer.join().unwrap();
+        store.detach_sync_adapter().unwrap();
+        assert_eq!(store.sync_mode(), None);
+    }
+
+    #[test]
+    fn inbound_apply_and_cache_fill_refuse_while_a_notify_is_in_flight() {
+        let (store, rig) = bounded_in_flight_rig();
+        let writer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || store.put_doc("docs", "a", &json!({"n": 1})).unwrap())
+        };
+        within(&rig.entered, "on_commit to start");
+        let inbound = vec![SyncBatch {
+            seq: 3,
+            ops: vec![SyncOp::PutDoc {
+                collection: "docs".into(),
+                id: "in".into(),
+                doc: json!({"in": true}),
+            }],
+        }];
+        let err = store.apply_inbound(inbound.clone()).unwrap_err();
+        assert!(
+            matches!(&err, StoreError::Backend(m) if m.contains("commits are pending")),
+            "{err}"
+        );
+        let err = store.require_sync_idle().unwrap_err();
+        assert!(matches!(err, StoreError::Backend(_)));
+        // A silent commit and a silent fill must not move synced_seq past the
+        // unacknowledged batch.
+        assert!(
+            store
+                .commit_if_seq_inner(
+                    1,
+                    &[Op::Put {
+                        collection: "docs".into(),
+                        id: "silent".into(),
+                        doc: json!({"silent": true}),
+                    }],
+                    true,
+                )
+                .unwrap()
+        );
+        assert_eq!(store.synced_seq(), 0);
+        let filled = store
+            .install_fetched_doc("docs", "fill", json!({"fill": true}))
+            .unwrap();
+        assert_eq!(filled, None);
+        assert_eq!(store.synced_seq(), 0);
+        open(&rig.release);
+        writer.join().unwrap();
+        assert_eq!(store.synced_seq(), 1);
+        store.apply_inbound(inbound).unwrap();
+        assert_eq!(
+            store.get_doc("docs", "in").unwrap(),
+            Some(json!({"in": true}))
+        );
+    }
 }
