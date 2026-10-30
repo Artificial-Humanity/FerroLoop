@@ -4383,6 +4383,12 @@ mod tests {
         .unwrap();
         fs::create_dir_all(skills.join("broken")).unwrap();
         fs::write(skills.join("broken/SKILL.md"), "no frontmatter here").unwrap();
+        fs::create_dir_all(skills.join("unfenced")).unwrap();
+        fs::write(
+            skills.join("unfenced/SKILL.md"),
+            "intro\nname: unfenced\ndescription: x\n---\n",
+        )
+        .unwrap();
         // A skill whose directory is a symlink to outside the workspace.
         let outside = TempDir::new().unwrap();
         fs::create_dir_all(outside.path().join("evil")).unwrap();
@@ -4436,6 +4442,7 @@ mod tests {
                 json!({ "name": "ship", "kind": "workflow", "description": "Ship a change" })
             );
             assert!(find("skill", "broken").is_none());
+            assert!(find("skill", "unfenced").is_none());
             assert!(find("skill", "evil").is_none());
             assert!(find("workflow", "leak").is_none());
             for c in &commands {

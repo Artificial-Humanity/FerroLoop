@@ -351,6 +351,15 @@ mod tests {
             &root.join(".agents/skills/bad/SKILL.md"),
             "no frontmatter at all",
         );
+        // A name with no `---` fence, and a fence that never closes, are malformed too.
+        write(
+            &root.join(".agents/skills/unfenced/SKILL.md"),
+            "intro\nname: unfenced\ndescription: x\n---\n",
+        );
+        write(
+            &root.join(".agents/skills/unclosed/SKILL.md"),
+            "---\nname: unclosed\ndescription: x\n",
+        );
         write(
             &root.join(".agents/skills/noname/SKILL.md"),
             "---\ndescription: nameless\n---\n",
