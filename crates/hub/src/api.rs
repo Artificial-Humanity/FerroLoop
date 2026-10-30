@@ -3660,14 +3660,16 @@ fn handle_post_session_decommission(
         Ok(target) => target,
         Err(e) => return lifecycle_error_response(&e),
     };
+    let caller = if authority.is_owner() {
+        lifecycle::Caller::Owner
+    } else {
+        lifecycle::Caller::Peer
+    };
     let result = match mode {
-        DecommissionMode::Prepare => lifecycle::prepare_decommission(&*store, &env, &target, by),
+        DecommissionMode::Prepare => {
+            lifecycle::prepare_decommission(&*store, &env, &target, by, caller)
+        }
         DecommissionMode::Teardown => {
-            let caller = if authority.is_owner() {
-                lifecycle::Caller::Owner
-            } else {
-                lifecycle::Caller::Peer
-            };
             lifecycle::teardown_session(&*store, &env, &target, by, caller, |key| {
                 state.clear_session_prompt_queue(key)
             })

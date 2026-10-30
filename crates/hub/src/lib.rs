@@ -2754,6 +2754,60 @@ mod tests {
     }
 
     #[test]
+    fn peer_prepare_of_an_unmanaged_session_is_403_and_cannot_unlock_teardown() {
+        use fl_core::agent::{AgentRole, AgentStatus};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        register_resident(&state, "jarvis", AgentRole::LabManager, "ferroloop");
+        let hosted_count = || {
+            handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap()["sessions"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let jarvis_status = || {
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name("jarvis")
+                .unwrap()
+                .unwrap()
+                .status
+        };
+
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "peer-tok-secret", "claude%3Ajarvis", mode);
+            assert_eq!(
+                resp.status,
+                403,
+                "{mode}: {}",
+                String::from_utf8_lossy(&resp.body)
+            );
+            assert_eq!(hosted_count(), 0, "{mode}");
+            assert_eq!(jarvis_status(), AgentStatus::Active, "{mode}");
+        }
+        assert!(state.session_queue("claude:jarvis").is_empty());
+
+        // The Owner may prepare (adopting the session); the Peer still cannot retire it.
+        let resp = decommission_as(&state, "owner-tok-secret", "claude%3Ajarvis", "prepare");
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(hosted_count(), 1);
+        assert_eq!(jarvis_status(), AgentStatus::Active);
+    }
+
+    #[test]
     fn a_decommissioned_session_cannot_be_prepared_or_restarted() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);

@@ -560,9 +560,13 @@ pub fn run<S: AgentRegistry + Handles + StateStore>(
                 SessionTarget::resolve(store, &session, None).map_err(lifecycle_failure)?;
             // `fl` holds no hub prompt queue: an undelivered prepare prompt is printed instead.
             let out = match mode {
-                DecommissionMode::Prepare => {
-                    lifecycle::prepare_decommission(store, &env, &target, &by)
-                }
+                DecommissionMode::Prepare => lifecycle::prepare_decommission(
+                    store,
+                    &env,
+                    &target,
+                    &by,
+                    lifecycle::Caller::Owner,
+                ),
                 DecommissionMode::Teardown => lifecycle::teardown_session(
                     store,
                     &env,

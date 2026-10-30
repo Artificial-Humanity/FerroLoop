@@ -659,6 +659,9 @@ pub struct SessionTarget {
     pub raw_id: String,
     pub session_id: String,
     pub persona: String,
+    /// The caller's canonical id for the session, which can differ from `raw_id` and
+    /// `session_id`; queues and routes may be keyed by it.
+    pub discovered_id: String,
     pub hosted: Option<HostedSessionRecord>,
 }
 
@@ -688,6 +691,7 @@ impl SessionTarget {
                 raw_id: raw.to_string(),
                 session_id: rec.session_id.clone(),
                 persona: rec.persona.clone(),
+                discovered_id: disc_id,
                 hosted: Some(rec),
             },
             None => {
@@ -699,8 +703,9 @@ impl SessionTarget {
                 }
                 Self {
                     raw_id: raw.to_string(),
-                    session_id: disc_id,
+                    session_id: disc_id.clone(),
                     persona: persona_guess,
+                    discovered_id: disc_id,
                     hosted: None,
                 }
             }
@@ -709,12 +714,17 @@ impl SessionTarget {
 
     /// Distinct ids that can key this session in a queue or route table.
     fn keys(&self) -> Vec<&str> {
-        let mut keys = vec![
+        let mut keys: Vec<&str> = Vec::with_capacity(4);
+        for key in [
             self.session_id.as_str(),
             self.raw_id.as_str(),
+            self.discovered_id.as_str(),
             self.persona.as_str(),
-        ];
-        keys.dedup();
+        ] {
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
         keys
     }
 }
@@ -777,12 +787,22 @@ fn record_for_target<S: AgentRegistry>(
 /// Phase one: ask the agent to save its work and hand off. Nothing is stopped or unregistered.
 ///
 /// `handshake_dispatched` is `false` when no live route took the prompt; the caller may queue it.
+/// `caller` gates adopting a session that has no hosted record (owner only).
 pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
     target: &SessionTarget,
     by: &str,
+    caller: Caller,
 ) -> Result<DecommissionResponse, LifecycleError> {
+    // Prepare adopts an unmanaged session into a hosted record, which teardown then accepts from
+    // any caller, so the adoption gate applies here too, before any side effect.
+    if target.hosted.is_none() && caller != Caller::Owner {
+        return Err(LifecycleError::Forbidden(format!(
+            "only Owner authority may decommission `{}`, which has no hosted session record",
+            target.raw_id
+        )));
+    }
     if target.hosted.as_ref().is_some_and(is_decommissioned) {
         return Err(decommissioned_conflict(&target.session_id));
     }
@@ -1224,7 +1244,7 @@ mod tests {
         let routes = webhook_route_file(home.path(), "felicity");
 
         let target = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
-        let out = prepare_decommission(&store, &env, &target, "owner").unwrap();
+        let out = prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap();
         assert_eq!(out.mode, DecommissionMode::Prepare);
         assert_eq!(out.status, "decommissioning");
         assert!(!out.unregistered && !out.runtime_stopped);
@@ -1249,7 +1269,8 @@ mod tests {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
         let target = SessionTarget::resolve(&store, "ghost", None).unwrap();
-        let err = prepare_decommission(&store, &env(&home), &target, "owner").unwrap_err();
+        let err =
+            prepare_decommission(&store, &env(&home), &target, "owner", Caller::Owner).unwrap_err();
         assert_eq!(err.status(), 404);
     }
 
@@ -1328,7 +1349,7 @@ mod tests {
         )
         .unwrap();
         let target = SessionTarget::resolve(&store, "claude:felicity", None).unwrap();
-        prepare_decommission(&store, &env, &target, "owner").unwrap();
+        prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap();
 
         let out = restart_hosted_session(&store, &env, "claude:felicity", "owner").unwrap();
         assert_eq!(out.record.restart_count, 1);
@@ -1363,7 +1384,7 @@ mod tests {
         let err = restart_hosted_session(&store, &env, "claude:felicity", "owner").unwrap_err();
         assert!(matches!(err, LifecycleError::Conflict(_)), "{err}");
         assert_eq!(err.status(), 409);
-        let err = prepare_decommission(&store, &env, &target, "owner").unwrap_err();
+        let err = prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap_err();
         assert_eq!(err.status(), 409);
 
         assert_eq!(
@@ -1544,6 +1565,94 @@ mod tests {
     }
 
     #[test]
+    fn peer_prepare_of_an_unmanaged_session_is_forbidden_and_adopts_nothing() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        register(&store, "jarvis", "ferroloop", AgentRole::LabManager);
+        let routes = webhook_route_file(home.path(), "jarvis");
+        // A live listener on the route's socket would receive any prompt delivered.
+        let listener =
+            std::os::unix::net::UnixListener::bind(home.path().join("none.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let target = SessionTarget::resolve(&store, "claude:jarvis", None).unwrap();
+        assert!(target.hosted.is_none());
+
+        let err = prepare_decommission(&store, &env, &target, "peer", Caller::Peer).unwrap_err();
+        assert!(matches!(err, LifecycleError::Forbidden(_)), "{err}");
+        assert_eq!(err.status(), 403);
+        assert!(list_hosted_sessions(&store).unwrap().is_empty());
+        assert!(listener.accept().is_err(), "no prompt may be delivered");
+        assert!(RouteTable::load(Some(&routes)).get("jarvis").is_some());
+        assert_eq!(
+            store.agent_by_name("jarvis").unwrap().unwrap().status,
+            AgentStatus::Active
+        );
+        // The peer cannot reach teardown through an adopted record either.
+        let target = SessionTarget::resolve(&store, "claude:jarvis", None).unwrap();
+        let err =
+            teardown_session(&store, &env, &target, "peer", Caller::Peer, |_| {}).unwrap_err();
+        assert_eq!(err.status(), 403);
+
+        // The owner may still adopt it.
+        let out = prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap();
+        assert_eq!(out.status, "decommissioning");
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn peer_prepare_of_a_hosted_session_still_works() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(&store, &env, &req("ada", "assistant", "claude"), "peer").unwrap();
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        let out = prepare_decommission(&store, &env, &target, "peer", Caller::Peer).unwrap();
+        assert_eq!(out.status, "decommissioning");
+        assert!(out.prompt.is_some());
+    }
+
+    #[test]
+    fn teardown_clears_queues_under_the_discovered_id_of_a_hosted_session() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        spin_up(&store, &env, &req("ada", "assistant", "claude"), "owner").unwrap();
+        let target = SessionTarget::resolve(
+            &store,
+            "claude:ada",
+            Some(("claude-xyz".into(), Some("Ada".into()))),
+        )
+        .unwrap();
+        assert!(target.hosted.is_some());
+        assert_eq!(target.discovered_id, "claude-xyz");
+        let mut cleared = Vec::new();
+        teardown_session(&store, &env, &target, "owner", Caller::Owner, |k| {
+            cleared.push(k.to_string())
+        })
+        .unwrap();
+        for key in ["claude:ada", "claude-xyz", "ada"] {
+            assert!(cleared.contains(&key.to_string()), "{key}: {cleared:?}");
+        }
+        let mut distinct = cleared.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), cleared.len(), "keys repeat: {cleared:?}");
+    }
+
+    #[test]
+    fn target_keys_are_distinct_even_when_equal_ids_are_not_adjacent() {
+        let target = SessionTarget {
+            raw_id: "ada".into(),
+            session_id: "claude:ada".into(),
+            persona: "ada".into(),
+            discovered_id: "claude:ada".into(),
+            hosted: None,
+        };
+        assert_eq!(target.keys(), vec!["claude:ada", "ada"]);
+    }
+
+    #[test]
     fn a_malformed_session_id_is_rejected_before_any_side_effect() {
         let store = MemStore::default();
         let home = TempDir::new().unwrap();
@@ -1574,6 +1683,7 @@ mod tests {
             raw_id: "claude:Bad Name".into(),
             session_id: "claude:Bad Name".into(),
             persona: "bad name".into(),
+            discovered_id: "claude:Bad Name".into(),
             hosted: None,
         };
         let mut cleared = Vec::new();
