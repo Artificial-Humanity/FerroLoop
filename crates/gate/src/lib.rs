@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+pub mod adapter;
 pub mod bridge;
 pub mod connector;
 pub mod mcp;
@@ -11,6 +12,10 @@ pub mod proxy;
 pub mod registry;
 pub mod vault;
 
+pub use adapter::{
+    McpRegistryAdapter, McpRelayAdapter, RegistryTier, TieredRegistryEntry, forward_mcp_relay,
+    handle_tiered_registry_v01_get,
+};
 pub use bridge::{
     BridgeConfig, BridgeDispatchPlan, BridgeTarget, InboundBridgeEvent,
     evaluate_inbound_bridge_event, verify_inbound_bridge_webhook,
@@ -64,6 +69,8 @@ pub enum GateError {
     SsrfBlocked { host: String, reason: String },
     #[error("upstream HTTP call failed: {cause}")]
     UpstreamHttp { cause: String },
+    #[error("adapter `{provider}` failed: {reason}")]
+    Adapter { provider: String, reason: String },
     #[error("invalid connector manifest {}: {reason}", path.display())]
     InvalidConnector { path: PathBuf, reason: String },
     #[error("unknown FerroGate connector tool `{tool}`")]

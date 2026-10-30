@@ -118,7 +118,7 @@ pub(super) fn parse_superblock(buf: &[u8]) -> Option<Superblock> {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Op {
+pub enum Op {
     Put {
         collection: String,
         id: String,

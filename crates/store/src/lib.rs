@@ -21,8 +21,9 @@ pub mod workflow;
 
 pub use ferrostore::{
     AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
-    FerroStore, FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit, VectorHit, VectorMetric,
-    VectorStorage, ZoneMap, default_socket_path_for_store, migrate_redb_to_ferrostore,
+    FerroStore, FerroStoreServer, Fusion, GateRunRollup, KnowledgeHit, SyncAdapter, SyncBatch,
+    SyncMode, SyncOp, VectorHit, VectorMetric, VectorStorage, ZoneMap,
+    default_socket_path_for_store, migrate_redb_to_ferrostore,
 };
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};

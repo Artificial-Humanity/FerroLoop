@@ -296,3 +296,15 @@ HNSW parameters live on the collection. There is no hidden default `M`. The leve
 `search_knowledge` uses that fusion and those two collections. Each hit is the id, the fused score, the vector metadata when the id is in the vector collection (`None` when it is absent or when the id is BM25-only), and the document when the id is in the document collection (`None` otherwise). The caller stores a knowledge entry with `put_doc` and its embedding with `upsert_vector` under the same id. FerroStore does not call an embedding model, and this phase does not change the redb state format.
 
 A checkpoint with any vector collection writes snapshot version 3. A document-only store stays version 1 and byte-identical. Columnar tables with no vector collections stay version 2. `migrate_redb_to_ferrostore` refuses a non-empty document map, column-table map, or vector map.
+
+## Sync adapter
+
+A process may attach one `SyncAdapter` in a `SyncMode`: `WriteThrough`, `WriteBehind`, `LocalCache`, or `CloudPreCache`. The mode, the adapter, the pending batches, and `synced_seq` are process memory. They are not written to the `.fls` file. A reopened store has no adapter and `synced_seq` of 0.
+
+After a commit that advances the store sequence, the store builds a `SyncBatch` of that sequence and its ops. An empty op list does not. The adapter is not called while the memory document mutex or the disk `flock` is held. `WriteThrough` calls `on_commit` after the commit is published. Success sets `synced_seq` to that sequence. Failure leaves the commit applied, appends the batch to the pending buffer, and returns the error. `WriteBehind`, `LocalCache`, and `CloudPreCache` append the batch and do not call `on_commit`. With no adapter, commits are unchanged.
+
+`sync_flush` calls `on_commit` for each pending batch in order, in every mode. The first error leaves that batch and the later ones pending. Success clears the buffer and sets `synced_seq` to the last batch sequence.
+
+`get_doc` in `LocalCache` or `CloudPreCache`, and only when the pending buffer is empty, treats a missing document as a cache miss and calls `fetch_document`. `Ok(None)` stays a miss. `Ok(Some(doc))` is stored with a silent put: a durable memory, disk, or remote write that advances the sequence, does not call `on_commit`, and is not queued. When the pending buffer is empty, that put sets `synced_seq` to the new sequence. A stored JSON null is a hit, not a miss. A remote `get_doc` of JSON null is a miss. Other modes do not fetch. A fetch error is returned.
+
+`sync_pull` calls `pull_since` with the store sequence. `sync_prewarm` calls `prewarm`. Both require an adapter and an empty pending buffer, and both apply the returned batches through the normal commit path with sync suppressed. The batches must be strictly increasing, each non-empty, and the first sequence must be the current sequence plus one. Any other shape is an error and writes nothing. After a successful apply, `synced_seq` is the last applied sequence. An empty result writes nothing and returns the current `synced_seq`.
