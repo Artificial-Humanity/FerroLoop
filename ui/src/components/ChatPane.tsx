@@ -18,6 +18,7 @@ import {
   type TranscriptTurn,
 } from "../types/api";
 import { AgentSettingsModal } from "./AgentSettingsModal";
+import { dispatchOpenHelp, type HelpTopicId } from "./HelpDrawer";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { TurnCard } from "./TurnCard";
 
@@ -333,6 +334,7 @@ export interface ChatPaneProps {
     thinkingLevel?: string | null,
   ) => Promise<SetSessionModelResponse | unknown> | void;
   onOpenArtifact?: (pathOrUrl: string) => void;
+  onOpenHelpTopic?: (topic: HelpTopicId) => void;
   apiClient?: HubApiClient;
 }
 
@@ -388,6 +390,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onInterruptSession,
   onSetSessionModel,
   onOpenArtifact,
+  onOpenHelpTopic,
   apiClient,
 }) => {
   const [internalTurns, setInternalTurns] = React.useState<TranscriptTurn[]>([]);
@@ -2370,6 +2373,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                   <strong style={{ color: "var(--accent-hover)" }}>Reforge:</strong>{" "}
                   Clears the agent&apos;s context and immediately re-primes the agent with its
                   registered identity, project, and role prompt.
+                </div>
+                <div style={{ marginTop: "8px" }}>
+                  <button
+                    type="button"
+                    data-testid="open-full-help-btn"
+                    className="fd-btn"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => {
+                      onOpenHelpTopic?.("lifecycle");
+                      dispatchOpenHelp("lifecycle");
+                    }}
+                  >
+                    Open Full Documentation
+                  </button>
                 </div>
               </div>
             )}

@@ -1,4 +1,5 @@
 import {
+  DEFAULT_HUB_SETTINGS,
   DEFAULT_SLASH_COMMANDS,
   type AgentsResponse,
   type ArchitectureResponse,
@@ -13,6 +14,7 @@ import {
   type DecommissionSessionResponse,
   type DiscoveredSessionSummary,
   type HealthResponse,
+  type HubSettings,
   type HubStatsResponse,
   type InterruptSessionResponse,
   type LivenessResponse,
@@ -23,6 +25,8 @@ import {
   type PromptResponse,
   type PrReviewRequest,
   type PrReviewResponse,
+  type PruneArtifactsRequest,
+  type PruneArtifactsResponse,
   type PullRequestItem,
   type QueuedOperatorPrompt,
   type SessionQueueResponse,
@@ -59,6 +63,87 @@ import {
   type WorktreeDiff,
   type WorktreeSummary,
 } from "../types/api";
+
+export function normalizeHubSettings(
+  raw: unknown,
+  fallback: HubSettings = DEFAULT_HUB_SETTINGS,
+): HubSettings {
+  const obj =
+    raw && typeof raw === "object"
+      ? ("settings" in (raw as Record<string, unknown>) &&
+        (raw as Record<string, unknown>).settings &&
+        typeof (raw as Record<string, unknown>).settings === "object"
+          ? ((raw as Record<string, unknown>).settings as Record<string, unknown>)
+          : (raw as Record<string, unknown>))
+      : {};
+
+  const themeRaw = obj.theme_preference;
+  const theme_preference: HubSettings["theme_preference"] =
+    themeRaw === "dark" || themeRaw === "light" || themeRaw === "system"
+      ? themeRaw
+      : fallback.theme_preference;
+
+  const subRaw =
+    obj.subsystems && typeof obj.subsystems === "object"
+      ? (obj.subsystems as Record<string, unknown>)
+      : {};
+  const notifRaw =
+    obj.notifications && typeof obj.notifications === "object"
+      ? (obj.notifications as Record<string, unknown>)
+      : {};
+  const connRaw =
+    obj.hub_connection && typeof obj.hub_connection === "object"
+      ? (obj.hub_connection as Record<string, unknown>)
+      : {};
+
+  return {
+    theme_preference,
+    subsystems: {
+      ferrogate_enabled:
+        typeof subRaw.ferrogate_enabled === "boolean"
+          ? subRaw.ferrogate_enabled
+          : fallback.subsystems.ferrogate_enabled,
+      ferrostate_enabled:
+        typeof subRaw.ferrostate_enabled === "boolean"
+          ? subRaw.ferrostate_enabled
+          : fallback.subsystems.ferrostate_enabled,
+      ferrostep_enabled:
+        typeof subRaw.ferrostep_enabled === "boolean"
+          ? subRaw.ferrostep_enabled
+          : fallback.subsystems.ferrostep_enabled,
+    },
+    notifications: {
+      notify_on_pr_review:
+        typeof notifRaw.notify_on_pr_review === "boolean"
+          ? notifRaw.notify_on_pr_review
+          : fallback.notifications.notify_on_pr_review,
+      notify_on_session_error:
+        typeof notifRaw.notify_on_session_error === "boolean"
+          ? notifRaw.notify_on_session_error
+          : fallback.notifications.notify_on_session_error,
+      notify_on_wire_urgent:
+        typeof notifRaw.notify_on_wire_urgent === "boolean"
+          ? notifRaw.notify_on_wire_urgent
+          : fallback.notifications.notify_on_wire_urgent,
+      sound_enabled:
+        typeof notifRaw.sound_enabled === "boolean"
+          ? notifRaw.sound_enabled
+          : fallback.notifications.sound_enabled,
+    },
+    hub_connection: {
+      auto_reconnect_ws:
+        typeof connRaw.auto_reconnect_ws === "boolean"
+          ? connRaw.auto_reconnect_ws
+          : fallback.hub_connection.auto_reconnect_ws,
+      poll_interval_secs:
+        typeof connRaw.poll_interval_secs === "number" &&
+        Number.isFinite(connRaw.poll_interval_secs) &&
+        connRaw.poll_interval_secs > 0
+          ? connRaw.poll_interval_secs
+          : fallback.hub_connection.poll_interval_secs,
+    },
+  };
+}
 
 export const DEFAULT_TOKEN_STORAGE_KEY = "fl_hub_session_token";
 
@@ -698,6 +783,31 @@ export class HubApiClient {
     }
     const suffix = qs.toString() ? `?${qs.toString()}` : "";
     return this.request<ArtifactListResponse>(`/api/v1/artifacts/list${suffix}`);
+  }
+
+  public async pruneArtifacts(
+    opts?: PruneArtifactsRequest,
+  ): Promise<PruneArtifactsResponse> {
+    return this.request<PruneArtifactsResponse>("/api/v1/artifacts/prune", {
+      method: "POST",
+      body: JSON.stringify(opts ?? {}),
+    });
+  }
+
+  public async getSettings(): Promise<HubSettings> {
+    const raw = await this.request<unknown>("/api/v1/settings");
+    return normalizeHubSettings(raw, DEFAULT_HUB_SETTINGS);
+  }
+
+  public async updateSettings(
+    patch: Partial<HubSettings>,
+  ): Promise<HubSettings> {
+    const mergedFallback = normalizeHubSettings(patch, DEFAULT_HUB_SETTINGS);
+    const raw = await this.request<unknown>("/api/v1/settings", {
+      method: "PUT",
+      body: JSON.stringify(patch),
+    });
+    return normalizeHubSettings(raw, mergedFallback);
   }
 
   public getArtifactRawUrl(path: string, download = false): string {

@@ -6,6 +6,11 @@ import { ArtifactPreviewPane } from "./components/ArtifactPreviewPane";
 import { ChatPane } from "./components/ChatPane";
 import { COCKPIT_TABS, ContextHeader } from "./components/ContextHeader";
 import { GitPrPane } from "./components/GitPrPane";
+import {
+  HelpDrawer,
+  OPEN_HELP_EVENT,
+  type HelpTopicId,
+} from "./components/HelpDrawer";
 import { HubDrawer } from "./components/HubDrawer";
 import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
@@ -268,6 +273,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
+  const [helpDrawerOpen, setHelpDrawerOpen] = useState<boolean>(false);
+  const [helpTopic, setHelpTopic] = useState<HelpTopicId>("chat");
   const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
   const [agentSettingsOpen, setAgentSettingsOpen] = useState<boolean>(false);
   const [nodes, setNodes] = useState<EnrolledNode[]>([]);
@@ -309,6 +316,19 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     window.addEventListener(OPEN_ARTIFACT_EVENT, handler);
     return () => window.removeEventListener(OPEN_ARTIFACT_EVENT, handler);
   }, [handleOpenArtifact]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = (event: Event) => {
+      const custom = event as CustomEvent<{ topic?: HelpTopicId }>;
+      if (custom.detail?.topic) {
+        setHelpTopic(custom.detail.topic);
+      }
+      setHelpDrawerOpen(true);
+    };
+    window.addEventListener(OPEN_HELP_EVENT, handler);
+    return () => window.removeEventListener(OPEN_HELP_EVENT, handler);
+  }, []);
 
   useEffect(() => {
     applyThemeMode(themeMode);
@@ -1293,6 +1313,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             onInterruptSession={handleInterruptSession}
             onSetSessionModel={handleSetSessionModel}
             onOpenArtifact={handleOpenArtifact}
+            onOpenHelpTopic={(topic) => {
+              setHelpTopic(topic);
+              setHelpDrawerOpen(true);
+            }}
             apiClient={apiClient}
           />
         );
@@ -1375,6 +1399,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           onlineNodesCount={onlineNodesCount}
           onOpenNodesModal={() => setNodesModalOpen(true)}
           onOpenSettingsModal={() => setSettingsModalOpen(true)}
+          onOpenHelpModal={(tab) => {
+            setHelpTopic(tab ?? activeTab);
+            setHelpDrawerOpen(true);
+          }}
           onOpenAgentSettings={() => {
             if (!splitView && activeTab !== "chat") {
               setActiveTab("chat");
@@ -1427,6 +1455,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 onInterruptSession={handleInterruptSession}
                 onSetSessionModel={handleSetSessionModel}
                 onOpenArtifact={handleOpenArtifact}
+                onOpenHelpTopic={(topic) => {
+                  setHelpTopic(topic);
+                  setHelpDrawerOpen(true);
+                }}
                 apiClient={apiClient}
               />
               {renderSecondaryPane(rightSplitTab)}
@@ -1494,7 +1526,23 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         isOpen={settingsModalOpen}
         onClose={() => setSettingsModalOpen(false)}
         onBulkSessionAction={handleBulkSessionAction}
+        onSettingsUpdated={(updated) => {
+          if (
+            updated.theme_preference === "dark" ||
+            updated.theme_preference === "light"
+          ) {
+            persistThemeMode(updated.theme_preference);
+            setThemeMode(updated.theme_preference);
+          }
+        }}
         apiClient={apiClient}
+      />
+
+      <HelpDrawer
+        isOpen={helpDrawerOpen}
+        activeTopic={helpTopic}
+        onSelectTopic={setHelpTopic}
+        onClose={() => setHelpDrawerOpen(false)}
       />
     </div>
   );
