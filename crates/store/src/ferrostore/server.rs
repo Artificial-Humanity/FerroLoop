@@ -333,9 +333,14 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
             )?;
             Ok(Value::Null)
         }
-        "get_doc" => Ok(store
-            .get_doc(param_str(params, "collection")?, param_str(params, "id")?)?
-            .unwrap_or(Value::Null)),
+        "get_doc" => {
+            // Null is a missing id. A stored value, including JSON null, is wrapped
+            // so the client can tell the two apart.
+            match store.get_doc(param_str(params, "collection")?, param_str(params, "id")?)? {
+                Some(doc) => Ok(json!({"doc": doc})),
+                None => Ok(Value::Null),
+            }
+        }
         "delete_doc" => {
             store.delete_doc(param_str(params, "collection")?, param_str(params, "id")?)?;
             Ok(Value::Null)
@@ -469,7 +474,7 @@ struct RemoteShared {
     write: Mutex<UnixStream>,
     pending: Mutex<HashMap<u64, Sender<Result<Value, String>>>>,
     next_id: AtomicU64,
-    subs: Mutex<HashMap<String, Vec<Sender<MqRecord>>>>,
+    subs: Mutex<HashMap<String, Vec<Arc<Sender<MqRecord>>>>>,
 }
 
 pub(super) struct RemoteClient {
@@ -512,7 +517,8 @@ impl RemoteClient {
         Ok(())
     }
 
-    /// JSON null is an absent document. A stored null is not distinct on the wire.
+    /// JSON null is a missing document. A present document, including JSON null,
+    /// is `{"doc": value}`.
     pub(super) fn call_option(
         &self,
         method: &str,
@@ -520,10 +526,13 @@ impl RemoteClient {
     ) -> Result<Option<Value>, StoreError> {
         let value = self.call(method, params)?;
         if value.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(value))
+            return Ok(None);
         }
+        let doc = value
+            .get("doc")
+            .cloned()
+            .ok_or_else(|| backend("result is neither null nor a document"))?;
+        Ok(Some(doc))
     }
 
     pub(super) fn call_strings(
@@ -595,14 +604,28 @@ impl RemoteClient {
 
     pub(super) fn subscribe_topic(&self, topic: &str) -> Receiver<MqRecord> {
         let (tx, rx) = mpsc::channel();
+        let tx = Arc::new(tx);
         lock_mutex(&self.shared.subs)
             .entry(topic.to_string())
             .or_default()
-            .push(tx);
-        // The sender is registered first so a push that arrives with the
-        // response is delivered. The method returns only the receiver.
-        let _ = self.call("subscribe_mq", json!({"topic": topic}));
+            .push(Arc::clone(&tx));
+        // Registered first so a push that arrives with the response is
+        // delivered. A failed RPC drops this sender, so recv is Disconnected.
+        if self.call("subscribe_mq", json!({"topic": topic})).is_err() {
+            remove_subscriber(&self.shared, topic, &tx);
+        }
         rx
+    }
+}
+
+fn remove_subscriber(shared: &RemoteShared, topic: &str, tx: &Arc<Sender<MqRecord>>) {
+    let mut subs = lock_mutex(&shared.subs);
+    let Some(senders) = subs.get_mut(topic) else {
+        return;
+    };
+    senders.retain(|sender| !Arc::ptr_eq(sender, tx));
+    if senders.is_empty() {
+        subs.remove(topic);
     }
 }
 
@@ -663,6 +686,8 @@ fn reader_loop(mut stream: UnixStream, shared: Arc<RemoteShared>) {
         }
     }
     fail_pending(&shared, "FerroStore connection closed");
+    // Drop live subscription senders so an already-open recv sees Disconnected.
+    let _ = std::mem::take(&mut *lock_mutex(&shared.subs));
 }
 
 fn deliver_push(shared: &RemoteShared, frame: &Value) {
@@ -706,5 +731,37 @@ fn fail_pending(shared: &RemoteShared, message: &str) {
     let pending = std::mem::take(&mut *lock_mutex(&shared.pending));
     for (_, sender) in pending {
         let _ = sender.send(Err(message.to_string()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_method_errors_and_the_connection_stays_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("store.sock");
+        let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+        let client = connect_unix(&sock.display().to_string()).unwrap();
+        let err = client.call("nope", json!({})).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Backend(ref message) if message.contains("nope")),
+            "{err}"
+        );
+        client
+            .call(
+                "put_doc",
+                json!({"collection": "docs", "id": "a", "doc": {"n": 1}}),
+            )
+            .unwrap();
+        assert_eq!(
+            client
+                .call("get_doc", json!({"collection": "docs", "id": "a"}))
+                .unwrap(),
+            json!({"doc": {"n": 1}})
+        );
+        drop(client);
+        drop(server);
     }
 }

@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
 use std::time::Duration;
 
@@ -786,6 +787,52 @@ fn bind_unix_refuses_a_non_socket_and_drop_unlinks_its_socket() {
     drop(client);
     drop(server);
     assert!(!sock.exists());
+}
+
+#[test]
+fn unix_socket_get_doc_returns_stored_null_and_missing_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("null.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    client.put_doc("docs", "empty", &json!(null)).unwrap();
+    let stored = client.get_doc("docs", "empty");
+    assert!(
+        matches!(stored, Ok(Some(ref value)) if value.is_null()),
+        "{stored:?}"
+    );
+    let missing = client.get_doc("docs", "missing");
+    assert!(matches!(missing, Ok(None)), "{missing:?}");
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn unix_socket_subscribe_after_server_drop_is_disconnected() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("gone.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    drop(server);
+    let rx = client.subscribe_mq("orders");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(400)).unwrap_err(),
+        RecvTimeoutError::Disconnected
+    );
+}
+
+#[test]
+fn unix_socket_subscribe_disconnects_when_the_server_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("live.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    let rx = client.subscribe_mq("orders");
+    drop(server);
+    assert_eq!(
+        rx.recv_timeout(Duration::from_millis(500)).unwrap_err(),
+        RecvTimeoutError::Disconnected
+    );
 }
 
 fn committed_frames(path: &Path) -> Vec<(u64, Vec<Op>)> {
