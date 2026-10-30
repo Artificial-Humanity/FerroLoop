@@ -494,7 +494,7 @@ fn session_model_info(
             agy_live_model_info(agy_ls_address, agy_csrf_token, session_id, agy_env_fallback)
         }
         "claude" => claude_model_info(transcript_path, home),
-        "codex" => codex_model_info(home),
+        "codex" => codex_model_info(transcript_path, home),
         "grok" => grok_model_info(transcript_path, home),
         "muse" => SessionModelInfo {
             model: Some(MUSE_MODEL.to_string()),
@@ -825,7 +825,61 @@ fn codex_listed_models(cache: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn codex_model_info(home: Option<&Path>) -> SessionModelInfo {
+/// Longest accepted per-session Codex model id.
+const CODEX_MODEL_MAX_CHARS: usize = 128;
+/// Longest accepted per-session Codex reasoning effort.
+const CODEX_EFFORT_MAX_CHARS: usize = 32;
+
+/// A trimmed, non-empty, single-line string of at most `max_chars` characters with no
+/// control characters. Anything else is `None`.
+fn plain_bounded_str(value: Option<&Value>, max_chars: usize) -> Option<String> {
+    non_empty_str(value)
+        .filter(|s| s.chars().count() <= max_chars && !s.chars().any(char::is_control))
+}
+
+/// Per-session `(model, thinking_level)` from the newest Codex rollout lines. Each field is
+/// the most recent valid value, found independently: a later line may carry only one of them.
+/// The effort comes from `payload.effort`, else `payload.reasoning_effort`, else
+/// `payload.collaboration_mode.settings.reasoning_effort`. A cut-off first line of a tail
+/// is not valid JSON and is skipped like any other malformed line.
+fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
+    const EFFORT_POINTERS: [&str; 3] = [
+        "/payload/effort",
+        "/payload/reasoning_effort",
+        "/payload/collaboration_mode/settings/reasoning_effort",
+    ];
+    let (mut model, mut effort) = (None, None);
+    for line in jsonl.lines().rev() {
+        if model.is_some() && effort.is_some() {
+            break;
+        }
+        // Cheap prefilter: a line that names neither key cannot carry a value.
+        if !line.contains("\"model\"") && !line.contains("effort") {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if model.is_none() {
+            model = plain_bounded_str(val.pointer("/payload/model"), CODEX_MODEL_MAX_CHARS);
+        }
+        if effort.is_none() {
+            effort = EFFORT_POINTERS.iter().find_map(|pointer| {
+                plain_bounded_str(val.pointer(pointer), CODEX_EFFORT_MAX_CHARS)
+            });
+        }
+    }
+    (model, effort)
+}
+
+/// Model and thinking level of a Codex session. The session's rollout transcript names what
+/// the session runs; `~/.codex/config.toml` is only the default for a field the rollout
+/// does not carry.
+fn codex_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> SessionModelInfo {
+    let (session_model, session_effort) = transcript_path
+        .and_then(|p| read_file_tail(Path::new(p), CLAUDE_TRANSCRIPT_TAIL_BYTES))
+        .map(|tail| codex_rollout_settings(&tail))
+        .unwrap_or_default();
     let codex_dir = home.map(|h| h.join(".codex"));
     let config = codex_dir
         .as_ref()
@@ -839,10 +893,13 @@ fn codex_model_info(home: Option<&Path>) -> SessionModelInfo {
         available_models = owned_strings(&CODEX_DEFAULT_MODELS);
     }
     SessionModelInfo {
-        model: config.as_ref().and_then(|c| toml_non_empty_str(c, "model")),
-        thinking_level: config
-            .as_ref()
-            .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort")),
+        model: session_model
+            .or_else(|| config.as_ref().and_then(|c| toml_non_empty_str(c, "model"))),
+        thinking_level: session_effort.or_else(|| {
+            config
+                .as_ref()
+                .and_then(|c| toml_non_empty_str(c, "model_reasoning_effort"))
+        }),
         available_models,
     }
 }
@@ -3827,7 +3884,7 @@ mod tests {
     fn codex_model_falls_back_when_files_are_missing_or_malformed() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
-        let missing = codex_model_info(Some(home));
+        let missing = codex_model_info(None, Some(home));
         assert_eq!(missing.model, None);
         assert_eq!(missing.thinking_level, None);
         assert_eq!(missing.available_models, strings(&CODEX_DEFAULT_MODELS));
@@ -3836,7 +3893,7 @@ mod tests {
         fs::create_dir_all(&codex).unwrap();
         fs::write(codex.join("config.toml"), "model = [unterminated").unwrap();
         fs::write(codex.join("models_cache.json"), "{ nope").unwrap();
-        assert_eq!(codex_model_info(Some(home)), missing);
+        assert_eq!(codex_model_info(None, Some(home)), missing);
 
         // A cache that lists nothing visible also falls back.
         fs::write(
@@ -3845,13 +3902,277 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            codex_model_info(Some(home)).available_models,
+            codex_model_info(None, Some(home)).available_models,
             strings(&CODEX_DEFAULT_MODELS)
         );
         assert_eq!(
-            codex_model_info(None).available_models,
+            codex_model_info(None, None).available_models,
             strings(&CODEX_DEFAULT_MODELS)
         );
+    }
+
+    /// A temp home whose `config.toml` defaults to `gpt-6.1-terra` at `high`.
+    fn codex_home_with_config() -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let codex = tmp.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("config.toml"),
+            "model = \"gpt-6.1-terra\"\nmodel_reasoning_effort = \"high\"\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// Write a rollout under the temp home and return its path.
+    fn write_codex_rollout(home: &Path, thread_id: &str, body: &str) -> String {
+        let dir = home
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("10")
+            .join("30");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-10-30T01-02-03-{thread_id}.jsonl"));
+        fs::write(&path, body).unwrap();
+        path.display().to_string()
+    }
+
+    fn codex_session_info(home: &Path, rollout_lines: &[&str]) -> SessionModelInfo {
+        let path = write_codex_rollout(home, "t-fixture", &rollout_lines.join("\n"));
+        codex_model_info(Some(&path), Some(home))
+    }
+
+    #[test]
+    fn codex_model_comes_from_the_session_rollout_before_config() {
+        let tmp = codex_home_with_config();
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"type":"session_meta","payload":{"id":"t-fixture"}}"#,
+                r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"low"}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+        assert_eq!(
+            info.available_models,
+            strings(&CODEX_DEFAULT_MODELS),
+            "the selectable models do not come from the rollout"
+        );
+    }
+
+    #[test]
+    fn codex_effort_falls_back_to_config_when_the_rollout_has_a_model_only() {
+        let tmp = codex_home_with_config();
+        let info = codex_session_info(
+            tmp.path(),
+            &[r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}"#],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("high"));
+        // An effort with no model keeps the config model.
+        let info = codex_session_info(
+            tmp.path(),
+            &[r#"{"type":"turn_context","payload":{"effort":"minimal"}}"#],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(info.thinking_level.as_deref(), Some("minimal"));
+    }
+
+    #[test]
+    fn codex_effort_pointers_are_honored_in_priority_order() {
+        let tmp = codex_home_with_config();
+        let effort = |line: &str| {
+            codex_session_info(tmp.path(), &[line])
+                .thinking_level
+                .unwrap()
+        };
+        assert_eq!(
+            effort(
+                r#"{"payload":{"effort":"low","reasoning_effort":"medium","collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}}"#
+            ),
+            "low"
+        );
+        assert_eq!(
+            effort(
+                r#"{"payload":{"reasoning_effort":"medium","collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}}"#
+            ),
+            "medium"
+        );
+        assert_eq!(
+            effort(
+                r#"{"payload":{"collaboration_mode":{"settings":{"reasoning_effort":"xhigh"}}}}"#
+            ),
+            "xhigh"
+        );
+        // An unusable higher pointer yields to the next one on the same line.
+        assert_eq!(
+            effort(r#"{"payload":{"effort":"","reasoning_effort":"medium"}}"#),
+            "medium"
+        );
+        // Only the payload is read, not other top-level fields.
+        assert_eq!(effort(r#"{"effort":"low","model":"x"}"#), "high");
+    }
+
+    #[test]
+    fn codex_later_rollout_lines_win_field_by_field() {
+        let tmp = codex_home_with_config();
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"payload":{"model":"gpt-old","effort":"low"}}"#,
+                r#"{"payload":{"model":"gpt-6.1-sol"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count"}}"#,
+                r#"{"payload":{"effort":"medium"}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+        // The newer of two full lines wins both fields.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"payload":{"model":"gpt-a","effort":"low"}}"#,
+                r#"{"payload":{"model":"gpt-b","effort":"minimal"}}"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-b"));
+        assert_eq!(info.thinking_level.as_deref(), Some("minimal"));
+    }
+
+    #[test]
+    fn codex_rollout_tail_ignores_a_cut_first_line_and_malformed_lines() {
+        let tmp = codex_home_with_config();
+        let pad = |n: usize| "x".repeat(n);
+        let cut_line = |n: usize| {
+            format!(
+                r#"{{"pad":"{}","payload":{{"model":"gpt-cut","effort":"cut"}}}}"#,
+                pad(n)
+            )
+        };
+        let newest = r#"{"payload":{"reasoning_effort":"medium"}}"#;
+
+        // Control: a short file keeps its first line, so its model is used.
+        let path = write_codex_rollout(
+            tmp.path(),
+            "t-short",
+            &format!("{}\n{newest}\n", cut_line(10)),
+        );
+        let info = codex_model_info(Some(&path), Some(tmp.path()));
+        assert_eq!(info.model.as_deref(), Some("gpt-cut"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+
+        // A first line longer than the tail window is cut in the middle: its model is not
+        // read, so the config model stays.
+        let long = CLAUDE_TRANSCRIPT_TAIL_BYTES as usize;
+        let path = write_codex_rollout(
+            tmp.path(),
+            "t-long",
+            &format!("{}\n{newest}\n", cut_line(long)),
+        );
+        let info = codex_model_info(Some(&path), Some(tmp.path()));
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+
+        // Malformed lines, blank lines and wrongly typed values are skipped.
+        let info = codex_session_info(
+            tmp.path(),
+            &[
+                r#"{"payload":{"model":"gpt-6.1-sol","effort":"low"}}"#,
+                "this is not json but mentions \"model\" and effort",
+                r#"{"payload":{"model":"#,
+                "",
+                r#"{"payload":{"model":42,"effort":["high"]}}"#,
+                r#"[1,2,3]"#,
+            ],
+        );
+        assert_eq!(info.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(info.thinking_level.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn codex_without_a_readable_rollout_uses_config() {
+        let tmp = codex_home_with_config();
+        let home = tmp.path();
+        let config = codex_model_info(None, Some(home));
+        assert_eq!(config.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(config.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            codex_model_info(Some("/definitely/missing.jsonl"), Some(home)),
+            config
+        );
+        // A directory is unreadable as a file, and an empty or binary file names nothing.
+        assert_eq!(codex_model_info(home.to_str(), Some(home)), config);
+        let empty = write_codex_rollout(home, "t-empty", "");
+        assert_eq!(codex_model_info(Some(&empty), Some(home)), config);
+        let binary = home.join("binary.jsonl");
+        fs::write(&binary, [0xff, 0xfe, 0x00, b'{', 0x80]).unwrap();
+        assert_eq!(codex_model_info(binary.to_str(), Some(home)), config);
+        // No config either: nothing is invented.
+        let bare = TempDir::new().unwrap();
+        let rollout = write_codex_rollout(bare.path(), "t-bare", "not json");
+        let info = codex_model_info(Some(&rollout), Some(bare.path()));
+        assert_eq!((info.model, info.thinking_level), (None, None));
+    }
+
+    #[test]
+    fn codex_rollout_values_are_validated_before_use() {
+        let tmp = codex_home_with_config();
+        let model_of = |model: &str, effort: &str| {
+            let line = serde_json::json!({"payload": {"model": model, "effort": effort}});
+            let info = codex_session_info(tmp.path(), &[&line.to_string()]);
+            (info.model.unwrap(), info.thinking_level.unwrap())
+        };
+        let config = ("gpt-6.1-terra".to_string(), "high".to_string());
+
+        // Oversized and control-character values are dropped, so config answers.
+        assert_eq!(model_of(&"m".repeat(129), &"e".repeat(33)), config);
+        assert_eq!(model_of("gpt\u{7}x", "lo\nw"), config);
+        assert_eq!(model_of("gpt\nsol", "lo\rw"), config);
+        assert_eq!(model_of("   ", "\t"), config);
+        // The bounds themselves are accepted, and surrounding whitespace is trimmed.
+        assert_eq!(
+            model_of(&"m".repeat(128), &"e".repeat(32)),
+            ("m".repeat(128), "e".repeat(32))
+        );
+        assert_eq!(
+            model_of("  gpt-6.1-sol ", " low "),
+            ("gpt-6.1-sol".to_string(), "low".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_discovery_reports_each_session_own_rollout_model() {
+        let tmp = codex_home_with_config();
+        let home = tmp.path();
+        write_codex_rollout(
+            home,
+            "codex-sol-thread",
+            r#"{"type":"turn_context","payload":{"model":"gpt-6.1-sol","effort":"xhigh"}}"#,
+        );
+        write_codex_rollout(
+            home,
+            "codex-default-thread",
+            r#"{"type":"session_meta","payload":{"id":"codex-default-thread"}}"#,
+        );
+        write_routes(
+            home,
+            &[
+                ("sol", r#"{"kind":"codex","thread_id":"codex-sol-thread"}"#),
+                (
+                    "plain",
+                    r#"{"kind":"codex","thread_id":"codex-default-thread"}"#,
+                ),
+            ],
+        );
+        let sessions = discover_in(home);
+        let sol = session_for(&sessions, "sol");
+        assert_eq!(sol.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(sol.thinking_level.as_deref(), Some("xhigh"));
+        let plain = session_for(&sessions, "plain");
+        assert_eq!(plain.model.as_deref(), Some("gpt-6.1-terra"));
+        assert_eq!(plain.thinking_level.as_deref(), Some("high"));
     }
 
     #[test]
