@@ -48,6 +48,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::ThreadId;
 pub use sync::{SyncAdapter, SyncBatch, SyncMode, SyncOp};
 pub use vector::{Fusion, KnowledgeHit, VectorHit, VectorMetric, VectorStorage};
 
@@ -98,8 +99,10 @@ struct SyncSlot {
     adapter: Option<Arc<dyn SyncAdapter>>,
     synced_seq: u64,
     pending: Vec<SyncBatch>,
-    /// `on_commit` is running. `sync_flush` waits until this is clear.
+    /// `on_commit` is running. Another thread's `sync_flush` waits until this is clear.
     notify_in_flight: bool,
+    /// Thread that set `notify_in_flight`. Cleared with the flag.
+    notify_owner: Option<ThreadId>,
 }
 
 struct Committed {
@@ -876,8 +879,9 @@ impl FerroStore {
 
     /// Call `on_commit` for each pending batch, oldest first.
     ///
-    /// Waits while a notify is already in flight, then sends only the front
-    /// batch. A later batch stays pending until this loop reaches it.
+    /// Waits while another thread's notify is in flight, then sends only the
+    /// front batch. The thread that owns that notify returns `synced_seq` and
+    /// does not send. A later batch stays pending until this loop reaches it.
     pub fn sync_flush(&self) -> Result<u64, StoreError> {
         let adapter = {
             let slot = lock_mutex(&self.sync);
@@ -889,12 +893,16 @@ impl FerroStore {
             let batch = {
                 let mut slot = lock_mutex(&self.sync);
                 while slot.notify_in_flight {
+                    if slot.notify_owner == Some(std::thread::current().id()) {
+                        return Ok(slot.synced_seq);
+                    }
                     slot = wait_mutex(&self.sync_cv, slot);
                 }
                 match slot.pending.first() {
                     Some(batch) => {
                         let batch = batch.clone();
                         slot.notify_in_flight = true;
+                        slot.notify_owner = Some(std::thread::current().id());
                         batch
                     }
                     None => return Ok(slot.synced_seq),
@@ -903,6 +911,7 @@ impl FerroStore {
             let result = adapter.on_commit(&batch);
             let mut slot = lock_mutex(&self.sync);
             slot.notify_in_flight = false;
+            slot.notify_owner = None;
             let failed = match result {
                 Ok(()) => {
                     if slot
@@ -1441,7 +1450,8 @@ impl FerroStore {
     /// Dry-run every batch, then publish them in one critical section.
     /// `silent` does not call `on_commit`. An empty list returns `synced_seq`.
     ///
-    /// A loud apply queues every prepared batch before `on_commit`, then flushes.
+    /// A loud apply queues every prepared batch. Only `WriteThrough` then calls
+    /// `sync_flush`. The other modes leave the batches pending.
     /// The commit gate covers the idle check, the publish, and that registration.
     fn apply_sync_batches(&self, batches: Vec<SyncBatch>, silent: bool) -> Result<u64, StoreError> {
         if batches.is_empty() {
@@ -1476,8 +1486,9 @@ impl FerroStore {
                 return Ok(seq);
             }
             let mut slot = lock_mutex(&self.sync);
-            let flush = slot.adapter.is_some() && slot.mode.is_some();
-            if flush {
+            let queue = slot.adapter.is_some() && slot.mode.is_some();
+            let flush = queue && slot.mode == Some(SyncMode::WriteThrough);
+            if queue {
                 for batch in prepared {
                     slot.pending.push(SyncBatch {
                         seq: batch.seq,
@@ -1521,6 +1532,7 @@ impl FerroStore {
                     None
                 } else {
                     slot.notify_in_flight = true;
+                    slot.notify_owner = Some(std::thread::current().id());
                     Some((adapter, batch))
                 }
             }
@@ -1544,6 +1556,7 @@ impl FerroStore {
         let result = adapter.on_commit(&batch);
         let mut slot = lock_mutex(&self.sync);
         slot.notify_in_flight = false;
+        slot.notify_owner = None;
         match result {
             Ok(()) => {
                 if batch.seq > slot.synced_seq {

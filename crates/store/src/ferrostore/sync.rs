@@ -1298,4 +1298,130 @@ mod tests {
         drop(client);
         drop(server);
     }
+
+    fn two_doc_batches() -> Vec<SyncBatch> {
+        vec![
+            SyncBatch {
+                seq: 1,
+                ops: vec![SyncOp::PutDoc {
+                    collection: "docs".into(),
+                    id: "a".into(),
+                    doc: json!({"n": 1}),
+                }],
+            },
+            SyncBatch {
+                seq: 2,
+                ops: vec![SyncOp::PutDoc {
+                    collection: "docs".into(),
+                    id: "b".into(),
+                    doc: json!({"n": 2}),
+                }],
+            },
+        ]
+    }
+
+    #[test]
+    fn loud_apply_flushes_only_in_write_through() {
+        for mode in [
+            SyncMode::WriteBehind,
+            SyncMode::LocalCache,
+            SyncMode::CloudPreCache,
+        ] {
+            let (store, fake) = attach(mode);
+            assert_eq!(
+                store.apply_sync_batches(two_doc_batches(), false).unwrap(),
+                2
+            );
+            assert!(
+                fake.commits().is_empty(),
+                "{mode:?} called on_commit from a loud apply"
+            );
+            assert_eq!(store.synced_seq(), 0);
+            assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
+            assert_eq!(store.get_doc("docs", "b").unwrap(), Some(json!({"n": 2})));
+            assert_eq!(store.sync_flush().unwrap(), 2);
+            assert_eq!(
+                fake.commits()
+                    .iter()
+                    .map(|batch| batch.seq)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            assert_eq!(store.synced_seq(), 2);
+        }
+
+        let (store, fake) = attach(SyncMode::WriteThrough);
+        assert_eq!(
+            store.apply_sync_batches(two_doc_batches(), false).unwrap(),
+            2
+        );
+        assert_eq!(
+            fake.commits()
+                .iter()
+                .map(|batch| batch.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(store.synced_seq(), 2);
+        assert_eq!(store.get_doc("docs", "b").unwrap(), Some(json!({"n": 2})));
+        assert_eq!(store.sync_flush().unwrap(), 2);
+        assert_eq!(fake.commits().len(), 2);
+    }
+
+    struct FlushOnCommit {
+        store: Mutex<Option<Arc<FerroStore>>>,
+        seqs: Mutex<Vec<u64>>,
+    }
+
+    impl SyncAdapter for FlushOnCommit {
+        fn name(&self) -> &str {
+            "flush-on-commit"
+        }
+
+        fn on_commit(&self, batch: &SyncBatch) -> Result<(), StoreError> {
+            self.seqs.lock().unwrap().push(batch.seq);
+            let store = self.store.lock().unwrap().clone().unwrap();
+            store.sync_flush()?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sync_flush_from_in_flight_on_commit_returns() {
+        let adapter = Arc::new(FlushOnCommit {
+            store: Mutex::new(None),
+            seqs: Mutex::new(Vec::new()),
+        });
+        let store = Arc::new(
+            FerroStore::in_memory()
+                .with_sync_adapter(
+                    SyncMode::WriteThrough,
+                    Arc::clone(&adapter) as Arc<dyn SyncAdapter>,
+                )
+                .unwrap(),
+        );
+        *adapter.store.lock().unwrap() = Some(Arc::clone(&store));
+        store.put_doc("docs", "a", &json!({"n": 1})).unwrap();
+        assert_eq!(adapter.seqs.lock().unwrap().as_slice(), &[1]);
+        assert_eq!(store.synced_seq(), 1);
+        assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
+
+        let behind = Arc::new(
+            FerroStore::in_memory()
+                .with_sync_adapter(
+                    SyncMode::WriteBehind,
+                    Arc::clone(&adapter) as Arc<dyn SyncAdapter>,
+                )
+                .unwrap(),
+        );
+        behind.put_doc("docs", "a", &json!({"n": 1})).unwrap();
+        behind.put_doc("docs", "b", &json!({"n": 2})).unwrap();
+        assert_eq!(adapter.seqs.lock().unwrap().as_slice(), &[1]);
+        *adapter.store.lock().unwrap() = Some(Arc::clone(&behind));
+        adapter.seqs.lock().unwrap().clear();
+        assert_eq!(behind.sync_flush().unwrap(), 2);
+        assert_eq!(adapter.seqs.lock().unwrap().as_slice(), &[1, 2]);
+        assert_eq!(behind.synced_seq(), 2);
+        *adapter.store.lock().unwrap() = None;
+    }
 }
