@@ -15,6 +15,9 @@ use fl_core::telemetry::{
     AttemptHeartbeat, DEFAULT_STALE_AFTER_MS, LivenessVerdict, evaluate_liveness,
     liveness_agent_slug, liveness_record_slug,
 };
+use fl_hub::lifecycle::{
+    self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
+};
 use serde::Serialize;
 
 use crate::refs::Ref;
@@ -64,6 +67,49 @@ pub enum AgentCmd {
         /// Agent IRI (`urn:uuid:...`), numeric handle (`1`, `2`, …), or `name_key`.
         agent: String,
         /// Author recording this retirement.
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Spin up a hosted agent session: register the agent, open its tmux runtime, and hydrate it.
+    SpinUp {
+        /// Persona slug (`felicity`): lowercase letters, digits and `-`.
+        persona: String,
+        /// Project / area the agent works in.
+        #[arg(long)]
+        project: String,
+        /// Role (`lead`, `assistant`, `ui-developer`, or `lab-manager`).
+        #[arg(long)]
+        role: String,
+        /// Vendor runtime (`claude`, `antigravity`, `codex`, `grok`, or `muse`).
+        #[arg(long)]
+        vendor: String,
+        #[arg(long)]
+        model: Option<String>,
+        /// Node the session runs on (default `ai-lab-0`).
+        #[arg(long = "node-id")]
+        node_id: Option<String>,
+        /// Open a tmux runtime for the session (`--hosted false` records it without one).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        hosted: bool,
+        /// Working directory for the tmux session.
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Author recording this spin-up.
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Decommission a session in two phases: `prepare` asks it to hand off, `teardown` removes it.
+    Decommission {
+        /// Session id (`claude:felicity`) or persona.
+        session: String,
+        /// `prepare` (handoff prompt, status `decommissioning`) or `teardown` (retire and clean up).
+        #[arg(long)]
+        mode: String,
+        /// Author recording this decommission.
         #[arg(long)]
         by: String,
         #[arg(long)]
@@ -336,6 +382,16 @@ pub fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
+/// Exit code 2 for a registry conflict (as `register` reports one), 1 for everything else.
+fn lifecycle_failure(e: LifecycleError) -> (i32, String) {
+    let code = if matches!(e, LifecycleError::Conflict(_)) {
+        2
+    } else {
+        1
+    };
+    (code, e.to_string())
+}
+
 pub fn run<S: AgentRegistry + Handles + StateStore>(
     store: &S,
     cmd: AgentCmd,
@@ -452,6 +508,82 @@ pub fn run<S: AgentRegistry + Handles + StateStore>(
                 println!("{}", serde_json::to_string_pretty(&retired).unwrap());
             } else {
                 println!("{}\t{}\tretired", retired.id, retired.display_name);
+            }
+            Ok(())
+        }
+        AgentCmd::SpinUp {
+            persona,
+            project,
+            role,
+            vendor,
+            model,
+            node_id,
+            hosted,
+            cwd,
+            by,
+            json,
+        } => {
+            let req = SpinUpRequest {
+                persona,
+                project,
+                role,
+                vendor,
+                model,
+                node_id,
+                hosted: Some(hosted),
+                cwd,
+            };
+            let out = lifecycle::spin_up(store, &LifecycleEnv::new(None), &req, &by)
+                .map_err(lifecycle_failure)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                println!(
+                    "{}\t{}\t{}\thydration_dispatched={}",
+                    out.session_id,
+                    out.status,
+                    out.tmux_target.as_deref().unwrap_or("-"),
+                    out.hydration_dispatched
+                );
+            }
+            Ok(())
+        }
+        AgentCmd::Decommission {
+            session,
+            mode,
+            by,
+            json,
+        } => {
+            let mode = DecommissionMode::parse(&mode).map_err(lifecycle_failure)?;
+            let env = LifecycleEnv::new(None);
+            let target =
+                SessionTarget::resolve(store, &session, None).map_err(lifecycle_failure)?;
+            // `fl` holds no hub prompt queue: an undelivered prepare prompt is printed instead.
+            let out = match mode {
+                DecommissionMode::Prepare => {
+                    lifecycle::prepare_decommission(store, &env, &target, &by)
+                }
+                DecommissionMode::Teardown => {
+                    lifecycle::teardown_session(store, &env, &target, &by, |_| {})
+                }
+            }
+            .map_err(lifecycle_failure)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            } else {
+                println!(
+                    "{}\t{}\thandshake_dispatched={}\tunregistered={}\truntime_stopped={}",
+                    out.session_id,
+                    out.status,
+                    out.handshake_dispatched,
+                    out.unregistered,
+                    out.runtime_stopped
+                );
+                if let (false, Some(prompt)) = (out.handshake_dispatched, &out.prompt) {
+                    println!(
+                        "no live route took the handshake; send this prompt to the session:\n{prompt}"
+                    );
+                }
             }
             Ok(())
         }
