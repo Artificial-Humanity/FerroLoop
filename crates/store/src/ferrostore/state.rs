@@ -189,15 +189,16 @@ pub(super) fn search_hybrid(
     limit: usize,
     fusion: Fusion,
 ) -> Result<Vec<(String, f64)>, StoreError> {
-    if limit == 0 {
-        return Ok(Vec::new());
-    }
     vector::validate_fusion(fusion)?;
     let Some(col) = vectors.get(vector_collection) else {
         return Err(backend(format!(
             "no vector collection `{vector_collection}`"
         )));
     };
+    vector::prepare_query(col, values)?;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let bm25 = search_bm25_docs(docs, doc_collection, query, limit);
     let found = vector::search(col, values, limit, None)?;
     vector::fuse(&bm25, &found, fusion, limit)

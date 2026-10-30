@@ -3307,6 +3307,61 @@ fn exercise_vector_rpc(client: &FerroStore, file: &Path) {
     assert!(only.metadata.is_none());
     assert!(only.doc.is_none());
     assert!(knowledge.iter().all(|hit| hit.score.is_finite()));
+    let rrf = Fusion::Rrf { k: 60 };
+    assert!(
+        client
+            .search_hybrid("notes", "emb", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        client
+            .search_knowledge("notes", "emb", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        client
+            .search_hybrid("no-such-docs", "emb", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap()
+            .is_empty()
+    );
+    for search in [
+        client
+            .search_hybrid("notes", "missing", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap_err(),
+        client
+            .search_knowledge("notes", "missing", "alpha", &[1.0, 0.0], 0, rrf)
+            .unwrap_err(),
+        client
+            .search_hybrid("notes", "emb", "alpha", &[1.0], 0, rrf)
+            .unwrap_err(),
+        client
+            .search_knowledge("notes", "emb", "alpha", &[1.0], 0, rrf)
+            .unwrap_err(),
+        client
+            .search_hybrid(
+                "notes",
+                "emb",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 0 },
+            )
+            .unwrap_err(),
+        client
+            .search_knowledge(
+                "notes",
+                "emb",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 0 },
+            )
+            .unwrap_err(),
+    ] {
+        assert!(matches!(search, StoreError::Backend(_)), "{search}");
+    }
     let remote = client.read_state().unwrap();
     let disk = FerroStore::open(file).unwrap().read_state().unwrap();
     assert_eq!(remote.vectors, disk.vectors);
@@ -3417,6 +3472,17 @@ fn f32_f16_and_i8_vectors_round_trip_search_and_share_a_document_name() {
     assert_eq!(hits[0].0, "near");
     assert_eq!(hits[0].1, 100.0);
     assert!(hits.iter().all(|(_, score)| score.is_finite()));
+}
+
+#[test]
+fn i8_quantize_rounds_half_away_from_zero_and_saturates() {
+    let bytes =
+        super::vector::quantize(VectorStorage::I8, &[0.49999997, -0.49999997, 127.5, -128.5])
+            .unwrap();
+    assert_eq!(
+        super::vector::dequantize(VectorStorage::I8, &bytes).unwrap(),
+        vec![0.0, 0.0, 127.0, -128.0]
+    );
 }
 
 #[test]
@@ -3960,11 +4026,74 @@ fn hybrid_and_knowledge_fusion_orders_one_sided_ids() {
                 "alpha",
                 &[1.0, 0.0],
                 0,
-                Fusion::Rrf { k: 0 },
+                Fusion::Rrf { k: 60 },
             )
             .unwrap()
             .is_empty()
     );
+    assert!(
+        store
+            .search_hybrid(
+                "no-such-docs",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 60 },
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_knowledge(
+                "notes",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                0,
+                Fusion::Rrf { k: 60 },
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let err = store
+        .search_hybrid(
+            "notes",
+            "missing",
+            "alpha",
+            &[1.0, 0.0],
+            0,
+            Fusion::Rrf { k: 60 },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .search_hybrid("notes", "notes", "alpha", &[1.0], 0, Fusion::Rrf { k: 60 })
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .search_hybrid(
+            "notes",
+            "notes",
+            "alpha",
+            &[1.0, 0.0],
+            0,
+            Fusion::Rrf { k: 0 },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    let err = store
+        .search_knowledge(
+            "notes",
+            "notes",
+            "alpha",
+            &[1.0, 0.0],
+            0,
+            Fusion::Rrf { k: 0 },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
     let err = store
         .search_hybrid(
             "notes",
@@ -3976,6 +4105,52 @@ fn hybrid_and_knowledge_fusion_orders_one_sided_ids() {
         )
         .unwrap_err();
     assert!(err.to_string().contains("k"), "{err}");
+    let err = store
+        .search_hybrid(
+            "notes",
+            "notes",
+            "alpha",
+            &[1.0, 0.0],
+            5,
+            Fusion::Weighted {
+                bm25: f64::MAX,
+                vector: f64::MAX,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert_eq!(
+        store
+            .search_hybrid(
+                "notes",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                10,
+                Fusion::Weighted {
+                    bm25: f64::MAX,
+                    vector: 0.0,
+                },
+            )
+            .unwrap(),
+        weighted_scores(&bm25, &vectors, f64::MAX, 0.0)
+    );
+    assert_eq!(
+        store
+            .search_hybrid(
+                "notes",
+                "notes",
+                "alpha",
+                &[1.0, 0.0],
+                10,
+                Fusion::Weighted {
+                    bm25: 0.0,
+                    vector: f64::MAX,
+                },
+            )
+            .unwrap(),
+        weighted_scores(&bm25, &vectors, 0.0, f64::MAX)
+    );
     let err = store
         .search_hybrid(
             "notes",
@@ -4046,6 +4221,50 @@ fn zero_vector_cosine_is_zero_and_empty_limits_do_not_error() {
             .unwrap()
             .is_empty()
     );
+    store
+        .create_vector_collection(
+            "empty",
+            2,
+            VectorStorage::F32,
+            VectorMetric::Cosine,
+            4,
+            8,
+            8,
+        )
+        .unwrap();
+    assert!(
+        store
+            .search_vectors("empty", &[1.0, 0.0], 0, None)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_vectors("empty", &[1.0, 0.0], 5, Some(0))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .search_vectors("empty", &[1.0, 0.0], 5, None)
+            .unwrap()
+            .is_empty()
+    );
+    for (limit, ef) in [(0_usize, None), (5, Some(0))] {
+        let wrong = store.search_vectors("z", &[1.0], limit, ef).unwrap_err();
+        assert!(matches!(wrong, StoreError::Backend(_)), "{wrong}");
+        let non_finite = store
+            .search_vectors("z", &[f32::NAN, 0.0], limit, ef)
+            .unwrap_err();
+        assert!(matches!(non_finite, StoreError::Backend(_)), "{non_finite}");
+        let empty_wrong = store
+            .search_vectors("empty", &[1.0], limit, ef)
+            .unwrap_err();
+        assert!(
+            matches!(empty_wrong, StoreError::Backend(_)),
+            "{empty_wrong}"
+        );
+    }
     let err = store
         .search_vectors("missing", &[0.0, 0.0], 1, None)
         .unwrap_err();

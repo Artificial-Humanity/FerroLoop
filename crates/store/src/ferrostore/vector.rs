@@ -339,18 +339,8 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 fn quantize_i8(value: f32) -> i8 {
-    if value >= 127.5 {
-        return 127;
-    }
-    if value <= -128.5 {
-        return -128;
-    }
-    let rounded = if value >= 0.0 {
-        (value + 0.5).floor()
-    } else {
-        (value - 0.5).ceil()
-    };
-    rounded as i8
+    // `f32::round` is half away from zero. `quantize` rejects non-finite values first.
+    value.round().clamp(-128.0, 127.0) as i8
 }
 
 pub(super) fn quantize(storage: VectorStorage, values: &[f32]) -> Result<Vec<u8>, StoreError> {
@@ -885,10 +875,10 @@ pub(super) fn search(
     limit: usize,
     ef: Option<u32>,
 ) -> Result<Vec<(String, f64)>, StoreError> {
+    let query = prepare_query(col, values)?;
     if limit == 0 || ef == Some(0) {
         return Ok(Vec::new());
     }
-    let query = prepare_query(col, values)?;
     if col.vectors.is_empty() {
         return Ok(Vec::new());
     }
@@ -941,6 +931,7 @@ pub(super) fn validate_fusion(fusion: Fusion) -> Result<(), StoreError> {
                 || bm25 < 0.0
                 || vector < 0.0
                 || (bm25 == 0.0 && vector == 0.0)
+                || !(bm25 + vector).is_finite()
             {
                 return Err(backend(
                     "weighted fusion weights must be finite, >= 0, and not both zero",

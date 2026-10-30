@@ -639,9 +639,6 @@ impl FerroStore {
         fusion: Fusion,
     ) -> Result<Vec<(String, f64)>, StoreError> {
         if let Inner::Remote(remote) = &self.inner {
-            if limit == 0 {
-                return Ok(Vec::new());
-            }
             return vector::parse_hits(&remote.call(
                 "search_hybrid",
                 hybrid_params(
@@ -684,9 +681,6 @@ impl FerroStore {
         fusion: Fusion,
     ) -> Result<Vec<KnowledgeHit>, StoreError> {
         if let Inner::Remote(remote) = &self.inner {
-            if limit == 0 {
-                return Ok(Vec::new());
-            }
             return vector::parse_knowledge(&remote.call(
                 "search_knowledge",
                 hybrid_params(
