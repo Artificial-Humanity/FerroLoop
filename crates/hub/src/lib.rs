@@ -3,6 +3,7 @@
 //! discovery, static `FerroDeck` serving, and `/api/v1/*` REST API (spec §2–§4).
 
 pub mod api;
+mod artifacts;
 pub mod auth;
 pub mod commands;
 mod direct_quota;
@@ -10,6 +11,7 @@ pub mod discovery;
 pub mod lifecycle;
 pub mod nodes;
 pub mod session_actions;
+mod settings;
 pub mod terminal;
 pub mod ws;
 
@@ -5018,5 +5020,840 @@ default_target = "wire:felicity"
                 );
             }
         }
+    }
+
+    // --- Record 29: artifact registry, archived copies, pruning -------------------------------
+
+    fn artifacts_root_of(tmp: &TempDir) -> std::path::PathBuf {
+        crate::artifacts::data_root(tmp.path())
+    }
+
+    fn artifacts_root_of_home(home: &std::path::Path) -> std::path::PathBuf {
+        crate::artifacts::data_root(home)
+    }
+
+    fn managed_files(tmp: &TempDir) -> Vec<String> {
+        let dir = crate::artifacts::managed_dir(&artifacts_root_of(tmp));
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    fn list_artifacts(state: &HubState) -> Value {
+        let resp = call(state, "GET", "/api/v1/artifacts/list", OWNER, &json!({}));
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        resp.json_value().unwrap()
+    }
+
+    fn prune(state: &HubState, token: &str, body: &Value) -> HttpResponse {
+        call(state, "POST", "/api/v1/artifacts/prune", token, body)
+    }
+
+    #[test]
+    fn artifact_list_reports_live_then_archived_then_drops_what_is_gone() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let att = tmp.path().join("attachments");
+        fs::create_dir_all(&att).unwrap();
+        let file = att.join("plan.md");
+        fs::write(&file, "# plan").unwrap();
+        let file_str = fs::canonicalize(&file).unwrap().display().to_string();
+
+        let live = list_artifacts(&state);
+        assert_eq!(live["pruned_count"], 0);
+        assert_eq!(live["artifacts"].as_array().unwrap().len(), 1);
+        assert_eq!(live["artifacts"][0]["status"], "live");
+        assert_eq!(live["artifacts"][0]["path"], file_str.as_str());
+        let reg = crate::artifacts::Registry::load(&artifacts_root_of(&tmp));
+        assert_eq!(reg.entries.len(), 1);
+        assert_eq!(reg.entries[0].canonical_path, file_str);
+        assert!(reg.entries[0].managed_path.is_none());
+
+        // Archive it, then lose the original: the managed copy is served in its place.
+        let resp = prune(&state, OWNER, &json!({ "paths": [file_str] }));
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(managed_files(&tmp).len(), 1);
+        fs::remove_file(&file).unwrap();
+        let archived = list_artifacts(&state);
+        assert_eq!(archived["pruned_count"], 0);
+        let item = &archived["artifacts"][0];
+        assert_eq!(item["status"], "archived");
+        assert_eq!(item["original_path"], file_str.as_str());
+        let managed_dir = crate::artifacts::managed_dir(&artifacts_root_of(&tmp));
+        let served = item["path"].as_str().unwrap();
+        assert!(
+            std::path::Path::new(served).starts_with(fs::canonicalize(&managed_dir).unwrap()),
+            "{served}"
+        );
+        assert_eq!(item["name"], "plan.md");
+        assert_eq!(item["kind"], "markdown");
+
+        // The archived file previews even though its worktree-side original is gone.
+        let preview = call(
+            &state,
+            "GET",
+            &format!("/api/v1/artifacts/preview?path={served}"),
+            OWNER,
+            &json!({}),
+        );
+        assert_eq!(preview.status, 200, "{}", error_text(&preview));
+        assert_eq!(preview.json_value().unwrap()["content"], "# plan");
+
+        // Original and copy both gone: dropped from the response and the registry.
+        for name in managed_files(&tmp) {
+            fs::remove_file(managed_dir.join(name)).unwrap();
+        }
+        let gone = list_artifacts(&state);
+        assert_eq!(gone["artifacts"], json!([]));
+        assert_eq!(gone["pruned_count"], 1);
+        assert!(
+            crate::artifacts::Registry::load(&artifacts_root_of(&tmp))
+                .entries
+                .is_empty()
+        );
+        assert_eq!(list_artifacts(&state)["pruned_count"], 0);
+    }
+
+    #[test]
+    fn archived_artifacts_preview_when_home_is_apart_from_the_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(home.join("attachments")).unwrap();
+        let state = HubState::new(HubServerConfig {
+            store_path: home.join("store.redb"),
+            repo_root: repo.clone(),
+            owner_token: Some(OWNER.to_string()),
+            home_override: Some(home.clone()),
+            ..HubServerConfig::default()
+        });
+        let file = home.join("attachments/keep.md");
+        fs::write(&file, "# kept").unwrap();
+        let named = file.display().to_string();
+        assert_eq!(
+            prune(&state, OWNER, &json!({ "paths": [named] })).status,
+            200
+        );
+        fs::remove_file(&file).unwrap();
+        let listed = list_artifacts(&state);
+        let item = &listed["artifacts"][0];
+        assert_eq!(item["status"], "archived", "{listed}");
+        let served = item["path"].as_str().unwrap().to_string();
+        assert!(served.contains("/fl/artifacts/managed/"), "{served}");
+        let preview = call(
+            &state,
+            "GET",
+            &format!("/api/v1/artifacts/preview?path={served}"),
+            OWNER,
+            &json!({}),
+        );
+        assert_eq!(preview.status, 200, "{}", error_text(&preview));
+        assert_eq!(preview.json_value().unwrap()["content"], "# kept");
+        // Anything else under the managed root's parent stays out of reach.
+        let registry = artifacts_root_of_home(&home).join("registry.json");
+        let enc = registry.display().to_string();
+        let denied = call(
+            &state,
+            "GET",
+            &format!("/api/v1/artifacts/preview?path={enc}"),
+            OWNER,
+            &json!({}),
+        );
+        assert_eq!(denied.status, 403);
+    }
+
+    #[test]
+    fn artifact_registry_ignores_a_managed_path_outside_the_managed_dir() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let secret = tmp.path().join("notes.md");
+        fs::write(&secret, "private").unwrap();
+        let gone = tmp.path().join("gone.md");
+        let canon = fs::canonicalize(&secret).unwrap();
+        crate::artifacts::with_registry(&artifacts_root_of(&tmp), |reg| {
+            reg.entries.push(crate::artifacts::ArtifactEntry {
+                path: gone.display().to_string(),
+                canonical_path: gone.display().to_string(),
+                managed_path: Some(canon.display().to_string()),
+                name: "gone.md".into(),
+                ext: "md".into(),
+                kind: "markdown".into(),
+                size_bytes: 7,
+                session_id: None,
+                status: "live".into(),
+                updated_at_ms: 1,
+            });
+        });
+        let listed = list_artifacts(&state);
+        assert_eq!(listed["artifacts"], json!([]));
+        assert_eq!(listed["pruned_count"], 1);
+    }
+
+    #[test]
+    fn artifact_prune_is_owner_only_and_validates_its_body() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let url = "/api/v1/artifacts/prune";
+        let unauth = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", url).with_json_body(&json!({})),
+        );
+        assert_eq!(unauth.status, 401);
+        let peer = prune(&state, PEER, &json!({}));
+        assert_eq!(peer.status, 403, "{}", error_text(&peer));
+
+        let owner_req = |body: &[u8]| {
+            HttpRequest::new("POST", url)
+                .with_header("Authorization", format!("Bearer {OWNER}"))
+                .with_body(body.to_vec())
+        };
+        let malformed = handle_http_request(&state, &owner_req(b"{ nope"));
+        assert_eq!(malformed.status, 400);
+        let not_object = handle_http_request(&state, &owner_req(b"[1]"));
+        assert_eq!(not_object.status, 400);
+        for bad in [
+            json!({ "paths": "a.md" }),
+            json!({ "paths": [3] }),
+            json!({ "worktree_path": 4 }),
+            json!({ "session_id": [] }),
+        ] {
+            assert_eq!(prune(&state, OWNER, &bad).status, 400, "{bad}");
+        }
+        let empty = handle_http_request(&state, &owner_req(b""));
+        assert_eq!(empty.status, 200);
+        assert_eq!(
+            empty.json_value().unwrap(),
+            json!({ "ok": true, "pruned_count": 0, "archived_count": 0, "active_count": 0 })
+        );
+        assert!(managed_files(&tmp).is_empty());
+    }
+
+    #[test]
+    fn artifact_prune_copies_only_small_user_facing_files_inside_the_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(wt.join("docs")).unwrap();
+        fs::write(wt.join("docs/notes.md"), "# notes").unwrap();
+        fs::write(wt.join("diagram.mmd"), "graph TD;A-->B").unwrap();
+        fs::write(wt.join("big.png"), vec![0u8; 5 * 1024 * 1024 + 1]).unwrap();
+        fs::write(wt.join("main.rs"), "fn main() {}").unwrap();
+        // Same file name elsewhere in the repo: named, but outside the worktree.
+        fs::write(tmp.path().join("notes.md"), "# other notes").unwrap();
+        let named: Vec<String> = ["docs/notes.md", "diagram.mmd", "big.png", "main.rs"]
+            .iter()
+            .map(|p| wt.join(p).display().to_string())
+            .chain([tmp.path().join("notes.md").display().to_string()])
+            .collect();
+
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": wt.display().to_string(), "paths": named }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let out = resp.json_value().unwrap();
+        assert_eq!(out["ok"], true);
+        assert_eq!(out["pruned_count"], 0);
+        assert_eq!(out["active_count"], 2, "{out}");
+        let managed = managed_files(&tmp);
+        assert_eq!(managed.len(), 2, "{managed:?}");
+        assert!(managed.iter().any(|n| n.ends_with("-notes.md")));
+        assert!(managed.iter().any(|n| n.ends_with("-diagram.mmd")));
+        assert!(managed.iter().all(|n| !n.contains('/')));
+        let reg = crate::artifacts::Registry::load(&artifacts_root_of(&tmp));
+        assert_eq!(reg.entries.len(), 2);
+        assert!(reg.entries.iter().all(|e| e.managed_path.is_some()));
+        assert!(reg.entries.iter().all(|e| e.status == "live"));
+
+        // Pruning again re-copies in place: no duplicates.
+        let again = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": wt.display().to_string(), "paths": [wt.join("diagram.mmd").display().to_string()] }),
+        );
+        assert_eq!(again.status, 200);
+        assert_eq!(managed_files(&tmp), managed);
+    }
+
+    #[test]
+    fn artifact_prune_refuses_worktrees_and_paths_outside_the_allowed_roots() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("leak.md"), "# leak").unwrap();
+
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": outside.path().display().to_string() }),
+        );
+        assert_eq!(resp.status, 403, "{}", error_text(&resp));
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "paths": [outside.path().join("leak.md").display().to_string()] }),
+        );
+        assert_eq!(resp.status, 403, "{}", error_text(&resp));
+        // A missing path outside the roots is refused the same way: no existence oracle.
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": outside.path().join("nope").display().to_string() }),
+        );
+        assert_eq!(resp.status, 403);
+        // Forbidden names inside the roots.
+        fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+        for forbidden in ["repo/.git", "repo/../repo"] {
+            let resp = prune(
+                &state,
+                OWNER,
+                &json!({ "worktree_path": tmp.path().join(forbidden).display().to_string() }),
+            );
+            assert_eq!(resp.status, 403, "{forbidden}");
+        }
+        let env_file = tmp.path().join(".env");
+        fs::write(&env_file, "TOKEN=1").unwrap();
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "paths": [env_file.display().to_string()] }),
+        );
+        assert_eq!(resp.status, 403);
+        // A symlink in the worktree that leads outside the roots is refused, not followed.
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("leak.md"), wt.join("link.md")).unwrap();
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": wt.display().to_string(),
+                     "paths": [wt.join("link.md").display().to_string()] }),
+        );
+        assert_eq!(resp.status, 403);
+        assert!(managed_files(&tmp).is_empty());
+    }
+
+    #[test]
+    fn artifact_prune_skips_tampered_registry_entries() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let wt = tmp.path().join("wt");
+        let other = tmp.path().join("other");
+        fs::create_dir_all(&wt).unwrap();
+        fs::create_dir_all(other.join(".git")).unwrap();
+        fs::write(wt.join("ok.md"), "# ok").unwrap();
+        fs::write(other.join("elsewhere.md"), "# elsewhere").unwrap();
+        fs::write(other.join(".git/hidden.md"), "# hidden").unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::write(outside.path().join("leak.md"), "# leak").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("leak.md"), wt.join("link.md")).unwrap();
+        let entry = |p: &std::path::Path| crate::artifacts::ArtifactEntry {
+            path: p.display().to_string(),
+            canonical_path: p.display().to_string(),
+            managed_path: None,
+            name: "x.md".into(),
+            ext: "md".into(),
+            kind: "markdown".into(),
+            size_bytes: 1,
+            session_id: None,
+            status: "live".into(),
+            updated_at_ms: 1,
+        };
+        let canon_wt = fs::canonicalize(&wt).unwrap();
+        crate::artifacts::with_registry(&artifacts_root_of(&tmp), |reg| {
+            for p in [
+                canon_wt.join("ok.md"),
+                fs::canonicalize(&other).unwrap().join("elsewhere.md"),
+                fs::canonicalize(&other).unwrap().join(".git/hidden.md"),
+                canon_wt.join("link.md"),
+            ] {
+                reg.entries.push(entry(&p));
+            }
+        });
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": wt.display().to_string() }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let managed = managed_files(&tmp);
+        assert_eq!(managed.len(), 1, "{managed:?}");
+        assert!(managed[0].ends_with("-ok.md"));
+    }
+
+    #[test]
+    fn a_later_session_id_cannot_retag_a_listed_artifact_and_attachments_stay_untagged() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let brain = tmp.path().join(".gemini/antigravity-cli/brain");
+        fs::create_dir_all(brain.join("sess-a")).unwrap();
+        fs::create_dir_all(brain.join("sess-b")).unwrap();
+        fs::write(brain.join("sess-a/plan.md"), "# plan").unwrap();
+        // sess-b can reach the same file (a link inside the allowed brain root).
+        std::os::unix::fs::symlink("../sess-a/plan.md", brain.join("sess-b/plan.md")).unwrap();
+        fs::create_dir_all(tmp.path().join("attachments")).unwrap();
+        fs::write(tmp.path().join("attachments/shared.md"), "# shared").unwrap();
+
+        let list_as = |sid: &str| {
+            let resp = call(
+                &state,
+                "GET",
+                &format!("/api/v1/artifacts/list?session_id={sid}"),
+                PEER,
+                &json!({}),
+            );
+            assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        };
+        let session_of = |name: &str| {
+            crate::artifacts::Registry::load(&artifacts_root_of(&tmp))
+                .entries
+                .into_iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("no entry for {name}"))
+                .session_id
+        };
+        list_as("sess-a");
+        let first = session_of("plan.md");
+        assert!(
+            first.as_deref().is_some_and(|s| s.contains("sess-a")),
+            "{first:?}"
+        );
+        assert_eq!(
+            session_of("shared.md"),
+            None,
+            "attachments belong to no session"
+        );
+        list_as("sess-b");
+        assert_eq!(session_of("plan.md"), first, "first owner is kept");
+        assert_eq!(session_of("shared.md"), None);
+    }
+
+    #[test]
+    fn prune_with_a_missing_worktree_archives_nothing_from_paths() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let elsewhere = tmp.path().join("elsewhere.md");
+        fs::write(&elsewhere, "# elsewhere").unwrap();
+        let named = elsewhere.display().to_string();
+        let gone = tmp.path().join("wt-gone").display().to_string();
+
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": gone, "paths": [named] }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let out = resp.json_value().unwrap();
+        assert_eq!(out["archived_count"], 0, "{out}");
+        assert!(managed_files(&tmp).is_empty());
+        assert!(
+            crate::artifacts::Registry::load(&artifacts_root_of(&tmp))
+                .entries
+                .is_empty()
+        );
+
+        // With no worktree named, the same path is archived.
+        assert_eq!(
+            prune(&state, OWNER, &json!({ "paths": [named] })).status,
+            200
+        );
+        assert_eq!(managed_files(&tmp).len(), 1);
+    }
+
+    #[test]
+    fn prune_skips_a_current_copy_and_caps_the_files_per_call() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let wt = tmp.path().join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("keep.md"), "# keep").unwrap();
+        let wt_arg = wt.display().to_string();
+        let body =
+            json!({ "worktree_path": wt_arg, "paths": [wt.join("keep.md").display().to_string()] });
+        assert_eq!(prune(&state, OWNER, &body).status, 200);
+        let dir = crate::artifacts::managed_dir(&artifacts_root_of(&tmp));
+        let copy = dir.join(&managed_files(&tmp)[0]);
+        let first = fs::metadata(&copy).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(prune(&state, OWNER, &body).status, 200);
+        assert_eq!(
+            fs::metadata(&copy).unwrap().modified().unwrap(),
+            first,
+            "not copied again"
+        );
+        // The registry still records the copy.
+        let reg = crate::artifacts::Registry::load(&artifacts_root_of(&tmp));
+        assert!(reg.entries[0].managed_path.is_some());
+
+        let many = tmp.path().join("many");
+        fs::create_dir_all(&many).unwrap();
+        let paths: Vec<String> = (0..205)
+            .map(|i| {
+                let f = many.join(format!("n{i}.md"));
+                fs::write(&f, format!("# {i}")).unwrap();
+                f.display().to_string()
+            })
+            .collect();
+        let resp = prune(
+            &state,
+            OWNER,
+            &json!({ "worktree_path": many.display().to_string(), "paths": paths }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        // 1 from the first call plus at most 200 more.
+        assert_eq!(
+            managed_files(&tmp).len(),
+            201,
+            "{}",
+            managed_files(&tmp).len()
+        );
+    }
+
+    fn teardown_body(body: &mut Value, cwd: &std::path::Path) {
+        body["cwd"] = json!(cwd.display().to_string());
+    }
+
+    fn seed_artifact(tmp: &TempDir, file: &std::path::Path, session: &str) {
+        let canon = fs::canonicalize(file).unwrap();
+        crate::artifacts::with_registry(&artifacts_root_of(tmp), |reg| {
+            reg.entries.push(crate::artifacts::ArtifactEntry {
+                path: canon.display().to_string(),
+                canonical_path: canon.display().to_string(),
+                managed_path: None,
+                name: "report.md".into(),
+                ext: "md".into(),
+                kind: "markdown".into(),
+                size_bytes: 8,
+                session_id: Some(session.into()),
+                status: "live".into(),
+                updated_at_ms: 1,
+            });
+        });
+    }
+
+    #[test]
+    fn teardown_archives_the_sessions_artifacts_and_survives_an_archive_failure() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let wt = tmp.path().join("wt-felicity");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("report.md"), "# report").unwrap();
+        let mut body = spin_up_body("felicity");
+        teardown_body(&mut body, &wt);
+        assert_eq!(spin_up(&state, &body).status, 200);
+        seed_artifact(&tmp, &wt.join("report.md"), "claude:felicity");
+
+        // Prepare never archives.
+        let prepared = decommission_as(&state, OWNER, "claude%3Afelicity", "prepare");
+        assert_eq!(prepared.status, 200, "{}", error_text(&prepared));
+        assert!(managed_files(&tmp).is_empty());
+
+        let torn = decommission_as(&state, OWNER, "claude%3Afelicity", "teardown");
+        assert_eq!(torn.status, 200, "{}", error_text(&torn));
+        assert_eq!(torn.json_value().unwrap()["status"], "decommissioned");
+        let managed = managed_files(&tmp);
+        assert_eq!(managed.len(), 1, "{managed:?}");
+        let reg = crate::artifacts::Registry::load(&artifacts_root_of(&tmp));
+        assert!(reg.entries[0].managed_path.is_some());
+
+        // The worktree goes; its report is still listed, from the archive.
+        fs::remove_dir_all(&wt).unwrap();
+        let listed = list_artifacts(&state);
+        assert_eq!(listed["artifacts"][0]["status"], "archived");
+        assert_eq!(listed["artifacts"][0]["name"], "report.md");
+
+        // An archive that cannot be written never blocks a teardown or changes its status.
+        let wt2 = tmp.path().join("wt-ada");
+        fs::create_dir_all(&wt2).unwrap();
+        fs::write(wt2.join("report.md"), "# report").unwrap();
+        let mut body = spin_up_body("ada");
+        teardown_body(&mut body, &wt2);
+        assert_eq!(spin_up(&state, &body).status, 200);
+        seed_artifact(&tmp, &wt2.join("report.md"), "claude:ada");
+        let root = artifacts_root_of(&tmp);
+        fs::remove_dir_all(&root).unwrap();
+        fs::create_dir_all(root.parent().unwrap()).unwrap();
+        fs::write(&root, "not a directory").unwrap();
+        let torn = decommission_as(&state, OWNER, "claude%3Aada", "teardown");
+        assert_eq!(torn.status, 200, "{}", error_text(&torn));
+        assert_eq!(torn.json_value().unwrap()["status"], "decommissioned");
+    }
+
+    #[test]
+    fn a_refused_peer_teardown_archives_nothing() {
+        use fl_core::agent::{AgentRole, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let wt = tmp.path().join("wt-ada");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("report.md"), "# report").unwrap();
+        let mut body = spin_up_body("ada");
+        teardown_body(&mut body, &wt);
+        assert_eq!(spin_up(&state, &body).status, 200);
+        assert_eq!(
+            decommission_as(&state, OWNER, "claude%3Aada", "teardown").status,
+            200
+        );
+        // The persona registers again outside the lifecycle: a Peer may not retire it, but the
+        // stale record still names the worktree.
+        state
+            .open_store()
+            .unwrap()
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: Some("ada@example.org".into()),
+                project: "FerroLoop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: Vec::new(),
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "ada".into(),
+            })
+            .unwrap();
+        let root = artifacts_root_of(&tmp);
+        let _ = fs::remove_dir_all(&root);
+        seed_artifact(&tmp, &wt.join("report.md"), "claude:ada");
+
+        let resp = decommission_as(&state, PEER, "claude%3Aada", "teardown");
+        assert_eq!(resp.status, 403, "{}", error_text(&resp));
+        assert!(managed_files(&tmp).is_empty());
+        let reg = crate::artifacts::Registry::load(&root);
+        assert!(reg.entries[0].managed_path.is_none());
+
+        // The Owner is let through, and then it does archive.
+        let resp = decommission_as(&state, OWNER, "claude%3Aada", "teardown");
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(managed_files(&tmp).len(), 1);
+    }
+
+    // --- Record 4: unified settings ----------------------------------------------------------
+
+    fn default_settings_json() -> Value {
+        json!({
+            "theme_preference": "dark",
+            "subsystems": {
+                "ferrogate_enabled": true,
+                "ferrostate_enabled": true,
+                "ferrostep_enabled": true,
+            },
+            "notifications": {
+                "notify_on_pr_review": true,
+                "notify_on_session_error": true,
+                "notify_on_wire_urgent": true,
+                "sound_enabled": false,
+            },
+            "hub_connection": { "auto_reconnect_ws": true, "poll_interval_secs": 10 },
+        })
+    }
+
+    #[test]
+    fn settings_get_returns_defaults_for_any_authenticated_caller() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let unauth = handle_http_request(&state, &HttpRequest::new("GET", "/api/v1/settings"));
+        assert_eq!(unauth.status, 401);
+        for token in [OWNER, PEER] {
+            let resp = call(&state, "GET", "/api/v1/settings", token, &json!({}));
+            assert_eq!(resp.status, 200, "{}", error_text(&resp));
+            assert_eq!(resp.json_value().unwrap(), default_settings_json());
+        }
+        // Reading never writes the file.
+        assert!(
+            !tmp.path()
+                .join(".config/fl/ferrodeck-settings.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn settings_put_is_owner_only_merges_partials_and_persists() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let url = "/api/v1/settings";
+        let peer = call(
+            &state,
+            "PUT",
+            url,
+            PEER,
+            &json!({ "theme_preference": "light" }),
+        );
+        assert_eq!(peer.status, 403, "{}", error_text(&peer));
+        assert_eq!(
+            call(&state, "GET", url, PEER, &json!({}))
+                .json_value()
+                .unwrap(),
+            default_settings_json()
+        );
+
+        let resp = call(
+            &state,
+            "PUT",
+            url,
+            OWNER,
+            &json!({
+                "theme_preference": "system",
+                "notifications": { "sound_enabled": true },
+                "hub_connection": { "poll_interval_secs": 30 },
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let mut expected = default_settings_json();
+        expected["theme_preference"] = json!("system");
+        expected["notifications"]["sound_enabled"] = json!(true);
+        expected["hub_connection"]["poll_interval_secs"] = json!(30);
+        assert_eq!(resp.json_value().unwrap(), expected);
+
+        // A second partial keeps the first one's changes.
+        let resp = call(
+            &state,
+            "PUT",
+            url,
+            OWNER,
+            &json!({ "subsystems": { "ferrostep_enabled": false } }),
+        );
+        assert_eq!(resp.status, 200);
+        expected["subsystems"]["ferrostep_enabled"] = json!(false);
+        assert_eq!(resp.json_value().unwrap(), expected);
+
+        // Persisted: a fresh hub over the same home reads them back.
+        let reloaded = test_hub_state(&tmp);
+        let resp = call(&reloaded, "GET", url, PEER, &json!({}));
+        assert_eq!(resp.json_value().unwrap(), expected);
+        let on_disk: Value = serde_json::from_slice(
+            &fs::read(tmp.path().join(".config/fl/ferrodeck-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk, expected);
+    }
+
+    #[test]
+    fn settings_put_rejects_bad_values_without_changing_anything() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let url = "/api/v1/settings";
+        for bad in [
+            json!({ "hub_connection": { "poll_interval_secs": 1 } }),
+            json!({ "hub_connection": { "poll_interval_secs": 301 } }),
+            json!({ "hub_connection": { "poll_interval_secs": -5 } }),
+            json!({ "hub_connection": { "poll_interval_secs": "10" } }),
+            json!({ "theme_preference": "purple" }),
+            json!({ "theme_preference": 3 }),
+            json!({ "colour": "red" }),
+            json!({ "subsystems": { "ferrobogus_enabled": true } }),
+            json!({ "notifications": { "sound_enabled": "loud" } }),
+            // Valid fields beside an invalid one are not applied.
+            json!({ "theme_preference": "light", "hub_connection": { "poll_interval_secs": 1 } }),
+        ] {
+            let resp = call(&state, "PUT", url, OWNER, &bad);
+            assert_eq!(resp.status, 400, "{bad}: {}", error_text(&resp));
+        }
+        let ok = call(
+            &state,
+            "PUT",
+            url,
+            OWNER,
+            &json!({ "hub_connection": { "poll_interval_secs": 2 } }),
+        );
+        assert_eq!(ok.status, 200);
+        let ok = call(
+            &state,
+            "PUT",
+            url,
+            OWNER,
+            &json!({ "hub_connection": { "poll_interval_secs": 300 } }),
+        );
+        assert_eq!(ok.status, 200);
+        let bad_json = handle_http_request(
+            &state,
+            &HttpRequest::new("PUT", url)
+                .with_header("Authorization", format!("Bearer {OWNER}"))
+                .with_body(b"{ nope".to_vec()),
+        );
+        assert_eq!(bad_json.status, 400);
+        // Nothing but the two valid interval changes ever reached the file.
+        let mut expected = default_settings_json();
+        expected["hub_connection"]["poll_interval_secs"] = json!(300);
+        assert_eq!(
+            call(&state, "GET", url, OWNER, &json!({}))
+                .json_value()
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn settings_load_survives_a_damaged_file() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let path = tmp.path().join(".config/fl/ferrodeck-settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"theme_preference":"light","hub_connection":{"poll_interval_secs":"x"}}"#,
+        )
+        .unwrap();
+        let resp = call(&state, "GET", "/api/v1/settings", OWNER, &json!({}));
+        assert_eq!(resp.status, 200);
+        let mut expected = default_settings_json();
+        expected["theme_preference"] = json!("light");
+        assert_eq!(resp.json_value().unwrap(), expected);
+        fs::write(&path, "\u{0}garbage").unwrap();
+        let resp = call(&state, "GET", "/api/v1/settings", OWNER, &json!({}));
+        assert_eq!(resp.json_value().unwrap(), default_settings_json());
+    }
+
+    #[test]
+    fn settings_put_broadcasts_settings_updated_and_a_refused_one_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let mut rx = state.subscribe();
+        assert_eq!(
+            call(
+                &state,
+                "PUT",
+                "/api/v1/settings",
+                PEER,
+                &json!({ "theme_preference": "light" })
+            )
+            .status,
+            403
+        );
+        assert_eq!(
+            call(
+                &state,
+                "PUT",
+                "/api/v1/settings",
+                OWNER,
+                &json!({ "theme_preference": "bad" })
+            )
+            .status,
+            400
+        );
+        assert!(rx.try_recv().is_err(), "a refused PUT must not broadcast");
+
+        let resp = call(
+            &state,
+            "PUT",
+            "/api/v1/settings",
+            OWNER,
+            &json!({ "theme_preference": "light" }),
+        );
+        assert_eq!(resp.status, 200);
+        let frame = rx.try_recv().expect("settings.updated frame");
+        assert_eq!(frame.channel, "settings");
+        assert_eq!(frame.event, "settings.updated");
+        assert_eq!(frame.data, resp.json_value().unwrap());
+        assert_eq!(frame.data["theme_preference"], "light");
     }
 }

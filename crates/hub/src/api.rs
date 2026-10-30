@@ -69,6 +69,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::HubStoreGuard;
+use crate::artifacts::{self, ArtifactEntry};
 use crate::auth::{
     HubAuthority, constant_time_eq, extract_bearer_token, extract_session_cookie,
     format_logout_set_cookie, format_session_set_cookie, sha256_hex,
@@ -91,6 +92,7 @@ use crate::nodes::{
 use crate::session_actions::{
     self, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, ModelOverride, route_vendor,
 };
+use crate::settings;
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
 
 /// Parsed HTTP/1.1 request passed to [`handle_http_request`].
@@ -486,6 +488,9 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET", "/api/v1/architecture") => handle_get_architecture(state, req),
         ("GET" | "HEAD", "/api/v1/artifacts/preview") => handle_get_artifact_preview(state, req),
         ("GET", "/api/v1/artifacts/list") => handle_get_artifacts_list(state, req),
+        ("POST", "/api/v1/artifacts/prune") => handle_post_artifacts_prune(state, &authority, req),
+        ("GET", "/api/v1/settings") => handle_get_settings(state),
+        ("PUT", "/api/v1/settings") => handle_put_settings(state, &authority, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
         ("POST", "/api/v1/gate/secrets") => handle_post_gate_secret(state, &authority, req),
         ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
@@ -2424,14 +2429,11 @@ fn allowed_artifact_roots(state: &HubState) -> Vec<PathBuf> {
         }
     }
 
-    let home_dir = state
-        .config
-        .home_override
-        .clone()
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-    if let Some(home) = home_dir {
+    if let Some(home) = hub_home_dir(state) {
         candidates.push(home.join(".gemini/antigravity-cli/brain"));
         candidates.push(home.join(".local/share/fl/attachments"));
+        // Archived artifact copies, so previews of files whose worktree is gone still work.
+        candidates.push(artifacts::managed_dir(&artifacts::data_root(&home)));
         if state.config.home_override.is_none() {
             candidates.push(home.join("Projects/Artificial-Humanity"));
         }
@@ -2623,83 +2625,94 @@ fn handle_get_artifact_preview(state: &HubState, req: &HttpRequest) -> HttpRespo
     )
 }
 
-fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpResponse {
+/// Most artifacts one list call returns.
+const MAX_ARTIFACT_LIST_ITEMS: usize = 50;
+
+/// The hub's home directory: the configured override, else `$HOME`.
+fn hub_home_dir(state: &HubState) -> Option<PathBuf> {
+    state
+        .config
+        .home_override
+        .clone()
+        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+}
+
+/// Data root of the artifact registry and its managed copies.
+fn artifacts_root(state: &HubState) -> Option<PathBuf> {
+    hub_home_dir(state).map(|home| artifacts::data_root(&home))
+}
+
+/// Files a session's brain dir and transcript point at. Not yet vetted against the allowed roots.
+fn discover_session_artifact_candidates(
+    state: &HubState,
+    session_id: &str,
+    canonical_session_id: &str,
+) -> Vec<PathBuf> {
     let mut candidate_paths: Vec<PathBuf> = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    if let Some(session_id) = req
-        .query
-        .get("session_id")
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        let (canonical_session_id, _persona) = resolve_session_target(state, session_id);
-        let home_dir = state
-            .config
-            .home_override
-            .clone()
-            .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
-        if let Some(ref home) = home_dir {
-            for candidate_id in [session_id, canonical_session_id.as_str()] {
-                if candidate_id.is_empty()
-                    || candidate_id.contains('/')
-                    || candidate_id.contains('\\')
-                    || candidate_id.contains("..")
-                    || candidate_id.contains('\0')
-                {
-                    continue;
-                }
-                let brain_dir = home
-                    .join(".gemini/antigravity-cli/brain")
-                    .join(candidate_id);
-                if brain_dir.is_dir()
-                    && let Ok(entries) = fs::read_dir(&brain_dir)
-                {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        if p.is_file() {
-                            candidate_paths.push(p);
-                        }
-                    }
-                }
+    if let Some(home) = hub_home_dir(state) {
+        for candidate_id in [session_id, canonical_session_id] {
+            if candidate_id.is_empty()
+                || candidate_id.contains('/')
+                || candidate_id.contains('\\')
+                || candidate_id.contains("..")
+                || candidate_id.contains('\0')
+            {
+                continue;
             }
-        }
-
-        let snap = load_discovery_snapshot(state);
-        let turns = read_session_transcript_from_snapshot(
-            session_id,
-            &snap,
-            state.config.home_override.as_deref(),
-        );
-        for turn in turns.iter().rev().take(60) {
-            let mut remainder = turn.content.as_str();
-            while let Some(pos) = remainder.find("file:///") {
-                let valid_prefix = pos == 0
-                    || remainder[..pos].chars().next_back().is_some_and(|c| {
-                        c.is_whitespace() || matches!(c, '(' | '<' | '"' | '\'' | '`')
-                    });
-                let after = &remainder[pos + "file:///".len()..];
-                let end = after
-                    .find(|c: char| {
-                        c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | '`')
-                    })
-                    .unwrap_or(after.len());
-                if valid_prefix {
-                    let raw_target = &after[..end];
-                    let clean = raw_target
-                        .trim_end_matches(['.', ',', ';'])
-                        .split('#')
-                        .next()
-                        .unwrap_or(raw_target);
-                    if !clean.is_empty() {
-                        candidate_paths.push(PathBuf::from(format!("/{clean}")));
+            let brain_dir = home
+                .join(".gemini/antigravity-cli/brain")
+                .join(candidate_id);
+            if brain_dir.is_dir()
+                && let Ok(entries) = fs::read_dir(&brain_dir)
+            {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        candidate_paths.push(p);
                     }
                 }
-                remainder = &after[end..];
             }
         }
     }
 
+    let snap = load_discovery_snapshot(state);
+    let turns = read_session_transcript_from_snapshot(
+        session_id,
+        &snap,
+        state.config.home_override.as_deref(),
+    );
+    for turn in turns.iter().rev().take(60) {
+        let mut remainder = turn.content.as_str();
+        while let Some(pos) = remainder.find("file:///") {
+            let valid_prefix = pos == 0
+                || remainder[..pos].chars().next_back().is_some_and(|c| {
+                    c.is_whitespace() || matches!(c, '(' | '<' | '"' | '\'' | '`')
+                });
+            let after = &remainder[pos + "file:///".len()..];
+            let end = after
+                .find(|c: char| {
+                    c.is_whitespace() || matches!(c, ')' | ']' | '>' | '"' | '\'' | '`')
+                })
+                .unwrap_or(after.len());
+            if valid_prefix {
+                let raw_target = &after[..end];
+                let clean = raw_target
+                    .trim_end_matches(['.', ',', ';'])
+                    .split('#')
+                    .next()
+                    .unwrap_or(raw_target);
+                if !clean.is_empty() {
+                    candidate_paths.push(PathBuf::from(format!("/{clean}")));
+                }
+            }
+            remainder = &after[end..];
+        }
+    }
+    candidate_paths
+}
+
+fn discover_attachment_candidates(state: &HubState) -> Vec<PathBuf> {
+    let mut candidate_paths = Vec::new();
     let att_dir = attachments_dir(state);
     if att_dir.is_dir()
         && let Ok(entries) = fs::read_dir(&att_dir)
@@ -2711,54 +2724,545 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
             }
         }
     }
+    candidate_paths
+}
+
+/// The canonical path and metadata of `cand`, when it is a regular file the hub may serve as an
+/// artifact: not forbidden, inside an allowed root, within the preview size cap.
+fn vet_artifact_file(allowed_roots: &[PathBuf], cand: &Path) -> Option<(PathBuf, fs::Metadata)> {
+    if is_forbidden_artifact_path(cand) {
+        return None;
+    }
+    let canon = fs::canonicalize(cand).ok()?;
+    if is_forbidden_artifact_path(&canon) || !allowed_roots.iter().any(|r| canon.starts_with(r)) {
+        return None;
+    }
+    let meta = fs::metadata(&canon).ok()?;
+    (meta.is_file() && meta.len() <= MAX_ARTIFACT_PREVIEW_BYTES).then_some((canon, meta))
+}
+
+fn artifact_name_and_ext(canon: &Path) -> (String, String) {
+    let name = canon
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact")
+        .to_string();
+    let ext = canon
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    (name, ext)
+}
+
+fn artifact_entry(canon: &Path, size_bytes: u64, session_id: Option<&str>) -> ArtifactEntry {
+    let (name, ext) = artifact_name_and_ext(canon);
+    let path = canon.display().to_string();
+    ArtifactEntry {
+        path: path.clone(),
+        canonical_path: path,
+        managed_path: None,
+        name,
+        ext,
+        kind: classify_artifact_kind(canon).to_string(),
+        size_bytes,
+        session_id: session_id.map(str::to_string),
+        status: artifacts::STATUS_LIVE.to_string(),
+        updated_at_ms: artifacts::now_ms(),
+    }
+}
+
+fn live_artifact_item(canon: &Path, size_bytes: u64) -> Value {
+    let (name, ext) = artifact_name_and_ext(canon);
+    json!({
+        "path": canon.display().to_string(),
+        "name": name,
+        "ext": ext,
+        "kind": classify_artifact_kind(canon),
+        "size_bytes": size_bytes,
+        "status": artifacts::STATUS_LIVE,
+    })
+}
+
+/// An entry whose original is gone, served from its managed copy.
+fn archived_artifact_item(entry: &ArtifactEntry) -> Option<Value> {
+    let managed = entry.managed_path.as_deref()?;
+    let size_bytes = fs::metadata(managed)
+        .map(|m| m.len())
+        .unwrap_or(entry.size_bytes);
+    Some(json!({
+        "path": managed,
+        "original_path": entry.canonical_path,
+        "name": entry.name,
+        "ext": entry.ext,
+        "kind": entry.kind,
+        "size_bytes": size_bytes,
+        "status": artifacts::STATUS_ARCHIVED,
+    }))
+}
+
+fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    let session_id = req
+        .query
+        .get("session_id")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let canonical_session_id = session_id.map(|raw| resolve_session_target(state, raw).0);
+
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    if let (Some(raw), Some(canonical)) = (session_id, canonical_session_id.as_deref()) {
+        candidate_paths.extend(discover_session_artifact_candidates(state, raw, canonical));
+    }
+    candidate_paths.extend(discover_attachment_candidates(state));
 
     let allowed_roots = allowed_artifact_roots(state);
-    let mut items = Vec::new();
+    let mut live: Vec<(PathBuf, u64)> = Vec::new();
+    let mut seen = BTreeSet::new();
     for cand in candidate_paths {
-        if is_forbidden_artifact_path(&cand) {
-            continue;
-        }
-        let Ok(canon) = fs::canonicalize(&cand) else {
+        let Some((canon, meta)) = vet_artifact_file(&allowed_roots, &cand) else {
             continue;
         };
-        if is_forbidden_artifact_path(&canon) || !allowed_roots.iter().any(|r| canon.starts_with(r))
-        {
+        if !seen.insert(canon.clone()) {
             continue;
         }
-        let Ok(meta) = fs::metadata(&canon) else {
-            continue;
-        };
-        if !meta.is_file() || meta.len() > MAX_ARTIFACT_PREVIEW_BYTES {
-            continue;
-        }
-        let path_str = canon.display().to_string();
-        if !seen.insert(path_str.clone()) {
-            continue;
-        }
-        let name = canon
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("artifact")
-            .to_string();
-        let ext = canon
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let kind = classify_artifact_kind(&canon);
-        items.push(json!({
-            "path": path_str,
-            "name": name,
-            "ext": ext,
-            "kind": kind,
-            "size_bytes": meta.len(),
-        }));
-        if items.len() >= 50 {
+        live.push((canon, meta.len()));
+        if live.len() >= MAX_ARTIFACT_LIST_ITEMS {
             break;
         }
     }
+    let mut items: Vec<Value> = live
+        .iter()
+        .map(|(canon, size)| live_artifact_item(canon, *size))
+        .collect();
 
-    HttpResponse::json(200, json!({ "artifacts": items }))
+    let mut pruned_count = 0;
+    if let Some(root) = artifacts_root(state) {
+        let session_ids: Option<Vec<&str>> = session_id.map(|raw| {
+            let mut ids = vec![raw];
+            if let Some(canonical) = canonical_session_id.as_deref()
+                && canonical != raw
+            {
+                ids.push(canonical);
+            }
+            ids
+        });
+        // Files in the shared attachments dir belong to no session.
+        let attachments = fs::canonicalize(attachments_dir(state)).ok();
+        let outcome = artifacts::with_registry(&root, |registry| {
+            for (canon, size) in &live {
+                let shared = attachments.as_ref().is_some_and(|a| canon.starts_with(a));
+                let tag = if shared {
+                    None
+                } else {
+                    canonical_session_id.as_deref()
+                };
+                registry.upsert(artifact_entry(canon, *size, tag));
+            }
+            registry.reconcile(&artifacts::managed_dir(&root), session_ids.as_deref())
+        });
+        pruned_count = outcome.pruned;
+        for entry in &outcome.archived {
+            if items.len() >= MAX_ARTIFACT_LIST_ITEMS {
+                break;
+            }
+            items.extend(archived_artifact_item(entry));
+        }
+    }
+
+    HttpResponse::json(
+        200,
+        json!({ "artifacts": items, "pruned_count": pruned_count }),
+    )
+}
+
+/// What `preserve_artifacts` archives.
+struct ArtifactPreservation {
+    /// Files to register and archive (each still vetted).
+    candidates: Vec<PathBuf>,
+    /// Canonical dirs the files must sit in. Empty means no location limit.
+    scope: Vec<PathBuf>,
+    /// Session recorded on newly registered files.
+    session_tag: Option<String>,
+    /// Session ids whose tracked registry entries are archived too (all when empty). Tracked
+    /// entries are archived only when `scope` is set.
+    session_ids: Vec<String>,
+}
+
+/// Most files one `preserve_artifacts` call copies.
+const MAX_PRESERVE_TARGETS: usize = 200;
+
+/// Copy the plan's user-facing files into the managed dir and record the copies in the registry.
+/// Every file, tracked or named, is vetted again here (the registry file is only a hint), so
+/// nothing forbidden, symlinked out of its scope, or outside the allowed roots is copied; the
+/// copy itself refuses a symlink and vets the path it opened (see `archive_file`). The copies are
+/// made outside the registry lock, which is taken once at the end. A copy that is already
+/// current is not made again, and one call handles at most `MAX_PRESERVE_TARGETS` files.
+/// Returns how many files now have a managed copy; failures are logged and skipped.
+fn preserve_artifacts(state: &HubState, root: &Path, plan: &ArtifactPreservation) -> usize {
+    let allowed_roots = allowed_artifact_roots(state);
+    let wanted = |canon: &Path, size: u64| {
+        (plan.scope.is_empty() || plan.scope.iter().any(|r| canon.starts_with(r)))
+            && artifacts::is_archivable(canon, size)
+    };
+
+    let mut fresh: Vec<(PathBuf, u64)> = Vec::new();
+    for cand in &plan.candidates {
+        if fresh.len() >= MAX_PRESERVE_TARGETS {
+            break;
+        }
+        if let Some((canon, meta)) = vet_artifact_file(&allowed_roots, cand)
+            && wanted(&canon, meta.len())
+            && !fresh.iter().any(|(p, _)| *p == canon)
+        {
+            fresh.push((canon, meta.len()));
+        }
+    }
+
+    let mut targets: Vec<PathBuf> = fresh.iter().map(|(p, _)| p.clone()).collect();
+    if !plan.scope.is_empty() {
+        let tracked: Vec<String> = artifacts::with_registry(root, |registry| {
+            registry
+                .entries
+                .iter()
+                .filter(|e| {
+                    plan.session_ids.is_empty()
+                        || e.session_id
+                            .as_deref()
+                            .is_some_and(|sid| plan.session_ids.iter().any(|id| id == sid))
+                })
+                .map(|e| e.canonical_path.clone())
+                .collect()
+        });
+        for path in tracked {
+            if targets.len() >= MAX_PRESERVE_TARGETS {
+                break;
+            }
+            if let Some((canon, meta)) = vet_artifact_file(&allowed_roots, Path::new(&path))
+                && canon == Path::new(&path)
+                && wanted(&canon, meta.len())
+                && !targets.contains(&canon)
+            {
+                targets.push(canon);
+            }
+        }
+    }
+
+    // The vetting again, on the path the opened file resolves to.
+    let still_vetted = |resolved: &Path| {
+        vet_artifact_file(&allowed_roots, resolved)
+            .is_some_and(|(canon, meta)| canon == resolved && wanted(&canon, meta.len()))
+    };
+    let mut copies: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for canon in targets {
+        if let Some(dest) = artifacts::current_managed_copy(root, &canon) {
+            copies.push((canon, dest));
+            continue;
+        }
+        match artifacts::archive_file(root, &canon, &still_vetted) {
+            Ok(dest) => copies.push((canon, dest)),
+            Err(err) => eprintln!(
+                "fl-hub: could not archive artifact {}: {err}",
+                canon.display()
+            ),
+        }
+    }
+
+    artifacts::with_registry(root, |registry| {
+        for (canon, size) in &fresh {
+            registry.upsert(artifact_entry(canon, *size, plan.session_tag.as_deref()));
+        }
+        for (canon, dest) in &copies {
+            let canon_str = canon.display().to_string();
+            if let Some(entry) = registry
+                .entries
+                .iter_mut()
+                .find(|e| e.canonical_path == canon_str)
+            {
+                let dest_str = dest.display().to_string();
+                if entry.managed_path.as_deref() != Some(dest_str.as_str()) {
+                    entry.managed_path = Some(dest_str);
+                    entry.updated_at_ms = artifacts::now_ms();
+                }
+            }
+        }
+    });
+    copies.len()
+}
+
+/// Canonical dirs a session's artifacts live in: its recorded cwd (none when that is gone), else
+/// every git worktree other than the primary checkout.
+fn session_worktree_scope(state: &HubState, cwd: Option<&str>) -> Vec<PathBuf> {
+    if let Some(cwd) = cwd.map(str::trim).filter(|c| !c.is_empty()) {
+        return fs::canonicalize(cwd)
+            .ok()
+            .filter(|c| c.is_dir())
+            .into_iter()
+            .collect();
+    }
+    let primary = fs::canonicalize(&state.config.repo_root).ok();
+    list_git_worktrees(&state.config.repo_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|wt| fs::canonicalize(wt.path).ok())
+        .filter(|p| p.is_dir() && Some(p) != primary.as_ref())
+        .collect()
+}
+
+/// Best-effort archive of a session's artifacts before its teardown removes the worktree. Never
+/// fails the teardown: problems are logged and skipped.
+fn archive_session_artifacts(
+    state: &HubState,
+    target: &SessionTarget,
+    discovered_id: &str,
+    candidates: Vec<PathBuf>,
+) {
+    let Some(root) = artifacts_root(state) else {
+        return;
+    };
+    let scope =
+        session_worktree_scope(state, target.hosted.as_ref().and_then(|h| h.cwd.as_deref()));
+    if scope.is_empty() {
+        return;
+    }
+    let mut session_ids: Vec<String> = Vec::new();
+    for id in [
+        target.raw_id.as_str(),
+        discovered_id,
+        target.session_id.as_str(),
+    ] {
+        if !session_ids.iter().any(|s| s == id) {
+            session_ids.push(id.to_string());
+        }
+    }
+    preserve_artifacts(
+        state,
+        &root,
+        &ArtifactPreservation {
+            candidates,
+            scope,
+            session_tag: Some(discovered_id.to_string()),
+            session_ids,
+        },
+    );
+}
+
+/// The worktree a prune request names, canonical. `Ok(None)` when it does not exist (nothing to
+/// copy); an error response when it is forbidden, outside the allowed roots, or not a directory.
+fn resolve_prune_worktree(
+    state: &HubState,
+    allowed_roots: &[PathBuf],
+    raw: &str,
+) -> Result<Option<PathBuf>, HttpResponse> {
+    let deny = |status, msg: &str| Err(HttpResponse::json(status, json!({ "error": msg })));
+    if raw.contains('\0') {
+        return deny(400, "invalid worktree_path");
+    }
+    let given = Path::new(raw);
+    let candidate = if given.is_absolute() {
+        given.to_path_buf()
+    } else {
+        state.config.repo_root.join(given)
+    };
+    if is_forbidden_artifact_path(&candidate) {
+        return deny(403, "access to sensitive or internal path is forbidden");
+    }
+    let Ok(canonical) = fs::canonicalize(&candidate) else {
+        // Same containment check as an existing path, so a missing path leaks nothing.
+        if allowed_roots.iter().any(|r| candidate.starts_with(r))
+            || candidate.starts_with(&state.config.repo_root)
+        {
+            return Ok(None);
+        }
+        return deny(403, "worktree_path outside allowed workspace roots");
+    };
+    if is_forbidden_artifact_path(&canonical) {
+        return deny(403, "access to sensitive or internal path is forbidden");
+    }
+    if !allowed_roots.iter().any(|r| canonical.starts_with(r)) {
+        return deny(403, "worktree_path outside allowed workspace roots");
+    }
+    if !canonical.is_dir() {
+        return deny(400, "worktree_path is not a directory");
+    }
+    Ok(Some(canonical))
+}
+
+/// `POST /api/v1/artifacts/prune` (Record 29): archive the user-facing artifacts of a worktree
+/// before it goes, then drop registry entries that have neither an original nor a copy. Owner
+/// only. Body (all optional): `paths`, `worktree_path`, `session_id`.
+fn handle_post_artifacts_prune(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may prune artifacts" }),
+        );
+    }
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let paths: Vec<String> = match body.get("paths") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => match json_string_items("paths", items) {
+            Ok(paths) => paths,
+            Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+        },
+        Some(_) => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": "`paths` must be an array of strings" }),
+            );
+        }
+    };
+    let worktree_raw = match json_string(&body, "worktree_path") {
+        Ok(v) => v.trim().to_string(),
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let session_raw = match json_string(&body, "session_id") {
+        Ok(v) => v.trim().to_string(),
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let Some(root) = artifacts_root(state) else {
+        return HttpResponse::json(500, json!({ "error": "home directory unavailable" }));
+    };
+
+    let allowed_roots = allowed_artifact_roots(state);
+    let mut scope: Vec<PathBuf> = Vec::new();
+    // A worktree that was named but is gone gives no scope, and an empty scope would let `paths`
+    // be archived from anywhere, so nothing is archived then (the prune below still runs).
+    let mut worktree_missing = false;
+    if !worktree_raw.is_empty() {
+        match resolve_prune_worktree(state, &allowed_roots, &worktree_raw) {
+            Ok(Some(found)) => scope.push(found),
+            Ok(None) => worktree_missing = true,
+            Err(resp) => return resp,
+        }
+    }
+
+    // Named paths take the same checks as a preview. A missing file is skipped: it is what the
+    // prune below is for.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for raw in &paths {
+        match resolve_artifact_candidate_path(state, raw) {
+            Ok(canon) => candidates.push(canon),
+            Err((404, _)) => {}
+            Err((status, msg)) => return HttpResponse::json(status, json!({ "error": msg })),
+        }
+    }
+
+    // Resolve before taking the store guard: discovery opens the store itself.
+    let mut session_ids: Vec<String> = Vec::new();
+    let mut session_tag = None;
+    if !session_raw.is_empty() {
+        let (canonical, _) = resolve_session_target(state, &session_raw);
+        let mut cwd: Option<String> = None;
+        if scope.is_empty()
+            && let Ok(store) = open_store_response(state)
+        {
+            cwd = lifecycle::find_hosted_session(&*store, &[&session_raw, &canonical])
+                .ok()
+                .flatten()
+                .and_then(|rec| rec.cwd);
+        }
+        // A cwd the Owner did not name is used only when it passes the same checks.
+        if let Some(cwd) = cwd
+            && let Ok(Some(found)) = resolve_prune_worktree(state, &allowed_roots, cwd.trim())
+        {
+            scope.push(found);
+        }
+        if !scope.is_empty() {
+            candidates.extend(discover_session_artifact_candidates(
+                state,
+                &session_raw,
+                &canonical,
+            ));
+        }
+        session_ids.push(session_raw.clone());
+        if canonical != session_raw {
+            session_ids.push(canonical.clone());
+        }
+        session_tag = Some(canonical);
+    }
+
+    if !worktree_missing {
+        preserve_artifacts(
+            state,
+            &root,
+            &ArtifactPreservation {
+                candidates,
+                scope,
+                session_tag,
+                session_ids,
+            },
+        );
+    }
+    let outcome = artifacts::with_registry(&root, |registry| {
+        registry.reconcile(&artifacts::managed_dir(&root), None)
+    });
+    HttpResponse::json(
+        200,
+        json!({
+            "ok": true,
+            "pruned_count": outcome.pruned,
+            "archived_count": outcome.archived.len(),
+            "active_count": outcome.live,
+        }),
+    )
+}
+
+/// `GET /api/v1/settings` (Record 4): the saved settings, or the defaults.
+fn handle_get_settings(state: &HubState) -> HttpResponse {
+    let Some(home) = hub_home_dir(state) else {
+        return HttpResponse::json(200, json!(settings::Settings::default()));
+    };
+    HttpResponse::json(200, json!(settings::load(&home)))
+}
+
+/// `PUT /api/v1/settings` (Record 4): merge a full or partial body into the saved settings.
+/// Owner only. Broadcasts `settings.updated` on the `settings` channel.
+fn handle_put_settings(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change settings" }),
+        );
+    }
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let patch: settings::SettingsPatch = match serde_json::from_value(body) {
+        Ok(patch) => patch,
+        Err(e) => {
+            return HttpResponse::json(400, json!({ "error": format!("invalid settings: {e}") }));
+        }
+    };
+    let Some(home) = hub_home_dir(state) else {
+        return HttpResponse::json(500, json!({ "error": "home directory unavailable" }));
+    };
+    match settings::update(&home, patch) {
+        Ok(updated) => {
+            let data = json!(updated);
+            state.broadcast("settings", "settings.updated", data.clone());
+            HttpResponse::json(200, data)
+        }
+        Err(settings::UpdateError::Invalid(msg)) => {
+            HttpResponse::json(400, json!({ "error": msg }))
+        }
+        Err(settings::UpdateError::Io(e)) => HttpResponse::json(
+            500,
+            json!({ "error": format!("could not save settings: {e}") }),
+        ),
+    }
 }
 
 fn handle_dynamic_api_routes(
@@ -4023,6 +4527,15 @@ fn handle_post_session_decommission(
 
     // Resolve before taking the store guard: discovery opens the store itself.
     let discovered = resolve_session_target(state, session_id);
+    let discovered_id = discovered.0.clone();
+    // Read-only discovery of what the session's transcript and brain reference; it opens the
+    // store itself, so it runs before the guard below. Nothing is archived until the teardown
+    // gate has passed.
+    let artifact_candidates = if mode == DecommissionMode::Teardown {
+        discover_session_artifact_candidates(state, session_id, &discovered_id)
+    } else {
+        Vec::new()
+    };
     let by = authority.actor_name();
     let env = lifecycle_env(state);
     let Ok(store) = open_store_response(state) else {
@@ -4038,6 +4551,13 @@ fn handle_post_session_decommission(
             lifecycle::prepare_decommission(&*store, &env, &target, by, caller)
         }
         DecommissionMode::Teardown => {
+            // Keep the session's artifacts before the teardown lets its worktree go. Asking the
+            // teardown's own gate first means a refused caller archives nothing. Best effort:
+            // archive_session_artifacts logs and swallows its failures, so the teardown and its
+            // status never depend on it.
+            if lifecycle::authorize_teardown(&*store, &target, caller).is_ok() {
+                archive_session_artifacts(state, &target, &discovered_id, artifact_candidates);
+            }
             lifecycle::teardown_session(&*store, &env, &target, by, caller, |key| {
                 state.clear_session_prompt_queue(key);
                 state.clear_session_model_override(key);
