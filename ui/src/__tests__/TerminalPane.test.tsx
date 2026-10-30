@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { TerminalPane } from "../components/TerminalPane";
+import { TerminalPane, formatTerminalOutputLog } from "../components/TerminalPane";
 import type { HubWsFrame } from "../types/api";
 
 describe("TerminalPane", () => {
@@ -130,5 +130,27 @@ describe("TerminalPane", () => {
         session_id: "term-owner-01",
       }),
     );
+  });
+
+  it("enforces left alignment on xterm-container and terminal-output-log and strips ANSI/non-PTY startup noise", () => {
+    expect(
+      formatTerminalOutputLog(
+        "bash: cannot set terminal process group (1234): Inappropriate ioctl for device\r\nbash: no job control in this shell\r\n\u001b[32mlmcfarlin@ai-lab-0\u001b[0m:~$ fl status\r\nOK\r\n",
+      ),
+    ).toBe("lmcfarlin@ai-lab-0:~$ fl status\nOK\n");
+
+    render(
+      <TerminalPane
+        authority={{ tier: "owner", login: "lmcfarlin" }}
+        sessionId="term-align-01"
+        cwd="/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop"
+        onSendTerminalFrame={vi.fn()}
+      />,
+    );
+
+    const xtermContainer = screen.getByTestId("xterm-container");
+    const outputLog = screen.getByTestId("terminal-output-log");
+    expect(xtermContainer.style.textAlign).toBe("left");
+    expect(outputLog.style.textAlign).toBe("left");
   });
 });

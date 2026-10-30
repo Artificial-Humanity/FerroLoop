@@ -384,6 +384,10 @@ describe("Mobile responsive sidebar drawer (Record 55)", () => {
     expect(sidebar).toHaveAttribute("data-mobile-open", "false");
     expect(screen.queryByTestId("mobile-sidebar-backdrop")).toBeNull();
 
+    // Clicking per-agent settings cog on roster row selects agent and opens agent-settings-modal
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(screen.getByTestId("agent-settings-modal")).toBeInTheDocument();
+
     unmount();
   });
 });

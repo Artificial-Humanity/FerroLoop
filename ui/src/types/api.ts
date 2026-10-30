@@ -102,6 +102,8 @@ export interface DiscoveredSessionSummary {
   source: "route" | "attempt" | string;
   adapter: "claude" | "antigravity" | "codex" | "muse" | "grok" | "webhook" | string;
   model?: string | null;
+  thinking_level?: string | null;
+  available_models?: string[] | null;
   persona?: string | null;
   status: string;
   updated_at?: string | null;
@@ -112,6 +114,7 @@ export interface DiscoveredSessionSummary {
 }
 
 export type DiscoveredSession = DiscoveredSessionSummary;
+export type SessionSummary = DiscoveredSessionSummary;
 
 export interface AgentsResponse {
   agents: AgentRecord[];
@@ -289,10 +292,16 @@ export interface InterruptSessionResponse {
   method: string;
 }
 
+export interface SetSessionModelRequest {
+  model: string;
+  thinking_level?: string | null;
+}
+
 export interface SetSessionModelResponse {
   session_id: string;
   vendor: string;
   model: string;
+  thinking_level?: string | null;
   switched: boolean;
   method: string;
 }

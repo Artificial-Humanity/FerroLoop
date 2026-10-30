@@ -25,6 +25,31 @@ export interface TerminalPaneProps {
   onOpenPairing?: () => void;
 }
 
+const ANSI_ESCAPE_REGEX =
+  // eslint-disable-next-line no-control-regex
+  /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b[@-Z\\-_]/g;
+
+export function formatTerminalOutputLog(raw: string): string {
+  if (!raw) {
+    return "";
+  }
+  const stripped = raw
+    .replace(ANSI_ESCAPE_REGEX, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n");
+  const lines = stripped.split("\n").filter((line) => {
+    const lower = line.toLowerCase();
+    if (lower.includes("cannot set terminal process group")) {
+      return false;
+    }
+    if (lower.includes("no job control in this shell")) {
+      return false;
+    }
+    return true;
+  });
+  return lines.join("\n").trimStart();
+}
+
 export const TerminalPane: React.FC<TerminalPaneProps> = ({
   authority,
   sessionId,
@@ -142,6 +167,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     if (!isJsdom) {
       try {
         term = new Terminal({
+          convertEol: true,
           cursorBlink: true,
           fontFamily:
             '"JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
@@ -406,6 +432,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       >
         <div
           ref={containerRef}
+          className="fd-terminal-viewport"
           data-testid="xterm-container"
           style={{
             flex: 1,
@@ -414,6 +441,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             border: "1px solid var(--border-subtle)",
             padding: "6px",
             backgroundColor: "#0A0D12",
+            textAlign: "left",
           }}
         />
 
@@ -433,9 +461,10 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
             overflowY: "auto",
             whiteSpace: "pre-wrap",
             wordBreak: "break-word",
+            textAlign: "left",
           }}
         >
-          {outputLog || "Ready for interactive PTY output..."}
+          {formatTerminalOutputLog(outputLog) || "Ready for interactive PTY output..."}
         </pre>
       </div>
 

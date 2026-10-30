@@ -161,7 +161,8 @@ describe("SpinUpAgentModal", () => {
 
     transcriptFetches.length = 0;
 
-    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    fireEvent.click(screen.getByTestId("open-decommission-modal-btn"));
     fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
 
     await waitFor(() => {

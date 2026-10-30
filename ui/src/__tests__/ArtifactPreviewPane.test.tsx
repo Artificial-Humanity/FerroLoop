@@ -3,7 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import { HubApiClient } from "../api/client";
 import type { HubWsClient } from "../api/ws";
 import { App } from "../App";
-import { ArtifactPreviewPane } from "../components/ArtifactPreviewPane";
+import {
+  ArtifactPreviewPane,
+  isUserFacingArtifactPath,
+} from "../components/ArtifactPreviewPane";
 import { OPEN_ARTIFACT_EVENT, dispatchOpenArtifact } from "../components/RichMarkdown";
 import type { ArtifactPreviewResponse } from "../types/api";
 
@@ -304,5 +307,66 @@ describe("ArtifactPreviewPane", () => {
     } finally {
       window.removeEventListener(OPEN_ARTIFACT_EVENT, windowSpy);
     }
+  });
+
+  it("filters quick-switch artifacts to User Documents & Media by default and reveals source files when switched to All Files", async () => {
+    expect(isUserFacingArtifactPath("docs/spec.md")).toBe(true);
+    expect(isUserFacingArtifactPath("assets/hero.png")).toBe(true);
+    expect(isUserFacingArtifactPath("docs/report.pdf")).toBe(true);
+    expect(isUserFacingArtifactPath("src/main.rs")).toBe(false);
+    expect(isUserFacingArtifactPath("ui/src/App.tsx")).toBe(false);
+
+    const mdPath = "/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop/docs/spec.md";
+    const rsPath = "/home/lmcfarlin/Projects/Artificial-Humanity/FerroLoop/src/main.rs";
+    const apiClient = makeApiClient({
+      [mdPath]: {
+        path: mdPath,
+        name: "spec.md",
+        ext: "md",
+        mime_type: "text/plain; charset=utf-8",
+        size_bytes: 32,
+        kind: "markdown",
+        content: "# Spec Doc",
+        raw_url: `/api/v1/artifacts/preview?path=${encodeURIComponent(mdPath)}&mode=raw`,
+        download_url: `/api/v1/artifacts/preview?path=${encodeURIComponent(mdPath)}&download=1`,
+      },
+      [rsPath]: {
+        path: rsPath,
+        name: "main.rs",
+        ext: "rs",
+        mime_type: "text/plain; charset=utf-8",
+        size_bytes: 32,
+        kind: "code",
+        content: "fn main() {}",
+        raw_url: `/api/v1/artifacts/preview?path=${encodeURIComponent(rsPath)}&mode=raw`,
+        download_url: `/api/v1/artifacts/preview?path=${encodeURIComponent(rsPath)}&download=1`,
+      },
+    });
+
+    render(
+      <ArtifactPreviewPane
+        apiClient={apiClient}
+        activePath={mdPath}
+        recentPaths={[mdPath, rsPath]}
+      />,
+    );
+
+    const filterSelect = screen.getByTestId("artifact-filter-select") as HTMLSelectElement;
+    expect(filterSelect.value).toBe("user-docs");
+
+    const switcher = screen.getByTestId("artifact-quick-switcher") as HTMLSelectElement;
+    const defaultOptions = Array.from(switcher.querySelectorAll("option")).map(
+      (opt) => opt.value,
+    );
+    expect(defaultOptions).toContain(mdPath);
+    expect(defaultOptions).not.toContain(rsPath);
+
+    // Switch filter to "all" -> includes main.rs
+    fireEvent.change(filterSelect, { target: { value: "all" } });
+    const allOptions = Array.from(switcher.querySelectorAll("option")).map(
+      (opt) => opt.value,
+    );
+    expect(allOptions).toContain(mdPath);
+    expect(allOptions).toContain(rsPath);
   });
 });
