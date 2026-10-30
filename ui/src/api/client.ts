@@ -62,6 +62,12 @@ import {
   type WorkflowRunDetailResponse,
   type WorktreeDiff,
   type WorktreeSummary,
+  type CreateRecordRequest,
+  type CreateRecordResponse,
+  type MoveRecordResponse,
+  type ProjectRecordItem,
+  type RecordState,
+  type RecordsListResponse,
 } from "../types/api";
 
 export function normalizeHubSettings(
@@ -853,6 +859,42 @@ export class HubApiClient {
     await this.request<unknown>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`, {
       method: "DELETE",
     });
+  }
+
+  public async listRecords(project?: string): Promise<RecordsListResponse> {
+    const qs = new URLSearchParams();
+    if (project && project.trim().length > 0) {
+      qs.set("project", project.trim());
+    }
+    const suffix = qs.toString() ? `?${qs.toString()}` : "";
+    return this.request<RecordsListResponse>(`/api/v1/records${suffix}`);
+  }
+
+  public async createRecord(
+    req: CreateRecordRequest,
+  ): Promise<{ record: ProjectRecordItem }> {
+    return this.request<CreateRecordResponse>("/api/v1/records", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  public async moveRecord(
+    id: string,
+    to: RecordState,
+    project?: string,
+  ): Promise<{ ok: boolean; outcome: string; record: ProjectRecordItem }> {
+    const body: { to: RecordState; project?: string } = { to };
+    if (project && project.trim().length > 0) {
+      body.project = project.trim();
+    }
+    return this.request<MoveRecordResponse>(
+      `/api/v1/records/${encodeURIComponent(id)}/move`,
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    );
   }
 }
 

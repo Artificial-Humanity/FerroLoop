@@ -14,6 +14,7 @@ import {
 import { HubDrawer } from "./components/HubDrawer";
 import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
+import { RecordsBoardPane } from "./components/RecordsBoardPane";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import { RosterSidebar } from "./components/RosterSidebar";
 import { SettingsModal } from "./components/SettingsModal";
@@ -1223,6 +1224,13 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             onReviewPr={handleReviewPr}
             onMergePr={handleMergePr}
             loading={loading}
+            apiClient={apiClient}
+          />
+        );
+      case "board":
+        return (
+          <RecordsBoardPane
+            selectedProject={selectedAgent?.project ?? null}
             apiClient={apiClient}
           />
         );
