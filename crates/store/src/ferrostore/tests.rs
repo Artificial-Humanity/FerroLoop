@@ -1658,6 +1658,11 @@ fn migration_refuses_a_non_empty_store_and_an_empty_redb_stays_empty() {
         .unwrap();
     let err = migrate_redb_to_ferrostore(&redb, &occupied).unwrap_err();
     assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    assert!(err.to_string().contains("column table"), "{err}");
+    let tabular = FerroStore::in_memory();
+    tabular.create_column_table("t", &int_column()).unwrap();
+    let err = migrate_redb_to_ferrostore(&redb, &tabular).unwrap_err();
+    assert!(err.to_string().contains("column table"), "{err}");
     assert_eq!(
         occupied.get_doc("docs", "kept").unwrap(),
         Some(json!({ "ok": true }))
@@ -2572,6 +2577,21 @@ fn sample_attempt(
     }
 }
 
+fn sample_error_run(gate: GateId, duration_ms: u64, cost_usd_micros: u64) -> GateRun {
+    GateRun {
+        id: None,
+        at: None,
+        gate,
+        record: None,
+        commit: "abc".into(),
+        verdict: Verdict::error("boom"),
+        population: 1,
+        output_excerpt: None,
+        duration_ms,
+        cost_usd_micros,
+    }
+}
+
 fn sample_run(gate: GateId, pass: bool, duration_ms: u64, cost_usd_micros: u64) -> GateRun {
     GateRun {
         id: None,
@@ -2604,6 +2624,9 @@ fn assert_rollups(store: &FerroStore) {
     store
         .append_gate_run(sample_run(gate_b.clone(), false, 9, 10))
         .unwrap();
+    store
+        .append_gate_run(sample_error_run(gate_a.clone(), 4, 5))
+        .unwrap();
 
     assert_eq!(
         store.attempt_rollup(None).unwrap(),
@@ -2631,9 +2654,9 @@ fn assert_rollups(store: &FerroStore) {
         GateRunRollup {
             pass: 1,
             fail: 1,
-            error: 0,
-            duration_ms: 16,
-            cost_usd_micros: 18,
+            error: 1,
+            duration_ms: 20,
+            cost_usd_micros: 23,
         }
     );
     assert_eq!(
@@ -2641,9 +2664,9 @@ fn assert_rollups(store: &FerroStore) {
         GateRunRollup {
             pass: 1,
             fail: 0,
-            error: 0,
-            duration_ms: 7,
-            cost_usd_micros: 8,
+            error: 1,
+            duration_ms: 11,
+            cost_usd_micros: 13,
         }
     );
     assert_eq!(store.gate_run_rollup(Some(&gate_b)).unwrap().fail, 1);
@@ -2662,4 +2685,257 @@ fn attempt_and_gate_rollups_match_hand_sums_locally_and_over_unix() {
     assert_rollups(&client);
     drop(client);
     drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("roll.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+    assert_rollups(&client);
+    drop(client);
+    drop(server);
+}
+
+fn float_column() -> Vec<ColumnDef> {
+    vec![ColumnDef {
+        name: "f".into(),
+        ty: ColumnType::Float64,
+    }]
+}
+
+fn float_bits(value: &ColumnValue) -> u64 {
+    match value {
+        ColumnValue::Float64(number) => number.to_bits(),
+        other => panic!("expected f64, got {other:?}"),
+    }
+}
+
+fn float_filter(predicate: ColumnPredicate) -> ColumnFilter {
+    ColumnFilter {
+        column: "f".into(),
+        predicate,
+    }
+}
+
+fn assert_non_finite_round_trip(store: &FerroStore) {
+    let payload = f64::from_bits(0x7ff8_0000_0000_0001);
+    assert_ne!(payload.to_bits(), f64::NAN.to_bits());
+    let rows = vec![
+        vec![ColumnValue::Float64(payload)],
+        vec![ColumnValue::Float64(f64::INFINITY)],
+        vec![ColumnValue::Float64(f64::NEG_INFINITY)],
+        vec![ColumnValue::Float64(1.5)],
+    ];
+    store.create_column_table("f", &float_column()).unwrap();
+    store.append_column_rows("f", &rows).unwrap();
+    let scan = store.scan_column_table("f", &[]).unwrap();
+    let got = scan
+        .rows
+        .iter()
+        .map(|row| float_bits(&row[0]))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        got,
+        vec![
+            payload.to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            1.5f64.to_bits(),
+        ]
+    );
+    let nan = store
+        .scan_column_table(
+            "f",
+            &[float_filter(ColumnPredicate::Eq(ColumnValue::Float64(
+                f64::NAN,
+            )))],
+        )
+        .unwrap();
+    assert_eq!(nan.row_groups_total, 1);
+    assert_eq!(nan.row_groups_skipped, 1);
+    assert!(nan.rows.is_empty());
+    let inverted = store
+        .scan_column_table(
+            "f",
+            &[float_filter(ColumnPredicate::Between {
+                low: ColumnValue::Float64(2.0),
+                high: ColumnValue::Float64(1.0),
+            })],
+        )
+        .unwrap();
+    assert_eq!(inverted.row_groups_skipped, 1);
+    assert!(inverted.rows.is_empty());
+    let finite = store
+        .scan_column_table(
+            "f",
+            &[float_filter(ColumnPredicate::Eq(ColumnValue::Float64(1.5)))],
+        )
+        .unwrap();
+    assert_eq!(finite.row_groups_skipped, 0);
+    assert_eq!(finite.rows.len(), 1);
+    assert_eq!(float_bits(&finite.rows[0][0]), 1.5f64.to_bits());
+}
+
+#[test]
+fn negative_zero_compares_equal_and_keeps_its_bits_across_reopen() {
+    let payload = f64::from_bits(0x7ff8_0000_0000_0001);
+    assert_ne!(payload.to_bits(), f64::NAN.to_bits());
+    let neg = -0.0f64;
+    let (_dir, path) = temp_fls();
+    {
+        let store = FerroStore::open(&path).unwrap();
+        store.create_column_table("f", &float_column()).unwrap();
+        store
+            .append_column_rows(
+                "f",
+                &[
+                    vec![ColumnValue::Float64(neg)],
+                    vec![ColumnValue::Float64(payload)],
+                ],
+            )
+            .unwrap();
+    }
+    let store = FerroStore::open(&path).unwrap();
+    let scan = store.scan_column_table("f", &[]).unwrap();
+    assert_eq!(float_bits(&scan.rows[0][0]), neg.to_bits());
+    assert_eq!(float_bits(&scan.rows[1][0]), payload.to_bits());
+    for predicate in [
+        ColumnPredicate::Eq(ColumnValue::Float64(0.0)),
+        ColumnPredicate::Le(ColumnValue::Float64(0.0)),
+        ColumnPredicate::Ge(ColumnValue::Float64(0.0)),
+    ] {
+        let hit = store
+            .scan_column_table("f", &[float_filter(predicate)])
+            .unwrap();
+        assert_eq!(hit.row_groups_skipped, 0);
+        assert_eq!(hit.rows.len(), 1);
+        assert_eq!(float_bits(&hit.rows[0][0]), neg.to_bits());
+    }
+}
+
+#[test]
+fn non_finite_floats_round_trip_locally_and_over_unix_and_ws() {
+    assert_non_finite_round_trip(&FerroStore::in_memory());
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("floats.fls");
+    let sock = dir.path().join("floats.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    assert_non_finite_round_trip(&client);
+    drop(client);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("floats.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("ws://{}", server.local_addr())).unwrap();
+    assert_non_finite_round_trip(&client);
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn le_and_ge_together_skip_a_group_only_when_a_zone_excludes_it() {
+    let store = FerroStore::in_memory();
+    store.create_column_table("t", &int_column()).unwrap();
+    store.append_column_rows("t", &ints(&[1, 2, 3])).unwrap();
+    store.append_column_rows("t", &ints(&[10, 20])).unwrap();
+    let scan = store
+        .scan_column_table(
+            "t",
+            &[
+                ColumnFilter {
+                    column: "n".into(),
+                    predicate: ColumnPredicate::Le(ColumnValue::Int64(5)),
+                },
+                ColumnFilter {
+                    column: "n".into(),
+                    predicate: ColumnPredicate::Ge(ColumnValue::Int64(2)),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(scan.row_groups_total, 2);
+    assert_eq!(scan.row_groups_skipped, 1);
+    assert_eq!(scan.rows, ints(&[2, 3]));
+
+    let overlap = FerroStore::in_memory();
+    overlap.create_column_table("t", &int_column()).unwrap();
+    overlap.append_column_rows("t", &ints(&[1, 10])).unwrap();
+    let scan = overlap
+        .scan_column_table(
+            "t",
+            &[
+                ColumnFilter {
+                    column: "n".into(),
+                    predicate: ColumnPredicate::Le(ColumnValue::Int64(2)),
+                },
+                ColumnFilter {
+                    column: "n".into(),
+                    predicate: ColumnPredicate::Ge(ColumnValue::Int64(9)),
+                },
+            ],
+        )
+        .unwrap();
+    assert_eq!(scan.row_groups_total, 1);
+    assert_eq!(scan.row_groups_skipped, 0);
+    assert!(scan.rows.is_empty());
+}
+
+#[test]
+fn a_row_group_that_does_not_decode_is_not_written() {
+    let store = FerroStore::in_memory();
+    store
+        .put_doc("docs", "a", &json!({ "kept": true }))
+        .unwrap();
+    store.create_column_table("t", &int_column()).unwrap();
+    let seq = store.read_state().unwrap().last_seq;
+    let err = store
+        .commit_if_seq(
+            seq,
+            &[Op::AppendColumnGroup {
+                name: "t".into(),
+                bytes: vec![0, 0, 0, 0],
+            }],
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("corrupt"), "{err}");
+    assert_eq!(store.read_state().unwrap().last_seq, seq);
+    assert!(store.scan_column_table("t", &[]).unwrap().rows.is_empty());
+    assert_eq!(
+        store.get_doc("docs", "a").unwrap(),
+        Some(json!({ "kept": true }))
+    );
+}
+
+#[test]
+fn a_version_2_snapshot_with_no_tables_or_a_bad_group_is_corrupt() {
+    let docs: BTreeMap<(String, String), serde_json::Value> = BTreeMap::new();
+    let tables: BTreeMap<String, super::columnar::ColumnTable> = BTreeMap::new();
+    let blob = layout::encode_snapshot_v2(1, &docs, &tables).unwrap();
+    let err = match layout::decode_snapshot(&blob) {
+        Ok(_) => panic!("version-2 snapshot with no tables opened"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("no column tables"), "{err}");
+
+    let mut tables = BTreeMap::new();
+    tables.insert(
+        "t".into(),
+        super::columnar::ColumnTable {
+            columns: int_column(),
+            groups: vec![vec![0, 0, 0, 0]],
+        },
+    );
+    let blob = layout::encode_snapshot_v2(1, &docs, &tables).unwrap();
+    let err = match layout::decode_snapshot(&blob) {
+        Ok(_) => panic!("version-2 snapshot with a bad row group opened"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("corrupt"), "{err}");
+
+    let v1 = layout::encode_snapshot(1, &docs).unwrap();
+    assert!(layout::decode_snapshot(&v1).unwrap().tables.is_empty());
 }

@@ -114,12 +114,14 @@ impl ZoneMap {
             return true;
         };
         match predicate {
-            ColumnPredicate::Eq(value) => is_lt(value, min) || is_gt(value, max),
-            ColumnPredicate::Lt(value) => is_ge(min, value),
-            ColumnPredicate::Le(value) => is_gt(min, value),
-            ColumnPredicate::Gt(value) => is_le(max, value),
-            ColumnPredicate::Ge(value) => is_lt(max, value),
-            ColumnPredicate::Between { low, high } => is_lt(max, low) || is_gt(min, high),
+            ColumnPredicate::Eq(value) => !(is_ge(value, min) && is_le(value, max)),
+            ColumnPredicate::Lt(value) => !is_lt(min, value),
+            ColumnPredicate::Le(value) => !is_le(min, value),
+            ColumnPredicate::Gt(value) => !is_gt(max, value),
+            ColumnPredicate::Ge(value) => !is_ge(max, value),
+            ColumnPredicate::Between { low, high } => {
+                !(is_le(low, high) && is_ge(max, low) && is_le(min, high))
+            }
         }
     }
 }
@@ -167,13 +169,20 @@ pub(super) fn check_new_table(
 }
 
 fn check_name(kind: &str, name: &str) -> Result<(), StoreError> {
-    if name.is_empty()
-        || name.len() > NAME_MAX
-        || name.as_bytes().contains(&b'/')
-        || name.as_bytes().contains(&0)
-    {
+    if name.is_empty() {
+        return Err(backend(format!("{kind} name is empty")));
+    }
+    if name.len() > NAME_MAX || name.as_bytes().contains(&b'/') || name.as_bytes().contains(&0) {
         return Err(backend(format!("invalid {kind} name {name:?}")));
     }
+    Ok(())
+}
+
+/// Decode `bytes` against `columns`. A bad header, a bad codec, or a row
+/// count of zero is rejected here, before a frame is published.
+pub(super) fn validate_row_group(columns: &[ColumnDef], bytes: &[u8]) -> Result<(), StoreError> {
+    let indexed = index_group(bytes, columns)?;
+    decode_indexed(columns, &indexed)?;
     Ok(())
 }
 
@@ -615,6 +624,9 @@ fn value_type(value: &ColumnValue) -> Option<ColumnType> {
 fn index_group<'a>(blob: &'a [u8], columns: &[ColumnDef]) -> Result<IndexedGroup<'a>, StoreError> {
     let mut cur = Cur::new(blob);
     let row_count_u32 = cur.u32()?;
+    if row_count_u32 == 0 {
+        return Err(corrupt("row group has no rows"));
+    }
     let row_count =
         usize::try_from(row_count_u32).map_err(|_| corrupt("row count does not fit"))?;
     let mut indexed = Vec::with_capacity(columns.len());
@@ -902,11 +914,18 @@ fn read_zone(cur: &mut Cur<'_>, ty: ColumnType) -> Result<ZoneMap, StoreError> {
             min: None,
             max: None,
         }),
-        1 => Ok(ZoneMap {
-            null_count,
-            min: Some(read_typed(cur, ty)?),
-            max: Some(read_typed(cur, ty)?),
-        }),
+        1 => {
+            let min = read_typed(cur, ty)?;
+            let max = read_typed(cur, ty)?;
+            if !is_le(&min, &max) {
+                return Err(corrupt("zone map bounds are not ordered"));
+            }
+            Ok(ZoneMap {
+                null_count,
+                min: Some(min),
+                max: Some(max),
+            })
+        }
         _ => Err(corrupt("zone map flag is not 0 or 1")),
     }
 }
@@ -1435,9 +1454,17 @@ pub(super) fn cell_json(cell: &ColumnValue) -> Result<Value, StoreError> {
         ColumnValue::Null => json!({"t": "null"}),
         ColumnValue::Int64(value) => json!({"t": "i64", "v": value}),
         ColumnValue::Float64(value) => {
-            let number = Number::from_f64(*value)
-                .ok_or_else(|| backend("f64 cell is not a finite json number"))?;
-            json!({"t": "f64", "v": number})
+            if value.is_finite() {
+                let number = Number::from_f64(*value)
+                    .ok_or_else(|| backend("f64 cell is not a finite json number"))?;
+                json!({"t": "f64", "v": number})
+            } else {
+                json!({
+                    "t": "f64",
+                    "v": non_finite_f64_label(*value),
+                    "bits": value.to_bits(),
+                })
+            }
         }
         ColumnValue::Bool(value) => json!({"t": "bool", "v": value}),
         ColumnValue::Utf8(value) => json!({"t": "utf8", "v": value}),
@@ -1457,10 +1484,7 @@ pub(super) fn parse_cell(value: &Value) -> Result<ColumnValue, StoreError> {
     let raw = value.get("v").ok_or_else(|| backend("cell is missing v"))?;
     match kind {
         "i64" => Ok(ColumnValue::Int64(json_i64(raw)?)),
-        "f64" => Ok(ColumnValue::Float64(
-            raw.as_f64()
-                .ok_or_else(|| backend("f64 cell is not a number"))?,
-        )),
+        "f64" => Ok(ColumnValue::Float64(parse_f64_cell(value)?)),
         "bool" => Ok(ColumnValue::Bool(
             raw.as_bool()
                 .ok_or_else(|| backend("bool cell is not a bool"))?,
@@ -1474,6 +1498,54 @@ pub(super) fn parse_cell(value: &Value) -> Result<ColumnValue, StoreError> {
         "ts" => Ok(ColumnValue::TimestampMs(json_i64(raw)?)),
         other => Err(backend(format!("unknown cell type `{other}`"))),
     }
+}
+
+fn non_finite_f64_label(value: f64) -> &'static str {
+    if value.is_nan() {
+        "NaN"
+    } else if value.is_sign_negative() {
+        "-Infinity"
+    } else {
+        "Infinity"
+    }
+}
+
+fn f64_label_matches(label: &str, value: f64) -> bool {
+    match label {
+        "NaN" => value.is_nan(),
+        "Infinity" => value.is_infinite() && value.is_sign_positive(),
+        "-Infinity" => value.is_infinite() && value.is_sign_negative(),
+        _ => false,
+    }
+}
+
+fn parse_f64_cell(cell: &Value) -> Result<f64, StoreError> {
+    let raw = cell.get("v").ok_or_else(|| backend("cell is missing v"))?;
+    if let Some(label) = raw.as_str() {
+        if !matches!(label, "NaN" | "Infinity" | "-Infinity") {
+            return Err(backend("finite f64 cell must not use a string"));
+        }
+        let Some(bits) = cell.get("bits") else {
+            return Ok(match label {
+                "NaN" => f64::NAN,
+                "Infinity" => f64::INFINITY,
+                _ => f64::NEG_INFINITY,
+            });
+        };
+        let bits = bits
+            .as_u64()
+            .ok_or_else(|| backend("f64 bits are not an integer in 0..=u64::MAX"))?;
+        let value = f64::from_bits(bits);
+        if !f64_label_matches(label, value) {
+            return Err(backend("f64 bits do not match v"));
+        }
+        return Ok(value);
+    }
+    if cell.get("bits").is_some() {
+        return Err(backend("finite f64 cell must not include bits"));
+    }
+    raw.as_f64()
+        .ok_or_else(|| backend("f64 cell is not a number"))
 }
 
 fn json_i64(value: &Value) -> Result<i64, StoreError> {
@@ -1936,5 +2008,129 @@ mod tests {
         };
         assert!(flags.excludes(&ColumnPredicate::Lt(ColumnValue::Bool(false))));
         assert!(!flags.excludes(&ColumnPredicate::Eq(ColumnValue::Bool(false))));
+
+        let floats = ZoneMap {
+            null_count: 0,
+            min: Some(ColumnValue::Float64(1.0)),
+            max: Some(ColumnValue::Float64(2.0)),
+        };
+        assert!(!floats.excludes(&ColumnPredicate::Le(ColumnValue::Float64(1.0))));
+        assert!(floats.excludes(&ColumnPredicate::Le(ColumnValue::Float64(0.5))));
+        assert!(!floats.excludes(&ColumnPredicate::Ge(ColumnValue::Float64(2.0))));
+        assert!(floats.excludes(&ColumnPredicate::Ge(ColumnValue::Float64(3.0))));
+        assert!(floats.excludes(&ColumnPredicate::Eq(ColumnValue::Float64(f64::NAN))));
+        assert!(floats.excludes(&ColumnPredicate::Lt(ColumnValue::Float64(f64::NAN))));
+        assert!(floats.excludes(&ColumnPredicate::Le(ColumnValue::Float64(f64::NAN))));
+        assert!(floats.excludes(&ColumnPredicate::Gt(ColumnValue::Float64(f64::NAN))));
+        assert!(floats.excludes(&ColumnPredicate::Ge(ColumnValue::Float64(f64::NAN))));
+        assert!(floats.excludes(&ColumnPredicate::Between {
+            low: ColumnValue::Float64(2.0),
+            high: ColumnValue::Float64(1.0),
+        }));
+    }
+
+    #[test]
+    fn non_finite_f64_json_round_trips_bits_and_rejects_a_mismatch() {
+        let payload = f64::from_bits(0x7ff8_0000_0000_0001);
+        assert_ne!(payload.to_bits(), f64::NAN.to_bits());
+        for value in [payload, f64::INFINITY, f64::NEG_INFINITY, -0.0] {
+            let encoded = cell_json(&ColumnValue::Float64(value)).unwrap();
+            let text = serde_json::to_string(&encoded).unwrap();
+            let parsed: Value = serde_json::from_str(&text).unwrap();
+            let ColumnValue::Float64(number) = parse_cell(&parsed).unwrap() else {
+                panic!("expected f64");
+            };
+            assert_eq!(number.to_bits(), value.to_bits(), "{text}");
+            if value.is_finite() {
+                assert!(parsed.get("bits").is_none(), "{parsed}");
+            }
+        }
+        let ColumnValue::Float64(canonical) = parse_cell(&json!({"t": "f64", "v": "NaN"})).unwrap()
+        else {
+            panic!("expected f64");
+        };
+        assert_eq!(canonical.to_bits(), f64::NAN.to_bits());
+        let ColumnValue::Float64(inf) = parse_cell(&json!({"t": "f64", "v": "Infinity"})).unwrap()
+        else {
+            panic!("expected f64");
+        };
+        assert_eq!(inf.to_bits(), f64::INFINITY.to_bits());
+        let err = parse_cell(&json!({
+            "t": "f64",
+            "v": "Infinity",
+            "bits": payload.to_bits(),
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("do not match"), "{err}");
+        let err = parse_cell(&json!({"t": "f64", "v": "1.5"})).unwrap_err();
+        assert!(err.to_string().contains("string"), "{err}");
+        let err = parse_cell(&json!({"t": "f64", "v": "NaN", "bits": -1})).unwrap_err();
+        assert!(err.to_string().contains("0..=u64::MAX"), "{err}");
+        let err = parse_cell(&json!({"t": "f64", "v": "NaN", "bits": 1.5})).unwrap_err();
+        assert!(err.to_string().contains("0..=u64::MAX"), "{err}");
+        let err = parse_cell(&json!({"t": "f64", "v": 1.5, "bits": 0})).unwrap_err();
+        assert!(err.to_string().contains("bits"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_row_group_and_a_nan_zone_bound_are_corrupt() {
+        let columns = int_col();
+        let mut empty = Vec::new();
+        write_u32(&mut empty, 0);
+        write_u64(&mut empty, 0);
+        empty.push(0);
+        empty.push(CODEC_DELTA);
+        write_u32(&mut empty, 0);
+        let err = validate_row_group(&columns, &empty).unwrap_err();
+        assert!(err.to_string().contains("no rows"), "{err}");
+
+        let good = encode_row_group(&columns, &[vec![ColumnValue::Int64(4)]]).unwrap();
+        validate_row_group(&columns, &good).unwrap();
+        let mut bad = good;
+        assert_eq!(bad[29], CODEC_DELTA);
+        bad[29] = 0xff;
+        let err = validate_row_group(&columns, &bad).unwrap_err();
+        assert!(err.to_string().contains("codec"), "{err}");
+
+        let mut blob = Vec::new();
+        write_u32(&mut blob, 1);
+        write_u64(&mut blob, 0);
+        blob.push(1);
+        write_i64(&mut blob, 1);
+        write_i64(&mut blob, 1);
+        blob.push(CODEC_DELTA);
+        let mut body = vec![0u8];
+        write_i64(&mut body, 1);
+        write_u32(&mut blob, u32::try_from(body.len()).unwrap());
+        blob.extend_from_slice(&body);
+        write_u64(&mut blob, 0);
+        blob.push(1);
+        blob.extend_from_slice(&f64::NAN.to_le_bytes());
+        blob.extend_from_slice(&f64::NAN.to_le_bytes());
+        blob.push(CODEC_PLAIN);
+        let mut body = vec![0u8];
+        body.extend_from_slice(&1.0f64.to_le_bytes());
+        write_u32(&mut blob, u32::try_from(body.len()).unwrap());
+        blob.extend_from_slice(&body);
+        let columns = vec![
+            ColumnDef {
+                name: "n".to_string(),
+                ty: ColumnType::Int64,
+            },
+            ColumnDef {
+                name: "f".to_string(),
+                ty: ColumnType::Float64,
+            },
+        ];
+        let err = scan_groups(
+            &columns,
+            &[blob],
+            &[ColumnFilter {
+                column: "n".to_string(),
+                predicate: ColumnPredicate::Eq(ColumnValue::Int64(99)),
+            }],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not ordered"), "{err}");
     }
 }

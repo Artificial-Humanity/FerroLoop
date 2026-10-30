@@ -1,6 +1,8 @@
 //! Little-endian `.fls` layout: superblocks, copy-on-write snapshots, WAL frames.
 
-use super::columnar::{ColumnDef, ColumnTable, type_from_tag, type_tag};
+use super::columnar::{
+    ColumnDef, ColumnTable, check_new_table, type_from_tag, type_tag, validate_row_group,
+};
 use fl_core::StoreError;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -307,6 +309,9 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
     let mut tables = BTreeMap::new();
     if version == SNAPSHOT_VERSION_COLUMNAR {
         let table_count = cur.u32()?;
+        if table_count == 0 {
+            return Err(corrupt("snapshot has no column tables"));
+        }
         if usize::try_from(table_count).unwrap_or(usize::MAX) > cur.remaining() {
             return Err(corrupt("snapshot table count exceeds the blob"));
         }
@@ -333,12 +338,14 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
             for _ in 0..group_count {
                 groups.push(cur.lp()?.to_vec());
             }
-            if tables
-                .insert(name.clone(), ColumnTable { columns, groups })
-                .is_some()
-            {
+            if tables.contains_key(&name) {
                 return Err(corrupt(format!("snapshot repeats column table `{name}`")));
             }
+            check_new_table(&tables, &name, &columns)?;
+            for group in &groups {
+                validate_row_group(&columns, group)?;
+            }
+            tables.insert(name, ColumnTable { columns, groups });
         }
     }
     cur.finish()?;

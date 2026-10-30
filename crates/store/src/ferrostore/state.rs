@@ -1,7 +1,7 @@
 //! Document map, top-level field index, Okapi BM25, and FerroMQ views.
 //! Indexes are derived from documents; they are not part of the log.
 
-use super::columnar::ColumnTable;
+use super::columnar::{ColumnTable, check_new_table, validate_row_group};
 use super::layout::{Op, backend, corrupt};
 use fl_core::StoreError;
 use serde_json::Value;
@@ -119,10 +119,7 @@ fn apply_op(state: &mut DocState, op: &Op) -> Result<(), StoreError> {
             state.docs.remove(&(collection.clone(), id.clone()));
         }
         Op::CreateColumnTable { name, columns } => {
-            reject_empty_table(name)?;
-            if state.tables.contains_key(name) {
-                return Err(corrupt(format!("column table `{name}` already exists")));
-            }
+            check_new_table(&state.tables, name, columns)?;
             state.tables.insert(
                 name.clone(),
                 ColumnTable {
@@ -132,19 +129,12 @@ fn apply_op(state: &mut DocState, op: &Op) -> Result<(), StoreError> {
             );
         }
         Op::AppendColumnGroup { name, bytes } => {
-            reject_empty_table(name)?;
             let Some(table) = state.tables.get_mut(name) else {
                 return Err(corrupt(format!("append to missing column table `{name}`")));
             };
+            validate_row_group(&table.columns, bytes)?;
             table.groups.push(bytes.clone());
         }
-    }
-    Ok(())
-}
-
-fn reject_empty_table(name: &str) -> Result<(), StoreError> {
-    if name.is_empty() {
-        return Err(corrupt("column table name is empty"));
     }
     Ok(())
 }
