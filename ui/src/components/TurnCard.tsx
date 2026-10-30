@@ -106,9 +106,56 @@ export function stripAgyUserRequestWrapper(content: string): string {
     .trim();
 }
 
+export function isSubagentHandbackContent(content: string): boolean {
+  if (!content) {
+    return false;
+  }
+  const withoutClaudeForward = content
+    .trimStart()
+    .replace(/^Another Claude session sent a message:\s*/i, "")
+    .trimStart();
+  return (
+    /^<agent-message\b/i.test(withoutClaudeForward) ||
+    /^\[Subagent\s/i.test(withoutClaudeForward) ||
+    withoutClaudeForward.includes("[Subagent hand-back]")
+  );
+}
+
+/**
+ * Strip Claude / subagent hand-back wrapper tags and boilerplate header so expanded
+ * `Wire · subagent` turns cleanly render the subagent's Markdown report.
+ */
+export function stripSubagentHandbackWrapper(content: string): string {
+  if (!content) {
+    return "";
+  }
+  return content
+    .replace(/^\s*Another Claude session sent a message:\s*/i, "")
+    .replace(/^\s*<agent-message[^>]*>\s*/i, "")
+    .replace(/\s*<\/agent-message>\s*$/i, "")
+    .replace(
+      /^\s*(?:\[Subagent hand-back\][\s\S]*?The report follows:\s*|\[Subagent [^\]]+\]\s*)/i,
+      "",
+    )
+    .trim();
+}
+
+function hasSystemNoticePrefix(text: string): boolean {
+  return (
+    /^\[Notice\]\s/i.test(text) ||
+    /^<EPHEMERAL_MESSAGE>/i.test(text) ||
+    /^<task-notification[\s>]/i.test(text) ||
+    /^<local-command-caveat[\s>]/i.test(text) ||
+    /^<local-command-stdout[\s>]/i.test(text) ||
+    /^\[SYSTEM NOTIFICATION - NOT USER INPUT\]/i.test(text) ||
+    (/^<SYSTEM_MESSAGE>/i.test(text) &&
+      !text.includes("[Operator Prompt via FerroDeck"))
+  );
+}
+
 export function extractTurnAttachments(
   content: string,
-  options?: { stripAgyWrapper?: boolean },
+  options?: { stripAgyWrapper?: boolean; stripSubagentWrapper?: boolean },
 ): {
   cleanedContent: string;
   attachments: ParsedTurnAttachment[];
@@ -117,7 +164,10 @@ export function extractTurnAttachments(
     return { cleanedContent: "", attachments: [] };
   }
   const shouldStrip = options?.stripAgyWrapper ?? true;
-  const stripped = shouldStrip ? stripAgyUserRequestWrapper(content) : content;
+  const agyStripped = shouldStrip ? stripAgyUserRequestWrapper(content) : content;
+  const stripped = options?.stripSubagentWrapper
+    ? stripSubagentHandbackWrapper(agyStripped)
+    : agyStripped;
   const attachments: ParsedTurnAttachment[] = [];
   const attachmentRegex = /\[Attached file:\s*([^\])\n]+?)(?:\s+\(([^)\n]+)\))?\]/g;
   const cleanedContent = stripped
@@ -157,24 +207,32 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   );
   // Defensive: raw system/code snippet dumps can be mislabeled as user turns.
   const looksLikeSystemCodeDump = /^"\)\r?\n\d+:\s/.test(trimmedStart);
-  // Defensive: Antigravity [Notice], <EPHEMERAL_MESSAGE>, and non-operator <SYSTEM_MESSAGE>
-  // blocks arrive with role === "user" but represent system notices.
+  // Defensive: Antigravity [Notice], <EPHEMERAL_MESSAGE>, non-operator <SYSTEM_MESSAGE>,
+  // and Claude internal notification/command tags arrive with role === "user" but represent system notices.
   const looksLikeSystemNotice =
-    /^\[Notice\]\s/i.test(trimmedStart) ||
-    /^\[Notice\]\s/i.test(strippedForNotice) ||
-    /^<EPHEMERAL_MESSAGE>/i.test(trimmedStart) ||
-    (/^<SYSTEM_MESSAGE>/i.test(trimmedStart) &&
-      !trimmedStart.includes("[Operator Prompt via FerroDeck"));
+    hasSystemNoticePrefix(trimmedStart) || hasSystemNoticePrefix(strippedForNotice);
+  // Defensive: Subagent hand-back messages can arrive as role === "user" when forwarded
+  // across sessions; always render them as collapsed `Wire · subagent` cards.
+  const looksLikeSubagentHandback =
+    (roleNormalized === "user" || roleNormalized === "wire:subagent") &&
+    (isSubagentHandbackContent(trimmedStart) || isSubagentHandbackContent(strippedForNotice));
   const isUser =
     roleNormalized === "user" &&
     !looksLikeBackgroundTaskOutput &&
     !looksLikeSystemCodeDump &&
-    !looksLikeSystemNotice;
-  const isWire = roleNormalized.startsWith("wire:");
-  const wireSender = isWire ? turn.role.slice(5) : null;
+    !looksLikeSystemNotice &&
+    !looksLikeSubagentHandback;
+  const isWire = roleNormalized.startsWith("wire:") || looksLikeSubagentHandback;
+  const wireSender = roleNormalized.startsWith("wire:")
+    ? turn.role.slice(5)
+    : looksLikeSubagentHandback
+      ? "subagent"
+      : null;
   const isSystem =
     roleNormalized === "system" ||
-    (roleNormalized === "user" && (looksLikeSystemCodeDump || looksLikeSystemNotice));
+    (roleNormalized === "user" &&
+      !looksLikeSubagentHandback &&
+      (looksLikeSystemCodeDump || looksLikeSystemNotice));
   const isToolOutput =
     roleNormalized === "tool" ||
     looksLikeBackgroundTaskOutput ||
@@ -205,8 +263,9 @@ export const TurnCard: React.FC<TurnCardProps> = ({
     () =>
       extractTurnAttachments(turn.content, {
         stripAgyWrapper: shouldStripAgyWrapper,
+        stripSubagentWrapper: looksLikeSubagentHandback,
       }),
-    [turn.content, shouldStripAgyWrapper],
+    [turn.content, shouldStripAgyWrapper, looksLikeSubagentHandback],
   );
 
   // Prose agent output addressed to the operator is the conversation's
