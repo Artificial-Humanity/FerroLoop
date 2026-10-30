@@ -52,21 +52,7 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
                 return Err(format!("claude pid {pid} is no longer running"));
             }
-            let resolved_key = key_path.clone().or_else(|| {
-                std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
-                    resolve_claude_key_path(&h.join(".claude").join("sessions"), *pid, socket_path)
-                })
-            });
-            let Some(kpath) = resolved_key else {
-                return Err(format!(
-                    "missing claude session key file for pid {pid} ({})",
-                    socket_path.display()
-                ));
-            };
-            let key_raw = fs::read_to_string(&kpath)
-                .map_err(|e| format!("failed to read {}: {e}", kpath.display()))?;
-            let key_json: serde_json::Value = serde_json::from_str(&key_raw)
-                .map_err(|e| format!("invalid JSON in {}: {e}", kpath.display()))?;
+            let (kpath, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref())?;
             let peer_token = key_json
                 .get("peerToken")
                 .and_then(|v| v.as_str())
@@ -1150,6 +1136,51 @@ fn prefixed_operator_body(sender_name: &str, body: &str) -> String {
     }
 }
 
+/// The session key file of a Claude route (its `key_path`, else the one under `~/.claude`)
+/// and its parsed JSON.
+fn read_claude_key(
+    pid: u32,
+    socket_path: &Path,
+    key_path: Option<&Path>,
+) -> Result<(PathBuf, serde_json::Value), String> {
+    let resolved_key = key_path.map(Path::to_path_buf).or_else(|| {
+        std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
+            resolve_claude_key_path(&h.join(".claude").join("sessions"), pid, socket_path)
+        })
+    });
+    let Some(kpath) = resolved_key else {
+        return Err(format!(
+            "missing claude session key file for pid {pid} ({})",
+            socket_path.display()
+        ));
+    };
+    let key_raw = fs::read_to_string(&kpath)
+        .map_err(|e| format!("failed to read {}: {e}", kpath.display()))?;
+    let key_json: serde_json::Value = serde_json::from_str(&key_raw)
+        .map_err(|e| format!("invalid JSON in {}: {e}", kpath.display()))?;
+    Ok((kpath, key_json))
+}
+
+/// The live tmux pane id (`%<n>`) a Claude route's session key file names, or `None` for any
+/// other vendor, a stopped process, an unreadable key file, or a pane that is not alive.
+/// An interrupt of a session the hub does not host uses it as the pane to send `Escape` to.
+pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
+    let VendorRoute::Claude {
+        pid,
+        socket_path,
+        key_path,
+        ..
+    } = route
+    else {
+        return None;
+    };
+    if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
+        return None;
+    }
+    let (_, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref()).ok()?;
+    claude_live_tmux_pane(&key_json)
+}
+
 pub fn dispatch_operator_prompt_to_route(
     route: &VendorRoute,
     sender_name: &str,
@@ -1165,21 +1196,7 @@ pub fn dispatch_operator_prompt_to_route(
             if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
                 return Err(format!("claude pid {pid} is no longer running"));
             }
-            let resolved_key = key_path.clone().or_else(|| {
-                std::env::var_os("HOME").map(PathBuf::from).and_then(|h| {
-                    resolve_claude_key_path(&h.join(".claude").join("sessions"), *pid, socket_path)
-                })
-            });
-            let Some(kpath) = resolved_key else {
-                return Err(format!(
-                    "missing claude session key file for pid {pid} ({})",
-                    socket_path.display()
-                ));
-            };
-            let key_raw = fs::read_to_string(&kpath)
-                .map_err(|e| format!("failed to read {}: {e}", kpath.display()))?;
-            let key_json: serde_json::Value = serde_json::from_str(&key_raw)
-                .map_err(|e| format!("invalid JSON in {}: {e}", kpath.display()))?;
+            let (kpath, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref())?;
             // The owner's own chat prompt is delivered as direct terminal input when the
             // session runs in a live tmux pane. The peer-session socket below labels every
             // message "came from another Claude session", which is wrong for the owner. Only

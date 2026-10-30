@@ -3625,6 +3625,13 @@ fn reset_session(
     {
         state.clear_session_prompt_queue(name);
     }
+    // The session starts over, so a model the operator chose for the old run no longer applies.
+    for key in [Some(canonical_id), Some(raw_session_id), persona]
+        .into_iter()
+        .flatten()
+    {
+        state.clear_session_model_override(key);
+    }
 
     let prompt = if mode == "reforge" {
         let lookup = persona.unwrap_or(canonical_id);
@@ -3690,8 +3697,10 @@ fn handle_post_session_interrupt(
         Err(e) => return HttpResponse::json(404, json!({ "error": e })),
     };
     // Claude and Codex routes carry no tmux target; a hosted session's record names its pane.
+    // A Claude session the hub does not host falls back to the live pane its key file names.
     let hosted_tmux = hosted_record_for(state, &[session_id, &canonical_id], persona.as_deref())
-        .and_then(|record| record.tmux_target);
+        .and_then(|record| record.tmux_target)
+        .or_else(|| fl_wire::dispatcher::claude_route_live_pane(&route));
     let method = match session_actions::interrupt_route(
         &lifecycle_env(state),
         &route,
@@ -3797,8 +3806,20 @@ fn handle_post_session_model(
         (None, None, None) => "unknown".to_string(),
     };
 
+    // Key the override by the discovered session id. A session discovery does not list (a
+    // route or hosted record only) has no id a summary could match, so it is keyed by its
+    // lowercased persona, which `apply_model_overrides` also matches.
+    let override_key = match matched {
+        Some(s) => s.id.clone(),
+        None => hosted
+            .as_ref()
+            .map(|record| record.persona.as_str())
+            .or(persona.as_deref())
+            .unwrap_or(&canonical_id)
+            .to_ascii_lowercase(),
+    };
     state.set_session_model_override(
-        &canonical_id,
+        &override_key,
         ModelOverride {
             model: model.clone(),
             thinking_level: thinking_level.clone(),
@@ -3962,6 +3983,9 @@ fn handle_post_session_spin_up(
         caller_of(authority),
     ) {
         Ok(out) => {
+            // A new run has its own model: drop what the operator chose for an earlier one.
+            state.clear_session_model_override(&out.session_id);
+            state.clear_session_model_override(&out.persona);
             let data = serde_json::to_value(&out).unwrap_or_default();
             state.broadcast("sessions", "session.spun_up", data.clone());
             HttpResponse::json(200, data)
@@ -4009,7 +4033,8 @@ fn handle_post_session_decommission(
         }
         DecommissionMode::Teardown => {
             lifecycle::teardown_session(&*store, &env, &target, by, caller, |key| {
-                state.clear_session_prompt_queue(key)
+                state.clear_session_prompt_queue(key);
+                state.clear_session_model_override(key);
             })
         }
     };

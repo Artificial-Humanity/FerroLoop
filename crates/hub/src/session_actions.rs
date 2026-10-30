@@ -55,8 +55,10 @@ pub fn validate_thinking_level(raw: &str) -> Result<String, String> {
     }
 }
 
-/// Put each session's override over what discovery found. A session with no override is
-/// untouched. An override without a thinking level keeps the discovered one.
+/// Put each session's override over what discovery found. An override is keyed by a session id
+/// or by a lowercased persona (see `HubState::set_session_model_override`): a session matches on
+/// its id first and its persona second. A session with no override is untouched. An override
+/// without a thinking level keeps the discovered one.
 pub fn apply_model_overrides(
     sessions: &mut [DiscoveredSessionSummary],
     overrides: &BTreeMap<String, ModelOverride>,
@@ -65,7 +67,13 @@ pub fn apply_model_overrides(
         return;
     }
     for session in sessions {
-        if let Some(over) = overrides.get(&session.id) {
+        let found = overrides.get(&session.id).or_else(|| {
+            session
+                .persona
+                .as_deref()
+                .and_then(|persona| overrides.get(&persona.to_ascii_lowercase()))
+        });
+        if let Some(over) = found {
             session.model = Some(over.model.clone());
             if over.thinking_level.is_some() {
                 session.thinking_level = over.thinking_level.clone();

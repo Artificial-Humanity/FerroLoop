@@ -139,11 +139,24 @@ fn contained_entries(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Read at most [`MAX_FILE_BYTES`] of `path` as UTF-8; `None` when unreadable or not text.
+///
+/// The cap can cut a multibyte character in half. That incomplete tail is dropped, so a file
+/// whose frontmatter is valid is still read; bytes that are invalid anywhere else are not text.
 fn read_capped(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES).read_to_end(&mut bytes).ok()?;
-    String::from_utf8(bytes).ok()
+    let capped = u64::try_from(bytes.len()).is_ok_and(|len| len >= MAX_FILE_BYTES);
+    match String::from_utf8(bytes) {
+        Ok(text) => Some(text),
+        Err(err) if capped && err.utf8_error().error_len().is_none() => {
+            let valid = err.utf8_error().valid_up_to();
+            let mut bytes = err.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).ok()
+        }
+        Err(_) => None,
+    }
 }
 
 fn valid_name(name: &str) -> bool {
@@ -388,6 +401,36 @@ mod tests {
                 entry("ship", "workflow", "Ship it"),
             ]
         );
+    }
+
+    #[test]
+    fn read_capped_drops_a_multibyte_character_cut_by_the_cap() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let cap = usize::try_from(MAX_FILE_BYTES).unwrap();
+        let head = "---\nname: big\ndescription: Big skill\n---\n";
+        // A 3-byte character starting one byte before the cap: the cap keeps only its first byte.
+        let mut body = head.to_string();
+        body.push_str(&"a".repeat(cap - head.len() - 1));
+        body.push('\u{20ac}');
+        body.push_str("tail");
+        assert!(body.len() > cap && !body.is_char_boundary(cap));
+        write(&root.join(".agents/skills/big/SKILL.md"), &body);
+        let text = read_capped(&root.join(".agents/skills/big/SKILL.md")).unwrap();
+        assert_eq!(text.len(), cap - 1);
+        assert_eq!(
+            discover_skills(&root.join(SKILLS_DIR)),
+            vec![entry("big", "skill", "Big skill")]
+        );
+
+        // Bytes that are not UTF-8 anywhere else are still not text.
+        let bad = root.join("bad.bin");
+        fs::write(&bad, b"---\nname: x\n\xff\xfe---\n").unwrap();
+        assert_eq!(read_capped(&bad), None);
+        // A short file that ends mid-character was not cut by the cap, so it is not text either.
+        let short = root.join("short.bin");
+        fs::write(&short, b"abc\xe2\x82").unwrap();
+        assert_eq!(read_capped(&short), None);
     }
 
     #[test]

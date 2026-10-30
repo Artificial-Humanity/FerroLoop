@@ -197,9 +197,13 @@ impl HubState {
         }
     }
 
-    /// Remember the model an operator chose for `session_id` (canonical id). The map is in
-    /// memory only: it is lost when the hub restarts, after which discovery reports what the
-    /// vendor session itself says. `GET /api/v1/sessions` overlays it on every summary.
+    /// Remember the model an operator chose. `key` is the discovered session id when discovery
+    /// lists the session, else the lowercased persona: [`session_actions::apply_model_overrides`]
+    /// matches a summary on its id first and its persona second, so either key applies. The map
+    /// is in memory only: it is lost when the hub restarts, after which discovery reports what
+    /// the vendor session itself says, and an override is dropped by
+    /// [`HubState::clear_session_model_override`] when its session is cleared, reforged,
+    /// spun up again or torn down. `GET /api/v1/sessions` overlays it on every summary.
     pub fn set_session_model_override(
         &self,
         session_id: &str,
@@ -210,6 +214,18 @@ impl HubState {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         guard.insert(session_id.to_string(), model_override);
+    }
+
+    /// Drop the override recorded under `key`, or under its lowercased form (the persona key).
+    /// A session that is cleared, reforged, spun up or torn down no longer runs the model the
+    /// operator chose for its previous run, so the override must not mask what it reports now.
+    pub fn clear_session_model_override(&self, key: &str) {
+        let mut guard = self
+            .model_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.remove(key);
+        guard.remove(&key.to_ascii_lowercase());
     }
 
     pub fn session_model_override(
@@ -4004,6 +4020,47 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_endpoint_uses_the_key_file_pane_of_a_claude_session_the_hub_does_not_host() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let _listener = install_claude_tmux_route(tmp.path(), "felicity");
+        let post = |persona: &str| {
+            call(
+                &state,
+                "POST",
+                &format!("/api/v1/sessions/{persona}/interrupt"),
+                OWNER,
+                &json!({}),
+            )
+        };
+
+        // No hosted record, but the key file names a live pane: the interrupt has a target.
+        let resp = post("felicity");
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let data = resp.json_value().unwrap();
+        assert_eq!(data["vendor"], "claude");
+        assert_eq!(data["method"], "noop-test");
+        assert!(
+            tmux.log().contains("display-message -p -t %12"),
+            "{}",
+            tmux.log()
+        );
+
+        // A key file whose pane is a session name (not a `%n` pane id) or that is missing is
+        // still a 502.
+        fs::write(
+            tmp.path().join("felicity.key"),
+            json!({ "peerToken": "t", "tmux": "Felicity:@12" }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(post("felicity").status, 502);
+        fs::remove_file(tmp.path().join("felicity.key")).unwrap();
+        assert_eq!(post("felicity").status, 502);
+    }
+
+    #[test]
     fn interrupt_endpoint_finds_a_claude_pane_in_the_hosted_record_and_handles_antigravity() {
         use fl_wire::identity::VendorRoute;
 
@@ -4169,6 +4226,117 @@ mod tests {
             })
             .collect();
         assert_eq!(bodies, vec!["/model claude-opus-5-5", "/model gpt-6-sol"]);
+    }
+
+    fn set_model(state: &HubState, target: &str, model: &str) {
+        let resp = call(
+            state,
+            "POST",
+            &format!("/api/v1/sessions/{target}/model"),
+            OWNER,
+            &json!({ "model": model }),
+        );
+        assert_eq!(resp.status, 200, "{target}: {}", error_text(&resp));
+    }
+
+    fn listed_model(state: &HubState, id: &str) -> Value {
+        let listed = call(state, "GET", "/api/v1/sessions", OWNER, &json!({}));
+        let sessions = listed.json_value().unwrap()["sessions"]
+            .as_array()
+            .unwrap()
+            .clone();
+        sessions.iter().find(|s| s["id"] == id).unwrap()["model"].clone()
+    }
+
+    #[test]
+    fn model_override_applies_when_the_session_matches_by_persona_only() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        install_route(
+            tmp.path(),
+            "felicia",
+            webhook_route(&tmp.path().join("felicia.sock")),
+        );
+
+        // `Felicia` is not the discovered persona, so the request matches no summary, but it
+        // does find the route. The override is keyed by the lowercased persona and still shows.
+        set_model(&state, "Felicia", "model-a");
+        assert_eq!(
+            state.session_model_override("felicia").unwrap().model,
+            "model-a"
+        );
+        assert!(state.session_model_override("Felicia").is_none());
+        assert_eq!(listed_model(&state, "webhook-felicia"), "model-a");
+
+        // A hosted session with no route yet: the override waits under its persona, and shows
+        // as soon as discovery lists the session.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        set_model(&state, "claude:ada", "model-b");
+        assert_eq!(
+            state.session_model_override("ada").unwrap().model,
+            "model-b"
+        );
+        install_route(
+            tmp.path(),
+            "ada",
+            webhook_route(&tmp.path().join("ada.sock")),
+        );
+        assert_eq!(listed_model(&state, "webhook-ada"), "model-b");
+        // A session id match wins over a persona key.
+        state.set_session_model_override(
+            "webhook-ada",
+            session_actions::ModelOverride {
+                model: "model-c".into(),
+                thinking_level: None,
+            },
+        );
+        assert_eq!(listed_model(&state, "webhook-ada"), "model-c");
+    }
+
+    #[test]
+    fn model_override_is_dropped_on_reset_spin_up_and_teardown() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+
+        // Clear: the override of the discovered session id goes.
+        let socket = tmp.path().join("felicia.sock");
+        install_route(tmp.path(), "felicia", webhook_route(&socket));
+        // The webhook takes `/model model-a`, then `/clear`.
+        let lines = collect_webhook_lines(socket, 2);
+        set_model(&state, "felicia", "model-a");
+        assert!(state.session_model_override("webhook-felicia").is_some());
+        let cleared = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/felicia/clear",
+            OWNER,
+            &json!({ "mode": "clear" }),
+        );
+        assert_eq!(cleared.status, 200, "{}", error_text(&cleared));
+        lines.join().unwrap();
+        assert!(state.session_model_override("webhook-felicia").is_none());
+        assert_eq!(listed_model(&state, "webhook-felicia"), Value::Null);
+
+        // Spin-up again of a persona with an override waiting.
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        set_model(&state, "claude:ada", "model-b");
+        assert!(state.session_model_override("ada").is_some());
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        assert!(state.session_model_override("ada").is_none());
+
+        // Teardown.
+        set_model(&state, "claude:ada", "model-c");
+        assert!(state.session_model_override("ada").is_some());
+        let torn = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/claude:ada/decommission",
+            OWNER,
+            &json!({ "mode": "teardown" }),
+        );
+        assert_eq!(torn.status, 200, "{}", error_text(&torn));
+        assert!(state.session_model_override("ada").is_none());
+        assert!(state.session_model_override("claude:ada").is_none());
     }
 
     #[test]
