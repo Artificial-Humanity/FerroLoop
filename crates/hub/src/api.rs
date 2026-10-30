@@ -3431,11 +3431,7 @@ fn handle_post_session_prompt(
         ));
     }
 
-    let sender_raw = payload
-        .by
-        .as_deref()
-        .unwrap_or_else(|| authority.actor_name());
-    let sender_name = validate_sender_name(sender_raw).unwrap_or_else(|_| "owner".to_string());
+    let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
     drain_ready_session_queues(state);
     let (canonical_session_id, target_persona) = resolve_session_target(state, session_id);
@@ -3502,6 +3498,29 @@ fn handle_post_session_prompt(
     });
     state.broadcast("session", "prompt_sent", data.clone());
     HttpResponse::json(200, data)
+}
+
+/// The sender name of an operator prompt. `claimed_by` is client-supplied text: it labels the
+/// prompt, and it must never decide who the sender is.
+///
+/// An Owner keeps the label it asked for (an unusable one becomes `owner`). Anyone else is a
+/// peer: a claim of the owner's name, or no usable claim, falls back to the peer's own
+/// authenticated name, which [`HubAuthority::actor_name`] never makes the owner's. The result
+/// is the only thing that decides whether the prompt may arrive as direct terminal input (see
+/// `fl_wire::dispatcher::is_owner_sender`), so a peer cannot produce an owner name.
+fn resolve_prompt_sender(authority: &HubAuthority, claimed_by: Option<&str>) -> String {
+    let own = authority.actor_name();
+    let claimed = claimed_by.unwrap_or(own);
+    if authority.is_owner() {
+        return validate_sender_name(claimed).unwrap_or_else(|_| "owner".to_string());
+    }
+    match validate_sender_name(claimed) {
+        Ok(name) if !fl_wire::dispatcher::is_owner_sender(&name) => name,
+        _ => match validate_sender_name(own) {
+            Ok(name) if !fl_wire::dispatcher::is_owner_sender(&name) => name,
+            _ => "peer".to_string(),
+        },
+    }
 }
 
 thread_local! {

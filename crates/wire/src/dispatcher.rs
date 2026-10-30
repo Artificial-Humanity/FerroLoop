@@ -1114,6 +1114,42 @@ fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `true` when `sender_name` names the owner (`owner`, or the owner's login `lmcfarlin`).
+///
+/// This is the gate that lets an operator prompt arrive as direct terminal input. The match is
+/// exact (case-insensitive, no trimming) so a padded name never passes. A caller that builds a
+/// sender name from anything a peer can influence must refuse these names first: see
+/// `HubAuthority::actor_name` in `fl-hub`.
+pub fn is_owner_sender(sender_name: &str) -> bool {
+    sender_name.eq_ignore_ascii_case("owner") || sender_name.eq_ignore_ascii_case("lmcfarlin")
+}
+
+/// The tmux pane id (`%<n>`) of a Claude session, read from the `tmux` field of its session key
+/// file (for example `"Felicia:@12.%12"`), when that pane is alive.
+///
+/// Only a pane id is accepted. A session or window name is not: `tmux -t <name>` resolves to
+/// whichever pane is active there, which need not be the pane Claude runs in.
+fn claude_live_tmux_pane(key_json: &serde_json::Value) -> Option<String> {
+    let raw = key_json.get("tmux")?.as_str()?.trim();
+    let pane = raw.rsplit('.').next()?;
+    let digits = pane.strip_prefix('%')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    tmux_target_alive(pane).then(|| pane.to_string())
+}
+
+/// The body pasted into a terminal for an operator prompt: the FerroDeck prefix, unless the body
+/// already carries it or is a slash command (a prefix would stop it being one).
+fn prefixed_operator_body(sender_name: &str, body: &str) -> String {
+    let trimmed = body.trim_start();
+    if body.starts_with("[Operator Prompt via FerroDeck") || trimmed.starts_with('/') {
+        body.to_string()
+    } else {
+        format!("[Operator Prompt via FerroDeck — from {sender_name}]\n\n{body}")
+    }
+}
+
 pub fn dispatch_operator_prompt_to_route(
     route: &VendorRoute,
     sender_name: &str,
@@ -1144,6 +1180,16 @@ pub fn dispatch_operator_prompt_to_route(
                 .map_err(|e| format!("failed to read {}: {e}", kpath.display()))?;
             let key_json: serde_json::Value = serde_json::from_str(&key_raw)
                 .map_err(|e| format!("invalid JSON in {}: {e}", kpath.display()))?;
+            // The owner's own chat prompt is delivered as direct terminal input when the
+            // session runs in a live tmux pane. The peer-session socket below labels every
+            // message "came from another Claude session", which is wrong for the owner. Only
+            // an owner sender may take this path: it must stay out of reach of any caller
+            // that is merely authenticated as a peer.
+            if is_owner_sender(sender_name)
+                && let Some(pane) = claude_live_tmux_pane(&key_json)
+            {
+                return deliver_via_tmux_paste(&pane, &prefixed_operator_body(sender_name, body));
+            }
             let peer_token = key_json
                 .get("peerToken")
                 .and_then(|v| v.as_str())
@@ -1656,6 +1702,198 @@ mod tests {
         assert_eq!(wh_json["kind"], "operator_prompt");
         assert_eq!(wh_json["sender_name"], "lmcfarlin");
         assert_eq!(wh_json["body"], "Inspect the UI");
+    }
+
+    /// A fake tmux that logs its arguments, keeps `load-buffer` stdin, and answers
+    /// `display-message` with a pane id when `alive`, or fails when not.
+    fn write_fake_tmux(dir: &Path, alive: bool) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let out = dir.join("tmux.out");
+        let stdin_out = dir.join("tmux.stdin");
+        let bin = dir.join("fake-tmux.sh");
+        let display = if alive { "echo \"%12\"" } else { "exit 1" };
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  {display}\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > \"{}\"\nfi\n",
+                out.display(),
+                stdin_out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, out, stdin_out)
+    }
+
+    /// A Claude route whose mock socket records whether anything connected. The session key
+    /// file carries `tmux_field` (the raw `tmux` value) when it is `Some`.
+    fn claude_route_with_mock_socket(
+        dir: &Path,
+        tmux_field: Option<&str>,
+    ) -> (VendorRoute, UnixListener) {
+        let sock_path = dir.join("claude-tmux.sock");
+        let key_path = dir.join("0.key");
+        let key = match tmux_field {
+            Some(t) => serde_json::json!({ "peerToken": "tok-t", "tmux": t }),
+            None => serde_json::json!({ "peerToken": "tok-t" }),
+        };
+        fs::write(&key_path, key.to_string()).unwrap();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        (
+            VendorRoute::Claude {
+                pid: 0,
+                session_id: "s-tmux".into(),
+                socket_path: sock_path,
+                key_path: Some(key_path),
+            },
+            listener,
+        )
+    }
+
+    fn socket_frames(listener: &UnixListener) -> Option<Vec<String>> {
+        let (stream, _) = listener.accept().ok()?;
+        stream.set_nonblocking(false).unwrap();
+        let reader = std::io::BufReader::new(stream);
+        Some(reader.lines().take(2).map(|l| l.unwrap()).collect())
+    }
+
+    #[test]
+    fn claude_owner_prompt_with_live_tmux_pane_is_pasted_not_sent_to_the_peer_socket() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+
+        for sender in ["owner", "lmcfarlin", "Owner"] {
+            let _ = fs::remove_file(&tmux_out);
+            dispatch_operator_prompt_to_route(&route, sender, "Check the queue status").unwrap();
+            let cmds = fs::read_to_string(&tmux_out).unwrap();
+            assert!(
+                cmds.contains("display-message -p -t %12 #{pane_id}"),
+                "{cmds}"
+            );
+            assert!(cmds.contains("paste-buffer -d -b"), "{cmds}");
+            assert!(cmds.contains("-t %12"), "{cmds}");
+            assert!(cmds.contains("send-keys -t %12 Enter"), "{cmds}");
+            assert_eq!(
+                fs::read_to_string(&tmux_stdin).unwrap().trim(),
+                format!(
+                    "[Operator Prompt via FerroDeck — from {sender}]\n\nCheck the queue status"
+                )
+            );
+        }
+        assert!(
+            socket_frames(&listener).is_none(),
+            "the peer socket must receive nothing"
+        );
+    }
+
+    #[test]
+    fn claude_owner_slash_command_is_pasted_without_the_prefix() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, _tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+
+        dispatch_operator_prompt_to_route(&route, "owner", "/compact").unwrap();
+        assert_eq!(fs::read_to_string(&tmux_stdin).unwrap().trim(), "/compact");
+        assert!(socket_frames(&listener).is_none());
+    }
+
+    #[test]
+    fn claude_owner_prompt_without_a_usable_tmux_pane_uses_the_socket() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+
+        // No `tmux` field at all.
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), None);
+        dispatch_operator_prompt_to_route(&route, "owner", "no field").unwrap();
+        let frames = socket_frames(&listener).expect("socket path");
+        let user: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        assert_eq!(user["message"]["content"], "no field");
+        assert!(!tmux_out.exists(), "tmux must not be used without a field");
+        drop(listener);
+        let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+
+        // A `tmux` field naming a session, not a pane id: never used as a target.
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12"));
+        dispatch_operator_prompt_to_route(&route, "owner", "no pane id").unwrap();
+        assert!(socket_frames(&listener).is_some());
+        assert!(!tmux_out.exists());
+        drop(listener);
+        let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+
+        // A pane that is gone.
+        let (dead_bin, dead_out, _) = {
+            let dead_dir = tmp.path().join("dead");
+            fs::create_dir(&dead_dir).unwrap();
+            write_fake_tmux(&dead_dir, false)
+        };
+        let _dead_env = EnvGuard::set("FL_WIRE_TMUX_BIN", &dead_bin);
+        let (route, listener) = claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+        dispatch_operator_prompt_to_route(&route, "owner", "dead pane").unwrap();
+        let frames = socket_frames(&listener).expect("socket path");
+        let user: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+        assert_eq!(user["message"]["content"], "dead pane");
+        let cmds = fs::read_to_string(&dead_out).unwrap();
+        assert!(cmds.contains("display-message"), "{cmds}");
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+    }
+
+    #[test]
+    fn claude_non_owner_prompt_with_live_tmux_pane_uses_the_socket_not_tmux() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+
+        for sender in ["peer", "ferris", "jarvis", " owner", "owner2", "system"] {
+            let (route, listener) =
+                claude_route_with_mock_socket(tmp.path(), Some("Felicity:@12.%12"));
+            dispatch_operator_prompt_to_route(&route, sender, "from a peer").unwrap();
+            let frames = socket_frames(&listener).expect("socket path");
+            let user: serde_json::Value = serde_json::from_str(&frames[1]).unwrap();
+            assert_eq!(user["from"], sender);
+            assert_eq!(user["message"]["content"], "from a peer");
+            assert!(!tmux_out.exists(), "sender `{sender}` must not reach tmux");
+            drop(listener);
+            let _ = fs::remove_file(tmp.path().join("claude-tmux.sock"));
+        }
+    }
+
+    #[test]
+    fn claude_tmux_pane_is_read_only_from_a_pane_id() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, _, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let pane = |v: serde_json::Value| claude_live_tmux_pane(&serde_json::json!({ "tmux": v }));
+        assert_eq!(pane("Felicity:@12.%12".into()).as_deref(), Some("%12"));
+        assert_eq!(pane("%7".into()).as_deref(), Some("%7"));
+        assert_eq!(pane("Felicity".into()), None);
+        assert_eq!(pane("Felicity:@12".into()), None);
+        assert_eq!(pane("Felicity:@12.%".into()), None);
+        assert_eq!(pane("Felicity:@12.%1;x".into()), None);
+        assert_eq!(pane(serde_json::json!(12)), None);
+        assert_eq!(claude_live_tmux_pane(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn is_owner_sender_matches_only_the_exact_owner_names() {
+        assert!(is_owner_sender("owner"));
+        assert!(is_owner_sender("OWNER"));
+        assert!(is_owner_sender("lmcfarlin"));
+        assert!(!is_owner_sender(" owner"));
+        assert!(!is_owner_sender("owner "));
+        assert!(!is_owner_sender("owner2"));
+        assert!(!is_owner_sender("peer"));
+        assert!(!is_owner_sender(""));
     }
 
     #[test]

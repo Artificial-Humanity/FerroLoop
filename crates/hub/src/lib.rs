@@ -4463,4 +4463,276 @@ mod tests {
             assert_eq!(keys, sorted);
         }
     }
+
+    // ---- Operator prompts reach a terminal as direct input for the owner only -----------
+
+    static TMUX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `FL_WIRE_TMUX_BIN` at a fake tmux that records its arguments in `<dir>/tmux.out`
+    /// and reports every pane alive, then restores the variable on drop. Hold `TMUX_ENV_LOCK`.
+    struct FakeTmux {
+        out: std::path::PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl FakeTmux {
+        fn install(dir: &std::path::Path) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let out = dir.join("tmux.out");
+            let bin = dir.join("fake-tmux.sh");
+            fs::write(
+                &bin,
+                format!(
+                    "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ \"$1\" = \"display-message\" ]; then\n  echo \"%12\"\nelif [ \"$1\" = \"load-buffer\" ]; then\n  cat > /dev/null\nfi\n",
+                    out.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+            let prev = std::env::var_os("FL_WIRE_TMUX_BIN");
+            // SAFETY: callers hold TMUX_ENV_LOCK; the previous value is restored on drop.
+            unsafe { std::env::set_var("FL_WIRE_TMUX_BIN", &bin) };
+            Self { out, prev }
+        }
+
+        fn log(&self) -> String {
+            fs::read_to_string(&self.out).unwrap_or_default()
+        }
+
+        fn forget(&self) {
+            let _ = fs::remove_file(&self.out);
+        }
+    }
+
+    impl Drop for FakeTmux {
+        fn drop(&mut self) {
+            // SAFETY: see `install`.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("FL_WIRE_TMUX_BIN", v),
+                    None => std::env::remove_var("FL_WIRE_TMUX_BIN"),
+                }
+            }
+        }
+    }
+
+    /// A Claude route for `persona` whose key file names a tmux pane. The mock socket is
+    /// returned so a test can see whether the peer-session path was used.
+    fn install_claude_tmux_route(
+        home: &std::path::Path,
+        persona: &str,
+    ) -> std::os::unix::net::UnixListener {
+        use std::os::unix::net::UnixListener;
+
+        let sock = home.join(format!("{persona}.sock"));
+        let key = home.join(format!("{persona}.key"));
+        fs::write(
+            &key,
+            json!({ "peerToken": "tok-hub", "tmux": "Felicity:@12.%12" }).to_string(),
+        )
+        .unwrap();
+        let listener = UnixListener::bind(&sock).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        install_route(
+            home,
+            persona,
+            fl_wire::identity::VendorRoute::Claude {
+                pid: 0,
+                session_id: format!("cs-{persona}"),
+                socket_path: sock,
+                key_path: Some(key),
+            },
+        );
+        listener
+    }
+
+    /// The `from` of the peer-session user frame the socket received, if it received one.
+    fn socket_from(listener: &std::os::unix::net::UnixListener) -> Option<String> {
+        use std::io::{BufRead, BufReader};
+
+        let (stream, _) = listener.accept().ok()?;
+        stream.set_nonblocking(false).unwrap();
+        let lines: Vec<String> = BufReader::new(stream)
+            .lines()
+            .take(2)
+            .map(|l| l.unwrap())
+            .collect();
+        let user: Value = serde_json::from_str(&lines[1]).unwrap();
+        Some(user["from"].as_str().unwrap().to_string())
+    }
+
+    fn post_prompt(
+        state: &HubState,
+        persona: &str,
+        token: &str,
+        agent: Option<&str>,
+        body: &Value,
+    ) -> Value {
+        let mut req = authed(
+            "POST",
+            &format!("/api/v1/sessions/{persona}/prompt"),
+            token,
+            body,
+        );
+        if let Some(agent) = agent {
+            req = req.with_header("X-Fl-Agent", agent);
+        }
+        let resp = handle_http_request(state, &req);
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        resp.json_value().unwrap()
+    }
+
+    #[test]
+    fn owner_prompt_reaches_a_claude_tmux_pane_but_a_peer_never_does() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let listener = install_claude_tmux_route(tmp.path(), "felicity");
+
+        // The Owner token: pasted into the pane, nothing on the peer socket.
+        let sent = post_prompt(
+            &state,
+            "felicity",
+            OWNER,
+            None,
+            &json!({ "prompt": "hello from the owner", "send_now": true }),
+        );
+        assert_eq!(sent["delivered"], true, "{sent}");
+        assert_eq!(sent["by"], "lmcfarlin");
+        let log = tmux.log();
+        assert!(log.contains("paste-buffer -d -b"), "{log}");
+        assert!(log.contains("send-keys -t %12 Enter"), "{log}");
+        assert_eq!(socket_from(&listener), None, "owner prompt used the socket");
+
+        // A Peer token that claims to be the owner, however it spells the claim, takes the
+        // peer-session socket and never the pane.
+        let claims: [(Option<&str>, Value); 6] = [
+            (
+                None,
+                json!({ "send_now": true, "prompt": "p1", "by": "owner" }),
+            ),
+            (
+                None,
+                json!({ "send_now": true, "prompt": "p2", "by": "OWNER" }),
+            ),
+            (
+                None,
+                json!({ "send_now": true, "prompt": "p3", "by": " lmcfarlin " }),
+            ),
+            (
+                None,
+                json!({ "send_now": true, "prompt": "p4", "by": "not a slug!" }),
+            ),
+            (Some("owner"), json!({ "send_now": true, "prompt": "p5" })),
+            (
+                Some("lmcfarlin"),
+                json!({ "send_now": true, "prompt": "p6", "by": "owner" }),
+            ),
+        ];
+        for (agent, body) in claims {
+            tmux.forget();
+            let sent = post_prompt(&state, "felicity", PEER, agent, &body);
+            assert_eq!(sent["delivered"], true, "{body}: {sent}");
+            let by = sent["by"].as_str().unwrap().to_string();
+            assert!(
+                !fl_wire::dispatcher::is_owner_sender(&by),
+                "{body}: sender `{by}` is an owner name"
+            );
+            assert!(
+                !tmux.log().contains("paste-buffer"),
+                "{body}: a peer prompt was pasted into the pane: {}",
+                tmux.log()
+            );
+            assert_eq!(
+                socket_from(&listener).as_deref(),
+                Some(by.as_str()),
+                "{body}"
+            );
+        }
+
+        // A Peer with an honest name keeps its own label.
+        tmux.forget();
+        let sent = post_prompt(
+            &state,
+            "felicity",
+            PEER,
+            Some("ferris"),
+            &json!({ "send_now": true, "prompt": "p7" }),
+        );
+        assert_eq!(sent["by"], "ferris");
+        assert!(!tmux.log().contains("paste-buffer"));
+        assert_eq!(socket_from(&listener).as_deref(), Some("ferris"));
+    }
+
+    #[test]
+    fn peer_authority_never_resolves_to_an_owner_name() {
+        use crate::auth::HubAuthority;
+
+        for agent in ["owner", "OWNER", "lmcfarlin", " Owner "] {
+            let peer = HubAuthority::Peer {
+                agent: Some(agent.to_string()),
+            };
+            assert_eq!(peer.actor_name(), "peer", "{agent:?}");
+        }
+        let named = HubAuthority::Peer {
+            agent: Some("ferris".into()),
+        };
+        assert_eq!(named.actor_name(), "ferris");
+        assert_eq!(HubAuthority::Peer { agent: None }.actor_name(), "peer");
+        let owner = HubAuthority::Owner {
+            login: "lmcfarlin".into(),
+        };
+        assert_eq!(owner.actor_name(), "lmcfarlin");
+    }
+
+    #[test]
+    fn peer_spin_up_hydration_is_never_pasted_into_a_pane_even_as_owner_named_agent() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let listener = install_claude_tmux_route(tmp.path(), "felicity");
+
+        let mut req = authed(
+            "POST",
+            "/api/v1/sessions/spin-up",
+            PEER,
+            &spin_up_body("felicity"),
+        );
+        req = req.with_header("X-Fl-Agent", "owner");
+        let resp = handle_http_request(&state, &req);
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        assert_eq!(resp.json_value().unwrap()["hydration_dispatched"], true);
+        assert!(
+            !tmux.log().contains("paste-buffer"),
+            "peer hydration was pasted: {}",
+            tmux.log()
+        );
+        assert_eq!(socket_from(&listener).as_deref(), Some("peer"));
+    }
+
+    #[test]
+    fn spin_up_refuses_the_owner_names_as_a_persona() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        for persona in ["owner", "lmcfarlin"] {
+            for token in [OWNER, PEER] {
+                let resp = call(
+                    &state,
+                    "POST",
+                    "/api/v1/sessions/spin-up",
+                    token,
+                    &spin_up_body(persona),
+                );
+                assert_eq!(resp.status, 400, "{persona}: {}", error_text(&resp));
+                assert!(
+                    error_text(&resp).contains("persona"),
+                    "{}",
+                    error_text(&resp)
+                );
+            }
+        }
+    }
 }

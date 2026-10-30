@@ -46,10 +46,17 @@ impl HubAuthority {
         matches!(self, Self::Owner { .. })
     }
 
+    /// The name this authority acts as. A peer chooses its own agent name (`X-Fl-Agent`), so a
+    /// peer can never act as the owner: an agent name that is the owner's (`owner`,
+    /// `lmcfarlin`) is replaced with `peer`. Operator prompts only reach a terminal as direct
+    /// input for an owner sender, so this is a security boundary.
     pub fn actor_name(&self) -> &str {
         match self {
             Self::Owner { login } => login.as_str(),
-            Self::Peer { agent } => agent.as_deref().unwrap_or("peer"),
+            Self::Peer { agent } => agent
+                .as_deref()
+                .filter(|name| !fl_wire::dispatcher::is_owner_sender(name.trim()))
+                .unwrap_or("peer"),
         }
     }
 }

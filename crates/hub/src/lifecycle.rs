@@ -186,6 +186,12 @@ impl SpinUpRequest {
                 "must be a lowercase slug (a-z, 0-9, '-'; starts with a letter; at most 36 characters)",
             ));
         }
+        if fl_wire::dispatcher::is_owner_sender(&persona) {
+            return Err(invalid_field(
+                "persona",
+                "must not be the owner's name (`owner`, `lmcfarlin`)",
+            ));
+        }
         let project = self.project.trim().to_string();
         if project.is_empty() {
             return Err(invalid_field("project", "must not be empty"));
