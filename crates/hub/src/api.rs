@@ -74,10 +74,10 @@ use crate::auth::{
     format_logout_set_cookie, format_session_set_cookie, sha256_hex,
 };
 use crate::discovery::{
-    DiscoveryStoreSnapshot, discover_sessions_from_snapshot, list_git_worktrees,
-    read_session_context_usage_from_snapshot, read_session_quota_usage_with_home,
-    read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
-    snapshot_discovery_store,
+    DiscoveryStoreSnapshot, discover_route_sessions_without_model_info,
+    discover_sessions_from_snapshot, list_git_worktrees, read_session_context_usage_from_snapshot,
+    read_session_quota_usage_with_home, read_session_transcript_from_snapshot, read_worktree_diff,
+    scan_cargo_architecture_conformance, snapshot_discovery_store,
 };
 use crate::lifecycle::{
     self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
@@ -87,6 +87,9 @@ use crate::nodes::{
     RevokeFail, detect_capabilities, enroll_worker, ensure_hub_node, find_hub_node,
     list_visible_nodes, local_hostname, mint_enroll_token, node_id_from_hostname, node_state_slug,
     node_token_matches, revoke_node, touch_node,
+};
+use crate::session_actions::{
+    self, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, ModelOverride, route_vendor,
 };
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
 
@@ -462,6 +465,11 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
             handle_post_state(&store, &authority, req)
         }
         ("POST", "/api/v1/sessions/spin-up") => handle_post_session_spin_up(state, &authority, req),
+        // Exact match, so `bulk-action` is never read as a session id by the dynamic routes.
+        ("POST", "/api/v1/sessions/bulk-action") => {
+            handle_post_session_bulk_action(state, &authority, req)
+        }
+        ("GET", "/api/v1/commands") => handle_get_commands(state),
         ("GET", "/api/v1/hosted-sessions") => handle_get_hosted_sessions(state),
         ("POST", "/api/v1/state/checkpoint") => {
             handle_post_state_checkpoint(state, &authority, req)
@@ -966,7 +974,10 @@ fn handle_get_sessions(state: &HubState) -> HttpResponse {
         Ok(store) => snapshot_discovery_store(&store),
         Err(_) => return store_open_failure(),
     };
-    let sessions = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
+    let sessions = state.with_model_overrides(discover_sessions_from_snapshot(
+        &snap,
+        state.config.home_override.as_deref(),
+    ));
     HttpResponse::json(200, json!({ "sessions": sessions }))
 }
 
@@ -1107,7 +1118,10 @@ fn handle_get_agents(state: &HubState, req: &HttpRequest) -> HttpResponse {
     };
     let snap = snapshot_discovery_store(&store);
     drop(store);
-    let routes = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
+    let routes = state.with_model_overrides(discover_sessions_from_snapshot(
+        &snap,
+        state.config.home_override.as_deref(),
+    ));
     HttpResponse::json(
         200,
         json!({
@@ -1154,7 +1168,9 @@ fn handle_get_agents_liveness(state: &HubState, req: &HttpRequest) -> HttpRespon
     }
     let snap = snapshot_discovery_store(&store);
     drop(store);
-    let sessions = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
+    // Liveness reads only `source`, `persona` and `adapter`: no model discovery.
+    let sessions =
+        discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref());
 
     let mut items = Vec::with_capacity(agents.len());
     for (ag, hb) in agents.iter().zip(heartbeats.iter()) {
@@ -1298,12 +1314,12 @@ fn handle_post_wire_send(
         },
     };
 
-    let raw_sender = payload
-        .sender_name
-        .as_deref()
-        .or(payload.from.as_deref())
-        .unwrap_or_else(|| authority.actor_name());
-    let sender_name = validate_sender_name(raw_sender).unwrap_or_else(|_| "owner".to_string());
+    // A Peer can never send as the owner: `resolve_prompt_sender` rewrites an owner or unusable
+    // claim to the Peer's own authenticated name (or `peer`). An Owner keeps its claimed label.
+    let sender_name = resolve_prompt_sender(
+        authority,
+        payload.sender_name.as_deref().or(payload.from.as_deref()),
+    );
     let now = stamp::now();
     let Ok(store) = open_store_response(state) else {
         return store_open_failure();
@@ -2853,6 +2869,12 @@ fn handle_dynamic_api_routes(
             ("POST", "clear") => {
                 return handle_post_session_clear(state, authority, &session_id, req);
             }
+            ("POST", "interrupt") => {
+                return handle_post_session_interrupt(state, authority, &session_id, req);
+            }
+            ("POST", "model") => {
+                return handle_post_session_model(state, authority, &session_id, req);
+            }
             ("POST", "decommission") => {
                 return handle_post_session_decommission(state, authority, &session_id, req);
             }
@@ -3032,7 +3054,9 @@ fn resolve_session_target_from_snapshot(
     raw_session_id: &str,
 ) -> (String, Option<String>) {
     let trimmed = raw_session_id.trim();
-    let sessions = discover_sessions_from_snapshot(snap, state.config.home_override.as_deref());
+    // Only `id` and `persona` are read, so skip model discovery.
+    let sessions =
+        discover_route_sessions_without_model_info(snap, state.config.home_override.as_deref());
     if let Some(matched) = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -3411,11 +3435,7 @@ fn handle_post_session_prompt(
         ));
     }
 
-    let sender_raw = payload
-        .by
-        .as_deref()
-        .unwrap_or_else(|| authority.actor_name());
-    let sender_name = validate_sender_name(sender_raw).unwrap_or_else(|_| "owner".to_string());
+    let sender_name = resolve_prompt_sender(authority, payload.by.as_deref());
 
     drain_ready_session_queues(state);
     let (canonical_session_id, target_persona) = resolve_session_target(state, session_id);
@@ -3484,6 +3504,40 @@ fn handle_post_session_prompt(
     HttpResponse::json(200, data)
 }
 
+/// The sender name of an operator prompt. `claimed_by` is client-supplied text: it labels the
+/// prompt, and it must never decide who the sender is.
+///
+/// An Owner keeps the label it asked for (an unusable one becomes `owner`). Anyone else is a
+/// peer: a claim of the owner's name, or no usable claim, falls back to the peer's own
+/// authenticated name, which [`HubAuthority::actor_name`] never makes the owner's. The result
+/// is the only thing that decides whether the prompt may arrive as direct terminal input (see
+/// `fl_wire::dispatcher::is_owner_sender`), so a peer cannot produce an owner name.
+fn resolve_prompt_sender(authority: &HubAuthority, claimed_by: Option<&str>) -> String {
+    let own = authority.actor_name();
+    let claimed = claimed_by.unwrap_or(own);
+    if authority.is_owner() {
+        return validate_sender_name(claimed).unwrap_or_else(|_| "owner".to_string());
+    }
+    match validate_sender_name(claimed) {
+        Ok(name) if !fl_wire::dispatcher::is_owner_sender(&name) => name,
+        _ => match validate_sender_name(own) {
+            Ok(name) if !fl_wire::dispatcher::is_owner_sender(&name) => name,
+            _ => "peer".to_string(),
+        },
+    }
+}
+
+/// The sender label of a prompt that arrives through an inbound bridge webhook. The webhook
+/// body is third-party text: the secret (or Owner auth) that admits the call says nothing about
+/// who wrote the message, so the label is never an owner name. An unusable label, or one that
+/// names the owner, becomes `bridge`.
+fn bridge_prompt_sender(claimed: &str) -> String {
+    match validate_sender_name(claimed) {
+        Ok(name) if !fl_wire::dispatcher::is_owner_sender(&name) => name,
+        _ => "bridge".to_string(),
+    }
+}
+
 thread_local! {
     static HYDRATE_LOCK_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
@@ -3538,49 +3592,70 @@ fn handle_post_session_clear(
     };
 
     let (canonical_id, persona) = resolve_session_target(state, session_id);
-    state.clear_session_prompt_queue(&canonical_id);
-    if session_id != canonical_id {
-        state.clear_session_prompt_queue(session_id);
+    match reset_session(
+        state,
+        authority.actor_name(),
+        session_id,
+        &canonical_id,
+        persona.as_deref(),
+        mode,
+    ) {
+        Ok(data) => HttpResponse::json(200, data),
+        Err((status, error)) => HttpResponse::json(status, json!({ "error": error })),
     }
-    if let Some(name) = persona.as_deref()
+}
+
+/// Clear or reforge one session: drop its queued prompts, build the reforge prompt, and reset
+/// the live vendor route. `mode` is `"clear"` or `"reforge"`. `raw_session_id` is the id the
+/// caller used (its queue is dropped too); `canonical_id` and `persona` come from
+/// [`resolve_session_target`]. Returns the response body, or `(status, error)`: 404 when there
+/// is no agent record (reforge) or no live route, 502 when the dispatch itself fails.
+/// Shared by the single-session clear handler and the bulk action.
+fn reset_session(
+    state: &HubState,
+    actor: &str,
+    raw_session_id: &str,
+    canonical_id: &str,
+    persona: Option<&str>,
+    mode: &str,
+) -> Result<Value, (u16, String)> {
+    state.clear_session_prompt_queue(canonical_id);
+    if raw_session_id != canonical_id {
+        state.clear_session_prompt_queue(raw_session_id);
+    }
+    if let Some(name) = persona
         && name != canonical_id
-        && name != session_id
+        && name != raw_session_id
     {
         state.clear_session_prompt_queue(name);
     }
+    // The session starts over, so a model the operator chose for the old run no longer applies.
+    for key in [Some(canonical_id), Some(raw_session_id), persona]
+        .into_iter()
+        .flatten()
+    {
+        state.clear_session_model_override(key);
+    }
 
     let prompt = if mode == "reforge" {
-        let lookup = persona.as_deref().unwrap_or(canonical_id.as_str());
+        let lookup = persona.unwrap_or(canonical_id);
         match build_reforge_prompt(state, lookup) {
             Some(prompt) => Some(prompt),
             None => {
-                return HttpResponse::json(
-                    404,
-                    json!({ "error": format!("no agent record for reforge of `{lookup}`") }),
-                );
+                return Err((404, format!("no agent record for reforge of `{lookup}`")));
             }
         }
     } else {
         None
     };
 
-    let route = match vendor_route_for_session(state, persona.as_deref(), &canonical_id) {
-        Ok(route) => route,
-        Err(e) => return HttpResponse::json(404, json!({ "error": e })),
-    };
+    let route = vendor_route_for_session(state, persona, canonical_id).map_err(|e| (404, e))?;
     let reset_mode = if mode == "reforge" {
         SessionResetMode::Reforge
     } else {
         SessionResetMode::Clear
     };
-    if let Err(e) = clear_or_reforge_session(
-        &route,
-        reset_mode,
-        authority.actor_name(),
-        prompt.as_deref(),
-    ) {
-        return HttpResponse::json(502, json!({ "error": e }));
-    }
+    clear_or_reforge_session(&route, reset_mode, actor, prompt.as_deref()).map_err(|e| (502, e))?;
 
     let data = json!({
         "ok": true,
@@ -3590,7 +3665,292 @@ fn handle_post_session_clear(
         "prompt": prompt,
     });
     state.broadcast("sessions", "session.cleared", data.clone());
+    Ok(data)
+}
+
+/// `{ "reason"?: string }`: an optional body. An empty body or `{}` is fine.
+fn optional_reason(req: &HttpRequest) -> Result<Option<String>, HttpResponse> {
+    let body = json_object_body(req)?;
+    match body.get("reason") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(reason)) => Ok(Some(reason.chars().take(500).collect())),
+        Some(_) => Err(HttpResponse::json(
+            400,
+            json!({ "error": "`reason` must be a string" }),
+        )),
+    }
+}
+
+/// `POST /api/v1/sessions/:id/interrupt` (Record 47): stop the turn the session is running.
+/// Any authenticated token may call it, as for clear. 404 when the session has no live route;
+/// 502 when the interrupt cannot be delivered. See [`session_actions::interrupt_route`] for
+/// the per-vendor mechanism and the test-mode no-op.
+fn handle_post_session_interrupt(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let reason = match optional_reason(req) {
+        Ok(reason) => reason,
+        Err(resp) => return resp,
+    };
+    let (canonical_id, persona) = resolve_session_target(state, session_id);
+    let route = match vendor_route_for_session(state, persona.as_deref(), &canonical_id) {
+        Ok(route) => route,
+        Err(e) => return HttpResponse::json(404, json!({ "error": e })),
+    };
+    // Claude and Codex routes carry no tmux target; a hosted session's record names its pane.
+    // A Claude session the hub does not host falls back to the live pane its key file names.
+    let hosted_tmux = hosted_record_for(state, &[session_id, &canonical_id], persona.as_deref())
+        .and_then(|record| record.tmux_target)
+        .or_else(|| fl_wire::dispatcher::claude_route_live_pane(&route));
+    let method = match session_actions::interrupt_route(
+        &lifecycle_env(state),
+        &route,
+        hosted_tmux.as_deref(),
+    ) {
+        Ok(method) => method,
+        Err(e) => return HttpResponse::json(502, json!({ "error": e })),
+    };
+    // Whatever prompt was in flight is no longer running, so the session stops reading as busy.
+    // Queued prompts stay queued and drain as usual once the session is idle.
+    state.clear_session_in_flight(&canonical_id);
+    if session_id != canonical_id {
+        state.clear_session_in_flight(session_id);
+    }
+    let vendor = route_vendor(&route);
+    let data = json!({
+        "session_id": canonical_id,
+        "interrupted": true,
+        "vendor": vendor,
+        "method": method,
+    });
+    let mut event = data.clone();
+    event["persona"] = json!(persona);
+    event["reason"] = json!(reason);
+    event["by"] = json!(authority.actor_name());
+    state.broadcast("sessions", "session.interrupted", event);
     HttpResponse::json(200, data)
+}
+
+/// The hosted-session record for one of `keys` (or the persona), if the store has one.
+fn hosted_record_for(
+    state: &HubState,
+    keys: &[&str],
+    persona: Option<&str>,
+) -> Option<lifecycle::HostedSessionRecord> {
+    let mut all: Vec<&str> = keys.to_vec();
+    if let Some(persona) = persona {
+        all.push(persona);
+    }
+    let store = state.open_store().ok()?;
+    lifecycle::find_hosted_session(&*store, &all).ok().flatten()
+}
+
+/// `POST /api/v1/sessions/:id/model` (Records 48 and 57): switch the model of a session.
+/// Any authenticated token may call it, as for clear. The choice is kept in `HubState` and
+/// overlaid on `GET /api/v1/sessions` (in memory: gone after a hub restart), written to the
+/// hosted-session record when one exists, and sent to a live CLI as `/model <id>`.
+/// Antigravity is not sent anything: its method is `override-only`.
+fn handle_post_session_model(
+    state: &HubState,
+    authority: &HubAuthority,
+    session_id: &str,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let model_raw = match json_string(&body, "model") {
+        Ok(model) => model,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let model = match session_actions::validate_model(&model_raw) {
+        Ok(model) => model,
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    let thinking_level = match body.get("thinking_level") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => match session_actions::validate_thinking_level(raw) {
+            Ok(level) => Some(level),
+            Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+        },
+        Some(_) => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": "`thinking_level` must be a string" }),
+            );
+        }
+    };
+
+    let snap = load_discovery_snapshot(state);
+    // Only `id`, `persona` and `adapter` are read, so skip model discovery.
+    let sessions =
+        discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref());
+    let trimmed = session_id.trim();
+    let matched = sessions
+        .iter()
+        .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed));
+    let (canonical_id, persona) = match matched {
+        Some(s) => (s.id.clone(), s.persona.clone()),
+        None => (trimmed.to_string(), Some(trimmed.to_ascii_lowercase())),
+    };
+    let route = vendor_route_for_session(state, persona.as_deref(), &canonical_id).ok();
+    let hosted = hosted_record_for(state, &[trimmed, &canonical_id], persona.as_deref());
+    if matched.is_none() && route.is_none() && hosted.is_none() {
+        return HttpResponse::json(
+            404,
+            json!({ "error": format!("unknown session `{trimmed}`") }),
+        );
+    }
+    let vendor = match (&route, matched, &hosted) {
+        (Some(route), _, _) => route_vendor(route).to_string(),
+        (None, Some(s), _) => s.adapter.clone(),
+        (None, None, Some(record)) => record.vendor.clone(),
+        (None, None, None) => "unknown".to_string(),
+    };
+
+    // Key the override by the discovered session id. A session discovery does not list (a
+    // route or hosted record only) has no id a summary could match, so it is keyed by its
+    // lowercased persona, which `apply_model_overrides` also matches.
+    let override_key = match matched {
+        Some(s) => s.id.clone(),
+        None => hosted
+            .as_ref()
+            .map(|record| record.persona.as_str())
+            .or(persona.as_deref())
+            .unwrap_or(&canonical_id)
+            .to_ascii_lowercase(),
+    };
+    state.set_session_model_override(
+        &override_key,
+        ModelOverride {
+            model: model.clone(),
+            thinking_level: thinking_level.clone(),
+        },
+    );
+    if hosted.is_some() {
+        match open_store_response(state) {
+            Ok(store) => {
+                // Best effort: the override above already answers `GET /api/v1/sessions`.
+                let _ = lifecycle::set_hosted_session_model(
+                    &*store,
+                    &[trimmed, &canonical_id],
+                    &model,
+                    authority.actor_name(),
+                );
+            }
+            Err(()) => return store_open_failure(),
+        }
+    }
+
+    let method = match &route {
+        Some(route) if !matches!(route, fl_wire::identity::VendorRoute::Agy { .. }) => {
+            match dispatch_operator_prompt_to_route(
+                route,
+                authority.actor_name(),
+                &format!("/model {model}"),
+            ) {
+                Ok(()) => METHOD_OPERATOR_PROMPT,
+                Err(_) => METHOD_OVERRIDE_ONLY,
+            }
+        }
+        _ => METHOD_OVERRIDE_ONLY,
+    };
+
+    let data = json!({
+        "ok": true,
+        "session_id": canonical_id,
+        "vendor": vendor,
+        "model": model,
+        "thinking_level": thinking_level,
+        "switched": true,
+        "method": method,
+    });
+    state.broadcast("sessions", "session.model_changed", data.clone());
+    HttpResponse::json(200, data)
+}
+
+/// `POST /api/v1/sessions/bulk-action` (Record 44): run `compact`, `clear` or `reforge` on
+/// every discovered session that has a live route. Owner only. One failure never stops the
+/// batch; each session reports its own result.
+fn handle_post_session_bulk_action(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may run a bulk session action" }),
+        );
+    }
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let action = match json_string(&body, "action") {
+        Ok(action) => action.trim().to_ascii_lowercase(),
+        Err(e) => return HttpResponse::json(400, json!({ "error": e })),
+    };
+    if !matches!(action.as_str(), "compact" | "clear" | "reforge") {
+        return HttpResponse::json(
+            400,
+            json!({ "error": "action must be \"compact\", \"clear\" or \"reforge\"" }),
+        );
+    }
+
+    let snap = load_discovery_snapshot(state);
+    let targets: Vec<(String, Option<String>)> =
+        discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref())
+            .into_iter()
+            .filter(|s| s.source == "route")
+            .map(|s| (s.id, s.persona))
+            .collect();
+    let actor = authority.actor_name();
+    let mut results = Vec::with_capacity(targets.len());
+    for (id, persona) in &targets {
+        let outcome: Result<(), String> = match action.as_str() {
+            "compact" => compact_session(state, actor, id, persona.as_deref()),
+            mode => reset_session(state, actor, id, id, persona.as_deref(), mode)
+                .map(|_| ())
+                .map_err(|(_, error)| error),
+        };
+        results.push(match outcome {
+            Ok(()) => json!({ "session_id": id, "ok": true }),
+            Err(error) => json!({ "session_id": id, "ok": false, "error": error }),
+        });
+    }
+    let succeeded = results.iter().filter(|r| r["ok"] == true).count();
+    let data = json!({
+        "action": action,
+        "total": results.len(),
+        "succeeded": succeeded,
+        "results": results,
+    });
+    state.broadcast("sessions", "session.bulk_action", data.clone());
+    HttpResponse::json(200, data)
+}
+
+/// Send `/compact` to one session through the operator-prompt path.
+fn compact_session(
+    state: &HubState,
+    actor: &str,
+    session_id: &str,
+    persona: Option<&str>,
+) -> Result<(), String> {
+    dispatch_operator_prompt_for_session(state, persona, session_id, actor, "/compact")?;
+    state.mark_session_in_flight_released(session_id);
+    Ok(())
+}
+
+/// `GET /api/v1/commands` (Record 30): built-in slash commands plus the workspace's skills
+/// and workflows. The workspace is the hub's `repo_root`.
+fn handle_get_commands(state: &HubState) -> HttpResponse {
+    let commands = crate::commands::list_commands(&state.config.repo_root);
+    HttpResponse::json(200, json!({ "commands": commands }))
 }
 
 fn lifecycle_error_response(err: &LifecycleError) -> HttpResponse {
@@ -3629,6 +3989,9 @@ fn handle_post_session_spin_up(
         caller_of(authority),
     ) {
         Ok(out) => {
+            // A new run has its own model: drop what the operator chose for an earlier one.
+            state.clear_session_model_override(&out.session_id);
+            state.clear_session_model_override(&out.persona);
             let data = serde_json::to_value(&out).unwrap_or_default();
             state.broadcast("sessions", "session.spun_up", data.clone());
             HttpResponse::json(200, data)
@@ -3676,7 +4039,8 @@ fn handle_post_session_decommission(
         }
         DecommissionMode::Teardown => {
             lifecycle::teardown_session(&*store, &env, &target, by, caller, |key| {
-                state.clear_session_prompt_queue(key)
+                state.clear_session_prompt_queue(key);
+                state.clear_session_model_override(key);
             })
         }
     };
@@ -4695,12 +5059,13 @@ fn handle_post_gate_bridge_webhook(
     match &plan.target {
         BridgeTarget::WireAgent { persona } => {
             let (canonical_id, target_persona) = resolve_session_target(state, persona);
-            let sender_label = event.sender_name.as_deref().unwrap_or(&event.sender_id);
+            let sender_label =
+                bridge_prompt_sender(event.sender_name.as_deref().unwrap_or(&event.sender_id));
             let delivery_res = dispatch_operator_prompt_for_session(
                 state,
                 target_persona.as_deref(),
                 &canonical_id,
-                sender_label,
+                &sender_label,
                 &plan.prompt_body,
             );
             state.mark_session_in_flight_released(&canonical_id);

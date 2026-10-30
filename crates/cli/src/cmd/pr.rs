@@ -9,8 +9,8 @@ use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress}
 use fl_core::ids::AgentId;
 use fl_core::pr_policy::{
     DEFAULT_OWNER_LOGIN, FlReviewMarker, PolicyRefusal, RequiredTier, ReviewVerdict,
-    authorize_agent_action, authorize_agent_merge, evaluate_pr_policy, extract_review_marker,
-    format_review_body, verify_merge_approvals,
+    authorize_agent_action, authorize_agent_merge, evaluate_pr_policy, format_review_body,
+    verify_merge_approvals, verify_review_integrity,
 };
 use fl_core::store::{AgentRegistry, MessageStore};
 use fl_github::{
@@ -727,50 +727,10 @@ pub fn run(
                 );
             }
 
-            for review in &reviews {
-                let state = review.state.trim().to_ascii_uppercase();
-                let on_head = review
-                    .commit_id
-                    .as_deref()
-                    .is_none_or(|cid| cid == pr.head_sha);
-                if state == "APPROVED"
-                    && on_head
-                    && !review
-                        .author_login
-                        .eq_ignore_ascii_case(DEFAULT_OWNER_LOGIN)
-                {
-                    let Some(marker) = extract_review_marker(&review.body) else {
-                        return emit_refusal(
-                            &PolicyRefusal::MissingValidApproval {
-                                head_sha: pr.head_sha.clone(),
-                            },
-                            json,
-                        );
-                    };
-                    if marker.verdict != ReviewVerdict::Approved || marker.head_sha != pr.head_sha {
-                        return emit_refusal(
-                            &PolicyRefusal::MissingValidApproval {
-                                head_sha: pr.head_sha.clone(),
-                            },
-                            json,
-                        );
-                    }
-                    let Some(agent) = agents.iter().find(|a| {
-                        a.status == AgentStatus::Active
-                            && a.name_key.eq_ignore_ascii_case(&marker.reviewer)
-                            && a.role == marker.role
-                    }) else {
-                        return emit_refusal(
-                            &PolicyRefusal::UnknownOrInactiveAgent {
-                                agent: marker.reviewer,
-                            },
-                            json,
-                        );
-                    };
-                    if let Err(refusal) = authorize_agent_action(&eval, agent) {
-                        return emit_refusal(&refusal, json);
-                    }
-                }
+            if let Err(refusal) =
+                verify_review_integrity(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN)
+            {
+                return emit_refusal(&refusal, json);
             }
 
             let approved_by = if require_approval {
