@@ -313,6 +313,9 @@ pub fn node_token_matches(store: &RedbStore, node_id: &str, bearer: &str) -> Res
     let Some(rec) = load_node(store, &slug)? else {
         return Ok(false);
     };
+    if rec.revoked {
+        return Ok(false);
+    }
     let Some(token_hash) = rec.token_hash else {
         return Ok(false);
     };
@@ -430,7 +433,11 @@ fn sanitize_node_tail(raw: &str) -> Result<String, String> {
 
 fn node_state_slug(node_id: &str) -> Result<String, String> {
     let tail = sanitize_node_tail(node_id)?;
-    Ok(format!("{NODE_SLUG_PREFIX}{tail}"))
+    let slug = format!("{NODE_SLUG_PREFIX}{tail}");
+    if slug.starts_with(ENROLL_SLUG_PREFIX) {
+        return Err("node_id collides with the enroll-record slug prefix".to_string());
+    }
+    Ok(slug)
 }
 
 /// State slugs are at most 64 bytes. `hub-node-enroll-` is 16, so the slug keeps
@@ -520,6 +527,9 @@ fn load_node(store: &RedbStore, slug: &str) -> Result<Option<NodeRecord>, String
     let Some(entry) = load_runtime(store, slug)? else {
         return Ok(None);
     };
+    if !entry.sensitive {
+        return Ok(None);
+    }
     let StatePayload::Runtime(rt) = entry.payload else {
         return Err(format!("state `{slug}` is not a runtime node record"));
     };
@@ -544,6 +554,9 @@ fn load_enroll(store: &RedbStore, slug: &str) -> Result<Option<EnrollRecord>, St
 }
 
 fn node_from_entry(entry: &StateEntry) -> Option<NodeRecord> {
+    if !entry.sensitive {
+        return None;
+    }
     let StatePayload::Runtime(rt) = &entry.payload else {
         return None;
     };
@@ -556,7 +569,7 @@ fn iter_node_records(store: &RedbStore) -> Result<Vec<NodeRecord>, String> {
         .map_err(|err| err.to_string())?;
     let mut out = Vec::new();
     for entry in entries {
-        if !is_node_slug(&entry.slug) {
+        if !is_node_slug(&entry.slug) || !entry.sensitive {
             continue;
         }
         if let Some(rec) = node_from_entry(&entry) {
@@ -737,6 +750,17 @@ mod tests {
             .unwrap();
         assert_eq!(before, after);
         assert!(node_token_matches(&store, "w1", &enrolled.node_token).unwrap());
+
+        let err = enroll_worker(
+            &store,
+            enroll_req(&info.code, "w1", "W", info.expires_at_ms + 1),
+        )
+        .unwrap_err();
+        assert_eq!(err, EnrollFail::Used);
+        let after_expiry = load_node(&store, &node_state_slug("w1").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(after_expiry.token_hash, before.token_hash);
     }
 
     #[test]
@@ -876,6 +900,38 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].node_id, "primary");
         assert_eq!(listed[0].status, "online");
+    }
+
+    #[test]
+    fn revoked_worker_token_does_not_match() {
+        let (_tmp, store) = open_store();
+        let info = mint_enroll_token(&store, None, 60, "http://hub", 1_000).unwrap();
+        let enrolled = enroll_worker(&store, enroll_req(&info.code, "w-tok", "W", 2_000)).unwrap();
+        assert!(node_token_matches(&store, "w-tok", &enrolled.node_token).unwrap());
+        revoke_node(&store, "w-tok").unwrap();
+        assert!(!node_token_matches(&store, "w-tok", &enrolled.node_token).unwrap());
+    }
+
+    #[test]
+    fn enroll_mac_node_id_is_rejected_and_writes_no_row() {
+        let (_tmp, store) = open_store();
+        let info = mint_enroll_token(&store, None, 60, "http://hub", 1_000).unwrap();
+        let err =
+            enroll_worker(&store, enroll_req(&info.code, "enroll-mac", "W", 1_100)).unwrap_err();
+        assert_eq!(err, EnrollFail::Invalid);
+        assert!(ensure_hub_node(&store, hub_args("enroll-mac", 1_200, None)).is_err());
+        let slug = format!("{NODE_SLUG_PREFIX}enroll-mac");
+        assert!(slug.starts_with(ENROLL_SLUG_PREFIX));
+        assert!(
+            store
+                .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &slug)
+                .unwrap()
+                .is_none()
+        );
+        let (_enroll_slug, stored) = stored_enroll(&store, &info.code);
+        assert_eq!(stored["used"], false);
+        assert!(list_visible_nodes(&store, 1_200).unwrap().is_empty());
+        assert!(find_hub_node(&store).unwrap().is_none());
     }
 
     #[test]

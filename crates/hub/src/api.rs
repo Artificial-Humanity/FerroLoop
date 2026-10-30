@@ -1160,10 +1160,7 @@ fn handle_get_state(
 
     let filtered: Vec<StateEntry> = entries
         .into_iter()
-        .filter(|e| {
-            !(e.scope == StateScope::Workspace
-                && (e.slug.starts_with("hub-pairing-") || e.slug.starts_with("hub-session-")))
-        })
+        .filter(|e| !(e.scope == StateScope::Workspace && is_reserved_hub_slug(&e.slug)))
         .map(|e| {
             if authority.is_owner() {
                 e
@@ -1176,9 +1173,14 @@ fn handle_get_state(
     HttpResponse::json(200, json!({ "entries": filtered }))
 }
 
+fn is_reserved_hub_slug(slug: &str) -> bool {
+    slug.starts_with("hub-pairing-")
+        || slug.starts_with("hub-session-")
+        || slug.starts_with("hub-node-")
+}
+
 fn is_internal_hub_entry(entry: &StateEntry) -> bool {
-    entry.scope == StateScope::Workspace
-        && (entry.slug.starts_with("hub-pairing-") || entry.slug.starts_with("hub-session-"))
+    entry.scope == StateScope::Workspace && is_reserved_hub_slug(&entry.slug)
 }
 
 fn redact_search_hit(mut hit: StateSearchHit, is_owner: bool) -> StateSearchHit {
@@ -1391,7 +1393,7 @@ fn handle_post_state(
     };
 
     let normalized_slug = slug.trim().to_ascii_lowercase();
-    if normalized_slug.starts_with("hub-pairing-") || normalized_slug.starts_with("hub-session-") {
+    if is_reserved_hub_slug(&normalized_slug) {
         return HttpResponse::json(
             403,
             json!({ "error": "reserved internal hub authentication slug prefix" }),
@@ -1565,7 +1567,7 @@ fn handle_post_state_checkpoint(
     // on the trimmed, lowercased input before slug validation).
     if let Some(raw_slug) = slug_field.as_deref() {
         let normalized = raw_slug.trim().to_ascii_lowercase();
-        if normalized.starts_with("hub-pairing-") || normalized.starts_with("hub-session-") {
+        if is_reserved_hub_slug(&normalized) {
             return HttpResponse::json(
                 403,
                 json!({ "error": "reserved internal hub authentication slug prefix" }),

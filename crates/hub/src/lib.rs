@@ -545,12 +545,15 @@ mod tests {
             403
         );
 
-        // Peer cannot forge internal `hub-pairing-*` or `hub-session-*` state entries via POST /api/v1/state:
+        // Peer cannot forge internal `hub-pairing-*`, `hub-session-*`, or `hub-node-*` entries.
         for forged_slug in [
             "hub-pairing-forgedcode",
             "HUB-PAIRING-forgedcode",
             "hub-session-forgedhash",
             "  hub-session-forgedhash  ",
+            "hub-node-forgedid",
+            "HUB-NODE-forgedid",
+            "  hub-node-forgedid  ",
         ] {
             let forged_write = HttpRequest::new("POST", "/api/v1/state")
                 .with_header("Authorization", "Bearer peer-tok-secret")
@@ -938,14 +941,20 @@ mod tests {
         }
 
         // Reserved hub slugs are 403 for owner and peer alike.
-        for auth in [&owner, &peer] {
-            let resp = handle_http_request(
-                &state,
-                &HttpRequest::new("POST", "/api/v1/state/checkpoint")
-                    .with_header("Authorization", auth)
-                    .with_json_body(&json!({ "slug": "hub-pairing-forged" })),
-            );
-            assert_eq!(resp.status, 403);
+        for slug in [
+            "hub-pairing-forged",
+            "hub-session-forged",
+            "hub-node-forged",
+        ] {
+            for auth in [&owner, &peer] {
+                let resp = handle_http_request(
+                    &state,
+                    &HttpRequest::new("POST", "/api/v1/state/checkpoint")
+                        .with_header("Authorization", auth)
+                        .with_json_body(&json!({ "slug": slug })),
+                );
+                assert_eq!(resp.status, 403, "{slug}");
+            }
         }
 
         // A peer cannot overwrite an existing sensitive checkpoint.
@@ -998,6 +1007,8 @@ mod tests {
             (json!({ "scope": "bogus:1" }), 400),
             (json!({ "slug": "1bad slug!" }), 400),
             (json!({ "slug": "hub-pairing-forged" }), 403),
+            (json!({ "slug": "hub-session-forged" }), 403),
+            (json!({ "slug": "hub-node-forged" }), 403),
         ] {
             let resp = handle_http_request(
                 &state,
