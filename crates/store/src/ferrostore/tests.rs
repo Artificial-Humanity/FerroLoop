@@ -658,16 +658,8 @@ fn unix_socket_serves_concurrent_clients_without_opening_the_file() {
     client.delete_doc("docs", "id-3").unwrap();
     assert!(client.get_doc("docs", "id-3").unwrap().is_none());
     client.checkpoint().unwrap();
-    let err = match client.with_read(|_| Ok(())) {
-        Ok(()) => panic!("remote read transaction was accepted"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, StoreError::Backend(_)), "{err}");
-    let err = match client.with_write(|_| Ok(())) {
-        Ok(()) => panic!("remote write transaction was accepted"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    client.with_read(|_| Ok(())).unwrap();
+    client.with_write(|_| Ok(())).unwrap();
 
     assert_eq!(
         server.store().get_doc("docs", "id-0").unwrap().unwrap()["n"],
@@ -1940,11 +1932,7 @@ fn auto_uses_the_listening_socket_and_otherwise_the_file() {
 
     let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&path).unwrap()).unwrap();
     let client = FerroStore::auto(&path).unwrap();
-    let err = match client.with_read(|_| Ok(())) {
-        Ok(()) => panic!("auto opened the file beside a listening socket"),
-        Err(err) => err,
-    };
-    assert!(matches!(err, StoreError::Backend(_)), "{err}");
+    client.with_read(|_| Ok(())).unwrap();
     client.put_doc("docs", "remote", &json!({"n": 2})).unwrap();
     assert_eq!(
         server.store().get_doc("docs", "remote").unwrap().unwrap()["n"],
@@ -1960,4 +1948,305 @@ fn auto_uses_the_listening_socket_and_otherwise_the_file() {
     let opened = FerroStore::open(&path).unwrap();
     assert_eq!(opened.get_doc("docs", "again").unwrap().unwrap()["n"], 3);
     assert_eq!(opened.get_doc("docs", "remote").unwrap().unwrap()["n"], 2);
+}
+
+fn exercise_store_traits(store: &FerroStore, tag: &str) {
+    use fl_core::agent::{AgentRole, AreaRecord, RegisterAgentArgs};
+    use fl_core::at::At;
+    use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+    use fl_core::ids::{WorkflowId, seq_iri};
+    use fl_core::model::State;
+    use fl_core::state::{
+        HandoffEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
+    };
+    use fl_core::store::{
+        AgentRegistry, Catalog, MessageStore, StateStore, Tracker, WorkflowStore,
+    };
+    use fl_core::workflow::{
+        AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS, DEFAULT_STEP_MAX_VISITS,
+        END_STEP, EdgeCondition, EdgeDef, JoinPolicy, StepCompletion, StepDef, WorkflowDef,
+    };
+    use std::collections::BTreeMap;
+
+    let root = format!("/work/{tag}");
+    let project = store.add_project(&root).unwrap();
+    let loaded = store.get_project(&project).unwrap().expect("project");
+    assert_eq!(loaded.id, project);
+    assert_eq!(loaded.root, root);
+
+    let title = format!("title {tag}");
+    let record = store.add_record(&project, &title).unwrap();
+    store.set_record_state(&record, State::Doing).unwrap();
+    let got = store.get_record(&record).unwrap().expect("record");
+    assert_eq!(got.id, record);
+    assert_eq!(got.state, State::Doing);
+    assert_eq!(got.title, title);
+
+    let area_name = format!("area-{tag}");
+    store
+        .upsert_area(
+            AreaRecord::new(
+                &area_name,
+                Some(format!("{tag}/")),
+                "Agent orchestration",
+                At::from_unix_millis(1),
+                "owner",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let agent_name = format!("agent-{tag}");
+    let agent = store
+        .register_agent(RegisterAgentArgs {
+            display_name: agent_name.clone(),
+            email: None,
+            project: area_name.clone(),
+            role: AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: false,
+            replace: false,
+            at: At::from_unix_millis(2),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let fetched = store.get_agent(&agent.id).unwrap().expect("agent");
+    assert_eq!(fetched.id, agent.id);
+    assert_eq!(fetched.display_name, agent_name);
+    assert_eq!(fetched.project, area_name);
+
+    let slug = format!("rule-{tag}");
+    let state = store
+        .upsert_state(UpsertStateArgs {
+            scope: StateScope::Workspace,
+            slug: slug.clone(),
+            sensitivity: SensitivityPatch::Inherit,
+            payload: StatePayload::Handoff(HandoffEntry {
+                summary: "v6".into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            at: At::from_unix_millis(10),
+            by: "jarvis".into(),
+        })
+        .unwrap();
+    let got_state = store.get_state(&state.id).unwrap().expect("state");
+    assert_eq!(got_state.id, state.id);
+    assert_eq!(got_state.slug, slug);
+
+    let flow = format!("flow-{tag}");
+    let workflow = store
+        .upsert_workflow_def(WorkflowDef {
+            id: WorkflowId(seq_iri(900)),
+            project: project.clone(),
+            slug: flow.clone(),
+            title: format!("CI {tag}"),
+            start_step: "build".into(),
+            steps: vec![StepDef {
+                step_id: "build".into(),
+                title: "Build".into(),
+                prompt: "Run build.".into(),
+                assignee: AssigneeRule::Agent {
+                    name: "felicia".into(),
+                },
+                reviews_step: None,
+                require_different_vendor: false,
+                completion: StepCompletion::Ungated,
+                join_policy: JoinPolicy::All,
+                max_attempts: DEFAULT_STEP_MAX_ATTEMPTS,
+                max_visits: DEFAULT_STEP_MAX_VISITS,
+                budget_usd_micros: None,
+                max_tokens: None,
+                isolate_worktree: false,
+            }],
+            edges: vec![EdgeDef {
+                from_step: "build".into(),
+                to_step: END_STEP.into(),
+                on: EdgeCondition::Pass,
+            }],
+            max_total_steps: DEFAULT_MAX_TOTAL_STEPS,
+            budget_usd_micros: None,
+            max_tokens: None,
+            declared_keys: BTreeMap::new(),
+            authored_at_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            authored_by: "ferris".into(),
+        })
+        .unwrap();
+    let got_workflow = store
+        .get_workflow_def(&workflow.id)
+        .unwrap()
+        .expect("workflow");
+    assert_eq!(got_workflow.slug, flow);
+    assert_eq!(got_workflow.project, project);
+
+    let body = format!("Body {tag}");
+    let (message, _) = store
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: Some("ai-lab-0".into()),
+            to: WireAddress::AgentName(agent_name),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: format!("Hello {tag}"),
+            body: body.clone(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+    let got_message = store
+        .get_wire_message(&message.id)
+        .unwrap()
+        .expect("wire message");
+    assert_eq!(got_message.id, message.id);
+    assert_eq!(got_message.body, body);
+}
+
+fn assert_concurrent_increments(connect: impl Fn() -> FerroStore + Sync, path: &Path) {
+    const THREADS: u64 = 8;
+    thread::scope(|scope| {
+        for i in 0..THREADS {
+            let connect = &connect;
+            scope.spawn(move || {
+                let client = connect();
+                client
+                    .with_write(|txn| {
+                        let n = txn
+                            .get("counter", "n")
+                            .and_then(|doc| doc.as_u64())
+                            .unwrap_or(0);
+                        txn.put("counter", "n", json!(n + 1));
+                        txn.put("private", format!("t{i}"), json!(i));
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+        }
+    });
+
+    let client = connect();
+    assert_eq!(
+        client.get_doc("counter", "n").unwrap().unwrap(),
+        json!(THREADS)
+    );
+    for i in 0..THREADS {
+        assert_eq!(
+            client
+                .get_doc("private", &format!("t{i}"))
+                .unwrap()
+                .unwrap(),
+            json!(i)
+        );
+    }
+
+    let frames = committed_frames(path);
+    assert_eq!(
+        frames.len(),
+        usize::try_from(THREADS).unwrap(),
+        "{frames:?}"
+    );
+    let mut privates = BTreeMap::new();
+    for (i, (seq, ops)) in frames.iter().enumerate() {
+        let expect = i as u64 + 1;
+        assert_eq!(*seq, expect);
+        assert_eq!(ops.len(), 2, "seq {seq} was not one frame: {ops:?}");
+        match &ops[..] {
+            [
+                Op::Put {
+                    collection: counter_collection,
+                    id: counter_id,
+                    doc: counter,
+                },
+                Op::Put {
+                    collection: private_collection,
+                    id: private_id,
+                    doc: private,
+                },
+            ] => {
+                assert_eq!(counter_collection, "counter");
+                assert_eq!(counter_id, "n");
+                assert_eq!(counter, &json!(expect));
+                assert_eq!(private_collection, "private");
+                assert_eq!(private, &json!(private.as_u64().unwrap()));
+                assert!(
+                    privates
+                        .insert(private_id.clone(), private.clone())
+                        .is_none(),
+                    "duplicate {private_id}"
+                );
+            }
+            other => panic!("expected counter and private puts, got {other:?}"),
+        }
+    }
+    assert_eq!(privates.len(), usize::try_from(THREADS).unwrap());
+}
+
+#[test]
+fn store_traits_run_over_unix_ws_and_auto() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("traits.fls");
+    let sock = dir.path().join("traits.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    exercise_store_traits(&client, "unix");
+    drop(client);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("traits.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let port = server.local_addr().port();
+    let client = FerroStore::connect_uri(&format!("ws://127.0.0.1:{port}")).unwrap();
+    exercise_store_traits(&client, "ws");
+    drop(client);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("traits.fls");
+    let server = FerroStoreServer::bind_unix(
+        default_socket_path_for_store(&path),
+        FerroStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    let client = FerroStore::auto(&path).unwrap();
+    exercise_store_traits(&client, "auto");
+    drop(client);
+    drop(server);
+}
+
+#[test]
+fn remote_with_write_commits_both_ops_in_one_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cas.fls");
+    let sock = dir.path().join("cas.sock");
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::open(&file).unwrap()).unwrap();
+    let uri = format!("unix://{}", sock.display());
+    assert_concurrent_increments(|| FerroStore::connect_uri(&uri).unwrap(), &file);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("cas.fls");
+    let server =
+        FerroStoreServer::bind_tcp("127.0.0.1:0", FerroStore::open(&file).unwrap()).unwrap();
+    let port = server.local_addr().port();
+    let uri = format!("ws://127.0.0.1:{port}");
+    assert_concurrent_increments(|| FerroStore::connect_uri(&uri).unwrap(), &file);
+    drop(server);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cas.fls");
+    let server = FerroStoreServer::bind_unix(
+        default_socket_path_for_store(&path),
+        FerroStore::open(&path).unwrap(),
+    )
+    .unwrap();
+    assert_concurrent_increments(|| FerroStore::auto(&path).unwrap(), &path);
+    drop(server);
 }

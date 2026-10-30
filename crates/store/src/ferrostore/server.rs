@@ -4,11 +4,12 @@
 //! speak length-prefixed JSON. WebSocket clients speak one JSON value per
 //! frame. Neither takes `flock`.
 
-use super::layout::backend;
+use super::layout::{Op, backend};
+use super::state::DocState;
 use super::{FerroStore, MqRecord, lock_mutex};
 use fl_core::StoreError;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -531,6 +532,17 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
             store.checkpoint()?;
             Ok(Value::Null)
         }
+        "read_state" => Ok(doc_state_value(&store.read_state()?)),
+        "commit_ops" => {
+            let expected_seq = param_u64(params, "expected_seq")?;
+            let ops = parse_ops(
+                params
+                    .get("ops")
+                    .ok_or_else(|| backend("missing param `ops`"))?,
+            )?;
+            // `false` is a sequence mismatch, not an error response.
+            Ok(Value::Bool(store.commit_if_seq(expected_seq, &ops)?))
+        }
         _ => Err(backend(format!("no such method `{method}`"))),
     }
 }
@@ -580,6 +592,97 @@ fn param_value(params: &Value, key: &str) -> Result<Value, StoreError> {
         .get(key)
         .cloned()
         .ok_or_else(|| backend(format!("missing param `{key}`")))
+}
+
+fn doc_state_value(state: &DocState) -> Value {
+    let docs = state
+        .docs
+        .iter()
+        .map(|((collection, id), doc)| {
+            json!({
+                "collection": collection,
+                "id": id,
+                "doc": doc,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "last_seq": state.last_seq,
+        "docs": docs,
+    })
+}
+
+fn parse_doc_state(value: &Value) -> Result<DocState, StoreError> {
+    let last_seq = value
+        .get("last_seq")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| backend("read_state result is missing last_seq"))?;
+    let items = value
+        .get("docs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| backend("read_state result is missing docs"))?;
+    let mut docs = BTreeMap::new();
+    for item in items {
+        let collection = param_str(item, "collection")?.to_string();
+        let id = param_str(item, "id")?.to_string();
+        let doc = item
+            .get("doc")
+            .cloned()
+            .ok_or_else(|| backend("read_state doc is missing doc"))?;
+        docs.insert((collection, id), doc);
+    }
+    Ok(DocState { docs, last_seq })
+}
+
+fn op_value(op: &Op) -> Value {
+    match op {
+        Op::Put {
+            collection,
+            id,
+            doc,
+        } => json!({
+            "op": "put",
+            "collection": collection,
+            "id": id,
+            "doc": doc,
+        }),
+        Op::Delete { collection, id } => json!({
+            "op": "delete",
+            "collection": collection,
+            "id": id,
+        }),
+    }
+}
+
+fn parse_ops(value: &Value) -> Result<Vec<Op>, StoreError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| backend("param `ops` is not an array"))?;
+    items.iter().map(parse_op).collect()
+}
+
+fn parse_op(value: &Value) -> Result<Op, StoreError> {
+    let kind = value
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(|| backend("op is missing op"))?;
+    let collection = param_str(value, "collection")?.to_string();
+    let id = param_str(value, "id")?.to_string();
+    match kind {
+        "put" => {
+            let doc = value
+                .get("doc")
+                .cloned()
+                .ok_or_else(|| backend("put op is missing doc"))?;
+            Ok(Op::Put {
+                collection,
+                id,
+                doc,
+            })
+        }
+        "delete" => Ok(Op::Delete { collection, id }),
+        other => Err(backend(format!("unknown op `{other}`"))),
+    }
 }
 
 enum Incoming {
@@ -656,6 +759,9 @@ impl JsonIo for WsIo {
     fn read_value(&mut self) -> Result<Incoming, StoreError> {
         match ws::read_event(&mut self.stream, self.client)? {
             ws::WsEvent::Data(payload) => {
+                if payload.is_empty() {
+                    return Err(backend("frame length is outside 1..=16MiB"));
+                }
                 let text =
                     std::str::from_utf8(&payload).map_err(|_| backend("frame is not utf-8"))?;
                 let value = serde_json::from_str(text).map_err(|_| backend("frame is not json"))?;
@@ -840,6 +946,23 @@ impl RemoteClient {
         items.iter().map(parse_record).collect()
     }
 
+    pub(super) fn read_state(&self) -> Result<DocState, StoreError> {
+        parse_doc_state(&self.call("read_state", json!({}))?)
+    }
+
+    pub(super) fn commit_ops(&self, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
+        let value = self.call(
+            "commit_ops",
+            json!({
+                "expected_seq": expected_seq,
+                "ops": ops.iter().map(op_value).collect::<Vec<_>>(),
+            }),
+        )?;
+        value
+            .as_bool()
+            .ok_or_else(|| backend("commit_ops result is not a bool"))
+    }
+
     pub(super) fn subscribe_topic(&self, topic: &str) -> Receiver<MqRecord> {
         let (tx, rx) = mpsc::channel();
         let tx = Arc::new(tx);
@@ -983,6 +1106,39 @@ fn deliver_push(shared: &RemoteShared, frame: &Value) {
     senders.retain(|sender| sender.send(record.clone()).is_ok());
     if senders.is_empty() {
         subs.remove(topic);
+    }
+}
+
+#[cfg(test)]
+mod empty_frame {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn empty_websocket_data_frame_is_outside_the_json_limit_and_empty_ping_is_a_ping() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut io = WsIo::server(server, false);
+
+        ws::write_frame(&mut client, true, 0x1, &[]).unwrap();
+        let msg = match io.read_value() {
+            Err(err) => err.to_string(),
+            Ok(Incoming::Ping(_)) => panic!("empty data frame was a ping"),
+            Ok(Incoming::Value(_)) => panic!("empty data frame was accepted"),
+            Ok(Incoming::Close) => panic!("empty data frame was a close"),
+        };
+        assert!(msg.contains("frame length is outside 1..=16MiB"), "{msg}");
+        assert!(!msg.contains("frame is not json"), "{msg}");
+
+        ws::write_frame(&mut client, true, 0xA, &[]).unwrap();
+        ws::write_frame(&mut client, true, 0x9, &[]).unwrap();
+        match io.read_value().unwrap() {
+            Incoming::Ping(payload) => assert!(payload.is_empty()),
+            Incoming::Value(_) => panic!("empty ping was parsed as json"),
+            Incoming::Close => panic!("empty ping was a close"),
+        }
     }
 }
 

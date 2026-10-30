@@ -301,7 +301,7 @@ impl AgentRegistry for FerroStore {
             };
             doc::put_json(txn, AREAS, &normalized.area_key, &normalized)?;
             append_registry_event(txn, &ev)?;
-            Ok(normalized)
+            Ok(normalized.clone())
         })
     }
 
@@ -372,7 +372,7 @@ impl AgentRegistry for FerroStore {
                 && !args.replace
             {
                 return Err(StoreError::AgentCollision {
-                    name_key,
+                    name_key: name_key.clone(),
                     existing_id: existing.id.clone(),
                     status: existing.status,
                 });
@@ -390,7 +390,7 @@ impl AgentRegistry for FerroStore {
                 if let Some(mut lead) = conflicting {
                     if !args.replace {
                         return Err(StoreError::LeadTaken {
-                            project,
+                            project: project.clone(),
                             lead_name: lead.display_name,
                             lead_id: lead.id,
                         });
@@ -420,11 +420,11 @@ impl AgentRegistry for FerroStore {
             let record = AgentRecord {
                 id: agent_id.clone(),
                 name_key: name_key.clone(),
-                display_name,
-                email,
-                project,
-                role: args.role,
-                extra_areas,
+                display_name: display_name.clone(),
+                email: email.clone(),
+                project: project.clone(),
+                role: args.role.clone(),
+                extra_areas: extra_areas.clone(),
                 status: AgentStatus::Active,
                 updated_at: args.at.clone(),
                 by: args.by.clone(),
@@ -433,8 +433,8 @@ impl AgentRegistry for FerroStore {
             doc::put_json(txn, AGENTS, agent_id.as_str(), &record)?;
             let ev = RegistryEvent {
                 event_id: mint()?,
-                at: args.at,
-                by: args.by,
+                at: args.at.clone(),
+                by: args.by.clone(),
                 kind: RegistryEventKind::AgentUpsert(record.clone()),
             };
             append_registry_event(txn, &ev)?;
@@ -467,7 +467,7 @@ impl AgentRegistry for FerroStore {
             doc::put_json(txn, AGENTS, resolved.as_str(), &rec)?;
             let ev = RegistryEvent {
                 event_id: mint()?,
-                at,
+                at: at.clone(),
                 by: rec.by.clone(),
                 kind: RegistryEventKind::AgentRetire { id: resolved },
             };
@@ -704,14 +704,14 @@ impl StateStore for FerroStore {
             };
             let entry = StateEntry {
                 id: entry_id.clone(),
-                scope: args.scope,
+                scope: args.scope.clone(),
                 concern,
-                slug,
+                slug: slug.clone(),
                 sensitive,
                 ever_sensitive,
-                payload: args.payload,
+                payload: args.payload.clone(),
                 head_revision: rev_id,
-                updated_at: args.at,
+                updated_at: args.at.clone(),
                 by: args.by.trim().to_string(),
             };
             append_state_revision(txn, &rev)?;
@@ -906,7 +906,7 @@ impl StateStore for FerroStore {
                 ever_sensitive,
                 payload: chosen.payload,
                 head_revision: merge_rev_id,
-                updated_at: at,
+                updated_at: at.clone(),
                 by: by.trim().to_string(),
             };
             txn.delete(STATE_CONFLICTS, resolved.as_str());

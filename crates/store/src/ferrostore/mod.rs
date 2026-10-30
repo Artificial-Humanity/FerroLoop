@@ -418,9 +418,6 @@ impl FerroStore {
         &self,
         body: impl FnOnce(&Txn) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        if matches!(&self.inner, Inner::Remote(_)) {
-            return Err(remote_unsupported());
-        }
         let state = self.read_state()?;
         let txn = Txn {
             docs: state.docs,
@@ -433,6 +430,27 @@ impl FerroStore {
         match &self.inner {
             Inner::Memory(state) => Ok(lock_mutex(state).clone()),
             Inner::Disk(disk) => Ok(read_consistent(&disk.read)?.2),
+            Inner::Remote(remote) => remote.read_state(),
+        }
+    }
+
+    /// Compare-and-swap `ops` onto a store whose `last_seq` is still `expected_seq`.
+    ///
+    /// `Ok(false)` means the sequence moved and nothing was written. An empty `ops`
+    /// list that matches returns `Ok(true)` and does not advance `last_seq`. A
+    /// non-empty disk success is one WAL frame at `expected_seq + 1`. Remote
+    /// handles do not call this; the server's store is memory or disk.
+    fn commit_if_seq(&self, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
+        match &self.inner {
+            Inner::Memory(slot) => {
+                let mut state = lock_mutex(slot);
+                if state.last_seq != expected_seq {
+                    return Ok(false);
+                }
+                commit_ops(&mut state, ops)?;
+                Ok(true)
+            }
+            Inner::Disk(disk) => commit_if_seq_disk(disk, expected_seq, ops),
             Inner::Remote(_) => Err(remote_unsupported()),
         }
     }
@@ -443,12 +461,28 @@ impl FerroStore {
     /// re-reads a consistent snapshot, then builds the transaction from that
     /// state. `Ok` with at least one op appends one WAL frame (`seq = last_seq + 1`)
     /// and publishes one superblock. `Err` or an empty op list writes nothing.
+    /// A remote handle compare-and-swaps those ops and runs `body` again when
+    /// `last_seq` changed. The body may run more than once only on a remote handle.
     fn with_write<T>(
         &self,
-        body: impl FnOnce(&mut Txn) -> Result<T, StoreError>,
+        mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
         match &self.inner {
-            Inner::Remote(_) => Err(remote_unsupported()),
+            Inner::Remote(remote) => loop {
+                let state = remote.read_state()?;
+                let seq_base = state.last_seq;
+                let mut txn = Txn {
+                    docs: state.docs,
+                    ops: Vec::new(),
+                };
+                let result = body(&mut txn)?;
+                if txn.ops.is_empty() {
+                    return Ok(result);
+                }
+                if remote.commit_ops(seq_base, &txn.ops)? {
+                    return Ok(result);
+                }
+            },
             Inner::Memory(slot) => {
                 let mut state = lock_mutex(slot);
                 let mut txn = Txn {
@@ -529,9 +563,27 @@ fn file_uri_path(rest: &str) -> String {
     rest.to_string()
 }
 
+fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
+    let file = lock_mutex(&disk.write);
+    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
+    let (index, sb, state) = read_consistent(&file)?;
+    if state.last_seq != expected_seq {
+        return Ok(false);
+    }
+    if ops.is_empty() {
+        return Ok(true);
+    }
+    let seq = expected_seq
+        .checked_add(1)
+        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let frame = encode_frame(seq, ops)?;
+    append_frame(&file, index, &sb, &frame)?;
+    Ok(true)
+}
+
 fn with_write_disk<T>(
     disk: &Disk,
-    body: impl FnOnce(&mut Txn) -> Result<T, StoreError>,
+    mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;

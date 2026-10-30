@@ -180,12 +180,16 @@ Each call is one JSON object:
 | `ack_mq` | `topic`, `group`, `seq` | `null` |
 | `checkpoint` | none | `null` |
 | `subscribe_mq` | `topic` | `null`, then push frames |
+| `read_state` | none | `{"last_seq": <u64>, "docs": [{"collection", "id", "doc"}, ...]}`. Documents are in `(collection, id)` order. A stored JSON `null` is `"doc": null`. Missing documents are omitted |
+| `commit_ops` | `expected_seq`, `ops` | `true` when the compare-and-swap commits. `false` when `last_seq` is not `expected_seq`, and nothing is written. A bad op is an error, not `false` |
 
 `subscribe_mq` does not replay history. A later publish on that topic is pushed on the same connection as a frame with no `id`:
 
 ```json
 {"method": "mq", "params": {"topic": "orders", "record": {"seq": 1, "key": "k", "payload": {}}}}
 ```
+
+`read_state` is an atomic snapshot of the document map. `commit_ops` is a compare-and-swap of `ops` against `expected_seq`. Each op is `{"op":"put","collection","id","doc"}` or `{"op":"delete","collection","id"}`. `false` means `last_seq` did not match, and the call writes nothing. A non-empty success is one WAL frame. A remote `with_write` retries until the compare-and-swap succeeds, so concurrent remote writers do not lose updates. The body may run more than once on a remote handle. `fl_core::store` traits on `unix://`, `ws://`, and a connected `FerroStore::auto` use this path.
 
 ## Auto
 
