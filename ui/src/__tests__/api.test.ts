@@ -427,6 +427,105 @@ describe("HubApiClient", () => {
       },
     ]);
   });
+
+  it("calls spinUpSession and decommissionSession endpoints with expected payloads", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, body });
+
+      if (url.endsWith("/api/v1/sessions/spin-up") && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            session_id: "sess-kacey-01",
+            persona: body.persona,
+            project: body.project,
+            role: body.role,
+            vendor: body.vendor,
+            model: body.model ?? null,
+            node_id: body.node_id ?? "ai-lab-0",
+            hosted: Boolean(body.hosted),
+            status: "running",
+            tmux_target: "kacey:0.0",
+            hydration_dispatched: true,
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.includes("/decommission") && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            session_id: "sess-kacey-01",
+            persona: "kacey",
+            mode: body.mode,
+            status: body.mode === "prepare" ? "decommissioning" : "decommissioned",
+            handshake_dispatched: body.mode === "prepare",
+            unregistered: body.mode === "teardown",
+            runtime_stopped: body.mode === "teardown",
+            prompt: body.mode === "prepare" ? "Pre-decommission handshake" : null,
+          }),
+          { status: 200 },
+        );
+      }
+
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    });
+
+    const client = new HubApiClient({
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    const spinRes = await client.spinUpSession({
+      persona: "kacey",
+      project: "kaggle-gemma4",
+      role: "assistant",
+      vendor: "claude",
+      model: "claude-sonnet-4-6",
+      node_id: "ai-lab-0",
+      hosted: true,
+    });
+    expect(spinRes.session_id).toBe("sess-kacey-01");
+    expect(spinRes.hydration_dispatched).toBe(true);
+
+    const prepRes = await client.decommissionSession("sess-kacey-01", "prepare");
+    expect(prepRes.mode).toBe("prepare");
+    expect(prepRes.handshake_dispatched).toBe(true);
+    expect(prepRes.unregistered).toBe(false);
+
+    const tearRes = await client.decommissionSession("sess/kacey 01", "teardown");
+    expect(tearRes.mode).toBe("teardown");
+    expect(tearRes.unregistered).toBe(true);
+    expect(tearRes.runtime_stopped).toBe(true);
+
+    expect(calls).toEqual([
+      {
+        url: "/api/v1/sessions/spin-up",
+        method: "POST",
+        body: {
+          persona: "kacey",
+          project: "kaggle-gemma4",
+          role: "assistant",
+          vendor: "claude",
+          model: "claude-sonnet-4-6",
+          node_id: "ai-lab-0",
+          hosted: true,
+        },
+      },
+      {
+        url: "/api/v1/sessions/sess-kacey-01/decommission",
+        method: "POST",
+        body: { mode: "prepare" },
+      },
+      {
+        url: "/api/v1/sessions/sess%2Fkacey%2001/decommission",
+        method: "POST",
+        body: { mode: "teardown" },
+      },
+    ]);
+  });
 });
 
 describe("HubWsClient", () => {

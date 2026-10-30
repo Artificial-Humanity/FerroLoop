@@ -11,6 +11,7 @@ import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import { RosterSidebar } from "./components/RosterSidebar";
+import { SpinUpAgentModal } from "./components/SpinUpAgentModal";
 import { TerminalPane } from "./components/TerminalPane";
 import { VaultGatePane } from "./components/VaultGatePane";
 import { FerroStatePane } from "./components/FerroStatePane";
@@ -21,6 +22,7 @@ import {
   type AgentRecord,
   type ArchitectureResponse,
   type CockpitTab,
+  type DecommissionMode,
   type DiscoveredSessionSummary,
   type EnrolledNode,
   type HubAuthority,
@@ -31,6 +33,7 @@ import {
   type PullRequestItem,
   type SessionContextUsage,
   type SessionQuotaUsage,
+  type SpinUpSessionRequest,
   type QueuedOperatorPrompt,
   type TranscriptTurn,
   type WireInboxItem,
@@ -262,6 +265,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [pairingOpen, setPairingOpen] = useState<boolean>(false);
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
+  const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
   const [nodes, setNodes] = useState<EnrolledNode[]>([]);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
 
@@ -470,7 +474,10 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setSessions(list);
         }
         await scanBackgroundTranscripts(list);
-        const targetId = sessionOverride ?? selectedSessionId ?? selectedAgentName;
+        const targetId =
+          sessionOverride === null
+            ? null
+            : (sessionOverride ?? selectedSessionId ?? selectedAgentName);
         if (targetId) {
           const trRes = await apiClient.getSessionTranscript(targetId).catch(() => null);
           if (trRes) {
@@ -1005,6 +1012,43 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     await refreshWireAndRoster();
   };
 
+  const handleSpinUpSession = async (req: SpinUpSessionRequest) => {
+    const res = await apiClient.spinUpSession(req);
+    await Promise.all([
+      refreshWireAndRoster(),
+      refreshSessionsAndTranscript(res.session_id),
+    ]);
+    if (res.persona) {
+      setSelectedAgentName(res.persona);
+    }
+    if (res.session_id) {
+      setSelectedSessionId(res.session_id);
+    }
+    return res;
+  };
+
+  const handleDecommissionSession = async (mode: DecommissionMode) => {
+    const targetId = activeSession?.id || selectedAgent?.name_key;
+    if (!targetId) {
+      throw new Error("No active session selected to decommission.");
+    }
+    const res = await apiClient.decommissionSession(targetId, mode);
+    if (mode === "teardown") {
+      setSelectedSessionId(null);
+      selectedSessionIdRef.current = null;
+      setTranscriptTurns([]);
+      setSessionQueue([]);
+      setIsSessionBusy(false);
+      setSessionContextUsage(null);
+      setSessionQuotaUsage(null);
+    }
+    await Promise.all([
+      refreshWireAndRoster(),
+      refreshSessionsAndTranscript(mode === "teardown" ? null : targetId),
+    ]);
+    return res;
+  };
+
   const renderSecondaryPane = (paneTab: CockpitTab) => {
     switch (paneTab) {
       case "artifacts":
@@ -1118,6 +1162,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             onSendQueuedNow={handleSendQueuedNow}
             onCancelQueued={handleCancelQueued}
             onUpdateQueued={handleUpdateQueued}
+            onDecommissionSession={handleDecommissionSession}
             onOpenArtifact={handleOpenArtifact}
             apiClient={apiClient}
           />
@@ -1145,6 +1190,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setSelectedAgentName(nameKey);
           setSelectedSessionId(null);
         }}
+        onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         isOpen={mobileRosterOpen}
         onClose={() => setMobileRosterOpen(false)}
       />
@@ -1200,6 +1246,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 onSendQueuedNow={handleSendQueuedNow}
                 onCancelQueued={handleCancelQueued}
                 onUpdateQueued={handleUpdateQueued}
+                onDecommissionSession={handleDecommissionSession}
                 onOpenArtifact={handleOpenArtifact}
                 apiClient={apiClient}
               />
@@ -1253,6 +1300,14 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setNodes((prev) => prev.filter((n) => n.node_id !== nodeId));
           await refreshNodes();
         }}
+        apiClient={apiClient}
+      />
+
+      <SpinUpAgentModal
+        isOpen={spinUpModalOpen}
+        onClose={() => setSpinUpModalOpen(false)}
+        nodes={nodes}
+        onSpinUp={handleSpinUpSession}
         apiClient={apiClient}
       />
     </div>

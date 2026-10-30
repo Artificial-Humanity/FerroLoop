@@ -2,6 +2,8 @@ import React from "react";
 import type { HubApiClient } from "../api/client";
 import type {
   ClearSessionMode,
+  DecommissionMode,
+  DecommissionSessionResponse,
   PromptAttachment,
   PromptRequest,
   PromptResponse,
@@ -253,6 +255,9 @@ export interface ChatPaneProps {
   onSendQueuedNow?: (promptId: string) => Promise<unknown> | void;
   onCancelQueued?: (promptId: string) => Promise<unknown> | void;
   onUpdateQueued?: (promptId: string, prompt: string) => Promise<unknown> | void;
+  onDecommissionSession?: (
+    mode: DecommissionMode,
+  ) => Promise<DecommissionSessionResponse | unknown> | void;
   onOpenArtifact?: (pathOrUrl: string) => void;
   apiClient?: HubApiClient;
 }
@@ -295,6 +300,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onSendQueuedNow,
   onCancelQueued,
   onUpdateQueued,
+  onDecommissionSession,
   onOpenArtifact,
   apiClient,
 }) => {
@@ -315,6 +321,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [clearHelpVisible, setClearHelpVisible] = React.useState<boolean>(false);
   const [clearing, setClearing] = React.useState<boolean>(false);
   const clearHelpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [decommissionModalOpen, setDecommissionModalOpen] = React.useState<boolean>(false);
+  const [decommissionHelpVisible, setDecommissionHelpVisible] = React.useState<boolean>(false);
+  const [decommissioning, setDecommissioning] = React.useState<boolean>(false);
+  const decommissionHelpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
   const [visibleTurnLimit, setVisibleTurnLimit] = React.useState<number>(100);
@@ -406,13 +416,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     Boolean(targetSessionOrAgent) &&
     !compacting &&
     !clearing &&
+    !decommissioning &&
     !submitting;
-  const canClear = Boolean(targetSessionOrAgent) && !clearing && !compacting && !submitting;
+  const canClear =
+    Boolean(targetSessionOrAgent) && !clearing && !decommissioning && !compacting && !submitting;
+  const canDecommission =
+    Boolean(targetSessionOrAgent) && !decommissioning && !clearing && !compacting && !submitting;
 
   React.useEffect(() => {
     return () => {
       if (clearHelpTimerRef.current !== null) {
         clearTimeout(clearHelpTimerRef.current);
+      }
+      if (decommissionHelpTimerRef.current !== null) {
+        clearTimeout(decommissionHelpTimerRef.current);
       }
     };
   }, []);
@@ -497,6 +514,90 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       handleCloseClearModal();
     } finally {
       setClearing(false);
+    }
+  };
+
+  const handleOpenDecommissionModal = () => {
+    if (!canDecommission) return;
+    if (decommissionHelpTimerRef.current !== null) {
+      clearTimeout(decommissionHelpTimerRef.current);
+      decommissionHelpTimerRef.current = null;
+    }
+    setDecommissionHelpVisible(false);
+    setDecommissionModalOpen(true);
+  };
+
+  const handleCloseDecommissionModal = React.useCallback(() => {
+    if (decommissionHelpTimerRef.current !== null) {
+      clearTimeout(decommissionHelpTimerRef.current);
+      decommissionHelpTimerRef.current = null;
+    }
+    setDecommissionHelpVisible(false);
+    setDecommissionModalOpen(false);
+  }, []);
+
+  React.useEffect(() => {
+    handleCloseDecommissionModal();
+  }, [targetSessionOrAgent, handleCloseDecommissionModal]);
+
+  React.useEffect(() => {
+    if (!decommissionModalOpen) return;
+    const handleKeyDownEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !decommissioning) {
+        handleCloseDecommissionModal();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDownEscape);
+    return () => window.removeEventListener("keydown", handleKeyDownEscape);
+  }, [decommissionModalOpen, decommissioning, handleCloseDecommissionModal]);
+
+  const handleShowDecommissionHelp = () => {
+    if (decommissionHelpTimerRef.current !== null) {
+      clearTimeout(decommissionHelpTimerRef.current);
+    }
+    setDecommissionHelpVisible(true);
+    decommissionHelpTimerRef.current = setTimeout(() => {
+      setDecommissionHelpVisible(false);
+      decommissionHelpTimerRef.current = null;
+    }, 6_000);
+  };
+
+  const handleDecommission = async (mode: DecommissionMode) => {
+    if (!targetSessionOrAgent || decommissioning) {
+      return;
+    }
+    setDecommissioning(true);
+    setCompactFeedback(null);
+    setSubmitError(null);
+    try {
+      if (onDecommissionSession) {
+        await onDecommissionSession(mode);
+      } else if (apiClient) {
+        await apiClient.decommissionSession(targetSessionOrAgent, mode);
+        if (mode === "teardown") {
+          setInternalTurns([]);
+          setInternalQueue([]);
+          setInternalIsBusy(false);
+        } else if (turns === undefined) {
+          void fetchTranscript();
+        }
+        if (onRefresh) {
+          onRefresh();
+        }
+      } else {
+        throw new Error("No session route is configured for decommissioning.");
+      }
+      handleCloseDecommissionModal();
+      setCompactFeedback(
+        mode === "prepare" ? "Prepared decommission" : "Tore down session",
+      );
+    } catch (err) {
+      setSubmitError(
+        err instanceof Error ? err.message : `Failed to ${mode} session`,
+      );
+      handleCloseDecommissionModal();
+    } finally {
+      setDecommissioning(false);
     }
   };
 
@@ -1202,6 +1303,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           >
             {clearing ? "Clearing..." : "Clear"}
           </button>
+          <button
+            type="button"
+            className="fd-btn fd-btn-danger"
+            data-testid="decommission-session-btn"
+            disabled={!canDecommission}
+            title="Prepare graceful decommission handshake or tear down session immediately"
+            onClick={handleOpenDecommissionModal}
+            style={{ whiteSpace: "nowrap" }}
+          >
+            {decommissioning ? "Decommissioning..." : "Decommission"}
+          </button>
           {compactFeedback && (
             <span
               role="status"
@@ -1811,6 +1923,126 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 onClick={() => void handleClearOrReforge("reforge")}
               >
                 Reforge
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {decommissionModalOpen && (
+        <div
+          className="fd-modal-backdrop"
+          onClick={handleCloseDecommissionModal}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="decommission-session-modal-title"
+            data-testid="decommission-modal"
+            className="fd-modal"
+            onClick={(e) => e.stopPropagation()}
+            style={{ position: "relative", maxWidth: "460px" }}
+          >
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "8px",
+                marginBottom: "10px",
+              }}
+            >
+              <h3
+                id="decommission-session-modal-title"
+                style={{
+                  margin: 0,
+                  fontSize: "15px",
+                  fontWeight: 600,
+                  color: "var(--text-primary)",
+                }}
+              >
+                Decommission Agent Session
+              </h3>
+              <button
+                type="button"
+                data-testid="decommission-help-btn"
+                aria-label="Help"
+                title="Explain Prepare & Decommission vs. Tear Down"
+                className="fd-btn fd-help-icon-btn"
+                onClick={handleShowDecommissionHelp}
+              >
+                ?
+              </button>
+            </div>
+
+            {decommissionHelpVisible && (
+              <div
+                role="note"
+                data-testid="decommission-help-popover"
+                className="fd-ephemeral-help-popover"
+              >
+                <div style={{ marginBottom: "6px" }}>
+                  <strong style={{ color: "var(--accent-hover)" }}>
+                    Prepare &amp; Decommission:
+                  </strong>{" "}
+                  Sends a pre-decommission state and worktree hygiene handshake prompt so the
+                  agent saves STATE.md/FerroState, cleans up worktrees, and messages its Lead.
+                </div>
+                <div>
+                  <strong style={{ color: "var(--text-primary)" }}>Tear Down:</strong>{" "}
+                  Immediately stops the runtime session, clears queues and routes, and
+                  unregisters the persona.
+                </div>
+              </div>
+            )}
+
+            <p
+              style={{
+                margin: "0 0 16px 0",
+                fontSize: "13px",
+                color: "var(--text-secondary)",
+                lineHeight: 1.5,
+              }}
+            >
+              Choose how to decommission{" "}
+              <strong style={{ color: "var(--text-primary)" }}>{displayTarget}</strong>:
+            </p>
+
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "flex-end",
+                gap: "8px",
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="decommission-cancel-btn"
+                disabled={decommissioning}
+                onClick={handleCloseDecommissionModal}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="fd-btn fd-btn-danger"
+                data-testid="decommission-teardown-btn"
+                disabled={decommissioning}
+                onClick={() => void handleDecommission("teardown")}
+              >
+                Tear Down
+              </button>
+              <button
+                type="button"
+                className="fd-btn fd-btn-primary"
+                data-testid="decommission-prepare-btn"
+                disabled={decommissioning}
+                onClick={() => void handleDecommission("prepare")}
+              >
+                Prepare &amp; Decommission
               </button>
             </div>
           </div>

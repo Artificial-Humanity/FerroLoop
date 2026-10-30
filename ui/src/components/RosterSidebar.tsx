@@ -14,6 +14,7 @@ export interface RosterSidebarProps {
   unreadByAgent: Record<string, number>;
   selectedAgentName: string | null;
   onSelectAgent: (nameKey: string) => void;
+  onOpenSpinUpModal?: () => void;
   isOpen?: boolean;
   onClose?: () => void;
 }
@@ -65,6 +66,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   unreadByAgent,
   selectedAgentName,
   onSelectAgent,
+  onOpenSpinUpModal,
   isOpen = false,
   onClose,
 }) => {
@@ -208,20 +210,33 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
               FerroDeck
             </span>
           </div>
-          <span className="fd-badge" title="Registered Workspace Agents">
-            {enrichedAgents.length} agents
-          </span>
-          {onClose && (
-            <button
-              type="button"
-              className="fd-btn"
-              onClick={onClose}
-              aria-label="Close Roster"
-              style={{ padding: "2px 6px" }}
-            >
-              ✕
-            </button>
-          )}
+          <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+            <span className="fd-badge" title="Registered Workspace Agents">
+              {enrichedAgents.length} agents
+            </span>
+            {onOpenSpinUpModal && (
+              <button
+                type="button"
+                className="fd-btn fd-btn-primary"
+                data-testid="spin-up-agent-btn"
+                onClick={onOpenSpinUpModal}
+                style={{ padding: "3px 8px", fontSize: "11px" }}
+              >
+                + Spin Up
+              </button>
+            )}
+            {onClose && (
+              <button
+                type="button"
+                className="fd-btn"
+                onClick={onClose}
+                aria-label="Close Roster"
+                style={{ padding: "2px 6px" }}
+              >
+                ✕
+              </button>
+            )}
+          </div>
         </div>
 
         <input
