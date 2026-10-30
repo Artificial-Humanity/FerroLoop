@@ -214,10 +214,11 @@ impl WorkflowStore for FerroStore {
         })
     }
 
-    fn import_workflow_def(&self, mut def: WorkflowDef) -> Result<(), StoreError> {
+    fn import_workflow_def(&self, def: WorkflowDef) -> Result<(), StoreError> {
         validate_workflow_def(&def).map_err(|e| StoreError::InvalidWorkflow(e.to_string()))?;
         let label = self.label.clone();
         self.with_write(|txn| {
+            let mut def = def.clone();
             let project = ProjectId(doc::resolve_if_kind(
                 txn,
                 &label,
@@ -268,9 +269,10 @@ impl WorkflowStore for FerroStore {
         })
     }
 
-    fn import_workflow_run(&self, mut run: WorkflowRun) -> Result<(), StoreError> {
+    fn import_workflow_run(&self, run: WorkflowRun) -> Result<(), StoreError> {
         let label = self.label.clone();
         self.with_write(|txn| {
+            let mut run = run.clone();
             let project = ProjectId(doc::resolve_if_kind(
                 txn,
                 &label,

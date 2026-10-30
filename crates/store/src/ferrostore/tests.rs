@@ -1954,7 +1954,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
     use fl_core::agent::{AgentRole, AreaRecord, RegisterAgentArgs};
     use fl_core::at::At;
     use fl_core::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
-    use fl_core::ids::{WorkflowId, seq_iri};
+    use fl_core::ids::{WorkflowId, WorkflowRunId, seq_iri};
     use fl_core::model::State;
     use fl_core::state::{
         HandoffEntry, SensitivityPatch, StatePayload, StateScope, UpsertStateArgs,
@@ -1965,6 +1965,7 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
     use fl_core::workflow::{
         AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS, DEFAULT_STEP_MAX_VISITS,
         END_STEP, EdgeCondition, EdgeDef, JoinPolicy, StepCompletion, StepDef, WorkflowDef,
+        WorkflowRun,
     };
     use std::collections::BTreeMap;
 
@@ -2080,6 +2081,35 @@ fn exercise_store_traits(store: &FerroStore, tag: &str) {
         .expect("workflow");
     assert_eq!(got_workflow.slug, flow);
     assert_eq!(got_workflow.project, project);
+
+    let run = store
+        .create_workflow_run(
+            WorkflowRun::new(
+                WorkflowRunId(seq_iri(901)),
+                &got_workflow,
+                format!("CI run {tag}"),
+                At::from_unix_millis(20),
+                "ferris",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let got_run = store.get_workflow_run(&run.id).unwrap().expect("run");
+    assert_eq!(got_run.id, run.id);
+    assert_eq!(got_run.workflow_id, got_workflow.id);
+
+    let import_def = got_workflow.clone();
+    let import_run = got_run.clone();
+    store.import_workflow_def(import_def).unwrap();
+    store.import_workflow_run(import_run).unwrap();
+    assert_eq!(
+        store.get_workflow_def(&got_workflow.id).unwrap().as_ref(),
+        Some(&got_workflow)
+    );
+    assert_eq!(
+        store.get_workflow_run(&got_run.id).unwrap().as_ref(),
+        Some(&got_run)
+    );
 
     let body = format!("Body {tag}");
     let (message, _) = store
