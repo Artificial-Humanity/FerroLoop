@@ -93,6 +93,19 @@ export const HELP_TOPICS: HelpTopicDoc[] = [
     ],
   },
   {
+    id: "board",
+    shortLabel: "Records & Board",
+    tier: "Project",
+    title: "Project Records, Kanban Swimlanes & Velocity Strip",
+    summary:
+      "Manage project records across Todo, Doing, and Done Kanban swimlanes with gated state transitions and real-time velocity metrics.",
+    bullets: [
+      "3-Column Kanban Swimlanes: Inspect records grouped by state (Todo, Doing, Done) with display handles (#id), area tags, and open findings badges.",
+      "Drag-and-Drop & Quick-Move Transitions: Drag record cards between swimlanes or click direct quick-move buttons (→ Todo, → Doing, → Done) to execute fl record move transitions.",
+      "Velocity & Completion Metrics Strip: Track Todo/Doing/Done counts, overall completion percentage with a stacked progress bar, open findings, and execution attempts per project.",
+    ],
+  },
+  {
     id: "terminal",
     shortLabel: "Terminal",
     tier: "System",

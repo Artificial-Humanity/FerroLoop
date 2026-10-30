@@ -35,6 +35,7 @@ describe("Wave A UI — Records 10, 4 & 29", () => {
         "mail",
         "artifacts",
         "git",
+        "board",
         "terminal",
         "hub",
         "gate",
