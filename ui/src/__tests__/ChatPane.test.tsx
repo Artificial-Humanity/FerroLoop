@@ -1217,4 +1217,38 @@ describe("Resizable chat composer (Record 57)", () => {
     fireEvent.mouseUp(window);
     expect(textarea.style.height).toBe("72px");
   });
+
+  it("resets selectedModel to opts[0] when switching from a Claude agent to an Antigravity agent with model={null}", () => {
+    const { rerender } = render(
+      <ChatPane
+        agentName="felicity"
+        agentDisplayName="Felicity"
+        adapter="claude"
+        model={null}
+        turns={[]}
+      />,
+    );
+
+    expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+      "claude · claude-opus-5-5 (high)",
+    );
+
+    rerender(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        model={null}
+        turns={[]}
+      />,
+    );
+
+    expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+      "antigravity · gemini-4-argon (high)",
+    );
+
+    fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    const select = screen.getByTestId("session-model-select") as HTMLSelectElement;
+    expect(select.value).toBe("gemini-4-argon");
+  });
 });

@@ -550,7 +550,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       setSelectedModel(trimmed);
     } else {
       const opts = getVendorModelOptions(adapter, model, availableModels);
-      setSelectedModel((prev) => (opts.includes(prev) ? prev : opts[0] ?? ""));
+      setSelectedModel(opts[0] ?? "");
     }
   }, [model, adapter, availableModels, targetSessionOrAgent]);
 
