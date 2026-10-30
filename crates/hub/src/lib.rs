@@ -2749,6 +2749,87 @@ mod tests {
     }
 
     #[test]
+    fn peer_cannot_reach_a_reregistered_agent_through_its_stale_decommissioned_record() {
+        use fl_core::agent::{AgentRole, AgentStatus, RegisterAgentArgs};
+        use fl_core::store::AgentRegistry;
+
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        assert_eq!(spin_up(&state, &spin_up_body("ada")).status, 200);
+        let torn = decommission_as(&state, "owner-tok-secret", "claude%3Aada", "teardown");
+        assert_eq!(torn.status, 200, "{}", String::from_utf8_lossy(&torn.body));
+        // The resident restarts and registers itself again, outside the lifecycle.
+        state
+            .open_store()
+            .unwrap()
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: Some("ada@example.org".into()),
+                project: "FerroLoop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: Vec::new(),
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "ada".into(),
+            })
+            .unwrap();
+        let agent = || {
+            state
+                .open_store()
+                .unwrap()
+                .agent_by_name("ada")
+                .unwrap()
+                .unwrap()
+        };
+        let hosted = || {
+            handle_http_request(
+                &state,
+                &authed(
+                    "GET",
+                    "/api/v1/hosted-sessions",
+                    "owner-tok-secret",
+                    &json!({}),
+                ),
+            )
+            .json_value()
+            .unwrap()["sessions"]
+                .clone()
+        };
+        let agent_before = agent();
+        let hosted_before = hosted();
+        assert_eq!(agent_before.status, AgentStatus::Active);
+        assert_eq!(hosted_before[0]["status"], "decommissioned");
+
+        let resp = handle_http_request(
+            &state,
+            &authed(
+                "POST",
+                "/api/v1/sessions/spin-up",
+                "peer-tok-secret",
+                &spin_up_body("ada"),
+            ),
+        );
+        assert_eq!(resp.status, 403, "{}", String::from_utf8_lossy(&resp.body));
+        for mode in ["prepare", "teardown"] {
+            let resp = decommission_as(&state, "peer-tok-secret", "claude%3Aada", mode);
+            assert_eq!(
+                resp.status,
+                403,
+                "{mode}: {}",
+                String::from_utf8_lossy(&resp.body)
+            );
+        }
+        assert_eq!(agent(), agent_before);
+        assert_eq!(hosted(), hosted_before);
+
+        // The Owner may still spin it up again.
+        let resp = spin_up(&state, &spin_up_body("ada"));
+        assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+        assert_eq!(hosted()[0]["status"], "running");
+    }
+
+    #[test]
     fn peer_teardown_needs_a_hosted_record_and_malformed_ids_are_400_without_side_effects() {
         use fl_core::agent::{AgentRole, AgentStatus};
         use fl_core::store::AgentRegistry;

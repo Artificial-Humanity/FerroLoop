@@ -552,10 +552,10 @@ fn remove_routes(home_override: Option<&Path>, personas: &[&str], session_ids: &
 /// The record is written before tmux starts, so a runtime this call opens always has a record
 /// that teardown can find; the record is then updated with what actually started.
 ///
-/// `caller` gates hosting an unmanaged agent: an Active agent with no hosted record for this
-/// session becomes hosted by the spin-up, after which a peer's teardown would be allowed, so
-/// only the owner may do it. A peer may still spin up a new or retired persona, or re-spin a
-/// session that already has a hosted record.
+/// `caller` gates hosting an unmanaged agent: an Active agent with no LIVE hosted record for this
+/// session (none, or a decommissioned one left from an earlier teardown) becomes hosted by the
+/// spin-up, after which a peer's teardown would be allowed, so only the owner may do it. A peer
+/// may still spin up a new or retired persona, or re-spin a session whose hosted record is live.
 pub fn spin_up<S: AgentRegistry + StateStore>(
     store: &S,
     env: &LifecycleEnv<'_>,
@@ -565,22 +565,20 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
 ) -> Result<SpinUpResponse, LifecycleError> {
     let v = req.validate()?;
     let session_id = format!("{}:{}", v.vendor, v.persona);
+    // The unfiltered record carries `created_at_ms`, `restart_count` and `runtime_spawned` over;
+    // the gate below looks only at whether it is LIVE.
     let previous =
         find_hosted_session(store, &[&session_id])?.filter(|r| r.session_id == session_id);
     // Order: this gate runs first, before the Lead and project/role Conflict checks in
     // `register_spun_up_agent`, because a refusal here reveals nothing about the agent's
     // project or role. It sits before every side effect.
-    if caller != Caller::Owner
-        && previous.is_none()
-        && store
-            .agent_by_name(&v.persona)?
-            .is_some_and(|a| a.status == AgentStatus::Active)
-    {
-        return Err(LifecycleError::Forbidden(format!(
-            "only Owner authority may spin up `{}`, an active agent with no hosted session record",
-            v.persona
-        )));
-    }
+    require_owner_for_unmanaged(
+        store,
+        caller,
+        &v.persona,
+        previous.as_ref(),
+        OwnerGate::SpinUp,
+    )?;
     register_spun_up_agent(store, &v, by)?;
 
     let display = capitalize(&v.persona);
@@ -816,13 +814,17 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     caller: Caller,
 ) -> Result<DecommissionResponse, LifecycleError> {
     // Prepare adopts an unmanaged session into a hosted record, which teardown then accepts from
-    // any caller, so the adoption gate applies here too, before any side effect.
-    if target.hosted.is_none() && caller != Caller::Owner {
-        return Err(LifecycleError::Forbidden(format!(
-            "only Owner authority may decommission `{}`, which has no hosted session record",
-            target.raw_id
-        )));
-    }
+    // any caller, so the adoption gate applies here too, before any side effect. Order: this
+    // gate runs before the decommissioned 409 below. A Peer is refused with 403 when the agent
+    // is Active and unmanaged (no record, or only a stale decommissioned one), which reveals
+    // nothing; the 409 is reached only by the Owner, or by a Peer when no Active agent exists.
+    require_owner_for_unmanaged(
+        store,
+        caller,
+        &target.persona,
+        target.hosted.as_ref(),
+        OwnerGate::Decommission,
+    )?;
     if target.hosted.as_ref().is_some_and(is_decommissioned) {
         return Err(decommissioned_conflict(&target.session_id));
     }
@@ -860,9 +862,10 @@ pub fn prepare_decommission<S: AgentRegistry + StateStore>(
     })
 }
 
-/// Who asks for a spin-up or teardown. A session with no hosted record is adopted by a teardown,
-/// which retires whatever agent its id names, and an Active agent with no hosted record is
-/// adopted by a spin-up, so only the owner may adopt one.
+/// Who asks for a spin-up or teardown. A session with no live hosted record is adopted by a
+/// teardown, which retires whatever agent its id names, and an Active agent with no live hosted
+/// record is adopted by a spin-up, so only the owner may adopt one
+/// (see `require_owner_for_unmanaged`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Caller {
     Owner,
@@ -871,6 +874,59 @@ pub enum Caller {
 
 fn is_decommissioned(record: &HostedSessionRecord) -> bool {
     record.status == STATUS_DECOMMISSIONED
+}
+
+/// A hosted record that still manages its session. A decommissioned record is history: it is kept
+/// after teardown, and the persona may since have been registered again outside the lifecycle.
+fn is_live_hosted(record: &HostedSessionRecord) -> bool {
+    !is_decommissioned(record)
+}
+
+/// The action a Peer asks for, which decides what a missing or stale hosted record means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerGate {
+    /// Hosting a persona: needs the Owner only when it adopts an Active agent.
+    SpinUp,
+    /// Prepare or teardown: needs the Owner for any session with no record, and for an Active
+    /// agent behind a decommissioned one.
+    Decommission,
+}
+
+/// The one decision on whether a non-Owner caller needs Owner authority for a target. The Owner
+/// always passes. For anyone else a LIVE hosted record always passes. Without one (none, or only
+/// a decommissioned record), the action adopts whatever the persona now names: a spin-up is
+/// refused when an Active agent exists, a prepare or teardown when no record exists or an Active
+/// agent exists. A new or Retired persona still passes a spin-up, and a repeated teardown of a
+/// decommissioned record whose agent is Retired or absent stays harmless and allowed.
+///
+/// Every gate calls this before its first side effect.
+fn require_owner_for_unmanaged<S: AgentRegistry>(
+    store: &S,
+    caller: Caller,
+    persona: &str,
+    hosted: Option<&HostedSessionRecord>,
+    gate: OwnerGate,
+) -> Result<(), LifecycleError> {
+    if caller == Caller::Owner || hosted.is_some_and(is_live_hosted) {
+        return Ok(());
+    }
+    let active = store
+        .agent_by_name(persona)?
+        .is_some_and(|a| a.status == AgentStatus::Active);
+    match (gate, hosted) {
+        (OwnerGate::SpinUp, _) if active => Err(LifecycleError::Forbidden(format!(
+            "only Owner authority may spin up `{persona}`, an active agent with no live hosted \
+             session record"
+        ))),
+        (OwnerGate::Decommission, None) => Err(LifecycleError::Forbidden(format!(
+            "only Owner authority may decommission `{persona}`, which has no hosted session record"
+        ))),
+        (OwnerGate::Decommission, Some(_)) if active => Err(LifecycleError::Forbidden(format!(
+            "only Owner authority may decommission `{persona}`, an active agent whose hosted \
+             session record is decommissioned"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 fn decommissioned_conflict(session_id: &str) -> LifecycleError {
@@ -898,12 +954,13 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     caller: Caller,
     mut clear_queue: impl FnMut(&str),
 ) -> Result<DecommissionResponse, LifecycleError> {
-    if target.hosted.is_none() && caller != Caller::Owner {
-        return Err(LifecycleError::Forbidden(format!(
-            "only Owner authority may decommission `{}`, which has no hosted session record",
-            target.raw_id
-        )));
-    }
+    require_owner_for_unmanaged(
+        store,
+        caller,
+        &target.persona,
+        target.hosted.as_ref(),
+        OwnerGate::Decommission,
+    )?;
     let mut record = record_for_target(store, target)?;
     let agent = store.agent_by_name(&target.persona)?;
     // The tmux session name is the capitalised persona, so `claude:ada` and `codex:ada` share
@@ -1781,6 +1838,145 @@ mod tests {
         let out = prepare_decommission(&store, &env, &target, "owner", Caller::Owner).unwrap();
         assert_eq!(out.status, "decommissioning");
         assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+    }
+
+    /// `claude:ada` hosted and torn down (record decommissioned, agent Retired), then registered
+    /// Active again outside the lifecycle, as a resident does after a restart.
+    fn stale_ada(store: &MemStore, env: &LifecycleEnv<'_>) {
+        spin_up(
+            store,
+            env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let target = SessionTarget::resolve(store, "claude:ada", None).unwrap();
+        teardown_session(store, env, &target, "owner", Caller::Owner, |_| {}).unwrap();
+        assert_eq!(
+            store.agent_by_name("ada").unwrap().unwrap().status,
+            AgentStatus::Retired
+        );
+        store
+            .register_agent(RegisterAgentArgs {
+                display_name: "Ada".into(),
+                email: Some("ada@example.org".into()),
+                project: "FerroLoop".into(),
+                role: AgentRole::Assistant,
+                extra_areas: Vec::new(),
+                create_area: true,
+                replace: true,
+                at: stamp::now(),
+                by: "ada".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            store.agent_by_name("ada").unwrap().unwrap().status,
+            AgentStatus::Active
+        );
+    }
+
+    #[test]
+    fn peer_cannot_use_a_stale_decommissioned_record_to_reach_a_reregistered_agent() {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        stale_ada(&store, &env);
+        let agent_before = store.agent_by_name("ada").unwrap().unwrap();
+        let record_before = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(record_before.status, "decommissioned");
+        let target = SessionTarget::resolve(&store, "claude:ada", None).unwrap();
+        assert!(target.hosted.is_some());
+
+        let err = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "peer",
+            Caller::Peer,
+        )
+        .unwrap_err();
+        assert!(matches!(err, LifecycleError::Forbidden(_)), "{err}");
+        assert_eq!(err.status(), 403);
+        let err = prepare_decommission(&store, &env, &target, "peer", Caller::Peer).unwrap_err();
+        assert!(matches!(err, LifecycleError::Forbidden(_)), "{err}");
+        assert_eq!(err.status(), 403);
+        let mut cleared = Vec::new();
+        let err = teardown_session(&store, &env, &target, "peer", Caller::Peer, |k| {
+            cleared.push(k.to_string())
+        })
+        .unwrap_err();
+        assert!(matches!(err, LifecycleError::Forbidden(_)), "{err}");
+        assert_eq!(err.status(), 403);
+        assert!(cleared.is_empty());
+
+        // Nothing changed: the record, the agent, and the record count.
+        assert_eq!(
+            find_hosted_session(&store, &["claude:ada"])
+                .unwrap()
+                .unwrap(),
+            record_before
+        );
+        assert_eq!(store.agent_by_name("ada").unwrap().unwrap(), agent_before);
+        assert_eq!(agent_before.status, AgentStatus::Active);
+        assert_eq!(list_hosted_sessions(&store).unwrap().len(), 1);
+
+        // The Owner still revives it, keeping the record's history.
+        let out = spin_up(
+            &store,
+            &env,
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        assert_eq!(out.status, "running");
+        let revived = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(revived.status, "running");
+        assert_eq!(revived.created_at_ms, record_before.created_at_ms);
+    }
+
+    #[test]
+    fn peer_spin_up_and_repeat_teardown_still_work_on_a_decommissioned_record_with_a_retired_agent()
+    {
+        let store = MemStore::default();
+        let home = TempDir::new().unwrap();
+        let env = env(&home);
+        let target = decommissioned_felicity(&store, &env);
+        let before = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+
+        // Teardown stays repeatable and harmless for a Peer.
+        let out = teardown_session(&store, &env, &target, "peer", Caller::Peer, |_| {}).unwrap();
+        assert_eq!(out.status, "decommissioned");
+        // Prepare keeps its 409 for a Peer when no Active agent exists.
+        let err = prepare_decommission(&store, &env, &target, "peer", Caller::Peer).unwrap_err();
+        assert_eq!(err.status(), 409);
+
+        // A Peer spin-up of the persona whose agent is Retired revives it and keeps the history.
+        let out = spin_up(
+            &store,
+            &env,
+            &req("felicity", "assistant", "claude"),
+            "peer",
+            Caller::Peer,
+        )
+        .unwrap();
+        assert_eq!(out.status, "running");
+        let after = find_hosted_session(&store, &["claude:felicity"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, "running");
+        assert_eq!(after.created_at_ms, before.created_at_ms);
+        assert_eq!(
+            store.agent_by_name("felicity").unwrap().unwrap().status,
+            AgentStatus::Active
+        );
     }
 
     #[test]
