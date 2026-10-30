@@ -1069,9 +1069,18 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       throw new Error("No active session selected to update model.");
     }
     const res = await apiClient.setSessionModel(targetId, model);
+    const matchesTarget = (sess: DiscoveredSessionSummary) =>
+      sess.id === targetId ||
+      (sess.persona ?? "").toLowerCase() === targetId.toLowerCase();
+    const updatedModel = res.model || model;
     setSessions((prev) =>
       prev.map((sess) =>
-        sess.id === targetId ? { ...sess, model: res.model || model } : sess,
+        matchesTarget(sess) ? { ...sess, model: updatedModel } : sess,
+      ),
+    );
+    setRoutes((prev) =>
+      prev.map((sess) =>
+        matchesTarget(sess) ? { ...sess, model: updatedModel } : sess,
       ),
     );
     await refreshSessionsAndTranscript(targetId);

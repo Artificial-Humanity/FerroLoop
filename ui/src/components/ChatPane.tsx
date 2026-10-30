@@ -636,6 +636,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   };
 
   const handleChangeModel = async (nextModel: string) => {
+    const prevModel = selectedModel;
     setSelectedModel(nextModel);
     if (!targetSessionOrAgent || !nextModel || switchingModel) {
       return;
@@ -656,6 +657,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       }
       setCompactFeedback(`Model: ${nextModel}`);
     } catch (err) {
+      setSelectedModel(prevModel);
       setSubmitError(
         err instanceof Error ? err.message : "Failed to switch model",
       );

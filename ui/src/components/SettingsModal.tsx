@@ -159,8 +159,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               fontSize: "12px",
             }}
           >
-            Completed <strong>{ACTION_LABELS[lastResult.action]}</strong>:{" "}
-            {lastResult.succeeded} / {lastResult.total} sessions succeeded.
+            <div>
+              Completed <strong>{ACTION_LABELS[lastResult.action]}</strong>:{" "}
+              {lastResult.succeeded} / {lastResult.total} sessions succeeded.
+            </div>
+            {lastResult.results.some((r) => !r.ok) && (
+              <ul
+                style={{
+                  margin: "6px 0 0 0",
+                  paddingLeft: "18px",
+                  color: "#FCA5A5",
+                }}
+              >
+                {lastResult.results
+                  .filter((r) => !r.ok)
+                  .map((r) => (
+                    <li key={r.session_id}>
+                      <code>{r.session_id}</code>:{" "}
+                      {r.error || "Unknown failure"}
+                    </li>
+                  ))}
+              </ul>
+            )}
           </div>
         )}
 
