@@ -11,6 +11,7 @@ import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import { RosterSidebar } from "./components/RosterSidebar";
+import { SettingsModal } from "./components/SettingsModal";
 import { SpinUpAgentModal } from "./components/SpinUpAgentModal";
 import { TerminalPane } from "./components/TerminalPane";
 import { VaultGatePane } from "./components/VaultGatePane";
@@ -21,6 +22,7 @@ import {
   type AgentLivenessItem,
   type AgentRecord,
   type ArchitectureResponse,
+  type BulkSessionAction,
   type CockpitTab,
   type DecommissionMode,
   type DiscoveredSessionSummary,
@@ -265,6 +267,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [pairingOpen, setPairingOpen] = useState<boolean>(false);
   const [pairingError, setPairingError] = useState<string | null>(null);
   const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
+  const [settingsModalOpen, setSettingsModalOpen] = useState<boolean>(false);
   const [spinUpModalOpen, setSpinUpModalOpen] = useState<boolean>(false);
   const [nodes, setNodes] = useState<EnrolledNode[]>([]);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
@@ -1049,6 +1052,41 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     return res;
   };
 
+  const handleInterruptSession = async () => {
+    const targetId = activeSession?.id || selectedAgent?.name_key;
+    if (!targetId) {
+      throw new Error("No active session selected to interrupt.");
+    }
+    const res = await apiClient.interruptSession(targetId);
+    setIsSessionBusy(false);
+    await refreshSessionsAndTranscript(targetId);
+    return res;
+  };
+
+  const handleSetSessionModel = async (model: string) => {
+    const targetId = activeSession?.id || selectedAgent?.name_key;
+    if (!targetId) {
+      throw new Error("No active session selected to update model.");
+    }
+    const res = await apiClient.setSessionModel(targetId, model);
+    setSessions((prev) =>
+      prev.map((sess) =>
+        sess.id === targetId ? { ...sess, model: res.model || model } : sess,
+      ),
+    );
+    await refreshSessionsAndTranscript(targetId);
+    return res;
+  };
+
+  const handleBulkSessionAction = async (action: BulkSessionAction) => {
+    const res = await apiClient.bulkSessionAction(action);
+    await Promise.all([
+      refreshWireAndRoster(),
+      refreshSessionsAndTranscript(),
+    ]);
+    return res;
+  };
+
   const renderSecondaryPane = (paneTab: CockpitTab) => {
     switch (paneTab) {
       case "artifacts":
@@ -1149,6 +1187,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             agentName={selectedAgent?.name_key ?? null}
             agentDisplayName={selectedAgent?.display_name ?? null}
             adapter={activeSession?.adapter ?? null}
+            model={activeSession?.model ?? null}
             sessionId={activeSession?.id ?? null}
             turns={transcriptTurns}
             contextUsage={sessionContextUsage}
@@ -1163,6 +1202,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
             onCancelQueued={handleCancelQueued}
             onUpdateQueued={handleUpdateQueued}
             onDecommissionSession={handleDecommissionSession}
+            onInterruptSession={handleInterruptSession}
+            onSetSessionModel={handleSetSessionModel}
             onOpenArtifact={handleOpenArtifact}
             apiClient={apiClient}
           />
@@ -1218,6 +1259,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           wsConnected={wsConnected}
           onlineNodesCount={onlineNodesCount}
           onOpenNodesModal={() => setNodesModalOpen(true)}
+          onOpenSettingsModal={() => setSettingsModalOpen(true)}
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
           onOpenMobileRoster={() => setMobileRosterOpen((prev) => !prev)}
@@ -1233,6 +1275,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 agentName={selectedAgent?.name_key ?? null}
                 agentDisplayName={selectedAgent?.display_name ?? null}
                 adapter={activeSession?.adapter ?? null}
+                model={activeSession?.model ?? null}
                 sessionId={activeSession?.id ?? null}
                 turns={transcriptTurns}
                 contextUsage={sessionContextUsage}
@@ -1247,6 +1290,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
                 onCancelQueued={handleCancelQueued}
                 onUpdateQueued={handleUpdateQueued}
                 onDecommissionSession={handleDecommissionSession}
+                onInterruptSession={handleInterruptSession}
+                onSetSessionModel={handleSetSessionModel}
                 onOpenArtifact={handleOpenArtifact}
                 apiClient={apiClient}
               />
@@ -1308,6 +1353,13 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         onClose={() => setSpinUpModalOpen(false)}
         nodes={nodes}
         onSpinUp={handleSpinUpSession}
+        apiClient={apiClient}
+      />
+
+      <SettingsModal
+        isOpen={settingsModalOpen}
+        onClose={() => setSettingsModalOpen(false)}
+        onBulkSessionAction={handleBulkSessionAction}
         apiClient={apiClient}
       />
     </div>

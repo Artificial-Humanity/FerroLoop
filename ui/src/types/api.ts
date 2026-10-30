@@ -101,6 +101,7 @@ export interface DiscoveredSessionSummary {
   id: string;
   source: "route" | "attempt" | string;
   adapter: "claude" | "antigravity" | "codex" | "muse" | "grok" | "webhook" | string;
+  model?: string | null;
   persona?: string | null;
   status: string;
   updated_at?: string | null;
@@ -280,6 +281,83 @@ export interface DecommissionSessionResponse {
   runtime_stopped: boolean;
   prompt?: string | null;
 }
+
+export interface InterruptSessionResponse {
+  session_id: string;
+  interrupted: boolean;
+  vendor: string;
+  method: string;
+}
+
+export interface SetSessionModelResponse {
+  session_id: string;
+  vendor: string;
+  model: string;
+  switched: boolean;
+  method: string;
+}
+
+export type BulkSessionAction = "compact" | "clear" | "reforge";
+
+export interface BulkSessionActionResponse {
+  action: BulkSessionAction;
+  total: number;
+  succeeded: number;
+  results: Array<{
+    session_id: string;
+    ok: boolean;
+    error?: string | null;
+  }>;
+}
+
+export interface SlashCommandEntry {
+  name: string;
+  kind: "command" | "skill" | "workflow";
+  description: string;
+}
+
+export const DEFAULT_SLASH_COMMANDS: SlashCommandEntry[] = [
+  {
+    name: "compact",
+    kind: "command",
+    description: "Summarize and compact the active session context window",
+  },
+  {
+    name: "clear",
+    kind: "command",
+    description: "Clear the conversation history for a clean-slate session",
+  },
+  {
+    name: "model",
+    kind: "command",
+    description: "Switch the active language model for this session",
+  },
+  {
+    name: "goal",
+    kind: "command",
+    description: "Run an autonomous long-running task until the goal is achieved",
+  },
+  {
+    name: "plan",
+    kind: "command",
+    description: "Draft a structured step-by-step plan before execution",
+  },
+  {
+    name: "boost",
+    kind: "command",
+    description: "Deep thinking, strategic planning, and rigorous verification",
+  },
+  {
+    name: "code-review",
+    kind: "skill",
+    description: "Subagent-driven code review, finding evaluation, and remediation",
+  },
+  {
+    name: "subagent-dev",
+    kind: "skill",
+    description: "Execute a multi-task plan with per-task implementer and reviewer subagents",
+  },
+];
 
 export interface PromptRequest {
   prompt: string;

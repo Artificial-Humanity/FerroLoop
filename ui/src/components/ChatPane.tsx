@@ -1,20 +1,62 @@
 import React from "react";
 import type { HubApiClient } from "../api/client";
-import type {
-  ClearSessionMode,
-  DecommissionMode,
-  DecommissionSessionResponse,
-  PromptAttachment,
-  PromptRequest,
-  PromptResponse,
-  QueuedOperatorPrompt,
-  QuotaWindowUsage,
-  SessionContextUsage,
-  SessionQuotaUsage,
-  TranscriptTurn,
+import {
+  DEFAULT_SLASH_COMMANDS,
+  type ClearSessionMode,
+  type DecommissionMode,
+  type DecommissionSessionResponse,
+  type InterruptSessionResponse,
+  type PromptAttachment,
+  type PromptRequest,
+  type PromptResponse,
+  type QueuedOperatorPrompt,
+  type QuotaWindowUsage,
+  type SessionContextUsage,
+  type SessionQuotaUsage,
+  type SetSessionModelResponse,
+  type SlashCommandEntry,
+  type TranscriptTurn,
 } from "../types/api";
 import { ThinkingBlock } from "./ThinkingBlock";
 import { TurnCard } from "./TurnCard";
+
+export function getVendorModelOptions(
+  adapter?: string | null,
+  currentModel?: string | null,
+): string[] {
+  const normalized = (adapter ?? "").trim().toLowerCase();
+  let base: string[];
+  if (normalized === "claude" || normalized.startsWith("claude-")) {
+    base = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"];
+  } else if (
+    normalized === "antigravity" ||
+    normalized === "agy" ||
+    normalized === "argon" ||
+    normalized === "gemini"
+  ) {
+    base = ["gemini-3.1-pro", "gemini-3.1-flash", "claude-sonnet-4-6"];
+  } else if (normalized === "codex" || normalized.startsWith("codex-")) {
+    base = ["gpt-5.4", "o3"];
+  } else if (normalized === "grok" || normalized.startsWith("grok-")) {
+    base = ["grok-4.7", "grok-4.7-fast"];
+  } else if (normalized === "muse" || normalized.startsWith("muse-")) {
+    base = ["muse-spark"];
+  } else {
+    base = [
+      "claude-opus-4-7",
+      "claude-sonnet-4-6",
+      "gemini-3.1-pro",
+      "gpt-5.4",
+      "grok-4.7",
+      "muse-spark",
+    ];
+  }
+  const trimmedCurrent = (currentModel ?? "").trim();
+  if (trimmedCurrent && !base.includes(trimmedCurrent)) {
+    return [trimmedCurrent, ...base];
+  }
+  return base;
+}
 
 /** Rough fixed cost of system prompt plus tool definitions per session. */
 export const BASE_SYSTEM_OVERHEAD_TOKENS = 12_000;
@@ -236,6 +278,7 @@ export interface ChatPaneProps {
   agentName?: string | null;
   agentDisplayName?: string | null;
   adapter?: string | null;
+  model?: string | null;
   sessionId?: string | null;
   turns?: TranscriptTurn[];
   /** Server-measured context usage; estimates apply when absent. */
@@ -247,6 +290,7 @@ export interface ChatPaneProps {
   loading?: boolean;
   error?: string | null;
   wsConnected?: boolean;
+  slashCommands?: SlashCommandEntry[];
   onRefresh?: () => void;
   onSendPrompt?: (
     targetSessionOrAgentId: string,
@@ -258,6 +302,10 @@ export interface ChatPaneProps {
   onDecommissionSession?: (
     mode: DecommissionMode,
   ) => Promise<DecommissionSessionResponse | unknown> | void;
+  onInterruptSession?: () => Promise<InterruptSessionResponse | unknown> | void;
+  onSetSessionModel?: (
+    model: string,
+  ) => Promise<SetSessionModelResponse | unknown> | void;
   onOpenArtifact?: (pathOrUrl: string) => void;
   apiClient?: HubApiClient;
 }
@@ -286,6 +334,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   agentName,
   agentDisplayName,
   adapter,
+  model = null,
   sessionId,
   turns,
   contextUsage = null,
@@ -295,12 +344,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   loading = false,
   error = null,
   wsConnected = false,
+  slashCommands,
   onRefresh,
   onSendPrompt,
   onSendQueuedNow,
   onCancelQueued,
   onUpdateQueued,
   onDecommissionSession,
+  onInterruptSession,
+  onSetSessionModel,
   onOpenArtifact,
   apiClient,
 }) => {
@@ -325,6 +377,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [decommissionHelpVisible, setDecommissionHelpVisible] = React.useState<boolean>(false);
   const [decommissioning, setDecommissioning] = React.useState<boolean>(false);
   const decommissionHelpTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [interruptArmed, setInterruptArmed] = React.useState<boolean>(false);
+  const [interrupting, setInterrupting] = React.useState<boolean>(false);
+  const interruptTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [switchingModel, setSwitchingModel] = React.useState<boolean>(false);
+  const [internalSlashCommands, setInternalSlashCommands] =
+    React.useState<SlashCommandEntry[]>(DEFAULT_SLASH_COMMANDS);
+  const [slashMenuDismissed, setSlashMenuDismissed] = React.useState<boolean>(false);
+  const [slashActiveIndex, setSlashActiveIndex] = React.useState<number>(0);
 
   const [filterQuery, setFilterQuery] = React.useState<string>("");
   const [visibleTurnLimit, setVisibleTurnLimit] = React.useState<number>(100);
@@ -422,6 +482,90 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     Boolean(targetSessionOrAgent) && !clearing && !decommissioning && !compacting && !submitting;
   const canDecommission =
     Boolean(targetSessionOrAgent) && !decommissioning && !clearing && !compacting && !submitting;
+  const canInterrupt =
+    Boolean(targetSessionOrAgent) && !interrupting && !decommissioning && !clearing;
+
+  const modelOptions = React.useMemo(
+    () => getVendorModelOptions(adapter, model),
+    [adapter, model],
+  );
+  const [selectedModel, setSelectedModel] = React.useState<string>(
+    () => (model && model.trim()) || getVendorModelOptions(adapter, model)[0] || "",
+  );
+
+  React.useEffect(() => {
+    const trimmed = (model ?? "").trim();
+    if (trimmed) {
+      setSelectedModel(trimmed);
+    } else {
+      const opts = getVendorModelOptions(adapter, model);
+      setSelectedModel((prev) => (opts.includes(prev) ? prev : opts[0] ?? ""));
+    }
+  }, [model, adapter, targetSessionOrAgent]);
+
+  React.useEffect(() => {
+    if (slashCommands) {
+      return;
+    }
+    if (!apiClient) {
+      return;
+    }
+    let cancelled = false;
+    apiClient
+      .listSlashCommands()
+      .then((res) => {
+        if (!cancelled && Array.isArray(res.commands) && res.commands.length > 0) {
+          setInternalSlashCommands(res.commands);
+        }
+      })
+      .catch(() => {
+        // Fallback to DEFAULT_SLASH_COMMANDS
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiClient, slashCommands]);
+
+  const availableSlashCommands = slashCommands ?? internalSlashCommands;
+
+  const slashQuery = React.useMemo(() => {
+    if (!promptText.startsWith("/")) {
+      return null;
+    }
+    const afterSlash = promptText.slice(1);
+    if (/\s/.test(afterSlash)) {
+      return null;
+    }
+    return afterSlash.toLowerCase();
+  }, [promptText]);
+
+  const matchingSlashCommands = React.useMemo(() => {
+    if (slashQuery === null) {
+      return [];
+    }
+    return availableSlashCommands.filter((cmd) => {
+      const cleanName = cmd.name.replace(/^\/+/, "").toLowerCase();
+      return (
+        cleanName.startsWith(slashQuery) ||
+        cleanName.includes(slashQuery)
+      );
+    });
+  }, [availableSlashCommands, slashQuery]);
+
+  const showSlashMenu =
+    slashQuery !== null && !slashMenuDismissed && matchingSlashCommands.length > 0;
+
+  React.useEffect(() => {
+    setSlashMenuDismissed(false);
+    setSlashActiveIndex(0);
+  }, [promptText]);
+
+  const handleSelectSlashCommand = (cmd: SlashCommandEntry) => {
+    const cleanName = cmd.name.replace(/^\/+/, "");
+    setPromptText(`/${cleanName} `);
+    setSlashMenuDismissed(true);
+    setSlashActiveIndex(0);
+  };
 
   React.useEffect(() => {
     return () => {
@@ -431,8 +575,94 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (decommissionHelpTimerRef.current !== null) {
         clearTimeout(decommissionHelpTimerRef.current);
       }
+      if (interruptTimerRef.current !== null) {
+        clearTimeout(interruptTimerRef.current);
+      }
     };
   }, []);
+
+  const disarmInterrupt = React.useCallback(() => {
+    if (interruptTimerRef.current !== null) {
+      clearTimeout(interruptTimerRef.current);
+      interruptTimerRef.current = null;
+    }
+    setInterruptArmed(false);
+  }, []);
+
+  React.useEffect(() => {
+    disarmInterrupt();
+  }, [targetSessionOrAgent, disarmInterrupt]);
+
+  const handleArmInterrupt = () => {
+    if (!canInterrupt) return;
+    if (interruptTimerRef.current !== null) {
+      clearTimeout(interruptTimerRef.current);
+    }
+    setInterruptArmed(true);
+    interruptTimerRef.current = setTimeout(() => {
+      setInterruptArmed(false);
+      interruptTimerRef.current = null;
+    }, 3_000);
+  };
+
+  const handleConfirmInterrupt = async () => {
+    if (!targetSessionOrAgent || interrupting) {
+      return;
+    }
+    disarmInterrupt();
+    setInterrupting(true);
+    setCompactFeedback(null);
+    setSubmitError(null);
+    try {
+      if (onInterruptSession) {
+        await onInterruptSession();
+      } else if (apiClient) {
+        await apiClient.interruptSession(targetSessionOrAgent);
+        setInternalIsBusy(false);
+        if (onRefresh) {
+          onRefresh();
+        }
+      } else {
+        throw new Error("No session route is configured for interrupt.");
+      }
+      setCompactFeedback("Stopped session");
+    } catch (err) {
+      setSubmitError(
+        err instanceof Error ? err.message : "Failed to interrupt session",
+      );
+    } finally {
+      setInterrupting(false);
+    }
+  };
+
+  const handleChangeModel = async (nextModel: string) => {
+    setSelectedModel(nextModel);
+    if (!targetSessionOrAgent || !nextModel || switchingModel) {
+      return;
+    }
+    setSwitchingModel(true);
+    setCompactFeedback(null);
+    setSubmitError(null);
+    try {
+      if (onSetSessionModel) {
+        await onSetSessionModel(nextModel);
+      } else if (apiClient) {
+        await apiClient.setSessionModel(targetSessionOrAgent, nextModel);
+        if (onRefresh) {
+          onRefresh();
+        }
+      } else {
+        throw new Error("No session route is configured for switching model.");
+      }
+      setCompactFeedback(`Model: ${nextModel}`);
+    } catch (err) {
+      setSubmitError(
+        err instanceof Error ? err.message : "Failed to switch model",
+      );
+    } finally {
+      setSwitchingModel(false);
+    }
+  };
 
   const handleOpenClearModal = () => {
     if (!canClear) return;
@@ -1015,6 +1245,39 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (showSlashMenu) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSlashActiveIndex((prev) => (prev + 1) % matchingSlashCommands.length);
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSlashActiveIndex(
+          (prev) =>
+            (prev - 1 + matchingSlashCommands.length) %
+            matchingSlashCommands.length,
+        );
+        return;
+      }
+      if (
+        (e.key === "Enter" && !e.metaKey && !e.ctrlKey && !e.shiftKey) ||
+        e.key === "Tab"
+      ) {
+        const chosen =
+          matchingSlashCommands[slashActiveIndex] ?? matchingSlashCommands[0];
+        if (chosen) {
+          e.preventDefault();
+          handleSelectSlashCommand(chosen);
+          return;
+        }
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setSlashMenuDismissed(true);
+        return;
+      }
+    }
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void submitPrompt();
@@ -1276,6 +1539,57 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 </span>
               )}
             </div>
+          )}
+          <select
+            aria-label="Session Model"
+            data-testid="session-model-select"
+            className="fd-select fd-mono"
+            disabled={!targetSessionOrAgent || switchingModel}
+            value={selectedModel}
+            onChange={(e) => void handleChangeModel(e.target.value)}
+            style={{ fontSize: "11px", padding: "4px 8px" }}
+          >
+            {modelOptions.map((opt) => (
+              <option key={opt} value={opt}>
+                {opt}
+              </option>
+            ))}
+          </select>
+          {interruptArmed ? (
+            <div style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+              <button
+                type="button"
+                className="fd-btn fd-btn-danger"
+                data-testid="interrupt-confirm-btn"
+                disabled={interrupting}
+                onClick={() => void handleConfirmInterrupt()}
+                style={{ whiteSpace: "nowrap" }}
+              >
+                {interrupting ? "Stopping..." : "Confirm Stop"}
+              </button>
+              <button
+                type="button"
+                className="fd-btn"
+                data-testid="interrupt-cancel-btn"
+                disabled={interrupting}
+                onClick={disarmInterrupt}
+                style={{ whiteSpace: "nowrap" }}
+              >
+                Cancel
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="fd-btn fd-btn-danger"
+              data-testid="interrupt-session-btn"
+              disabled={!canInterrupt}
+              title="Stop active session execution (requires confirmation click)"
+              onClick={handleArmInterrupt}
+              style={{ whiteSpace: "nowrap" }}
+            >
+              {interrupting ? "Stopping..." : "Stop"}
+            </button>
           )}
           <button
             type="button"
@@ -1641,6 +1955,77 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 );
               })}
             </div>
+          </div>
+        )}
+
+        {showSlashMenu && (
+          <div
+            role="listbox"
+            aria-label="Slash Commands"
+            data-testid="slash-command-menu"
+            className="fd-card"
+            style={{
+              padding: "6px",
+              display: "flex",
+              flexDirection: "column",
+              gap: "2px",
+              maxHeight: "220px",
+              overflowY: "auto",
+              backgroundColor: "var(--bg-elevated)",
+              borderColor: "var(--border-accent)",
+            }}
+          >
+            {matchingSlashCommands.map((cmd, idx) => {
+              const cleanName = cmd.name.replace(/^\/+/, "");
+              const isSelected = idx === slashActiveIndex;
+              return (
+                <button
+                  key={cleanName}
+                  type="button"
+                  role="option"
+                  aria-selected={isSelected}
+                  data-testid={`slash-command-item-${cleanName}`}
+                  onClick={() => handleSelectSlashCommand(cmd)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "10px",
+                    width: "100%",
+                    textAlign: "left",
+                    padding: "6px 10px",
+                    borderRadius: "6px",
+                    border: "none",
+                    cursor: "pointer",
+                    backgroundColor: isSelected
+                      ? "var(--accent-subtle)"
+                      : "transparent",
+                    color: "var(--text-primary)",
+                    fontSize: "12px",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span className="fd-mono" style={{ fontWeight: 600 }}>
+                      /{cleanName}
+                    </span>
+                    <span
+                      style={{
+                        color: "var(--text-secondary)",
+                        fontSize: "11.5px",
+                      }}
+                    >
+                      {cmd.description}
+                    </span>
+                  </div>
+                  <span
+                    className="fd-badge"
+                    style={{ fontSize: "10px", textTransform: "uppercase" }}
+                  >
+                    {cmd.kind}
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
 

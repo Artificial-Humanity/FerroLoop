@@ -1,57 +1,63 @@
-import type {
-  AgentsResponse,
-  ArchitectureResponse,
-  ArtifactListResponse,
-  ArtifactPreviewResponse,
-  AuthSessionResponse,
-  ClearSessionMode,
-  ClearSessionResponse,
-  DecommissionMode,
-  DecommissionSessionResponse,
-  DiscoveredSessionSummary,
-  HealthResponse,
-  HubStatsResponse,
-  LivenessResponse,
-  PrMergeRequest,
-  PrMergeResponse,
-  PromptAttachment,
-  PromptRequest,
-  PromptResponse,
-  PrReviewRequest,
-  PrReviewResponse,
-  PullRequestItem,
-  QueuedOperatorPrompt,
-  SessionQueueResponse,
-  SessionTranscriptResponse,
-  SpinUpSessionRequest,
-  SpinUpSessionResponse,
-  CodeSearchKind,
-  CodeSearchResponse,
-  ImportWorkspaceStateResponse,
-  StateCheckpointResponse,
-  StateEntriesResponse,
-  StateEntry,
-  StateEntryResponse,
-  StateSearchResponse,
-  UpsertStateEntryInput,
-  WireAckRequest,
-  WireAckResponse,
-  WireInboxItem,
-  WireSendRequest,
-  WireSendResponse,
-  DeleteGateSecretResponse,
-  EnrolledNode,
-  GateConnectorsResponse,
-  GateSecretResponse,
-  GateSecretsResponse,
-  NodeEnrollTokenResponse,
-  NodesResponse,
-  SetVaultSecretInput,
-  WorkflowDef,
-  WorkflowRun,
-  WorkflowRunDetailResponse,
-  WorktreeDiff,
-  WorktreeSummary,
+import {
+  DEFAULT_SLASH_COMMANDS,
+  type AgentsResponse,
+  type ArchitectureResponse,
+  type ArtifactListResponse,
+  type ArtifactPreviewResponse,
+  type AuthSessionResponse,
+  type BulkSessionAction,
+  type BulkSessionActionResponse,
+  type ClearSessionMode,
+  type ClearSessionResponse,
+  type DecommissionMode,
+  type DecommissionSessionResponse,
+  type DiscoveredSessionSummary,
+  type HealthResponse,
+  type HubStatsResponse,
+  type InterruptSessionResponse,
+  type LivenessResponse,
+  type PrMergeRequest,
+  type PrMergeResponse,
+  type PromptAttachment,
+  type PromptRequest,
+  type PromptResponse,
+  type PrReviewRequest,
+  type PrReviewResponse,
+  type PullRequestItem,
+  type QueuedOperatorPrompt,
+  type SessionQueueResponse,
+  type SessionTranscriptResponse,
+  type SetSessionModelResponse,
+  type SlashCommandEntry,
+  type SpinUpSessionRequest,
+  type SpinUpSessionResponse,
+  type CodeSearchKind,
+  type CodeSearchResponse,
+  type ImportWorkspaceStateResponse,
+  type StateCheckpointResponse,
+  type StateEntriesResponse,
+  type StateEntry,
+  type StateEntryResponse,
+  type StateSearchResponse,
+  type UpsertStateEntryInput,
+  type WireAckRequest,
+  type WireAckResponse,
+  type WireInboxItem,
+  type WireSendRequest,
+  type WireSendResponse,
+  type DeleteGateSecretResponse,
+  type EnrolledNode,
+  type GateConnectorsResponse,
+  type GateSecretResponse,
+  type GateSecretsResponse,
+  type NodeEnrollTokenResponse,
+  type NodesResponse,
+  type SetVaultSecretInput,
+  type WorkflowDef,
+  type WorkflowRun,
+  type WorkflowRunDetailResponse,
+  type WorktreeDiff,
+  type WorktreeSummary,
 } from "../types/api";
 
 export const DEFAULT_TOKEN_STORAGE_KEY = "fl_hub_session_token";
@@ -270,6 +276,57 @@ export class HubApiClient {
         body: JSON.stringify({ mode }),
       },
     );
+  }
+
+  public async interruptSession(
+    sessionId: string,
+  ): Promise<InterruptSessionResponse> {
+    return this.request<InterruptSessionResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/interrupt`,
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+    );
+  }
+
+  public async setSessionModel(
+    sessionId: string,
+    model: string,
+  ): Promise<SetSessionModelResponse> {
+    return this.request<SetSessionModelResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/model`,
+      {
+        method: "POST",
+        body: JSON.stringify({ model }),
+      },
+    );
+  }
+
+  public async bulkSessionAction(
+    action: BulkSessionAction,
+  ): Promise<BulkSessionActionResponse> {
+    return this.request<BulkSessionActionResponse>(
+      "/api/v1/sessions/bulk-action",
+      {
+        method: "POST",
+        body: JSON.stringify({ action }),
+      },
+    );
+  }
+
+  public async listSlashCommands(): Promise<{ commands: SlashCommandEntry[] }> {
+    try {
+      const data = await this.request<{ commands?: SlashCommandEntry[] }>(
+        "/api/v1/commands",
+      );
+      if (Array.isArray(data.commands) && data.commands.length > 0) {
+        return { commands: data.commands };
+      }
+      return { commands: DEFAULT_SLASH_COMMANDS };
+    } catch {
+      return { commands: DEFAULT_SLASH_COMMANDS };
+    }
   }
 
   public async sendSessionPrompt(
@@ -717,4 +774,32 @@ export async function decommissionSession(
   client?: HubApiClient,
 ): Promise<DecommissionSessionResponse> {
   return (client ?? new HubApiClient()).decommissionSession(sessionId, mode);
+}
+
+export async function interruptSession(
+  sessionId: string,
+  client?: HubApiClient,
+): Promise<InterruptSessionResponse> {
+  return (client ?? new HubApiClient()).interruptSession(sessionId);
+}
+
+export async function setSessionModel(
+  sessionId: string,
+  model: string,
+  client?: HubApiClient,
+): Promise<SetSessionModelResponse> {
+  return (client ?? new HubApiClient()).setSessionModel(sessionId, model);
+}
+
+export async function bulkSessionAction(
+  action: BulkSessionAction,
+  client?: HubApiClient,
+): Promise<BulkSessionActionResponse> {
+  return (client ?? new HubApiClient()).bulkSessionAction(action);
+}
+
+export async function listSlashCommands(
+  client?: HubApiClient,
+): Promise<{ commands: SlashCommandEntry[] }> {
+  return (client ?? new HubApiClient()).listSlashCommands();
 }

@@ -22,6 +22,7 @@ export interface ContextHeaderProps {
   wsConnected?: boolean;
   onlineNodesCount?: number;
   onOpenNodesModal?: () => void;
+  onOpenSettingsModal?: () => void;
   onOpenPairingModal: () => void;
   onLogout?: () => void;
   onOpenMobileRoster?: () => void;
@@ -53,6 +54,7 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
   wsConnected = false,
   onlineNodesCount = 0,
   onOpenNodesModal,
+  onOpenSettingsModal,
   onOpenPairingModal,
   onLogout,
   onOpenMobileRoster,
@@ -199,6 +201,17 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           >
             <span className={`fd-dot ${onlineNodesCount > 0 ? "fd-dot-alive" : "fd-dot-dead"}`} />
             <span>{onlineNodesCount > 0 ? `Nodes (${onlineNodesCount})` : "Nodes"}</span>
+          </button>
+        )}
+
+        {onOpenSettingsModal && (
+          <button
+            type="button"
+            data-testid="settings-modal-btn"
+            className="fd-btn"
+            onClick={onOpenSettingsModal}
+          >
+            Settings
           </button>
         )}
 
