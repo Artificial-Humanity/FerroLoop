@@ -168,7 +168,7 @@ pub(super) fn check_new_table(
     Ok(())
 }
 
-fn check_name(kind: &str, name: &str) -> Result<(), StoreError> {
+pub(super) fn check_name(kind: &str, name: &str) -> Result<(), StoreError> {
     if name.is_empty() {
         return Err(backend(format!("{kind} name is empty")));
     }

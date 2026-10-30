@@ -11,6 +11,7 @@ mod traits_catalog;
 mod traits_state;
 mod traits_wire;
 mod traits_workflow;
+mod vector;
 mod ws;
 
 #[cfg(test)]
@@ -20,7 +21,8 @@ use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 use layout::{
     HEADER_BYTES, Op, SLOT_LEN, Superblock, backend, corrupt, decode_snapshot, decode_wal,
-    encode_frame, encode_snapshot, encode_snapshot_v2, encode_superblock, parse_superblock,
+    encode_frame, encode_snapshot, encode_snapshot_v2, encode_snapshot_v3, encode_superblock,
+    parse_superblock,
 };
 use serde_json::{Value, json};
 use state::{
@@ -44,6 +46,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
+pub use vector::{Fusion, KnowledgeHit, VectorHit, VectorMetric, VectorStorage};
 
 const LOCK_EX: i32 = 2;
 const LOCK_UN: i32 = 8;
@@ -97,6 +100,7 @@ struct Disk {
 struct Txn {
     docs: BTreeMap<(String, String), Value>,
     tables: BTreeMap<String, columnar::ColumnTable>,
+    vectors: BTreeMap<String, vector::VectorCollection>,
     ops: Vec<Op>,
 }
 
@@ -454,6 +458,268 @@ impl FerroStore {
         self.with_read(move |txn| columnar::gate_run_rollup(txn, gate.as_ref()))
     }
 
+    /// Create an empty vector collection. An existing name is an error and writes nothing.
+    /// A document collection may use the same name; the two maps are distinct.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_vector_collection(
+        &self,
+        name: &str,
+        dim: u32,
+        storage: VectorStorage,
+        metric: VectorMetric,
+        m: u32,
+        ef_construction: u32,
+        ef_search: u32,
+    ) -> Result<(), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_unit(
+                "create_vector_collection",
+                json!({
+                    "name": name,
+                    "dim": dim,
+                    "storage": vector::storage_name(storage),
+                    "metric": vector::metric_name(metric),
+                    "m": m,
+                    "ef_construction": ef_construction,
+                    "ef_search": ef_search,
+                }),
+            );
+        }
+        let name = name.to_string();
+        self.with_write(move |txn| {
+            vector::check_create(&name, dim, storage, m, ef_construction, ef_search)?;
+            if txn.vectors.contains_key(&name) {
+                return Err(backend(format!(
+                    "vector collection `{name}` already exists"
+                )));
+            }
+            txn.ops.push(Op::CreateVectorCollection {
+                name: name.clone(),
+                dim,
+                storage,
+                metric,
+                m,
+                ef_construction,
+                ef_search,
+            });
+            Ok(())
+        })
+    }
+
+    /// Insert or replace one vector. `None` metadata is absent. `Some(Null)` stores JSON null.
+    pub fn upsert_vector(
+        &self,
+        collection: &str,
+        id: &str,
+        values: &[f32],
+        metadata: Option<&Value>,
+    ) -> Result<(), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            let mut params = serde_json::Map::new();
+            params.insert("collection".into(), json!(collection));
+            params.insert("id".into(), json!(id));
+            params.insert("values".into(), vector::values_json(values)?);
+            if let Some(metadata) = metadata {
+                params.insert("metadata".into(), metadata.clone());
+            }
+            return remote.call_unit("upsert_vector", Value::Object(params));
+        }
+        let collection = collection.to_string();
+        let id = id.to_string();
+        let values = values.to_vec();
+        let metadata = metadata.cloned();
+        self.with_write(move |txn| {
+            let Some(col) = txn.vectors.get(&collection) else {
+                return Err(backend(format!("no vector collection `{collection}`")));
+            };
+            let dim = col.dim;
+            let storage = col.storage;
+            vector::check_vector_id(&id)?;
+            if u32::try_from(values.len()).ok() != Some(dim) {
+                return Err(backend(format!(
+                    "vector values have length {}, expected {dim}",
+                    values.len()
+                )));
+            }
+            let bytes = vector::quantize(storage, &values)?;
+            txn.ops.push(Op::UpsertVector {
+                collection: collection.clone(),
+                id: id.clone(),
+                bytes,
+                metadata: metadata.clone(),
+            });
+            Ok(())
+        })
+    }
+
+    /// Delete one vector. A missing id still commits. A missing collection writes nothing.
+    pub fn delete_vector(&self, collection: &str, id: &str) -> Result<(), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return remote.call_unit("delete_vector", json!({"collection": collection, "id": id}));
+        }
+        let collection = collection.to_string();
+        let id = id.to_string();
+        self.with_write(move |txn| {
+            if !txn.vectors.contains_key(&collection) {
+                return Err(backend(format!("no vector collection `{collection}`")));
+            }
+            vector::check_vector_id(&id)?;
+            txn.ops.push(Op::DeleteVector {
+                collection: collection.clone(),
+                id: id.clone(),
+            });
+            Ok(())
+        })
+    }
+
+    /// Dequantized values and metadata. `Ok(None)` when the id is missing.
+    #[allow(clippy::type_complexity)]
+    pub fn get_vector(
+        &self,
+        collection: &str,
+        id: &str,
+    ) -> Result<Option<(Vec<f32>, Option<Value>)>, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            return vector::parse_get(
+                &remote.call("get_vector", json!({"collection": collection, "id": id}))?,
+            );
+        }
+        let collection = collection.to_string();
+        let id = id.to_string();
+        self.with_read(move |txn| {
+            let Some(col) = txn.vectors.get(&collection) else {
+                return Err(backend(format!("no vector collection `{collection}`")));
+            };
+            vector::check_vector_id(&id)?;
+            let Some(record) = col.vectors.get(&id) else {
+                return Ok(None);
+            };
+            let values = vector::dequantize(col.storage, &record.bytes)?;
+            Ok(Some((values, record.metadata.clone())))
+        })
+    }
+
+    /// Higher-better scores, at most `limit`. `ef` of `None` uses the collection `ef_search`.
+    /// `limit == 0` or `ef == Some(0)` is an empty vec.
+    pub fn search_vectors(
+        &self,
+        collection: &str,
+        values: &[f32],
+        limit: usize,
+        ef: Option<u32>,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            if limit == 0 || ef == Some(0) {
+                return Ok(Vec::new());
+            }
+            let mut params = serde_json::Map::new();
+            params.insert("collection".into(), json!(collection));
+            params.insert("values".into(), vector::values_json(values)?);
+            params.insert("limit".into(), json!(limit));
+            if let Some(ef) = ef {
+                params.insert("ef".into(), json!(ef));
+            }
+            return vector::parse_hits(&remote.call("search_vectors", Value::Object(params))?);
+        }
+        let collection = collection.to_string();
+        let values = values.to_vec();
+        self.with_read(move |txn| {
+            let Some(col) = txn.vectors.get(&collection) else {
+                return Err(backend(format!("no vector collection `{collection}`")));
+            };
+            vector::search(col, &values, limit, ef)
+        })
+    }
+
+    /// Fuse at most `limit` BM25 hits with at most `limit` vector hits, then keep `limit`.
+    pub fn search_hybrid(
+        &self,
+        doc_collection: &str,
+        vector_collection: &str,
+        query: &str,
+        values: &[f32],
+        limit: usize,
+        fusion: Fusion,
+    ) -> Result<Vec<(String, f64)>, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            return vector::parse_hits(&remote.call(
+                "search_hybrid",
+                hybrid_params(
+                    doc_collection,
+                    vector_collection,
+                    query,
+                    values,
+                    limit,
+                    fusion,
+                )?,
+            )?);
+        }
+        let doc_collection = doc_collection.to_string();
+        let vector_collection = vector_collection.to_string();
+        let query = query.to_string();
+        let values = values.to_vec();
+        self.with_read(move |txn| {
+            state::search_hybrid(
+                &txn.docs,
+                &txn.vectors,
+                &doc_collection,
+                &vector_collection,
+                &query,
+                &values,
+                limit,
+                fusion,
+            )
+        })
+    }
+
+    /// Same fusion as [`Self::search_hybrid`]. `doc` is the document at that id, if any.
+    /// `metadata` is the vector metadata when the id is in the vector collection.
+    pub fn search_knowledge(
+        &self,
+        doc_collection: &str,
+        vector_collection: &str,
+        query: &str,
+        values: &[f32],
+        limit: usize,
+        fusion: Fusion,
+    ) -> Result<Vec<KnowledgeHit>, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            return vector::parse_knowledge(&remote.call(
+                "search_knowledge",
+                hybrid_params(
+                    doc_collection,
+                    vector_collection,
+                    query,
+                    values,
+                    limit,
+                    fusion,
+                )?,
+            )?);
+        }
+        let doc_collection = doc_collection.to_string();
+        let vector_collection = vector_collection.to_string();
+        let query = query.to_string();
+        let values = values.to_vec();
+        self.with_read(move |txn| {
+            state::search_knowledge(
+                &txn.docs,
+                &txn.vectors,
+                &doc_collection,
+                &vector_collection,
+                &query,
+                &values,
+                limit,
+                fusion,
+            )
+        })
+    }
+
     /// Append one message. The returned sequence starts at 1 per topic and is
     /// not reused after that message document is deleted.
     pub fn publish_mq(&self, topic: &str, key: &str, payload: &Value) -> Result<u64, StoreError> {
@@ -555,6 +821,7 @@ impl FerroStore {
         let txn = Txn {
             docs: state.docs,
             tables: state.tables,
+            vectors: state.vectors,
             ops: Vec::new(),
         };
         body(&txn)
@@ -609,6 +876,7 @@ impl FerroStore {
                 let mut txn = Txn {
                     docs: state.docs,
                     tables: state.tables,
+                    vectors: state.vectors,
                     ops: Vec::new(),
                 };
                 let result = body(&mut txn)?;
@@ -624,6 +892,7 @@ impl FerroStore {
                 let mut txn = Txn {
                     docs: state.docs.clone(),
                     tables: state.tables.clone(),
+                    vectors: state.vectors.clone(),
                     ops: Vec::new(),
                 };
                 let result = body(&mut txn)?;
@@ -664,6 +933,35 @@ impl FerroStore {
 
 fn remote_unsupported() -> StoreError {
     backend("a remote FerroStore does not run a local transaction")
+}
+
+fn hybrid_params(
+    doc_collection: &str,
+    vector_collection: &str,
+    query: &str,
+    values: &[f32],
+    limit: usize,
+    fusion: Fusion,
+) -> Result<Value, StoreError> {
+    vector::validate_fusion(fusion)?;
+    let fusion = match fusion {
+        Fusion::Rrf { k } => json!({"method": "rrf", "k": k}),
+        Fusion::Weighted { bm25, vector } => {
+            json!({
+                "method": "weighted",
+                "bm25": bm25,
+                "vector": vector,
+            })
+        }
+    };
+    Ok(json!({
+        "doc_collection": doc_collection,
+        "vector_collection": vector_collection,
+        "query": query,
+        "values": vector::values_json(values)?,
+        "limit": limit,
+        "fusion": fusion,
+    }))
 }
 
 /// `dir/store.fls` -> `dir/store.fls.sock`.
@@ -727,6 +1025,7 @@ fn with_write_disk<T>(
     let mut txn = Txn {
         docs: state.docs,
         tables: state.tables,
+        vectors: state.vectors,
         ops: Vec::new(),
     };
     let result = body(&mut txn)?;
@@ -757,7 +1056,9 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
     let (index, sb, state) = read_consistent(&file)?;
-    let blob = if state.tables.is_empty() {
+    let blob = if !state.vectors.is_empty() {
+        encode_snapshot_v3(state.last_seq, &state.docs, &state.tables, &state.vectors)?
+    } else if state.tables.is_empty() {
         encode_snapshot(state.last_seq, &state.docs)?
     } else {
         encode_snapshot_v2(state.last_seq, &state.docs, &state.tables)?
@@ -885,6 +1186,7 @@ fn read_consistent(file: &File) -> Result<(usize, Superblock, DocState), StoreEr
         DocState {
             docs: snap.docs,
             tables: snap.tables,
+            vectors: snap.vectors,
             last_seq: snap.seq,
         }
     };

@@ -3,6 +3,7 @@
 
 use super::columnar::{ColumnTable, check_new_table, validate_row_group};
 use super::layout::{Op, backend, corrupt};
+use super::vector::{self, Fusion, KnowledgeHit, VectorCollection};
 use fl_core::StoreError;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -14,6 +15,7 @@ const BM25_B: f64 = 0.75;
 pub(super) struct DocState {
     pub(super) docs: BTreeMap<(String, String), Value>,
     pub(super) tables: BTreeMap<String, ColumnTable>,
+    pub(super) vectors: BTreeMap<String, VectorCollection>,
     pub(super) last_seq: u64,
 }
 
@@ -135,8 +137,108 @@ fn apply_op(state: &mut DocState, op: &Op) -> Result<(), StoreError> {
             validate_row_group(&table.columns, bytes)?;
             table.groups.push(bytes.clone());
         }
+        Op::CreateVectorCollection {
+            name,
+            dim,
+            storage,
+            metric,
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            vector::check_create(name, *dim, *storage, *m, *ef_construction, *ef_search)?;
+            if state.vectors.contains_key(name) {
+                return Err(backend(format!(
+                    "vector collection `{name}` already exists"
+                )));
+            }
+            state.vectors.insert(
+                name.clone(),
+                VectorCollection::empty(*dim, *storage, *metric, *m, *ef_construction, *ef_search),
+            );
+        }
+        Op::UpsertVector {
+            collection,
+            id,
+            bytes,
+            metadata,
+        } => {
+            let Some(col) = state.vectors.get_mut(collection) else {
+                return Err(backend(format!("no vector collection `{collection}`")));
+            };
+            col.upsert(id.clone(), bytes.clone(), metadata.clone())?;
+        }
+        Op::DeleteVector { collection, id } => {
+            let Some(col) = state.vectors.get_mut(collection) else {
+                return Err(backend(format!("no vector collection `{collection}`")));
+            };
+            col.delete_id(id)?;
+        }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn search_hybrid(
+    docs: &BTreeMap<(String, String), Value>,
+    vectors: &BTreeMap<String, VectorCollection>,
+    doc_collection: &str,
+    vector_collection: &str,
+    query: &str,
+    values: &[f32],
+    limit: usize,
+    fusion: Fusion,
+) -> Result<Vec<(String, f64)>, StoreError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    vector::validate_fusion(fusion)?;
+    let Some(col) = vectors.get(vector_collection) else {
+        return Err(backend(format!(
+            "no vector collection `{vector_collection}`"
+        )));
+    };
+    let bm25 = search_bm25_docs(docs, doc_collection, query, limit);
+    let found = vector::search(col, values, limit, None)?;
+    vector::fuse(&bm25, &found, fusion, limit)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn search_knowledge(
+    docs: &BTreeMap<(String, String), Value>,
+    vectors: &BTreeMap<String, VectorCollection>,
+    doc_collection: &str,
+    vector_collection: &str,
+    query: &str,
+    values: &[f32],
+    limit: usize,
+    fusion: Fusion,
+) -> Result<Vec<KnowledgeHit>, StoreError> {
+    let fused = search_hybrid(
+        docs,
+        vectors,
+        doc_collection,
+        vector_collection,
+        query,
+        values,
+        limit,
+        fusion,
+    )?;
+    let mut hits = Vec::with_capacity(fused.len());
+    for (id, score) in fused {
+        let metadata = vectors
+            .get(vector_collection)
+            .and_then(|col| col.vectors.get(&id))
+            .and_then(|record| record.metadata.clone());
+        let doc = docs.get(&(doc_collection.to_string(), id.clone())).cloned();
+        hits.push(KnowledgeHit {
+            id,
+            score,
+            metadata,
+            doc,
+        });
+    }
+    Ok(hits)
 }
 
 pub(super) fn query_by_field(
@@ -180,6 +282,15 @@ pub(super) fn search_bm25(
     query: &str,
     limit: usize,
 ) -> Vec<(String, f64)> {
+    search_bm25_docs(&state.docs, collection, query, limit)
+}
+
+fn search_bm25_docs(
+    stored: &BTreeMap<(String, String), Value>,
+    collection: &str,
+    query: &str,
+    limit: usize,
+) -> Vec<(String, f64)> {
     if limit == 0 || query.is_empty() {
         return Vec::new();
     }
@@ -197,7 +308,7 @@ pub(super) fn search_bm25(
     let mut docs = Vec::new();
     let mut df: HashMap<String, u32> = HashMap::new();
     let mut total_tokens = 0usize;
-    for ((coll, id), doc) in &state.docs {
+    for ((coll, id), doc) in stored {
         if coll != collection {
             continue;
         }

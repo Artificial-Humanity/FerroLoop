@@ -3,6 +3,10 @@
 use super::columnar::{
     ColumnDef, ColumnTable, check_new_table, type_from_tag, type_tag, validate_row_group,
 };
+use super::vector::{
+    self, VectorCollection, VectorMetric, VectorRecord, VectorStorage, metric_from_tag, metric_tag,
+    storage_from_tag, storage_tag,
+};
 use fl_core::StoreError;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -14,10 +18,14 @@ const SNAP_MAGIC: &[u8; 8] = b"FERRSNAP";
 const FORMAT_VERSION: u32 = 1;
 const SNAPSHOT_VERSION_DOCS: u32 = 1;
 const SNAPSHOT_VERSION_COLUMNAR: u32 = 2;
+const SNAPSHOT_VERSION_VECTOR: u32 = 3;
 const TAG_PUT: u8 = 1;
 const TAG_DELETE: u8 = 2;
 const TAG_CREATE_COLUMN_TABLE: u8 = 3;
 const TAG_APPEND_COLUMN_GROUP: u8 = 4;
+const TAG_CREATE_VECTOR_COLLECTION: u8 = 5;
+const TAG_UPSERT_VECTOR: u8 = 6;
+const TAG_DELETE_VECTOR: u8 = 7;
 
 pub(super) fn backend(err: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(err.to_string())
@@ -128,6 +136,25 @@ pub(super) enum Op {
         name: String,
         bytes: Vec<u8>,
     },
+    CreateVectorCollection {
+        name: String,
+        dim: u32,
+        storage: VectorStorage,
+        metric: VectorMetric,
+        m: u32,
+        ef_construction: u32,
+        ef_search: u32,
+    },
+    UpsertVector {
+        collection: String,
+        id: String,
+        bytes: Vec<u8>,
+        metadata: Option<Value>,
+    },
+    DeleteVector {
+        collection: String,
+        id: String,
+    },
 }
 
 pub(super) fn encode_frame(seq: u64, ops: &[Op]) -> Result<Vec<u8>, StoreError> {
@@ -181,6 +208,54 @@ fn encode_op(buf: &mut Vec<u8>, op: &Op) -> Result<(), StoreError> {
             write_lp(buf, name.as_bytes())?;
             write_lp(buf, bytes)?;
         }
+        Op::CreateVectorCollection {
+            name,
+            dim,
+            storage,
+            metric,
+            m,
+            ef_construction,
+            ef_search,
+        } => {
+            buf.push(TAG_CREATE_VECTOR_COLLECTION);
+            write_lp(buf, name.as_bytes())?;
+            buf.extend_from_slice(&dim.to_le_bytes());
+            buf.push(storage_tag(*storage));
+            buf.push(metric_tag(*metric));
+            buf.extend_from_slice(&m.to_le_bytes());
+            buf.extend_from_slice(&ef_construction.to_le_bytes());
+            buf.extend_from_slice(&ef_search.to_le_bytes());
+        }
+        Op::UpsertVector {
+            collection,
+            id,
+            bytes,
+            metadata,
+        } => {
+            buf.push(TAG_UPSERT_VECTOR);
+            write_lp(buf, collection.as_bytes())?;
+            write_lp(buf, id.as_bytes())?;
+            write_lp(buf, bytes)?;
+            write_metadata(buf, metadata)?;
+        }
+        Op::DeleteVector { collection, id } => {
+            buf.push(TAG_DELETE_VECTOR);
+            write_lp(buf, collection.as_bytes())?;
+            write_lp(buf, id.as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+fn write_metadata(buf: &mut Vec<u8>, metadata: &Option<Value>) -> Result<(), StoreError> {
+    match metadata {
+        None => buf.push(0),
+        Some(value) => {
+            buf.push(1);
+            let raw =
+                serde_json::to_vec(value).map_err(|err| backend(format!("json encode: {err}")))?;
+            write_lp(buf, &raw)?;
+        }
     }
     Ok(())
 }
@@ -196,6 +271,7 @@ pub(super) struct Snapshot {
     pub(super) seq: u64,
     pub(super) docs: BTreeMap<(String, String), Value>,
     pub(super) tables: BTreeMap<String, ColumnTable>,
+    pub(super) vectors: BTreeMap<String, VectorCollection>,
 }
 
 pub(super) fn encode_snapshot(
@@ -265,6 +341,112 @@ pub(super) fn encode_snapshot_v2(
     Ok(body)
 }
 
+/// Version 3: the version-1 document section, the version-2 table section
+/// (`table_count` may be 0), then one or more vector collections.
+pub(super) fn encode_snapshot_v3(
+    seq: u64,
+    docs: &BTreeMap<(String, String), Value>,
+    tables: &BTreeMap<String, ColumnTable>,
+    vectors: &BTreeMap<String, VectorCollection>,
+) -> Result<Vec<u8>, StoreError> {
+    if vectors.is_empty() {
+        return Err(backend("snapshot has no vector collections"));
+    }
+    for (name, collection) in vectors {
+        vector::validate_graph(name, collection)?;
+    }
+    let mut body = Vec::new();
+    body.extend_from_slice(SNAP_MAGIC);
+    body.extend_from_slice(&SNAPSHOT_VERSION_VECTOR.to_le_bytes());
+    body.extend_from_slice(&seq.to_le_bytes());
+    let count =
+        u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
+    body.extend_from_slice(&count.to_le_bytes());
+    for ((collection, id), doc) in docs {
+        write_lp(&mut body, collection.as_bytes())?;
+        write_lp(&mut body, id.as_bytes())?;
+        let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
+        write_lp(&mut body, &raw)?;
+    }
+    let table_count =
+        u32::try_from(tables.len()).map_err(|_| backend("snapshot has too many column tables"))?;
+    body.extend_from_slice(&table_count.to_le_bytes());
+    for (name, table) in tables {
+        write_column_table(&mut body, name, table)?;
+    }
+    let collection_count = u32::try_from(vectors.len())
+        .map_err(|_| backend("snapshot has too many vector collections"))?;
+    body.extend_from_slice(&collection_count.to_le_bytes());
+    for (name, collection) in vectors {
+        write_vector_collection(&mut body, name, collection)?;
+    }
+    let crc = crc32(&body);
+    body.extend_from_slice(&crc.to_le_bytes());
+    Ok(body)
+}
+
+fn write_column_table(
+    body: &mut Vec<u8>,
+    name: &str,
+    table: &ColumnTable,
+) -> Result<(), StoreError> {
+    write_lp(body, name.as_bytes())?;
+    let col_count = u32::try_from(table.columns.len()).map_err(|_| backend("too many columns"))?;
+    body.extend_from_slice(&col_count.to_le_bytes());
+    for column in &table.columns {
+        write_lp(body, column.name.as_bytes())?;
+        body.push(type_tag(column.ty));
+    }
+    let group_count =
+        u32::try_from(table.groups.len()).map_err(|_| backend("too many row groups"))?;
+    body.extend_from_slice(&group_count.to_le_bytes());
+    for group in &table.groups {
+        write_lp(body, group)?;
+    }
+    Ok(())
+}
+
+fn write_vector_collection(
+    body: &mut Vec<u8>,
+    name: &str,
+    collection: &VectorCollection,
+) -> Result<(), StoreError> {
+    write_lp(body, name.as_bytes())?;
+    body.extend_from_slice(&collection.dim.to_le_bytes());
+    body.push(storage_tag(collection.storage));
+    body.push(metric_tag(collection.metric));
+    body.extend_from_slice(&collection.m.to_le_bytes());
+    body.extend_from_slice(&collection.ef_construction.to_le_bytes());
+    body.extend_from_slice(&collection.ef_search.to_le_bytes());
+    let count = u32::try_from(collection.vectors.len())
+        .map_err(|_| backend("too many vectors in one collection"))?;
+    body.extend_from_slice(&count.to_le_bytes());
+    for (id, record) in &collection.vectors {
+        write_lp(body, id.as_bytes())?;
+        write_lp(body, &record.bytes)?;
+        write_metadata(body, &record.metadata)?;
+    }
+    match &collection.entry {
+        None => body.push(0),
+        Some(id) => {
+            body.push(1);
+            write_lp(body, id.as_bytes())?;
+        }
+    }
+    for record in collection.vectors.values() {
+        body.push(record.level);
+        for neighbors in &record.neighbors {
+            let ncount =
+                u32::try_from(neighbors.len()).map_err(|_| backend("too many vector neighbors"))?;
+            body.extend_from_slice(&ncount.to_le_bytes());
+            for neighbor in neighbors {
+                write_lp(body, neighbor.as_bytes())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
     if buf.len() < 4 {
         return Err(corrupt("snapshot is shorter than its crc"));
@@ -285,7 +467,10 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
         return Err(corrupt("snapshot magic mismatch"));
     }
     let version = cur.u32()?;
-    if version != SNAPSHOT_VERSION_DOCS && version != SNAPSHOT_VERSION_COLUMNAR {
+    if version != SNAPSHOT_VERSION_DOCS
+        && version != SNAPSHOT_VERSION_COLUMNAR
+        && version != SNAPSHOT_VERSION_VECTOR
+    {
         return Err(corrupt(format!(
             "snapshot version {version} is not supported"
         )));
@@ -307,49 +492,171 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
         }
     }
     let mut tables = BTreeMap::new();
-    if version == SNAPSHOT_VERSION_COLUMNAR {
-        let table_count = cur.u32()?;
-        if table_count == 0 {
-            return Err(corrupt("snapshot has no column tables"));
-        }
-        if usize::try_from(table_count).unwrap_or(usize::MAX) > cur.remaining() {
-            return Err(corrupt("snapshot table count exceeds the blob"));
-        }
-        for _ in 0..table_count {
-            let name = cur.lp_str()?;
-            let col_count = cur.u32()?;
-            if usize::try_from(col_count).unwrap_or(usize::MAX) > cur.remaining() {
-                return Err(corrupt("snapshot column count exceeds the blob"));
-            }
-            let mut columns = Vec::with_capacity(usize::try_from(col_count).unwrap_or(0));
-            for _ in 0..col_count {
-                let column_name = cur.lp_str()?;
-                let ty = type_from_tag(cur.u8()?)?;
-                columns.push(ColumnDef {
-                    name: column_name,
-                    ty,
-                });
-            }
-            let group_count = cur.u32()?;
-            if usize::try_from(group_count).unwrap_or(usize::MAX) > cur.remaining() {
-                return Err(corrupt("snapshot row-group count exceeds the blob"));
-            }
-            let mut groups = Vec::with_capacity(usize::try_from(group_count).unwrap_or(0));
-            for _ in 0..group_count {
-                groups.push(cur.lp()?.to_vec());
-            }
-            if tables.contains_key(&name) {
-                return Err(corrupt(format!("snapshot repeats column table `{name}`")));
-            }
-            check_new_table(&tables, &name, &columns)?;
-            for group in &groups {
-                validate_row_group(&columns, group)?;
-            }
-            tables.insert(name, ColumnTable { columns, groups });
-        }
+    if version == SNAPSHOT_VERSION_COLUMNAR || version == SNAPSHOT_VERSION_VECTOR {
+        tables = decode_column_tables(&mut cur, version == SNAPSHOT_VERSION_COLUMNAR)?;
+    }
+    let mut vectors = BTreeMap::new();
+    if version == SNAPSHOT_VERSION_VECTOR {
+        vectors = decode_vector_collections(&mut cur)?;
     }
     cur.finish()?;
-    Ok(Snapshot { seq, docs, tables })
+    Ok(Snapshot {
+        seq,
+        docs,
+        tables,
+        vectors,
+    })
+}
+
+fn decode_column_tables(
+    cur: &mut Cur<'_>,
+    require_nonempty: bool,
+) -> Result<BTreeMap<String, ColumnTable>, StoreError> {
+    let table_count = cur.u32()?;
+    if require_nonempty && table_count == 0 {
+        return Err(corrupt("snapshot has no column tables"));
+    }
+    if usize::try_from(table_count).unwrap_or(usize::MAX) > cur.remaining() {
+        return Err(corrupt("snapshot table count exceeds the blob"));
+    }
+    let mut tables = BTreeMap::new();
+    for _ in 0..table_count {
+        let name = cur.lp_str()?;
+        let col_count = cur.u32()?;
+        if usize::try_from(col_count).unwrap_or(usize::MAX) > cur.remaining() {
+            return Err(corrupt("snapshot column count exceeds the blob"));
+        }
+        let mut columns = Vec::with_capacity(usize::try_from(col_count).unwrap_or(0));
+        for _ in 0..col_count {
+            let column_name = cur.lp_str()?;
+            let ty = type_from_tag(cur.u8()?)?;
+            columns.push(ColumnDef {
+                name: column_name,
+                ty,
+            });
+        }
+        let group_count = cur.u32()?;
+        if usize::try_from(group_count).unwrap_or(usize::MAX) > cur.remaining() {
+            return Err(corrupt("snapshot row-group count exceeds the blob"));
+        }
+        let mut groups = Vec::with_capacity(usize::try_from(group_count).unwrap_or(0));
+        for _ in 0..group_count {
+            groups.push(cur.lp()?.to_vec());
+        }
+        if tables.contains_key(&name) {
+            return Err(corrupt(format!("snapshot repeats column table `{name}`")));
+        }
+        check_new_table(&tables, &name, &columns)?;
+        for group in &groups {
+            validate_row_group(&columns, group)?;
+        }
+        tables.insert(name, ColumnTable { columns, groups });
+    }
+    Ok(tables)
+}
+
+fn decode_vector_collections(
+    cur: &mut Cur<'_>,
+) -> Result<BTreeMap<String, VectorCollection>, StoreError> {
+    let collection_count = cur.u32()?;
+    if collection_count == 0 {
+        return Err(corrupt("snapshot has no vector collections"));
+    }
+    if usize::try_from(collection_count).unwrap_or(usize::MAX) > cur.remaining() {
+        return Err(corrupt("snapshot vector count exceeds the blob"));
+    }
+    let mut collections = BTreeMap::new();
+    for _ in 0..collection_count {
+        let name = cur.lp_str()?;
+        let dim = cur.u32()?;
+        let storage = storage_from_tag(cur.u8()?)?;
+        let metric = metric_from_tag(cur.u8()?)?;
+        let m = cur.u32()?;
+        let ef_construction = cur.u32()?;
+        let ef_search = cur.u32()?;
+        let vector_count = cur.u32()?;
+        if usize::try_from(vector_count).unwrap_or(usize::MAX) > cur.remaining() {
+            return Err(corrupt("snapshot vector count exceeds the blob"));
+        }
+        let mut vectors = BTreeMap::new();
+        for _ in 0..vector_count {
+            let id = cur.lp_str()?;
+            let bytes = cur.lp()?.to_vec();
+            let metadata = read_metadata(cur)?;
+            if vectors
+                .insert(
+                    id.clone(),
+                    VectorRecord {
+                        bytes,
+                        metadata,
+                        level: 0,
+                        neighbors: Vec::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(corrupt(format!("snapshot repeats vector id `{id}`")));
+            }
+        }
+        let entry_flag = cur.u8()?;
+        let entry = match entry_flag {
+            0 => None,
+            1 => Some(cur.lp_str()?),
+            _ => return Err(corrupt(format!("unknown vector entry flag {entry_flag}"))),
+        };
+        for record in vectors.values_mut() {
+            let level = cur.u8()?;
+            if usize::from(level) > cur.remaining() {
+                return Err(corrupt("snapshot vector level exceeds the blob"));
+            }
+            let mut neighbors = Vec::with_capacity(usize::from(level) + 1);
+            for _layer in 0..=level {
+                let ncount = cur.u32()?;
+                if usize::try_from(ncount).unwrap_or(usize::MAX) > cur.remaining() {
+                    return Err(corrupt("snapshot neighbor count exceeds the blob"));
+                }
+                let mut nids = Vec::with_capacity(usize::try_from(ncount).unwrap_or(0));
+                for _ in 0..ncount {
+                    nids.push(cur.lp_str()?);
+                }
+                neighbors.push(nids);
+            }
+            record.level = level;
+            record.neighbors = neighbors;
+        }
+        if collections.contains_key(&name) {
+            return Err(corrupt(format!(
+                "snapshot repeats vector collection `{name}`"
+            )));
+        }
+        let collection = VectorCollection {
+            dim,
+            storage,
+            metric,
+            m,
+            ef_construction,
+            ef_search,
+            vectors,
+            entry,
+        };
+        vector::validate_graph(&name, &collection)?;
+        collections.insert(name, collection);
+    }
+    Ok(collections)
+}
+
+fn read_metadata(cur: &mut Cur<'_>) -> Result<Option<Value>, StoreError> {
+    let flag = cur.u8()?;
+    match flag {
+        0 => Ok(None),
+        1 => {
+            let raw = cur.lp()?;
+            let value =
+                serde_json::from_slice(raw).map_err(|_| corrupt("vector metadata is not json"))?;
+            Ok(Some(value))
+        }
+        _ => Err(corrupt(format!("unknown vector metadata flag {flag}"))),
+    }
 }
 
 /// Decode committed WAL bytes. A torn tail is dropped; a bad CRC with a
@@ -457,6 +764,41 @@ fn decode_payload(buf: &[u8]) -> Result<(u64, Vec<Op>), StoreError> {
                 let name = cur.lp_str()?;
                 let bytes = cur.lp()?.to_vec();
                 Op::AppendColumnGroup { name, bytes }
+            }
+            TAG_CREATE_VECTOR_COLLECTION => {
+                let name = cur.lp_str()?;
+                let dim = cur.u32()?;
+                let storage = storage_from_tag(cur.u8()?)?;
+                let metric = metric_from_tag(cur.u8()?)?;
+                let m = cur.u32()?;
+                let ef_construction = cur.u32()?;
+                let ef_search = cur.u32()?;
+                Op::CreateVectorCollection {
+                    name,
+                    dim,
+                    storage,
+                    metric,
+                    m,
+                    ef_construction,
+                    ef_search,
+                }
+            }
+            TAG_UPSERT_VECTOR => {
+                let collection = cur.lp_str()?;
+                let id = cur.lp_str()?;
+                let bytes = cur.lp()?.to_vec();
+                let metadata = read_metadata(&mut cur)?;
+                Op::UpsertVector {
+                    collection,
+                    id,
+                    bytes,
+                    metadata,
+                }
+            }
+            TAG_DELETE_VECTOR => {
+                let collection = cur.lp_str()?;
+                let id = cur.lp_str()?;
+                Op::DeleteVector { collection, id }
             }
             _ => return Err(corrupt(format!("unknown wal op tag {tag}"))),
         };
