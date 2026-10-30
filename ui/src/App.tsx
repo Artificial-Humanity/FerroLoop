@@ -1295,6 +1295,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           }
           setSelectedAgentName(nameKey);
           setSelectedSessionId(null);
+          setMobileRosterOpen(false);
         }}
         onOpenSpinUpModal={() => setSpinUpModalOpen(true)}
         isOpen={mobileRosterOpen}
@@ -1338,6 +1339,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
           onOpenMobileRoster={() => setMobileRosterOpen((prev) => !prev)}
+          mobileSidebarOpen={mobileRosterOpen}
         />
 
         <main
