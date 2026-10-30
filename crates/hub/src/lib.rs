@@ -45,9 +45,9 @@ pub use discovery::{
 };
 pub use nodes::{
     EnrollFail, EnrollTokenInfo, EnrollWorker, EnrolledWorker, EnsureHubArgs, HeartbeatFail,
-    HeartbeatUpdate, NodeRecord, NodeView, RevokeFail, detect_capabilities, enroll_worker,
-    ensure_hub_node, find_hub_node, list_visible_nodes, local_hostname, mint_enroll_token,
-    node_status, node_token_matches, revoke_node, touch_node,
+    HeartbeatUpdate, NodeRecord, NodeView, RevokeFail, canonical_node_id, detect_capabilities,
+    enroll_worker, ensure_hub_node, find_hub_node, list_visible_nodes, local_hostname,
+    mint_enroll_token, node_status, node_token_matches, revoke_node, touch_node,
 };
 pub use terminal::{TerminalManager, TerminalSession};
 pub use ws::{HubServer, HubWsClient, compute_accept_key, try_parse_ws_frame};

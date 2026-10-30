@@ -82,8 +82,8 @@ use crate::discovery::{
 use crate::nodes::{
     EnrollFail, EnrollWorker, EnsureHubArgs, HeartbeatFail, HeartbeatUpdate, NodeRecord, NodeView,
     RevokeFail, detect_capabilities, enroll_worker, ensure_hub_node, find_hub_node,
-    list_visible_nodes, local_hostname, mint_enroll_token, node_token_matches, revoke_node,
-    touch_node,
+    list_visible_nodes, local_hostname, mint_enroll_token, node_state_slug, node_token_matches,
+    revoke_node, touch_node,
 };
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
 
@@ -633,27 +633,7 @@ fn node_heartbeat_segment(path: &str) -> Option<&str> {
 /// Same slug as `nodes::node_state_slug`. Heartbeat reads the row after
 /// `node_token_matches` returns false for a revoked worker.
 fn stored_node_slug(node_id: &str) -> Option<String> {
-    if node_id.is_empty() {
-        return None;
-    }
-    let mut tail = String::new();
-    for ch in node_id.trim().chars() {
-        let lower = ch.to_ascii_lowercase();
-        if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == '-' || lower == '_' {
-            tail.push(lower);
-        }
-        if tail.len() >= 48 {
-            break;
-        }
-    }
-    if tail.is_empty() {
-        return None;
-    }
-    let slug = format!("hub-node-{tail}");
-    if slug.starts_with("hub-node-enroll-") {
-        return None;
-    }
-    Some(slug)
+    node_state_slug(node_id).ok()
 }
 
 fn revoked_node_bearer_matches(

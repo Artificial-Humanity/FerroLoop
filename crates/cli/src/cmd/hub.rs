@@ -11,8 +11,8 @@ use clap::Subcommand;
 use fl_core::pr_policy::DEFAULT_OWNER_LOGIN;
 use fl_hub::{
     DEFAULT_HUB_LISTEN, DEFAULT_PAIRING_TTL_SECS, DEFAULT_SESSION_TTL_SECS, EnsureHubArgs,
-    HubServer, HubServerConfig, NodeView, detect_capabilities, ensure_hub_node, find_hub_node,
-    generate_hex_token, list_visible_nodes, local_hostname, mint_enroll_token,
+    HubServer, HubServerConfig, NodeView, canonical_node_id, detect_capabilities, ensure_hub_node,
+    find_hub_node, generate_hex_token, list_visible_nodes, local_hostname, mint_enroll_token,
     mint_pairing_code_in_store, resolve_owner_token, resolve_peer_token,
 };
 use fl_store::RedbStore;
@@ -749,18 +749,21 @@ fn cmd_init(
 fn choose_hub_node_id(store: &RedbStore, name: Option<String>) -> Result<String, (i32, String)> {
     let existing = find_hub_node(store).map_err(|e| (2, e))?;
     if let Some(requested) = name {
-        if let Some(hub) = existing
-            && hub.node_id != requested
-        {
-            return Err((
-                2,
-                format!(
-                    "hub node `{}` already exists and `--name` `{requested}` would create a second hub",
-                    hub.node_id
-                ),
-            ));
+        let canonical = canonical_node_id(&requested).map_err(|e| (2, e))?;
+        if let Some(hub) = existing {
+            let existing_id =
+                canonical_node_id(&hub.node_id).unwrap_or_else(|_| hub.node_id.clone());
+            if existing_id != canonical {
+                return Err((
+                    2,
+                    format!(
+                        "hub node `{}` already exists and `--name` `{requested}` would create a second hub",
+                        hub.node_id
+                    ),
+                ));
+            }
         }
-        return Ok(requested);
+        return Ok(canonical);
     }
     if let Some(hub) = existing {
         return Ok(hub.node_id);
@@ -1127,4 +1130,55 @@ fn xml_escape(text: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_store() -> (tempfile::TempDir, RedbStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = RedbStore::open(&dir.path().join("store.redb")).unwrap();
+        (dir, store)
+    }
+
+    fn hub_args(node_id: &str) -> EnsureHubArgs {
+        EnsureHubArgs {
+            node_id: node_id.to_string(),
+            display_name: "Primary Hub".to_string(),
+            hostname: "hubhost".to_string(),
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            listen_addr: None,
+            capabilities: Vec::new(),
+            now_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn choose_hub_node_id_compares_canonical_ids_and_rejects_bad_names() {
+        let (_dir, store) = open_store();
+        ensure_hub_node(&store, hub_args("primary")).unwrap();
+
+        assert_eq!(
+            choose_hub_node_id(&store, Some("Primary".to_string())).unwrap(),
+            "primary"
+        );
+        assert_eq!(choose_hub_node_id(&store, None).unwrap(), "primary");
+
+        let second = choose_hub_node_id(&store, Some("other-hub".to_string())).unwrap_err();
+        assert_eq!(second.0, 2);
+        assert!(second.1.contains("second hub"), "{}", second.1);
+
+        let bad = choose_hub_node_id(&store, Some("a/b".to_string())).unwrap_err();
+        assert_eq!(bad.0, 2);
+        assert!(bad.1.contains("[a-z0-9_-]"), "{}", bad.1);
+        assert!(!bad.1.contains("second hub"), "{}", bad.1);
+
+        let (_empty_dir, empty) = open_store();
+        assert_eq!(
+            choose_hub_node_id(&empty, Some("Primary".to_string())).unwrap(),
+            "primary"
+        );
+    }
 }

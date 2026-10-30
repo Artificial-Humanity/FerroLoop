@@ -1,5 +1,6 @@
 //! Hub and worker node records plus one-time enrollment tokens in workspace runtime state.
 
+use std::ffi::c_char;
 use std::fs;
 use std::path::Path;
 
@@ -155,10 +156,10 @@ pub fn node_status(role: &str, revoked: bool, last_seen_at_ms: u64, now_ms: u64)
 }
 
 pub fn ensure_hub_node(store: &RedbStore, args: EnsureHubArgs) -> Result<NodeRecord, String> {
-    let slug = node_state_slug(&args.node_id)?;
+    let node_id = canonical_node_id(&args.node_id)?;
+    let slug = node_state_slug(&node_id)?;
     let existing = load_node(store, &slug)?;
     if let Some(rec) = &existing {
-        let node_id = &args.node_id;
         if rec.role == "worker" {
             return Err(format!("node `{node_id}` is already enrolled as a worker"));
         }
@@ -174,7 +175,7 @@ pub fn ensure_hub_node(store: &RedbStore, args: EnsureHubArgs) -> Result<NodeRec
         None => (Vec::new(), None, args.now_ms),
     };
     let record = NodeRecord {
-        node_id: args.node_id,
+        node_id,
         display_name: args.display_name,
         role: "hub".to_string(),
         hostname: args.hostname,
@@ -247,6 +248,10 @@ pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWor
         Ok(slug) => slug,
         Err(_) => return Err(EnrollFail::Invalid),
     };
+    let node_id = match canonical_node_id(&req.node_id) {
+        Ok(node_id) => node_id,
+        Err(_) => return Err(EnrollFail::Invalid),
+    };
     let code_hash = sha256_hex(&req.code);
     let loaded = match load_enroll(store, &enroll_state_slug(&code_hash)) {
         Ok(loaded) => loaded,
@@ -270,7 +275,6 @@ pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWor
     }
     let existing = load_node(store, &slug).map_err(EnrollFail::Store)?;
     if existing.as_ref().is_some_and(|rec| rec.role == "hub") {
-        let node_id = &req.node_id;
         return Err(EnrollFail::Rejected(format!(
             "refusing to enroll over hub node `{node_id}`"
         )));
@@ -282,7 +286,7 @@ pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWor
         .unwrap_or(req.now_ms);
     let node_token = generate_hex_token(32);
     let record = NodeRecord {
-        node_id: req.node_id.clone(),
+        node_id: node_id.clone(),
         display_name: req.display_name,
         role: "worker".to_string(),
         hostname: req.hostname,
@@ -298,10 +302,10 @@ pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWor
     };
     persist_node(store, &slug, &record).map_err(EnrollFail::Store)?;
     entry.used = true;
-    entry.used_by_node_id = Some(req.node_id.clone());
+    entry.used_by_node_id = Some(node_id.clone());
     persist_enroll(store, &enroll_state_slug(&code_hash), &entry).map_err(EnrollFail::Store)?;
     Ok(EnrolledWorker {
-        node_id: req.node_id,
+        node_id,
         node_token,
     })
 }
@@ -373,16 +377,49 @@ pub fn detect_capabilities(path_env: &str) -> Vec<String> {
     found
 }
 
-pub fn local_hostname() -> String {
-    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
-        if let Ok(raw) = fs::read_to_string(path) {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
+// libc `gethostname`. No extra crate: the process already links libc.
+unsafe extern "C" {
+    fn gethostname(buf: *mut c_char, len: usize) -> i32;
+}
+
+fn hostname_from_buffer(buf: &[u8]) -> Option<String> {
+    let end = buf.iter().position(|byte| *byte == 0).unwrap_or(buf.len());
+    let trimmed = std::str::from_utf8(&buf[..end]).ok()?.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn hostname_from_libc() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: `buf` is a 256-byte writable array that outlives the call.
+    // `gethostname` writes at most `buf.len()` bytes and returns 0 or -1.
+    let rc = unsafe { gethostname(buf.as_mut_ptr().cast::<c_char>(), buf.len()) };
+    if rc != 0 {
+        return None;
     }
-    "localhost".to_string()
+    hostname_from_buffer(&buf)
+}
+
+fn read_hostname_file(path: &str) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn pick_hostname(candidates: impl IntoIterator<Item = Option<String>>) -> String {
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|name| !name.is_empty())
+        .unwrap_or_else(|| "localhost".to_string())
+}
+
+pub fn local_hostname() -> String {
+    // `gethostname` first: macOS has neither procfs nor `/etc/hostname`.
+    pick_hostname([
+        hostname_from_libc(),
+        read_hostname_file("/proc/sys/kernel/hostname"),
+        read_hostname_file("/etc/hostname"),
+    ])
 }
 
 pub fn find_hub_node(store: &RedbStore) -> Result<Option<NodeRecord>, String> {
@@ -411,28 +448,22 @@ fn to_view(rec: &NodeRecord, now_ms: u64) -> NodeView {
     }
 }
 
-fn sanitize_node_tail(raw: &str) -> Result<String, String> {
-    if raw.is_empty() {
-        return Err("node_id is empty".to_string());
+/// Trimmed, ASCII-lowercased node id. The whole result must match `[a-z0-9_-]{1,48}`.
+pub fn canonical_node_id(raw: &str) -> Result<String, String> {
+    let id = raw.trim().to_ascii_lowercase();
+    let chars_ok = id.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
+    });
+    if id.is_empty() || id.len() > SLUG_TAIL_MAX || !chars_ok {
+        return Err(
+            "node_id must be 1-48 characters of [a-z0-9_-] after trim and lowercase".to_string(),
+        );
     }
-    let mut out = String::new();
-    for ch in raw.trim().chars() {
-        let lower = ch.to_ascii_lowercase();
-        if lower.is_ascii_lowercase() || lower.is_ascii_digit() || lower == '-' || lower == '_' {
-            out.push(lower);
-        }
-        if out.len() >= SLUG_TAIL_MAX {
-            break;
-        }
-    }
-    if out.is_empty() {
-        return Err("node_id sanitizes to empty".to_string());
-    }
-    Ok(out)
+    Ok(id)
 }
 
-fn node_state_slug(node_id: &str) -> Result<String, String> {
-    let tail = sanitize_node_tail(node_id)?;
+pub(crate) fn node_state_slug(node_id: &str) -> Result<String, String> {
+    let tail = canonical_node_id(node_id)?;
     let slug = format!("{NODE_SLUG_PREFIX}{tail}");
     if slug.starts_with(ENROLL_SLUG_PREFIX) {
         return Err("node_id collides with the enroll-record slug prefix".to_string());
@@ -984,6 +1015,11 @@ mod tests {
         assert!(!refreshed.revoked);
         assert_eq!(to_view(&refreshed, 5_000 + 600_001).status, "online");
 
+        let mixed = ensure_hub_node(&store, hub_args("Primary", 6_000, None)).unwrap();
+        assert_eq!(mixed.node_id, "primary");
+        assert_eq!(mixed.enrolled_at_ms, 1_000);
+        assert_eq!(mixed.token_hash.as_deref(), Some("abc123"));
+
         ensure_hub_node(&store, hub_args("hub-b", 2_000, None)).unwrap();
         assert_eq!(find_hub_node(&store).unwrap().unwrap().node_id, "hub-b");
     }
@@ -1034,6 +1070,98 @@ mod tests {
         );
         assert!(!node_token_matches(&store, "edge-1", &enrolled.node_token).unwrap());
         assert!(node_token_matches(&store, "edge-1", &replaced.node_token).unwrap());
+    }
+
+    #[test]
+    fn enroll_rejects_slash_without_consuming_code_or_writing_stripped_row() {
+        let (_tmp, store) = open_store();
+        let info = mint_enroll_token(&store, None, 60, "http://hub", 1_000).unwrap();
+        let err = enroll_worker(&store, enroll_req(&info.code, "a/b", "W", 1_100)).unwrap_err();
+        assert_eq!(err, EnrollFail::Invalid);
+        let (_slug, stored) = stored_enroll(&store, &info.code);
+        assert_eq!(stored["used"], false);
+        assert!(stored["used_by_node_id"].is_null());
+        let stripped = format!("{NODE_SLUG_PREFIX}ab");
+        assert!(
+            store
+                .get_state_by_key(&StateScope::Workspace, StateConcern::Runtime, &stripped)
+                .unwrap()
+                .is_none()
+        );
+        assert!(list_visible_nodes(&store, 1_100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn enroll_stores_canonical_node_id_and_matches_either_case() {
+        let (_tmp, store) = open_store();
+        let info = mint_enroll_token(&store, None, 60, "http://hub", 1_000).unwrap();
+        let enrolled =
+            enroll_worker(&store, enroll_req(&info.code, "Worker-A", "W", 1_100)).unwrap();
+        assert_eq!(enrolled.node_id, "worker-a");
+        let record = load_node(&store, &node_state_slug("Worker-A").unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.node_id, "worker-a");
+        assert_eq!(
+            node_state_slug("worker-a").unwrap(),
+            node_state_slug("Worker-A").unwrap()
+        );
+        let (_slug, stored) = stored_enroll(&store, &info.code);
+        assert_eq!(stored["used"], true);
+        assert_eq!(stored["used_by_node_id"], "worker-a");
+        assert!(node_token_matches(&store, "Worker-A", &enrolled.node_token).unwrap());
+        assert!(node_token_matches(&store, "worker-a", &enrolled.node_token).unwrap());
+    }
+
+    #[test]
+    fn enroll_rejects_49_char_id_without_consuming_code() {
+        let (_tmp, store) = open_store();
+        let info = mint_enroll_token(&store, None, 60, "http://hub", 1_000).unwrap();
+        let long_id = "a".repeat(49);
+        let err = enroll_worker(&store, enroll_req(&info.code, &long_id, "W", 1_100)).unwrap_err();
+        assert_eq!(err, EnrollFail::Invalid);
+        let (_slug, stored) = stored_enroll(&store, &info.code);
+        assert_eq!(stored["used"], false);
+        assert!(stored["used_by_node_id"].is_null());
+        let truncated = format!("{NODE_SLUG_PREFIX}{}", "a".repeat(48));
+        assert!(load_node(&store, &truncated).unwrap().is_none());
+    }
+
+    #[test]
+    fn local_hostname_prefers_gethostname_then_files_then_localhost() {
+        assert_eq!(hostname_from_buffer(b"lab\0unused").as_deref(), Some("lab"));
+        assert_eq!(hostname_from_buffer(b"  lab \0").as_deref(), Some("lab"));
+        assert_eq!(hostname_from_buffer(&[0u8; 4]), None);
+        assert_eq!(hostname_from_buffer(b"   \0"), None);
+        assert_eq!(hostname_from_buffer(&[0xff, 0xfe]), None);
+
+        assert_eq!(
+            pick_hostname([
+                Some("from-libc".to_string()),
+                Some("from-proc".to_string()),
+                Some("from-etc".to_string()),
+            ]),
+            "from-libc"
+        );
+        assert_eq!(
+            pick_hostname([
+                None,
+                Some("from-proc".to_string()),
+                Some("from-etc".to_string())
+            ]),
+            "from-proc"
+        );
+        assert_eq!(
+            pick_hostname([Some(String::new()), None, Some("from-etc".to_string())]),
+            "from-etc"
+        );
+        assert_eq!(pick_hostname([None, None, None]), "localhost");
+
+        let got = local_hostname();
+        assert!(!got.is_empty());
+        if let Some(from_libc) = hostname_from_libc() {
+            assert_eq!(got, from_libc);
+        }
     }
 
     fn entry_sensitive(store: &RedbStore, slug: &str) -> bool {
