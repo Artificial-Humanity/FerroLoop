@@ -132,7 +132,10 @@ export function stripSubagentHandbackWrapper(content: string): string {
   return content
     .replace(/^\s*Another Claude session sent a message:\s*/i, "")
     .replace(/^\s*<agent-message[^>]*>\s*/i, "")
-    .replace(/\s*<\/agent-message>\s*$/i, "")
+    .replace(
+      /\s*<\/agent-message>(?:\s*This came from another Claude session[\s\S]*)?\s*$/i,
+      "",
+    )
     .replace(
       /^\s*(?:\[Subagent hand-back\][\s\S]*?The report follows:\s*|\[Subagent [^\]]+\]\s*)/i,
       "",

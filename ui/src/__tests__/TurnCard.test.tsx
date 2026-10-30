@@ -317,6 +317,8 @@ describe("TurnCard directed assistant highlight", () => {
       "### Findings",
       "Forwarded subagent report details.",
       "</agent-message>",
+      "",
+      'This came from another Claude session (ID: acd87c17952de4c0a). Reply using SendMessage with to: "acd87c17952de4c0a".',
     ].join("\n");
 
     expect(stripSubagentHandbackWrapper(directHandback)).toBe(
