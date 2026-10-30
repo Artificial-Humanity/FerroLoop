@@ -171,18 +171,27 @@ pub fn resolve_agy_exe(
 }
 
 /// Port of a language-server address (`host:port`, `[v6]:port`, or a bare port).
+///
+/// Every dial goes to `127.0.0.1`, so only an address that names this machine is usable:
+/// an empty host, `127.0.0.1`, `localhost` or `[::1]`. Any other host is `None`, and the
+/// route's CSRF token never goes to whatever listens on that port locally.
 pub fn agy_ls_port(addr: &str) -> Option<u16> {
     let addr = addr.trim();
     if addr.is_empty() {
         return None;
     }
-    let port_src = if let Some(rest) = addr.strip_prefix('[') {
-        rest.split_once(']')?.1.strip_prefix(':')?
-    } else if let Some((_, port)) = addr.rsplit_once(':') {
-        port
+    let (host, port_src) = if let Some(rest) = addr.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        (format!("[{host}]"), after.strip_prefix(':')?)
+    } else if let Some((host, port)) = addr.rsplit_once(':') {
+        (host.to_string(), port)
     } else {
-        addr
+        (String::new(), addr)
     };
+    let host = host.trim().to_ascii_lowercase();
+    if !matches!(host.as_str(), "" | "127.0.0.1" | "localhost" | "[::1]") {
+        return None;
+    }
     let digits: String = port_src
         .trim()
         .chars()
@@ -3360,6 +3369,48 @@ mod tests {
         // Port 1 is not an ephemeral bind target, so a parallel test cannot steal it.
         assert!(!agy_ls_address_listening("127.0.0.1:1"));
         assert!(!agy_ls_address_listening("not-a-port"));
+        drop(listener);
+    }
+
+    #[test]
+    fn agy_ls_port_accepts_only_addresses_that_name_this_machine() {
+        for (addr, port) in [
+            ("127.0.0.1:8080", 8080),
+            ("localhost:8080", 8080),
+            ("LOCALHOST:8080", 8080),
+            ("[::1]:8080", 8080),
+            (":8080", 8080),
+            ("8080", 8080),
+            ("  127.0.0.1:41234 ", 41234),
+        ] {
+            assert_eq!(agy_ls_port(addr), Some(port), "{addr}");
+        }
+        for addr in [
+            "10.0.0.5:8080",
+            "example.com:8080",
+            "0.0.0.0:8080",
+            "127.0.0.2:8080",
+            "[fe80::1]:8080",
+            "[2001:db8::1]:8080",
+            "::1:8080",
+            "http://localhost:8080",
+            "evil.localhost:8080",
+            "",
+            "localhost",
+            "127.0.0.1:",
+            "not-a-port",
+        ] {
+            assert_eq!(agy_ls_port(addr), None, "{addr}");
+        }
+    }
+
+    #[test]
+    fn agy_ls_address_listening_ignores_a_remote_host_on_a_local_open_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(agy_ls_address_listening(&format!("127.0.0.1:{port}")));
+        assert!(!agy_ls_address_listening(&format!("10.0.0.5:{port}")));
+        assert!(!agy_ls_address_listening(&format!("example.com:{port}")));
         drop(listener);
     }
 

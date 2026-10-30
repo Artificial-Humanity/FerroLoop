@@ -74,10 +74,10 @@ use crate::auth::{
     format_logout_set_cookie, format_session_set_cookie, sha256_hex,
 };
 use crate::discovery::{
-    DiscoveryStoreSnapshot, discover_sessions_from_snapshot, list_git_worktrees,
-    read_session_context_usage_from_snapshot, read_session_quota_usage_with_home,
-    read_session_transcript_from_snapshot, read_worktree_diff, scan_cargo_architecture_conformance,
-    snapshot_discovery_store,
+    DiscoveryStoreSnapshot, discover_route_sessions_without_model_info,
+    discover_sessions_from_snapshot, list_git_worktrees, read_session_context_usage_from_snapshot,
+    read_session_quota_usage_with_home, read_session_transcript_from_snapshot, read_worktree_diff,
+    scan_cargo_architecture_conformance, snapshot_discovery_store,
 };
 use crate::lifecycle::{
     self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
@@ -1168,7 +1168,9 @@ fn handle_get_agents_liveness(state: &HubState, req: &HttpRequest) -> HttpRespon
     }
     let snap = snapshot_discovery_store(&store);
     drop(store);
-    let sessions = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
+    // Liveness reads only `source`, `persona` and `adapter`: no model discovery.
+    let sessions =
+        discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref());
 
     let mut items = Vec::with_capacity(agents.len());
     for (ag, hb) in agents.iter().zip(heartbeats.iter()) {
@@ -3052,7 +3054,9 @@ fn resolve_session_target_from_snapshot(
     raw_session_id: &str,
 ) -> (String, Option<String>) {
     let trimmed = raw_session_id.trim();
-    let sessions = discover_sessions_from_snapshot(snap, state.config.home_override.as_deref());
+    // Only `id` and `persona` are read, so skip model discovery.
+    let sessions =
+        discover_route_sessions_without_model_info(snap, state.config.home_override.as_deref());
     if let Some(matched) = sessions
         .iter()
         .find(|s| s.id == trimmed || s.persona.as_deref() == Some(trimmed))
@@ -3782,7 +3786,9 @@ fn handle_post_session_model(
     };
 
     let snap = load_discovery_snapshot(state);
-    let sessions = discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref());
+    // Only `id`, `persona` and `adapter` are read, so skip model discovery.
+    let sessions =
+        discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref());
     let trimmed = session_id.trim();
     let matched = sessions
         .iter()
@@ -3898,7 +3904,7 @@ fn handle_post_session_bulk_action(
 
     let snap = load_discovery_snapshot(state);
     let targets: Vec<(String, Option<String>)> =
-        discover_sessions_from_snapshot(&snap, state.config.home_override.as_deref())
+        discover_route_sessions_without_model_info(&snap, state.config.home_override.as_deref())
             .into_iter()
             .filter(|s| s.source == "route")
             .map(|s| (s.id, s.persona))

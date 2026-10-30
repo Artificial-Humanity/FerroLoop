@@ -244,6 +244,17 @@ pub fn discover_sessions_from_snapshot(
     discover_sessions_impl(snap, home_override, true)
 }
 
+/// Discover sessions like [`discover_sessions_from_snapshot`], but leave `model`,
+/// `thinking_level` and `available_models` empty. For callers that only look a session up
+/// by `id`, `persona` or `source`: it never reads a model file or transcript tail and never
+/// calls a language server.
+pub fn discover_route_sessions_without_model_info(
+    snap: &DiscoveryStoreSnapshot,
+    home_override: Option<&Path>,
+) -> Vec<DiscoveredSessionSummary> {
+    discover_sessions_impl(snap, home_override, false)
+}
+
 /// Shared body of [`discover_sessions_from_snapshot`]. `with_model_info` is false for
 /// callers that only look a session up by id, so they never read model files or wait on
 /// a language server.
@@ -521,12 +532,30 @@ fn non_empty_str(value: Option<&Value>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Largest config or cache file (`settings.json`, `config.toml`, `models_cache.json`,
+/// `summary.json`) read on a poll. A bigger file counts as unreadable.
+const MODEL_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// A whole file as UTF-8, or `None` when it is unreadable, not UTF-8, or longer than
+/// `max_bytes`. Never reads more than `max_bytes + 1` bytes, even from a special file.
+fn read_capped_string(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    let mut text = String::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= max_bytes).then_some(text)
+}
+
 fn read_json_file(path: &Path) -> Option<Value> {
-    serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
+    serde_json::from_str(&read_capped_string(path, MODEL_FILE_MAX_BYTES)?).ok()
 }
 
 fn read_toml_file(path: &Path) -> Option<toml::Table> {
-    fs::read_to_string(path).ok()?.parse::<toml::Table>().ok()
+    read_capped_string(path, MODEL_FILE_MAX_BYTES)?
+        .parse::<toml::Table>()
+        .ok()
 }
 
 fn toml_non_empty_str(table: &toml::Table, key: &str) -> Option<String> {
@@ -585,13 +614,7 @@ fn parse_agy_model_config(body: &str) -> Option<AgyModelConfig> {
 /// `"generatorModel"` string in the text that did arrive is used then.
 fn parse_agy_generator_model(body: &str) -> Option<String> {
     if let Ok(val) = serde_json::from_str::<Value>(body) {
-        return val
-            .pointer("/steps")
-            .or_else(|| val.pointer("/trajectory/steps"))?
-            .as_array()?
-            .iter()
-            .rev()
-            .find_map(|step| non_empty_str(step.pointer("/metadata/generatorModel")));
+        return generator_model_from_json(&val);
     }
     const KEY: &str = "\"generatorModel\"";
     let mut latest = None;
@@ -607,6 +630,22 @@ fn parse_agy_generator_model(body: &str) -> Option<String> {
         }
     }
     latest
+}
+
+fn generator_model_from_json(val: &Value) -> Option<String> {
+    val.pointer("/steps")
+        .or_else(|| val.pointer("/trajectory/steps"))?
+        .as_array()?
+        .iter()
+        .rev()
+        .find_map(|step| non_empty_str(step.pointer("/metadata/generatorModel")))
+}
+
+/// [`parse_agy_generator_model`] for a body that must be complete. A `GetCascadeTrajectory`
+/// body cut off by the size cap holds the OLDEST steps, so its last `generatorModel` is a
+/// stale early model: a body that is not valid JSON names no model.
+fn parse_agy_complete_generator_model(body: &str) -> Option<String> {
+    generator_model_from_json(&serde_json::from_str::<Value>(body).ok()?)
 }
 
 /// Split a trailing `-low`, `-medium` or `-high` off a model id. An id with no such suffix
@@ -671,14 +710,34 @@ static AGY_PLACEHOLDER_CACHE: AgyCache<(u16, String), String> = Mutex::new(BTree
 /// `Some(entry)` while `key` has a live cache entry. A cached miss lives for the shorter
 /// negative TTL.
 fn agy_cache_get<K: Ord + Clone, V: Clone>(cache: &AgyCache<K, V>, key: &K) -> Option<Option<V>> {
+    agy_cache_get_with_ttls(cache, key, AGY_CACHE_TTL, AGY_NEGATIVE_CACHE_TTL)
+}
+
+/// [`agy_cache_get`] with explicit TTLs, so a test can expire an entry without waiting.
+fn agy_cache_get_with_ttls<K: Ord + Clone, V: Clone>(
+    cache: &AgyCache<K, V>,
+    key: &K,
+    ttl: Duration,
+    negative_ttl: Duration,
+) -> Option<Option<V>> {
     let guard = cache.lock().unwrap_or_else(|err| err.into_inner());
     let (at, value) = guard.get(key)?;
-    let ttl = if value.is_some() {
-        AGY_CACHE_TTL
-    } else {
-        AGY_NEGATIVE_CACHE_TTL
-    };
+    let ttl = if value.is_some() { ttl } else { negative_ttl };
     (at.elapsed() < ttl).then(|| value.clone())
+}
+
+/// Drop every cached answer for `port`. The kernel can hand a stub's port to a later stub
+/// inside the TTL, and the stale entry would answer from the cache.
+#[cfg(test)]
+fn forget_agy_port_caches(port: u16) {
+    AGY_CONFIG_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .remove(&port);
+    AGY_PLACEHOLDER_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .retain(|(cached_port, _), _| *cached_port != port);
 }
 
 fn agy_cache_put<K: Ord, V>(cache: &AgyCache<K, V>, key: K, value: Option<V>) {
@@ -778,7 +837,7 @@ fn agy_cached_generator_model(
                 &body,
                 AGY_TRAJECTORY_MAX_BYTES,
             )
-            .and_then(|resp| parse_agy_generator_model(&resp))
+            .and_then(|resp| parse_agy_complete_generator_model(&resp))
         });
     agy_cache_put(&AGY_PLACEHOLDER_CACHE, key, placeholder.clone());
     placeholder
@@ -856,7 +915,8 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     file.seek(SeekFrom::Start(len.saturating_sub(max_bytes)))
         .ok()?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).ok()?;
+    // `take` bounds the read even when the file grew after `metadata()` or is a special file.
+    file.take(max_bytes).read_to_end(&mut bytes).ok()?;
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
@@ -865,8 +925,8 @@ fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
 fn latest_claude_transcript_model(jsonl: &str) -> Option<String> {
     jsonl.lines().rev().find_map(|line| {
         let val: Value = serde_json::from_str(line.trim()).ok()?;
-        non_empty_str(val.pointer("/message/model"))
-            .or_else(|| non_empty_str(val.get("model")))
+        plain_bounded_str(val.pointer("/message/model"), MODEL_ID_MAX_CHARS)
+            .or_else(|| plain_bounded_str(val.get("model"), MODEL_ID_MAX_CHARS))
             .filter(|model| !model.starts_with('<'))
     })
 }
@@ -877,7 +937,7 @@ fn claude_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sess
         .and_then(|tail| latest_claude_transcript_model(&tail));
     let model = from_transcript.or_else(|| {
         let settings = read_json_file(&home?.join(".claude").join("settings.json"))?;
-        non_empty_str(settings.get("model"))
+        plain_bounded_str(settings.get("model"), MODEL_ID_MAX_CHARS)
     });
     SessionModelInfo {
         model,
@@ -903,8 +963,8 @@ fn codex_listed_models(cache: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Longest accepted per-session Codex model id.
-const CODEX_MODEL_MAX_CHARS: usize = 128;
+/// Longest accepted per-session model id (Claude and Codex).
+const MODEL_ID_MAX_CHARS: usize = 128;
 /// Longest accepted per-session Codex reasoning effort.
 const CODEX_EFFORT_MAX_CHARS: usize = 32;
 
@@ -939,7 +999,7 @@ fn codex_rollout_settings(jsonl: &str) -> (Option<String>, Option<String>) {
             continue;
         };
         if model.is_none() {
-            model = plain_bounded_str(val.pointer("/payload/model"), CODEX_MODEL_MAX_CHARS);
+            model = plain_bounded_str(val.pointer("/payload/model"), MODEL_ID_MAX_CHARS);
         }
         if effort.is_none() {
             effort = EFFORT_POINTERS.iter().find_map(|pointer| {
@@ -3954,6 +4014,9 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
+        // The kernel may reuse a port within the cache TTL; drop answers cached for an
+        // earlier stub on it so this test sees every request it expects.
+        forget_agy_port_caches(port);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -4357,6 +4420,290 @@ mod tests {
             stub_paths(&stub)
         );
         stub.shutdown();
+    }
+
+    #[test]
+    fn route_discovery_without_model_info_never_reads_model_sources() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let project = home.join(".claude").join("projects").join("p");
+        fs::create_dir_all(&project).unwrap();
+        let session_id = "claude-lookup-sess-1";
+        fs::write(
+            project.join(format!("{session_id}.jsonl")),
+            r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-5-5","content":"a"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join(".claude").join("settings.json"),
+            r#"{"model":"sonnet"}"#,
+        )
+        .unwrap();
+        let stub = spawn_agy_stub_with_steps(
+            AGY_CONFIG_FIXTURE,
+            AGY_TRAJECTORY_FIXTURE,
+            "agy-lookup-1",
+            None,
+        );
+        let addr = format!("127.0.0.1:{}", stub.port);
+        write_routes(
+            home,
+            &[
+                (
+                    "kayla",
+                    &format!(
+                        r#"{{"kind":"claude","pid":1,"session_id":"{session_id}","socket_path":"{}"}}"#,
+                        home.join("c.sock").display()
+                    ),
+                ),
+                (
+                    "ferris",
+                    &format!(
+                        r#"{{"kind":"agy","conversation_id":"agy-lookup-1","ls_address":"{addr}","csrf_token":"stub-csrf"}}"#
+                    ),
+                ),
+            ],
+        );
+        let snap = DiscoveryStoreSnapshot::default();
+
+        // The lookup-only pass must not call the language server (the stub log stays
+        // empty) and must leave every model field empty even though the transcript,
+        // settings and stub all name a model.
+        let lookup = discover_route_sessions_without_model_info(&snap, Some(home));
+        assert!(
+            stub.seen.lock().unwrap().is_empty(),
+            "no language-server call: {:?}",
+            stub.seen.lock().unwrap()
+        );
+        assert_eq!(lookup.len(), 2);
+        for session in &lookup {
+            assert_eq!(session.model, None, "{}", session.id);
+            assert_eq!(session.thinking_level, None, "{}", session.id);
+            assert!(session.available_models.is_empty(), "{}", session.id);
+        }
+
+        let full = discover_sessions_from_snapshot(&snap, Some(home));
+        assert_eq!(
+            full.iter()
+                .map(|s| (&s.id, &s.persona, &s.source, &s.adapter))
+                .collect::<Vec<_>>(),
+            lookup
+                .iter()
+                .map(|s| (&s.id, &s.persona, &s.source, &s.adapter))
+                .collect::<Vec<_>>(),
+            "ids, personas, sources and adapters match the full discovery"
+        );
+        assert_eq!(
+            session_for(&full, "kayla").model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            session_for(&full, "ferris").model.as_deref(),
+            Some("gemini-4-argon")
+        );
+        assert!(
+            !stub.seen.lock().unwrap().is_empty(),
+            "the full discovery does call the language server"
+        );
+        stub.shutdown();
+    }
+
+    #[test]
+    fn agy_trajectory_cut_by_the_size_cap_names_no_model() {
+        // The first step names a model; padding pushes the body past the cap, so the
+        // client receives only the OLDEST steps. Their model is stale and must not be shown.
+        let pad = "a".repeat(AGY_TRAJECTORY_MAX_BYTES + 1024);
+        let body: &'static str = Box::leak(
+            format!(
+                r#"{{"trajectory":{{"steps":[{{"metadata":{{"generatorModel":"MODEL_PLACEHOLDER_M417"}}}},{{"pad":"{pad}"}}]}}}}"#
+            )
+            .into_boxed_str(),
+        );
+        assert!(body.len() > AGY_TRAJECTORY_MAX_BYTES);
+        let stub = spawn_agy_stub(AGY_CONFIG_FIXTURE, body);
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let info = agy_live_model_info(Some(&addr), Some("stub-csrf"), "agy-live-1", false);
+        // M417 is gemini-4-argon; the config default (M420) is shown instead of it.
+        assert_eq!(info.model.as_deref(), Some("gemini-3.8-flash"));
+        assert_eq!(info.thinking_level.as_deref(), Some("medium"));
+        assert_eq!(
+            info.available_models.first().map(String::as_str),
+            Some("gemini-4-argon")
+        );
+        assert_eq!(
+            stub_paths(&stub),
+            ["GetCascadeModelConfigData", "GetCascadeTrajectory"]
+        );
+        stub.shutdown();
+
+        // The strict parser accepts a complete body and refuses a cut one.
+        assert_eq!(
+            parse_agy_complete_generator_model(AGY_TRAJECTORY_FIXTURE).as_deref(),
+            Some("MODEL_PLACEHOLDER_M417")
+        );
+        let cut = r#"{"trajectory":{"steps":[{"metadata":{"generatorModel":"MODEL_PLACEHOLDER_M416"}},{"metadata":{"generatorMo"#;
+        assert_eq!(parse_agy_complete_generator_model(cut), None);
+        assert_eq!(
+            parse_agy_generator_model(cut).as_deref(),
+            Some("MODEL_PLACEHOLDER_M416"),
+            "the lenient parser still reads a cut body for the tail-steps call"
+        );
+    }
+
+    #[test]
+    fn agy_stub_ports_start_with_no_cached_answers() {
+        // A cached answer for a port is dropped when a stub takes the port.
+        agy_cache_put(&AGY_CONFIG_CACHE, 4242, None);
+        agy_cache_put(&AGY_PLACEHOLDER_CACHE, (4242, "c".to_string()), None);
+        agy_cache_put(&AGY_PLACEHOLDER_CACHE, (4243, "c".to_string()), None);
+        forget_agy_port_caches(4242);
+        assert!(agy_cache_get(&AGY_CONFIG_CACHE, &4242).is_none());
+        assert!(agy_cache_get(&AGY_PLACEHOLDER_CACHE, &(4242, "c".to_string())).is_none());
+        assert!(agy_cache_get(&AGY_PLACEHOLDER_CACHE, &(4243, "c".to_string())).is_some());
+        forget_agy_port_caches(4243);
+    }
+
+    #[test]
+    fn agy_failed_lookup_is_cached_briefly_then_retried() {
+        let cache: AgyCache<u16, String> = Mutex::new(BTreeMap::new());
+        let (ttl, negative_ttl) = (Duration::from_secs(30), Duration::from_millis(60));
+        agy_cache_put(&cache, 1, None);
+        agy_cache_put(&cache, 2, Some("hit".to_string()));
+        assert_eq!(
+            agy_cache_get_with_ttls(&cache, &1, ttl, negative_ttl),
+            Some(None)
+        );
+        assert_eq!(
+            agy_cache_get_with_ttls(&cache, &2, ttl, negative_ttl),
+            Some(Some("hit".to_string()))
+        );
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(
+            agy_cache_get_with_ttls(&cache, &1, ttl, negative_ttl),
+            None,
+            "the cached miss expired, so the lookup is retried"
+        );
+        assert_eq!(
+            agy_cache_get_with_ttls(&cache, &2, ttl, negative_ttl),
+            Some(Some("hit".to_string())),
+            "a hit lives for the longer TTL"
+        );
+
+        // Through a stub: a config that fails to parse is asked for once, then served
+        // from the negative cache.
+        let stub = spawn_agy_stub("not json", AGY_TRAJECTORY_FIXTURE);
+        let addr = format!("127.0.0.1:{}", stub.port);
+        let offline = offline_agy_model_info();
+        for _ in 0..3 {
+            assert_eq!(
+                agy_live_model_info(Some(&addr), Some("stub-csrf"), "agy-live-1", false),
+                offline
+            );
+        }
+        assert_eq!(stub_paths(&stub), ["GetCascadeModelConfigData"]);
+        stub.shutdown();
+    }
+
+    #[test]
+    fn model_file_reads_are_capped() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("f.json");
+        let wrap = |pad: usize| format!(r#"{{"model":"x","pad":"{}"}}"#, "a".repeat(pad));
+        let overhead = wrap(0).len();
+        let cap = MODEL_FILE_MAX_BYTES as usize;
+
+        fs::write(&path, wrap(cap - overhead)).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), MODEL_FILE_MAX_BYTES);
+        assert!(read_json_file(&path).is_some(), "a file at the cap is read");
+        fs::write(&path, wrap(cap - overhead + 1)).unwrap();
+        assert!(
+            read_json_file(&path).is_none(),
+            "one byte over the cap is unreadable"
+        );
+
+        let toml_path = tmp.path().join("c.toml");
+        fs::write(
+            &toml_path,
+            format!("model = \"x\"\n# {}\n", "a".repeat(cap)),
+        )
+        .unwrap();
+        assert!(read_toml_file(&toml_path).is_none());
+        fs::write(&toml_path, "model = \"x\"\n").unwrap();
+        assert!(read_toml_file(&toml_path).is_some());
+
+        // Through discovery: an over-cap Codex cache and config fall back silently.
+        let codex = tmp.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        fs::write(
+            codex.join("models_cache.json"),
+            format!(
+                r#"{{"models":[{{"slug":"big-model","visibility":"list"}}],"pad":"{}"}}"#,
+                "a".repeat(cap)
+            ),
+        )
+        .unwrap();
+        fs::write(
+            codex.join("config.toml"),
+            format!("model = \"cfg-model\"\n# {}\n", "a".repeat(cap)),
+        )
+        .unwrap();
+        let info = codex_model_info(None, Some(tmp.path()));
+        assert_eq!(info.model, None);
+        assert_eq!(info.available_models, strings(&CODEX_DEFAULT_MODELS));
+
+        // The tail reader returns at most the last `max_bytes`.
+        let log = tmp.path().join("log.jsonl");
+        fs::write(&log, "0123456789").unwrap();
+        assert_eq!(read_file_tail(&log, 4).as_deref(), Some("6789"));
+        assert_eq!(read_file_tail(&log, 100).as_deref(), Some("0123456789"));
+    }
+
+    #[test]
+    fn claude_model_names_are_length_and_control_character_bounded() {
+        let line = |model: &str| {
+            serde_json::json!({"type":"assistant","message":{"role":"assistant","model":model}})
+                .to_string()
+        };
+        let oversized = "m".repeat(MODEL_ID_MAX_CHARS + 1);
+        let at_limit = "m".repeat(MODEL_ID_MAX_CHARS);
+        // The newest valid name wins; an oversized or control-character one is skipped.
+        let transcript = [
+            line("claude-opus-5-5"),
+            line(&oversized),
+            line("bad\u{7}model"),
+            line("two\nlines"),
+        ]
+        .join("\n");
+        assert_eq!(
+            latest_claude_transcript_model(&transcript).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            latest_claude_transcript_model(&line(&at_limit)).as_deref(),
+            Some(at_limit.as_str())
+        );
+        assert_eq!(latest_claude_transcript_model(&line(&oversized)), None);
+        // The top-level `model` key is bounded the same way.
+        let top = serde_json::json!({"model": "x\u{1b}[31m"}).to_string();
+        assert_eq!(latest_claude_transcript_model(&top), None);
+
+        // settings.json is too.
+        let tmp = TempDir::new().unwrap();
+        let claude = tmp.path().join(".claude");
+        fs::create_dir_all(&claude).unwrap();
+        for bad in [oversized.as_str(), "bad\u{7}model"] {
+            fs::write(
+                claude.join("settings.json"),
+                serde_json::json!({ "model": bad }).to_string(),
+            )
+            .unwrap();
+            assert_eq!(claude_model_info(None, Some(tmp.path())).model, None);
+        }
+        fs::write(claude.join("settings.json"), r#"{"model":"sonnet"}"#).unwrap();
+        assert_eq!(
+            claude_model_info(None, Some(tmp.path())).model.as_deref(),
+            Some("sonnet")
+        );
     }
 
     #[test]

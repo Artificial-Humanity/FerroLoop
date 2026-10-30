@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fl_core::at::At;
 use fl_core::ferrowire::{DeliveryReceipt, DeliveryStatus, WireMessage};
@@ -497,11 +497,58 @@ fn revert_to_cascade_step_body(conversation_id: &str, plan_model: &str) -> Strin
     .to_string()
 }
 
+/// Longest accepted response status, header or chunk-size line.
+const MAX_AGY_HEADER_LINE_BYTES: u64 = 8 * 1024;
+/// Longest accepted response header section, status line included.
+const MAX_AGY_HEADER_SECTION_BYTES: usize = 64 * 1024;
+
+/// A [`TcpStream`] reader that fails with `TimedOut` once `deadline` has passed and never
+/// waits on one read for longer than the time left. `timeout` caps a single read.
+struct DeadlineReader {
+    inner: TcpStream,
+    deadline: Instant,
+    timeout: Duration,
+    expired: std::cell::Cell<bool>,
+}
+
+impl Read for DeadlineReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            self.expired.set(true);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "antigravity response deadline exceeded",
+            ));
+        }
+        self.inner.set_read_timeout(Some(self.timeout.min(left)))?;
+        let result = self.inner.read(buf);
+        if result.is_err() && Instant::now() >= self.deadline {
+            self.expired.set(true);
+        }
+        result
+    }
+}
+
+/// Read one line of at most [`MAX_AGY_HEADER_LINE_BYTES`] into `line`. A longer line is an error.
+fn read_bounded_agy_line<R: BufRead>(reader: &mut R, line: &mut String) -> std::io::Result<usize> {
+    let read = (&mut *reader)
+        .take(MAX_AGY_HEADER_LINE_BYTES)
+        .read_line(line)?;
+    if read as u64 >= MAX_AGY_HEADER_LINE_BYTES && !line.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "antigravity response line is too long",
+        ));
+    }
+    Ok(read)
+}
+
 fn read_agy_chunked_body<R: BufRead>(reader: &mut R, max_bytes: usize) -> Vec<u8> {
     let mut out = Vec::new();
     loop {
         let mut size_line = String::new();
-        match reader.read_line(&mut size_line) {
+        match read_bounded_agy_line(reader, &mut size_line) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
@@ -546,8 +593,14 @@ fn post_agy_connect_rpc(
     post_agy_connect_rpc_limited(port, csrf, procedure, body, timeout, MAX_AGY_RPC_BODY_BYTES)
 }
 
+/// How many times `timeout` the whole call may take. `timeout` itself bounds one connect,
+/// read or write, so a peer that sends a byte per read would otherwise hold the caller.
+const AGY_RPC_DEADLINE_FACTOR: u32 = 4;
+
 /// POST a JSON body to the Antigravity language server on `127.0.0.1:port` and return
-/// `(status code, status line, body)`. `timeout` bounds the connect and each read or write.
+/// `(status code, status line, body)`. `timeout` bounds the connect and each read or write,
+/// and the whole call must finish within [`AGY_RPC_DEADLINE_FACTOR`] times `timeout`. A
+/// status or header line over 8 KiB, or a header section over 64 KiB, is an error.
 /// The response body is cut off at `max_body_bytes`.
 pub fn post_agy_connect_rpc_limited(
     port: u16,
@@ -557,6 +610,28 @@ pub fn post_agy_connect_rpc_limited(
     timeout: Duration,
     max_body_bytes: usize,
 ) -> Result<(u16, String, String), String> {
+    post_agy_connect_rpc_with_deadline(
+        port,
+        csrf,
+        procedure,
+        body,
+        timeout,
+        max_body_bytes,
+        timeout.saturating_mul(AGY_RPC_DEADLINE_FACTOR),
+    )
+}
+
+/// [`post_agy_connect_rpc_limited`] with an explicit overall time limit `overall`.
+fn post_agy_connect_rpc_with_deadline(
+    port: u16,
+    csrf: &str,
+    procedure: &str,
+    body: &str,
+    timeout: Duration,
+    max_body_bytes: usize,
+    overall: Duration,
+) -> Result<(u16, String, String), String> {
+    let deadline = Instant::now() + overall;
     let host = format!("127.0.0.1:{port}");
     let request = format!(
         "POST {procedure} HTTP/1.1\r\n\
@@ -581,18 +656,29 @@ pub fn post_agy_connect_rpc_limited(
     stream
         .write_all(request.as_bytes())
         .map_err(|err| format!("antigravity revert write to {host} failed: {err}"))?;
-    let mut reader = std::io::BufReader::new(stream);
+    let mut reader = std::io::BufReader::new(DeadlineReader {
+        inner: stream,
+        deadline,
+        timeout,
+        expired: std::cell::Cell::new(false),
+    });
     let mut status = String::new();
-    reader
-        .read_line(&mut status)
+    read_bounded_agy_line(&mut reader, &mut status)
         .map_err(|err| format!("antigravity revert read from {host} failed: {err}"))?;
+    let mut header_bytes = status.len();
     let mut content_length: Option<usize> = None;
     let mut is_chunked = false;
     loop {
         let mut line = String::new();
-        match reader.read_line(&mut line) {
+        match read_bounded_agy_line(&mut reader, &mut line) {
             Ok(0) => break,
-            Ok(_) => {
+            Ok(read) => {
+                header_bytes += read;
+                if header_bytes > MAX_AGY_HEADER_SECTION_BYTES {
+                    return Err(format!(
+                        "antigravity revert response headers from {host} are too long"
+                    ));
+                }
                 if line == "\r\n" || line == "\n" {
                     break;
                 }
@@ -608,6 +694,12 @@ pub fn post_agy_connect_rpc_limited(
                     }
                 }
             }
+            Err(err) if reader.get_ref().expired.get() => {
+                return Err(format!("antigravity revert read from {host} failed: {err}"));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+                return Err(format!("antigravity revert read from {host} failed: {err}"));
+            }
             Err(_) => break,
         }
     }
@@ -617,10 +709,15 @@ pub fn post_agy_connect_rpc_limited(
         let max_body = content_length.unwrap_or(max_body_bytes).min(max_body_bytes);
         let mut buf = Vec::new();
         if max_body > 0 {
-            let _ = reader.take(max_body as u64).read_to_end(&mut buf);
+            let _ = (&mut reader).take(max_body as u64).read_to_end(&mut buf);
         }
         buf
     };
+    if reader.get_ref().expired.get() {
+        return Err(format!(
+            "antigravity revert read from {host} exceeded its {overall:?} deadline"
+        ));
+    }
     let resp_body = String::from_utf8_lossy(&resp_bytes).into_owned();
     let code = status
         .split_whitespace()
@@ -2636,5 +2733,159 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Serve one loopback connection with `serve`, which gets the accepted stream after the
+    /// request has been read. Returns the port and the thread, which ends once `serve` returns.
+    fn spawn_raw_agy_stub(
+        serve: impl FnOnce(TcpStream) + Send + 'static,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            serve(stream);
+        });
+        (port, handle)
+    }
+
+    #[test]
+    fn agy_rpc_returns_a_normal_response_within_its_deadline() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            );
+        });
+        let (code, status, body) = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(1),
+            1024,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            (code, status.as_str(), body.as_str()),
+            (200, "HTTP/1.1 200 OK", "hello")
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn agy_rpc_gives_up_on_a_body_that_trickles_past_the_overall_deadline() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n",
+            );
+            // One byte per 20 ms never trips the per-read timeout.
+            while stream.write_all(b"x").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let err = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(2),
+            8 * 1024 * 1024,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.contains("deadline"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn agy_rpc_gives_up_on_a_header_line_that_trickles_past_the_overall_deadline() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nX-Slow: ");
+            while stream.write_all(b"a").is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let err = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(2),
+            1024,
+            Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(err.contains("failed"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn agy_rpc_refuses_an_endless_header_line() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nX-Endless: ");
+            let chunk = [b'a'; 4096];
+            while stream.write_all(&chunk).is_ok() {}
+        });
+        let started = Instant::now();
+        let err = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(5),
+            1024,
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(err.contains("too long"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn agy_rpc_refuses_an_oversized_header_section() {
+        let (port, handle) = spawn_raw_agy_stub(|mut stream| {
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\n");
+            // Each line is well under the line limit; together they pass the section limit.
+            let line = format!("X-Pad: {}\r\n", "a".repeat(1000));
+            while stream.write_all(line.as_bytes()).is_ok() {}
+        });
+        let err = post_agy_connect_rpc_with_deadline(
+            port,
+            "csrf",
+            "/p",
+            "{}",
+            Duration::from_secs(5),
+            1024,
+            Duration::from_secs(10),
+        )
+        .unwrap_err();
+        assert!(err.contains("headers"), "{err}");
+        assert!(err.contains("too long"), "{err}");
+        handle.join().unwrap();
     }
 }
