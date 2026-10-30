@@ -242,6 +242,45 @@ export interface ClearSessionResponse {
   prompt?: string | null;
 }
 
+export interface SpinUpSessionRequest {
+  persona: string;
+  project: string;
+  role: string;
+  vendor: string;
+  model?: string;
+  node_id?: string;
+  hosted?: boolean;
+  cwd?: string;
+}
+
+export interface SpinUpSessionResponse {
+  session_id: string;
+  persona: string;
+  project: string;
+  role: string;
+  vendor: string;
+  model?: string | null;
+  node_id: string;
+  hosted: boolean;
+  status: string;
+  tmux_target?: string | null;
+  hydration_dispatched: boolean;
+  prompt?: string | null;
+}
+
+export type DecommissionMode = "prepare" | "teardown";
+
+export interface DecommissionSessionResponse {
+  session_id: string;
+  persona?: string | null;
+  mode: DecommissionMode;
+  status: string;
+  handshake_dispatched: boolean;
+  unregistered: boolean;
+  runtime_stopped: boolean;
+  prompt?: string | null;
+}
+
 export interface PromptRequest {
   prompt: string;
   by?: string;

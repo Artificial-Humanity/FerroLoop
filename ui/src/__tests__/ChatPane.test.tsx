@@ -985,3 +985,139 @@ describe("ChatPane Clear | Reforge modal and ephemeral ? help", () => {
     expect(await screen.findByTestId("compact-feedback")).toHaveTextContent("Reforged session");
   });
 });
+
+describe("ChatPane Decommission modal and 6-second ephemeral ? help", () => {
+  it("opens the Cancel | Tear Down | Prepare & Decommission modal and auto-hides the ? help popover after 6 seconds", () => {
+    vi.useFakeTimers();
+    try {
+      render(
+        <ChatPane
+          agentName="kacey"
+          agentDisplayName="Kacey"
+          adapter="claude"
+          sessionId="sess-kacey-01"
+          turns={[]}
+          onSendPrompt={vi.fn()}
+        />,
+      );
+
+      const decommissionBtn = screen.getByTestId("decommission-session-btn");
+      expect(decommissionBtn).not.toBeDisabled();
+      fireEvent.click(decommissionBtn);
+
+      const modal = screen.getByTestId("decommission-modal");
+      expect(modal).toHaveAttribute("role", "dialog");
+      expect(modal).toHaveAttribute("aria-modal", "true");
+      expect(screen.getByTestId("decommission-cancel-btn")).toHaveTextContent("Cancel");
+      expect(screen.getByTestId("decommission-teardown-btn")).toHaveTextContent("Tear Down");
+      expect(screen.getByTestId("decommission-prepare-btn")).toHaveTextContent(
+        "Prepare & Decommission",
+      );
+
+      expect(screen.queryByTestId("decommission-help-popover")).toBeNull();
+      fireEvent.click(screen.getByTestId("decommission-help-btn"));
+
+      const popover = screen.getByTestId("decommission-help-popover");
+      expect(popover).toHaveTextContent(/Prepare & Decommission:/);
+      expect(popover).toHaveTextContent(/STATE\.md\/FerroState/);
+      expect(popover).toHaveTextContent(/Tear Down:/);
+      expect(popover).toHaveTextContent(/unregisters the persona/i);
+
+      act(() => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(screen.getByTestId("decommission-help-popover")).toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(1_000);
+      });
+      expect(screen.queryByTestId("decommission-help-popover")).toBeNull();
+
+      fireEvent.click(screen.getByTestId("decommission-cancel-btn"));
+      expect(screen.queryByTestId("decommission-modal")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("calls onDecommissionSession and POST /api/v1/sessions/:id/decommission with 'prepare' and 'teardown'", async () => {
+    const onDecommissionSession = vi.fn(async () => undefined);
+    const { unmount } = render(
+      <ChatPane
+        agentName="kacey"
+        agentDisplayName="Kacey"
+        adapter="claude"
+        sessionId="sess-kacey-01"
+        turns={[]}
+        onDecommissionSession={onDecommissionSession}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("decommission-prepare-btn"));
+
+    await waitFor(() => {
+      expect(onDecommissionSession).toHaveBeenCalledWith("prepare");
+    });
+    expect(screen.queryByTestId("decommission-modal")).toBeNull();
+    expect(await screen.findByTestId("compact-feedback")).toHaveTextContent(
+      "Prepared decommission",
+    );
+
+    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("decommission-teardown-btn"));
+
+    await waitFor(() => {
+      expect(onDecommissionSession).toHaveBeenCalledWith("teardown");
+    });
+    expect(await screen.findByTestId("compact-feedback")).toHaveTextContent(
+      "Tore down session",
+    );
+    unmount();
+
+    const decommCalls: Array<{ url: string; body: unknown }> = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url === "/api/v1/sessions/sess-kacey-01/decommission" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        decommCalls.push({ url, body });
+        return new Response(
+          JSON.stringify({
+            session_id: "sess-kacey-01",
+            persona: "kacey",
+            mode: body.mode,
+            status: body.mode === "prepare" ? "decommissioning" : "decommissioned",
+            handshake_dispatched: body.mode === "prepare",
+            unregistered: body.mode === "teardown",
+            runtime_stopped: body.mode === "teardown",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+
+    render(
+      <ChatPane
+        agentName="kacey"
+        agentDisplayName="Kacey"
+        adapter="claude"
+        sessionId="sess-kacey-01"
+        turns={[]}
+        apiClient={apiClient}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId("decommission-session-btn"));
+    fireEvent.click(screen.getByTestId("decommission-prepare-btn"));
+
+    await waitFor(() => {
+      expect(decommCalls).toEqual([
+        { url: "/api/v1/sessions/sess-kacey-01/decommission", body: { mode: "prepare" } },
+      ]);
+    });
+  });
+});

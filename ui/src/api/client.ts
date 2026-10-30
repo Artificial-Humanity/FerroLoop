@@ -6,6 +6,8 @@ import type {
   AuthSessionResponse,
   ClearSessionMode,
   ClearSessionResponse,
+  DecommissionMode,
+  DecommissionSessionResponse,
   DiscoveredSessionSummary,
   HealthResponse,
   HubStatsResponse,
@@ -21,6 +23,8 @@ import type {
   QueuedOperatorPrompt,
   SessionQueueResponse,
   SessionTranscriptResponse,
+  SpinUpSessionRequest,
+  SpinUpSessionResponse,
   CodeSearchKind,
   CodeSearchResponse,
   ImportWorkspaceStateResponse,
@@ -239,6 +243,28 @@ export class HubApiClient {
   ): Promise<ClearSessionResponse> {
     return this.request<ClearSessionResponse>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/clear`,
+      {
+        method: "POST",
+        body: JSON.stringify({ mode }),
+      },
+    );
+  }
+
+  public async spinUpSession(
+    req: SpinUpSessionRequest,
+  ): Promise<SpinUpSessionResponse> {
+    return this.request<SpinUpSessionResponse>("/api/v1/sessions/spin-up", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  public async decommissionSession(
+    sessionId: string,
+    mode: DecommissionMode,
+  ): Promise<DecommissionSessionResponse> {
+    return this.request<DecommissionSessionResponse>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/decommission`,
       {
         method: "POST",
         body: JSON.stringify({ mode }),
@@ -676,4 +702,19 @@ export async function revokeNode(
   client?: HubApiClient,
 ): Promise<void> {
   return (client ?? new HubApiClient()).revokeNode(nodeId);
+}
+
+export async function spinUpSession(
+  req: SpinUpSessionRequest,
+  client?: HubApiClient,
+): Promise<SpinUpSessionResponse> {
+  return (client ?? new HubApiClient()).spinUpSession(req);
+}
+
+export async function decommissionSession(
+  sessionId: string,
+  mode: DecommissionMode,
+  client?: HubApiClient,
+): Promise<DecommissionSessionResponse> {
+  return (client ?? new HubApiClient()).decommissionSession(sessionId, mode);
 }
