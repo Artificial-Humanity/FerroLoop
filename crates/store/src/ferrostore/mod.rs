@@ -19,7 +19,10 @@ use layout::{
     encode_frame, encode_snapshot, encode_superblock, parse_superblock,
 };
 use serde_json::Value;
-use state::{DocState, apply_commit, apply_frames, commit_ops, next_mq_seq, unread_mq};
+use state::{
+    DocState, MQ_HIGH_WATER_ID, apply_commit, apply_frames, commit_ops, mq_hw_collection,
+    mq_message_collection, next_mq_seq, unread_mq,
+};
 
 pub use migrate::migrate_redb_to_ferrostore;
 pub use state::MqRecord;
@@ -246,31 +249,36 @@ impl FerroStore {
         Ok(state::search_bm25(&state, collection, query, limit))
     }
 
-    /// Append one message. The returned sequence starts at 1 per topic.
+    /// Append one message. The returned sequence starts at 1 per topic and is
+    /// not reused after that message document is deleted.
     pub fn publish_mq(&self, topic: &str, key: &str, payload: &Value) -> Result<u64, StoreError> {
         let topic_owned = topic.to_string();
         let key_owned = key.to_string();
         let payload = payload.clone();
-        let record = self.commit(move |state| {
-            let seq = next_mq_seq(state, &topic_owned)?;
+        // One `with_write`: the message and the high-water share a WAL frame.
+        // A crash must not persist either document alone.
+        let record = self.with_write(move |txn| {
+            let seq = next_mq_seq(&txn.docs, &topic_owned)?;
             let record = MqRecord {
                 seq,
                 key: key_owned.clone(),
                 payload: payload.clone(),
             };
-            let doc = serde_json::json!({
-                "seq": seq,
-                "key": key_owned,
-                "payload": payload,
-            });
-            Ok((
-                Op::Put {
-                    collection: format!("mq:{topic_owned}"),
-                    id: seq.to_string(),
-                    doc,
-                },
-                record,
-            ))
+            txn.put(
+                mq_message_collection(&topic_owned),
+                seq.to_string(),
+                serde_json::json!({
+                    "seq": seq,
+                    "key": key_owned,
+                    "payload": payload,
+                }),
+            );
+            txn.put(
+                mq_hw_collection(&topic_owned),
+                MQ_HIGH_WATER_ID,
+                serde_json::json!({ "seq": seq }),
+            );
+            Ok(record)
         })?;
         self.notify(topic, &record);
         Ok(record.seq)

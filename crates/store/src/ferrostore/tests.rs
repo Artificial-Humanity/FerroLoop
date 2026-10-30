@@ -600,6 +600,100 @@ fn ferromq_redelivers_until_ack_and_subscribers_see_the_next_publish() {
     assert_eq!(store.publish_mq("orders", "k4", &json!(4)).unwrap(), 4);
 }
 
+fn committed_frames(path: &Path) -> Vec<(u64, Vec<Op>)> {
+    let file = File::open(path).unwrap();
+    let sb = live(path);
+    let mut buf = vec![0u8; usize::try_from(sb.wal_length).unwrap()];
+    if !buf.is_empty() {
+        file.read_exact_at(&mut buf, sb.wal_offset).unwrap();
+    }
+    layout::decode_wal(&buf).unwrap()
+}
+
+#[test]
+fn ferromq_sequence_survives_acked_delete_checkpoint_and_reopen() {
+    let (_dir, path) = temp_fls();
+    {
+        let store = FerroStore::open(&path).unwrap();
+        assert_eq!(
+            store.publish_mq("orders", "k", &json!({ "a": 1 })).unwrap(),
+            1
+        );
+        let frames = committed_frames(&path);
+        assert_eq!(frames.len(), 1, "message and high-water share one frame");
+        let (seq, ops) = &frames[0];
+        assert_eq!(*seq, 1);
+        assert_eq!(ops.len(), 2);
+        match &ops[..] {
+            [
+                Op::Put {
+                    collection: message_collection,
+                    id: message_id,
+                    doc: message,
+                },
+                Op::Put {
+                    collection: hw_collection,
+                    id: hw_id,
+                    doc: hw,
+                },
+            ] => {
+                assert_eq!(message_collection, "mq:orders");
+                assert_eq!(message_id, "1");
+                assert_eq!(message["seq"], 1);
+                assert_eq!(hw_collection, "mq_hw:orders");
+                assert_eq!(hw_id, "high_water");
+                assert_eq!(hw["seq"], 1);
+            }
+            other => panic!("expected message and high-water puts, got {other:?}"),
+        }
+
+        store.ack_mq("orders", "g", 1).unwrap();
+        store.delete_doc("mq:orders", "1").unwrap();
+        assert!(store.get_doc("mq:orders", "1").unwrap().is_none());
+        assert_eq!(
+            store
+                .get_doc("mq_hw:orders", "high_water")
+                .unwrap()
+                .unwrap()["seq"],
+            1
+        );
+        store.checkpoint().unwrap();
+    }
+
+    let store = FerroStore::open(&path).unwrap();
+    assert!(store.get_doc("mq:orders", "1").unwrap().is_none());
+    assert_eq!(
+        store
+            .get_doc("mq_hw:orders", "high_water")
+            .unwrap()
+            .unwrap()["seq"],
+        1
+    );
+    let seq = store.publish_mq("orders", "k2", &json!(2)).unwrap();
+    assert_eq!(seq, 2);
+    let pending = store.poll_mq_group("orders", "g", 10).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].seq, 2);
+    assert_eq!(pending[0].key, "k2");
+    assert_eq!(pending[0].payload, json!(2));
+
+    // A file that already has messages and no high-water document.
+    store
+        .put_doc(
+            "mq:legacy",
+            "4",
+            &json!({ "seq": 4, "key": "old", "payload": true }),
+        )
+        .unwrap();
+    assert_eq!(store.publish_mq("legacy", "n", &json!(1)).unwrap(), 5);
+    store.delete_doc("mq:legacy", "4").unwrap();
+    store.delete_doc("mq:legacy", "5").unwrap();
+    assert_eq!(store.publish_mq("legacy", "n2", &json!(2)).unwrap(), 6);
+    let legacy = store.poll_mq_group("legacy", "g", 10).unwrap();
+    assert_eq!(legacy.len(), 1);
+    assert_eq!(legacy[0].seq, 6);
+}
+
 #[test]
 fn connect_uri_mem_and_file_and_refuses_other_schemes() {
     let mem = FerroStore::connect_uri("mem://").unwrap();

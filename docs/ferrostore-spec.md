@@ -184,7 +184,7 @@ subscribe_mq(topic) -> Receiver<MqRecord>
 
 `MqRecord` is `{ seq, key, payload }`.
 
-Durable messages are documents in collection `mq:{topic}`. The id is the decimal sequence with no padding. The JSON object is `{"seq": N, "key": "...", "payload": ...}`. The sequence starts at 1 for each topic and increases by 1 for each publish on that topic. A publish is one put transaction. Acks do not advance the topic sequence.
+Durable messages are documents in collection `mq:{topic}`. The id is the decimal sequence with no padding. The JSON object is `{"seq": N, "key": "...", "payload": ...}`. The sequence starts at 1 for each topic and increases by 1 for each publish on that topic. It is not reused after the message document is deleted. Each topic has a high-water document in collection `mq_hw:{topic}`, id `high_water`, JSON `{"seq": N}`. A publish is one transaction that puts the message and sets that high-water to the new sequence. The assigned sequence is one past the high-water. If the high-water document is absent, the next sequence is one past the highest message `seq` still stored for the topic, and the high-water is set to that new sequence. Deleting `mq:{topic}/{id}` does not delete or lower the high-water. Acks do not advance the topic sequence.
 
 Acks are documents in collection `mq_ack:{topic}:{group}`, id the decimal sequence, JSON `{"seq": N}`. `ack_mq` is durable. Acking an unknown sequence still records the ack and is idempotent.
 

@@ -258,10 +258,54 @@ pub(super) fn tokenize(text: &str) -> Vec<String> {
     out
 }
 
-pub(super) fn next_mq_seq(state: &DocState, topic: &str) -> Result<u64, StoreError> {
-    let collection = format!("mq:{topic}");
+/// Document id of the per-topic FerroMQ high-water in `mq_hw:{topic}`.
+///
+/// Checkpoint keeps every live document and drops puts whose rows were
+/// deleted. The high-water is a separate document so deleting `mq:{topic}/{id}`
+/// cannot reuse a sequence.
+pub(super) const MQ_HIGH_WATER_ID: &str = "high_water";
+
+pub(super) fn mq_message_collection(topic: &str) -> String {
+    format!("mq:{topic}")
+}
+
+pub(super) fn mq_hw_collection(topic: &str) -> String {
+    format!("mq_hw:{topic}")
+}
+
+pub(super) fn next_mq_seq(
+    docs: &BTreeMap<(String, String), Value>,
+    topic: &str,
+) -> Result<u64, StoreError> {
+    // Absent on files written before the high-water existed: one past the
+    // highest message still stored. A present high-water is not lowered by
+    // deletes, so it wins over the remaining messages.
+    let floor = match mq_high_water(docs, topic)? {
+        Some(seq) => seq,
+        None => max_stored_mq_seq(docs, topic),
+    };
+    floor
+        .checked_add(1)
+        .ok_or_else(|| backend("mq sequence overflow"))
+}
+
+fn mq_high_water(
+    docs: &BTreeMap<(String, String), Value>,
+    topic: &str,
+) -> Result<Option<u64>, StoreError> {
+    let Some(doc) = docs.get(&(mq_hw_collection(topic), MQ_HIGH_WATER_ID.to_string())) else {
+        return Ok(None);
+    };
+    let Some(seq) = doc.get("seq").and_then(Value::as_u64) else {
+        return Err(corrupt(format!("mq high-water for {topic} has no seq")));
+    };
+    Ok(Some(seq))
+}
+
+fn max_stored_mq_seq(docs: &BTreeMap<(String, String), Value>, topic: &str) -> u64 {
+    let collection = mq_message_collection(topic);
     let mut max = 0u64;
-    for ((coll, id), doc) in &state.docs {
+    for ((coll, id), doc) in docs {
         if coll != &collection {
             continue;
         }
@@ -273,8 +317,7 @@ pub(super) fn next_mq_seq(state: &DocState, topic: &str) -> Result<u64, StoreErr
             max = max.max(seq);
         }
     }
-    max.checked_add(1)
-        .ok_or_else(|| backend("mq sequence overflow"))
+    max
 }
 
 pub(super) fn unread_mq(
@@ -294,7 +337,7 @@ pub(super) fn unread_mq(
 }
 
 fn load_mq(state: &DocState, topic: &str) -> Result<Vec<MqRecord>, StoreError> {
-    let collection = format!("mq:{topic}");
+    let collection = mq_message_collection(topic);
     let mut records = Vec::new();
     for ((coll, id), doc) in &state.docs {
         if coll != &collection {
