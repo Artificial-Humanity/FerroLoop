@@ -442,6 +442,30 @@ body,
 }
 
 /* Mobile Responsive */
+.fd-sidebar-backdrop {
+  display: none;
+}
+
+.fd-tab-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  flex-wrap: nowrap;
+  max-width: 100%;
+  scrollbar-width: none;
+}
+
+.fd-tab-bar::-webkit-scrollbar {
+  display: none;
+}
+
+.fd-tab-bar > .fd-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
 .fd-mobile-nav {
   display: none;
   background-color: var(--bg-surface);
@@ -451,21 +475,90 @@ body,
 }
 
 @media (max-width: 768px) {
+  .fd-sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background-color: rgba(5, 7, 11, 0.68);
+    z-index: 25;
+  }
+
   .fd-sidebar {
     position: fixed;
     top: 0;
     bottom: 0;
     left: 0;
+    min-width: 0;
+    max-width: calc(100vw - 48px);
     transform: translateX(-100%);
     transition: transform 0.2s ease;
     box-shadow: 8px 0 24px rgba(0, 0, 0, 0.5);
+    z-index: 30;
   }
 
-  .fd-sidebar.is-open {
+  .fd-sidebar.is-open,
+  .fd-sidebar[data-mobile-open="true"] {
     transform: translateX(0);
+  }
+
+  .fd-header {
+    padding: 8px 10px;
+    gap: 8px;
+  }
+
+  .fd-workspace.is-split {
+    flex-direction: column;
+  }
+
+  .fd-workspace.is-split > .fd-pane {
+    border-right: none;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  .fd-modal-backdrop {
+    padding: 12px;
+  }
+
+  .fd-modal {
+    max-width: calc(100vw - 24px) !important;
+    max-height: calc(100dvh - 32px) !important;
+    overflow-y: auto;
+    padding: 16px;
+  }
+
+  .fd-input,
+  .fd-select,
+  .fd-textarea {
+    font-size: 16px !important;
+  }
+
+  .fd-chat-toolbar {
+    padding: 8px 10px !important;
+    gap: 6px !important;
+  }
+
+  .chat-header-meta {
+    width: 100%;
+    min-width: 0;
+    gap: 6px !important;
+  }
+
+  .fd-transcript-filter-input {
+    max-width: 100% !important;
+    flex: 1 1 100%;
   }
 
   .fd-mobile-nav {
     display: flex;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap;
+    justify-content: flex-start;
+    gap: 6px;
+  }
+
+  .fd-mobile-nav > .fd-btn {
+    flex-shrink: 0;
+    white-space: nowrap;
   }
 }
