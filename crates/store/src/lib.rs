@@ -20,7 +20,9 @@ pub mod state;
 pub mod workflow;
 
 pub use ferrostore::{
-    FerroStore, FerroStoreServer, default_socket_path_for_store, migrate_redb_to_ferrostore,
+    AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
+    FerroStore, FerroStoreServer, GateRunRollup, ZoneMap, default_socket_path_for_store,
+    migrate_redb_to_ferrostore,
 };
 
 use crate::manifest::{LedgerRoot, Manifest, ManifestError};

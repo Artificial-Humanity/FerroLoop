@@ -1,6 +1,7 @@
 //! Document store and FerroMQ log in a `.fls` file, and a socket server.
 //! See `docs/ferrostore-spec.md`.
 
+mod columnar;
 mod doc;
 mod layout;
 mod migrate;
@@ -16,16 +17,21 @@ mod ws;
 mod tests;
 
 use fl_core::StoreError;
+use fl_core::ids::{GateId, ProjectId};
 use layout::{
     HEADER_BYTES, Op, SLOT_LEN, Superblock, backend, corrupt, decode_snapshot, decode_wal,
-    encode_frame, encode_snapshot, encode_superblock, parse_superblock,
+    encode_frame, encode_snapshot, encode_snapshot_v2, encode_superblock, parse_superblock,
 };
 use serde_json::{Value, json};
 use state::{
     DocState, MQ_HIGH_WATER_ID, apply_commit, apply_frames, commit_ops, mq_hw_collection,
-    mq_message_collection, next_mq_seq, unread_mq,
+    mq_message_collection, next_mq_seq, stage_ops, unread_mq,
 };
 
+pub use columnar::{
+    AttemptRollup, ColumnDef, ColumnFilter, ColumnPredicate, ColumnScan, ColumnType, ColumnValue,
+    GateRunRollup, ZoneMap,
+};
 pub use migrate::migrate_redb_to_ferrostore;
 pub use server::FerroStoreServer;
 pub use state::MqRecord;
@@ -90,6 +96,7 @@ struct Disk {
 /// `get` / `put` / `delete` / `scan` all see earlier writes in this transaction.
 struct Txn {
     docs: BTreeMap<(String, String), Value>,
+    tables: BTreeMap<String, columnar::ColumnTable>,
     ops: Vec<Op>,
 }
 
@@ -321,6 +328,132 @@ impl FerroStore {
         Ok(state::search_bm25(&state, collection, query, limit))
     }
 
+    /// Create a column table. An existing name is an error and writes nothing.
+    pub fn create_column_table(&self, name: &str, columns: &[ColumnDef]) -> Result<(), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            let defs = columns
+                .iter()
+                .map(columnar::column_def_json)
+                .collect::<Vec<_>>();
+            return remote.call_unit(
+                "create_column_table",
+                json!({"name": name, "columns": defs}),
+            );
+        }
+        let name = name.to_string();
+        let columns = columns.to_vec();
+        self.with_write(move |txn| {
+            columnar::check_new_table(&txn.tables, &name, &columns)?;
+            txn.tables.insert(
+                name.clone(),
+                columnar::ColumnTable {
+                    columns: columns.clone(),
+                    groups: Vec::new(),
+                },
+            );
+            txn.ops.push(Op::CreateColumnTable {
+                name: name.clone(),
+                columns: columns.clone(),
+            });
+            Ok(())
+        })
+    }
+
+    /// Append one row group. An empty `rows` writes nothing. A bad row writes nothing.
+    pub fn append_column_rows(
+        &self,
+        name: &str,
+        rows: &[Vec<ColumnValue>],
+    ) -> Result<(), StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            let mut encoded = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut cells = Vec::with_capacity(row.len());
+                for cell in row {
+                    cells.push(columnar::cell_json(cell)?);
+                }
+                encoded.push(Value::Array(cells));
+            }
+            return remote.call_unit("append_column_rows", json!({"name": name, "rows": encoded}));
+        }
+        let name = name.to_string();
+        let rows = rows.to_vec();
+        self.with_write(move |txn| {
+            let Some(table) = txn.tables.get(&name) else {
+                return Err(backend(format!("no column table `{name}`")));
+            };
+            if rows.is_empty() {
+                return Ok(());
+            }
+            let bytes = columnar::encode_row_group(&table.columns, &rows)?;
+            let Some(table) = txn.tables.get_mut(&name) else {
+                return Err(backend(format!("no column table `{name}`")));
+            };
+            table.groups.push(bytes.clone());
+            txn.ops.push(Op::AppendColumnGroup {
+                name: name.clone(),
+                bytes,
+            });
+            Ok(())
+        })
+    }
+
+    /// Scan `name`. A row group whose zone map excludes any filter is skipped
+    /// before its values are decoded. Filters are AND.
+    pub fn scan_column_table(
+        &self,
+        name: &str,
+        filters: &[ColumnFilter],
+    ) -> Result<ColumnScan, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            let mut encoded = Vec::with_capacity(filters.len());
+            for filter in filters {
+                encoded.push(columnar::filter_json(filter)?);
+            }
+            let value = remote.call(
+                "scan_column_table",
+                json!({"name": name, "filters": encoded}),
+            )?;
+            return columnar::parse_scan(&value);
+        }
+        let name = name.to_string();
+        let filters = filters.to_vec();
+        self.with_read(move |txn| {
+            let Some(table) = txn.tables.get(&name) else {
+                return Err(backend(format!("no column table `{name}`")));
+            };
+            columnar::scan_groups(&table.columns, &table.groups, &filters)
+        })
+    }
+
+    /// Sum attempt ledger rows through an in-memory columnar scan. `None` is every attempt.
+    pub fn attempt_rollup(&self, project: Option<&ProjectId>) -> Result<AttemptRollup, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            let project = match project {
+                Some(id) => Value::String(id.as_str().to_string()),
+                None => Value::Null,
+            };
+            let value = remote.call("attempt_rollup", json!({"project": project}))?;
+            return columnar::parse_attempt_rollup(&value);
+        }
+        let project = project.cloned();
+        self.with_read(move |txn| columnar::attempt_rollup(txn, project.as_ref()))
+    }
+
+    /// Sum gate-run ledger rows through an in-memory columnar scan. `None` is every run.
+    pub fn gate_run_rollup(&self, gate: Option<&GateId>) -> Result<GateRunRollup, StoreError> {
+        if let Inner::Remote(remote) = &self.inner {
+            let gate = match gate {
+                Some(id) => Value::String(id.as_str().to_string()),
+                None => Value::Null,
+            };
+            let value = remote.call("gate_run_rollup", json!({"gate": gate}))?;
+            return columnar::parse_gate_rollup(&value);
+        }
+        let gate = gate.cloned();
+        self.with_read(move |txn| columnar::gate_run_rollup(txn, gate.as_ref()))
+    }
+
     /// Append one message. The returned sequence starts at 1 per topic and is
     /// not reused after that message document is deleted.
     pub fn publish_mq(&self, topic: &str, key: &str, payload: &Value) -> Result<u64, StoreError> {
@@ -421,6 +554,7 @@ impl FerroStore {
         let state = self.read_state()?;
         let txn = Txn {
             docs: state.docs,
+            tables: state.tables,
             ops: Vec::new(),
         };
         body(&txn)
@@ -438,8 +572,9 @@ impl FerroStore {
     ///
     /// `Ok(false)` means the sequence moved and nothing was written. An empty `ops`
     /// list that matches returns `Ok(true)` and does not advance `last_seq`. A
-    /// non-empty disk success is one WAL frame at `expected_seq + 1`. Remote
-    /// handles do not call this; the server's store is memory or disk.
+    /// non-empty disk success is one WAL frame at `expected_seq + 1`. Ops that do
+    /// not apply return `Err` and write nothing. Remote handles do not call this;
+    /// the server's store is memory or disk.
     fn commit_if_seq(&self, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
         match &self.inner {
             Inner::Memory(slot) => {
@@ -473,6 +608,7 @@ impl FerroStore {
                 let seq_base = state.last_seq;
                 let mut txn = Txn {
                     docs: state.docs,
+                    tables: state.tables,
                     ops: Vec::new(),
                 };
                 let result = body(&mut txn)?;
@@ -487,6 +623,7 @@ impl FerroStore {
                 let mut state = lock_mutex(slot);
                 let mut txn = Txn {
                     docs: state.docs.clone(),
+                    tables: state.tables.clone(),
                     ops: Vec::new(),
                 };
                 let result = body(&mut txn)?;
@@ -573,9 +710,7 @@ fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<bool
     if ops.is_empty() {
         return Ok(true);
     }
-    let seq = expected_seq
-        .checked_add(1)
-        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let seq = stage_ops(state, ops)?.last_seq;
     let frame = encode_frame(seq, ops)?;
     append_frame(&file, index, &sb, &frame)?;
     Ok(true)
@@ -588,18 +723,17 @@ fn with_write_disk<T>(
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
     let (index, sb, state) = read_consistent(&file)?;
-    let seq_base = state.last_seq;
+    let baseline = state.clone();
     let mut txn = Txn {
         docs: state.docs,
+        tables: state.tables,
         ops: Vec::new(),
     };
     let result = body(&mut txn)?;
     if txn.ops.is_empty() {
         return Ok(result);
     }
-    let seq = seq_base
-        .checked_add(1)
-        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let seq = stage_ops(baseline, &txn.ops)?.last_seq;
     let frame = encode_frame(seq, &txn.ops)?;
     append_frame(&file, index, &sb, &frame)?;
     Ok(result)
@@ -613,10 +747,7 @@ fn commit_disk<T>(
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
     let (index, sb, state) = read_consistent(&file)?;
     let (op, extra) = build(&state)?;
-    let seq = state
-        .last_seq
-        .checked_add(1)
-        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let seq = stage_ops(state, std::slice::from_ref(&op))?.last_seq;
     let frame = encode_frame(seq, std::slice::from_ref(&op))?;
     append_frame(&file, index, &sb, &frame)?;
     Ok(extra)
@@ -626,7 +757,11 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     let file = lock_mutex(&disk.write);
     let _locked = FlockGuard::acquire(file.as_raw_fd())?;
     let (index, sb, state) = read_consistent(&file)?;
-    let blob = encode_snapshot(state.last_seq, &state.docs)?;
+    let blob = if state.tables.is_empty() {
+        encode_snapshot(state.last_seq, &state.docs)?
+    } else {
+        encode_snapshot_v2(state.last_seq, &state.docs, &state.tables)?
+    };
     let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
     let offset = allocate_extent(&file, &sb, blob_len)?;
     file.write_all_at(&blob, offset).map_err(io_err)?;
@@ -749,6 +884,7 @@ fn read_consistent(file: &File) -> Result<(usize, Superblock, DocState), StoreEr
         }
         DocState {
             docs: snap.docs,
+            tables: snap.tables,
             last_seq: snap.seq,
         }
     };

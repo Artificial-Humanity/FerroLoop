@@ -1,6 +1,6 @@
 # FerroStore
 
-FerroStore keeps an object/document collection and a FerroMQ log in one `.fls` file, or entirely in memory. Phase 2 serves that store over a Unix socket or `ws://`. Columnar storage and vector search are later phases; this version does not implement them.
+FerroStore keeps an object/document collection, a FerroMQ log, and columnar tables in one `.fls` file, or entirely in memory. Phase 2 serves that store over a Unix socket or `ws://`. Vector search is Phase 4 and is not implemented.
 
 Integers on disk are little-endian. The CRC-32 is ISO-HDLC: polynomial `0xEDB88320`, init `0xFFFFFFFF`, xorout `0xFFFFFFFF` (the reflected zlib polynomial). A checksum covers the bytes named below and nothing else.
 
@@ -57,13 +57,15 @@ A snapshot is a copy-on-write blob. A live snapshot's bytes are never overwritte
 | Offset | Type | Contents |
 | --- | --- | --- |
 | `0..8` | bytes | Magic `FERRSNAP` |
-| `8..12` | `u32` | Version `1` |
+| `8..12` | `u32` | Version `1` when the store has no column tables, otherwise version `2` |
 | `12..20` | `u64` | `seq`, the last committed sequence in the blob |
-| `20..24` | `u32` | `count` |
-| `24..` | records | `count` documents |
+| `20..24` | `u32` | `count` of documents |
+| `24..` | records | `count` documents, then column tables when the version is `2` |
 | tail | `u32` | CRC-32 of every preceding snapshot byte |
 
-Each record is `u32` length + bytes for the collection, then the same for the id, then the same for the raw JSON document.
+Each document record is `u32` length + bytes for the collection, then the same for the id, then the same for the raw JSON document. Version `1` ends there: `decode` calls `finish()` with no trailer, and a document-only `encode_snapshot` is byte-identical to that layout. A version `1` snapshot still opens.
+
+Version `2` is written only when at least one column table exists. After the documents it stores `u32` table count, then tables in name order. Each table is a length-prefixed name, `u32` column count, each column as a length-prefixed name plus a `u8` type tag (`1` int64, `2` float64, `3` bool, `4` utf8, `5` bytes, `6` timestamp_ms), `u32` row-group count, and each row group as a length-prefixed blob (the same bytes the WAL stored).
 
 `checkpoint` writes a new blob at an offset at or past the end of the file, and past both the live snapshot and the live WAL, so it does not overlap either. It `fsync`s the blob, then publishes a superblock that points `snapshot_offset` / `snapshot_length` at the new blob, sets `snapshot_seq` to the last committed sequence, sets `wal_offset` to the end of the new blob, and sets `wal_length` to `0`. A crash after the blob is written and before that publish leaves readers on the previous superblock.
 
@@ -87,7 +89,7 @@ One payload is one transaction:
 | `op_count` | `u32` | Number of operations |
 | ops | | Repeated operations |
 
-Each operation starts with a `u8` tag: `1` put, `2` delete. Then `u32` collection length, collection UTF-8, `u32` id length, id UTF-8. A put also stores `u32` document length and the raw JSON bytes. A delete stops after the id.
+Each operation starts with a `u8` tag. The tag is read first. Tag `1` put and tag `2` delete then store `u32` collection length, collection UTF-8, `u32` id length, id UTF-8. A put also stores `u32` document length and the raw JSON bytes. A delete stops after the id. Tag `3` creates a column table: length-prefixed name, `u32` column count, then each column as a length-prefixed name and a `u8` type tag (the same tags as a snapshot). Tag `4` appends one row group: length-prefixed table name, then a length-prefixed blob. Any other tag is corruption (`unknown wal op tag`).
 
 `seq` increases by exactly 1 for each committed transaction in the file. Puts, deletes, FerroMQ publishes, and FerroMQ acks are each one transaction. The sequence is a property of the file, not of a topic.
 
@@ -131,7 +133,7 @@ Phase 1 implements two of the four native models.
 | --- | --- | --- |
 | Object / document | 1 | JSON documents addressed by collection and id. Top-level field index and Okapi BM25. |
 | FerroMQ | 1 | Durable per-topic log, consumer-group acks, in-process subscribers. |
-| Columnar | 3 | Not written. Row groups, RLE/delta encoding, and zone maps are a later phase. |
+| Columnar | 3 | Row groups, delta / RLE / dictionary encodings, and zone-map skips. See Phases. |
 | Vector | 4 | Not written. `f32` / `f16` / `i8` embeddings, HNSW, and hybrid BM25+vector search are a later phase. |
 
 ## Connection URI
@@ -180,7 +182,12 @@ Each call is one JSON object:
 | `ack_mq` | `topic`, `group`, `seq` | `null` |
 | `checkpoint` | none | `null` |
 | `subscribe_mq` | `topic` | `null`, then push frames |
-| `read_state` | none | `{"last_seq": <u64>, "docs": [{"collection", "id", "doc"}, ...]}`. Documents are in `(collection, id)` order. A stored JSON `null` is `"doc": null`. Missing documents are omitted |
+| `read_state` | none | `{"last_seq": <u64>, "docs": [{"collection", "id", "doc"}, ...], "tables": [...]}`. Documents are in `(collection, id)` order. A stored JSON `null` is `"doc": null`. Missing documents are omitted. `tables` is name order: `{name, columns: [{name, ty}], groups}`, and each group is an array of bytes `0..=255` |
+| `create_column_table` | `name`, `columns` (`[{name, ty}]`; `ty` is `int64`, `float64`, `bool`, `utf8`, `bytes`, or `timestamp_ms`) | `null` |
+| `append_column_rows` | `name`, `rows` (array of arrays of cells) | `null` |
+| `scan_column_table` | `name`, `filters` (`[{column, op, value}]`; `op` is `eq`, `lt`, `le`, `gt`, `ge`, or `between`. `between` uses `low` and `high` instead of `value`) | `{"rows", "row_groups_total", "row_groups_skipped"}` |
+| `attempt_rollup` | `project` (IRI string, or JSON `null` for every attempt) | `count`, `cost_usd_micros`, `tokens_in`, `tokens_out`, `duration_ms` |
+| `gate_run_rollup` | `gate` (IRI string, or JSON `null` for every run) | `pass`, `fail`, `error`, `duration_ms`, `cost_usd_micros` |
 | `commit_ops` | `expected_seq`, `ops` | `true` when the compare-and-swap commits. `false` when `last_seq` is not `expected_seq`, and nothing is written. A bad op is an error, not `false` |
 
 `subscribe_mq` does not replay history. A later publish on that topic is pushed on the same connection as a frame with no `id`:
@@ -189,7 +196,9 @@ Each call is one JSON object:
 {"method": "mq", "params": {"topic": "orders", "record": {"seq": 1, "key": "k", "payload": {}}}}
 ```
 
-`read_state` is an atomic snapshot of the document map. `commit_ops` is a compare-and-swap of `ops` against `expected_seq`. Each op is `{"op":"put","collection","id","doc"}` or `{"op":"delete","collection","id"}`. `false` means `last_seq` did not match, and the call writes nothing. A non-empty success is one WAL frame. A remote `with_write` retries until the compare-and-swap succeeds, so concurrent remote writers do not lose updates. The body may run more than once on a remote handle. `fl_core::store` traits on `unix://`, `ws://`, and a connected `FerroStore::auto` use this path.
+`read_state` is an atomic snapshot of the document map and the columnar tables. `commit_ops` is a compare-and-swap of `ops` against `expected_seq`. Each op is `{"op":"put","collection","id","doc"}`, `{"op":"delete","collection","id"}`, `{"op":"create_column_table","name","columns"}`, or `{"op":"append_column_group","name","bytes"}` where `bytes` is an array of integers `0..=255`. `false` means `last_seq` did not match, and the call writes nothing. A non-empty success is one WAL frame. A remote `with_write` retries until the compare-and-swap succeeds, so concurrent remote writers do not lose updates. The body may run more than once on a remote handle. A remote `with_write` that only puts documents still works, and a stored JSON `null` stays distinct from a missing document. `fl_core::store` traits on `unix://`, `ws://`, and a connected `FerroStore::auto` use this path.
+
+A columnar cell is `{"t":"null"}`, `{"t":"i64","v":1}`, `{"t":"f64","v":1.5}`, `{"t":"bool","v":true}`, `{"t":"utf8","v":"a"}`, `{"t":"bytes","v":[1,2]}` (numbers `0..=255`, not base64), or `{"t":"ts","v":1}`. A finite `f64`, including `-0.0`, is a JSON number and has no `bits` field. A non-finite `f64` is `{"t":"f64","v":"NaN","bits":<u64>}`, `{"t":"f64","v":"Infinity","bits":<u64>}`, or `{"t":"f64","v":"-Infinity","bits":<u64>}`, and `bits` is that value's `to_bits()`. A missing `bits` means canonical `NaN`, `Infinity`, or `-Infinity`. When `bits` is present it is an integer in `0..=u64::MAX` and `f64::from_bits` must be the same class as `v` (a `NaN` pattern with `v` of `Infinity` is an error). A finite number must not use a string `v`. `unix://` and `ws://` use the same JSON. On a remote handle the five columnar methods call these RPCs and do not also run a local transaction.
 
 ## Auto
 
@@ -246,6 +255,19 @@ Phase 1 (Record 14) is this engine: the `.fls` container, `mem://`, `file://`, t
 
 Phase 2 (Record 13) is served mode: Unix-socket and WebSocket RPC, and `FerroStore::auto`. `unix://` and `ws://` are served. `wss://` is recognized and refused.
 
-Phase 3 is the columnar model (row groups, RLE/delta, zone maps). It is not implemented.
+Phase 3 is the columnar model. One non-empty `append_column_rows` is one row group. An empty append writes nothing and is success. The codec is chosen when the group is written and stored in the row-group blob; a read does not pick a different one.
+
+- `Int64` and `TimestampMs` store the first non-null value absolutely and each later non-null value as a zigzag delta of the previous non-null. If any run of equal deltas has length at least 3, the chunk uses `delta_rle`. Otherwise it uses `delta`. Identical values are a run of zero deltas, so a long enough run uses `delta_rle`.
+- `Utf8` uses a dictionary when there are at least two non-null values and the distinct count is at most half the non-null count. If every non-null value is the same and there are at least three, it uses RLE instead. Otherwise it stores plain length-prefixed strings.
+- `Bytes` uses RLE when every non-null blob is equal and there are at least three. Otherwise plain.
+- `Float64` uses RLE when every non-null value is bit-identical and there are at least three. Otherwise plain little-endian `f64`.
+- `Bool` uses RLE of runs.
+- Nulls are a bitset (1 = null), not encoded as values. Zone-map min and max ignore nulls. `null_count` is the number of nulls in that column chunk. An all-null chunk has `min` and `max` of `None`. `NaN` is not ordered: float min and max ignore `NaN`, a comparison never matches `NaN`, and a group whose only non-null values are `NaN` is excluded by every comparison.
+
+A scan skips a row group, before decoding its column values, when any filter's zone map excludes the predicate. `row_groups_skipped` counts only that exclusion, not rows dropped after a decode. Filters are AND. `ZoneMap::excludes` is true when `min` and `max` are `None`. `Eq(v)` excludes when `v < min` or `v > max`. `Lt(v)` excludes when `min >= v`. `Le(v)` excludes when `min > v`. `Gt(v)` excludes when `max <= v`. `Ge(v)` excludes when `max < v`. `Between { low, high }` is inclusive and excludes when `low > high`, or when `max < low` or `min > high`. A predicate that does not order against the bounds, including `NaN`, excludes the group. A stored bound that is `NaN`, or a min that is not `<=` max, is corrupt. `Int64` and `TimestampMs` compare as integers and do not compare with each other. `Float64` compares as ordered `f64` (no `NaN` in min or max). `Bool` compares as false < true. `Utf8` and `Bytes` compare bytewise. A group that is not skipped keeps a row only when every filter matches. Null fails every comparison.
+
+Table and column names are non-empty, at most 128 bytes, and contain no `/` or NUL. Duplicate column names, a second `create_column_table` of the same name, an append to a missing table, a bad row width, and a cell whose type does not match the column are `StoreError::Backend` and write nothing. Null is allowed in every column. A predicate whose value type does not match the column, or a filter that names a missing column, is `StoreError::Backend`.
+
+A snapshot stays version 1 until a column table exists, then a checkpoint writes version 2. A version 1 snapshot still opens. A version 2 snapshot with no tables is corrupt. Each version-2 table and row group is checked on open, and a row group whose row count is zero is corrupt. A create or append in a WAL frame is checked the same way before the frame is published. `attempt_rollup` and `gate_run_rollup` read the existing `attempts` and `gate_runs` documents, project them into an in-memory columnar table (they do not write a second durable copy, and they do not change `append_attempt` or `append_gate_run`), and aggregate with a columnar scan. `Pass` counts as pass, `Fail` as fail, and `Error` as error. `project` or `gate` of `None` sums every row; `Some` keeps that id only.
 
 Phase 4 is the vector model (`f32` / `f16` / `i8` embeddings, HNSW, hybrid BM25+vector). It is not implemented.

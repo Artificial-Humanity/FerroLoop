@@ -1,5 +1,8 @@
 //! Little-endian `.fls` layout: superblocks, copy-on-write snapshots, WAL frames.
 
+use super::columnar::{
+    ColumnDef, ColumnTable, check_new_table, type_from_tag, type_tag, validate_row_group,
+};
 use fl_core::StoreError;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -9,8 +12,12 @@ pub(super) const HEADER_BYTES: u64 = 8192;
 const SUPER_MAGIC: &[u8; 8] = b"FERRSTR1";
 const SNAP_MAGIC: &[u8; 8] = b"FERRSNAP";
 const FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION_DOCS: u32 = 1;
+const SNAPSHOT_VERSION_COLUMNAR: u32 = 2;
 const TAG_PUT: u8 = 1;
 const TAG_DELETE: u8 = 2;
+const TAG_CREATE_COLUMN_TABLE: u8 = 3;
+const TAG_APPEND_COLUMN_GROUP: u8 = 4;
 
 pub(super) fn backend(err: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(err.to_string())
@@ -113,6 +120,14 @@ pub(super) enum Op {
         collection: String,
         id: String,
     },
+    CreateColumnTable {
+        name: String,
+        columns: Vec<ColumnDef>,
+    },
+    AppendColumnGroup {
+        name: String,
+        bytes: Vec<u8>,
+    },
 }
 
 pub(super) fn encode_frame(seq: u64, ops: &[Op]) -> Result<Vec<u8>, StoreError> {
@@ -151,6 +166,21 @@ fn encode_op(buf: &mut Vec<u8>, op: &Op) -> Result<(), StoreError> {
             write_lp(buf, collection.as_bytes())?;
             write_lp(buf, id.as_bytes())?;
         }
+        Op::CreateColumnTable { name, columns } => {
+            buf.push(TAG_CREATE_COLUMN_TABLE);
+            write_lp(buf, name.as_bytes())?;
+            let count = u32::try_from(columns.len()).map_err(|_| backend("too many columns"))?;
+            buf.extend_from_slice(&count.to_le_bytes());
+            for column in columns {
+                write_lp(buf, column.name.as_bytes())?;
+                buf.push(type_tag(column.ty));
+            }
+        }
+        Op::AppendColumnGroup { name, bytes } => {
+            buf.push(TAG_APPEND_COLUMN_GROUP);
+            write_lp(buf, name.as_bytes())?;
+            write_lp(buf, bytes)?;
+        }
     }
     Ok(())
 }
@@ -165,6 +195,7 @@ fn write_lp(buf: &mut Vec<u8>, bytes: &[u8]) -> Result<(), StoreError> {
 pub(super) struct Snapshot {
     pub(super) seq: u64,
     pub(super) docs: BTreeMap<(String, String), Value>,
+    pub(super) tables: BTreeMap<String, ColumnTable>,
 }
 
 pub(super) fn encode_snapshot(
@@ -173,7 +204,7 @@ pub(super) fn encode_snapshot(
 ) -> Result<Vec<u8>, StoreError> {
     let mut body = Vec::new();
     body.extend_from_slice(SNAP_MAGIC);
-    body.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    body.extend_from_slice(&SNAPSHOT_VERSION_DOCS.to_le_bytes());
     body.extend_from_slice(&seq.to_le_bytes());
     let count =
         u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
@@ -183,6 +214,51 @@ pub(super) fn encode_snapshot(
         write_lp(&mut body, id.as_bytes())?;
         let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
         write_lp(&mut body, &raw)?;
+    }
+    let crc = crc32(&body);
+    body.extend_from_slice(&crc.to_le_bytes());
+    Ok(body)
+}
+
+/// Version 2: the version-1 document section, then column tables in name order.
+/// Callers use this only when `tables` is non-empty. An empty map stays version 1
+/// via [`encode_snapshot`], which is byte-identical to a document-only snapshot.
+pub(super) fn encode_snapshot_v2(
+    seq: u64,
+    docs: &BTreeMap<(String, String), Value>,
+    tables: &BTreeMap<String, ColumnTable>,
+) -> Result<Vec<u8>, StoreError> {
+    let mut body = Vec::new();
+    body.extend_from_slice(SNAP_MAGIC);
+    body.extend_from_slice(&SNAPSHOT_VERSION_COLUMNAR.to_le_bytes());
+    body.extend_from_slice(&seq.to_le_bytes());
+    let count =
+        u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
+    body.extend_from_slice(&count.to_le_bytes());
+    for ((collection, id), doc) in docs {
+        write_lp(&mut body, collection.as_bytes())?;
+        write_lp(&mut body, id.as_bytes())?;
+        let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
+        write_lp(&mut body, &raw)?;
+    }
+    let table_count =
+        u32::try_from(tables.len()).map_err(|_| backend("snapshot has too many column tables"))?;
+    body.extend_from_slice(&table_count.to_le_bytes());
+    for (name, table) in tables {
+        write_lp(&mut body, name.as_bytes())?;
+        let col_count =
+            u32::try_from(table.columns.len()).map_err(|_| backend("too many columns"))?;
+        body.extend_from_slice(&col_count.to_le_bytes());
+        for column in &table.columns {
+            write_lp(&mut body, column.name.as_bytes())?;
+            body.push(type_tag(column.ty));
+        }
+        let group_count =
+            u32::try_from(table.groups.len()).map_err(|_| backend("too many row groups"))?;
+        body.extend_from_slice(&group_count.to_le_bytes());
+        for group in &table.groups {
+            write_lp(&mut body, group)?;
+        }
     }
     let crc = crc32(&body);
     body.extend_from_slice(&crc.to_le_bytes());
@@ -209,7 +285,7 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
         return Err(corrupt("snapshot magic mismatch"));
     }
     let version = cur.u32()?;
-    if version != FORMAT_VERSION {
+    if version != SNAPSHOT_VERSION_DOCS && version != SNAPSHOT_VERSION_COLUMNAR {
         return Err(corrupt(format!(
             "snapshot version {version} is not supported"
         )));
@@ -230,8 +306,50 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
             return Err(corrupt("snapshot repeats a document id"));
         }
     }
+    let mut tables = BTreeMap::new();
+    if version == SNAPSHOT_VERSION_COLUMNAR {
+        let table_count = cur.u32()?;
+        if table_count == 0 {
+            return Err(corrupt("snapshot has no column tables"));
+        }
+        if usize::try_from(table_count).unwrap_or(usize::MAX) > cur.remaining() {
+            return Err(corrupt("snapshot table count exceeds the blob"));
+        }
+        for _ in 0..table_count {
+            let name = cur.lp_str()?;
+            let col_count = cur.u32()?;
+            if usize::try_from(col_count).unwrap_or(usize::MAX) > cur.remaining() {
+                return Err(corrupt("snapshot column count exceeds the blob"));
+            }
+            let mut columns = Vec::with_capacity(usize::try_from(col_count).unwrap_or(0));
+            for _ in 0..col_count {
+                let column_name = cur.lp_str()?;
+                let ty = type_from_tag(cur.u8()?)?;
+                columns.push(ColumnDef {
+                    name: column_name,
+                    ty,
+                });
+            }
+            let group_count = cur.u32()?;
+            if usize::try_from(group_count).unwrap_or(usize::MAX) > cur.remaining() {
+                return Err(corrupt("snapshot row-group count exceeds the blob"));
+            }
+            let mut groups = Vec::with_capacity(usize::try_from(group_count).unwrap_or(0));
+            for _ in 0..group_count {
+                groups.push(cur.lp()?.to_vec());
+            }
+            if tables.contains_key(&name) {
+                return Err(corrupt(format!("snapshot repeats column table `{name}`")));
+            }
+            check_new_table(&tables, &name, &columns)?;
+            for group in &groups {
+                validate_row_group(&columns, group)?;
+            }
+            tables.insert(name, ColumnTable { columns, groups });
+        }
+    }
     cur.finish()?;
-    Ok(Snapshot { seq, docs })
+    Ok(Snapshot { seq, docs, tables })
 }
 
 /// Decode committed WAL bytes. A torn tail is dropped; a bad CRC with a
@@ -300,10 +418,10 @@ fn decode_payload(buf: &[u8]) -> Result<(u64, Vec<Op>), StoreError> {
     let mut ops = Vec::new();
     for _ in 0..count {
         let tag = cur.u8()?;
-        let collection = cur.lp_str()?;
-        let id = cur.lp_str()?;
         let op = match tag {
             TAG_PUT => {
+                let collection = cur.lp_str()?;
+                let id = cur.lp_str()?;
                 let raw = cur.lp()?;
                 let doc =
                     serde_json::from_slice(raw).map_err(|_| corrupt("document is not json"))?;
@@ -313,7 +431,33 @@ fn decode_payload(buf: &[u8]) -> Result<(u64, Vec<Op>), StoreError> {
                     doc,
                 }
             }
-            TAG_DELETE => Op::Delete { collection, id },
+            TAG_DELETE => {
+                let collection = cur.lp_str()?;
+                let id = cur.lp_str()?;
+                Op::Delete { collection, id }
+            }
+            TAG_CREATE_COLUMN_TABLE => {
+                let name = cur.lp_str()?;
+                let col_count = cur.u32()?;
+                if usize::try_from(col_count).unwrap_or(usize::MAX) > cur.remaining() {
+                    return Err(corrupt("column count exceeds the wal payload"));
+                }
+                let mut columns = Vec::with_capacity(usize::try_from(col_count).unwrap_or(0));
+                for _ in 0..col_count {
+                    let column_name = cur.lp_str()?;
+                    let ty = type_from_tag(cur.u8()?)?;
+                    columns.push(ColumnDef {
+                        name: column_name,
+                        ty,
+                    });
+                }
+                Op::CreateColumnTable { name, columns }
+            }
+            TAG_APPEND_COLUMN_GROUP => {
+                let name = cur.lp_str()?;
+                let bytes = cur.lp()?.to_vec();
+                Op::AppendColumnGroup { name, bytes }
+            }
             _ => return Err(corrupt(format!("unknown wal op tag {tag}"))),
         };
         ops.push(op);
