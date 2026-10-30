@@ -1704,6 +1704,89 @@ fn strip_grok_user_query_wrapper(content: &str) -> String {
     content.to_string()
 }
 
+/// Wrapper tags Antigravity puts around operator and notice turns.
+const AGY_WRAPPER_TAGS: [&str; 3] = ["user_request", "additional_metadata", "ephemeral_message"];
+
+/// Strip Antigravity `<USER_REQUEST>`, `<ADDITIONAL_METADATA>` and `<EPHEMERAL_MESSAGE>` wrappers
+/// from a user turn. Mirrors the UI's `stripAgyUserRequestWrapper`.
+///
+/// Content that does not start with one of the three tags is returned unchanged, so a message
+/// that merely quotes a tag stays intact. Otherwise every `<ADDITIONAL_METADATA>` block is
+/// removed, every `<USER_REQUEST>` and `<EPHEMERAL_MESSAGE>` block is replaced by its trimmed
+/// inner text, runs of three or more newlines become two, and the result is trimmed.
+pub(crate) fn strip_agy_user_request_wrapper(content: &str) -> String {
+    unwrap_agy_wrappers(content).0
+}
+
+/// Like [`strip_agy_user_request_wrapper`], and reports whether an `<EPHEMERAL_MESSAGE>`
+/// block was unwrapped (the turn is then a system notice, not an operator message).
+fn unwrap_agy_wrappers(content: &str) -> (String, bool) {
+    let lowered = content.trim_start().to_ascii_lowercase();
+    if !AGY_WRAPPER_TAGS
+        .iter()
+        .any(|tag| lowered.starts_with(&format!("<{tag}>")))
+    {
+        return (content.to_string(), false);
+    }
+    let (without_metadata, _) =
+        replace_agy_blocks(content, "additional_metadata", |_| String::new());
+    let (without_request, _) = replace_agy_blocks(&without_metadata, "user_request", |inner| {
+        inner.trim().to_string()
+    });
+    let (unwrapped, ephemeral) =
+        replace_agy_blocks(&without_request, "ephemeral_message", |inner| {
+            inner.trim().to_string()
+        });
+    (
+        collapse_blank_runs(&unwrapped).trim().to_string(),
+        ephemeral,
+    )
+}
+
+/// Replace each complete `<tag>...</tag>` block (ASCII case-insensitive, non-greedy) with
+/// `replace(inner)`. An opening tag with no closing tag is left as it is.
+fn replace_agy_blocks(text: &str, tag: &str, replace: impl Fn(&str) -> String) -> (String, bool) {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    // ASCII lowercasing keeps byte offsets, so indexes into `lowered` are valid in `text`.
+    let lowered = text.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut found = false;
+    while let Some(rel_open) = lowered[cursor..].find(&open) {
+        let open_at = cursor + rel_open;
+        let inner_at = open_at + open.len();
+        let Some(rel_close) = lowered[inner_at..].find(&close) else {
+            break;
+        };
+        let close_at = inner_at + rel_close;
+        out.push_str(&text[cursor..open_at]);
+        out.push_str(&replace(&text[inner_at..close_at]));
+        cursor = close_at + close.len();
+        found = true;
+    }
+    out.push_str(&text[cursor..]);
+    (out, found)
+}
+
+/// Collapse every run of three or more newlines into exactly two.
+fn collapse_blank_runs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut run = 0;
+    for ch in text.chars() {
+        if ch == '\n' {
+            run += 1;
+            if run <= 2 {
+                out.push(ch);
+            }
+        } else {
+            run = 0;
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Return `true` when the latest turn in `turns` indicates the agent session is actively working
 /// (e.g. a user/wire/tool/system turn is awaiting an assistant reply, or the latest assistant turn
 /// issued tool calls that have not yet produced a final text-only assistant turn).
@@ -1743,7 +1826,10 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if role != "system" && role != "user" {
         return (role.to_string(), content.to_string());
     }
+    let (unwrapped, from_ephemeral) = unwrap_agy_wrappers(content);
+    let content = unwrapped.as_str();
     let trimmed_content = content.trim();
+    let is_notice = trimmed_content.starts_with("[Notice] ");
     let has_system_msg_block =
         trimmed_content.starts_with("<SYSTEM_MESSAGE>") || content.contains("\n<SYSTEM_MESSAGE>");
     let has_claude_peer_wrapper =
@@ -1753,6 +1839,8 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
         || trimmed_content.starts_with("[fl-wire ");
     if role != "system"
         && !has_system_msg_block
+        && !from_ephemeral
+        && !is_notice
         && !(role == "user" && (has_claude_peer_wrapper || has_wire_or_operator_prefix))
     {
         return (role.to_string(), content.to_string());
@@ -1885,6 +1973,12 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
             return (format!("wire:{}", sender.to_ascii_lowercase()), body);
         }
         return ("system".to_string(), body);
+    }
+
+    // An Antigravity `[Notice]` or `<EPHEMERAL_MESSAGE>` is a system notice, never an
+    // operator message, even though the transcript labels it as a user turn.
+    if from_ephemeral || inner.starts_with("[Notice] ") {
+        return ("system".to_string(), inner.to_string());
     }
 
     if !inner.starts_with("[Operator Prompt via FerroDeck")
@@ -2718,6 +2812,78 @@ mod tests {
         );
         assert_eq!(role, "user");
         assert_eq!(content, "Direct prompt without prefix");
+    }
+
+    #[test]
+    fn strip_agy_user_request_wrapper_mirrors_the_ui_twin() {
+        let raw = "<USER_REQUEST>\nPlease continue\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-29T18:44:28Z.\n</ADDITIONAL_METADATA>";
+        assert_eq!(strip_agy_user_request_wrapper(raw), "Please continue");
+
+        // Metadata first, mixed case tags, and blank-line runs collapse to one blank line.
+        let raw = "<additional_metadata>\nx\n</additional_metadata>\n\n\n<User_Request>\n a\n\n\n\nb \n</User_Request>";
+        assert_eq!(strip_agy_user_request_wrapper(raw), "a\n\nb");
+
+        let raw = "<EPHEMERAL_MESSAGE>\n[Notice] stopped\n</EPHEMERAL_MESSAGE>";
+        assert_eq!(strip_agy_user_request_wrapper(raw), "[Notice] stopped");
+
+        // A tag that is not at the start is quoted text and stays intact.
+        let quoted = "Here is a snippet:\n<USER_REQUEST>\nhello\n</USER_REQUEST>";
+        assert_eq!(strip_agy_user_request_wrapper(quoted), quoted);
+        assert_eq!(strip_agy_user_request_wrapper(""), "");
+
+        // An unclosed tag is left alone rather than swallowing the rest.
+        assert_eq!(
+            strip_agy_user_request_wrapper("<USER_REQUEST>\nno close"),
+            "<USER_REQUEST>\nno close"
+        );
+    }
+
+    #[test]
+    fn parse_jsonl_transcript_strips_agy_wrapper_and_classifies_notices_as_system() {
+        let jsonl = [
+            serde_json::json!({
+                "step_index": 0, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": "<USER_REQUEST>\nPlease continue\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-29T18:44:28Z.\n</ADDITIONAL_METADATA>"
+            }),
+            serde_json::json!({
+                "step_index": 1, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": "<USER_REQUEST>\n[Notice] All your subagents and background tasks have been stopped.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>"
+            }),
+            serde_json::json!({
+                "step_index": 2, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": "<EPHEMERAL_MESSAGE>\nThe user rewound the conversation.\n</EPHEMERAL_MESSAGE>"
+            }),
+            serde_json::json!({
+                "step_index": 3, "type": "SYSTEM_MESSAGE", "source": "SYSTEM",
+                "content": "<SYSTEM_MESSAGE>\n[Message] timestamp=2026-10-27T15:35:06Z sender=system priority=MESSAGE_PRIORITY_HIGH content=[Notice] Background task finished\n</SYSTEM_MESSAGE>"
+            }),
+            serde_json::json!({
+                "step_index": 4, "type": "USER_INPUT", "source": "USER_EXPLICIT",
+                "content": "Another Claude session sent a message:\nhello from a peer\n\nThis came from another Claude session"
+            }),
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+        let turns = parse_jsonl_transcript(&jsonl);
+        assert_eq!(turns.len(), 5);
+        assert_eq!(
+            (turns[0].role.as_str(), turns[0].content.as_str()),
+            ("user", "Please continue")
+        );
+        assert_eq!(turns[1].role, "system");
+        assert_eq!(
+            turns[1].content,
+            "[Notice] All your subagents and background tasks have been stopped."
+        );
+        assert_eq!(turns[2].role, "system");
+        assert_eq!(turns[2].content, "The user rewound the conversation.");
+        assert_eq!(turns[3].role, "system");
+        assert_eq!(turns[3].content, "[Notice] Background task finished");
+        assert_eq!(turns[4].role, "user");
+        assert_eq!(turns[4].content, "hello from a peer");
     }
 
     #[test]
