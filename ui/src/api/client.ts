@@ -36,9 +36,12 @@ import type {
   WireSendRequest,
   WireSendResponse,
   DeleteGateSecretResponse,
+  EnrolledNode,
   GateConnectorsResponse,
   GateSecretResponse,
   GateSecretsResponse,
+  NodeEnrollTokenResponse,
+  NodesResponse,
   SetVaultSecretInput,
   WorkflowDef,
   WorkflowRun,
@@ -622,4 +625,55 @@ export class HubApiClient {
     }
     return `${this.baseUrl}/api/v1/artifacts/preview?${qs.toString()}`;
   }
+
+  public async fetchNodes(): Promise<EnrolledNode[]> {
+    try {
+      const data = await this.request<NodesResponse>("/api/v1/nodes");
+      return data.nodes ?? [];
+    } catch (err) {
+      if (err instanceof HubApiError && err.status === 404) {
+        return [];
+      }
+      throw err;
+    }
+  }
+
+  public async getNodes(): Promise<EnrolledNode[]> {
+    return this.fetchNodes();
+  }
+
+  public async createNodeEnrollToken(
+    label?: string,
+    ttlSecs?: number,
+  ): Promise<NodeEnrollTokenResponse> {
+    return this.request<NodeEnrollTokenResponse>("/api/v1/nodes/enroll-token", {
+      method: "POST",
+      body: JSON.stringify({ label, ttl_secs: ttlSecs }),
+    });
+  }
+
+  public async revokeNode(nodeId: string): Promise<void> {
+    await this.request<unknown>(`/api/v1/nodes/${encodeURIComponent(nodeId)}`, {
+      method: "DELETE",
+    });
+  }
+}
+
+export async function fetchNodes(client?: HubApiClient): Promise<EnrolledNode[]> {
+  return (client ?? new HubApiClient()).fetchNodes();
+}
+
+export async function createNodeEnrollToken(
+  label?: string,
+  ttlSecs?: number,
+  client?: HubApiClient,
+): Promise<NodeEnrollTokenResponse> {
+  return (client ?? new HubApiClient()).createNodeEnrollToken(label, ttlSecs);
+}
+
+export async function revokeNode(
+  nodeId: string,
+  client?: HubApiClient,
+): Promise<void> {
+  return (client ?? new HubApiClient()).revokeNode(nodeId);
 }
