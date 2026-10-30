@@ -8,7 +8,7 @@ use super::columnar;
 use super::layout::{Op, backend};
 use super::state::DocState;
 use super::vector;
-use super::{FerroStore, MqRecord, lock_mutex};
+use super::{FerroStore, MqRecord, SyncBatch, lock_mutex};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::iri::Iri;
@@ -467,12 +467,23 @@ fn forward_mq(
 fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, StoreError> {
     match method {
         "put_doc" => {
-            store.put_doc(
-                param_str(params, "collection")?,
-                param_str(params, "id")?,
-                &param_value(params, "doc")?,
-            )?;
-            Ok(Value::Null)
+            let collection = param_str(params, "collection")?;
+            let id = param_str(params, "id")?;
+            let doc = param_value(params, "doc")?;
+            let silent = optional_bool(params, "silent")?;
+            if optional_bool(params, "if_absent")? {
+                let placed = store.put_if_absent(collection, id, &doc, silent)?;
+                let mut body = serde_json::Map::new();
+                body.insert("wrote".into(), Value::Bool(placed.wrote));
+                body.insert("doc".into(), placed.doc);
+                if let Some(seq) = placed.store_seq {
+                    body.insert("store_seq".into(), json!(seq));
+                }
+                Ok(Value::Object(body))
+            } else {
+                store.put_doc_inner(collection, id, &doc, silent)?;
+                Ok(Value::Null)
+            }
         }
         "get_doc" => {
             // Null is a missing id. A stored value, including JSON null, is wrapped
@@ -507,12 +518,12 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
             ))
         }
         "publish_mq" => {
-            let seq = store.publish_mq(
+            let (seq, store_seq) = store.publish_mq_detail(
                 param_str(params, "topic")?,
                 param_str(params, "key")?,
                 &param_value(params, "payload")?,
             )?;
-            Ok(Value::from(seq))
+            Ok(json!({"seq": seq, "store_seq": store_seq}))
         }
         "poll_mq_group" => {
             let records = store.poll_mq_group(
@@ -667,8 +678,22 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
                     .get("ops")
                     .ok_or_else(|| backend("missing param `ops`"))?,
             )?;
+            let silent = optional_bool(params, "silent")?;
             // `false` is a sequence mismatch, not an error response.
-            Ok(Value::Bool(store.commit_if_seq(expected_seq, &ops)?))
+            Ok(Value::Bool(store.commit_if_seq_inner(
+                expected_seq,
+                &ops,
+                silent,
+            )?))
+        }
+        "apply_sync_batches" => {
+            let batches = parse_sync_batches(
+                params
+                    .get("batches")
+                    .ok_or_else(|| backend("missing param `batches`"))?,
+            )?;
+            let silent = optional_bool(params, "silent")?;
+            Ok(Value::from(store.apply_sync_batches(batches, silent)?))
         }
         _ => Err(backend(format!("no such method `{method}`"))),
     }
@@ -717,6 +742,18 @@ fn param_usize(params: &Value, key: &str) -> Result<usize, StoreError> {
 fn param_u32(params: &Value, key: &str) -> Result<u32, StoreError> {
     u32::try_from(param_u64(params, key)?)
         .map_err(|_| backend(format!("param `{key}` does not fit")))
+}
+
+fn optional_bool(params: &Value, key: &str) -> Result<bool, StoreError> {
+    match params.get(key) {
+        None => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(backend(format!("param `{key}` is not a bool"))),
+    }
+}
+
+fn parse_sync_batches(value: &Value) -> Result<Vec<SyncBatch>, StoreError> {
+    serde_json::from_value(value.clone()).map_err(|err| backend(format!("sync batches: {err}")))
 }
 
 fn optional_u32(params: &Value, key: &str) -> Result<Option<u32>, StoreError> {
@@ -1208,13 +1245,6 @@ impl RemoteClient {
         Ok(out)
     }
 
-    pub(super) fn call_u64(&self, method: &str, params: Value) -> Result<u64, StoreError> {
-        let value = self.call(method, params)?;
-        value
-            .as_u64()
-            .ok_or_else(|| backend(format!("{method} result is not a u64")))
-    }
-
     pub(super) fn call_records(
         &self,
         method: &str,
@@ -1231,17 +1261,43 @@ impl RemoteClient {
         parse_doc_state(&self.call("read_state", json!({}))?)
     }
 
-    pub(super) fn commit_ops(&self, expected_seq: u64, ops: &[Op]) -> Result<bool, StoreError> {
-        let value = self.call(
-            "commit_ops",
-            json!({
-                "expected_seq": expected_seq,
-                "ops": ops.iter().map(op_value).collect::<Vec<_>>(),
-            }),
-        )?;
+    pub(super) fn commit_ops(
+        &self,
+        expected_seq: u64,
+        ops: &[Op],
+        silent: bool,
+    ) -> Result<bool, StoreError> {
+        let mut params = serde_json::Map::new();
+        params.insert("expected_seq".into(), json!(expected_seq));
+        params.insert(
+            "ops".into(),
+            Value::Array(ops.iter().map(op_value).collect()),
+        );
+        if silent {
+            params.insert("silent".into(), Value::Bool(true));
+        }
+        let value = self.call("commit_ops", Value::Object(params))?;
         value
             .as_bool()
             .ok_or_else(|| backend("commit_ops result is not a bool"))
+    }
+
+    pub(super) fn apply_sync_batches(
+        &self,
+        batches: &[SyncBatch],
+        silent: bool,
+    ) -> Result<u64, StoreError> {
+        let encoded = serde_json::to_value(batches)
+            .map_err(|err| backend(format!("encode sync batches: {err}")))?;
+        let mut params = serde_json::Map::new();
+        params.insert("batches".into(), encoded);
+        if silent {
+            params.insert("silent".into(), Value::Bool(true));
+        }
+        let value = self.call("apply_sync_batches", Value::Object(params))?;
+        value
+            .as_u64()
+            .ok_or_else(|| backend("apply_sync_batches result is not a u64"))
     }
 
     pub(super) fn subscribe_topic(&self, topic: &str) -> Receiver<MqRecord> {

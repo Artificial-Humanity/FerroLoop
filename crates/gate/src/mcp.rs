@@ -3,7 +3,9 @@
 
 use serde_json::{Value, json};
 
-use crate::connector::ConnectorManifest;
+use crate::adapter::{SecretProviderAdapter, authorize_mcp_tool};
+use crate::connector::{ConnectorManifest, project_response_body};
+use crate::proxy::execute_proxied_request_with_provider;
 use crate::vault::Vault;
 
 /// Build the MCP `tools/list` array across all enabled `connectors` (plus built-in discovery tools).
@@ -58,6 +60,28 @@ pub fn handle_mcp_jsonrpc_request(
     connectors: &[ConnectorManifest],
     connector_filter: Option<&str>,
     caller_agent: Option<String>,
+) -> Option<Value> {
+    handle_mcp_jsonrpc_request_with_secret_provider(
+        req,
+        vault,
+        connectors,
+        connector_filter,
+        caller_agent,
+        None,
+    )
+}
+
+/// [`handle_mcp_jsonrpc_request`] with an optional IAM and secret provider.
+///
+/// `None` keeps connector tools on [`ConnectorManifest::execute_tool`]. `Some` authorizes
+/// only connector-owned tools, then proxies with the provider. Built-in list tools are not authorized.
+pub fn handle_mcp_jsonrpc_request_with_secret_provider(
+    req: &Value,
+    vault: &Vault,
+    connectors: &[ConnectorManifest],
+    connector_filter: Option<&str>,
+    caller_agent: Option<String>,
+    secret_provider: Option<&dyn SecretProviderAdapter>,
 ) -> Option<Value> {
     let method = req.get("method").and_then(Value::as_str).unwrap_or("");
     let id = req.get("id").cloned();
@@ -151,7 +175,52 @@ pub fn handle_mcp_jsonrpc_request(
                 {
                     continue;
                 }
-                if conn.tools.iter().any(|t| t.name == tool_name) {
+                if let Some(tool) = conn.tools.iter().find(|t| t.name == tool_name) {
+                    if let Some(provider) = secret_provider {
+                        if let Err(err) = authorize_mcp_tool(
+                            provider,
+                            caller_agent.as_deref(),
+                            &conn.id,
+                            tool_name,
+                        ) {
+                            return Some(mcp_tool_text_response(id_val, &err.to_string(), true));
+                        }
+                        let proxy_req =
+                            match conn.build_tool_request(tool, &arguments, caller_agent) {
+                                Ok(proxy_req) => proxy_req,
+                                Err(err) => {
+                                    return Some(mcp_tool_text_response(
+                                        id_val,
+                                        &err.to_string(),
+                                        true,
+                                    ));
+                                }
+                            };
+                        return match execute_proxied_request_with_provider(
+                            vault,
+                            &proxy_req,
+                            Some(provider),
+                        ) {
+                            Ok(resp) => {
+                                let is_error = resp.status >= 400;
+                                let projected =
+                                    project_response_body(&resp.body, &tool.response_fields);
+                                let payload = json!({
+                                    "status": resp.status,
+                                    "data": projected,
+                                    "scrubbed_secrets": resp.scrubbed_secrets,
+                                });
+                                Some(mcp_tool_text_response(
+                                    id_val,
+                                    &serde_json::to_string_pretty(&payload).unwrap_or_default(),
+                                    is_error,
+                                ))
+                            }
+                            Err(err) => {
+                                Some(mcp_tool_text_response(id_val, &err.to_string(), true))
+                            }
+                        };
+                    }
                     return match conn.execute_tool(vault, tool_name, &arguments, caller_agent) {
                         Ok((resp, projected)) => {
                             let is_error = resp.status >= 400;

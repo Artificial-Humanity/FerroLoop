@@ -68,7 +68,15 @@ pub fn handle_registry_v01_get(
         .iter()
         .map(|c| connector_to_registry_entry(c, hub_base_url))
         .collect();
+    respond_registry_v01(subpath, query, entries)
+}
 
+/// List, search, and detail over an already built v0.1 entry list.
+pub(crate) fn respond_registry_v01(
+    subpath: &str,
+    query: &BTreeMap<String, String>,
+    entries: Vec<Value>,
+) -> (u16, Value) {
     let rest = subpath
         .trim_start_matches('/')
         .strip_prefix("v0.1/servers")
