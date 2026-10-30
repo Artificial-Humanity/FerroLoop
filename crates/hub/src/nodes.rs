@@ -448,6 +448,37 @@ fn to_view(rec: &NodeRecord, now_ms: u64) -> NodeView {
     }
 }
 
+/// Hostname shaped into an id that `canonical_node_id` and `node_state_slug` accept.
+///
+/// Trim, ASCII-lowercase, map `.` to `-`, drop every other character outside
+/// `[a-z0-9_-]`, then truncate to 48. An empty result or an enroll-slug collision
+/// is prefixed with `n-` and truncated again. A bare `n-`, or a result the slug
+/// check still rejects, becomes `localhost`.
+pub fn node_id_from_hostname(raw: &str) -> String {
+    let mut id = String::new();
+    for ch in raw.trim().chars() {
+        let lower = ch.to_ascii_lowercase();
+        let mapped = if lower == '.' { '-' } else { lower };
+        if mapped.is_ascii_lowercase() || mapped.is_ascii_digit() || mapped == '-' || mapped == '_'
+        {
+            id.push(mapped);
+        }
+        if id.len() >= SLUG_TAIL_MAX {
+            break;
+        }
+    }
+    if id.is_empty() || node_state_slug(&id).is_err() {
+        id.insert_str(0, "n-");
+        id.truncate(SLUG_TAIL_MAX);
+    }
+    // `n-` alone means the hostname contributed no characters (`""`, `@@@`).
+    if id == "n-" || node_state_slug(&id).is_err() {
+        "localhost".to_string()
+    } else {
+        id
+    }
+}
+
 /// Trimmed, ASCII-lowercased node id. The whole result must match `[a-z0-9_-]{1,48}`.
 pub fn canonical_node_id(raw: &str) -> Result<String, String> {
     let id = raw.trim().to_ascii_lowercase();
@@ -1162,6 +1193,42 @@ mod tests {
         if let Some(from_libc) = hostname_from_libc() {
             assert_eq!(got, from_libc);
         }
+    }
+
+    #[test]
+    fn node_id_from_hostname_is_canonical_and_stores() {
+        assert_eq!(node_id_from_hostname("ai-lab-0"), "ai-lab-0");
+        assert_eq!(node_id_from_hostname("Foo.Example.com"), "foo-example-com");
+        let enroll_host = node_id_from_hostname("enroll-mac.local");
+        assert_eq!(enroll_host, "n-enroll-mac-local");
+        assert!(node_state_slug(&enroll_host).is_ok(), "{enroll_host}");
+        assert_eq!(node_id_from_hostname(""), "localhost");
+        assert_eq!(node_id_from_hostname("@@@"), "localhost");
+        for id in [
+            "ai-lab-0",
+            "foo-example-com",
+            enroll_host.as_str(),
+            "localhost",
+        ] {
+            assert!(canonical_node_id(id).is_ok(), "{id}");
+            assert!(node_state_slug(id).is_ok(), "{id}");
+        }
+        assert!(canonical_node_id("a/b").is_err());
+        assert!(canonical_node_id("foo.bar").is_err());
+        assert!(canonical_node_id(&"a".repeat(49)).is_err());
+
+        let truncated = node_id_from_hostname(&"h".repeat(70));
+        assert_eq!(truncated.len(), 48);
+        assert_eq!(truncated, "h".repeat(48));
+        let (_long_tmp, long_store) = open_store();
+        let long_node = ensure_hub_node(&long_store, hub_args(&truncated, 1_000, None)).unwrap();
+        assert_eq!(long_node.node_id, truncated);
+
+        let (_lab_tmp, lab_store) = open_store();
+        let lab_id = node_id_from_hostname("lab.local");
+        assert_eq!(lab_id, "lab-local");
+        let lab_node = ensure_hub_node(&lab_store, hub_args(&lab_id, 2_000, None)).unwrap();
+        assert_eq!(lab_node.node_id, "lab-local");
     }
 
     fn entry_sensitive(store: &RedbStore, slug: &str) -> bool {

@@ -13,7 +13,7 @@ use fl_hub::{
     DEFAULT_HUB_LISTEN, DEFAULT_PAIRING_TTL_SECS, DEFAULT_SESSION_TTL_SECS, EnsureHubArgs,
     HubServer, HubServerConfig, NodeView, canonical_node_id, detect_capabilities, ensure_hub_node,
     find_hub_node, generate_hex_token, list_visible_nodes, local_hostname, mint_enroll_token,
-    mint_pairing_code_in_store, resolve_owner_token, resolve_peer_token,
+    mint_pairing_code_in_store, node_id_from_hostname, resolve_owner_token, resolve_peer_token,
 };
 use fl_store::RedbStore;
 use serde_json::{Value, json};
@@ -695,13 +695,14 @@ fn cmd_init(
 
     let (node_id, info) = {
         let store = open_hub_store_with_retry(&store_path)?;
+        let hostname = local_hostname();
         let node_id = choose_hub_node_id(&store, name)?;
         let record = ensure_hub_node(
             &store,
             EnsureHubArgs {
-                node_id: node_id.clone(),
-                display_name: node_id.clone(),
-                hostname: local_hostname(),
+                node_id,
+                display_name: hostname.clone(),
+                hostname,
                 os: std::env::consts::OS.to_string(),
                 arch: std::env::consts::ARCH.to_string(),
                 listen_addr: Some(listen.clone()),
@@ -768,7 +769,7 @@ fn choose_hub_node_id(store: &RedbStore, name: Option<String>) -> Result<String,
     if let Some(hub) = existing {
         return Ok(hub.node_id);
     }
-    Ok(local_hostname())
+    Ok(node_id_from_hostname(&local_hostname()))
 }
 
 fn cmd_enroll_token(
@@ -804,15 +805,20 @@ fn cmd_join(
     json_out: bool,
 ) -> Result<i32, (i32, String)> {
     let base_url = normalize_hub_url(&hub_url);
-    let node_id = name.unwrap_or_else(local_hostname);
+    let hostname = local_hostname();
+    let (node_id, display_name) = if let Some(explicit) = name {
+        (explicit.clone(), explicit)
+    } else {
+        (node_id_from_hostname(&hostname), hostname.clone())
+    };
     let enroll_url = format!("{base_url}/api/v1/nodes/enroll");
     let response = http_agent()
         .post(&enroll_url)
         .send_json(json!({
             "code": token,
             "node_id": node_id,
-            "display_name": node_id,
-            "hostname": local_hostname(),
+            "display_name": display_name,
+            "hostname": hostname,
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "listen_addr": null,

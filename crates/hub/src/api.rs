@@ -82,8 +82,8 @@ use crate::discovery::{
 use crate::nodes::{
     EnrollFail, EnrollWorker, EnsureHubArgs, HeartbeatFail, HeartbeatUpdate, NodeRecord, NodeView,
     RevokeFail, detect_capabilities, enroll_worker, ensure_hub_node, find_hub_node,
-    list_visible_nodes, local_hostname, mint_enroll_token, node_state_slug, node_token_matches,
-    revoke_node, touch_node,
+    list_visible_nodes, local_hostname, mint_enroll_token, node_id_from_hostname, node_state_slug,
+    node_token_matches, revoke_node, touch_node,
 };
 pub use crate::{HubState, QueuedOperatorPrompt, SavedPromptAttachment};
 
@@ -698,12 +698,10 @@ fn authorize_node_heartbeat<'a>(
 }
 
 fn ensure_primary_hub(state: &HubState, store: &RedbStore, now_ms: u64) -> Result<(), String> {
+    let hostname = local_hostname();
     let (node_id, display_name) = match find_hub_node(store)? {
         Some(hub) => (hub.node_id, hub.display_name),
-        None => {
-            let hostname = local_hostname();
-            (hostname.clone(), hostname)
-        }
+        None => (node_id_from_hostname(&hostname), hostname.clone()),
     };
     let path_env = std::env::var("PATH").unwrap_or_default();
     let listen_addr = (!state.config.listen.is_empty()).then(|| state.config.listen.clone());
@@ -712,7 +710,7 @@ fn ensure_primary_hub(state: &HubState, store: &RedbStore, now_ms: u64) -> Resul
         EnsureHubArgs {
             node_id,
             display_name,
-            hostname: local_hostname(),
+            hostname,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             listen_addr,
