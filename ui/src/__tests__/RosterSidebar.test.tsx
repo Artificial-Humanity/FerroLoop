@@ -1,5 +1,8 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import App from "../App";
+import { HubApiClient } from "../api/client";
+import type { HubWsClient } from "../api/ws";
 import { ContextHeader } from "../components/ContextHeader";
 import { PairingModal } from "../components/PairingModal";
 import { RosterSidebar } from "../components/RosterSidebar";
@@ -322,5 +325,65 @@ describe("ContextHeader session pill and header controls", () => {
       "aria-label",
       "Close right split panel",
     );
+  });
+});
+
+describe("Mobile responsive sidebar drawer (Record 55)", () => {
+  it("toggles mobile-sidebar-toggle-btn, renders mobile-sidebar-backdrop, dismisses on backdrop click, and auto-closes on agent select", async () => {
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes("/api/v1/auth/session")) {
+        return new Response(
+          JSON.stringify({
+            authenticated: true,
+            authority: { tier: "owner", login: "lmcfarlin" },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    const sidebar = await screen.findByTestId("roster-sidebar");
+    const toggleBtn = await screen.findByTestId("mobile-sidebar-toggle-btn");
+
+    // Initially closed on mobile
+    expect(sidebar).toHaveAttribute("data-mobile-open", "false");
+    expect(screen.queryByTestId("mobile-sidebar-backdrop")).toBeNull();
+
+    // Clicking mobile-sidebar-toggle-btn opens the drawer and renders backdrop
+    fireEvent.click(toggleBtn);
+    expect(sidebar).toHaveAttribute("data-mobile-open", "true");
+    expect(screen.getByTestId("mobile-sidebar-backdrop")).toBeInTheDocument();
+
+    // Clicking mobile-sidebar-backdrop closes the drawer
+    fireEvent.click(screen.getByTestId("mobile-sidebar-backdrop"));
+    expect(sidebar).toHaveAttribute("data-mobile-open", "false");
+    expect(screen.queryByTestId("mobile-sidebar-backdrop")).toBeNull();
+
+    // Re-open drawer and select an agent -> auto-closes drawer
+    fireEvent.click(toggleBtn);
+    expect(sidebar).toHaveAttribute("data-mobile-open", "true");
+    fireEvent.click(screen.getByTestId("agent-row-jarvis"));
+    expect(sidebar).toHaveAttribute("data-mobile-open", "false");
+    expect(screen.queryByTestId("mobile-sidebar-backdrop")).toBeNull();
+
+    unmount();
   });
 });

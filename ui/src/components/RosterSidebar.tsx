@@ -168,11 +168,21 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
   const selectedKey = (selectedAgentName ?? "").trim().toLowerCase();
 
   return (
-    <aside
-      className={`fd-sidebar${isOpen ? " is-open" : ""}`}
-      aria-label="Agent Roster"
-      data-testid="roster-sidebar"
-    >
+    <>
+      {isOpen && (
+        <div
+          className="fd-sidebar-backdrop"
+          data-testid="mobile-sidebar-backdrop"
+          onClick={onClose}
+          aria-hidden="true"
+        />
+      )}
+      <aside
+        className={`fd-sidebar${isOpen ? " is-open" : ""}`}
+        aria-label="Agent Roster"
+        data-testid="roster-sidebar"
+        data-mobile-open={isOpen ? "true" : "false"}
+      >
       <div
         style={{
           padding: "12px 14px",
@@ -381,6 +391,7 @@ export const RosterSidebar: React.FC<RosterSidebarProps> = ({
           ))
         )}
       </div>
-    </aside>
+      </aside>
+    </>
   );
 };

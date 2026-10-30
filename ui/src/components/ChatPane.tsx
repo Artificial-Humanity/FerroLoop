@@ -1290,6 +1290,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     <section className="fd-pane" data-testid="chat-pane">
       {/* Toolbar */}
       <div
+        className="fd-chat-toolbar"
         style={{
           display: "flex",
           alignItems: "center",
@@ -1303,7 +1304,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       >
         <div
           className="chat-header-meta"
-          style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, flexWrap: "wrap" }}
+          style={{ display: "flex", alignItems: "center", gap: "8px", flex: 1, flexWrap: "wrap", minWidth: 0 }}
         >
           <input
             type="search"
@@ -1315,7 +1316,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             data-1p-ignore="true"
             data-lpignore="true"
             data-form-type="other"
-            className="fd-input"
+            className="fd-input fd-transcript-filter-input"
             placeholder="Filter transcript turns, tools, or reasoning..."
             aria-label="Filter transcript"
             value={filterQuery}
