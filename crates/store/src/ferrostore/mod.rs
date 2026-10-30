@@ -99,12 +99,7 @@ impl FerroStore {
             .truncate(false)
             .open(path)
             .map_err(|err| backend(format!("open {}: {err}", path.display())))?;
-        if write.metadata().map_err(io_err)?.len() == 0 {
-            let _locked = FlockGuard::acquire(write.as_raw_fd())?;
-            if write.metadata().map_err(io_err)?.len() == 0 {
-                init_empty(&write)?;
-            }
-        }
+        ensure_superblock(&write)?;
         read_consistent(&write)?;
         // `OpenOptions::read` without write is `O_RDONLY`.
         let read = OpenOptions::new()
@@ -412,6 +407,19 @@ fn init_empty(file: &File) -> Result<(), StoreError> {
     Ok(())
 }
 
+// No valid slot yet. Publish slot 0 only when the file is empty or no longer
+// than the header. A longer file is not a torn create and is not rewritten.
+fn ensure_superblock(file: &File) -> Result<(), StoreError> {
+    if parsed_superblock(file)?.is_some() {
+        return Ok(());
+    }
+    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
+    if parsed_superblock(file)?.is_some() || file.metadata().map_err(io_err)?.len() > HEADER_BYTES {
+        return Ok(());
+    }
+    init_empty(file)
+}
+
 fn read_consistent(file: &File) -> Result<(usize, Superblock, DocState), StoreError> {
     let (index, sb) = latest_superblock(file)?;
     let mut state = if sb.snapshot_length == 0 {
@@ -433,7 +441,7 @@ fn read_consistent(file: &File) -> Result<(usize, Superblock, DocState), StoreEr
     Ok((index, sb, state))
 }
 
-fn latest_superblock(file: &File) -> Result<(usize, Superblock), StoreError> {
+fn parsed_superblock(file: &File) -> Result<Option<(usize, Superblock)>, StoreError> {
     let file_len = file.metadata().map_err(io_err)?.len();
     let mut best: Option<(usize, Superblock)> = None;
     for index in 0..2 {
@@ -453,7 +461,11 @@ fn latest_superblock(file: &File) -> Result<(usize, Superblock), StoreError> {
             }
         }
     }
-    best.ok_or_else(|| backend("no valid FerroStore superblock"))
+    Ok(best)
+}
+
+fn latest_superblock(file: &File) -> Result<(usize, Superblock), StoreError> {
+    parsed_superblock(file)?.ok_or_else(|| backend("no valid FerroStore superblock"))
 }
 
 fn write_slot(file: &File, index: usize, sb: &Superblock) -> Result<(), StoreError> {

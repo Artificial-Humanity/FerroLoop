@@ -2,6 +2,7 @@ use super::layout::{self, Op, Superblock};
 use super::{FerroStore, file_uri_path, latest_superblock, write_slot};
 use fl_core::StoreError;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -216,6 +217,47 @@ fn wal_truncated_tail_is_ignored_and_a_bad_crc_in_the_middle_is_corrupt() {
 }
 
 #[test]
+fn zeroed_header_recovers_and_a_longer_headerless_file_does_not() {
+    assert_eq!(layout::HEADER_BYTES, 8192);
+    let (_dir, path) = temp_fls();
+    {
+        let file = File::create(&path).unwrap();
+        file.set_len(8192).unwrap();
+        file.sync_all().unwrap();
+    }
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8192);
+    assert!(slots(&path).iter().all(Option::is_none));
+    {
+        let store = FerroStore::open(&path).unwrap();
+        store.put_doc("docs", "a", &json!({ "n": 1 })).unwrap();
+    }
+    let store = FerroStore::open(&path).unwrap();
+    assert_eq!(store.get_doc("docs", "a").unwrap().unwrap()["n"], 1);
+
+    let (_dir, path) = temp_fls();
+    let marker = vec![0xA5u8; 8193];
+    {
+        let file = File::create(&path).unwrap();
+        file.write_all_at(&marker, 0).unwrap();
+        file.sync_all().unwrap();
+    }
+    let err = match FerroStore::open(&path) {
+        Ok(_) => panic!("open rewrote a long headerless file into a store"),
+        Err(err) => err,
+    };
+    let msg = err.to_string();
+    assert!(
+        matches!(err, StoreError::Backend(_)) && msg.contains("no valid FerroStore superblock"),
+        "{msg}"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 8193);
+    let file = File::open(&path).unwrap();
+    let mut buf = vec![0u8; marker.len()];
+    file.read_exact_at(&mut buf, 0).unwrap();
+    assert_eq!(buf, marker);
+}
+
+#[test]
 fn checkpoint_compacts_the_wal_and_later_puts_survive_reopen() {
     let (_dir, path) = temp_fls();
     {
@@ -239,6 +281,53 @@ fn checkpoint_compacts_the_wal_and_later_puts_survive_reopen() {
     assert_eq!(store.get_doc("docs", "a").unwrap().unwrap()["n"], 1);
     assert_eq!(store.get_doc("docs", "c").unwrap().unwrap()["n"], 3);
     assert!(live(&path).wal_length > 0);
+}
+
+#[test]
+fn unpublished_snapshot_past_the_live_extent_keeps_committed_documents() {
+    let (_dir, path) = temp_fls();
+    {
+        let store = FerroStore::open(&path).unwrap();
+        store.put_doc("docs", "kept", &json!({ "n": 1 })).unwrap();
+        store.put_doc("docs", "also", &json!({ "n": 2 })).unwrap();
+    }
+    let before = live(&path);
+    let mut docs = BTreeMap::new();
+    docs.insert(("docs".into(), "kept".into()), json!({ "n": 99 }));
+    docs.insert(("docs".into(), "ghost".into()), json!({ "n": 7 }));
+    let blob = layout::encode_snapshot(99, &docs).unwrap();
+    let snap = layout::decode_snapshot(&blob).unwrap();
+    assert_eq!(snap.seq, 99);
+    assert_eq!(
+        snap.docs.get(&("docs".into(), "ghost".into())).unwrap()["n"],
+        7
+    );
+
+    {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (_, sb) = latest_superblock(&file).unwrap();
+        let live_end = sb
+            .snapshot_offset
+            .saturating_add(sb.snapshot_length)
+            .max(sb.wal_offset.saturating_add(sb.wal_length))
+            .max(layout::HEADER_BYTES);
+        let offset = file.metadata().unwrap().len().max(live_end);
+        assert!(offset >= live_end);
+        file.write_all_at(&blob, offset).unwrap();
+        file.sync_all().unwrap();
+        assert!(file.metadata().unwrap().len() > live_end);
+    }
+    assert_eq!(live(&path), before);
+
+    let store = FerroStore::open(&path).unwrap();
+    assert_eq!(store.get_doc("docs", "kept").unwrap().unwrap()["n"], 1);
+    assert_eq!(store.get_doc("docs", "also").unwrap().unwrap()["n"], 2);
+    assert!(store.get_doc("docs", "ghost").unwrap().is_none());
+    assert_eq!(live(&path), before);
 }
 
 #[test]
