@@ -964,6 +964,23 @@ fn tmux_session_name(tmux_target: &str) -> &str {
     tmux_target.split(':').next().unwrap_or(tmux_target)
 }
 
+/// The gate `teardown_session` runs before its first effect. A caller that wants to act on a
+/// teardown's behalf (such as archiving the session's artifacts) asks this first, so a refused
+/// teardown never causes a side effect and the decision stays in one place.
+pub fn authorize_teardown<S: AgentRegistry>(
+    store: &S,
+    target: &SessionTarget,
+    caller: Caller,
+) -> Result<(), LifecycleError> {
+    require_owner_for_unmanaged(
+        store,
+        caller,
+        &target.persona,
+        target.hosted.as_ref(),
+        OwnerGate::Decommission,
+    )
+}
+
 /// Phase two: drop queued prompts and routes, stop the runtime this lifecycle started, retire
 /// the agent, and mark the record `decommissioned`. Safe to repeat.
 ///
@@ -978,13 +995,7 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
     caller: Caller,
     mut clear_queue: impl FnMut(&str),
 ) -> Result<DecommissionResponse, LifecycleError> {
-    require_owner_for_unmanaged(
-        store,
-        caller,
-        &target.persona,
-        target.hosted.as_ref(),
-        OwnerGate::Decommission,
-    )?;
+    authorize_teardown(store, target, caller)?;
     let mut record = record_for_target(store, target)?;
     let agent = store.agent_by_name(&target.persona)?;
     // The tmux session name is the capitalised persona, so `claude:ada` and `codex:ada` share
