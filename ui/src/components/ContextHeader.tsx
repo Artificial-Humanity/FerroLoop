@@ -20,6 +20,8 @@ export interface ContextHeaderProps {
   onToggleTheme?: () => void;
   authority?: HubAuthority | null;
   wsConnected?: boolean;
+  onlineNodesCount?: number;
+  onOpenNodesModal?: () => void;
   onOpenPairingModal: () => void;
   onLogout?: () => void;
   onOpenMobileRoster?: () => void;
@@ -49,6 +51,8 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
   onToggleTheme,
   authority,
   wsConnected = false,
+  onlineNodesCount = 0,
+  onOpenNodesModal,
   onOpenPairingModal,
   onLogout,
   onOpenMobileRoster,
@@ -185,6 +189,18 @@ export const ContextHeader: React.FC<ContextHeaderProps> = ({
           <span className={`fd-dot ${wsConnected ? "fd-dot-alive" : "fd-dot-dead"}`} />
           WS
         </span>
+
+        {onOpenNodesModal && (
+          <button
+            type="button"
+            data-testid="nodes-modal-btn"
+            className="fd-btn"
+            onClick={onOpenNodesModal}
+          >
+            <span className={`fd-dot ${onlineNodesCount > 0 ? "fd-dot-alive" : "fd-dot-dead"}`} />
+            <span>{onlineNodesCount > 0 ? `Nodes (${onlineNodesCount})` : "Nodes"}</span>
+          </button>
+        )}
 
         <button
           type="button"

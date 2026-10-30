@@ -337,6 +337,96 @@ describe("HubApiClient", () => {
       "dead",
     );
   });
+
+  it("fetches nodes (gracefully returning [] on 404), creates enroll tokens, and revokes worker nodes", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    let return404 = true;
+
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, body });
+
+      if (url.endsWith("/api/v1/nodes") && method === "GET") {
+        if (return404) {
+          return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+        }
+        return new Response(
+          JSON.stringify({
+            nodes: [
+              {
+                node_id: "node-hub-01",
+                display_name: "ai-lab-0",
+                role: "hub",
+                hostname: "ai-lab-0",
+                os: "linux",
+                arch: "x86_64",
+                listen_addr: "127.0.0.1:8420",
+                capabilities: ["claude", "agy", "codex", "muse", "grok", "tmux"],
+                labels: ["primary"],
+                status: "online",
+                enrolled_at_ms: 1700000000000,
+                last_seen_at_ms: 1700000005000,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.endsWith("/api/v1/nodes/enroll-token") && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            code: "FLJOIN-998877",
+            expires_at_ms: 1700000600000,
+            ttl_secs: 600,
+            join_command: "fl hub join https://ferrodeck.ai-lab-0.mcfarlin.family --code FLJOIN-998877",
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.includes("/api/v1/nodes/") && method === "DELETE") {
+        return new Response(JSON.stringify({ revoked: true }), { status: 200 });
+      }
+
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    });
+
+    const client = new HubApiClient({
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    const emptyNodes = await client.fetchNodes();
+    expect(emptyNodes).toEqual([]);
+
+    return404 = false;
+    const populatedNodes = await client.fetchNodes();
+    expect(populatedNodes).toHaveLength(1);
+    expect(populatedNodes[0].node_id).toBe("node-hub-01");
+
+    const tok = await client.createNodeEnrollToken("macos-xcode", 600);
+    expect(tok.code).toBe("FLJOIN-998877");
+    expect(tok.join_command).toContain("fl hub join");
+
+    await client.revokeNode("worker/node 1");
+
+    expect(calls).toEqual([
+      { url: "/api/v1/nodes", method: "GET", body: undefined },
+      { url: "/api/v1/nodes", method: "GET", body: undefined },
+      {
+        url: "/api/v1/nodes/enroll-token",
+        method: "POST",
+        body: { label: "macos-xcode", ttl_secs: 600 },
+      },
+      {
+        url: "/api/v1/nodes/worker%2Fnode%201",
+        method: "DELETE",
+        body: undefined,
+      },
+    ]);
+  });
 });
 
 describe("HubWsClient", () => {

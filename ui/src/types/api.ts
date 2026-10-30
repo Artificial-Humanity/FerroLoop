@@ -807,6 +807,32 @@ export interface GateConnectorsResponse {
   connectors: GateConnectorSummary[];
 }
 
+export interface EnrolledNode {
+  node_id: string;
+  display_name: string;
+  role: "hub" | "worker";
+  hostname: string;
+  os: string;
+  arch: string;
+  listen_addr?: string | null;
+  capabilities: string[];
+  labels: string[];
+  status: "online" | "stale" | "offline" | "revoked";
+  enrolled_at_ms: number;
+  last_seen_at_ms: number;
+}
+
+export interface NodesResponse {
+  nodes?: EnrolledNode[];
+}
+
+export interface NodeEnrollTokenResponse {
+  code: string;
+  expires_at_ms: number;
+  ttl_secs: number;
+  join_command: string;
+}
+
 export interface HubWsFrame<T = unknown> {
   channel: "system" | "wire" | "session" | "workflow" | "terminal" | string;
   event: string;

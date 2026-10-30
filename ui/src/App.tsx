@@ -7,6 +7,7 @@ import { ChatPane } from "./components/ChatPane";
 import { COCKPIT_TABS, ContextHeader } from "./components/ContextHeader";
 import { GitPrPane } from "./components/GitPrPane";
 import { HubDrawer } from "./components/HubDrawer";
+import { NodesModal } from "./components/NodesModal";
 import { PairingModal } from "./components/PairingModal";
 import { OPEN_ARTIFACT_EVENT, normalizeArtifactTarget } from "./components/RichMarkdown";
 import { RosterSidebar } from "./components/RosterSidebar";
@@ -21,6 +22,7 @@ import {
   type ArchitectureResponse,
   type CockpitTab,
   type DiscoveredSessionSummary,
+  type EnrolledNode,
   type HubAuthority,
   type HubStatsResponse,
   type PrMergeRequest,
@@ -259,6 +261,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const [authority, setAuthority] = useState<HubAuthority | null>(null);
   const [pairingOpen, setPairingOpen] = useState<boolean>(false);
   const [pairingError, setPairingError] = useState<string | null>(null);
+  const [nodesModalOpen, setNodesModalOpen] = useState<boolean>(false);
+  const [nodes, setNodes] = useState<EnrolledNode[]>([]);
   const [wsConnected, setWsConnected] = useState<boolean>(false);
 
   // Navigation & Layout State
@@ -523,6 +527,15 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     }
   }, [apiClient]);
 
+  const refreshNodes = useCallback(async () => {
+    try {
+      const list = await apiClient.fetchNodes();
+      setNodes(list);
+    } catch {
+      // Ignore node refresh errors
+    }
+  }, [apiClient]);
+
   const loadAllInitialState = useCallback(async () => {
     setLoading(true);
     try {
@@ -537,6 +550,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         runsRes,
         archRes,
         statsRes,
+        nodesRes,
       ] = await Promise.all([
         apiClient.getAgents().catch(() => null),
         apiClient.getAgentsLiveness().catch(() => null),
@@ -548,7 +562,12 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         apiClient.getWorkflowRuns().catch(() => null),
         apiClient.getArchitecture().catch(() => null),
         apiClient.getStats().catch(() => null),
+        apiClient.fetchNodes().catch(() => null),
       ]);
+
+      if (nodesRes) {
+        setNodes(nodesRes);
+      }
 
       if (agentsRes) {
         if (agentsRes.agents && agentsRes.agents.length > 0) {
@@ -1109,6 +1128,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   const rightSplitTab: Exclude<CockpitTab, "chat"> =
     activeTab === "chat" ? secondaryTab : activeTab;
 
+  const onlineNodesCount = useMemo(
+    () => nodes.filter((n) => n.status === "online").length,
+    [nodes],
+  );
+
   return (
     <div className="fd-cockpit" data-testid="ferrodeck-cockpit">
       <RosterSidebar
@@ -1146,6 +1170,8 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           onToggleTheme={handleToggleTheme}
           authority={authority}
           wsConnected={wsConnected}
+          onlineNodesCount={onlineNodesCount}
+          onOpenNodesModal={() => setNodesModalOpen(true)}
           onOpenPairingModal={() => setPairingOpen(true)}
           onLogout={handleLogout}
           onOpenMobileRoster={() => setMobileRosterOpen((prev) => !prev)}
@@ -1212,6 +1238,22 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         onPairWithCode={handlePairWithCode}
         onPairWithToken={handlePairWithToken}
         error={pairingError}
+      />
+
+      <NodesModal
+        isOpen={nodesModalOpen}
+        onClose={() => setNodesModalOpen(false)}
+        nodes={nodes}
+        onRefreshNodes={refreshNodes}
+        onCreateEnrollToken={(label, ttlSecs) =>
+          apiClient.createNodeEnrollToken(label, ttlSecs)
+        }
+        onRevokeNode={async (nodeId) => {
+          await apiClient.revokeNode(nodeId);
+          setNodes((prev) => prev.filter((n) => n.node_id !== nodeId));
+          await refreshNodes();
+        }}
+        apiClient={apiClient}
       />
     </div>
   );
