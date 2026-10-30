@@ -667,6 +667,125 @@ fn connect_uri_mem_and_file_and_refuses_other_schemes() {
     }
 }
 
+#[test]
+fn with_write_is_one_frame_and_a_failure_or_empty_body_writes_nothing() {
+    let (_dir, path) = temp_fls();
+    let store = FerroStore::open(&path).unwrap();
+    store
+        .with_write(|txn| {
+            txn.put("c", "a", json!(1));
+            assert_eq!(txn.get("c", "a").unwrap(), json!(1));
+            txn.put("c", "a", json!(2));
+            assert_eq!(txn.get("c", "a").unwrap(), json!(2));
+            txn.put("c", "b", json!(3));
+            txn.delete("c", "b");
+            assert!(txn.get("c", "b").is_none());
+            txn.put("d", "z", json!(4));
+            let ids: Vec<_> = txn.scan("c").into_iter().map(|(id, _)| id).collect();
+            assert_eq!(ids, vec!["a".to_string()]);
+            assert!(txn.scan("missing").is_empty());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.get_doc("c", "a").unwrap().unwrap(), json!(2));
+    assert!(store.get_doc("c", "b").unwrap().is_none());
+    assert_eq!(store.get_doc("d", "z").unwrap().unwrap(), json!(4));
+
+    let err = store
+        .with_write(|txn| {
+            txn.put("c", "nope", json!(9));
+            Err::<(), _>(layout::backend("rollback"))
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("rollback"), "{err}");
+    assert!(store.get_doc("c", "nope").unwrap().is_none());
+
+    store
+        .with_write(|txn| {
+            assert_eq!(txn.get("c", "a").unwrap(), json!(2));
+            Ok(())
+        })
+        .unwrap();
+
+    store.checkpoint().unwrap();
+    assert_eq!(live(&path).snapshot_seq, 1);
+    assert_eq!(live(&path).wal_length, 0);
+
+    let mem = FerroStore::in_memory();
+    mem.with_write(|txn| {
+        txn.put("c", "a", json!("mem"));
+        assert_eq!(txn.scan("c").len(), 1);
+        txn.delete("c", "a");
+        assert!(txn.scan("c").is_empty());
+        txn.put("c", "b", json!(1));
+        Ok(())
+    })
+    .unwrap();
+    assert!(mem.get_doc("c", "a").unwrap().is_none());
+    assert_eq!(mem.get_doc("c", "b").unwrap().unwrap(), json!(1));
+    assert!(
+        mem.with_write(|txn| {
+            txn.put("c", "gone", json!(1));
+            Err::<(), _>(layout::backend("rollback"))
+        })
+        .is_err()
+    );
+    assert!(mem.get_doc("c", "gone").unwrap().is_none());
+}
+
+#[test]
+fn ferrostore_meets_the_store_contracts() {
+    use fl_core::conformance::{Single, SplitOver};
+    let fresh = || (FerroStore::in_memory(), ());
+    let single = || {
+        let (s, g) = fresh();
+        Single(s, g)
+    };
+    let split = || {
+        let (s, g) = fresh();
+        SplitOver(s, g)
+    };
+    fl_core::conformance::catalog(fresh);
+    fl_core::conformance::tracker(single);
+    fl_core::conformance::ledger(single);
+    fl_core::conformance::ledger(split);
+    fl_core::conformance::split_ledger(split);
+    fl_core::conformance::all_roles(single);
+    fl_core::conformance::local_handles(fresh);
+    fl_core::conformance::ledger_cache(fresh);
+    fl_core::conformance::agent_registry(fresh);
+    fl_core::conformance::state_store(fresh);
+    fl_core::conformance::message_store(fresh);
+    fl_core::conformance::workflow_store(fresh);
+    fl_core::conformance::escalations(|| {
+        let (s, g) = fresh();
+        Single(s, g)
+    });
+}
+
+#[test]
+fn project_record_and_state_survive_reopen() {
+    use fl_core::model::State;
+    use fl_core::store::{Catalog, Tracker};
+    let (_dir, path) = temp_fls();
+    let (project, record) = {
+        let store = FerroStore::open(&path).unwrap();
+        let project = store.add_project("/work/app").unwrap();
+        let record = store.add_record(&project, "keep this").unwrap();
+        store.set_record_state(&record, State::Doing).unwrap();
+        (project, record)
+    };
+    let store = FerroStore::open(&path).unwrap();
+    let loaded = store.get_project(&project).unwrap().expect("project");
+    assert_eq!(loaded.id, project);
+    assert_eq!(loaded.root, "/work/app");
+    let records = store.list_records(&project).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, record);
+    assert_eq!(records[0].title, "keep this");
+    assert_eq!(records[0].state, State::Doing);
+}
+
 struct RemoveDir(PathBuf);
 
 impl Drop for RemoveDir {

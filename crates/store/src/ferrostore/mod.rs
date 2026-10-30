@@ -1,8 +1,13 @@
 //! Document store and FerroMQ log in a `.fls` file.
 //! See `docs/ferrostore-spec.md`.
 
+mod doc;
 mod layout;
 mod state;
+mod traits_catalog;
+mod traits_state;
+mod traits_wire;
+mod traits_workflow;
 
 #[cfg(test)]
 mod tests;
@@ -13,10 +18,10 @@ use layout::{
     encode_frame, encode_snapshot, encode_superblock, parse_superblock,
 };
 use serde_json::Value;
-use state::{DocState, apply_commit, apply_frames, next_mq_seq, unread_mq};
+use state::{DocState, apply_commit, apply_frames, commit_ops, next_mq_seq, unread_mq};
 
 pub use state::MqRecord;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
@@ -71,6 +76,53 @@ struct Disk {
     read: File,
 }
 
+/// One transaction: a clone of the document map plus the ops that produced it.
+/// `get` / `put` / `delete` / `scan` all see earlier writes in this transaction.
+struct Txn {
+    docs: BTreeMap<(String, String), Value>,
+    ops: Vec<Op>,
+}
+
+impl Txn {
+    fn get(&self, collection: &str, id: &str) -> Option<Value> {
+        self.docs
+            .get(&(collection.to_string(), id.to_string()))
+            .cloned()
+    }
+
+    fn put(&mut self, collection: impl Into<String>, id: impl Into<String>, doc: Value) {
+        let collection = collection.into();
+        let id = id.into();
+        self.docs
+            .insert((collection.clone(), id.clone()), doc.clone());
+        self.ops.push(Op::Put {
+            collection,
+            id,
+            doc,
+        });
+    }
+
+    fn delete(&mut self, collection: impl Into<String>, id: impl Into<String>) {
+        let collection = collection.into();
+        let id = id.into();
+        self.docs.remove(&(collection.clone(), id.clone()));
+        self.ops.push(Op::Delete { collection, id });
+    }
+
+    /// Every document in `collection`, in document-id order.
+    fn scan(&self, collection: &str) -> Vec<(String, Value)> {
+        let start = (collection.to_string(), String::new());
+        let mut out = Vec::new();
+        for ((coll, id), doc) in self.docs.range(start..) {
+            if coll != collection {
+                break;
+            }
+            out.push((id.clone(), doc.clone()));
+        }
+        out
+    }
+}
+
 /// Phase 1 document store and FerroMQ log.
 ///
 /// `mem://` keeps the map in this process. `file://` is a `.fls` container:
@@ -78,6 +130,8 @@ struct Disk {
 pub struct FerroStore {
     inner: Inner,
     subs: Mutex<HashMap<String, Vec<Sender<MqRecord>>>>,
+    /// Named in `NotOwned`: where a lookup looked.
+    label: String,
 }
 
 impl FerroStore {
@@ -86,6 +140,7 @@ impl FerroStore {
         Self {
             inner: Inner::Memory(Mutex::new(DocState::default())),
             subs: Mutex::new(HashMap::new()),
+            label: "mem://".to_string(),
         }
     }
 
@@ -112,6 +167,7 @@ impl FerroStore {
                 read,
             }),
             subs: Mutex::new(HashMap::new()),
+            label: path.display().to_string(),
         })
     }
 
@@ -255,10 +311,47 @@ impl FerroStore {
         rx
     }
 
+    fn with_read<T>(
+        &self,
+        body: impl FnOnce(&Txn) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let state = self.read_state()?;
+        let txn = Txn {
+            docs: state.docs,
+            ops: Vec::new(),
+        };
+        body(&txn)
+    }
+
     fn read_state(&self) -> Result<DocState, StoreError> {
         match &self.inner {
             Inner::Memory(state) => Ok(lock_mutex(state).clone()),
             Inner::Disk(disk) => Ok(read_consistent(&disk.read)?.2),
+        }
+    }
+
+    /// Run `body` against a cloned document map.
+    ///
+    /// Memory holds the document mutex for the whole call. Disk takes `LOCK_EX`,
+    /// re-reads a consistent snapshot, then builds the transaction from that
+    /// state. `Ok` with at least one op appends one WAL frame (`seq = last_seq + 1`)
+    /// and publishes one superblock. `Err` or an empty op list writes nothing.
+    fn with_write<T>(
+        &self,
+        body: impl FnOnce(&mut Txn) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        match &self.inner {
+            Inner::Memory(slot) => {
+                let mut state = lock_mutex(slot);
+                let mut txn = Txn {
+                    docs: state.docs.clone(),
+                    ops: Vec::new(),
+                };
+                let result = body(&mut txn)?;
+                commit_ops(&mut state, &txn.ops)?;
+                Ok(result)
+            }
+            Inner::Disk(disk) => with_write_disk(disk, body),
         }
     }
 
@@ -300,6 +393,30 @@ fn file_uri_path(rest: &str) -> String {
         return "/".to_string();
     }
     rest.to_string()
+}
+
+fn with_write_disk<T>(
+    disk: &Disk,
+    body: impl FnOnce(&mut Txn) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let file = lock_mutex(&disk.write);
+    let _locked = FlockGuard::acquire(file.as_raw_fd())?;
+    let (index, sb, state) = read_consistent(&file)?;
+    let seq_base = state.last_seq;
+    let mut txn = Txn {
+        docs: state.docs,
+        ops: Vec::new(),
+    };
+    let result = body(&mut txn)?;
+    if txn.ops.is_empty() {
+        return Ok(result);
+    }
+    let seq = seq_base
+        .checked_add(1)
+        .ok_or_else(|| backend("transaction sequence overflow"))?;
+    let frame = encode_frame(seq, &txn.ops)?;
+    append_frame(&file, index, &sb, &frame)?;
+    Ok(result)
 }
 
 fn commit_disk<T>(

@@ -33,11 +33,21 @@ pub struct MqRecord {
 }
 
 pub(super) fn apply_commit(state: &mut DocState, op: Op) -> Result<(), StoreError> {
+    commit_ops(state, &[op])
+}
+
+/// Apply every op, then advance `last_seq` by one. An empty list writes nothing.
+pub(super) fn commit_ops(state: &mut DocState, ops: &[Op]) -> Result<(), StoreError> {
+    if ops.is_empty() {
+        return Ok(());
+    }
     let seq = state
         .last_seq
         .checked_add(1)
         .ok_or_else(|| backend("transaction sequence overflow"))?;
-    apply_op(state, &op);
+    for op in ops {
+        apply_op(state, op);
+    }
     state.last_seq = seq;
     Ok(())
 }
