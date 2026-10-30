@@ -529,9 +529,11 @@ impl RecordEnvelope {
                     .checked_mul(4)
                     .ok_or_else(|| backend("truncated record envelope"))?;
                 let raw = frame.take(byte_len)?;
+                let (chunks, _) = raw.as_chunks::<4>();
                 Some(
-                    raw.chunks_exact(4)
-                        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    chunks
+                        .iter()
+                        .map(|chunk| f32::from_le_bytes(*chunk))
                         .collect(),
                 )
             }
