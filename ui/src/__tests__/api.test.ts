@@ -526,6 +526,129 @@ describe("HubApiClient", () => {
       },
     ]);
   });
+
+  it("calls interruptSession, setSessionModel, bulkSessionAction, and listSlashCommands (with 404 fallback)", async () => {
+    const calls: Array<{ url: string; method: string; body?: unknown }> = [];
+    let commands404 = true;
+
+    const mockFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const method = init?.method ?? "GET";
+      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+      calls.push({ url, method, body });
+
+      if (url.includes("/interrupt") && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            session_id: "sess-ferris-01",
+            interrupted: true,
+            vendor: "claude",
+            method: "sigint",
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.includes("/model") && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            session_id: "sess-ferris-01",
+            vendor: "claude",
+            model: body.model,
+            switched: true,
+            method: "slash_model",
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.endsWith("/api/v1/sessions/bulk-action") && method === "POST") {
+        return new Response(
+          JSON.stringify({
+            action: body.action,
+            total: 3,
+            succeeded: 3,
+            results: [
+              { session_id: "s1", ok: true },
+              { session_id: "s2", ok: true },
+              { session_id: "s3", ok: true },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
+      if (url.endsWith("/api/v1/commands") && method === "GET") {
+        if (commands404) {
+          return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+        }
+        return new Response(
+          JSON.stringify({
+            commands: [
+              { name: "compact", kind: "command", description: "Compact context" },
+              { name: "subagent-dev", kind: "skill", description: "Subagent dev" },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    });
+
+    const client = new HubApiClient({
+      fetchImpl: mockFetch as unknown as typeof fetch,
+    });
+
+    const intRes = await client.interruptSession("sess/ferris 01");
+    expect(intRes.interrupted).toBe(true);
+    expect(intRes.method).toBe("sigint");
+
+    const modelRes = await client.setSessionModel("sess-ferris-01", "claude-opus-4-7");
+    expect(modelRes.switched).toBe(true);
+    expect(modelRes.model).toBe("claude-opus-4-7");
+
+    const bulkRes = await client.bulkSessionAction("compact");
+    expect(bulkRes.action).toBe("compact");
+    expect(bulkRes.succeeded).toBe(3);
+
+    const fallbackCmds = await client.listSlashCommands();
+    expect(fallbackCmds.commands.length).toBeGreaterThanOrEqual(8);
+    expect(fallbackCmds.commands.some((c) => c.name === "compact")).toBe(true);
+
+    commands404 = false;
+    const serverCmds = await client.listSlashCommands();
+    expect(serverCmds.commands).toHaveLength(2);
+    expect(serverCmds.commands[1].name).toBe("subagent-dev");
+
+    expect(calls).toEqual([
+      {
+        url: "/api/v1/sessions/sess%2Fferris%2001/interrupt",
+        method: "POST",
+        body: {},
+      },
+      {
+        url: "/api/v1/sessions/sess-ferris-01/model",
+        method: "POST",
+        body: { model: "claude-opus-4-7" },
+      },
+      {
+        url: "/api/v1/sessions/bulk-action",
+        method: "POST",
+        body: { action: "compact" },
+      },
+      {
+        url: "/api/v1/commands",
+        method: "GET",
+        body: undefined,
+      },
+      {
+        url: "/api/v1/commands",
+        method: "GET",
+        body: undefined,
+      },
+    ]);
+  });
 });
 
 describe("HubWsClient", () => {
