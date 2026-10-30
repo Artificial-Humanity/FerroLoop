@@ -13,8 +13,10 @@ pub mod registry;
 pub mod vault;
 
 pub use adapter::{
-    McpRegistryAdapter, McpRelayAdapter, RegistryTier, TieredRegistryEntry, forward_mcp_relay,
-    handle_tiered_registry_v01_get,
+    EdgeGuardAdapter, ExternalSecret, GuardStage, GuardVerdict, IamDecision, McpRegistryAdapter,
+    McpRelayAdapter, RegistryTier, SecretProviderAdapter, TieredRegistryEntry, authorize_mcp_tool,
+    evaluate_edge_guard, forward_mcp_relay, handle_tiered_registry_v01_get,
+    publish_connectors_to_registry, resolve_vault_secret,
 };
 pub use bridge::{
     BridgeConfig, BridgeDispatchPlan, BridgeTarget, InboundBridgeEvent,
@@ -24,11 +26,15 @@ pub use connector::{
     ConnectorManifest, ConnectorToolDef, discover_connectors, import_openapi_to_connector,
     project_response_body,
 };
-pub use mcp::{build_mcp_tools_list, handle_mcp_jsonrpc_request};
+pub use mcp::{
+    build_mcp_tools_list, handle_mcp_jsonrpc_request,
+    handle_mcp_jsonrpc_request_with_secret_provider,
+};
 pub use proxy::{
     PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX, PreparedProxyRequest, ProxyRequest, ProxyResponse,
-    execute_proxied_request, extract_placeholder_keys, host_matches_pattern,
-    is_private_or_loopback_ip, parse_url_scheme_host_port, prepare_proxied_request, scrub_secrets,
+    execute_proxied_request, execute_proxied_request_with_provider, extract_placeholder_keys,
+    host_matches_pattern, is_private_or_loopback_ip, parse_url_scheme_host_port,
+    prepare_proxied_request, prepare_proxied_request_with_provider, scrub_secrets,
     verify_host_ssrf,
 };
 pub use registry::{connector_to_registry_entry, handle_registry_v01_get};

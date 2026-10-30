@@ -10,6 +10,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize};
 
 use crate::GateError;
+use crate::adapter::{SecretProviderAdapter, resolve_vault_secret};
 use crate::vault::{Vault, normalize_secret_name};
 
 pub const PLACEHOLDER_PREFIX: &str = "{{FERROGATE:";
@@ -222,12 +223,39 @@ pub fn verify_host_ssrf(
     Ok(())
 }
 
+struct PreparedSecrets {
+    request: PreparedProxyRequest,
+    /// Plaintext from a provider, not the local vault. Scrubbed on the way out.
+    external_plaintexts: Vec<(String, String)>,
+}
+
 /// Validate all `{{FERROGATE:KEY}}` placeholders in `req` against `vault` policies and SSRF rules,
 /// returning a [`PreparedProxyRequest`] ready for transport execution.
 pub fn prepare_proxied_request(
     vault: &Vault,
     req: &ProxyRequest,
 ) -> Result<PreparedProxyRequest, GateError> {
+    prepare_proxied_request_with_provider(vault, req, None)
+}
+
+/// [`prepare_proxied_request`] with an optional external secret provider.
+///
+/// A local hit does not call `provider`. Host, method, agent, and https checks use the
+/// resolved metadata. SSRF still requires `vault.get_metadata` to allow a private network,
+/// so an external `allow_private_network` flag cannot bypass it.
+pub fn prepare_proxied_request_with_provider(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+) -> Result<PreparedProxyRequest, GateError> {
+    Ok(prepare_proxied_request_inner(vault, req, provider)?.request)
+}
+
+fn prepare_proxied_request_inner(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+) -> Result<PreparedSecrets, GateError> {
     let method = req.method.trim().to_ascii_uppercase();
     if method.is_empty() {
         return Err(GateError::InvalidUrl {
@@ -269,10 +297,15 @@ pub fn prepare_proxied_request(
     let (scheme, host, port) = parse_url_scheme_host_port(&req.url)?;
 
     let mut decrypted_map = BTreeMap::new();
+    let mut external_plaintexts = Vec::new();
     let mut allow_private = false;
 
     for secret_name in &referenced {
-        let (meta, secret_val) = vault.decrypt_raw(secret_name)?;
+        let (meta, secret_val) =
+            resolve_vault_secret(vault, provider, secret_name, req.caller_agent.as_deref())?;
+        if vault.get_metadata(secret_name).is_none() {
+            external_plaintexts.push((secret_name.clone(), secret_val.clone()));
+        }
 
         if !meta.allow_private_network && scheme != "https" {
             return Err(GateError::PolicyDenied {
@@ -377,13 +410,16 @@ pub fn prepare_proxied_request(
         );
     }
 
-    Ok(PreparedProxyRequest {
-        method,
-        url: final_url,
-        host,
-        headers: final_headers,
-        body: final_body,
-        injected_secrets,
+    Ok(PreparedSecrets {
+        request: PreparedProxyRequest {
+            method,
+            url: final_url,
+            host,
+            headers: final_headers,
+            body: final_body,
+            injected_secrets,
+        },
+        external_plaintexts,
     })
 }
 
@@ -477,6 +513,35 @@ fn simple_percent_encode(s: &str) -> String {
     out
 }
 
+/// Redact injected external plaintext of length >= 4. Vault values stay in [`scrub_secrets`].
+fn redact_external_plaintexts(text: &str, external: &[(String, String)]) -> (String, Vec<String>) {
+    let mut scrubbed = text.to_string();
+    let mut matched = Vec::new();
+    for (name, secret) in external {
+        if secret.len() < 4 || !scrubbed.contains(secret) {
+            continue;
+        }
+        let replacement = format!("[REDACTED:FERROGATE:{name}]");
+        scrubbed = scrubbed.replace(secret, &replacement);
+        if !matched.iter().any(|existing: &String| existing == name) {
+            matched.push(name.clone());
+        }
+    }
+    (scrubbed, matched)
+}
+
+fn scrub_with_external(
+    vault: &Vault,
+    text: &str,
+    external: &[(String, String)],
+) -> (String, BTreeSet<String>) {
+    let (scrubbed, hits) = scrub_secrets(vault, text);
+    let mut names: BTreeSet<String> = hits.into_iter().collect();
+    let (scrubbed, extra) = redact_external_plaintexts(&scrubbed, external);
+    names.extend(extra);
+    (scrubbed, names)
+}
+
 /// Execute `req` through the zero-knowledge credential proxy (`prepare_proxied_request`),
 /// disabling automatic redirect following so credentials are never forwarded cross-origin,
 /// and scrubbing any secret values from the response body and headers.
@@ -484,7 +549,20 @@ pub fn execute_proxied_request(
     vault: &Vault,
     req: &ProxyRequest,
 ) -> Result<ProxyResponse, GateError> {
-    let prepared = prepare_proxied_request(vault, req)?;
+    execute_proxied_request_with_provider(vault, req, None)
+}
+
+/// [`execute_proxied_request`] with an optional external secret provider.
+///
+/// Response and upstream error text also redact injected external plaintext of length >= 4.
+pub fn execute_proxied_request_with_provider(
+    vault: &Vault,
+    req: &ProxyRequest,
+    provider: Option<&dyn SecretProviderAdapter>,
+) -> Result<ProxyResponse, GateError> {
+    let prepared_secrets = prepare_proxied_request_inner(vault, req, provider)?;
+    let prepared = prepared_secrets.request;
+    let external = prepared_secrets.external_plaintexts;
     let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(30).clamp(1, 300));
 
     let config = ureq::Agent::config_builder()
@@ -546,7 +624,7 @@ pub fn execute_proxied_request(
     };
 
     let mut resp = send_result.map_err(|e| {
-        let (scrubbed_err, _) = scrub_secrets(vault, &e.to_string());
+        let (scrubbed_err, _) = scrub_with_external(vault, &e.to_string(), &external);
         GateError::UpstreamHttp {
             cause: scrubbed_err,
         }
@@ -557,19 +635,15 @@ pub fn execute_proxied_request(
     let mut scrubbed_names = BTreeSet::new();
     for (hk, hv) in resp.headers() {
         if let Ok(val_str) = hv.to_str() {
-            let (clean_v, hits) = scrub_secrets(vault, val_str);
-            for h in hits {
-                scrubbed_names.insert(h);
-            }
+            let (clean_v, hits) = scrub_with_external(vault, val_str, &external);
+            scrubbed_names.extend(hits);
             resp_headers.insert(hk.as_str().to_ascii_lowercase(), clean_v);
         }
     }
 
     let raw_body = resp.body_mut().read_to_string().unwrap_or_default();
-    let (clean_body, body_hits) = scrub_secrets(vault, &raw_body);
-    for h in body_hits {
-        scrubbed_names.insert(h);
-    }
+    let (clean_body, body_hits) = scrub_with_external(vault, &raw_body, &external);
+    scrubbed_names.extend(body_hits);
 
     Ok(ProxyResponse {
         status,

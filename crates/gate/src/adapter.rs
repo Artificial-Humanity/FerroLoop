@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::GateError;
 use crate::connector::ConnectorManifest;
 use crate::registry::{self, connector_to_registry_entry};
+use crate::vault::{Vault, VaultSecretMetadata};
 
 /// Where a registry row was discovered.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +32,24 @@ pub trait McpRegistryAdapter: Send + Sync {
     fn tier(&self) -> RegistryTier;
 
     fn list_servers(&self) -> Result<Vec<Value>, GateError>;
+
+    /// Publish registry rows. The default accepts them and reports nothing published.
+    fn publish_servers(&self, _entries: &[Value]) -> Result<usize, GateError> {
+        Ok(0)
+    }
+}
+
+/// Map `connectors` with [`connector_to_registry_entry`] and publish that list.
+pub fn publish_connectors_to_registry(
+    connectors: &[ConnectorManifest],
+    hub_base_url: &str,
+    adapter: &dyn McpRegistryAdapter,
+) -> Result<usize, GateError> {
+    let entries: Vec<Value> = connectors
+        .iter()
+        .map(|connector| connector_to_registry_entry(connector, hub_base_url))
+        .collect();
+    adapter.publish_servers(&entries)
 }
 
 /// Forwards one MCP JSON-RPC request to a remote connector.
@@ -112,6 +131,136 @@ pub fn forward_mcp_relay(
     adapter.forward_jsonrpc(connector_id, request)
 }
 
+/// IAM allow or deny. `Deny` names the policy that refused the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IamDecision {
+    Allow,
+    Deny { policy: String, reason: String },
+}
+
+/// A secret resolved outside the local vault. `value` is plaintext.
+#[derive(Debug, Clone)]
+pub struct ExternalSecret {
+    pub metadata: VaultSecretMetadata,
+    pub value: String,
+}
+
+/// Google Cloud Secret Manager and IAM, without a cloud SDK.
+pub trait SecretProviderAdapter: Send + Sync {
+    fn provider_name(&self) -> &str;
+
+    fn resolve_secret(
+        &self,
+        name: &str,
+        caller_agent: Option<&str>,
+    ) -> Result<Option<ExternalSecret>, GateError>;
+
+    fn check_tool_authorization(
+        &self,
+        _caller_agent: Option<&str>,
+        _connector_id: &str,
+        _tool_name: &str,
+    ) -> Result<IamDecision, GateError> {
+        Ok(IamDecision::Allow)
+    }
+}
+
+/// Local ciphertext first. A provider runs only for [`GateError::NoSuchSecret`].
+pub fn resolve_vault_secret(
+    vault: &Vault,
+    provider: Option<&dyn SecretProviderAdapter>,
+    name: &str,
+    caller_agent: Option<&str>,
+) -> Result<(VaultSecretMetadata, String), GateError> {
+    match vault.decrypt_raw(name) {
+        Ok(pair) => Ok(pair),
+        Err(GateError::NoSuchSecret { name }) => {
+            let Some(provider) = provider else {
+                return Err(GateError::NoSuchSecret { name });
+            };
+            match provider.resolve_secret(&name, caller_agent)? {
+                Some(secret) => Ok((secret.metadata, secret.value)),
+                None => Err(GateError::NoSuchSecret { name }),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// `Allow` is success. `Deny` is [`GateError::PolicyDenied`] with `secret` set to `policy`.
+pub fn authorize_mcp_tool(
+    provider: &dyn SecretProviderAdapter,
+    caller_agent: Option<&str>,
+    connector_id: &str,
+    tool_name: &str,
+) -> Result<(), GateError> {
+    match provider.check_tool_authorization(caller_agent, connector_id, tool_name)? {
+        IamDecision::Allow => Ok(()),
+        IamDecision::Deny { policy, reason } => Err(GateError::PolicyDenied {
+            secret: policy,
+            reason,
+        }),
+    }
+}
+
+/// Where an edge guard inspects a payload. Not wired into the MCP handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardStage {
+    AttemptPrompt,
+    WireMessage,
+    McpToolInput,
+    McpToolOutput,
+    InboundWebhook,
+}
+
+/// Model Armor style verdict. No cloud SDK is linked here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardVerdict {
+    Allow,
+    Sanitize {
+        redacted_payload: String,
+        findings: Vec<String>,
+    },
+    Block {
+        rule_id: String,
+        reason: String,
+    },
+}
+
+/// Inspect one payload. The store and the hub do not call this.
+pub trait EdgeGuardAdapter: Send + Sync {
+    fn provider_name(&self) -> &str;
+
+    fn inspect_payload(
+        &self,
+        stage: GuardStage,
+        caller_agent: Option<&str>,
+        target: &str,
+        payload: &str,
+    ) -> Result<GuardVerdict, GateError>;
+}
+
+/// `Allow` returns `payload`. `Sanitize` returns the redacted text.
+/// `Block` is [`GateError::PolicyDenied`] with `secret` `edge-guard:{rule_id}`.
+pub fn evaluate_edge_guard(
+    guard: &dyn EdgeGuardAdapter,
+    stage: GuardStage,
+    caller_agent: Option<&str>,
+    target: &str,
+    payload: &str,
+) -> Result<String, GateError> {
+    match guard.inspect_payload(stage, caller_agent, target, payload)? {
+        GuardVerdict::Allow => Ok(payload.to_string()),
+        GuardVerdict::Sanitize {
+            redacted_payload, ..
+        } => Ok(redacted_payload),
+        GuardVerdict::Block { rule_id, reason } => Err(GateError::PolicyDenied {
+            secret: format!("edge-guard:{rule_id}"),
+            reason,
+        }),
+    }
+}
+
 fn tier_label(tier: &RegistryTier) -> &'static str {
     match tier {
         RegistryTier::LocalMachine => "local",
@@ -164,8 +313,14 @@ fn push_unique(entries: &mut Vec<Value>, entry: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::ConnectorManifest;
+    use crate::connector::{ConnectorManifest, ConnectorToolDef};
+    use crate::mcp::handle_mcp_jsonrpc_request_with_secret_provider;
+    use crate::proxy::{
+        ProxyRequest, prepare_proxied_request, prepare_proxied_request_with_provider,
+    };
+    use crate::vault::{SetSecretArgs, Vault, load_or_init_master_key};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn manifest(id: &str, description: &str) -> ConnectorManifest {
         ConnectorManifest {
@@ -387,5 +542,456 @@ mod tests {
             err,
             GateError::Adapter { ref provider, .. } if provider == "cloud-run"
         ));
+    }
+
+    struct RecPublish {
+        seen: Mutex<Vec<Value>>,
+    }
+
+    impl McpRegistryAdapter for RecPublish {
+        fn provider_name(&self) -> &str {
+            "publish"
+        }
+
+        fn tier(&self) -> RegistryTier {
+            RegistryTier::CloudProvider {
+                provider: "gcp".into(),
+            }
+        }
+
+        fn list_servers(&self) -> Result<Vec<Value>, GateError> {
+            Ok(Vec::new())
+        }
+
+        fn publish_servers(&self, entries: &[Value]) -> Result<usize, GateError> {
+            *self.seen.lock().unwrap() = entries.to_vec();
+            Ok(3)
+        }
+    }
+
+    #[test]
+    fn publish_connectors_to_registry_maps_entries_and_returns_the_adapter_count() {
+        let connectors = vec![manifest("shared", "local shared"), manifest("other", "doc")];
+        let adapter = RecPublish {
+            seen: Mutex::new(Vec::new()),
+        };
+        let hub = "http://127.0.0.1:8420";
+        let count = publish_connectors_to_registry(&connectors, hub, &adapter).unwrap();
+        assert_eq!(count, 3);
+        let seen = adapter.seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        for (connector, entry) in connectors.iter().zip(seen.iter()) {
+            assert_eq!(entry, &connector_to_registry_entry(connector, hub));
+            assert_eq!(
+                entry["server"]["name"],
+                format!("io.ferroloop.gate/{}", connector.id)
+            );
+            let url = entry["server"]["remotes"][0]["url"].as_str().unwrap();
+            assert!(url.contains(hub), "{url}");
+            assert!(url.contains(&connector.id), "{url}");
+        }
+
+        let listing = ListAdapter {
+            name: "local",
+            tier: RegistryTier::LocalMachine,
+            servers: Vec::new(),
+        };
+        assert_eq!(
+            publish_connectors_to_registry(&connectors, hub, &listing).unwrap(),
+            0
+        );
+    }
+
+    fn external_meta(name: &str, hosts: &[&str], allow_private: bool) -> VaultSecretMetadata {
+        VaultSecretMetadata {
+            name: name.into(),
+            description: None,
+            allowed_hosts: hosts.iter().map(|host| (*host).to_string()).collect(),
+            allowed_methods: Vec::new(),
+            allowed_agents: Vec::new(),
+            allow_private_network: allow_private,
+            created_at: "2026-10-30T00:00:00Z".into(),
+            updated_at: "2026-10-30T00:00:00Z".into(),
+            lease_ttl_secs: None,
+            expires_at: None,
+        }
+    }
+
+    struct CountingProvider {
+        calls: AtomicUsize,
+        secret: Mutex<Option<ExternalSecret>>,
+        decision: Mutex<IamDecision>,
+        fail: Mutex<Option<GateError>>,
+    }
+
+    impl CountingProvider {
+        fn with_secret(secret: Option<ExternalSecret>) -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                secret: Mutex::new(secret),
+                decision: Mutex::new(IamDecision::Allow),
+                fail: Mutex::new(None),
+            }
+        }
+    }
+
+    impl SecretProviderAdapter for CountingProvider {
+        fn provider_name(&self) -> &str {
+            "gcp-sm"
+        }
+
+        fn resolve_secret(
+            &self,
+            name: &str,
+            _caller_agent: Option<&str>,
+        ) -> Result<Option<ExternalSecret>, GateError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(err) = self.fail.lock().unwrap().take() {
+                return Err(err);
+            }
+            Ok(self
+                .secret
+                .lock()
+                .unwrap()
+                .clone()
+                .filter(|secret| secret.metadata.name == name))
+        }
+
+        fn check_tool_authorization(
+            &self,
+            _caller_agent: Option<&str>,
+            _connector_id: &str,
+            _tool_name: &str,
+        ) -> Result<IamDecision, GateError> {
+            if let Some(err) = self.fail.lock().unwrap().take() {
+                return Err(err);
+            }
+            Ok(self.decision.lock().unwrap().clone())
+        }
+    }
+
+    struct DefaultAllow;
+
+    impl SecretProviderAdapter for DefaultAllow {
+        fn provider_name(&self) -> &str {
+            "default"
+        }
+
+        fn resolve_secret(
+            &self,
+            _name: &str,
+            _caller_agent: Option<&str>,
+        ) -> Result<Option<ExternalSecret>, GateError> {
+            Ok(None)
+        }
+    }
+
+    fn open_vault() -> (tempfile::TempDir, Vault) {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = load_or_init_master_key(&tmp.path().join("vault.key")).unwrap();
+        let vault = Vault::open(tmp.path().join("vault.enc"), key).unwrap();
+        (tmp, vault)
+    }
+
+    fn proxy_req(url: &str) -> ProxyRequest {
+        ProxyRequest {
+            method: "GET".into(),
+            url: url.into(),
+            headers: BTreeMap::new(),
+            body: None,
+            caller_agent: Some("felicia".into()),
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn secret_provider_prefers_the_local_vault_and_keeps_proxy_policy() {
+        let (_tmp, mut vault) = open_vault();
+        vault
+            .set(SetSecretArgs {
+                name: "LOCAL_KEY".into(),
+                value: "local-secret-value".into(),
+                allowed_hosts: vec!["example.com".into()],
+                ..SetSecretArgs::default()
+            })
+            .unwrap();
+        let provider = CountingProvider::with_secret(Some(ExternalSecret {
+            metadata: external_meta("EXT_KEY", &["example.com"], false),
+            value: "external-secret-value".into(),
+        }));
+        let (meta, value) =
+            resolve_vault_secret(&vault, Some(&provider), "LOCAL_KEY", Some("felicia")).unwrap();
+        assert_eq!(value, "local-secret-value");
+        assert_eq!(meta.name, "LOCAL_KEY");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let (meta, value) =
+            resolve_vault_secret(&vault, Some(&provider), "EXT_KEY", Some("felicia")).unwrap();
+        assert_eq!(value, "external-secret-value");
+        assert_eq!(meta.allowed_hosts, vec!["example.com".to_string()]);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        let missing = resolve_vault_secret(&vault, Some(&provider), "missing", None).unwrap_err();
+        assert!(
+            matches!(missing, GateError::NoSuchSecret { ref name } if name == "MISSING"),
+            "{missing}"
+        );
+
+        let invalid = resolve_vault_secret(&vault, Some(&provider), "bad name", None).unwrap_err();
+        assert!(
+            matches!(invalid, GateError::InvalidSecret { .. }),
+            "{invalid}"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+        let none = CountingProvider::with_secret(None);
+        let err = resolve_vault_secret(&vault, Some(&none), "ABSENT", None).unwrap_err();
+        assert!(matches!(err, GateError::NoSuchSecret { ref name } if name == "ABSENT"));
+
+        assert!(matches!(
+            authorize_mcp_tool(&DefaultAllow, None, "discord", "send"),
+            Ok(())
+        ));
+        assert!(matches!(
+            DefaultAllow.check_tool_authorization(None, "discord", "send"),
+            Ok(IamDecision::Allow)
+        ));
+        *provider.decision.lock().unwrap() = IamDecision::Deny {
+            policy: "organizations/1/policy".into(),
+            reason: "no binding".into(),
+        };
+        let denied = authorize_mcp_tool(&provider, Some("felicia"), "discord", "send").unwrap_err();
+        match denied {
+            GateError::PolicyDenied { secret, reason } => {
+                assert_eq!(secret, "organizations/1/policy");
+                assert_eq!(reason, "no binding");
+            }
+            other => panic!("{other}"),
+        }
+        *provider.fail.lock().unwrap() = Some(GateError::Adapter {
+            provider: "gcp-sm".into(),
+            reason: "iam down".into(),
+        });
+        let failed = authorize_mcp_tool(&provider, None, "discord", "send").unwrap_err();
+        assert!(
+            matches!(failed, GateError::Adapter { ref reason, .. } if reason == "iam down"),
+            "{failed}"
+        );
+
+        let prepared = prepare_proxied_request_with_provider(
+            &vault,
+            &proxy_req("https://example.com/q?token={{FERROGATE:EXT_KEY}}"),
+            Some(&provider),
+        )
+        .unwrap();
+        assert!(
+            prepared.url.contains("external-secret-value"),
+            "{}",
+            prepared.url
+        );
+        assert!(!prepared.url.contains("{{FERROGATE:"));
+        assert_eq!(prepared.host, "example.com");
+
+        let denied_host = prepare_proxied_request_with_provider(
+            &vault,
+            &proxy_req("https://evil.example/q?token={{FERROGATE:EXT_KEY}}"),
+            Some(&provider),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(denied_host, GateError::PolicyDenied { .. }),
+            "{denied_host}"
+        );
+
+        let provider = CountingProvider::with_secret(Some(ExternalSecret {
+            metadata: external_meta("EXT_KEY", &["127.0.0.1"], true),
+            value: "external-secret-value".into(),
+        }));
+        let ssrf = prepare_proxied_request_with_provider(
+            &vault,
+            &proxy_req("http://127.0.0.1/q?token={{FERROGATE:EXT_KEY}}"),
+            Some(&provider),
+        )
+        .unwrap_err();
+        assert!(matches!(ssrf, GateError::SsrfBlocked { .. }), "{ssrf}");
+
+        let absent = prepare_proxied_request(
+            &vault,
+            &proxy_req("https://example.com/q?token={{FERROGATE:NOT_THERE}}"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(absent, GateError::NoSuchSecret { ref name } if name == "NOT_THERE"),
+            "{absent}"
+        );
+    }
+
+    fn connector_with_tool() -> ConnectorManifest {
+        ConnectorManifest {
+            id: "discord".into(),
+            title: "Discord".into(),
+            version: "1.0.0".into(),
+            description: "discord".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            allowed_hosts: vec!["127.0.0.1".into()],
+            default_headers: BTreeMap::new(),
+            enabled: true,
+            tools: vec![ConnectorToolDef {
+                name: "discord_send".into(),
+                description: "send".into(),
+                method: "GET".into(),
+                path: "/messages".into(),
+                path_params: Vec::new(),
+                query_params: Vec::new(),
+                body_params: Vec::new(),
+                headers: BTreeMap::new(),
+                response_fields: Vec::new(),
+                input_schema: json!({"type": "object", "properties": {}}),
+            }],
+            bridges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_call_denial_is_an_error_result_without_an_http_call() {
+        let (_tmp, vault) = open_vault();
+        let connector = connector_with_tool();
+        let provider = CountingProvider::with_secret(None);
+        *provider.decision.lock().unwrap() = IamDecision::Deny {
+            policy: "organizations/1/policy".into(),
+            reason: "no binding".into(),
+        };
+        let response = handle_mcp_jsonrpc_request_with_secret_provider(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "discord_send", "arguments": {} }
+            }),
+            &vault,
+            std::slice::from_ref(&connector),
+            None,
+            Some("felicia".into()),
+            Some(&provider),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        let expected = GateError::PolicyDenied {
+            secret: "organizations/1/policy".into(),
+            reason: "no binding".into(),
+        };
+        assert_eq!(text, expected.to_string());
+        assert!(!text.contains("upstream"));
+    }
+
+    enum ScriptedVerdict {
+        Ready(GuardVerdict),
+        Fail,
+    }
+
+    struct GuardSeen {
+        stage: GuardStage,
+        caller: Option<String>,
+        target: String,
+        payload: String,
+    }
+
+    struct RecGuard {
+        seen: Mutex<Option<GuardSeen>>,
+        verdict: Mutex<ScriptedVerdict>,
+    }
+
+    impl EdgeGuardAdapter for RecGuard {
+        fn provider_name(&self) -> &str {
+            "model-armor"
+        }
+
+        fn inspect_payload(
+            &self,
+            stage: GuardStage,
+            caller_agent: Option<&str>,
+            target: &str,
+            payload: &str,
+        ) -> Result<GuardVerdict, GateError> {
+            *self.seen.lock().unwrap() = Some(GuardSeen {
+                stage,
+                caller: caller_agent.map(str::to_string),
+                target: target.to_string(),
+                payload: payload.to_string(),
+            });
+            match &*self.verdict.lock().unwrap() {
+                ScriptedVerdict::Ready(verdict) => Ok(verdict.clone()),
+                ScriptedVerdict::Fail => Err(GateError::Adapter {
+                    provider: "model-armor".into(),
+                    reason: "guard down".into(),
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn edge_guard_allow_sanitize_block_and_adapter_error() {
+        let guard = RecGuard {
+            seen: Mutex::new(None),
+            verdict: Mutex::new(ScriptedVerdict::Ready(GuardVerdict::Allow)),
+        };
+        let payload = "keep me";
+        assert_eq!(
+            evaluate_edge_guard(
+                &guard,
+                GuardStage::McpToolInput,
+                Some("felicia"),
+                "discord.send",
+                payload
+            )
+            .unwrap(),
+            payload
+        );
+
+        *guard.verdict.lock().unwrap() = ScriptedVerdict::Ready(GuardVerdict::Sanitize {
+            redacted_payload: "redacted".into(),
+            findings: vec!["injection".into()],
+        });
+        assert_eq!(
+            evaluate_edge_guard(
+                &guard,
+                GuardStage::WireMessage,
+                Some("felicia"),
+                "wire:ferris",
+                payload
+            )
+            .unwrap(),
+            "redacted"
+        );
+        let seen = guard.seen.lock().unwrap().take().unwrap();
+        assert_eq!(seen.stage, GuardStage::WireMessage);
+        assert_eq!(seen.caller.as_deref(), Some("felicia"));
+        assert_eq!(seen.target, "wire:ferris");
+        assert_eq!(seen.payload, payload);
+
+        *guard.verdict.lock().unwrap() = ScriptedVerdict::Ready(GuardVerdict::Block {
+            rule_id: "ma-9".into(),
+            reason: "prompt injection".into(),
+        });
+        let blocked =
+            evaluate_edge_guard(&guard, GuardStage::AttemptPrompt, None, "attempt", payload)
+                .unwrap_err();
+        match blocked {
+            GateError::PolicyDenied { secret, reason } => {
+                assert_eq!(secret, format!("edge-guard:{}", "ma-9"));
+                assert_eq!(reason, "prompt injection");
+            }
+            other => panic!("{other}"),
+        }
+
+        *guard.verdict.lock().unwrap() = ScriptedVerdict::Fail;
+        let err = evaluate_edge_guard(&guard, GuardStage::InboundWebhook, None, "hook", payload)
+            .unwrap_err();
+        assert!(
+            matches!(err, GateError::Adapter { ref provider, ref reason }
+                if provider == "model-armor" && reason == "guard down"),
+            "{err}"
+        );
     }
 }
