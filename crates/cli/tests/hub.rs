@@ -533,3 +533,210 @@ on = "pass"
     assert_eq!(connected.data["authority"]["tier"], "owner");
     let _ = ws.close();
 }
+
+fn unix_mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+fn config_text(env: &TestEnv) -> String {
+    fs::read_to_string(env.cfg_dir.join("fl/config.toml")).unwrap()
+}
+
+fn toml_key_count(text: &str, key: &str) -> usize {
+    text.lines()
+        .filter(|line| line.trim_start().starts_with(key))
+        .count()
+}
+
+#[test]
+fn fl_hub_init_json_writes_config_tokens_and_hub_node() {
+    let env = TestEnv::new();
+    let init = run_json({
+        let mut c = env.fl();
+        c.args(["hub", "init", "--json"]);
+        c
+    });
+    assert!(init["service_file"].is_null());
+    let node_id = init["node_id"].as_str().unwrap();
+    assert!(!node_id.is_empty());
+    assert_eq!(init["listen"].as_str(), Some("127.0.0.1:8420"));
+
+    let doc: toml::Value = toml::from_str(&config_text(&env)).unwrap();
+    let store = doc["state"]["store"].as_str().unwrap();
+    assert!(Path::new(store).is_absolute(), "{store}");
+    assert_eq!(store, init["store"].as_str().unwrap());
+    assert_eq!(doc["hub"]["listen"].as_str(), Some("127.0.0.1:8420"));
+
+    let owner = env.cfg_dir.join("fl/hub-owner.token");
+    let peer = env.cfg_dir.join("fl/hub-peer.token");
+    assert_eq!(init["owner_token_file"].as_str(), owner.to_str());
+    assert_eq!(init["peer_token_file"].as_str(), peer.to_str());
+    assert_eq!(unix_mode(&owner), 0o600);
+    assert_eq!(unix_mode(&peer), 0o600);
+    let owner_bytes = fs::read(&owner).unwrap();
+    assert!(!owner_bytes.iter().all(u8::is_ascii_whitespace));
+    assert!(!fs::read(&peer).unwrap().iter().all(u8::is_ascii_whitespace));
+    assert!(
+        !init
+            .to_string()
+            .contains(std::str::from_utf8(&owner_bytes).unwrap().trim())
+    );
+
+    let again = run_json({
+        let mut c = env.fl();
+        c.args(["hub", "init", "--json"]);
+        c
+    });
+    assert_eq!(again["node_id"].as_str(), Some(node_id));
+    assert_eq!(fs::read(&owner).unwrap(), owner_bytes);
+    let text = config_text(&env);
+    assert_eq!(toml_key_count(&text, "owner_token_file"), 1);
+    assert_eq!(toml_key_count(&text, "token_file"), 1);
+    assert_eq!(toml_key_count(&text, "listen"), 1);
+    assert_eq!(toml_key_count(&text, "store"), 1);
+
+    let store_db = fl_store::RedbStore::open(Path::new(store)).unwrap();
+    let hub = fl_hub::find_hub_node(&store_db).unwrap().expect("hub node");
+    assert_eq!(hub.node_id, node_id);
+    assert_eq!(hub.role, "hub");
+}
+
+#[test]
+fn fl_hub_init_service_writes_systemd_unit() {
+    let env = TestEnv::new();
+    let init = run_json({
+        let mut c = env.fl();
+        c.args(["hub", "init", "--service", "--json"]);
+        c
+    });
+    let service = env.cfg_dir.join("systemd/user/ferroloop-hub.service");
+    assert_eq!(init["service_file"].as_str(), service.to_str());
+    let text = fs::read_to_string(&service).unwrap();
+    assert!(text.contains("hub serve"), "{text}");
+    assert!(text.contains("ExecStart="), "{text}");
+    assert!(text.contains(&env.work_dir.display().to_string()), "{text}");
+}
+
+#[test]
+fn fl_hub_enroll_token_join_and_nodes_round_trip() {
+    let env = TestEnv::new();
+    let _init = run_json({
+        let mut c = env.fl();
+        c.args(["hub", "init", "--json"]);
+        c
+    });
+
+    let mut serve_cmd = env.fl();
+    serve_cmd
+        .args(["hub", "serve", "--listen", "127.0.0.1:0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = serve_cmd.spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut ready_line = String::new();
+    reader.read_line(&mut ready_line).unwrap();
+    let _hub_guard = RunningHubGuard { child };
+
+    let base_url = ready_line
+        .trim()
+        .strip_prefix("ferroloop-hub listening on ")
+        .expect("expected readiness banner from `fl hub serve`")
+        .to_string();
+
+    let minted = run_json({
+        let mut c = env.fl();
+        c.args([
+            "hub",
+            "enroll-token",
+            "--url",
+            &base_url,
+            "--label",
+            "lab",
+            "--json",
+        ]);
+        c
+    });
+    let code = minted["code"].as_str().unwrap();
+    let join_command = minted["join_command"].as_str().unwrap();
+    assert!(join_command.contains("fl hub join"), "{join_command}");
+    assert!(join_command.contains("--token"), "{join_command}");
+    assert!(join_command.contains(code), "{join_command}");
+    assert!(join_command.contains("--label"), "{join_command}");
+
+    let joined = run_json({
+        let mut c = env.fl();
+        c.args([
+            "hub", "join", &base_url, "--token", code, "--name", "worker-a", "--json",
+        ]);
+        c
+    });
+    assert_eq!(joined["node_id"], "worker-a");
+    assert_eq!(joined["hub_url"].as_str(), Some(base_url.as_str()));
+    let token_file = PathBuf::from(joined["token_file"].as_str().unwrap());
+    assert_eq!(token_file, env.cfg_dir.join("fl/hub-node.token"));
+    assert_eq!(unix_mode(&token_file), 0o600);
+    let node_token = joined["node_token"].as_str().unwrap();
+    assert_eq!(
+        fs::read_to_string(&token_file).unwrap(),
+        format!("{node_token}\n")
+    );
+    let node_toml = fs::read_to_string(env.cfg_dir.join("fl/node.toml")).unwrap();
+    let node_doc: toml::Value = toml::from_str(&node_toml).unwrap();
+    assert_eq!(node_doc["node_id"].as_str(), Some("worker-a"));
+    assert_eq!(node_doc["hub_url"].as_str(), Some(base_url.as_str()));
+    assert_eq!(node_doc["token_file"].as_str(), token_file.to_str());
+
+    let nodes = run_json({
+        let mut c = env.fl();
+        c.args(["hub", "nodes", "--url", &base_url, "--json"]);
+        c
+    });
+    assert!(!nodes.to_string().contains("token_hash"));
+    let listed = nodes["nodes"].as_array().unwrap();
+    assert!(listed.iter().any(|node| node["role"] == "hub"));
+    assert!(listed.iter().any(|node| node["node_id"] == "worker-a"));
+
+    let second = env
+        .fl()
+        .args([
+            "hub", "join", &base_url, "--token", code, "--name", "worker-b", "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!second.status.success());
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(output.contains("used"), "{output}");
+}
+
+#[test]
+fn fl_hub_init_preserves_existing_project() {
+    let env = TestEnv::new();
+    let cfg_path = env.cfg_dir.join("fl/config.toml");
+    fs::write(
+        &cfg_path,
+        format!(
+            "[wire]\npeers = [\"ws://127.0.0.1:9\"]\n\n[[project]]\nname = \"keep-me\"\nroot = \"{}\"\nstore = \"{}\"\n",
+            env.work_dir.display(),
+            env.store_path.display(),
+        ),
+    )
+    .unwrap();
+
+    let _init = run_json({
+        let mut c = env.fl();
+        c.args(["hub", "init", "--json"]);
+        c
+    });
+
+    let doc: toml::Value = toml::from_str(&config_text(&env)).unwrap();
+    let projects = doc["project"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["name"].as_str(), Some("keep-me"));
+    assert_eq!(doc["wire"]["peers"][0].as_str(), Some("ws://127.0.0.1:9"));
+}
