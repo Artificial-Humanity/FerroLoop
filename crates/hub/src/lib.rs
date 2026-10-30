@@ -10,16 +10,17 @@ mod direct_quota;
 pub mod discovery;
 pub mod lifecycle;
 pub mod nodes;
+mod records;
 pub mod session_actions;
 mod settings;
 pub mod terminal;
 pub mod ws;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use fl_core::pr_policy::DEFAULT_OWNER_LOGIN;
 use fl_core::store::StoreError;
@@ -151,8 +152,69 @@ pub struct HubState {
     pub auth: AuthManager,
     pub ws_tx: broadcast::Sender<HubWsFrame>,
     store_lock: Arc<Mutex<()>>,
+    /// One lock per per-project store file (see [`HubState::open_project_store_at`]).
+    path_locks: Arc<Mutex<HashMap<PathBuf, Arc<PathLock>>>>,
     prompt_queues: Arc<Mutex<PromptQueueState>>,
     model_overrides: Arc<Mutex<BTreeMap<String, session_actions::ModelOverride>>>,
+}
+
+/// How long a per-project open may take in all: the wait for the file's in-process lock plus
+/// the wait for another process (the CLI) that holds the `.redb` file.
+const PROJECT_OPEN_BUDGET: Duration = Duration::from_secs(2);
+/// Pause between tries on a file another process holds; the same as [`RedbStore::open`]'s.
+const PROJECT_OPEN_RETRY: Duration = Duration::from_millis(15);
+
+/// An in-process lock for one store file that a waiter can give up on: redb opens a file
+/// exclusively within a process, so two requests for one project must take turns, and a request
+/// must not wait forever behind a long one.
+#[derive(Debug, Default)]
+struct PathLock {
+    held: Mutex<bool>,
+    freed: Condvar,
+}
+
+/// Why a per-project store could not be opened in time.
+#[derive(Debug)]
+pub enum ProjectOpenError {
+    /// Another request on this project, or another process, held the file for the whole wait.
+    Busy,
+    /// The open failed for another reason.
+    Store(StoreError),
+}
+
+/// A per-project [`RedbStore`] together with that file's [`PathLock`]. Holding it blocks other
+/// requests for the same file and nothing else.
+pub struct ProjectStoreGuard {
+    store: Option<RedbStore>,
+    lock: Arc<PathLock>,
+}
+
+impl Deref for ProjectStoreGuard {
+    type Target = RedbStore;
+
+    fn deref(&self) -> &RedbStore {
+        self.store
+            .as_ref()
+            .expect("store present while guard is alive")
+    }
+}
+
+impl Drop for ProjectStoreGuard {
+    fn drop(&mut self) {
+        // Release the redb file lock before the path lock lets the next request in.
+        self.store.take();
+        *self.lock.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.lock.freed.notify_one();
+    }
+}
+
+/// Whether `err` is redb saying another holder has the file, the case [`RedbStore::open`]
+/// retries.
+fn is_file_busy(err: &StoreError) -> bool {
+    let StoreError::Unreachable { cause, .. } = err else {
+        return false;
+    };
+    cause.contains("Database already open") || cause.contains("Cannot acquire lock")
 }
 
 /// RAII guard holding a [`RedbStore`] together with the `store_lock` mutex for
@@ -194,6 +256,7 @@ impl HubState {
             auth,
             ws_tx,
             store_lock: Arc::new(Mutex::new(())),
+            path_locks: Arc::new(Mutex::new(HashMap::new())),
             prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
             model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
         }
@@ -467,15 +530,21 @@ impl HubState {
     /// The returned [`HubStoreGuard`] holds `store_lock` for the store's whole
     /// lifetime, serializing concurrent in-process opens.
     pub fn open_store(&self) -> Result<HubStoreGuard<'_>, StoreError> {
+        self.open_store_at(&self.config.store_path)
+    }
+
+    /// [`HubState::open_store`] for another `.redb` file (a per-project store): the same retry
+    /// loop and the same `store_lock`, so every open the hub makes stays serialized.
+    pub fn open_store_at(&self, path: &Path) -> Result<HubStoreGuard<'_>, StoreError> {
         let guard = Some(self.store_lock.lock().unwrap_or_else(|e| e.into_inner()));
-        if let Some(parent) = self.config.store_path.parent()
+        if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut last_err = None;
         for attempt in 0..200 {
-            match RedbStore::open(&self.config.store_path) {
+            match RedbStore::open(path) {
                 Ok(store) => {
                     return Ok(HubStoreGuard {
                         store: Some(store),
@@ -491,6 +560,48 @@ impl HubState {
             }
         }
         Err(last_err.expect("at least one attempt ran"))
+    }
+
+    /// Open a per-project store (`<slug>.redb`) for one operation, waiting at most
+    /// [`PROJECT_OPEN_BUDGET`] (about 2 s) in all, and failing with [`ProjectOpenError::Busy`]
+    /// when the file stays held. Unlike [`HubState::open_store_at`] it does not take the
+    /// hub-wide `store_lock`: requests for one file take turns on that file's own lock, so a
+    /// long operation on one project (a move runs gate commands) blocks that project only, and
+    /// a CLI process that holds the file stalls that project's requests for the budget, not
+    /// every store the hub reads.
+    pub fn open_project_store_at(
+        &self,
+        path: &Path,
+    ) -> Result<ProjectStoreGuard, ProjectOpenError> {
+        let deadline = Instant::now() + PROJECT_OPEN_BUDGET;
+        let lock = {
+            let mut locks = self.path_locks.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(locks.entry(path.to_path_buf()).or_default())
+        };
+        let held = lock.held.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut held, timeout) = lock
+            .freed
+            .wait_timeout_while(held, PROJECT_OPEN_BUDGET, |held| *held)
+            .unwrap_or_else(|e| e.into_inner());
+        if timeout.timed_out() && *held {
+            return Err(ProjectOpenError::Busy);
+        }
+        *held = true;
+        drop(held);
+        // From here the guard owns the path lock: any early return releases it on drop.
+        let mut guard = ProjectStoreGuard { store: None, lock };
+        let retries = (deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            / PROJECT_OPEN_RETRY.as_millis()) as u32;
+        match RedbStore::open_with_retries(path, retries) {
+            Ok(store) => {
+                guard.store = Some(store);
+                Ok(guard)
+            }
+            Err(e) if is_file_busy(&e) => Err(ProjectOpenError::Busy),
+            Err(e) => Err(ProjectOpenError::Store(e)),
+        }
     }
 
     /// Broadcast a [`HubWsFrame`] to all connected `/ws/v1` clients.

@@ -98,20 +98,11 @@ fn root_of(store: &RedbStore, project: &ProjectId) -> Result<PathBuf> {
 /// Spec §4.5: on an importing machine, the working tree's manifest must be
 /// the one this store imported. A project this store authors passes.
 pub fn ensure_import_current(store: &RedbStore, project: &ProjectId) -> Result<()> {
-    let Some(recorded) = store.imported_hash(project)? else {
-        return Ok(());
-    };
-    let root = root_of(store, project)?;
-    let m = manifest_of(&root, project, false)?;
-    if m.content_sha256 != recorded {
-        bail!(
-            "the manifest at {} changed since this store imported it (imported {recorded}, \
-             now {}). Run `fl manifest import` before running its gates.",
-            root.join(MANIFEST_PATH).display(),
-            m.content_sha256
-        );
-    }
-    Ok(())
+    // The check itself is shared with the hub, which refuses a gated move the same way.
+    fl_store::manifest::ensure_import_current(store, project).map_err(|e| match e {
+        fl_store::manifest::ImportCheckError::Store(e) => anyhow::Error::from(e),
+        other => anyhow::anyhow!("{other}"),
+    })
 }
 
 /// Routing spec §1.2: one routing rule per project, not per machine. On an

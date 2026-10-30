@@ -343,6 +343,80 @@ impl Manifest {
     }
 }
 
+/// Why [`ensure_import_current`] refused. Each message names what to run.
+#[derive(Debug, thiserror::Error)]
+pub enum ImportCheckError {
+    #[error("{0} is held by this store, but it is not a project")]
+    NotAProject(ProjectId),
+    #[error("could not look for {path}: {cause}")]
+    Look { path: String, cause: String },
+    #[error(
+        "there is no manifest at {path}. It comes from the machine that authors the project: \
+         restore it from git (pull, or check it out), then run `fl manifest import`"
+    )]
+    Missing { path: String },
+    #[error("could not read the manifest at {path}: {cause}")]
+    Unreadable { path: String, cause: String },
+    #[error("{path} was refused: {cause}")]
+    Refused {
+        path: String,
+        cause: Box<ManifestError>,
+    },
+    #[error(
+        "the manifest at {path} changed since this store imported it (imported {recorded}, \
+         now {now}). Run `fl manifest import` before running its gates."
+    )]
+    Stale {
+        path: String,
+        recorded: String,
+        now: String,
+    },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
+/// Spec §4.5: on an importing machine, the working tree's manifest must be the one this store
+/// imported. A project this store authors passes.
+pub fn ensure_import_current(
+    store: &crate::RedbStore,
+    project: &ProjectId,
+) -> Result<(), ImportCheckError> {
+    let Some(recorded) = store.imported_hash(project)? else {
+        return Ok(());
+    };
+    let Some(p) = store.get_project(project)? else {
+        return Err(ImportCheckError::NotAProject(project.clone()));
+    };
+    let path = std::path::Path::new(&p.root).join(MANIFEST_PATH);
+    let shown = path.display().to_string();
+    match path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Err(ImportCheckError::Missing { path: shown }),
+        Err(e) => {
+            return Err(ImportCheckError::Look {
+                path: shown,
+                cause: e.to_string(),
+            });
+        }
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| ImportCheckError::Unreadable {
+        path: shown.clone(),
+        cause: e.to_string(),
+    })?;
+    let m = Manifest::parse(&text).map_err(|cause| ImportCheckError::Refused {
+        path: shown.clone(),
+        cause: Box::new(cause),
+    })?;
+    if m.content_sha256 != recorded {
+        return Err(ImportCheckError::Stale {
+            path: shown,
+            recorded,
+            now: m.content_sha256,
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
