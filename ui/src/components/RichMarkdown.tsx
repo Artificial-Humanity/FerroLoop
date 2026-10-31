@@ -696,6 +696,10 @@ export function renderInlineMarkdown(
           <a
             key={key}
             href={url}
+            // The label is attacker-controllable text; expose the real
+            // destination so `[https://bank.example](https://evil.example)`
+            // cannot masquerade as its label.
+            title={url}
             target="_blank"
             rel="noopener noreferrer"
             style={{
@@ -703,7 +707,14 @@ export function renderInlineMarkdown(
               textDecoration: "underline",
             }}
           >
-            {renderInlineMarkdown(cleanedLabel, `${key}-lbl`, onOpenArtifact)}
+            {
+              // A URL inside a link label would nest an <a> in an <a>
+              // (invalid, and its inner target can differ from the outer
+              // one), so URL-bearing labels render as plain text.
+              /https?:\/\//i.test(cleanedLabel)
+                ? cleanedLabel
+                : renderInlineMarkdown(cleanedLabel, `${key}-lbl`, onOpenArtifact)
+            }
           </a>,
         );
       } else {

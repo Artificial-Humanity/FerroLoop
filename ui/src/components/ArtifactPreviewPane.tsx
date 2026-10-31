@@ -13,6 +13,7 @@ import {
   RichMarkdown,
 } from "./RichMarkdown";
 import { extractTurnAttachments } from "./TurnCard";
+import { canAttachTokenTo, isSafeLinkUrl } from "../lib/safeUrl";
 
 export interface ArtifactPreviewPaneProps {
   apiClient: HubApiClient;
@@ -152,9 +153,17 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     [onSelectPath],
   );
 
+  const sessionIdRef = React.useRef<string | null>(sessionId);
+  sessionIdRef.current = sessionId;
+
   const refreshSessionArtifacts = useCallback(async () => {
+    const requestedSession = sessionId;
     try {
-      const res = await apiClient.listSessionArtifacts(sessionId);
+      const res = await apiClient.listSessionArtifacts(requestedSession);
+      // Ignore a response for a session the operator has since left.
+      if (sessionIdRef.current !== requestedSession) {
+        return;
+      }
       if (Array.isArray(res?.artifacts)) {
         setSessionArtifacts(res.artifacts);
       }
@@ -166,6 +175,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   // Discover session artifacts from backend when sessionId changes
   useEffect(() => {
     let cancelled = false;
+    setSessionArtifacts([]);
     apiClient
       .listSessionArtifacts(sessionId)
       .then((res) => {
@@ -287,6 +297,10 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     }
 
     let cancelled = false;
+    // Drop the previous artifact right away: leaving it mounted while the new
+    // one loads shows (and offers Open Raw / Download for) a file that does
+    // not match the path now in the input.
+    setArtifact(null);
     setLoading(true);
     setError(null);
     apiClient
@@ -314,27 +328,44 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     };
   }, [apiClient, selectedPath]);
 
+  /**
+   * Resolve a hub-supplied artifact URL for use in href/src/iframe. Locally
+   * generated `data:` URLs pass through. Anything that is not http(s) or
+   * same-origin relative is dropped (`javascript:` in an iframe `src` would
+   * run in the FerroDeck origin). The session token is appended only for the
+   * hub's own origin: attaching it to a third-party URL would hand that host
+   * a bearer credential.
+   */
+  const resolveHubUrl = useCallback(
+    (candidate: string | undefined, fallback: () => string): string => {
+      if (candidate && candidate.startsWith("data:")) return candidate;
+      const base = candidate || fallback();
+      if (!isSafeLinkUrl(base)) return "";
+      const tok = apiClient.getToken();
+      const hubBase =
+        typeof apiClient.getBaseUrl === "function" ? apiClient.getBaseUrl() : "";
+      if (tok && !base.includes("token=") && canAttachTokenTo(base, hubBase)) {
+        const sep = base.includes("?") ? "&" : "?";
+        return `${base}${sep}token=${encodeURIComponent(tok)}`;
+      }
+      return base;
+    },
+    [apiClient],
+  );
+
   const rawUrl = useMemo(() => {
     if (!artifact) return "";
-    if (artifact.raw_url.startsWith("data:")) return artifact.raw_url;
-    const tok = apiClient.getToken();
-    if (tok && !artifact.raw_url.includes("token=")) {
-      const sep = artifact.raw_url.includes("?") ? "&" : "?";
-      return `${artifact.raw_url}${sep}token=${encodeURIComponent(tok)}`;
-    }
-    return artifact.raw_url || apiClient.getArtifactRawUrl(artifact.path, false);
-  }, [artifact, apiClient]);
+    return resolveHubUrl(artifact.raw_url, () =>
+      apiClient.getArtifactRawUrl(artifact.path, false),
+    );
+  }, [artifact, apiClient, resolveHubUrl]);
 
   const downloadUrl = useMemo(() => {
     if (!artifact) return "";
-    if (artifact.download_url.startsWith("data:")) return artifact.download_url;
-    const tok = apiClient.getToken();
-    if (tok && !artifact.download_url.includes("token=")) {
-      const sep = artifact.download_url.includes("?") ? "&" : "?";
-      return `${artifact.download_url}${sep}token=${encodeURIComponent(tok)}`;
-    }
-    return artifact.download_url || apiClient.getArtifactRawUrl(artifact.path, true);
-  }, [artifact, apiClient]);
+    return resolveHubUrl(artifact.download_url, () =>
+      apiClient.getArtifactRawUrl(artifact.path, true),
+    );
+  }, [artifact, apiClient, resolveHubUrl]);
 
   const imagePreviewSrc = useMemo(() => {
     if (!artifact) return "";
@@ -489,7 +520,8 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   )}
 
                 <a
-                  href={rawUrl}
+                  href={rawUrl || undefined}
+                  aria-disabled={!rawUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   data-testid="artifact-open-raw-btn"
@@ -500,7 +532,8 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                 </a>
 
                 <a
-                  href={downloadUrl}
+                  href={downloadUrl || undefined}
+                  aria-disabled={!downloadUrl}
                   download={artifact.kind === "mermaid" && downloadUrl.startsWith("data:image/svg") ? "diagram.svg" : artifact.name}
                   data-testid="artifact-download-btn"
                   className="fd-btn fd-btn-primary"
@@ -835,18 +868,29 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   backgroundColor: "var(--bg-input)",
                 }}
               >
+{rawUrl ? (
                 <iframe
-                  data-testid="artifact-pdf-frame"
-                  src={rawUrl}
-                  title={artifact.name}
-                  style={{
-                    width: "100%",
-                    height: "100%",
-                    minHeight: "520px",
-                    border: "none",
-                    flex: 1,
-                  }}
-                />
+                    data-testid="artifact-pdf-frame"
+                    src={rawUrl}
+                    title={artifact.name}
+                    style={{
+                      width: "100%",
+                      height: "100%",
+                      minHeight: "520px",
+                      border: "none",
+                      flex: 1,
+                    }}
+                  />
+                ) : (
+                  <div
+                    role="alert"
+                    data-testid="artifact-unsafe-url"
+                    className="fd-card"
+                    style={{ margin: "auto", fontSize: "12px", color: "var(--text-muted)" }}
+                  >
+                    This PDF cannot be previewed: the hub returned a URL that is not http(s) or same-origin.
+                  </div>
+                )}
               </div>
             )}
 
@@ -870,7 +914,8 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   {artifact.mime_type} · {formatByteSize(artifact.size_bytes)}
                 </div>
                 <a
-                  href={downloadUrl}
+                  href={downloadUrl || undefined}
+                  aria-disabled={!downloadUrl}
                   download={artifact.name}
                   className="fd-btn fd-btn-primary"
                   style={{ textDecoration: "none" }}

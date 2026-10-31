@@ -485,6 +485,11 @@ export class HubApiClient {
     return null;
   }
 
+  /** The hub origin this client talks to ("" means same-origin). */
+  public getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
   public getToken(): string | null {
     return this.memoryToken ?? this.readStoredToken();
   }

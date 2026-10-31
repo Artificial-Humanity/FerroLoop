@@ -57,6 +57,10 @@ function resolveDeliveryStatus(
   return "delivered";
 }
 
+function ackKey(agent: string | null | undefined, messageId: string): string {
+  return `${(agent ?? "").trim().toLowerCase() || "owner"}\u0000${messageId}`;
+}
+
 export const WireMailPane: React.FC<WireMailPaneProps> = ({
   messages,
   selectedAgentName,
@@ -75,6 +79,9 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
   const [scope, setScope] = useState<RecipientScope>("selected");
   const [unreadOnly, setUnreadOnly] = useState<boolean>(false);
   const [searchQuery, setSearchQuery] = useState<string>("");
+  // Receipts are per recipient, so the optimistic "acked" marker is keyed by
+  // (agent, message). Keyed by message alone, acking as one agent hid the
+  // message as acked for every other agent the operator switched to.
   const [localAckedIds, setLocalAckedIds] = useState<Set<string>>(() => new Set());
 
   // Compose Form State
@@ -138,7 +145,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
         }
       }
 
-      const status = localAckedIds.has(msg.id)
+      const status = localAckedIds.has(ackKey(selectedAgentName, msg.id))
         ? "acked"
         : resolveDeliveryStatus(item, selectedAgentName);
 
@@ -169,7 +176,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
       }
       setLocalAckedIds((prev) => {
         const next = new Set(prev);
-        next.add(messageId);
+        next.add(ackKey(byAgent, messageId));
         return next;
       });
     } catch (err) {
@@ -357,7 +364,7 @@ export const WireMailPane: React.FC<WireMailPaneProps> = ({
           ) : (
             filteredMessages.map((item) => {
               const msg = item.message;
-              const status = localAckedIds.has(msg.id)
+              const status = localAckedIds.has(ackKey(selectedAgentName, msg.id))
                 ? "acked"
                 : resolveDeliveryStatus(item, selectedAgentName);
               const isUrgent = msg.urgency === "urgent";
