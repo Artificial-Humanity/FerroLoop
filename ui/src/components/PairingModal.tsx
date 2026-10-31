@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { HubApiClient } from "../api/client";
+import { HubApiClient, getLastRegisteredPasskeyId } from "../api/client";
 import type { HubAuthority } from "../types/api";
 
 export type AuthTabMode = "token" | "password" | "passkey";
@@ -122,7 +122,7 @@ export const PairingModal: React.FC<PairingModalProps> = ({
     setSubmitting(true);
     try {
       const client = apiClient ?? new HubApiClient();
-      const credentialId = passkeyId.trim() || "webauthn-default";
+      const credentialId = passkeyId.trim() || getLastRegisteredPasskeyId();
       const res = await client.loginWithPasskey({
         credential_id: credentialId,
       });
