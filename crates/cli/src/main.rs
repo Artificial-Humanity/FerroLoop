@@ -282,9 +282,11 @@ fn explicit_db(flag: Option<PathBuf>) -> Option<PathBuf> {
 }
 
 /// [`explicit_db`] with the environment value passed in. An empty `$FL_DB`
-/// (CI templates often export one) is unset, not a store named "".
+/// (CI templates often export one) is unset, not a store named "", and so is
+/// an empty `--db`: it falls through to `$FL_DB`, then to the tiers below.
 fn explicit_db_from(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    flag.or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
+    flag.filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
 }
 
 /// Resolve the store path from `explicit` (`--db`, then `$FL_DB`), then
@@ -1319,6 +1321,13 @@ mod tests {
         assert_eq!(
             explicit_db_from(Some("/f.redb".into()), Some("/x".into())),
             Some(PathBuf::from("/f.redb"))
+        );
+        // An empty `--db` is unset too: `$FL_DB`, if set, takes over.
+        assert_eq!(explicit_db_from(Some("".into()), None), None);
+        assert_eq!(explicit_db_from(Some("".into()), Some("".into())), None);
+        assert_eq!(
+            explicit_db_from(Some("".into()), Some("/x/y.redb".into())),
+            Some(PathBuf::from("/x/y.redb"))
         );
     }
 

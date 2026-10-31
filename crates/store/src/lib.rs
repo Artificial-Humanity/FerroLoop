@@ -1967,6 +1967,12 @@ mod tests {
     }
 
     #[test]
+    fn a_cursor_at_u64_max_reads_nothing_instead_of_overflowing() {
+        let (s, _dir) = fresh();
+        fl_core::conformance::a_cursor_at_u64_max_reads_nothing(&s);
+    }
+
+    #[test]
     fn a_project_survives_a_close_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("t.redb");

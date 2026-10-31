@@ -727,6 +727,42 @@ mod tests {
         Registry::new(&fake.url()).unwrap()
     }
 
+    /// The `version` call itself refuses an answer for another server or
+    /// version, not only the helper it asks.
+    #[test]
+    fn version_refuses_an_answer_for_another_server_or_version() {
+        let fake = FakeRegistry::start();
+        let published = |name: &str, version: &str| {
+            let state = fake.state();
+            let found = state
+                .entries
+                .iter()
+                .find(|e| e["server"]["name"] == name && e["server"]["version"] == version);
+            found.expect("a published fixture").clone()
+        };
+        let weather = published(fake::WEATHER, "0.4.1");
+        let other = published(fake::NOTES, "1.1.0");
+        let notes = published(fake::NOTES, "1.2.0");
+        let reg = client(&fake);
+
+        // Another server's answer under the requested name.
+        fake.state().answer_next = Some(weather);
+        let err = reg.version(fake::NOTES, "latest").unwrap_err();
+        assert!(matches!(err, McpError::Registry { .. }), "{err:?}");
+        assert!(err.to_string().contains(fake::WEATHER), "{err}");
+
+        // Another version's answer to an exact request.
+        fake.state().answer_next = Some(other);
+        let err = reg.version(fake::NOTES, "1.2.0").unwrap_err();
+        assert!(matches!(err, McpError::Registry { .. }), "{err:?}");
+        assert!(err.to_string().contains("1.1.0"), "{err}");
+
+        // The matching answer is returned.
+        fake.state().answer_next = Some(notes);
+        let got = reg.version(fake::NOTES, "1.2.0").unwrap();
+        assert_eq!(got.server.name, fake::NOTES);
+    }
+
     fn names(servers: &[Summary]) -> Vec<&str> {
         servers.iter().map(|s| s.name.as_str()).collect()
     }

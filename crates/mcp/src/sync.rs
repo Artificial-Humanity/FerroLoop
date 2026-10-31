@@ -587,13 +587,13 @@ fn stage(target: &Target, bytes: &[u8]) -> Result<NamedTempFile, McpError> {
 
 /// What `File::create` gives: the umask applies to it.
 #[cfg(unix)]
-fn new_file_mode() -> Option<fs::Permissions> {
+pub(crate) fn new_file_mode() -> Option<fs::Permissions> {
     use std::os::unix::fs::PermissionsExt;
     Some(fs::Permissions::from_mode(0o666))
 }
 
 #[cfg(not(unix))]
-fn new_file_mode() -> Option<fs::Permissions> {
+pub(crate) fn new_file_mode() -> Option<fs::Permissions> {
     None
 }
 

@@ -658,10 +658,17 @@ impl Editor {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(io(e)),
         };
-        let mut temp = tempfile::Builder::new()
-            .prefix(".mcp.toml-")
-            .tempfile_in(dir)
-            .map_err(io)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".mcp.toml-");
+        // The catalog is committed and shared with the team, so a new file
+        // gets what `File::create` would give it (`0666` less the umask), as
+        // the vendor files do, not a temp file's private `0600`.
+        if existing.is_none()
+            && let Some(mode) = crate::sync::new_file_mode()
+        {
+            builder.permissions(mode);
+        }
+        let mut temp = builder.tempfile_in(dir).map_err(io)?;
         std::io::Write::write_all(&mut temp, self.text().as_bytes()).map_err(io)?;
         if let Some(mode) = existing {
             std::fs::set_permissions(temp.path(), mode).map_err(io)?;
@@ -887,6 +894,27 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(stray.len(), 1, "temp file left behind: {stray:?}");
+    }
+
+    /// The catalog is committed and shared: a new one is `0666` less the
+    /// umask, what `File::create` gives (the umask cannot be read without
+    /// `unsafe`, so a plain file made beside it stands for it), not the
+    /// private `0600` of a temp file.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_catalog_gets_the_default_file_mode_not_a_private_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::File::create(&plain).unwrap();
+        Editor::open(dir.path()).unwrap().save().unwrap();
+        let path = Catalog::path(dir.path());
+        assert_eq!(mode(&path), mode(&plain));
+        // An existing file keeps its own mode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        Editor::open(dir.path()).unwrap().save().unwrap();
+        assert_eq!(mode(&path), 0o640);
     }
 
     #[cfg(unix)]

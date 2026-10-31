@@ -202,9 +202,9 @@ freezes:
 
 | route | command and arguments |
 |---|---|
-| npm | `npx -y <package>@<version>` and the package's arguments |
-| PyPI | `uvx <package>==<version>` and the package's arguments |
-| OCI | `docker run -i --rm`, the image's runtime arguments, `-e NAME` for each variable passed, the image as the registry names it, and the package's arguments |
+| npm | `npx -y`, the registry's runtime flags (only the plain ones listed below), `<package>@<version>` and the package's arguments |
+| PyPI | `uvx`, the registry's runtime flags (only the plain ones listed below), `<package>==<version>` and the package's arguments |
+| OCI | `docker run -i --rm`, the image's runtime arguments (only `-e NAME=value` and a loopback `-p`, below), `-e NAME` for each variable passed, the image as the registry names it, and the package's arguments |
 | remote | its `url`, `transport` from the remote's type, and its headers |
 
 By hand, `fl mcp add <name> -- <command> [args…]` records a `stdio` server: `--env NAME=value` is a
@@ -322,7 +322,14 @@ Every refusal exits 2 and names the file, the entry and what to do next; an erro
   must be a semver version and a PyPI package's an exact PyPI version) or a package name that
   is not a plain npm or PyPI name; a header whose name is not an HTTP header name; any string of
   the entry that holds a control or invisible character, which fl would have to commit;
-  runtime arguments with a positional argument; a secret inside an argument, except
+  a runtime argument that is not on fl's list: for npm and PyPI only the boolean flags `-y`,
+  `--yes`, `--no-update-notifier`, `--prefer-offline` and `--quiet`, spelled exactly so (anything else
+  could name another package or index, or leave a word that the runner takes as the package to
+  run); for OCI only `-i`, `--rm`, `-e NAME=value` and `-p 127.0.0.1:<port>:<port>`, never a
+  positional one (so no `--privileged`, `-v`, `--mount`, `--entrypoint`, `--network`, and the
+  like); an environment variable the registry names that repoints a fetch or a load
+  (`npm_config_*`, `UV_*`, `PIP_*`, `NODE_*`, `PATH`, `HOME`, `LD_*`, `DYLD_*`, `PYTHON*`,
+  `DOCKER_*`, `XDG_*`, `SSL_*`, the proxy variables); a secret inside an argument, except
   docker's `-e NAME={secret}`, which becomes `-e NAME` and a reference; a required argument or
   variable with no value; an argument of a type fl does not know. Each refusal names what to do,
   often `fl mcp add <name> -- <command>` by hand. An `upgrade` whose pinned route the new

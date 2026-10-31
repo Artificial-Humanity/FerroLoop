@@ -260,39 +260,55 @@ fn normalize_policy_path(raw: &str) -> String {
     parts.join("/")
 }
 
+/// The three shapes `matches_pattern` always took literally: `dir/**`,
+/// `**/name` and a bare name or full path, each compared as plain text. Both
+/// arguments are normalised.
+fn literal_match(path: &str, pattern: &str) -> bool {
+    if let Some(dir) = pattern.strip_suffix("/**") {
+        return path == dir || path.starts_with(&format!("{dir}/"));
+    }
+    if let Some(suffix) = pattern.strip_prefix("**/") {
+        return path == suffix || path.ends_with(&format!("/{suffix}"));
+    }
+    if !pattern.contains('/') {
+        return path == pattern || path.ends_with(&format!("/{pattern}"));
+    }
+    path == pattern
+}
+
 fn matches_pattern(normalized_path: &str, raw_pattern: &str) -> bool {
     let pattern = normalize_policy_path(raw_pattern);
     if pattern.is_empty() {
         return false;
     }
     let path = normalize_policy_path(normalized_path);
-    if let Some(dir) = pattern.strip_suffix("/**") {
-        if !dir.contains(['*', '?', '[', '{']) {
-            return path == dir || path.starts_with(&format!("{dir}/"));
-        }
-    } else if !pattern.contains(['*', '?', '[', '{']) {
-        if let Some(suffix) = pattern.strip_prefix("**/") {
-            return path == suffix || path.ends_with(&format!("/{suffix}"));
-        }
-        if !pattern.contains('/') {
-            return path == pattern || path.ends_with(&format!("/{pattern}"));
-        }
-        return path == pattern;
+    if !pattern.contains(['*', '?', '[', '{']) {
+        return literal_match(&path, &pattern);
     }
-    // Anything else is a real glob. A pattern that does not compile fails
-    // closed: it protects its literal text rather than nothing.
-    match globset::GlobBuilder::new(&pattern)
-        .literal_separator(true)
-        .build()
+    // A `dir/**` with no glob character before the `/**` is the old
+    // directory form.
+    if let Some(dir) = pattern.strip_suffix("/**")
+        && !dir.contains(['*', '?', '[', '{'])
     {
-        Ok(g) => {
-            g.compile_matcher().is_match(&path)
-                || (!pattern.contains('/')
-                    && globset::Glob::new(&format!("**/{pattern}"))
-                        .is_ok_and(|g| g.compile_matcher().is_match(&path)))
-        }
-        Err(_) => path == pattern,
+        return literal_match(&path, &pattern);
     }
+    // Anything else is a real glob. It also protects the literal path or
+    // directory it spells (`app/[id]/**` the directory named `[id]`): every
+    // path the plain-text matcher protected stays protected. A pattern that
+    // does not compile protects its literal text rather than nothing.
+    literal_match(&path, &pattern)
+        || match globset::GlobBuilder::new(&pattern)
+            .literal_separator(true)
+            .build()
+        {
+            Ok(g) => {
+                g.compile_matcher().is_match(&path)
+                    || (!pattern.contains('/')
+                        && globset::Glob::new(&format!("**/{pattern}"))
+                            .is_ok_and(|g| g.compile_matcher().is_match(&path)))
+            }
+            Err(_) => false,
+        }
 }
 
 /// Check whether `path` matches any default protected pattern or `extra_patterns`.
@@ -873,6 +889,26 @@ mod tests {
         assert!(is_protected_path("./a/../.github/x.yml", &[]));
         assert!(is_protected_path(".github\\workflows\\ci.yml", &[]));
         assert!(!is_protected_path("src/main.rs", &["*.pem".into()]));
+    }
+
+    #[test]
+    fn a_pattern_with_a_literal_glob_character_still_protects_that_literal_path() {
+        // The plain-text matcher protected these; routing them through the
+        // glob matcher must not narrow that.
+        let p = |path: &str, pattern: &str| is_protected_path(path, &[pattern.to_string()]);
+        assert!(p("app/[id]/x", "app/[id]/**"));
+        assert!(p("app/[id]/x/deep.rs", "app/[id]/**"));
+        assert!(p("app/[id]", "app/[id]/**"));
+        assert!(p("app/i/x", "app/[id]/**"));
+        assert!(!p("app/other/x", "app/[id]/**"));
+        assert!(p("cfg/{a,b}/x", "cfg/{a,b}/**"));
+        assert!(p("cfg/a/x", "cfg/{a,b}/**"));
+        assert!(p("cfg/{a,b}.toml", "cfg/{a,b}.toml"));
+        assert!(p("cfg/b.toml", "cfg/{a,b}.toml"));
+        assert!(p("docs/what?.md", "docs/what?.md"));
+        assert!(p("docs/whatx.md", "docs/what?.md"));
+        assert!(p("deep/docs/[x].md", "**/[x].md"));
+        assert!(!p("docs/other.md", "docs/what?.md"));
     }
 
     #[test]
