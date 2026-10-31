@@ -2698,4 +2698,95 @@ mod tests {
             Some(json!({"in": true}))
         );
     }
+
+    /// An adapter whose first `on_commit` panics; later calls record the batch.
+    struct PanicsOnce {
+        armed: AtomicBool,
+        commits: Mutex<Vec<u64>>,
+    }
+
+    impl PanicsOnce {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                armed: AtomicBool::new(true),
+                commits: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    impl SyncAdapter for PanicsOnce {
+        fn name(&self) -> &str {
+            "panics-once"
+        }
+
+        fn on_commit(&self, batch: &SyncBatch) -> Result<(), StoreError> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                panic!("adapter blew up");
+            }
+            self.commits.lock().unwrap().push(batch.seq);
+            Ok(())
+        }
+    }
+
+    /// Run `f` on a fresh thread and fail the test when it does not finish in time (a wedged
+    /// store would block it for good).
+    fn finishes_within<T: Send + 'static>(
+        secs: u64,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+    }
+
+    #[test]
+    fn panicking_write_through_adapter_does_not_wedge_the_store() {
+        let adapter = PanicsOnce::new();
+        let store = Arc::new(
+            FerroStore::in_memory()
+                .with_sync_adapter(
+                    SyncMode::WriteThrough,
+                    adapter.clone() as Arc<dyn SyncAdapter>,
+                )
+                .unwrap(),
+        );
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.put_doc("docs", "a", &json!({"n": 1}));
+        }));
+        assert!(unwound.is_err(), "the adapter panic must still propagate");
+        // The batch is still queued, and another thread can flush it instead of blocking.
+        assert!(store.has_pending_sync());
+        let flusher = Arc::clone(&store);
+        let flushed = finishes_within(5, move || flusher.sync_flush());
+        assert_eq!(flushed.expect("sync_flush wedged").unwrap(), 1);
+        assert_eq!(*adapter.commits.lock().unwrap(), vec![1]);
+        assert!(!store.has_pending_sync());
+        // The write itself was committed locally, and later writes still go through.
+        assert_eq!(store.get_doc("docs", "a").unwrap(), Some(json!({"n": 1})));
+        store.put_doc("docs", "b", &json!({"n": 2})).unwrap();
+        assert_eq!(store.synced_seq(), 2);
+    }
+
+    #[test]
+    fn panicking_flush_keeps_the_batch_and_releases_waiters() {
+        let adapter = PanicsOnce::new();
+        let store = Arc::new(
+            FerroStore::in_memory()
+                .with_sync_adapter(
+                    SyncMode::WriteBehind,
+                    adapter.clone() as Arc<dyn SyncAdapter>,
+                )
+                .unwrap(),
+        );
+        store.put_doc("docs", "a", &json!({"n": 1})).unwrap();
+        let panicker = Arc::clone(&store);
+        let joined = thread::spawn(move || panicker.sync_flush()).join();
+        assert!(joined.is_err(), "the adapter panic must still propagate");
+        let flusher = Arc::clone(&store);
+        let flushed = finishes_within(5, move || flusher.sync_flush());
+        assert_eq!(flushed.expect("sync_flush wedged").unwrap(), 1);
+        assert_eq!(*adapter.commits.lock().unwrap(), vec![1]);
+    }
 }

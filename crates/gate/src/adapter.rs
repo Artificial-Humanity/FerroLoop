@@ -97,10 +97,18 @@ pub fn handle_tiered_registry_v01_get(
             ),
         );
     }
-    for rank in 0..3 {
+    // A `tier` filter keeps only that tier, so adapters of a later tier cannot change the
+    // answer (earlier tiers win on a name clash) and are not asked: a failing cloud adapter
+    // must not turn `?tier=local` or `?tier=hub` into a 502.
+    let last_rank: i32 = match query.get("tier").map(String::as_str) {
+        Some("local") => -1,
+        Some("hub") => 1,
+        _ => 2,
+    };
+    for rank in 0..=last_rank {
         for adapter in adapters
             .iter()
-            .filter(|adapter| tier_rank(&adapter.tier()) == rank)
+            .filter(|adapter| tier_rank(&adapter.tier()) as i32 == rank)
         {
             let listed = match adapter.list_servers() {
                 Ok(listed) => listed,
@@ -143,11 +151,21 @@ pub enum IamDecision {
     Deny { policy: String, reason: String },
 }
 
-/// A secret resolved outside the local vault. `value` is plaintext.
-#[derive(Debug, Clone)]
+/// A secret resolved outside the local vault. `value` is plaintext, so `Debug` redacts it: a
+/// `{:?}` of this type, or of a `Result` or log record holding one, must not print the secret.
+#[derive(Clone)]
 pub struct ExternalSecret {
     pub metadata: VaultSecretMetadata,
     pub value: String,
+}
+
+impl std::fmt::Debug for ExternalSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalSecret")
+            .field("metadata", &self.metadata)
+            .field("value", &"[REDACTED]")
+            .finish()
+    }
 }
 
 /// Google Cloud Secret Manager and IAM, without a cloud SDK.
@@ -1023,5 +1041,107 @@ mod tests {
                 if provider == "model-armor" && reason == "guard down"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn external_secret_debug_never_prints_the_value() {
+        let secret = ExternalSecret {
+            metadata: external_meta("API_KEY", &["api.example.com"], false),
+            value: "hunter2-plaintext".into(),
+        };
+        let direct = format!("{secret:?}");
+        let wrapped = format!("{:?}", Ok::<_, GateError>(Some(secret.clone())));
+        for shown in [&direct, &wrapped, &format!("{secret:#?}")] {
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert!(shown.contains("[REDACTED]"), "{shown}");
+            assert!(shown.contains("API_KEY"), "metadata stays visible: {shown}");
+        }
+    }
+
+    struct FailingAdapter(RegistryTier);
+
+    impl McpRegistryAdapter for FailingAdapter {
+        fn provider_name(&self) -> &str {
+            "failing"
+        }
+
+        fn tier(&self) -> RegistryTier {
+            self.0.clone()
+        }
+
+        fn list_servers(&self) -> Result<Vec<Value>, GateError> {
+            Err(GateError::Io {
+                op: "list",
+                path: "/internal/cloud".into(),
+                cause: "down".into(),
+            })
+        }
+    }
+
+    fn registry_status(tier: Option<&str>, attached: &[Arc<dyn McpRegistryAdapter>]) -> u16 {
+        let mut query = BTreeMap::new();
+        if let Some(tier) = tier {
+            query.insert("tier".to_string(), tier.to_string());
+        }
+        let connectors = vec![manifest("local-only", "doc")];
+        handle_tiered_registry_v01_get(
+            "/v0.1/servers",
+            &query,
+            &connectors,
+            "http://127.0.0.1:8420",
+            attached,
+        )
+        .0
+    }
+
+    #[test]
+    fn a_failing_later_tier_does_not_break_an_earlier_tier_filter() {
+        let cloud_down: Vec<Arc<dyn McpRegistryAdapter>> =
+            vec![Arc::new(FailingAdapter(RegistryTier::CloudProvider {
+                provider: "gcp".into(),
+            }))];
+        assert_eq!(registry_status(Some("local"), &cloud_down), 200);
+        assert_eq!(registry_status(Some("hub"), &cloud_down), 200);
+        // Asking for the failing tier, or for everything, still reports the failure.
+        assert_eq!(registry_status(Some("cloud"), &cloud_down), 502);
+        assert_eq!(registry_status(None, &cloud_down), 502);
+
+        let hub_down: Vec<Arc<dyn McpRegistryAdapter>> =
+            vec![Arc::new(FailingAdapter(RegistryTier::MultiNodeHub))];
+        assert_eq!(registry_status(Some("local"), &hub_down), 200);
+        assert_eq!(registry_status(Some("hub"), &hub_down), 502);
+        assert_eq!(registry_status(Some("cloud"), &hub_down), 502);
+    }
+
+    #[test]
+    fn tier_filter_keeps_hub_shadowing_cloud_rows() {
+        // `adapters()` has a hub row and a cloud row of the same name; skipping the hub adapter
+        // for `?tier=cloud` would let the shadowed cloud row through.
+        let attached = adapters();
+        let connectors: Vec<ConnectorManifest> = Vec::new();
+        for tier in ["local", "hub", "cloud"] {
+            let query = BTreeMap::from([("tier".to_string(), tier.to_string())]);
+            let (status, body) = handle_tiered_registry_v01_get(
+                "/v0.1/servers",
+                &query,
+                &connectors,
+                "http://127.0.0.1:8420",
+                &attached,
+            );
+            assert_eq!(status, 200, "{tier}");
+            for entry in body["servers"].as_array().unwrap() {
+                assert_eq!(entry["_meta"]["io.ferroloop.gate/tier"], tier);
+            }
+        }
+        let query = BTreeMap::from([("tier".to_string(), "hub".to_string())]);
+        let (_, body) = handle_tiered_registry_v01_get(
+            "/v0.1/servers",
+            &query,
+            &connectors,
+            "http://127.0.0.1:8420",
+            &attached,
+        );
+        // The adapter-supplied `_meta` tier of "local" was overwritten with the real tier.
+        assert_eq!(body["metadata"]["count"], 2);
     }
 }

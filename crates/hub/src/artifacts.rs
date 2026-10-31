@@ -91,24 +91,30 @@ pub(crate) struct Reconciled {
 
 impl Registry {
     /// A missing or unreadable registry is empty; one malformed entry is skipped, not fatal.
+    /// Production code goes through [`with_registry`], which also keeps a damaged file.
+    #[cfg(test)]
     pub(crate) fn load(root: &Path) -> Self {
+        Self::load_checked(root).0
+    }
+
+    /// [`Registry::load`], plus whether the file on disk held something that was dropped: text
+    /// that is not JSON, or an entry that does not decode. A save would then overwrite it.
+    fn load_checked(root: &Path) -> (Self, bool) {
         let Ok(bytes) = fs::read(registry_path(root)) else {
-            return Self::default();
+            return (Self::default(), false);
         };
         let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
-            return Self::default();
+            return (Self::default(), true);
         };
-        let entries = value
-            .get("entries")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| serde_json::from_value(item.clone()).ok())
-                    .collect()
-            })
-            .unwrap_or_default();
-        Self { entries }
+        let Some(items) = value.get("entries").and_then(Value::as_array) else {
+            return (Self::default(), !bytes.is_empty());
+        };
+        let entries: Vec<ArtifactEntry> = items
+            .iter()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect();
+        let dropped = entries.len() != items.len();
+        (Self { entries }, dropped)
     }
 
     /// Temp file plus rename, so a reader never sees a half-written registry.
@@ -193,15 +199,26 @@ pub(crate) fn with_registry<R>(root: &Path, f: impl FnOnce(&mut Registry) -> R) 
     let _guard = REGISTRY_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut registry = Registry::load(root);
+    let (mut registry, damaged) = Registry::load_checked(root);
     let before = registry.clone();
     let out = f(&mut registry);
-    if registry != before
-        && let Err(err) = registry.save(root)
-    {
-        eprintln!("fl-hub: artifact registry save failed: {err}");
+    if registry != before {
+        // The save replaces the file, and with it whatever part of it could not be read (a
+        // corrupt file would otherwise wipe every entry, and strand their managed copies).
+        // Keep that file once, beside the registry, for repair by hand.
+        if damaged && let Err(err) = fs::copy(registry_path(root), corrupt_backup_path(root)) {
+            eprintln!("fl-hub: could not back up the damaged artifact registry: {err}");
+        }
+        if let Err(err) = registry.save(root) {
+            eprintln!("fl-hub: artifact registry save failed: {err}");
+        }
     }
     out
+}
+
+/// Where a damaged `registry.json` is kept when the next save would overwrite it.
+pub(crate) fn corrupt_backup_path(root: &Path) -> PathBuf {
+    root.join("registry.json.corrupt")
 }
 
 /// The managed copy at `managed_path`, when it is an existing file inside `managed_dir`. The
@@ -655,5 +672,101 @@ mod tests {
             .set_modified(later)
             .unwrap();
         assert!(current_managed_copy(&root, &src).is_none(), "source newer");
+    }
+
+    #[test]
+    fn a_damaged_registry_is_kept_aside_before_the_next_save_replaces_it() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("artifacts");
+        fs::create_dir_all(&root).unwrap();
+        let good = serde_json::to_value(entry(Path::new("/x/old.md"), Some("s1"))).unwrap();
+        // One good entry, one that no longer decodes (as after a schema change).
+        let doc = serde_json::json!({ "entries": [good, { "path": 3 }] });
+        fs::write(registry_path(&root), doc.to_string()).unwrap();
+        with_registry(&root, |reg| {
+            reg.upsert(entry(Path::new("/x/new.md"), None));
+        });
+        let kept = fs::read_to_string(corrupt_backup_path(&root)).unwrap();
+        assert_eq!(kept, doc.to_string(), "the original text must survive");
+        assert_eq!(Registry::load(&root).entries.len(), 2);
+
+        // Unparseable text is kept too, and a registry with nothing dropped leaves no backup.
+        let _ = fs::remove_file(corrupt_backup_path(&root));
+        fs::write(registry_path(&root), b"{ truncated").unwrap();
+        with_registry(&root, |reg| reg.upsert(entry(Path::new("/x/a.md"), None)));
+        assert_eq!(
+            fs::read(corrupt_backup_path(&root)).unwrap(),
+            b"{ truncated"
+        );
+        let _ = fs::remove_file(corrupt_backup_path(&root));
+        with_registry(&root, |reg| reg.upsert(entry(Path::new("/x/b.md"), None)));
+        assert!(!corrupt_backup_path(&root).exists());
+    }
+
+    #[test]
+    fn a_read_only_use_of_a_damaged_registry_does_not_touch_it() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("artifacts");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(registry_path(&root), b"not json").unwrap();
+        let n = with_registry(&root, |reg| reg.entries.len());
+        assert_eq!(n, 0);
+        assert_eq!(fs::read(registry_path(&root)).unwrap(), b"not json");
+        assert!(!corrupt_backup_path(&root).exists());
+    }
+
+    #[test]
+    fn concurrent_registry_updates_are_not_lost() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("artifacts");
+        std::thread::scope(|scope| {
+            for i in 0..16 {
+                let root = &root;
+                scope.spawn(move || {
+                    with_registry(root, |reg| {
+                        reg.upsert(entry(Path::new(&format!("/x/{i}.md")), Some("s")));
+                    });
+                });
+            }
+        });
+        assert_eq!(Registry::load(&root).entries.len(), 16);
+    }
+
+    #[test]
+    fn write_atomic_replaces_a_symlink_instead_of_writing_through_it() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("precious.txt");
+        fs::write(&target, b"keep").unwrap();
+        let dest = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(&target, &dest).unwrap();
+        write_file_atomic(&dest, b"new").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+        assert!(
+            !fs::symlink_metadata(&dest)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn sanitised_names_stay_within_the_length_cap_and_keep_a_short_extension() {
+        let long = format!("{}.md", "n".repeat(500));
+        let name = sanitize_file_name(&long);
+        assert_eq!(name.len(), MAX_MANAGED_NAME_LEN);
+        assert!(name.ends_with(".md"));
+        // A long "extension" is not preserved, but the cap still holds.
+        let odd = format!("a.{}", "e".repeat(300));
+        assert!(sanitize_file_name(&odd).len() <= MAX_MANAGED_NAME_LEN);
+        for raw in ["..", ".", "...md", "", "\u{202e}md.exe", "a/../b", "é"] {
+            let clean = sanitize_file_name(raw);
+            assert!(!clean.is_empty() && !clean.starts_with('.'), "{raw:?}");
+            assert!(
+                clean
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            );
+        }
     }
 }

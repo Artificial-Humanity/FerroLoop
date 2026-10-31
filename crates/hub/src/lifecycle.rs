@@ -2298,4 +2298,26 @@ mod tests {
             assert_eq!(DecommissionMode::parse(bad).unwrap_err().status(), 400);
         }
     }
+
+    #[test]
+    fn hosted_session_slugs_stay_one_to_one_with_session_ids() {
+        // The slug turns `:` into `-`, so `a:b-c` and `a-b:c` would share one record if a vendor
+        // name could hold a `-`. Vendors are fixed, so this holds only while none does.
+        for vendor in SPIN_UP_VENDORS {
+            assert!(
+                !vendor.contains(['-', ':']),
+                "vendor `{vendor}` would let two session ids share one hosted-session record"
+            );
+        }
+        let mut seen = std::collections::BTreeMap::new();
+        for vendor in SPIN_UP_VENDORS {
+            for persona in ["a", "a-b", "claude-a", "codex-a-b", "x1"] {
+                let id = format!("{vendor}:{persona}");
+                let slug = hosted_session_slug(&id);
+                if let Some(other) = seen.insert(slug.clone(), id.clone()) {
+                    panic!("`{id}` and `{other}` share the slug `{slug}`");
+                }
+            }
+        }
+    }
 }

@@ -17,6 +17,62 @@ use crate::auth::HubAuthority;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
+/// How long, after the child has exited, the reader tasks get to reach end of file before the
+/// `exited` frame is sent anyway. A background job the shell left behind (`sleep 600 &`) keeps
+/// the stdout/stderr pipes open, so without this bound the exit would go unreported (and a
+/// close or disconnect would hang) until that job ended.
+const READER_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Turns a byte stream read in arbitrary chunks into text without damaging characters: a
+/// multi-byte character split across two reads is held back and completed by the next one,
+/// where decoding each chunk alone would turn both halves into U+FFFD. Bytes that are invalid
+/// in themselves still become U+FFFD.
+#[derive(Default)]
+struct Utf8Chunker {
+    carry: Vec<u8>,
+}
+
+impl Utf8Chunker {
+    fn push(&mut self, bytes: &[u8]) -> String {
+        self.carry.extend_from_slice(bytes);
+        let mut out = String::new();
+        let mut pos = 0;
+        loop {
+            match std::str::from_utf8(&self.carry[pos..]) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    pos = self.carry.len();
+                    break;
+                }
+                Err(err) => {
+                    let valid_end = pos + err.valid_up_to();
+                    out.push_str(&String::from_utf8_lossy(&self.carry[pos..valid_end]));
+                    match err.error_len() {
+                        Some(bad) => {
+                            out.push(char::REPLACEMENT_CHARACTER);
+                            pos = valid_end + bad;
+                        }
+                        // An incomplete character at the end: wait for the rest of it.
+                        None => {
+                            pos = valid_end;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        self.carry.drain(..pos);
+        out
+    }
+
+    /// The held-back tail at end of stream, lossily decoded.
+    fn finish(&mut self) -> String {
+        let tail = String::from_utf8_lossy(&self.carry).into_owned();
+        self.carry.clear();
+        tail
+    }
+}
+
 /// Active child process session managed for a single WebSocket connection.
 pub struct TerminalSession {
     pub session_id: String,
@@ -265,24 +321,29 @@ impl TerminalManager {
         let stdout_task = tokio::spawn(async move {
             if let Some(mut reader) = stdout {
                 let mut buf = [0u8; 4096];
-                while let Ok(n) = reader.read(&mut buf).await {
-                    if n == 0 {
+                let mut chunker = Utf8Chunker::default();
+                loop {
+                    let (text, eof) = match reader.read(&mut buf).await {
+                        Ok(n) if n > 0 => (chunker.push(&buf[..n]), false),
+                        _ => (chunker.finish(), true),
+                    };
+                    if !text.is_empty()
+                        && out_tx_stdout
+                            .send(HubWsFrame {
+                                channel: "terminal".to_string(),
+                                event: "output".to_string(),
+                                data: json!({
+                                    "session_id": sid_stdout,
+                                    "stream": "stdout",
+                                    "data": text,
+                                    "output": text,
+                                }),
+                            })
+                            .is_err()
+                    {
                         break;
                     }
-                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                    if out_tx_stdout
-                        .send(HubWsFrame {
-                            channel: "terminal".to_string(),
-                            event: "output".to_string(),
-                            data: json!({
-                                "session_id": sid_stdout,
-                                "stream": "stdout",
-                                "data": text,
-                                "output": text,
-                            }),
-                        })
-                        .is_err()
-                    {
+                    if eof {
                         break;
                     }
                 }
@@ -296,27 +357,30 @@ impl TerminalManager {
         let stderr_task = tokio::spawn(async move {
             if let Some(mut reader) = stderr {
                 let mut buf = [0u8; 4096];
-                while let Ok(n) = reader.read(&mut buf).await {
-                    if n == 0 {
+                let mut chunker = Utf8Chunker::default();
+                loop {
+                    let (text, eof) = match reader.read(&mut buf).await {
+                        Ok(n) if n > 0 => (chunker.push(&buf[..n]), false),
+                        _ => (chunker.finish(), true),
+                    };
+                    let text = filter_bash_startup_noise(&text);
+                    if !text.is_empty()
+                        && out_tx_stderr
+                            .send(HubWsFrame {
+                                channel: "terminal".to_string(),
+                                event: "output".to_string(),
+                                data: json!({
+                                    "session_id": sid_stderr,
+                                    "stream": "stderr",
+                                    "data": text,
+                                    "output": text,
+                                }),
+                            })
+                            .is_err()
+                    {
                         break;
                     }
-                    let text = filter_bash_startup_noise(&String::from_utf8_lossy(&buf[..n]));
-                    if text.is_empty() {
-                        continue;
-                    }
-                    if out_tx_stderr
-                        .send(HubWsFrame {
-                            channel: "terminal".to_string(),
-                            event: "output".to_string(),
-                            data: json!({
-                                "session_id": sid_stderr,
-                                "stream": "stderr",
-                                "data": text,
-                                "output": text,
-                            }),
-                        })
-                        .is_err()
-                    {
+                    if eof {
                         break;
                     }
                 }
@@ -335,8 +399,13 @@ impl TerminalManager {
                     child.wait().await
                 }
             };
-            let _ = stdout_done_rx.await;
-            let _ = stderr_done_rx.await;
+            // Normally both readers hit end of file at once. A background job that inherited
+            // the pipes can hold them open, so the wait is bounded (see `READER_DRAIN_GRACE`).
+            let drained = async {
+                let _ = stdout_done_rx.await;
+                let _ = stderr_done_rx.await;
+            };
+            let _ = tokio::time::timeout(READER_DRAIN_GRACE, drained).await;
             let exit_code = status_res.ok().and_then(|s| s.code()).unwrap_or(-1);
             let _ = out_tx_wait.send(HubWsFrame {
                 channel: "terminal".to_string(),
@@ -567,7 +636,8 @@ fn filter_bash_startup_noise(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::filter_bash_startup_noise;
+    use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn bash_startup_noise_lines_are_dropped() {
@@ -588,5 +658,167 @@ mod tests {
         let mixed = "bash: no job control in this shell\nreal error\n";
         assert_eq!(filter_bash_startup_noise(mixed), "real error\n");
         assert_eq!(filter_bash_startup_noise("no newline"), "no newline");
+    }
+
+    #[test]
+    fn chunker_joins_a_character_split_across_reads() {
+        // "é" is C3 A9, "€" is E2 82 AC, "🦀" is F0 9F A6 80: split each at every byte.
+        for text in ["é", "€", "🦀", "a🦀b€é"] {
+            let bytes = text.as_bytes();
+            for cut in 0..=bytes.len() {
+                let mut chunker = Utf8Chunker::default();
+                let mut got = chunker.push(&bytes[..cut]);
+                got.push_str(&chunker.push(&bytes[cut..]));
+                got.push_str(&chunker.finish());
+                assert_eq!(got, text, "cut at {cut}");
+            }
+        }
+    }
+
+    #[test]
+    fn chunker_holds_back_only_an_incomplete_tail() {
+        let mut chunker = Utf8Chunker::default();
+        assert_eq!(chunker.push(b"ab\xE2\x82"), "ab");
+        assert_eq!(chunker.push(b"\xAC!"), "€!");
+        assert_eq!(chunker.finish(), "");
+    }
+
+    #[test]
+    fn chunker_replaces_invalid_bytes_and_a_truncated_tail_at_eof() {
+        let mut chunker = Utf8Chunker::default();
+        // 0xFF is never valid; a lone lead byte followed by ASCII is invalid too.
+        assert_eq!(chunker.push(b"a\xFFb\xC3c"), "a\u{FFFD}b\u{FFFD}c");
+        assert_eq!(chunker.push(b"x\xF0\x9F"), "x");
+        assert_eq!(chunker.finish(), "\u{FFFD}");
+        assert_eq!(chunker.finish(), "");
+    }
+
+    #[test]
+    fn chunker_keeps_a_four_kib_stream_of_multibyte_text_intact() {
+        // 4096 is the reader's buffer size; 4095 bytes of ASCII then "é" straddles it.
+        let text = format!("{}é{}", "a".repeat(4095), "z");
+        let bytes = text.as_bytes();
+        let mut chunker = Utf8Chunker::default();
+        let mut got = chunker.push(&bytes[..4096]);
+        got.push_str(&chunker.push(&bytes[4096..]));
+        assert_eq!(got, text);
+        assert!(!got.contains('\u{FFFD}'));
+    }
+
+    fn owner() -> HubAuthority {
+        HubAuthority::Owner {
+            login: "owner".into(),
+        }
+    }
+
+    async fn open_shell(mgr: &mut TerminalManager, id: &str, script: &str) {
+        let cwd = std::env::temp_dir();
+        mgr.handle_frame(
+            &owner(),
+            true,
+            &cwd,
+            "open",
+            &json!({ "session_id": id, "command": ["/bin/sh", "-c", script] }),
+        )
+        .await;
+    }
+
+    /// Frames of `event` for `id`, waiting up to `limit` for the first one.
+    async fn wait_for(
+        rx: &mut mpsc::UnboundedReceiver<HubWsFrame>,
+        event: &str,
+        limit: Duration,
+    ) -> Option<HubWsFrame> {
+        let deadline = Instant::now() + limit;
+        loop {
+            let left = deadline.checked_duration_since(Instant::now())?;
+            match tokio::time::timeout(left, rx.recv()).await {
+                Ok(Some(frame)) if frame.event == event => return Some(frame),
+                Ok(Some(_)) => {}
+                _ => return None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_is_reported_even_when_a_background_job_holds_the_pipes() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut mgr = TerminalManager::new(tx);
+        // The shell exits at once; `sleep` inherits stdout/stderr and lives on for 8 s.
+        open_shell(&mut mgr, "t1", "sleep 8 & exit 3").await;
+        let exited = wait_for(&mut rx, "exited", Duration::from_secs(5))
+            .await
+            .expect("`exited` must not wait for the background job");
+        assert_eq!(exited.data["exit_code"], 3);
+        assert_eq!(exited.data["session_id"], "t1");
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn close_does_not_hang_on_a_pipe_held_by_a_background_job() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut mgr = TerminalManager::new(tx);
+        open_shell(&mut mgr, "t2", "sleep 8 & echo ready; wait").await;
+        // Kill the shell only once it has started the background job that holds the pipes.
+        let mut rx = rx;
+        let ready = wait_for(&mut rx, "output", Duration::from_secs(5)).await;
+        assert!(ready.is_some_and(|f| f.data["data"].as_str().unwrap().contains("ready")));
+        let started = Instant::now();
+        let done = tokio::time::timeout(Duration::from_secs(5), mgr.shutdown_all()).await;
+        assert!(
+            done.is_ok(),
+            "shutdown_all hung for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(mgr.active_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_output_keeps_multibyte_text_whole() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut mgr = TerminalManager::new(tx);
+        // 4095 ASCII bytes then "é" (2 bytes) puts the character across the 4096-byte read.
+        open_shell(
+            &mut mgr,
+            "t3",
+            "head -c 4095 /dev/zero | tr '\\0' a; printf '\\303\\251 end'",
+        )
+        .await;
+        let mut text = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let Some(frame) = wait_for(&mut rx, "output", Duration::from_secs(1)).await else {
+                break;
+            };
+            text.push_str(frame.data["data"].as_str().unwrap());
+            if text.ends_with("end") {
+                break;
+            }
+        }
+        assert!(
+            text.ends_with("\u{e9} end"),
+            "got tail {:?}",
+            &text[text.len().saturating_sub(12)..]
+        );
+        assert!(!text.contains('\u{FFFD}'));
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_requires_owner_authority_and_the_feature_flag() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut mgr = TerminalManager::new(tx);
+        let cwd = std::env::temp_dir();
+        let peer = HubAuthority::Peer { agent: None };
+        mgr.handle_frame(&peer, true, &cwd, "open", &json!({}))
+            .await;
+        mgr.handle_frame(&owner(), false, &cwd, "open", &json!({}))
+            .await;
+        for _ in 0..2 {
+            let frame = rx.recv().await.unwrap();
+            assert_eq!(frame.event, "error");
+            assert_eq!(frame.data["status"], 403);
+        }
+        assert_eq!(mgr.active_count(), 0);
     }
 }
