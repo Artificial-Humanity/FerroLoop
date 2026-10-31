@@ -1296,15 +1296,11 @@ fn replacing_and_deleting_vectors_keeps_the_graph_searchable() {
     );
 }
 
-/// Known gap, not a regression: delete unlinks a node without reconnecting its
-/// neighbours, so the graph can fragment and a search then returns fewer than `limit`
-/// hits although enough vectors remain. Run with `--ignored` to see it.
-///
-/// This passes once `delete_vector` repairs connectivity (reconnects the deleted node's
-/// neighbours to each other) so that a search returns `min(limit, remaining)` hits after
-/// any sequence of deletes; then drop the `#[ignore]`.
+/// Delete once unlinked a node without reconnecting its neighbours, so the graph could
+/// fragment and a search then returned fewer than `limit` hits although enough vectors
+/// remained. `delete_vector` now repairs connectivity (reconnects the deleted node's neighbours to each
+/// other), so a search returns `min(limit, remaining)` hits after any sequence of deletes.
 #[test]
-#[ignore = "known gap: HNSW delete does not reconnect neighbours, search can return fewer than the limit; see Notes/FerroLoop or file an issue"]
 fn search_still_fills_the_limit_after_random_deletes() {
     let store = FerroStore::in_memory();
     store
