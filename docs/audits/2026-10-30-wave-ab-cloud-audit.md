@@ -54,12 +54,12 @@ paths deserve a second pass.
 | F8 | Low | hub | Terminal output: a multi-byte character split across 4096-byte reads becomes U+FFFD | Fixed, reproduced |
 | F9 | Low | gate | `?tier=local` or `?tier=hub` returns 502 when an unrelated cloud adapter fails | Fixed, reproduced |
 | F10 | Low | hub | `SKILL.md` saved with a UTF-8 BOM is not discovered | Fixed, reproduced |
-| F12 | Medium | hub | Terminal: unbounded output queue and blocking stdin write | Open, read |
+| F12 | Medium | hub | Terminal: unbounded output queue and blocking stdin write | Fixed (this branch): bounded output queue with backpressure, 5 s stdin write timeout, 8-session cap, bounded `session_id` |
 | F13 | Medium | ui | Session token in URLs and passkey private key in `localStorage` | Open, delegate |
 | F14 | Low | ui | `request()` treats a non-JSON 2xx as success | Open, delegate |
-| F15 | Low | hub | Project falls back to the hub store under any slug | Open, read |
+| F15 | Low | hub | Project falls back to the hub store under any slug | Intentional (dev/unit-test fallback), per the maintainers |
 | F16 | Low | gate | Registry shadowing compares names byte-for-byte | Open, delegate |
-| F17 | Info | hub | `interrupt` and `model` accept Peer authority | Open, read — confirm intent |
+| F17 | Info | hub | `interrupt` and `model` accept Peer authority | Fixed (this branch): both routes are Owner only (403 for a Peer); `prompt` and `clear` stay peer-callable |
 | F18 | Info | store | Cloud search hits are not bounded or checked for non-finite scores | Open, delegate |
 | F19 | Info | store | FLEN decoder accepts non-canonical frames | Open, delegate |
 
@@ -212,6 +212,10 @@ so the skill was skipped. The leading BOM is now stripped.
 
 ### F12 — Terminal resource limits (Medium) — read
 
+**Fixed (this branch):** the output queue is bounded and applies backpressure, a stdin write times
+out after 5 s (and closes the session), a connection holds at most 8 live sessions, and
+`session_id` is length- and character-checked.
+
 * `terminal.rs:119` — frames go through `mpsc::UnboundedSender`. A child that writes faster than
   the WebSocket drains (`yes`) grows hub memory without limit.
 * `terminal.rs:490` — `stdin.write_all(..).await` runs inside `handle_input`, which holds
@@ -242,6 +246,8 @@ needs a pass over callers that rely on empty bodies.
 
 ### F15 — Any slug reaches the hub store (Low) — read
 
+**Maintainers' ruling: intentional (dev/unit-test fallback).** No change.
+
 `records.rs:130–148`, `open_project_store`. If `<slug>.redb` does not exist the request falls back
 to the hub store. `GET /api/v1/records?project=nonexistent` returns the hub store's records labelled
 `"project": "nonexistent"`, and an Owner `POST` creates a record in the hub store rooted at
@@ -257,6 +263,9 @@ tier-tagged, so this is confusion rather than override. Not wired into the hub t
 `handle_registry_v01_get` is), so latent.
 
 ### F17 — Peer authority on session control (Info) — read
+
+**Fixed (this branch):** `interrupt` and `model` are Owner only (403 for a Peer, checked before any
+other work); `prompt` and `clear` stay peer-callable.
 
 `api.rs` dynamic routes: `POST /sessions/:id/{prompt,clear,interrupt,model}` do not check
 `is_owner()`; `bulk-action`, `decommission` (for unmanaged sessions) and spin-up of active agents

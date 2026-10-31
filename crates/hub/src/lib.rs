@@ -4074,9 +4074,9 @@ mod tests {
         assert_eq!(frame.data["reason"], "stuck");
         assert_eq!(frame.data["persona"], "ada");
 
-        // `{}`, an empty body, a null reason, the canonical id and a Peer token all work.
+        // `{}`, an empty body, a null reason and the canonical id all work.
         for (token, target, req_body) in [
-            (PEER, "ada", Some(json!({}))),
+            (OWNER, "ada", Some(json!({}))),
             (OWNER, "ms-ada", None),
             (OWNER, "ada", Some(json!({ "reason": null }))),
         ] {
@@ -4099,6 +4099,91 @@ mod tests {
                 .with_body(b"{nope".to_vec()),
         );
         assert_eq!(bad_body.status, 400);
+    }
+
+    #[test]
+    fn interrupt_and_model_are_owner_only_and_a_peer_changes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        install_route(tmp.path(), "ada", muse_route("ms-ada", Some("muse:ada")));
+        // A busy session, so an accepted interrupt would visibly clear the flag.
+        state.mark_session_in_flight_from_turns("ms-ada", &[]);
+        let mut frames = state.subscribe();
+
+        // The gate runs before the body is parsed: a malformed or empty body is still a 403.
+        for (path, body) in [
+            ("/api/v1/sessions/ada/interrupt", json!({})),
+            ("/api/v1/sessions/ada/interrupt", json!({ "reason": 7 })),
+            ("/api/v1/sessions/ms-ada/interrupt", json!({})),
+            (
+                "/api/v1/sessions/ada/model",
+                json!({ "model": "gpt-6-sol" }),
+            ),
+            ("/api/v1/sessions/ada/model", json!({})),
+            ("/api/v1/sessions/nobody/model", json!({ "model": "x" })),
+            ("/api/v1/sessions/nobody/interrupt", json!({})),
+        ] {
+            let resp = call(&state, "POST", path, PEER, &body);
+            assert_eq!(resp.status, 403, "{path}: {}", resp.json_value().unwrap());
+            assert!(error_text(&resp).contains("Owner"), "{path}");
+        }
+        let raw = handle_http_request(
+            &state,
+            &HttpRequest::new("POST", "/api/v1/sessions/ada/model")
+                .with_header("Authorization", format!("Bearer {PEER}"))
+                .with_body(b"{nope".to_vec()),
+        );
+        assert_eq!(raw.status, 403);
+
+        // No side effect: the session is still busy, nothing was broadcast, no model stored.
+        assert!(state.is_session_busy_from_turns("ms-ada", &[]));
+        assert!(
+            frames.try_recv().is_err(),
+            "a rejected call must broadcast nothing"
+        );
+        for key in ["ms-ada", "ada", "nobody"] {
+            assert!(state.session_model_override(key).is_none(), "{key}");
+        }
+
+        // The Owner still can.
+        let ok = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/ada/interrupt",
+            OWNER,
+            &json!({}),
+        );
+        assert_eq!(ok.status, 200, "{}", error_text(&ok));
+        assert!(!state.is_session_busy_from_turns("ms-ada", &[]));
+        let ok = call(
+            &state,
+            "POST",
+            "/api/v1/sessions/ada/model",
+            OWNER,
+            &json!({ "model": "gpt-6-sol" }),
+        );
+        assert_eq!(ok.status, 200, "{}", error_text(&ok));
+        assert_eq!(
+            state.session_model_override("ms-ada").unwrap().model,
+            "gpt-6-sol"
+        );
+    }
+
+    #[test]
+    fn prompt_and_clear_stay_callable_by_a_peer() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        for (path, body) in [
+            (
+                "/api/v1/sessions/nobody/prompt",
+                json!({ "prompt": "hello" }),
+            ),
+            ("/api/v1/sessions/nobody/clear", json!({ "mode": "clear" })),
+        ] {
+            let resp = call(&state, "POST", path, PEER, &body);
+            assert_ne!(resp.status, 403, "{path}: {}", resp.json_value().unwrap());
+            assert_ne!(resp.status, 401, "{path}");
+        }
     }
 
     #[test]
@@ -4317,10 +4402,11 @@ mod tests {
         assert_eq!(felicia["model"], "claude-opus-5-5");
         assert_eq!(felicia["thinking_level"], "high");
 
-        // A Peer may switch too; no thinking level is `null`, and keeps the earlier level.
-        let peer = call(&state, "POST", url, PEER, &json!({ "model": "gpt-6-sol" }));
-        assert_eq!(peer.status, 200);
-        assert!(peer.json_value().unwrap()["thinking_level"].is_null());
+        // No thinking level is `null`, and the earlier level is not carried over. A Peer can
+        // still read the list.
+        let again = call(&state, "POST", url, OWNER, &json!({ "model": "gpt-6-sol" }));
+        assert_eq!(again.status, 200);
+        assert!(again.json_value().unwrap()["thinking_level"].is_null());
         let listed = call(&state, "GET", "/api/v1/sessions", PEER, &json!({}));
         let sessions = listed.json_value().unwrap()["sessions"]
             .as_array()

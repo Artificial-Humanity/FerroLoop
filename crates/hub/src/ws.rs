@@ -19,7 +19,7 @@ use crate::api::{
     HttpRequest, HttpResponse, drain_ready_session_queues, handle_http_request, parse_http_request,
 };
 use crate::auth::HubAuthority;
-use crate::terminal::TerminalManager;
+use crate::terminal::{self, TerminalManager};
 use crate::{HubServerConfig, HubState, HubWsFrame};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -250,7 +250,9 @@ async fn handle_websocket_session(
     };
     write_ws_json(&mut writer, &connected).await?;
 
-    let (term_tx, mut term_rx) = mpsc::unbounded_channel::<HubWsFrame>();
+    // Bounded: a client that reads slowly holds the child's output back instead of growing
+    // the hub's memory (see the `terminal` module comment).
+    let (term_tx, mut term_rx) = mpsc::channel::<HubWsFrame>(terminal::OUTPUT_QUEUE_CAPACITY);
     let mut terminal_mgr = TerminalManager::new(term_tx);
     let mut tmp = [0u8; 4096];
 
@@ -299,6 +301,9 @@ async fn handle_websocket_session(
     }
     .await;
 
+    // Close the output queue first: a reader blocked on a full queue then fails at once and the
+    // children stop, instead of the teardown waiting out their drain grace.
+    drop(term_rx);
     terminal_mgr.shutdown_all().await;
     loop_res
 }
@@ -334,7 +339,9 @@ async fn handle_incoming_ws_frame(
                         }
                     }
                     "terminal" => {
-                        terminal_mgr
+                        // Written here, not queued: this loop is the output queue's only
+                        // consumer and must not wait on it.
+                        if let Some(reply) = terminal_mgr
                             .handle_frame(
                                 authority,
                                 state.config.enable_terminal,
@@ -342,7 +349,10 @@ async fn handle_incoming_ws_frame(
                                 &ws_frame.event,
                                 &ws_frame.data,
                             )
-                            .await;
+                            .await
+                        {
+                            write_ws_json(writer, &reply).await?;
+                        }
                     }
                     other => {
                         let err_frame = HubWsFrame {

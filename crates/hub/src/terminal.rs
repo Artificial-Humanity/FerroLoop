@@ -1,14 +1,32 @@
 //! Owner-scoped interactive terminal process manager for `/ws/v1` (`channel = "terminal"`, spec §4.2).
+//!
+//! Resource limits (every one is per WebSocket connection):
+//!
+//! * Output is a bounded queue ([`OUTPUT_QUEUE_CAPACITY`] frames). The reader tasks `send().await`
+//!   into it, so a slow client makes them stop reading the child's pipe; the pipe fills and the
+//!   child blocks. Nothing is dropped and hub memory stays bounded.
+//! * The connection loop is also the queue's only consumer, so it must never wait on the queue.
+//!   Every reply to a client frame (`opened`, `resized`, `error`) is therefore *returned* from
+//!   [`TerminalManager::handle_frame`] and written by the caller, never queued.
+//! * The final `exited` frame is the one frame that must not be lost or wait behind a full
+//!   queue (a `close` waits for it). A queue slot is reserved for it when the session opens
+//!   (`try_reserve_owned`), so sending it never blocks and never fails while the client is
+//!   connected. An `open` that finds no free slot is refused.
+//! * A write to the child's stdin is bounded by [`STDIN_WRITE_TIMEOUT`].
+//! * At most [`MAX_SESSIONS_PER_CONNECTION`] live sessions; `session_id` is bounded.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{ChildStdin, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::HubWsFrame;
@@ -17,11 +35,28 @@ use crate::auth::HubAuthority;
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
 
+/// Frames the output queue of one connection holds before the reader tasks wait for the
+/// WebSocket writer. A frame is at most 4096 bytes of text, so this bounds the queue to about
+/// 1 MiB (plus JSON overhead) however fast the child writes.
+pub const OUTPUT_QUEUE_CAPACITY: usize = 256;
+
+/// How long one write of client input to the child's stdin may take. A child that stopped
+/// reading fills the pipe (64 KiB on Linux) and the write would wait forever.
+const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Live terminal sessions one connection may hold. A session that has exited does not count.
+const MAX_SESSIONS_PER_CONNECTION: usize = 8;
+
+/// Longest `session_id` a client may choose.
+const MAX_SESSION_ID_BYTES: usize = 64;
+
 /// How long, after the child has exited, the reader tasks get to reach end of file before the
 /// `exited` frame is sent anyway. A background job the shell left behind (`sleep 600 &`) keeps
 /// the stdout/stderr pipes open, so without this bound the exit would go unreported (and a
-/// close or disconnect would hang) until that job ended.
-const READER_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// close or disconnect would hang) until that job ended. The wait is for *no progress*: it
+/// restarts while the readers keep delivering frames, so a slow client that drains a large
+/// backlog still gets all the output before `exited`.
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// Turns a byte stream read in arbitrary chunks into text without damaging characters: a
 /// multi-byte character split across two reads is held back and completed by the next one,
@@ -72,7 +107,6 @@ impl Utf8Chunker {
         tail
     }
 }
-
 /// Active child process session managed for a single WebSocket connection.
 pub struct TerminalSession {
     pub session_id: String,
@@ -85,6 +119,9 @@ pub struct TerminalSession {
     wait_task: Option<JoinHandle<()>>,
     stdout_task: JoinHandle<()>,
     stderr_task: JoinHandle<()>,
+    /// Set just before the `exited` frame is queued, so a client that has seen the frame can
+    /// reopen at once without the session still counting against the cap.
+    exited: Arc<AtomicBool>,
 }
 
 impl TerminalSession {
@@ -100,6 +137,11 @@ impl TerminalSession {
         self.stdout_task.abort();
         self.stderr_task.abort();
     }
+
+    /// The child has exited and its `exited` frame is queued (or about to be).
+    fn is_finished(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
 }
 
 impl Drop for TerminalSession {
@@ -113,15 +155,49 @@ impl Drop for TerminalSession {
     }
 }
 
+fn terminal_frame(event: &str, data: Value) -> HubWsFrame {
+    HubWsFrame {
+        channel: "terminal".to_string(),
+        event: event.to_string(),
+        data,
+    }
+}
+
+fn error_frame(status: u16, session_id: Option<&str>, message: impl Into<String>) -> HubWsFrame {
+    let mut data = json!({ "status": status, "message": message.into() });
+    if let Some(id) = session_id {
+        data["session_id"] = json!(id);
+    }
+    terminal_frame("error", data)
+}
+
+/// The client's `session_id`, trimmed. `None` when absent or blank (the manager then picks one).
+fn clean_session_id(raw: Option<&str>) -> Result<Option<String>, String> {
+    let Some(id) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    if id.len() > MAX_SESSION_ID_BYTES {
+        return Err(format!(
+            "session_id is longer than {MAX_SESSION_ID_BYTES} bytes"
+        ));
+    }
+    if id.chars().any(char::is_control) {
+        return Err("session_id contains a control character".to_string());
+    }
+    Ok(Some(id.to_string()))
+}
+
 /// Per-WebSocket manager of active interactive terminal sessions (spec §4.2).
 pub struct TerminalManager {
     sessions: BTreeMap<String, TerminalSession>,
-    out_tx: mpsc::UnboundedSender<HubWsFrame>,
+    out_tx: mpsc::Sender<HubWsFrame>,
     next_id: u64,
 }
 
 impl TerminalManager {
-    pub fn new(out_tx: mpsc::UnboundedSender<HubWsFrame>) -> Self {
+    /// `out_tx` is the connection's output queue; create it with
+    /// `mpsc::channel(OUTPUT_QUEUE_CAPACITY)`.
+    pub fn new(out_tx: mpsc::Sender<HubWsFrame>) -> Self {
         Self {
             sessions: BTreeMap::new(),
             out_tx,
@@ -129,8 +205,9 @@ impl TerminalManager {
         }
     }
 
+    /// Sessions whose child is still running.
     pub fn active_count(&self) -> usize {
-        self.sessions.len()
+        self.sessions.values().filter(|s| !s.is_finished()).count()
     }
 
     /// Terminate all spawned child processes when the owning WebSocket disconnects.
@@ -143,7 +220,14 @@ impl TerminalManager {
         }
     }
 
-    /// Handle an incoming `channel == "terminal"` frame from a WebSocket client.
+    /// Forget sessions whose child has exited, so they no longer count against the cap.
+    fn reap_finished(&mut self) {
+        self.sessions.retain(|_, s| !s.is_finished());
+    }
+
+    /// Handle an incoming `channel == "terminal"` frame from a WebSocket client. The returned
+    /// frame, if any, is the direct reply; the caller writes it (see the module comment for why
+    /// it is not queued). Output and `exited` frames arrive on the output queue.
     pub async fn handle_frame(
         &mut self,
         authority: &HubAuthority,
@@ -151,38 +235,29 @@ impl TerminalManager {
         default_cwd: &Path,
         event: &str,
         data: &Value,
-    ) {
+    ) -> Option<HubWsFrame> {
         if !authority.is_owner() || !enable_terminal {
-            let _ = self.out_tx.send(HubWsFrame {
-                channel: "terminal".to_string(),
-                event: "error".to_string(),
-                data: json!({
-                    "status": 403,
-                    "message": "owner authority required for terminal sessions",
-                }),
-            });
-            return;
+            return Some(error_frame(
+                403,
+                None,
+                "owner authority required for terminal sessions",
+            ));
         }
 
         match event {
-            "open" => self.handle_open(default_cwd, data).await,
+            "open" => Some(self.handle_open(default_cwd, data).await),
             "input" => self.handle_input(data).await,
-            "resize" => self.handle_resize(data),
+            "resize" => Some(self.handle_resize(data)),
             "close" => self.handle_close(data).await,
-            other => {
-                let _ = self.out_tx.send(HubWsFrame {
-                    channel: "terminal".to_string(),
-                    event: "error".to_string(),
-                    data: json!({
-                        "status": 400,
-                        "message": format!("unknown terminal event `{other}`"),
-                    }),
-                });
-            }
+            other => Some(error_frame(
+                400,
+                None,
+                format!("unknown terminal event `{other}`"),
+            )),
         }
     }
 
-    async fn handle_open(&mut self, default_cwd: &Path, data: &Value) {
+    async fn handle_open(&mut self, default_cwd: &Path, data: &Value) -> HubWsFrame {
         #[derive(Debug, Deserialize, Default)]
         struct OpenPayload {
             #[serde(default)]
@@ -204,31 +279,32 @@ impl TerminalManager {
         let payload: OpenPayload = match serde_json::from_value(data.clone()) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.out_tx.send(HubWsFrame {
-                    channel: "terminal".to_string(),
-                    event: "error".to_string(),
-                    data: json!({
-                        "status": 400,
-                        "message": format!("invalid terminal open payload: {e}"),
-                    }),
-                });
-                return;
+                return error_frame(400, None, format!("invalid terminal open payload: {e}"));
             }
         };
 
-        let session_id = match payload
-            .session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(id) => id.to_string(),
-            None => {
+        let session_id = match clean_session_id(payload.session_id.as_deref()) {
+            Ok(Some(id)) => id,
+            Ok(None) => {
                 let id = format!("term-{}", self.next_id);
                 self.next_id += 1;
                 id
             }
+            Err(message) => return error_frame(400, None, message),
         };
+
+        // Reopening an id replaces its session, so that one does not count against the cap.
+        self.reap_finished();
+        let others = self.sessions.len() - usize::from(self.sessions.contains_key(&session_id));
+        if others >= MAX_SESSIONS_PER_CONNECTION {
+            return error_frame(
+                429,
+                Some(&session_id),
+                format!(
+                    "too many terminal sessions on this connection (limit {MAX_SESSIONS_PER_CONNECTION})"
+                ),
+            );
+        }
 
         let cwd = match payload
             .cwd
@@ -248,21 +324,32 @@ impl TerminalManager {
         };
 
         if !cwd.is_dir() {
-            let _ = self.out_tx.send(HubWsFrame {
-                channel: "terminal".to_string(),
-                event: "error".to_string(),
-                data: json!({
-                    "status": 400,
-                    "session_id": session_id,
-                    "message": format!("working directory `{}` does not exist", cwd.display()),
-                }),
-            });
-            return;
+            return error_frame(
+                400,
+                Some(&session_id),
+                format!("working directory `{}` does not exist", cwd.display()),
+            );
         }
 
         let (program, args) = resolve_command(payload.command.as_ref(), &payload.args);
         let cols = payload.cols.unwrap_or(DEFAULT_COLS).max(1);
         let rows = payload.rows.unwrap_or(DEFAULT_ROWS).max(1);
+
+        // The queue slot for this session's `exited` frame (see the module comment). Taken
+        // without waiting: the connection loop is the queue's consumer, so it cannot wait here.
+        let exit_permit = match self.out_tx.clone().try_reserve_owned() {
+            Ok(permit) => permit,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                return error_frame(
+                    503,
+                    Some(&session_id),
+                    "terminal output backlog is full; retry once the client has caught up",
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                return error_frame(500, Some(&session_id), "terminal output channel is closed");
+            }
+        };
 
         // If an older session with the same ID exists, shut it down cleanly before replacing it.
         if let Some(prev) = self.sessions.remove(&session_id) {
@@ -284,16 +371,11 @@ impl TerminalManager {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                let _ = self.out_tx.send(HubWsFrame {
-                    channel: "terminal".to_string(),
-                    event: "error".to_string(),
-                    data: json!({
-                        "status": 500,
-                        "session_id": session_id,
-                        "message": format!("failed to spawn `{program}`: {e}"),
-                    }),
-                });
-                return;
+                return error_frame(
+                    500,
+                    Some(&session_id),
+                    format!("failed to spawn `{program}`: {e}"),
+                );
             }
         };
 
@@ -302,99 +384,46 @@ impl TerminalManager {
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
-        // Emit `terminal:opened` before any stdout/stderr output or exit frames.
-        let _ = self.out_tx.send(HubWsFrame {
-            channel: "terminal".to_string(),
-            event: "opened".to_string(),
-            data: json!({
-                "session_id": session_id,
-                "pid": pid,
-                "cwd": cwd.display().to_string(),
-                "cols": cols,
-                "rows": rows,
-            }),
-        });
+        // Frames the readers have delivered (the drain grace restarts while this moves), and
+        // the signal a reader raises when the output queue is closed because the client is gone.
+        let progress = Arc::new(AtomicU64::new(0));
+        let client_gone = Arc::new(Notify::new());
 
         let (stdout_done_tx, stdout_done_rx) = oneshot::channel::<()>();
-        let sid_stdout = session_id.clone();
-        let out_tx_stdout = self.out_tx.clone();
-        let stdout_task = tokio::spawn(async move {
-            if let Some(mut reader) = stdout {
-                let mut buf = [0u8; 4096];
-                let mut chunker = Utf8Chunker::default();
-                loop {
-                    let (text, eof) = match reader.read(&mut buf).await {
-                        Ok(n) if n > 0 => (chunker.push(&buf[..n]), false),
-                        _ => (chunker.finish(), true),
-                    };
-                    if !text.is_empty()
-                        && out_tx_stdout
-                            .send(HubWsFrame {
-                                channel: "terminal".to_string(),
-                                event: "output".to_string(),
-                                data: json!({
-                                    "session_id": sid_stdout,
-                                    "stream": "stdout",
-                                    "data": text,
-                                    "output": text,
-                                }),
-                            })
-                            .is_err()
-                    {
-                        break;
-                    }
-                    if eof {
-                        break;
-                    }
-                }
-            }
-            let _ = stdout_done_tx.send(());
-        });
-
+        let stdout_task = tokio::spawn(pump_output(
+            stdout,
+            "stdout",
+            session_id.clone(),
+            self.out_tx.clone(),
+            progress.clone(),
+            client_gone.clone(),
+            stdout_done_tx,
+        ));
         let (stderr_done_tx, stderr_done_rx) = oneshot::channel::<()>();
-        let sid_stderr = session_id.clone();
-        let out_tx_stderr = self.out_tx.clone();
-        let stderr_task = tokio::spawn(async move {
-            if let Some(mut reader) = stderr {
-                let mut buf = [0u8; 4096];
-                let mut chunker = Utf8Chunker::default();
-                loop {
-                    let (text, eof) = match reader.read(&mut buf).await {
-                        Ok(n) if n > 0 => (chunker.push(&buf[..n]), false),
-                        _ => (chunker.finish(), true),
-                    };
-                    let text = filter_bash_startup_noise(&text);
-                    if !text.is_empty()
-                        && out_tx_stderr
-                            .send(HubWsFrame {
-                                channel: "terminal".to_string(),
-                                event: "output".to_string(),
-                                data: json!({
-                                    "session_id": sid_stderr,
-                                    "stream": "stderr",
-                                    "data": text,
-                                    "output": text,
-                                }),
-                            })
-                            .is_err()
-                    {
-                        break;
-                    }
-                    if eof {
-                        break;
-                    }
-                }
-            }
-            let _ = stderr_done_tx.send(());
-        });
+        let stderr_task = tokio::spawn(pump_output(
+            stderr,
+            "stderr",
+            session_id.clone(),
+            self.out_tx.clone(),
+            progress.clone(),
+            client_gone.clone(),
+            stderr_done_tx,
+        ));
 
         let (kill_tx, mut kill_rx) = oneshot::channel::<()>();
         let sid_wait = session_id.clone();
-        let out_tx_wait = self.out_tx.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_flag = exited.clone();
         let wait_task = tokio::spawn(async move {
             let status_res = tokio::select! {
                 res = child.wait() => res,
                 _ = &mut kill_rx => {
+                    let _ = child.start_kill();
+                    child.wait().await
+                }
+                // The client disconnected: nobody can read the output, so stop the child
+                // (a child that ignores SIGPIPE would otherwise run on, unread).
+                _ = client_gone.notified() => {
                     let _ = child.start_kill();
                     child.wait().await
                 }
@@ -405,24 +434,39 @@ impl TerminalManager {
                 let _ = stdout_done_rx.await;
                 let _ = stderr_done_rx.await;
             };
-            let _ = tokio::time::timeout(READER_DRAIN_GRACE, drained).await;
+            tokio::pin!(drained);
+            let mut seen = progress.load(Ordering::Relaxed);
+            loop {
+                if tokio::time::timeout(READER_DRAIN_GRACE, &mut drained)
+                    .await
+                    .is_ok()
+                {
+                    break;
+                }
+                let now = progress.load(Ordering::Relaxed);
+                if now == seen {
+                    break;
+                }
+                seen = now;
+            }
             let exit_code = status_res.ok().and_then(|s| s.code()).unwrap_or(-1);
-            let _ = out_tx_wait.send(HubWsFrame {
-                channel: "terminal".to_string(),
-                event: "exited".to_string(),
-                data: json!({
+            exited_flag.store(true, Ordering::Release);
+            // Into the slot reserved at open: never waits, and is lost only if the client is gone.
+            exit_permit.send(terminal_frame(
+                "exited",
+                json!({
                     "session_id": sid_wait,
                     "exit_code": exit_code,
                 }),
-            });
+            ));
         });
 
         self.sessions.insert(
             session_id.clone(),
             TerminalSession {
-                session_id,
+                session_id: session_id.clone(),
                 pid,
-                cwd,
+                cwd: cwd.clone(),
                 cols,
                 rows,
                 stdin,
@@ -430,8 +474,22 @@ impl TerminalManager {
                 wait_task: Some(wait_task),
                 stdout_task,
                 stderr_task,
+                exited,
             },
         );
+
+        // The caller writes this before it next drains the output queue, so `opened` always
+        // precedes the session's output and exit frames.
+        terminal_frame(
+            "opened",
+            json!({
+                "session_id": session_id,
+                "pid": pid,
+                "cwd": cwd.display().to_string(),
+                "cols": cols,
+                "rows": rows,
+            }),
+        )
     }
 
     fn resolve_session_key(&self, requested: Option<&str>) -> Option<String> {
@@ -447,7 +505,14 @@ impl TerminalManager {
         None
     }
 
-    async fn handle_input(&mut self, data: &Value) {
+    /// Write client input to the child's stdin.
+    ///
+    /// The write is bounded by [`STDIN_WRITE_TIMEOUT`] so a child that stopped reading cannot
+    /// stall the connection loop (and with it every other session's `close`). On a timeout the
+    /// session is closed: part of the input may already be in the pipe, so keeping the session
+    /// would feed the child a corrupted stream. The client gets a 504 error frame, then the
+    /// session's `exited` frame.
+    async fn handle_input(&mut self, data: &Value) -> Option<HubWsFrame> {
         #[derive(Debug, Deserialize, Default)]
         struct InputPayload {
             #[serde(default)]
@@ -459,51 +524,45 @@ impl TerminalManager {
         let payload: InputPayload = match serde_json::from_value(data.clone()) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.out_tx.send(HubWsFrame {
-                    channel: "terminal".to_string(),
-                    event: "error".to_string(),
-                    data: json!({
-                        "status": 400,
-                        "message": format!("invalid terminal input payload: {e}"),
-                    }),
-                });
-                return;
+                return Some(error_frame(
+                    400,
+                    None,
+                    format!("invalid terminal input payload: {e}"),
+                ));
             }
         };
 
         let Some(key) = self.resolve_session_key(payload.session_id.as_deref()) else {
-            let _ = self.out_tx.send(HubWsFrame {
-                channel: "terminal".to_string(),
-                event: "error".to_string(),
-                data: json!({
-                    "status": 404,
-                    "message": "terminal session not found",
-                }),
-            });
-            return;
+            return Some(error_frame(404, None, "terminal session not found"));
         };
 
-        let Some(sess) = self.sessions.get_mut(&key) else {
-            return;
-        };
-        if let Some(ref mut stdin) = sess.stdin {
-            if let Err(e) = stdin.write_all(payload.data.as_bytes()).await {
-                let _ = self.out_tx.send(HubWsFrame {
-                    channel: "terminal".to_string(),
-                    event: "error".to_string(),
-                    data: json!({
-                        "status": 500,
-                        "session_id": key,
-                        "message": format!("failed writing to terminal stdin: {e}"),
-                    }),
-                });
-                return;
+        let stdin = self.sessions.get_mut(&key)?.stdin.as_mut()?;
+        let written = tokio::time::timeout(STDIN_WRITE_TIMEOUT, async {
+            stdin.write_all(payload.data.as_bytes()).await?;
+            stdin.flush().await
+        })
+        .await;
+        match written {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(error_frame(
+                500,
+                Some(&key),
+                format!("failed writing to terminal stdin: {e}"),
+            )),
+            Err(_elapsed) => {
+                if let Some(sess) = self.sessions.remove(&key) {
+                    sess.shutdown().await;
+                }
+                Some(error_frame(
+                    504,
+                    Some(&key),
+                    "writing to terminal stdin timed out (the process is not reading); session closed",
+                ))
             }
-            let _ = stdin.flush().await;
         }
     }
 
-    fn handle_resize(&mut self, data: &Value) {
+    fn handle_resize(&mut self, data: &Value) -> HubWsFrame {
         #[derive(Debug, Deserialize, Default)]
         struct ResizePayload {
             #[serde(default)]
@@ -517,50 +576,34 @@ impl TerminalManager {
         let payload: ResizePayload = match serde_json::from_value(data.clone()) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.out_tx.send(HubWsFrame {
-                    channel: "terminal".to_string(),
-                    event: "error".to_string(),
-                    data: json!({
-                        "status": 400,
-                        "message": format!("invalid terminal resize payload: {e}"),
-                    }),
-                });
-                return;
+                return error_frame(400, None, format!("invalid terminal resize payload: {e}"));
             }
         };
 
-        let Some(key) = self.resolve_session_key(payload.session_id.as_deref()) else {
-            let _ = self.out_tx.send(HubWsFrame {
-                channel: "terminal".to_string(),
-                event: "error".to_string(),
-                data: json!({
-                    "status": 404,
-                    "message": "terminal session not found",
-                }),
-            });
-            return;
+        let Some(sess) = self
+            .resolve_session_key(payload.session_id.as_deref())
+            .and_then(|key| self.sessions.get_mut(&key))
+        else {
+            return error_frame(404, None, "terminal session not found");
         };
 
-        if let Some(sess) = self.sessions.get_mut(&key) {
-            if let Some(c) = payload.cols.filter(|&c| c > 0) {
-                sess.cols = c;
-            }
-            if let Some(r) = payload.rows.filter(|&r| r > 0) {
-                sess.rows = r;
-            }
-            let _ = self.out_tx.send(HubWsFrame {
-                channel: "terminal".to_string(),
-                event: "resized".to_string(),
-                data: json!({
-                    "session_id": sess.session_id,
-                    "cols": sess.cols,
-                    "rows": sess.rows,
-                }),
-            });
+        if let Some(c) = payload.cols.filter(|&c| c > 0) {
+            sess.cols = c;
         }
+        if let Some(r) = payload.rows.filter(|&r| r > 0) {
+            sess.rows = r;
+        }
+        terminal_frame(
+            "resized",
+            json!({
+                "session_id": sess.session_id,
+                "cols": sess.cols,
+                "rows": sess.rows,
+            }),
+        )
     }
 
-    async fn handle_close(&mut self, data: &Value) {
+    async fn handle_close(&mut self, data: &Value) -> Option<HubWsFrame> {
         #[derive(Debug, Deserialize, Default)]
         struct ClosePayload {
             #[serde(default)]
@@ -569,21 +612,66 @@ impl TerminalManager {
 
         let payload: ClosePayload = serde_json::from_value(data.clone()).unwrap_or_default();
         let Some(key) = self.resolve_session_key(payload.session_id.as_deref()) else {
-            let _ = self.out_tx.send(HubWsFrame {
-                channel: "terminal".to_string(),
-                event: "error".to_string(),
-                data: json!({
-                    "status": 404,
-                    "message": "terminal session not found",
-                }),
-            });
-            return;
+            return Some(error_frame(404, None, "terminal session not found"));
         };
 
         if let Some(sess) = self.sessions.remove(&key) {
             sess.shutdown().await;
         }
+        None
     }
+}
+
+/// Read one of the child's output pipes and queue its text as `output` frames until end of file.
+///
+/// `send().await` is the backpressure: while the queue is full this task stops reading, the
+/// pipe fills and the child blocks. A failed send means the queue's receiver is gone (the
+/// client disconnected): raise `client_gone` so the child is stopped, and stop reading.
+/// `done` is signalled on every way out.
+async fn pump_output(
+    reader: Option<impl AsyncRead + Unpin>,
+    stream: &'static str,
+    session_id: String,
+    out_tx: mpsc::Sender<HubWsFrame>,
+    progress: Arc<AtomicU64>,
+    client_gone: Arc<Notify>,
+    done: oneshot::Sender<()>,
+) {
+    if let Some(mut reader) = reader {
+        let mut buf = [0u8; 4096];
+        let mut chunker = Utf8Chunker::default();
+        loop {
+            let (text, eof) = match reader.read(&mut buf).await {
+                Ok(n) if n > 0 => (chunker.push(&buf[..n]), false),
+                _ => (chunker.finish(), true),
+            };
+            let text = if stream == "stderr" {
+                filter_bash_startup_noise(&text)
+            } else {
+                text
+            };
+            if !text.is_empty() {
+                let frame = terminal_frame(
+                    "output",
+                    json!({
+                        "session_id": session_id,
+                        "stream": stream,
+                        "data": text,
+                        "output": text,
+                    }),
+                );
+                if out_tx.send(frame).await.is_err() {
+                    client_gone.notify_one();
+                    break;
+                }
+                progress.fetch_add(1, Ordering::Relaxed);
+            }
+            if eof {
+                break;
+            }
+        }
+    }
+    let _ = done.send(());
 }
 
 fn resolve_command(command: Option<&Value>, extra_args: &[String]) -> (String, Vec<String>) {
@@ -711,21 +799,25 @@ mod tests {
         }
     }
 
-    async fn open_shell(mgr: &mut TerminalManager, id: &str, script: &str) {
-        let cwd = std::env::temp_dir();
-        mgr.handle_frame(
-            &owner(),
-            true,
-            &cwd,
+    /// Open `script` under `/bin/sh -c` and return the direct reply (`opened` or an error).
+    async fn open_shell(mgr: &mut TerminalManager, id: &str, script: &str) -> HubWsFrame {
+        send(
+            mgr,
             "open",
-            &json!({ "session_id": id, "command": ["/bin/sh", "-c", script] }),
+            json!({ "session_id": id, "command": ["/bin/sh", "-c", script] }),
         )
-        .await;
+        .await
+        .expect("open always replies")
+    }
+
+    async fn send(mgr: &mut TerminalManager, event: &str, data: Value) -> Option<HubWsFrame> {
+        let cwd = std::env::temp_dir();
+        mgr.handle_frame(&owner(), true, &cwd, event, &data).await
     }
 
     /// Frames of `event` for `id`, waiting up to `limit` for the first one.
     async fn wait_for(
-        rx: &mut mpsc::UnboundedReceiver<HubWsFrame>,
+        rx: &mut mpsc::Receiver<HubWsFrame>,
         event: &str,
         limit: Duration,
     ) -> Option<HubWsFrame> {
@@ -742,7 +834,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_is_reported_even_when_a_background_job_holds_the_pipes() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
         let mut mgr = TerminalManager::new(tx);
         // The shell exits at once; `sleep` inherits stdout/stderr and lives on for 8 s.
         open_shell(&mut mgr, "t1", "sleep 8 & exit 3").await;
@@ -756,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_does_not_hang_on_a_pipe_held_by_a_background_job() {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
         let mut mgr = TerminalManager::new(tx);
         open_shell(&mut mgr, "t2", "sleep 8 & echo ready; wait").await;
         // Kill the shell only once it has started the background job that holds the pipes.
@@ -775,7 +867,7 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_output_keeps_multibyte_text_whole() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
         let mut mgr = TerminalManager::new(tx);
         // 4095 ASCII bytes then "é" (2 bytes) puts the character across the 4096-byte read.
         open_shell(
@@ -806,19 +898,325 @@ mod tests {
 
     #[tokio::test]
     async fn terminal_requires_owner_authority_and_the_feature_flag() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
         let mut mgr = TerminalManager::new(tx);
         let cwd = std::env::temp_dir();
         let peer = HubAuthority::Peer { agent: None };
-        mgr.handle_frame(&peer, true, &cwd, "open", &json!({}))
-            .await;
-        mgr.handle_frame(&owner(), false, &cwd, "open", &json!({}))
-            .await;
-        for _ in 0..2 {
-            let frame = rx.recv().await.unwrap();
+        let replies = [
+            mgr.handle_frame(&peer, true, &cwd, "open", &json!({}))
+                .await,
+            mgr.handle_frame(&owner(), false, &cwd, "open", &json!({}))
+                .await,
+        ];
+        for reply in replies {
+            let frame = reply.expect("a refusal is a direct reply");
             assert_eq!(frame.event, "error");
             assert_eq!(frame.data["status"], 403);
         }
+        assert!(rx.try_recv().is_err(), "replies are not queued");
         assert_eq!(mgr.active_count(), 0);
+    }
+
+    /// Poll `cond` every 10 ms for up to `limit`.
+    async fn eventually(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        cond()
+    }
+
+    /// The pid is no longer in `/proc` (the manager reaps its child, so no zombie lingers).
+    async fn process_gone(pid: u32) -> bool {
+        let path = format!("/proc/{pid}");
+        eventually(Duration::from_secs(10), || !Path::new(&path).exists()).await
+    }
+
+    fn pid_of(opened: &HubWsFrame) -> u32 {
+        assert_eq!(opened.event, "opened", "{:?}", opened.data);
+        opened.data["pid"].as_u64().expect("pid") as u32
+    }
+
+    /// Wait until the output queue is (nearly) full: one slot is held for `exited`.
+    async fn wait_until_full(rx: &Receiver) {
+        assert!(
+            eventually(Duration::from_secs(15), || {
+                rx.len() + 2 >= OUTPUT_QUEUE_CAPACITY
+            })
+            .await,
+            "the queue never filled (len {})",
+            rx.len()
+        );
+    }
+
+    type Receiver = mpsc::Receiver<HubWsFrame>;
+
+    #[tokio::test]
+    async fn a_flooding_child_is_held_back_by_the_bounded_queue_and_resumes_on_drain() {
+        const { assert!(OUTPUT_QUEUE_CAPACITY <= 1024, "the bound must stay small") };
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        pid_of(&open_shell(&mut mgr, "flood", "yes").await);
+
+        // Nobody reads: the queue fills and then stops growing, however fast `yes` writes.
+        wait_until_full(&rx).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let held = rx.len();
+        assert!(held <= OUTPUT_QUEUE_CAPACITY, "queue holds {held} frames");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(rx.len(), held, "the reader must be blocked, not producing");
+
+        // Draining unblocks the reader and the child: the queue refills.
+        for _ in 0..100 {
+            rx.recv().await.expect("queued frame");
+        }
+        wait_until_full(&rx).await;
+        assert!(rx.len() <= OUTPUT_QUEUE_CAPACITY);
+
+        drop(rx);
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn backpressure_loses_no_output_and_keeps_its_order() {
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        // About 2 MiB, well over what the queue and the pipe hold together.
+        pid_of(&open_shell(&mut mgr, "count", "exec seq 1 300000").await);
+        wait_until_full(&rx).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let expected: String = (1..=300_000).map(|n| format!("{n}\n")).collect();
+        let mut got = String::new();
+        let mut exited = None;
+        while exited.is_none() {
+            let frame = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                .await
+                .expect("the stream stalled")
+                .expect("queue open");
+            match frame.event.as_str() {
+                "output" => got.push_str(frame.data["data"].as_str().unwrap()),
+                "exited" => exited = Some(frame),
+                other => panic!("unexpected `{other}` frame"),
+            }
+        }
+        assert_eq!(exited.unwrap().data["exit_code"], 0);
+        assert!(got == expected, "output differs ({} bytes)", got.len());
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn exited_is_queued_without_waiting_when_the_queue_is_full() {
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        let pid = pid_of(&open_shell(&mut mgr, "full", "exec yes").await);
+        wait_until_full(&rx).await;
+
+        // The child dies on its own (not through `close`) while nobody has drained anything.
+        // A blocked child cannot exit by itself, so end it from outside.
+        let status = std::process::Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success());
+        let finished = eventually(Duration::from_secs(15), || {
+            mgr.sessions["full"]
+                .wait_task
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+        })
+        .await;
+        assert!(finished, "`exited` waited for the full queue to drain");
+
+        let exited = wait_for(&mut rx, "exited", Duration::from_secs(15))
+            .await
+            .expect("`exited` must be delivered");
+        assert_eq!(exited.data["session_id"], "full");
+        assert_eq!(exited.data["exit_code"], -1);
+        drop(rx);
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn close_with_a_full_queue_returns_and_still_delivers_exited() {
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        pid_of(&open_shell(&mut mgr, "busy", "yes").await);
+        wait_until_full(&rx).await;
+
+        // The loop that handles `close` is the queue's only consumer: it must not wait on it.
+        let started = Instant::now();
+        let closed = tokio::time::timeout(
+            Duration::from_secs(20),
+            send(&mut mgr, "close", json!({ "session_id": "busy" })),
+        )
+        .await
+        .expect("close deadlocked behind the full output queue");
+        assert!(closed.is_none());
+        assert!(started.elapsed() < Duration::from_secs(15));
+        assert_eq!(mgr.active_count(), 0);
+
+        let exited = wait_for(&mut rx, "exited", Duration::from_secs(5))
+            .await
+            .expect("the final `exited` frame must not be lost");
+        assert_eq!(exited.data["session_id"], "busy");
+    }
+
+    #[tokio::test]
+    async fn a_child_that_never_reads_stdin_times_out_without_blocking_the_loop() {
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        let pid = pid_of(&open_shell(&mut mgr, "deaf", "exec sleep 30").await);
+
+        // 1 MiB cannot fit in the pipe, so the write waits for a reader that never comes.
+        let started = Instant::now();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(25),
+            send(
+                &mut mgr,
+                "input",
+                json!({ "session_id": "deaf", "data": "x".repeat(1 << 20) }),
+            ),
+        )
+        .await
+        .expect("a stalled stdin write hung the connection loop")
+        .expect("a timeout is reported to the client");
+        assert!(started.elapsed() < Duration::from_secs(20));
+        assert_eq!(reply.event, "error");
+        assert_eq!(reply.data["status"], 504, "{:?}", reply.data);
+        assert_eq!(reply.data["session_id"], "deaf");
+
+        // The session was closed: its child is gone and the client is told it exited.
+        assert!(process_gone(pid).await, "child {pid} still running");
+        wait_for(&mut rx, "exited", Duration::from_secs(10))
+            .await
+            .expect("`exited` follows the timeout");
+        assert_eq!(mgr.active_count(), 0);
+
+        // The loop is free: a later close and a fresh session are handled promptly.
+        let started = Instant::now();
+        let gone = send(&mut mgr, "close", json!({ "session_id": "deaf" }))
+            .await
+            .expect("the session no longer exists");
+        assert_eq!(gone.data["status"], 404);
+        let next = open_shell(&mut mgr, "next", "exec sleep 30").await;
+        pid_of(&next);
+        assert!(
+            send(&mut mgr, "close", json!({ "session_id": "next" }))
+                .await
+                .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn a_connection_holds_a_bounded_number_of_live_sessions() {
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        for i in 0..MAX_SESSIONS_PER_CONNECTION {
+            let opened = open_shell(&mut mgr, &format!("s{i}"), "exec sleep 30").await;
+            assert_eq!(opened.event, "opened", "{:?}", opened.data);
+        }
+        assert_eq!(mgr.active_count(), MAX_SESSIONS_PER_CONNECTION);
+
+        // One more is refused and spawns nothing.
+        let refused = open_shell(&mut mgr, "extra", "exec sleep 30").await;
+        assert_eq!(refused.event, "error");
+        assert_eq!(refused.data["status"], 429, "{:?}", refused.data);
+        assert_eq!(mgr.active_count(), MAX_SESSIONS_PER_CONNECTION);
+        assert!(!mgr.sessions.contains_key("extra"));
+        // Reopening an id that is already open replaces it: that is not a new session.
+        let replaced = open_shell(&mut mgr, "s0", "exec sleep 30").await;
+        assert_eq!(replaced.event, "opened", "{:?}", replaced.data);
+
+        // Closing one frees its slot.
+        assert!(
+            send(&mut mgr, "close", json!({ "session_id": "s1" }))
+                .await
+                .is_none()
+        );
+        let again = open_shell(&mut mgr, "extra", "exec sleep 30").await;
+        assert_eq!(again.event, "opened", "{:?}", again.data);
+        assert_eq!(mgr.active_count(), MAX_SESSIONS_PER_CONNECTION);
+
+        drop(rx.try_recv());
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn sessions_that_exit_on_their_own_free_their_slots() {
+        let (tx, mut rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        for i in 0..MAX_SESSIONS_PER_CONNECTION {
+            let opened = open_shell(&mut mgr, &format!("q{i}"), "exit 0").await;
+            assert_eq!(opened.event, "opened", "{:?}", opened.data);
+        }
+        for _ in 0..MAX_SESSIONS_PER_CONNECTION {
+            wait_for(&mut rx, "exited", Duration::from_secs(10))
+                .await
+                .expect("every child exits");
+        }
+        // The cap counts live sessions only, so the exited ones never exhaust it.
+        for round in 0..3 {
+            let opened = open_shell(&mut mgr, &format!("again{round}"), "exit 0").await;
+            assert_eq!(opened.event, "opened", "round {round}: {:?}", opened.data);
+            wait_for(&mut rx, "exited", Duration::from_secs(10))
+                .await
+                .expect("exits");
+        }
+        assert_eq!(mgr.active_count(), 0);
+        assert!(mgr.sessions.len() <= MAX_SESSIONS_PER_CONNECTION);
+    }
+
+    #[tokio::test]
+    async fn a_session_id_is_bounded_and_free_of_control_characters() {
+        let (tx, _rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        for bad in [
+            "x".repeat(MAX_SESSION_ID_BYTES + 1),
+            "a\u{0}b".to_string(),
+            "a\nb".to_string(),
+            "esc\u{1b}[0m".to_string(),
+        ] {
+            let reply = open_shell(&mut mgr, &bad, "exec sleep 30").await;
+            assert_eq!(reply.event, "error", "{bad:?}");
+            assert_eq!(reply.data["status"], 400, "{bad:?}");
+        }
+        assert!(mgr.sessions.is_empty(), "a refused open spawned something");
+
+        // The longest allowed id works, and a blank one gets a generated id.
+        let longest = "y".repeat(MAX_SESSION_ID_BYTES);
+        let ok = open_shell(&mut mgr, &longest, "exec sleep 30").await;
+        assert_eq!(ok.event, "opened", "{:?}", ok.data);
+        let blank = open_shell(&mut mgr, "   ", "exec sleep 30").await;
+        assert_eq!(blank.data["session_id"], "term-1");
+        mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_disconnecting_client_stops_a_flooding_child() {
+        let (tx, rx) = mpsc::channel(OUTPUT_QUEUE_CAPACITY);
+        let mut mgr = TerminalManager::new(tx);
+        // Ignores SIGPIPE, so it would spin on a closed pipe forever unless the hub stops it.
+        let pid = pid_of(
+            &open_shell(
+                &mut mgr,
+                "orphan",
+                "trap '' PIPE; while true; do echo flood; done",
+            )
+            .await,
+        );
+        wait_until_full(&rx).await;
+
+        // The client goes away; the manager is not told (no `close`, no `shutdown_all`).
+        drop(rx);
+        assert!(
+            process_gone(pid).await,
+            "child {pid} kept running after the client disconnected"
+        );
+        drop(mgr);
     }
 }
