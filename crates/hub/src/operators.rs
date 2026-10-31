@@ -53,6 +53,9 @@ const MAX_DISPLAY_NAME_CHARS: usize = 100;
 const MIN_PASSWORD_CHARS: usize = 8;
 const MAX_PASSWORD_CHARS: usize = 256;
 const MAX_TOTP_CODE_LEN: usize = 16;
+/// Stands in for a passkey-login `totp_code` that is not a string or is oversized. Never six
+/// digits, so it is always a wrong code.
+const UNUSABLE_TOTP_CODE: &str = "?";
 const MIN_CREDENTIAL_ID_LEN: usize = 16;
 const MAX_CREDENTIAL_ID_LEN: usize = 1024;
 const MAX_PASSKEYS_PER_OPERATOR: usize = 10;
@@ -1378,6 +1381,15 @@ fn login_token(state: &HubState, token: &str) -> HttpResponse {
     }
 }
 
+/// The TOTP check every login path shares: the live secret, one step either side of now, a
+/// constant-time compare, and a step strictly newer than the last one this operator spent.
+/// Returns the step to record as `last_totp_step`; the caller records it under the operators
+/// lock, in the same critical section as the check.
+fn verify_login_totp(op: &StoredOperator, code: &str) -> Option<u64> {
+    let secret = op.totp_secret_base32.as_deref().and_then(base32_decode)?;
+    verify_totp(&secret, code, now_unix_secs(), op.last_totp_step)
+}
+
 /// The throttle key shared by every login name that is not a valid username. It holds `:`, which
 /// `valid_username` refuses, so no real operator can have a login that lands in this bucket.
 const INVALID_USERNAME_THROTTLE_KEY: &str = "login-invalid:name";
@@ -1465,10 +1477,7 @@ fn login_password(state: &HubState, login: PasswordLogin) -> HttpResponse {
                 return Ok((None, false));
             };
             let target = &mut file.operators[i];
-            let secret = target.totp_secret_base32.as_deref().and_then(base32_decode);
-            let step =
-                secret.and_then(|s| verify_totp(&s, code, now_unix_secs(), target.last_totp_step));
-            let Some(step) = step else {
+            let Some(step) = verify_login_totp(target, code) else {
                 return Ok((None, false));
             };
             target.last_totp_step = Some(step);
@@ -1533,6 +1542,18 @@ fn login_passkey(state: &HubState, body: &Map<String, Value>) -> HttpResponse {
         return throttled(wait);
     }
     let owner_login = state.auth.owner_login().to_string();
+    // The optional second factor. An absent, null, empty or all-blank code is "no code". A code
+    // that is not a string or is oversized is a wrong code, not a missing one: it is mapped to
+    // a value `verify_totp` always refuses, so it is charged and refused like any other guess.
+    let totp_code: Option<&str> = match body.get("totp_code") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .filter(|c| c.len() <= MAX_TOTP_CODE_LEN)
+                .unwrap_or(UNUSABLE_TOTP_CODE),
+        ),
+    }
+    .filter(|c| !c.trim().is_empty());
     let credential_id = assertion_field(body, "credential_id")
         .filter(|c| c.len() <= MAX_CREDENTIAL_ID_LEN)
         .unwrap_or("");
@@ -1605,41 +1626,83 @@ fn login_passkey(state: &HubState, body: &Map<String, Value>) -> HttpResponse {
         return invalid_credentials();
     };
 
-    // Persist the counter against the file as it is now: a replay that raced this login finds
-    // the stored count already moved and fails the strict-increase rule. The session is minted
-    // in the same critical section, so the role it checks is the role now.
+    // Everything that decides the login now happens in ONE critical section on the file as it is
+    // now: the stored counter, the account's TOTP state and its last spent step are all read
+    // here, not from the snapshot taken before the assertion was checked. Two concurrent requests
+    // with the same assertion or the same code are serialised by the lock, so the second finds the
+    // counter or step already moved and is refused. Nothing is written unless every check
+    // passed: a missing or wrong code leaves the passkey counter and `last_totp_step` untouched,
+    // so a failed second factor never spends the authenticator's counter.
     let store = state.open_store().ok();
     let outcome = locked(&home, &owner_login, |file| {
         let Some(i) = file.operators.iter().position(|o| o.id == operator_id) else {
-            return Ok((None, false));
+            return Ok((PasskeyOutcome::Refused, false));
         };
         let op = &mut file.operators[i];
-        let Some(entry) = op
+        let Some(entry) = op.passkeys.iter().find(|k| k.credential_id == credential) else {
+            return Ok((PasskeyOutcome::Refused, false));
+        };
+        if entry.sign_count != 0 && new_count <= entry.sign_count {
+            return Ok((PasskeyOutcome::Refused, false));
+        }
+        let mut spent_step = None;
+        if op.totp_enabled {
+            // The assertion already checked out, so asking for the code reveals nothing to a
+            // caller who does not hold the passkey.
+            let Some(code) = totp_code else {
+                return Ok((PasskeyOutcome::RequiresTotp, false));
+            };
+            // The code is a second guess inside a request that was already admitted: charge it
+            // before it is checked, to the same name bucket the password path charges, and
+            // never turn the request away halfway.
+            state.login_guard.throttle().charge(&key, Instant::now());
+            let Some(step) = verify_login_totp(op, code) else {
+                return Ok((PasskeyOutcome::Refused, false));
+            };
+            spent_step = Some(step);
+        }
+        let entry = op
             .passkeys
             .iter_mut()
             .find(|k| k.credential_id == credential)
-        else {
-            return Ok((None, false));
-        };
-        if entry.sign_count != 0 && new_count <= entry.sign_count {
-            return Ok((None, false));
-        }
-        let changed = entry.sign_count != new_count;
+            .expect("the entry was found above under the same lock");
+        let changed = entry.sign_count != new_count || spent_step.is_some();
         entry.sign_count = new_count;
+        if let Some(step) = spent_step {
+            op.last_totp_step = Some(step);
+        }
         let result = mint_under_lock(state, store.as_deref(), file, &operator_id, None);
-        Ok((Some(result), changed))
+        Ok((PasskeyOutcome::Done(result), changed))
     });
     match outcome {
-        Ok(Some(result)) => {
+        Ok(PasskeyOutcome::Done(result)) => {
             let (resp, verified) = login_response(result, state);
             if verified {
                 state.login_guard.throttle().clear(&key);
             }
             resp
         }
-        Ok(None) => invalid_credentials(),
+        Ok(PasskeyOutcome::RequiresTotp) => HttpResponse::json(
+            401,
+            json!({
+                "ok": false,
+                "requires_totp": true,
+                "error": "TOTP code is required for this account",
+            }),
+        ),
+        Ok(PasskeyOutcome::Refused) => invalid_credentials(),
         Err(e) => op_error_response(e),
     }
+}
+
+/// How a passkey login that passed its assertion ended, decided under the operators lock.
+enum PasskeyOutcome {
+    Done(LoginResult),
+    /// The account has TOTP on and the request carried no code. Nothing was spent.
+    RequiresTotp,
+    /// The counter did not advance, the account is gone, or the code was wrong. Nothing was
+    /// spent.
+    Refused,
 }
 
 /// `POST /api/v1/auth/passkey/challenge` (public).
@@ -4423,6 +4486,195 @@ mod tests {
         assert_eq!(passkey_login(&fx, &opts(&fx.state, 5)).status, 200);
         assert_refused(&fx, &passkey_login(&fx, &opts(&fx.state, 4)), "regressed");
         assert_eq!(passkey_login(&fx, &opts(&fx.state, 6)).status, 200);
+    }
+
+    // --- passkey login with TOTP on -------------------------------------------------------------
+
+    /// A passkey login body carrying `code` as its second factor.
+    fn passkey_totp_body(fx: &Fx, count: u32, code: Option<&str>) -> Value {
+        let mut body = assertion_body(&fx.cred, &assertion_parts(&fx.key, &opts(&fx.state, count)));
+        if let Some(code) = code {
+            body["totp_code"] = json!(code);
+        }
+        body
+    }
+
+    fn passkey_totp_login(fx: &Fx, count: u32, code: Option<&str>) -> HttpResponse {
+        login(&fx.state, &passkey_totp_body(fx, count, code))
+    }
+
+    /// The stored passkey counter and the stored last spent TOTP step.
+    fn passkey_state(fx: &Fx) -> (u32, Option<u64>) {
+        let file = stored(&fx._tmp);
+        let (i, j) = file.find_credential(&fx.cred).unwrap();
+        (
+            file.operators[i].passkeys[j].sign_count,
+            file.operators[i].last_totp_step,
+        )
+    }
+
+    #[test]
+    fn a_passkey_login_without_the_code_is_refused_and_spends_nothing() {
+        let fx = fx("owner");
+        let secret = enable_totp(&fx.state, &fx.username);
+        let before = passkey_state(&fx);
+        for code in [None, Some(""), Some("   ")] {
+            fx.state.login_guard.throttle().clear(&fx.username);
+            let resp = passkey_totp_login(&fx, 1, code);
+            assert_eq!(resp.status, 401, "{}", body_text(&resp));
+            assert_eq!(
+                json_of(&resp),
+                json!({
+                    "ok": false,
+                    "requires_totp": true,
+                    "error": "TOTP code is required for this account",
+                })
+            );
+            assert!(set_cookie(&resp).is_none());
+            assert!(!body_text(&resp).contains("session_token"));
+        }
+        // Neither the counter nor the spent step moved, so the same count still logs in.
+        assert_eq!(passkey_state(&fx), before);
+        fx.state.login_guard.throttle().clear(&fx.username);
+        let resp = passkey_totp_login(&fx, 1, Some(&code_at(&secret, 1)));
+        assert_eq!(resp.status, 200, "{}", body_text(&resp));
+    }
+
+    #[test]
+    fn a_passkey_login_with_a_wrong_code_is_refused_and_spends_nothing() {
+        let fx = fx("owner");
+        let secret = enable_totp(&fx.state, &fx.username);
+        let before = passkey_state(&fx);
+        let good = code_at(&secret, 1);
+        let bad = format!("{:06}", (good.parse::<u32>().unwrap() + 7) % 1_000_000);
+        for wrong in [bad.as_str(), "12ab56", "12345"] {
+            fx.state.login_guard.throttle().clear(&fx.username);
+            let resp = passkey_totp_login(&fx, 1, Some(wrong));
+            assert!(is_invalid_credentials(&resp), "{}", body_text(&resp));
+            assert!(
+                !body_text(&resp).contains("totp"),
+                "a wrong code reveals nothing"
+            );
+        }
+        // A non-string and an oversized code are wrong codes, not missing ones.
+        for junk in [json!(123456), json!(["1"]), json!("1".repeat(64))] {
+            fx.state.login_guard.throttle().clear(&fx.username);
+            let mut body = passkey_totp_body(&fx, 1, None);
+            body["totp_code"] = junk;
+            assert!(is_invalid_credentials(&login(&fx.state, &body)));
+        }
+        assert_eq!(passkey_state(&fx), before);
+        // The right code with the same counter still works: nothing was burnt.
+        fx.state.login_guard.throttle().clear(&fx.username);
+        assert_eq!(passkey_totp_login(&fx, 1, Some(&good)).status, 200);
+    }
+
+    #[test]
+    fn wrong_passkey_totp_codes_lock_the_name_like_password_ones() {
+        let fx = fx("owner");
+        let secret = enable_totp(&fx.state, &fx.username);
+        let good = code_at(&secret, 1);
+        // Each attempt is charged twice (the assertion, then the code), the same as the password
+        // path, so the lockout lands inside the third wrong code.
+        for _ in 0..3 {
+            assert_eq!(passkey_totp_login(&fx, 1, Some("12ab56")).status, 401);
+        }
+        let locked_out = passkey_totp_login(&fx, 1, Some(&good));
+        assert_eq!(locked_out.status, 429);
+        assert!(header(&locked_out, "retry-after").is_some());
+        assert_eq!(
+            passkey_state(&fx).0,
+            0,
+            "no refused attempt spent the counter"
+        );
+        // The bucket is the operator's name, the one the password path charges.
+        let pw = login(
+            &fx.state,
+            &json!({ "mode": "password", "username": fx.username, "password": PASSWORD }),
+        );
+        assert_eq!(pw.status, 429);
+    }
+
+    #[test]
+    fn a_passkey_login_with_the_right_code_spends_the_step_and_the_counter() {
+        let fx = fx("owner");
+        let secret = enable_totp(&fx.state, &fx.username);
+        let step = now_unix_secs() / TOTP_STEP_SECS;
+        let good = code_at(&secret, 1);
+        let resp = passkey_totp_login(&fx, 4, Some(&good));
+        assert_eq!(resp.status, 200, "{}", body_text(&resp));
+        assert_eq!(
+            json_of(&session_via_cookie(&fx.state, &resp))["authority"]["login"],
+            fx.username
+        );
+        assert_eq!(passkey_state(&fx), (4, Some(step + 1)));
+        // The code is spent: a fresh assertion with a higher counter cannot reuse it.
+        fx.state.login_guard.throttle().clear(&fx.username);
+        let replay = passkey_totp_login(&fx, 5, Some(&good));
+        assert!(is_invalid_credentials(&replay), "{}", body_text(&replay));
+        // An older step's code is refused as well, and neither refusal moved the counter.
+        fx.state.login_guard.throttle().clear(&fx.username);
+        let older = passkey_totp_login(&fx, 5, Some(&code_at(&secret, -1)));
+        assert!(is_invalid_credentials(&older));
+        assert_eq!(passkey_state(&fx), (4, Some(step + 1)));
+    }
+
+    #[test]
+    fn a_replayed_passkey_assertion_is_refused_even_with_a_fresh_code() {
+        let fx = fx("owner");
+        let secret = enable_totp(&fx.state, &fx.username);
+        let body = passkey_totp_body(&fx, 2, Some(&code_at(&secret, 1)));
+        assert_eq!(login(&fx.state, &body).status, 200);
+        // The identical request again: its challenge is spent and so is its code.
+        fx.state.login_guard.throttle().clear(&fx.username);
+        assert!(is_invalid_credentials(&login(&fx.state, &body)));
+        // A new challenge but a counter that did not advance fails the strict increase before
+        // the code is even looked at.
+        fx.state.login_guard.throttle().clear(&fx.username);
+        let stale = passkey_totp_login(&fx, 2, Some(&code_at(&secret, 1)));
+        assert!(is_invalid_credentials(&stale));
+        assert_eq!(passkey_state(&fx).0, 2);
+    }
+
+    #[test]
+    fn two_concurrent_passkey_logins_with_one_code_let_exactly_one_in() {
+        for round in 0..20 {
+            let fx = fx("owner");
+            let secret = enable_totp(&fx.state, &fx.username);
+            let code = code_at(&secret, 1);
+            // Two distinct, valid assertions (own challenge, own counter) and the one code.
+            let bodies = [
+                passkey_totp_body(&fx, 1, Some(&code)),
+                passkey_totp_body(&fx, 2, Some(&code)),
+            ];
+            let clock = now_unix_secs();
+            let gate = std::sync::Barrier::new(2);
+            let statuses: Vec<u16> = std::thread::scope(|scope| {
+                let handles: Vec<_> = bodies
+                    .iter()
+                    .map(|body| {
+                        let (state, gate) = (&fx.state, &gate);
+                        scope.spawn(move || {
+                            set_clock(clock);
+                            gate.wait();
+                            login(state, body).status
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let ok = statuses.iter().filter(|s| **s == 200).count();
+            assert_eq!(ok, 1, "round {round}: {statuses:?}");
+            assert!(statuses.contains(&401), "round {round}: {statuses:?}");
+        }
+    }
+
+    #[test]
+    fn a_passkey_login_for_an_account_without_totp_ignores_a_stray_code() {
+        let fx = fx("owner");
+        let resp = passkey_totp_login(&fx, 1, Some("000000"));
+        assert_eq!(resp.status, 200, "{}", body_text(&resp));
+        assert_eq!(passkey_state(&fx), (1, None));
     }
 
     #[test]
