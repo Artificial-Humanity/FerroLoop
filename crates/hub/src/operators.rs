@@ -350,6 +350,12 @@ fn now_millis() -> u64 {
 }
 
 fn now_unix_secs() -> u64 {
+    // A test build can hold the clock still: a TOTP code is valid for one 30 s step, and a
+    // test that crosses a step boundary mid-way sees its notion of "now" change.
+    #[cfg(test)]
+    if let Some(secs) = TEST_CLOCK.with(std::cell::Cell::get) {
+        return secs;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -884,6 +890,13 @@ fn seed_file(owner_login: &str) -> Result<OperatorsFile, OpError> {
             created_at_ms: now_millis(),
         }],
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The Unix second `now_unix_secs` reports in this test's thread, when set (test builds
+    /// only). Unset, the real clock.
+    static TEST_CLOCK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -2167,7 +2180,27 @@ mod tests {
     const HOST: &str = "localhost:8420";
     const PASSWORD: &str = "correct horse battery";
 
+    /// Set this test's clock to Unix second `secs`.
+    fn set_clock(secs: u64) {
+        TEST_CLOCK.with(|c| c.set(Some(secs)));
+    }
+
+    /// The middle of the TOTP step the real clock is in now.
+    fn mid_step_now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / TOTP_STEP_SECS
+            * TOTP_STEP_SECS
+            + TOTP_STEP_SECS / 2
+    }
+
     fn state_for(tmp: &TempDir, owner_login: &str) -> HubState {
+        // Every test that builds a hub gets a clock that stands still mid-step, so no test
+        // meets a TOTP step boundary half way through (its "this step" and "next step" codes
+        // would shift under it). A test that wants a boundary moves the clock itself.
+        set_clock(mid_step_now());
         HubState::new(HubServerConfig {
             listen: "127.0.0.1:0".into(),
             store_path: tmp.path().join("store.redb"),
@@ -3741,6 +3774,35 @@ mod tests {
             &state,
             "tina",
             Some(&code_at(&secret, -5))
+        )));
+    }
+
+    #[test]
+    fn a_step_boundary_between_enrolment_and_login_keeps_the_spent_code_spent() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "tina", "owner", Some(PASSWORD));
+        // Enrol on the last second of a step: enrolment spends that step's code.
+        let boundary = mid_step_now() + TOTP_STEP_SECS / 2 - 1;
+        set_clock(boundary);
+        let secret = enable_totp(&state, "tina");
+        let spent = code_at(&secret, 0);
+        // The clock crosses into the next step before the login.
+        set_clock(boundary + 2);
+        assert_eq!(code_at(&secret, -1), spent);
+        assert!(
+            is_invalid_credentials(&totp_login(&state, "tina", Some(&spent))),
+            "the code enrolment used stays spent after the step rolls over"
+        );
+        // The new step's code is fresh, works once, and is then spent too.
+        let fresh = code_at(&secret, 0);
+        assert_ne!(fresh, spent);
+        let resp = totp_login(&state, "tina", Some(&fresh));
+        assert_eq!(resp.status, 200, "{}", body_text(&resp));
+        assert!(is_invalid_credentials(&totp_login(
+            &state,
+            "tina",
+            Some(&fresh)
         )));
     }
 
