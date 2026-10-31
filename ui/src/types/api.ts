@@ -1102,6 +1102,75 @@ export interface EnrolledNode {
   status: "online" | "stale" | "offline" | "revoked";
   enrolled_at_ms: number;
   last_seen_at_ms: number;
+  environment_kind?: EnvironmentKind;
+  federated_subsystems?: string[];
+  active_tasks?: number;
+  load_avg?: number | null;
+  reported_status?: "idle" | "busy" | "draining" | null;
+}
+
+export type EnvironmentKind =
+  | "ai-lab"
+  | "macos-xcode"
+  | "cloud-worker"
+  | "linux-worker";
+
+export type FederatedTaskStatus = "queued" | "running" | "completed" | "failed";
+
+export interface FederatedTask {
+  task_id: string;
+  node_id: string;
+  kind: string;
+  command: string;
+  project: string;
+  status: FederatedTaskStatus;
+  created_at_ms: number;
+  updated_at_ms: number;
+  output: string;
+  exit_code: number | null;
+}
+
+export interface DispatchNodeTaskInput {
+  command: string;
+  kind?: string;
+  project?: string;
+}
+
+export interface CliRuntimeStatus {
+  name: string;
+  installed: boolean;
+  path: string | null;
+  version: string | null;
+  error: string | null;
+  active_routes: number;
+  live_sessions: number;
+  probe_ms: number;
+}
+
+export interface VaultProviderStatus {
+  provider: string;
+  secret_name: string;
+  provisioned: boolean;
+  expired: boolean;
+  status: "ready" | "expired" | "missing";
+  expires_at: string | null;
+}
+
+export interface LocalEngineStatus {
+  name: string;
+  endpoint: string;
+  reachable: boolean;
+  latency_ms: number | null;
+  models: string[];
+  error: string | null;
+}
+
+export interface RuntimeMatrix {
+  generated_at_ms: number;
+  cli_runtimes: CliRuntimeStatus[];
+  vault_providers: VaultProviderStatus[];
+  local_engines: LocalEngineStatus[];
+  vault_error: string | null;
 }
 
 export interface NodesResponse {

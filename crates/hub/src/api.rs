@@ -85,10 +85,11 @@ use crate::lifecycle::{
     self, DecommissionMode, LifecycleEnv, LifecycleError, SessionTarget, SpinUpRequest,
 };
 use crate::nodes::{
-    EnrollFail, EnrollWorker, EnsureHubArgs, HeartbeatFail, HeartbeatUpdate, NodeRecord, NodeView,
-    RevokeFail, detect_capabilities, enroll_worker, ensure_hub_node, find_hub_node,
-    list_visible_nodes, local_hostname, mint_enroll_token, node_id_from_hostname, node_state_slug,
-    node_token_matches, revoke_node, touch_node,
+    DispatchTask, EnrollFail, EnrollWorker, EnsureHubArgs, HeartbeatFail, HeartbeatUpdate,
+    NodeRecord, NodeView, RevokeFail, TaskFail, TaskResult, detect_capabilities, dispatch_task,
+    enroll_worker, ensure_hub_node, find_hub_node, list_node_tasks, list_visible_nodes,
+    local_hostname, mint_enroll_token, node_id_from_hostname, node_state_slug, node_token_matches,
+    record_task_result, revoke_node, touch_node,
 };
 use crate::operators;
 use crate::records;
@@ -369,12 +370,11 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         return handle_post_node_enroll(state, req);
     }
 
-    // Worker heartbeat stays outside the general gate. A node bearer is not an
-    // owner token and must not authenticate any other route.
-    if method == "POST"
-        && let Some(raw_id) = node_heartbeat_segment(path)
-    {
-        return handle_post_node_heartbeat(state, req, raw_id);
+    // Node-scoped federation routes (heartbeat, dispatch, task queue) stay outside the general
+    // gate. A node bearer is not an owner token: it opens only its own node's routes, and each
+    // handler decides whether the owner alone may call it.
+    if let Some(route) = node_scoped_route(method, path) {
+        return handle_node_scoped(state, req, route);
     }
 
     // 2b. Unauthenticated local MCP Registry v0.1 (`GET /api/v1/gate/registry/v0.1/...`).
@@ -527,6 +527,10 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
         ("POST", "/api/v1/gate/call") => handle_post_gate_call(state, &authority, req),
         ("POST", "/api/v1/gate/mcp") => handle_post_gate_mcp(state, &authority, None, req),
+        ("GET", "/api/v1/runtimes/matrix") => crate::runtime_matrix::handle_get_matrix(state),
+        ("POST", "/api/v1/runtimes/probe") => {
+            crate::runtime_matrix::handle_post_probe(state, &authority, req)
+        }
         ("GET", "/api/v1/nodes") => handle_get_nodes(state),
         ("POST", "/api/v1/nodes/enroll-token") => handle_post_enroll_token(state, &authority, req),
         _ => handle_dynamic_api_routes(state, &authority, req),
@@ -649,6 +653,11 @@ fn node_view_json(view: &NodeView) -> Value {
         "status": view.status,
         "enrolled_at_ms": view.enrolled_at_ms,
         "last_seen_at_ms": view.last_seen_at_ms,
+        "environment_kind": view.environment_kind,
+        "federated_subsystems": view.federated_subsystems,
+        "active_tasks": view.active_tasks,
+        "load_avg": view.load_avg,
+        "reported_status": view.reported_status,
     })
 }
 
@@ -673,10 +682,35 @@ fn decode_node_id(raw_id: &str) -> Result<String, HttpResponse> {
     Ok(decoded)
 }
 
-fn node_heartbeat_segment(path: &str) -> Option<&str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeRoute<'a> {
+    Heartbeat(&'a str),
+    Dispatch(&'a str),
+    ListTasks(&'a str),
+    TaskResult(&'a str, &'a str),
+}
+
+fn node_scoped_route<'a>(method: &str, path: &'a str) -> Option<NodeRoute<'a>> {
     let rest = path.strip_prefix("/api/v1/nodes/")?;
-    let (raw_id, tail) = rest.split_once('/')?;
-    (tail == "heartbeat").then_some(raw_id)
+    let segments: Vec<&str> = rest.split('/').collect();
+    match (method, segments.as_slice()) {
+        ("POST", [id, "heartbeat"]) => Some(NodeRoute::Heartbeat(id)),
+        ("POST", [id, "dispatch"]) => Some(NodeRoute::Dispatch(id)),
+        ("GET", [id, "tasks"]) => Some(NodeRoute::ListTasks(id)),
+        ("POST", [id, "tasks", task_id, "result"]) => Some(NodeRoute::TaskResult(id, task_id)),
+        _ => None,
+    }
+}
+
+fn handle_node_scoped(state: &HubState, req: &HttpRequest, route: NodeRoute<'_>) -> HttpResponse {
+    match route {
+        NodeRoute::Heartbeat(raw_id) => handle_post_node_heartbeat(state, req, raw_id),
+        NodeRoute::Dispatch(raw_id) => handle_post_node_dispatch(state, req, raw_id),
+        NodeRoute::ListTasks(raw_id) => handle_get_node_tasks(state, req, raw_id),
+        NodeRoute::TaskResult(raw_id, task_id) => {
+            handle_post_node_task_result(state, req, raw_id, task_id)
+        }
+    }
 }
 
 /// Same slug as `nodes::node_state_slug`. Heartbeat reads the row after
@@ -717,18 +751,43 @@ fn revoked_node_bearer_matches(
     Ok(constant_time_eq(&sha256_hex(bearer), token_hash))
 }
 
-fn authorize_node_heartbeat<'a>(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeAccess {
+    /// The owner session only.
+    Owner,
+    /// The owner, or the node's own bearer token.
+    OwnerOrNode,
+    /// Heartbeat: any authenticated caller (existing behavior), or the node's own bearer even
+    /// when revoked, so a revoked worker is told so (403) instead of seeing a generic 401.
+    Heartbeat,
+}
+
+fn authorize_node_caller<'a>(
     state: &'a HubState,
     req: &HttpRequest,
     node_id: &str,
+    access: NodeAccess,
 ) -> Result<HubStoreGuard<'a>, HttpResponse> {
-    let authenticated = authenticate_api_request(state, req).is_ok();
+    let owner_only = access == NodeAccess::Owner;
+    let accept_revoked = access == NodeAccess::Heartbeat;
+    let authority = authenticate_api_request(state, req).ok();
     let store = match open_store_response(state) {
         Ok(store) => store,
         Err(()) => return Err(store_open_failure()),
     };
-    if authenticated {
-        return Ok(store);
+    match authority {
+        Some(authority) if authority.is_owner() => return Ok(store),
+        Some(_) if access == NodeAccess::Heartbeat => return Ok(store),
+        Some(_) => {
+            return Err(HttpResponse::json(
+                403,
+                json!({ "error": "owner authority or the node token is required" }),
+            ));
+        }
+        None if owner_only => {
+            return Err(HttpResponse::json(401, json!({ "error": "unauthorized" })));
+        }
+        None => {}
     }
     let bearer = req
         .headers
@@ -737,6 +796,9 @@ fn authorize_node_heartbeat<'a>(
         .unwrap_or_default();
     match node_token_matches(&store, node_id, &bearer) {
         Ok(true) => Ok(store),
+        Ok(false) if !accept_revoked => {
+            Err(HttpResponse::json(401, json!({ "error": "unauthorized" })))
+        }
         Ok(false) => match revoked_node_bearer_matches(&store, node_id, &bearer) {
             Ok(true) => Ok(store),
             Ok(false) => Err(HttpResponse::json(401, json!({ "error": "unauthorized" }))),
@@ -819,6 +881,8 @@ fn enroll_request_from_body(body: &Value) -> Result<EnrollWorker, String> {
         listen_addr: json_listen_addr(body)?,
         capabilities: json_string_array(body, "capabilities")?,
         labels: json_string_array(body, "labels")?,
+        environment_kind: json_optional_string(body, "environment_kind")?,
+        federated_subsystems: json_string_array(body, "federated_subsystems")?,
         now_ms: stamp::now().unix_millis(),
     })
 }
@@ -828,7 +892,7 @@ fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str)
         Ok(node_id) => node_id,
         Err(resp) => return resp,
     };
-    let store = match authorize_node_heartbeat(state, req, &node_id) {
+    let store = match authorize_node_caller(state, req, &node_id, NodeAccess::Heartbeat) {
         Ok(store) => store,
         Err(resp) => return resp,
     };
@@ -844,12 +908,21 @@ fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str)
         Ok(labels) => labels,
         Err(error) => return HttpResponse::json(400, json!({ "error": error })),
     };
+    let fields = match heartbeat_fields(&body) {
+        Ok(fields) => fields,
+        Err(error) => return HttpResponse::json(400, json!({ "error": error })),
+    };
     match touch_node(
         &store,
         HeartbeatUpdate {
             node_id,
             capabilities,
             labels,
+            environment_kind: fields.environment_kind,
+            federated_subsystems: fields.federated_subsystems,
+            active_tasks: fields.active_tasks,
+            load_avg: fields.load_avg,
+            reported_status: fields.reported_status,
             now_ms: stamp::now().unix_millis(),
         },
     ) {
@@ -858,14 +931,163 @@ fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str)
             json!({
                 "node_id": view.node_id,
                 "status": view.status,
+                "reported_status": view.reported_status,
                 "last_seen_at_ms": view.last_seen_at_ms,
+                "active_tasks": view.active_tasks,
+                "load_avg": view.load_avg,
+                "capabilities": view.capabilities,
+                "environment_kind": view.environment_kind,
             }),
         ),
+        Err(HeartbeatFail::Invalid(error)) => HttpResponse::json(400, json!({ "error": error })),
         Err(HeartbeatFail::NotFound) => {
             HttpResponse::json(404, json!({ "error": "node not found" }))
         }
         Err(HeartbeatFail::Revoked) => HttpResponse::json(403, json!({ "error": "node revoked" })),
         Err(HeartbeatFail::Store(err)) => HttpResponse::json(500, json!({ "error": err })),
+    }
+}
+
+struct HeartbeatFields {
+    environment_kind: Option<String>,
+    federated_subsystems: Option<Vec<String>>,
+    active_tasks: Option<u32>,
+    load_avg: Option<f64>,
+    reported_status: Option<String>,
+}
+
+fn heartbeat_fields(body: &Value) -> Result<HeartbeatFields, String> {
+    let active_tasks = match body.get("active_tasks") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| "`active_tasks` must be a non-negative integer".to_string())?,
+        ),
+    };
+    let load_avg = match body.get("load_avg") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_f64()
+                .ok_or_else(|| "`load_avg` must be a number".to_string())?,
+        ),
+    };
+    Ok(HeartbeatFields {
+        environment_kind: json_optional_string(body, "environment_kind")?,
+        federated_subsystems: json_optional_string_array(body, "federated_subsystems")?,
+        active_tasks,
+        load_avg,
+        reported_status: json_optional_string(body, "status")?,
+    })
+}
+
+fn node_task_failure(fail: TaskFail) -> HttpResponse {
+    match fail {
+        TaskFail::NodeNotFound => HttpResponse::json(404, json!({ "error": "node not found" })),
+        TaskFail::TaskNotFound => HttpResponse::json(404, json!({ "error": "task not found" })),
+        TaskFail::NodeRevoked => HttpResponse::json(403, json!({ "error": "node revoked" })),
+        TaskFail::NotWorker => HttpResponse::json(
+            400,
+            json!({ "error": "tasks can only be dispatched to worker nodes" }),
+        ),
+        TaskFail::Invalid(error) => HttpResponse::json(400, json!({ "error": error })),
+        TaskFail::Conflict(error) => HttpResponse::json(409, json!({ "error": error })),
+        TaskFail::Store(error) => HttpResponse::json(500, json!({ "error": error })),
+    }
+}
+
+fn handle_post_node_dispatch(state: &HubState, req: &HttpRequest, raw_id: &str) -> HttpResponse {
+    let node_id = match decode_node_id(raw_id) {
+        Ok(node_id) => node_id,
+        Err(resp) => return resp,
+    };
+    let store = match authorize_node_caller(state, req, &node_id, NodeAccess::Owner) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let parsed = (|| -> Result<DispatchTask, String> {
+        let kind = json_optional_string(&body, "kind")?.unwrap_or_else(|| "shell".to_string());
+        Ok(DispatchTask {
+            kind,
+            command: json_string(&body, "command")?,
+            project: json_string(&body, "project")?,
+            now_ms: stamp::now().unix_millis(),
+        })
+    })();
+    let args = match parsed {
+        Ok(args) => args,
+        Err(error) => return HttpResponse::json(400, json!({ "error": error })),
+    };
+    match dispatch_task(&store, &node_id, args) {
+        Ok(task) => HttpResponse::json(201, json!({ "task": task })),
+        Err(fail) => node_task_failure(fail),
+    }
+}
+
+fn handle_get_node_tasks(state: &HubState, req: &HttpRequest, raw_id: &str) -> HttpResponse {
+    let node_id = match decode_node_id(raw_id) {
+        Ok(node_id) => node_id,
+        Err(resp) => return resp,
+    };
+    let store = match authorize_node_caller(state, req, &node_id, NodeAccess::OwnerOrNode) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    match list_node_tasks(&store, &node_id) {
+        Ok(tasks) => HttpResponse::json(200, json!({ "node_id": node_id, "tasks": tasks })),
+        Err(fail) => node_task_failure(fail),
+    }
+}
+
+fn handle_post_node_task_result(
+    state: &HubState,
+    req: &HttpRequest,
+    raw_id: &str,
+    raw_task_id: &str,
+) -> HttpResponse {
+    let node_id = match decode_node_id(raw_id) {
+        Ok(node_id) => node_id,
+        Err(resp) => return resp,
+    };
+    let task_id = percent_decode(raw_task_id);
+    let store = match authorize_node_caller(state, req, &node_id, NodeAccess::OwnerOrNode) {
+        Ok(store) => store,
+        Err(resp) => return resp,
+    };
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let parsed = (|| -> Result<TaskResult, String> {
+        let exit_code = match body.get("exit_code") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_i64()
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(|| "`exit_code` must be an integer".to_string())?,
+            ),
+        };
+        Ok(TaskResult {
+            status: json_string(&body, "status")?,
+            output: json_string(&body, "output")?,
+            exit_code,
+            now_ms: stamp::now().unix_millis(),
+        })
+    })();
+    let result = match parsed {
+        Ok(result) => result,
+        Err(error) => return HttpResponse::json(400, json!({ "error": error })),
+    };
+    match record_task_result(&store, &node_id, &task_id, result) {
+        Ok(task) => HttpResponse::json(200, json!({ "task": task })),
+        Err(fail) => node_task_failure(fail),
     }
 }
 

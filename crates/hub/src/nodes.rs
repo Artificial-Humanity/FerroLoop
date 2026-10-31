@@ -3,6 +3,7 @@
 use std::ffi::c_char;
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
 
 use fl_core::state::{
     MergeMode, RuntimeEntry, SensitivityPatch, StateConcern, StateEntry, StatePayload, StateScope,
@@ -23,10 +24,31 @@ const DEFAULT_ENROLL_TTL_SECS: u64 = 600;
 const ONLINE_WINDOW_MS: u64 = 120_000;
 const STALE_WINDOW_MS: u64 = 600_000;
 const ACTOR: &str = "fl-hub";
+const TASK_SLUG_PREFIX: &str = "hub-ntasks-";
+/// Tasks kept per node. Finished tasks are dropped oldest-first once the queue is full.
+pub const MAX_TASKS_PER_NODE: usize = 200;
+const MAX_COMMAND_BYTES: usize = 8 * 1024;
+const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_FIELD_LEN: usize = 64;
+const MAX_LIST_ITEMS: usize = 32;
+/// Environment profiles a node may declare.
+pub const ENVIRONMENT_KINDS: [&str; 4] = ["ai-lab", "macos-xcode", "cloud-worker", "linux-worker"];
+/// Subsystems the primary hub federates by default.
+pub const FEDERATED_SUBSYSTEMS: [&str; 5] = [
+    "ferrowire",
+    "ferrostate",
+    "ferrogate",
+    "ferrostep",
+    "ferrodeck",
+];
+/// Worker-reported activity, separate from the liveness `status` the hub computes.
+pub const REPORTED_STATUSES: [&str; 3] = ["idle", "busy", "draining"];
+/// Serializes read-modify-write cycles on a node's task list.
+static TASK_LOCK: Mutex<()> = Mutex::new(());
 /// Compared when an enroll slug is absent so the token check still runs.
 const DUMMY_CODE_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeRecord {
     pub node_id: String,
@@ -42,9 +64,20 @@ pub struct NodeRecord {
     pub enrolled_at_ms: u64,
     pub last_seen_at_ms: u64,
     pub revoked: bool,
+    /// One of [`ENVIRONMENT_KINDS`]; empty on records written before federation.
+    #[serde(default)]
+    pub environment_kind: String,
+    #[serde(default)]
+    pub federated_subsystems: Vec<String>,
+    #[serde(default)]
+    pub active_tasks: u32,
+    #[serde(default)]
+    pub load_avg: Option<f64>,
+    #[serde(default)]
+    pub reported_status: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct NodeView {
     pub node_id: String,
     pub display_name: String,
@@ -58,6 +91,11 @@ pub struct NodeView {
     pub status: String,
     pub enrolled_at_ms: u64,
     pub last_seen_at_ms: u64,
+    pub environment_kind: String,
+    pub federated_subsystems: Vec<String>,
+    pub active_tasks: u32,
+    pub load_avg: Option<f64>,
+    pub reported_status: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +138,9 @@ pub struct EnrollWorker {
     pub listen_addr: Option<String>,
     pub capabilities: Vec<String>,
     pub labels: Vec<String>,
+    /// Declared profile; derived from `os` and `capabilities` when `None`.
+    pub environment_kind: Option<String>,
+    pub federated_subsystems: Vec<String>,
     pub now_ms: u64,
 }
 
@@ -109,11 +150,17 @@ pub struct EnrolledWorker {
     pub node_token: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct HeartbeatUpdate {
     pub node_id: String,
     pub capabilities: Option<Vec<String>>,
     pub labels: Option<Vec<String>>,
+    pub environment_kind: Option<String>,
+    pub federated_subsystems: Option<Vec<String>>,
+    pub active_tasks: Option<u32>,
+    pub load_avg: Option<f64>,
+    /// One of [`REPORTED_STATUSES`].
+    pub reported_status: Option<String>,
     pub now_ms: u64,
 }
 
@@ -121,6 +168,7 @@ pub struct HeartbeatUpdate {
 pub enum HeartbeatFail {
     NotFound,
     Revoked,
+    Invalid(String),
     Store(String),
 }
 
@@ -170,9 +218,34 @@ pub fn ensure_hub_node(store: &RedbStore, args: EnsureHubArgs) -> Result<NodeRec
             ));
         }
     }
-    let (labels, token_hash, enrolled_at_ms) = match existing {
-        Some(rec) => (rec.labels, rec.token_hash, rec.enrolled_at_ms),
-        None => (Vec::new(), None, args.now_ms),
+    let (labels, token_hash, enrolled_at_ms, prior) = match existing {
+        Some(rec) => {
+            let prior = (
+                rec.environment_kind.clone(),
+                rec.federated_subsystems.clone(),
+                rec.active_tasks,
+                rec.load_avg,
+                rec.reported_status.clone(),
+            );
+            (rec.labels, rec.token_hash, rec.enrolled_at_ms, prior)
+        }
+        None => (
+            Vec::new(),
+            None,
+            args.now_ms,
+            (String::new(), Vec::new(), 0, None, None),
+        ),
+    };
+    let (prior_kind, prior_subsystems, active_tasks, load_avg, reported_status) = prior;
+    let environment_kind = if prior_kind.is_empty() {
+        default_environment_kind("hub", &args.os, &args.capabilities)
+    } else {
+        prior_kind
+    };
+    let federated_subsystems = if prior_subsystems.is_empty() {
+        FEDERATED_SUBSYSTEMS.iter().map(|s| s.to_string()).collect()
+    } else {
+        prior_subsystems
     };
     let record = NodeRecord {
         node_id,
@@ -188,6 +261,11 @@ pub fn ensure_hub_node(store: &RedbStore, args: EnsureHubArgs) -> Result<NodeRec
         enrolled_at_ms,
         last_seen_at_ms: args.now_ms,
         revoked: false,
+        environment_kind,
+        federated_subsystems,
+        active_tasks,
+        load_avg,
+        reported_status,
     };
     persist_node(store, &slug, &record)?;
     Ok(record)
@@ -285,6 +363,12 @@ pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWor
         .map(|rec| rec.enrolled_at_ms)
         .unwrap_or(req.now_ms);
     let node_token = try_generate_hex_token(32).map_err(EnrollFail::Store)?;
+    let environment_kind = match req.environment_kind.as_deref().map(str::trim) {
+        None | Some("") => default_environment_kind("worker", &req.os, &req.capabilities),
+        Some(kind) => validate_environment_kind(kind).map_err(EnrollFail::Rejected)?,
+    };
+    let federated_subsystems =
+        validate_subsystems(req.federated_subsystems).map_err(EnrollFail::Rejected)?;
     let record = NodeRecord {
         node_id: node_id.clone(),
         display_name: req.display_name,
@@ -299,6 +383,11 @@ pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWor
         enrolled_at_ms,
         last_seen_at_ms: req.now_ms,
         revoked: false,
+        environment_kind,
+        federated_subsystems,
+        active_tasks: 0,
+        load_avg: None,
+        reported_status: None,
     };
     persist_node(store, &slug, &record).map_err(EnrollFail::Store)?;
     entry.used = true;
@@ -337,12 +426,55 @@ pub fn touch_node(store: &RedbStore, update: HeartbeatUpdate) -> Result<NodeView
     if rec.revoked {
         return Err(HeartbeatFail::Revoked);
     }
+    // Validate everything before mutating so a bad field leaves the record untouched.
+    let environment_kind = update
+        .environment_kind
+        .as_deref()
+        .map(validate_environment_kind)
+        .transpose()
+        .map_err(HeartbeatFail::Invalid)?;
+    let federated_subsystems = update
+        .federated_subsystems
+        .map(validate_subsystems)
+        .transpose()
+        .map_err(HeartbeatFail::Invalid)?;
+    let reported_status = update
+        .reported_status
+        .as_deref()
+        .map(validate_reported_status)
+        .transpose()
+        .map_err(HeartbeatFail::Invalid)?;
+    if let Some(load) = update.load_avg
+        && (!load.is_finite() || load < 0.0)
+    {
+        return Err(HeartbeatFail::Invalid(
+            "`load_avg` must be a finite number >= 0".to_string(),
+        ));
+    }
+    if let Some(capabilities) = &update.capabilities {
+        validate_string_list("capabilities", capabilities).map_err(HeartbeatFail::Invalid)?;
+    }
     rec.last_seen_at_ms = update.now_ms;
     if let Some(capabilities) = update.capabilities {
         rec.capabilities = capabilities;
     }
     if let Some(labels) = update.labels {
         rec.labels = labels;
+    }
+    if let Some(kind) = environment_kind {
+        rec.environment_kind = kind;
+    }
+    if let Some(subsystems) = federated_subsystems {
+        rec.federated_subsystems = subsystems;
+    }
+    if let Some(active) = update.active_tasks {
+        rec.active_tasks = active;
+    }
+    if update.load_avg.is_some() {
+        rec.load_avg = update.load_avg;
+    }
+    if let Some(status) = reported_status {
+        rec.reported_status = Some(status);
     }
     persist_node(store, &slug, &rec).map_err(HeartbeatFail::Store)?;
     Ok(to_view(&rec, update.now_ms))
@@ -375,6 +507,232 @@ pub fn detect_capabilities(path_env: &str) -> Vec<String> {
         found.push("xcode".to_string());
     }
     found
+}
+
+/// Task states. `completed` and `failed` are terminal.
+pub const TASK_STATUSES: [&str; 4] = ["queued", "running", "completed", "failed"];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FederatedTask {
+    pub task_id: String,
+    pub node_id: String,
+    pub kind: String,
+    pub command: String,
+    pub project: String,
+    pub status: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub output: String,
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskList {
+    tasks: Vec<FederatedTask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchTask {
+    pub kind: String,
+    pub command: String,
+    pub project: String,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskResult {
+    pub status: String,
+    pub output: String,
+    pub exit_code: Option<i32>,
+    pub now_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskFail {
+    NodeNotFound,
+    NodeRevoked,
+    /// Only worker nodes pull tasks.
+    NotWorker,
+    TaskNotFound,
+    Invalid(String),
+    Conflict(String),
+    Store(String),
+}
+
+fn task_state_slug(node_id: &str) -> Result<String, String> {
+    Ok(format!("{TASK_SLUG_PREFIX}{}", canonical_node_id(node_id)?))
+}
+
+fn lock_tasks() -> std::sync::MutexGuard<'static, ()> {
+    TASK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn load_task_list(store: &RedbStore, slug: &str) -> Result<TaskList, String> {
+    let Some(entry) = load_runtime(store, slug)? else {
+        return Ok(TaskList::default());
+    };
+    if !entry.sensitive {
+        return Ok(TaskList::default());
+    }
+    let StatePayload::Runtime(rt) = entry.payload else {
+        return Err(format!("state `{slug}` is not a runtime task list"));
+    };
+    serde_json::from_value(rt.value).map_err(|err| err.to_string())
+}
+
+fn persist_task_list(store: &RedbStore, slug: &str, list: &TaskList) -> Result<(), String> {
+    let value = serde_json::to_value(list).map_err(|err| err.to_string())?;
+    persist_runtime(store, slug, value)
+}
+
+fn load_worker(store: &RedbStore, node_id: &str) -> Result<NodeRecord, TaskFail> {
+    let slug = node_state_slug(node_id).map_err(|_| TaskFail::NodeNotFound)?;
+    load_node(store, &slug)
+        .map_err(TaskFail::Store)?
+        .ok_or(TaskFail::NodeNotFound)
+}
+
+fn truncate_utf8(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut cut = max;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    text
+}
+
+/// Queue a task for a worker node. The hub only records it; the worker pulls it from
+/// `GET /api/v1/nodes/:id/tasks` and reports back with `record_task_result`.
+pub fn dispatch_task(
+    store: &RedbStore,
+    node_id: &str,
+    args: DispatchTask,
+) -> Result<FederatedTask, TaskFail> {
+    let kind = args.kind.trim().to_ascii_lowercase();
+    let kind_ok = !kind.is_empty()
+        && kind.len() <= 32
+        && kind
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    if !kind_ok {
+        return Err(TaskFail::Invalid(
+            "`kind` must be 1-32 characters of [a-z0-9_-]".to_string(),
+        ));
+    }
+    if args.command.trim().is_empty() || args.command.len() > MAX_COMMAND_BYTES {
+        return Err(TaskFail::Invalid(format!(
+            "`command` must be non-empty and at most {MAX_COMMAND_BYTES} bytes"
+        )));
+    }
+    let project = args.project.trim().to_string();
+    let project_ok = project.len() <= MAX_FIELD_LEN
+        && project
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        && project != "."
+        && project != "..";
+    if !project_ok {
+        return Err(TaskFail::Invalid(
+            "`project` must be at most 64 characters of [A-Za-z0-9._-]".to_string(),
+        ));
+    }
+    let node = load_worker(store, node_id)?;
+    if node.revoked {
+        return Err(TaskFail::NodeRevoked);
+    }
+    if node.role != "worker" {
+        return Err(TaskFail::NotWorker);
+    }
+    let slug = task_state_slug(&node.node_id).map_err(TaskFail::Invalid)?;
+    let token = try_generate_hex_token(16).map_err(TaskFail::Store)?;
+    let task = FederatedTask {
+        task_id: format!("t-{}", &token[..16]),
+        node_id: node.node_id,
+        kind,
+        command: args.command,
+        project,
+        status: "queued".to_string(),
+        created_at_ms: args.now_ms,
+        updated_at_ms: args.now_ms,
+        output: String::new(),
+        exit_code: None,
+    };
+    let _guard = lock_tasks();
+    let mut list = load_task_list(store, &slug).map_err(TaskFail::Store)?;
+    if list.tasks.len() >= MAX_TASKS_PER_NODE {
+        let oldest_finished = list
+            .tasks
+            .iter()
+            .position(|t| t.status == "completed" || t.status == "failed");
+        match oldest_finished {
+            Some(index) => {
+                list.tasks.remove(index);
+            }
+            None => {
+                return Err(TaskFail::Conflict(format!(
+                    "node already has {MAX_TASKS_PER_NODE} unfinished tasks"
+                )));
+            }
+        }
+    }
+    list.tasks.push(task.clone());
+    persist_task_list(store, &slug, &list).map_err(TaskFail::Store)?;
+    Ok(task)
+}
+
+/// Tasks for a node, newest first.
+pub fn list_node_tasks(store: &RedbStore, node_id: &str) -> Result<Vec<FederatedTask>, TaskFail> {
+    let node = load_worker(store, node_id)?;
+    let slug = task_state_slug(&node.node_id).map_err(TaskFail::Invalid)?;
+    let _guard = lock_tasks();
+    let mut tasks = load_task_list(store, &slug).map_err(TaskFail::Store)?.tasks;
+    tasks.reverse();
+    Ok(tasks)
+}
+
+/// Record progress or completion. `queued` -> `running`/`completed`/`failed`,
+/// `running` -> `running`/`completed`/`failed`; a finished task is immutable.
+pub fn record_task_result(
+    store: &RedbStore,
+    node_id: &str,
+    task_id: &str,
+    result: TaskResult,
+) -> Result<FederatedTask, TaskFail> {
+    let status = result.status.trim().to_ascii_lowercase();
+    if !["running", "completed", "failed"].contains(&status.as_str()) {
+        return Err(TaskFail::Invalid(
+            "`status` must be one of running, completed, failed".to_string(),
+        ));
+    }
+    let node = load_worker(store, node_id)?;
+    if node.revoked {
+        return Err(TaskFail::NodeRevoked);
+    }
+    let slug = task_state_slug(&node.node_id).map_err(TaskFail::Invalid)?;
+    let _guard = lock_tasks();
+    let mut list = load_task_list(store, &slug).map_err(TaskFail::Store)?;
+    let Some(task) = list.tasks.iter_mut().find(|t| t.task_id == task_id) else {
+        return Err(TaskFail::TaskNotFound);
+    };
+    if task.status == "completed" || task.status == "failed" {
+        return Err(TaskFail::Conflict(format!(
+            "task `{task_id}` already {}",
+            task.status
+        )));
+    }
+    task.status = status;
+    task.output = truncate_utf8(result.output, MAX_OUTPUT_BYTES);
+    task.exit_code = result.exit_code;
+    task.updated_at_ms = result.now_ms;
+    let updated = task.clone();
+    persist_task_list(store, &slug, &list).map_err(TaskFail::Store)?;
+    Ok(updated)
 }
 
 // libc `gethostname`. No extra crate: the process already links libc.
@@ -445,7 +803,89 @@ fn to_view(rec: &NodeRecord, now_ms: u64) -> NodeView {
         status: node_status(&rec.role, rec.revoked, rec.last_seen_at_ms, now_ms).to_string(),
         enrolled_at_ms: rec.enrolled_at_ms,
         last_seen_at_ms: rec.last_seen_at_ms,
+        environment_kind: if rec.environment_kind.is_empty() {
+            default_environment_kind(&rec.role, &rec.os, &rec.capabilities)
+        } else {
+            rec.environment_kind.clone()
+        },
+        federated_subsystems: rec.federated_subsystems.clone(),
+        active_tasks: rec.active_tasks,
+        load_avg: rec.load_avg,
+        reported_status: rec.reported_status.clone(),
     }
+}
+
+/// Profile for a node that declared none: the hub is the `ai-lab`, a macOS host with Xcode is
+/// `macos-xcode`, any other host is a `linux-worker`. `cloud-worker` is only ever declared.
+pub fn default_environment_kind(role: &str, os: &str, capabilities: &[String]) -> String {
+    let has_xcode = capabilities.iter().any(|c| c == "xcode");
+    let kind = if os == "macos" && has_xcode {
+        "macos-xcode"
+    } else if role == "hub" {
+        "ai-lab"
+    } else {
+        "linux-worker"
+    };
+    kind.to_string()
+}
+
+fn validate_environment_kind(raw: &str) -> Result<String, String> {
+    let kind = raw.trim().to_ascii_lowercase();
+    if ENVIRONMENT_KINDS.contains(&kind.as_str()) {
+        Ok(kind)
+    } else {
+        Err(format!(
+            "`environment_kind` must be one of {}",
+            ENVIRONMENT_KINDS.join(", ")
+        ))
+    }
+}
+
+fn validate_reported_status(raw: &str) -> Result<String, String> {
+    let status = raw.trim().to_ascii_lowercase();
+    if REPORTED_STATUSES.contains(&status.as_str()) {
+        Ok(status)
+    } else {
+        Err(format!(
+            "`status` must be one of {}",
+            REPORTED_STATUSES.join(", ")
+        ))
+    }
+}
+
+fn validate_string_list(key: &str, items: &[String]) -> Result<(), String> {
+    if items.len() > MAX_LIST_ITEMS {
+        return Err(format!("`{key}` may hold at most {MAX_LIST_ITEMS} entries"));
+    }
+    if items
+        .iter()
+        .any(|item| item.is_empty() || item.len() > MAX_FIELD_LEN)
+    {
+        return Err(format!(
+            "`{key}` entries must be 1-{MAX_FIELD_LEN} characters"
+        ));
+    }
+    Ok(())
+}
+
+/// Lowercased, deduplicated, `[a-z0-9_-]{1,64}` subsystem names.
+fn validate_subsystems(items: Vec<String>) -> Result<Vec<String>, String> {
+    validate_string_list("federated_subsystems", &items)?;
+    let mut out: Vec<String> = Vec::with_capacity(items.len());
+    for item in items {
+        let name = item.trim().to_ascii_lowercase();
+        let ok = !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+        if !ok {
+            return Err("`federated_subsystems` entries must match [a-z0-9_-]".to_string());
+        }
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Ok(out)
 }
 
 /// Hostname shaped into an id that `canonical_node_id` and `node_state_slug` accept.
@@ -678,6 +1118,8 @@ mod tests {
             listen_addr: Some("127.0.0.1:9".to_string()),
             capabilities: vec!["git".to_string()],
             labels: vec!["edge".to_string()],
+            environment_kind: None,
+            federated_subsystems: Vec::new(),
             now_ms,
         }
     }
@@ -888,6 +1330,7 @@ mod tests {
                 capabilities: Some(vec!["tmux".to_string()]),
                 labels: None,
                 now_ms: 20_000,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -903,6 +1346,7 @@ mod tests {
                 capabilities: None,
                 labels: None,
                 now_ms: 20_000,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -918,6 +1362,7 @@ mod tests {
                 capabilities: Some(vec!["git".to_string()]),
                 labels: Some(vec!["changed".to_string()]),
                 now_ms: 90_000,
+                ..Default::default()
             },
         )
         .unwrap_err();
@@ -1014,6 +1459,7 @@ mod tests {
                 capabilities: None,
                 labels: Some(vec!["keep".to_string()]),
                 now_ms: 1_500,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1237,5 +1683,354 @@ mod tests {
             .unwrap()
             .unwrap()
             .sensitive
+    }
+
+    fn enroll_worker_node(store: &RedbStore, node_id: &str) {
+        let info = mint_enroll_token(store, None, 600, "http://hub", 1_000).unwrap();
+        enroll_worker(store, enroll_req(&info.code, node_id, node_id, 2_000)).unwrap();
+    }
+
+    fn task_args(command: &str) -> DispatchTask {
+        DispatchTask {
+            kind: "shell".to_string(),
+            command: command.to_string(),
+            project: "ferroloop".to_string(),
+            now_ms: 5_000,
+        }
+    }
+
+    #[test]
+    fn legacy_node_records_without_federation_fields_still_load() {
+        let (_tmp, store) = open_store();
+        let legacy = serde_json::json!({
+            "node_id": "old", "display_name": "Old", "role": "worker", "hostname": "h",
+            "os": "linux", "arch": "x86_64", "listen_addr": null, "capabilities": [],
+            "labels": [], "token_hash": null, "enrolled_at_ms": 1, "last_seen_at_ms": 2,
+            "revoked": false
+        });
+        persist_runtime(&store, "hub-node-old", legacy).unwrap();
+        let views = list_visible_nodes(&store, 3).unwrap();
+        assert_eq!(views[0].environment_kind, "linux-worker");
+        assert!(views[0].federated_subsystems.is_empty());
+    }
+
+    #[test]
+    fn environment_kind_defaults_and_validation() {
+        let xcode = vec!["xcode".to_string()];
+        assert_eq!(default_environment_kind("hub", "linux", &[]), "ai-lab");
+        assert_eq!(
+            default_environment_kind("hub", "macos", &xcode),
+            "macos-xcode"
+        );
+        assert_eq!(
+            default_environment_kind("worker", "macos", &xcode),
+            "macos-xcode"
+        );
+        assert_eq!(
+            default_environment_kind("worker", "macos", &[]),
+            "linux-worker"
+        );
+        assert_eq!(
+            default_environment_kind("worker", "linux", &[]),
+            "linux-worker"
+        );
+        for kind in ENVIRONMENT_KINDS {
+            assert_eq!(
+                validate_environment_kind(&kind.to_uppercase()).unwrap(),
+                kind
+            );
+        }
+        assert!(validate_environment_kind("toaster").is_err());
+    }
+
+    #[test]
+    fn subsystems_normalize_dedupe_and_reject_junk() {
+        let ok = validate_subsystems(vec!["FerroWire".into(), "ferrowire".into(), "x_y-1".into()]);
+        assert_eq!(ok.unwrap(), ["ferrowire", "x_y-1"]);
+        assert!(validate_subsystems(vec!["has space".into()]).is_err());
+        assert!(validate_subsystems(vec![String::new()]).is_err());
+        assert!(validate_subsystems(vec!["a".into(); MAX_LIST_ITEMS + 1]).is_err());
+    }
+
+    #[test]
+    fn hub_gets_all_subsystems_and_keeps_them_across_restarts() {
+        let (_tmp, store) = open_store();
+        let hub = ensure_hub_node(&store, hub_args("primary", 100, None)).unwrap();
+        assert_eq!(hub.environment_kind, "ai-lab");
+        assert_eq!(hub.federated_subsystems, FEDERATED_SUBSYSTEMS);
+        touch_node(
+            &store,
+            HeartbeatUpdate {
+                node_id: "primary".to_string(),
+                environment_kind: Some("macos-xcode".to_string()),
+                active_tasks: Some(3),
+                now_ms: 200,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let again = ensure_hub_node(&store, hub_args("primary", 300, None)).unwrap();
+        assert_eq!(again.environment_kind, "macos-xcode");
+        assert_eq!(again.active_tasks, 3);
+    }
+
+    #[test]
+    fn enroll_records_profile_and_rejects_bad_kind() {
+        let (_tmp, store) = open_store();
+        let info = mint_enroll_token(&store, None, 600, "http://hub", 1_000).unwrap();
+        let mut bad = enroll_req(&info.code, "w1", "W1", 2_000);
+        bad.environment_kind = Some("toaster".to_string());
+        assert!(matches!(
+            enroll_worker(&store, bad),
+            Err(EnrollFail::Rejected(_))
+        ));
+        // The code survives a validation failure.
+        let mut good = enroll_req(&info.code, "w1", "W1", 2_000);
+        good.environment_kind = Some("cloud-worker".to_string());
+        good.federated_subsystems = vec!["ferrowire".to_string()];
+        enroll_worker(&store, good).unwrap();
+        let view = &list_visible_nodes(&store, 2_000).unwrap()[0];
+        assert_eq!(view.environment_kind, "cloud-worker");
+        assert_eq!(view.federated_subsystems, ["ferrowire"]);
+    }
+
+    #[test]
+    fn heartbeat_updates_telemetry_and_rejects_bad_fields_atomically() {
+        let (_tmp, store) = open_store();
+        enroll_worker_node(&store, "w1");
+        let view = touch_node(
+            &store,
+            HeartbeatUpdate {
+                node_id: "w1".to_string(),
+                reported_status: Some("Busy".to_string()),
+                active_tasks: Some(4),
+                load_avg: Some(2.25),
+                federated_subsystems: Some(vec!["ferrostep".to_string()]),
+                now_ms: 9_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(view.reported_status.as_deref(), Some("busy"));
+        assert_eq!((view.active_tasks, view.load_avg), (4, Some(2.25)));
+        assert_eq!(view.federated_subsystems, ["ferrostep"]);
+
+        for bad in [
+            HeartbeatUpdate {
+                reported_status: Some("asleep".into()),
+                ..Default::default()
+            },
+            HeartbeatUpdate {
+                load_avg: Some(f64::NAN),
+                ..Default::default()
+            },
+            HeartbeatUpdate {
+                load_avg: Some(-0.5),
+                ..Default::default()
+            },
+            HeartbeatUpdate {
+                environment_kind: Some("x".into()),
+                ..Default::default()
+            },
+        ] {
+            let update = HeartbeatUpdate {
+                node_id: "w1".to_string(),
+                now_ms: 99_000,
+                active_tasks: Some(9),
+                ..bad
+            };
+            assert!(matches!(
+                touch_node(&store, update),
+                Err(HeartbeatFail::Invalid(_))
+            ));
+        }
+        // Nothing from the rejected heartbeats leaked into the record.
+        let view = &list_visible_nodes(&store, 9_000).unwrap()[0];
+        assert_eq!((view.active_tasks, view.last_seen_at_ms), (4, 9_000));
+    }
+
+    #[test]
+    fn task_lifecycle_queued_running_completed() {
+        let (_tmp, store) = open_store();
+        enroll_worker_node(&store, "w1");
+        let first = dispatch_task(&store, "w1", task_args("echo 1")).unwrap();
+        let second = dispatch_task(&store, "W1", task_args("echo 2")).unwrap();
+        assert_ne!(first.task_id, second.task_id);
+        assert_eq!(first.status, "queued");
+        let listed = list_node_tasks(&store, "w1").unwrap();
+        assert_eq!(listed[0].task_id, second.task_id, "newest first");
+
+        let run = |status: &str, output: &str| TaskResult {
+            status: status.to_string(),
+            output: output.to_string(),
+            exit_code: None,
+            now_ms: 6_000,
+        };
+        let running =
+            record_task_result(&store, "w1", &first.task_id, run("running", "a")).unwrap();
+        assert_eq!(running.status, "running");
+        let again = record_task_result(&store, "w1", &first.task_id, run("running", "ab")).unwrap();
+        assert_eq!(again.output, "ab");
+        let done = record_task_result(
+            &store,
+            "w1",
+            &first.task_id,
+            TaskResult {
+                exit_code: Some(0),
+                ..run("completed", "done")
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            (done.status.as_str(), done.exit_code, done.updated_at_ms),
+            ("completed", Some(0), 6_000)
+        );
+        assert!(matches!(
+            record_task_result(&store, "w1", &first.task_id, run("failed", "")),
+            Err(TaskFail::Conflict(_))
+        ));
+        // queued -> failed directly is allowed.
+        let failed =
+            record_task_result(&store, "w1", &second.task_id, run("failed", "boom")).unwrap();
+        assert_eq!(failed.status, "failed");
+    }
+
+    #[test]
+    fn task_validation_and_target_checks() {
+        let (_tmp, store) = open_store();
+        enroll_worker_node(&store, "w1");
+        ensure_hub_node(&store, hub_args("primary", 100, None)).unwrap();
+        assert_eq!(
+            dispatch_task(&store, "nope", task_args("x")).unwrap_err(),
+            TaskFail::NodeNotFound
+        );
+        assert_eq!(
+            dispatch_task(&store, "primary", task_args("x")).unwrap_err(),
+            TaskFail::NotWorker
+        );
+        assert!(matches!(
+            dispatch_task(&store, "w1", task_args("  ")),
+            Err(TaskFail::Invalid(_))
+        ));
+        let too_long = "x".repeat(MAX_COMMAND_BYTES + 1);
+        assert!(matches!(
+            dispatch_task(&store, "w1", task_args(&too_long)),
+            Err(TaskFail::Invalid(_))
+        ));
+        for kind in ["", "has space", "UP!"] {
+            let args = DispatchTask {
+                kind: kind.to_string(),
+                ..task_args("x")
+            };
+            assert!(
+                matches!(dispatch_task(&store, "w1", args), Err(TaskFail::Invalid(_))),
+                "{kind}"
+            );
+        }
+        for project in ["../etc", "a/b", ".."] {
+            let args = DispatchTask {
+                project: project.to_string(),
+                ..task_args("x")
+            };
+            assert!(
+                matches!(dispatch_task(&store, "w1", args), Err(TaskFail::Invalid(_))),
+                "{project}"
+            );
+        }
+        let result = TaskResult {
+            status: "queued".into(),
+            output: String::new(),
+            exit_code: None,
+            now_ms: 1,
+        };
+        assert!(matches!(
+            record_task_result(&store, "w1", "t-x", result.clone()),
+            Err(TaskFail::Invalid(_))
+        ));
+        let result = TaskResult {
+            status: "running".into(),
+            ..result
+        };
+        assert_eq!(
+            record_task_result(&store, "w1", "t-x", result).unwrap_err(),
+            TaskFail::TaskNotFound
+        );
+    }
+
+    #[test]
+    fn revoked_node_refuses_new_tasks_and_results() {
+        let (_tmp, store) = open_store();
+        enroll_worker_node(&store, "w1");
+        let task = dispatch_task(&store, "w1", task_args("x")).unwrap();
+        revoke_node(&store, "w1").unwrap();
+        assert_eq!(
+            dispatch_task(&store, "w1", task_args("y")).unwrap_err(),
+            TaskFail::NodeRevoked
+        );
+        let result = TaskResult {
+            status: "running".into(),
+            output: String::new(),
+            exit_code: None,
+            now_ms: 1,
+        };
+        assert_eq!(
+            record_task_result(&store, "w1", &task.task_id, result).unwrap_err(),
+            TaskFail::NodeRevoked
+        );
+    }
+
+    #[test]
+    fn output_is_truncated_on_a_char_boundary() {
+        let (_tmp, store) = open_store();
+        enroll_worker_node(&store, "w1");
+        let task = dispatch_task(&store, "w1", task_args("x")).unwrap();
+        let output = "é".repeat(MAX_OUTPUT_BYTES);
+        let result = TaskResult {
+            status: "completed".into(),
+            output,
+            exit_code: None,
+            now_ms: 1,
+        };
+        let done = record_task_result(&store, "w1", &task.task_id, result).unwrap();
+        assert!(done.output.len() <= MAX_OUTPUT_BYTES);
+        assert!(done.output.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn full_queue_evicts_oldest_finished_then_refuses() {
+        let (_tmp, store) = open_store();
+        enroll_worker_node(&store, "w1");
+        let first = dispatch_task(&store, "w1", task_args("0")).unwrap();
+        for i in 1..MAX_TASKS_PER_NODE {
+            dispatch_task(&store, "w1", task_args(&i.to_string())).unwrap();
+        }
+        // Everything is unfinished, so a new task is refused.
+        assert!(matches!(
+            dispatch_task(&store, "w1", task_args("more")),
+            Err(TaskFail::Conflict(_))
+        ));
+        let result = TaskResult {
+            status: "completed".into(),
+            output: String::new(),
+            exit_code: None,
+            now_ms: 1,
+        };
+        record_task_result(&store, "w1", &first.task_id, result).unwrap();
+        dispatch_task(&store, "w1", task_args("more")).unwrap();
+        let tasks = list_node_tasks(&store, "w1").unwrap();
+        assert_eq!(tasks.len(), MAX_TASKS_PER_NODE);
+        assert!(tasks.iter().all(|t| t.task_id != first.task_id));
+    }
+
+    #[test]
+    fn task_lists_are_per_node_and_not_node_records() {
+        let (_tmp, store) = open_store();
+        enroll_worker_node(&store, "tasks-w");
+        enroll_worker_node(&store, "w");
+        dispatch_task(&store, "w", task_args("only-w")).unwrap();
+        assert!(list_node_tasks(&store, "tasks-w").unwrap().is_empty());
+        assert_eq!(list_node_tasks(&store, "w").unwrap().len(), 1);
+        // The task rows do not show up as extra nodes.
+        assert_eq!(list_visible_nodes(&store, 3_000).unwrap().len(), 2);
     }
 }

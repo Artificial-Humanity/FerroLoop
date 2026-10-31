@@ -56,7 +56,10 @@ import {
   type WireSendRequest,
   type WireSendResponse,
   type DeleteGateSecretResponse,
+  type DispatchNodeTaskInput,
   type EnrolledNode,
+  type FederatedTask,
+  type RuntimeMatrix,
   type GateConnectorsResponse,
   type GateSecretResponse,
   type GateSecretsResponse,
@@ -1150,6 +1153,36 @@ export class HubApiClient {
       method: "POST",
       body: JSON.stringify({ label, ttl_secs: ttlSecs }),
     });
+  }
+
+  public async fetchRuntimeMatrix(): Promise<RuntimeMatrix> {
+    return this.request<RuntimeMatrix>("/api/v1/runtimes/matrix");
+  }
+
+  /** Re-probe runtimes. `target` narrows to a tier, runtime, provider or engine. */
+  public async probeRuntimes(target?: string): Promise<RuntimeMatrix> {
+    return this.request<RuntimeMatrix>("/api/v1/runtimes/probe", {
+      method: "POST",
+      body: JSON.stringify(target ? { target } : {}),
+    });
+  }
+
+  public async fetchNodeTasks(nodeId: string): Promise<FederatedTask[]> {
+    const data = await this.request<{ tasks?: FederatedTask[] }>(
+      `/api/v1/nodes/${encodeURIComponent(nodeId)}/tasks`,
+    );
+    return data.tasks ?? [];
+  }
+
+  public async dispatchNodeTask(
+    nodeId: string,
+    input: DispatchNodeTaskInput,
+  ): Promise<FederatedTask> {
+    const data = await this.request<{ task: FederatedTask }>(
+      `/api/v1/nodes/${encodeURIComponent(nodeId)}/dispatch`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+    return data.task;
   }
 
   public async revokeNode(nodeId: string): Promise<void> {
