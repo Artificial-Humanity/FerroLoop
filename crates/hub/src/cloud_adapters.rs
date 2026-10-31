@@ -750,6 +750,12 @@ impl std::error::Error for SsrfRefusal {}
 /// read. A signal (`SIGCHLD` from a child the hub spawned is enough) interrupts a blocking
 /// `read(2)` on a socket with `SO_RCVTIMEO` set, and Linux never restarts such a read, not even
 /// under `SA_RESTART`; ureq would report it as a transport failure.
+///
+/// This covers the plain-TCP path only, the `http://` loopback endpoints. On `https://` rustls
+/// already swallows `Interrupted` and re-reads inside its own layer (`complete_io` in rustls'
+/// `conn.rs`), so the error never reaches this wrapper; handshake reads are inner and
+/// unwrapped. Each of those re-reads restarts `SO_RCVTIMEO` with the full timeout, so a signal
+/// storm can stretch the deadline on HTTPS, and the outer wrapper cannot fix that.
 #[derive(Debug)]
 struct RetryInterruptedConnector(DefaultConnector);
 
@@ -768,7 +774,8 @@ impl Connector<()> for RetryInterruptedConnector {
 /// A [`Transport`] that repeats a read `EINTR` cut short. `EINTR` means the call consumed no
 /// data, so the repeat can neither lose nor duplicate a byte, whatever the request. Writes are
 /// left alone: they go through `write_all`, which already retries `Interrupted`, and a TLS
-/// layer must not see a write repeated behind its back.
+/// layer must not see a write repeated behind its back. Only the plain-TCP read can surface
+/// `Interrupted` here; see [`RetryInterruptedConnector`] for why `https://` never does.
 #[derive(Debug)]
 struct RetryInterrupted<T>(T);
 
@@ -791,7 +798,7 @@ impl<T: Transport> Transport for RetryInterrupted<T> {
                 other => return other,
             }
             // Each repeat gets only what is left, so a storm of signals cannot stretch the
-            // deadline ureq asked for.
+            // deadline ureq asked for (on the plain-TCP path this wrapper sees).
             if let UreqDuration::Exact(total) = asked {
                 let left = total.saturating_sub(started.elapsed());
                 if left.is_zero() {
@@ -2719,26 +2726,29 @@ mod tests {
 
     /// Signals the thread that built it until dropped. The handler is installed WITHOUT
     /// `SA_RESTART`, which is also how Linux treats a read under `SO_RCVTIMEO` whatever the
-    /// flag says.
+    /// flag says. The previous SIGUSR1 disposition is put back on drop, after the signaller
+    /// thread has been joined. The test is plain-TCP (`http://` loopback), the path the
+    /// wrapper covers.
     struct SignalStorm {
         stop: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
+        previous: libc::sigaction,
     }
 
     impl SignalStorm {
         fn aim_at_this_thread() -> Self {
             // SAFETY: `act` is zeroed then filled in; the handler does nothing, so it is
-            // async-signal-safe; SIGUSR1 has no other user in this process.
-            unsafe {
+            // async-signal-safe; SIGUSR1 has no other user in this process. `previous` is
+            // written by the call and kept for `Drop` to restore.
+            let previous = unsafe {
                 let mut act: libc::sigaction = std::mem::zeroed();
                 act.sa_sigaction = ignore_signal as extern "C" fn(libc::c_int) as usize;
                 libc::sigemptyset(&mut act.sa_mask);
                 act.sa_flags = 0;
-                assert_eq!(
-                    libc::sigaction(libc::SIGUSR1, &act, std::ptr::null_mut()),
-                    0
-                );
-            }
+                let mut previous: libc::sigaction = std::mem::zeroed();
+                assert_eq!(libc::sigaction(libc::SIGUSR1, &act, &mut previous), 0);
+                previous
+            };
             // SAFETY: reads the calling thread's own id.
             let target = unsafe { libc::pthread_self() };
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2754,6 +2764,7 @@ mod tests {
             Self {
                 stop,
                 thread: Some(thread),
+                previous,
             }
         }
     }
@@ -2763,6 +2774,11 @@ mod tests {
             self.stop.store(true, Ordering::SeqCst);
             if let Some(thread) = self.thread.take() {
                 let _ = thread.join();
+            }
+            // SAFETY: `previous` came from the `sigaction` call that installed the handler,
+            // and the signaller is joined, so no SIGUSR1 is still being sent.
+            unsafe {
+                libc::sigaction(libc::SIGUSR1, &self.previous, std::ptr::null_mut());
             }
         }
     }
