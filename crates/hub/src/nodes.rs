@@ -14,7 +14,7 @@ use fl_store::RedbStore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::auth::{constant_time_eq, generate_hex_token, sha256_hex};
+use crate::auth::{constant_time_eq, sha256_hex, try_generate_hex_token};
 
 const NODE_SLUG_PREFIX: &str = "hub-node-";
 const ENROLL_SLUG_PREFIX: &str = "hub-node-enroll-";
@@ -219,7 +219,7 @@ pub fn mint_enroll_token(
     } else {
         ttl_secs
     };
-    let code = generate_hex_token(32);
+    let code = try_generate_hex_token(32)?;
     let code_hash = sha256_hex(&code);
     let expires_at_ms = now_ms.saturating_add(ttl.saturating_mul(1000));
     let label = normalize_label(label);
@@ -284,7 +284,7 @@ pub fn enroll_worker(store: &RedbStore, req: EnrollWorker) -> Result<EnrolledWor
         .filter(|rec| rec.role == "worker")
         .map(|rec| rec.enrolled_at_ms)
         .unwrap_or(req.now_ms);
-    let node_token = generate_hex_token(32);
+    let node_token = try_generate_hex_token(32).map_err(EnrollFail::Store)?;
     let record = NodeRecord {
         node_id: node_id.clone(),
         display_name: req.display_name,

@@ -114,6 +114,17 @@ pub fn generate_hex_token(byte_len: usize) -> String {
     hex_encode(&bytes)
 }
 
+/// As [`generate_hex_token`] but fails closed: a credential (session token, pairing code) is
+/// never built from the UUIDv7 fallback, which is mostly a timestamp and repeats its first 16
+/// bytes. Use this for anything that authenticates.
+pub fn try_generate_hex_token(byte_len: usize) -> Result<String, String> {
+    let mut bytes = vec![0u8; byte_len.max(16)];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| "no secure randomness available".to_string())?;
+    Ok(hex_encode(&bytes))
+}
+
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -231,7 +242,7 @@ pub fn mint_pairing_code_in_store(
     base_url: &str,
     ttl_secs: u64,
 ) -> Result<PairingInfo, String> {
-    let code = generate_hex_token(16);
+    let code = try_generate_hex_token(16)?;
     let ttl = if ttl_secs == 0 {
         DEFAULT_PAIRING_TTL_SECS
     } else {
@@ -446,7 +457,7 @@ impl AuthManager {
         base_url: &str,
         ttl_secs: u64,
     ) -> Result<PairingInfo, String> {
-        let code = generate_hex_token(16);
+        let code = try_generate_hex_token(16)?;
         let ttl = if ttl_secs == 0 {
             DEFAULT_PAIRING_TTL_SECS
         } else {
@@ -477,7 +488,7 @@ impl AuthManager {
 
     /// Mint a 256-bit owner session token and persist its SHA-256 hash in `store` and memory.
     pub fn mint_session(&self, store: Option<&RedbStore>, login: &str) -> Result<String, String> {
-        let session_token = generate_hex_token(32);
+        let session_token = try_generate_hex_token(32)?;
         let token_hash = sha256_hex(&session_token);
         let expires_at_ms = now_millis().saturating_add(self.session_ttl_secs.saturating_mul(1000));
         let entry = StoredSessionEntry {
@@ -507,34 +518,36 @@ impl AuthManager {
         let now_ms = now_millis();
 
         if let Some(raw_code) = code.map(str::trim).filter(|s| !s.is_empty()) {
-            let mut found = if let Ok(guard) = self.cache.lock() {
-                guard.pairings.get(raw_code).cloned()
-            } else {
-                None
-            };
-            if found.is_none()
-                && let Some(s) = store
+            // Check, mark used and persist in ONE critical section: with the lock dropped between
+            // the check and the mark, two concurrent requests could both see `used == false` and
+            // each mint a session from one single-use code.
             {
-                found = load_pairing_entry(s, raw_code);
-            }
-            let Some(mut pairing) = found else {
-                return Err("unknown pairing code".to_string());
-            };
-            if pairing.used {
-                return Err("pairing code has already been used".to_string());
-            }
-            if now_ms > pairing.expires_at_ms {
-                return Err("pairing code has expired".to_string());
-            }
-            if !constant_time_eq(&pairing.code, raw_code) {
-                return Err("invalid pairing code".to_string());
-            }
-
-            pairing.used = true;
-            if let Some(s) = store {
-                persist_pairing_entry(s, &pairing)?;
-            }
-            if let Ok(mut guard) = self.cache.lock() {
+                let mut guard = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut found = guard.pairings.get(raw_code).cloned();
+                if found.is_none()
+                    && let Some(s) = store
+                {
+                    found = load_pairing_entry(s, raw_code);
+                }
+                let Some(mut pairing) = found else {
+                    return Err("unknown pairing code".to_string());
+                };
+                if pairing.used {
+                    return Err("pairing code has already been used".to_string());
+                }
+                if now_ms > pairing.expires_at_ms {
+                    return Err("pairing code has expired".to_string());
+                }
+                if !constant_time_eq(&pairing.code, raw_code) {
+                    return Err("invalid pairing code".to_string());
+                }
+                pairing.used = true;
+                if let Some(s) = store {
+                    persist_pairing_entry(s, &pairing)?;
+                }
                 guard.pairings.insert(raw_code.to_string(), pairing);
             }
 
@@ -575,21 +588,26 @@ impl AuthManager {
         let token_hash = sha256_hex(trimmed);
         let now_ms = now_millis();
 
-        let mut found = if let Ok(guard) = self.cache.lock() {
-            guard.sessions.get(&token_hash).cloned()
-        } else {
-            None
-        };
-        if found.is_none()
-            && let Some(s) = store
-        {
-            found = load_session_entry(s, &token_hash);
-            if let Some(ref entry) = found
-                && let Ok(mut guard) = self.cache.lock()
+        // The store read and the cache insert happen under the cache lock, the same lock a
+        // revocation holds from its first sweep to its last write. Without that, a lookup could
+        // read a live entry from the store, lose the CPU to a revocation, and then put the stale
+        // live entry back in the cache, undoing the revocation for this process.
+        let found = {
+            let mut guard = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut found = guard.sessions.get(&token_hash).cloned();
+            if found.is_none()
+                && let Some(s) = store
             {
-                guard.sessions.insert(token_hash.clone(), entry.clone());
+                found = load_session_entry(s, &token_hash);
+                if let Some(ref entry) = found {
+                    guard.sessions.insert(token_hash.clone(), entry.clone());
+                }
             }
-        }
+            found
+        };
 
         let entry = found?;
         if entry.revoked || now_ms > entry.expires_at_ms {
@@ -605,10 +623,14 @@ impl AuthManager {
             return;
         }
         let token_hash = sha256_hex(trimmed);
+        // One critical section with `verify_session_token`'s cache fill, as in
+        // `revoke_sessions_for_login`.
+        let mut guard = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut updated = None;
-        if let Ok(mut guard) = self.cache.lock()
-            && let Some(entry) = guard.sessions.get_mut(&token_hash)
-        {
+        if let Some(entry) = guard.sessions.get_mut(&token_hash) {
             entry.revoked = true;
             updated = Some(entry.clone());
         }
@@ -617,6 +639,7 @@ impl AuthManager {
             && let Some(mut entry) = load_session_entry(s, &token_hash)
         {
             entry.revoked = true;
+            guard.sessions.insert(token_hash.clone(), entry.clone());
             updated = Some(entry);
         }
         if let (Some(s), Some(entry)) = (store, updated) {
@@ -643,17 +666,17 @@ impl AuthManager {
                 && entry.login.trim().eq_ignore_ascii_case(wanted)
         };
         let mut revoked: BTreeMap<String, StoredSessionEntry> = BTreeMap::new();
-        {
-            // A poisoned lock is still the cache: failing open here would leave sessions alive.
-            let mut guard = self
-                .cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for entry in guard.sessions.values_mut() {
-                if matches(entry) {
-                    entry.revoked = true;
-                    revoked.insert(entry.token_hash.clone(), entry.clone());
-                }
+        // A poisoned lock is still the cache: failing open here would leave sessions alive. The
+        // lock is held through the store sweep and write-back so a concurrent
+        // `verify_session_token` cannot re-cache a live copy it read before the sweep.
+        let mut guard = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in guard.sessions.values_mut() {
+            if matches(entry) {
+                entry.revoked = true;
+                revoked.insert(entry.token_hash.clone(), entry.clone());
             }
         }
         if let Some(s) = store {
@@ -963,5 +986,223 @@ mod tests {
             auth.authenticate_request(None, &h_bad, &BTreeMap::new()),
             None
         );
+    }
+
+    // --- Wave C audit regressions (2026-10-30) ------------------------------------------------
+
+    fn test_auth() -> AuthManager {
+        AuthManager::new("lmcfarlin", Some("owner-secret".into()), None, false, 3600)
+    }
+
+    #[test]
+    fn a_pairing_code_redeemed_by_racing_requests_yields_exactly_one_session() {
+        let tmp = TempDir::new().unwrap();
+        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        for with_store in [true, false] {
+            let auth = test_auth();
+            let info = auth
+                .mint_pairing_code(with_store.then_some(&store), "http://127.0.0.1:8420", 600)
+                .unwrap();
+            let wins = std::sync::atomic::AtomicUsize::new(0);
+            let tokens = Mutex::new(Vec::new());
+            std::thread::scope(|scope| {
+                for _ in 0..16 {
+                    scope.spawn(|| {
+                        let got = auth.exchange_pairing_or_token(
+                            with_store.then_some(&store),
+                            Some(&info.code),
+                            None,
+                        );
+                        if let Ok((token, ..)) = got {
+                            wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tokens.lock().unwrap().push(token);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                wins.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "a single-use code minted more than one session (store: {with_store})"
+            );
+            assert!(
+                auth.exchange_pairing_or_token(
+                    with_store.then_some(&store),
+                    Some(&info.code),
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn a_pairing_code_minted_by_the_cli_redeems_once_through_a_cold_cache() {
+        let tmp = TempDir::new().unwrap();
+        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let info = mint_pairing_code_in_store(&store, "http://127.0.0.1:8420", 600).unwrap();
+        let auth = test_auth();
+        let wins = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    if auth
+                        .exchange_pairing_or_token(Some(&store), Some(&info.code), None)
+                        .is_ok()
+                    {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(wins.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // A restarted daemon sees the stored `used` flag.
+        assert!(
+            test_auth()
+                .exchange_pairing_or_token(Some(&store), Some(&info.code), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn an_expired_or_unknown_pairing_code_mints_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let auth = test_auth();
+        for bad in ["", "   ", "nope", "../../etc/passwd", &"f".repeat(4096)] {
+            assert!(
+                auth.exchange_pairing_or_token(Some(&store), Some(bad), None)
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        // A code is not a token, and a token is not a code.
+        let info = auth
+            .mint_pairing_code(Some(&store), "http://127.0.0.1:8420", 600)
+            .unwrap();
+        assert!(
+            auth.exchange_pairing_or_token(Some(&store), None, Some(&info.code))
+                .is_err()
+        );
+        assert!(
+            auth.exchange_pairing_or_token(Some(&store), Some("owner-secret"), None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_revocation_racing_a_cold_cache_lookup_is_never_undone() {
+        let tmp = TempDir::new().unwrap();
+        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let minter = test_auth();
+        for round in 0..60 {
+            let token = minter.mint_session(Some(&store), "racer").unwrap();
+            // A restarted daemon: its cache is empty, so a lookup fills it from the store.
+            let daemon = test_auth();
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _ = daemon.verify_session_token(Some(&store), &token);
+                });
+                scope.spawn(|| {
+                    daemon.revoke_sessions_for_login(Some(&store), "racer");
+                });
+            });
+            assert!(
+                daemon.verify_session_token(Some(&store), &token).is_none(),
+                "round {round}: a revoked session lives on in the cache"
+            );
+            assert!(
+                test_auth()
+                    .verify_session_token(Some(&store), &token)
+                    .is_none(),
+                "round {round}: the revocation did not reach the store"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_out_through_a_cold_cache_sticks_in_cache_and_store() {
+        let tmp = TempDir::new().unwrap();
+        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let token = test_auth().mint_session(Some(&store), "alice").unwrap();
+        let daemon = test_auth();
+        daemon.revoke_session_token(Some(&store), &token);
+        assert!(daemon.verify_session_token(Some(&store), &token).is_none());
+        assert!(
+            test_auth()
+                .verify_session_token(Some(&store), &token)
+                .is_none()
+        );
+        // Revoking a token nobody minted, or a blank one, is a quiet no-op.
+        daemon.revoke_session_token(Some(&store), "not-a-token");
+        daemon.revoke_session_token(Some(&store), "   ");
+        assert_eq!(daemon.revoke_sessions_for_login(Some(&store), "alice"), 0);
+    }
+
+    #[test]
+    fn revocation_matches_the_whole_login_and_ignores_expired_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let auth = test_auth();
+        let live = |t: &str| auth.verify_session_token(Some(&store), t).is_some();
+        let ali = auth.mint_session(Some(&store), "ali").unwrap();
+        let alice = auth.mint_session(Some(&store), "alice").unwrap();
+        let alice2 = auth.mint_session(Some(&store), "alice2").unwrap();
+        // A prefix, a suffix or a glob is not the login.
+        for not_alice in ["ali", "alic", "alice2", "*", "%", "alice%", ""] {
+            let ended = auth.revoke_sessions_for_login(Some(&store), not_alice);
+            assert_eq!(ended, usize::from(not_alice == "ali"), "{not_alice:?}");
+            if not_alice == "ali" {
+                break;
+            }
+        }
+        assert!(!live(&ali));
+        assert!(live(&alice) && live(&alice2));
+        // A session past its expiry is neither accepted, counted nor resurrected.
+        let token_hash = sha256_hex("expired-session-token");
+        persist_session_entry(
+            &store,
+            &StoredSessionEntry {
+                kind: "hub/session".to_string(),
+                key: format!("hub/session/{token_hash}"),
+                token_hash,
+                login: "zed".to_string(),
+                expires_at_ms: 1,
+                revoked: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            auth.verify_session_token(Some(&store), "expired-session-token")
+                .is_none()
+        );
+        assert_eq!(auth.revoke_sessions_for_login(Some(&store), "zed"), 0);
+        assert!(
+            auth.verify_session_token(Some(&store), "expired-session-token")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn credentials_come_from_the_system_rng_and_never_the_fallback() {
+        let mut seen = std::collections::BTreeSet::new();
+        for len in [0usize, 1, 15, 16, 32, 64] {
+            let token = try_generate_hex_token(len).unwrap();
+            assert_eq!(token.len(), len.max(16) * 2, "{len}");
+            assert!(
+                token
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            );
+            assert!(seen.insert(token), "a repeated token");
+        }
+        // Not the UUIDv7 fallback shape: that one repeats its first 16 bytes after byte 16.
+        let token = try_generate_hex_token(32).unwrap();
+        assert_ne!(token[..32], token[32..]);
+        let auth = test_auth();
+        let a = auth.mint_session(None, "x").unwrap();
+        let b = auth.mint_session(None, "x").unwrap();
+        assert_eq!((a.len(), b.len()), (64, 64));
+        assert_ne!(a, b);
     }
 }

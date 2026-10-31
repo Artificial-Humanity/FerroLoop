@@ -506,7 +506,8 @@ fn check_hostname(host: &str) -> Result<(), String> {
 }
 
 /// True for any address a cloud endpoint must never reach: unspecified, loopback, private,
-/// link-local (including the 169.254.169.254 and fd00:ec2::254 metadata endpoints), CGNAT,
+/// link-local (including the 169.254.169.254 and fd00:ec2::254 metadata endpoints), the Azure
+/// WireServer 168.63.129.16, CGNAT,
 /// documentation, benchmarking, unique-local, multicast, broadcast and reserved space, plus
 /// IPv6 forms that carry an IPv4 address (v4-mapped, v4-translated, NAT64, 6to4), which are judged by the
 /// address inside. Loopback is forbidden here; a caller that admits it does so itself.
@@ -517,7 +518,14 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Azure's WireServer: a public-looking address every Azure VM reaches for host services (VM
+/// extensions, provisioning, certificates), outside any private range.
+const AZURE_WIRESERVER: Ipv4Addr = Ipv4Addr::new(168, 63, 129, 16);
+
 fn v4_forbidden(ip: Ipv4Addr) -> bool {
+    if ip == AZURE_WIRESERVER {
+        return true;
+    }
     let [a, b, c, _] = ip.octets();
     matches!(
         (a, b, c),
@@ -1277,7 +1285,8 @@ impl McpRegistryAdapter for HttpCloudRegistryAdapter {
             .and_then(|body| body.get("published"))
             .and_then(Value::as_u64)
             .and_then(|n| usize::try_from(n).ok());
-        Ok(reported.unwrap_or(entries.len()))
+        // The server's count is its claim, not ours: it can never exceed what was sent.
+        Ok(reported.map_or(entries.len(), |n| n.min(entries.len())))
     }
 }
 
@@ -2713,5 +2722,167 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // --- Wave C audit regressions (2026-10-30) -----------------------------------------------
+
+    #[test]
+    fn the_azure_wireserver_is_forbidden_but_its_neighbours_are_not() {
+        for ip in [
+            "168.63.129.16",
+            "::ffff:168.63.129.16",
+            "64:ff9b::a83f:8110",
+        ] {
+            assert!(is_forbidden_ip(ip.parse().unwrap()), "{ip}");
+        }
+        assert!(validate_endpoint_url("https://168.63.129.16").is_err());
+        assert!(validate_endpoint_url("https://[::ffff:168.63.129.16]/x").is_err());
+        for ip in [
+            "168.63.129.15",
+            "168.63.129.17",
+            "168.63.128.16",
+            "168.62.129.16",
+        ] {
+            assert!(!is_forbidden_ip(ip.parse().unwrap()), "{ip}");
+        }
+        // The connect-time guard refuses a name that resolves to it.
+        assert!(check_resolved(&["168.63.129.16".parse().unwrap()], false).is_err());
+    }
+
+    #[test]
+    fn ipv6_forms_that_carry_a_private_ipv4_address_are_refused() {
+        for url in [
+            "https://[::ffff:127.0.0.1]",
+            "https://[::ffff:7f00:1]",
+            "https://[::127.0.0.1]",
+            "https://[::10.0.0.1]/x",
+            "https://[64:ff9b::7f00:1]",
+            "https://[64:ff9b::a9fe:a9fe]",
+            "https://[2002:7f00:1::1]",
+            "https://[2002:a9fe:a9fe::]",
+            "https://[fd00:ec2::254]",
+            "https://[fe80::1]",
+            "https://[::]",
+            "https://[0:0:0:0:0:0:0:1]",
+            "http://[0:0:0:0:0:0:0:1]",
+            "http://[::ffff:127.0.0.1]",
+            "http://[fe80::1%25eth0]",
+        ] {
+            assert!(validate_endpoint_url(url).is_err(), "{url}");
+        }
+        for url in [
+            "https://[2606:4700:4700::1111]",
+            "https://[2001:4860:4860::8888]:8443/p",
+        ] {
+            assert!(validate_endpoint_url(url).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn malformed_authorities_and_numeric_hosts_are_refused() {
+        for url in [
+            "https://example.com:0",
+            "https://example.com:65536",
+            "https://example.com:+80",
+            "https://example.com:-1",
+            "https://example.com:",
+            "https://example.com:80:80",
+            "https://exa%6dple.com",
+            "https://a..b",
+            "https://-a.com",
+            "https://a-.com",
+            "https://example.com.",
+            "https://127.0.0.1.",
+            "https://1.1.1.1.1",
+            "https://0x7f.1",
+            "https://0x7f000001",
+            "https://017700000001",
+            "https://2130706433",
+            "https://[::1]x",
+            "https://[::1",
+            "https://::1",
+            "http://localhost:80@evil.com",
+            "http://localhost@evil.com",
+            "https://evil.com\\@localhost",
+            "https://evil.com\t",
+            "https://evil.com\0",
+            "https://evil.com#@localhost",
+            "https://evil.com?@localhost",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.evil.com",
+            "http://127.0.0.2",
+            "http://0.0.0.0",
+            "file:///etc/passwd",
+            "gopher://localhost",
+            "//example.com",
+            "https:/example.com",
+            "https:example.com",
+            "https://",
+            "",
+        ] {
+            let got = validate_endpoint_url(url);
+            // The empty string is the "adapter off" spelling, handled before this function.
+            assert!(got.is_err(), "{url:?} was accepted as {got:?}");
+        }
+        // Case and a doubled slash in the path are not a way past the host rules.
+        let ok = validate_endpoint_url("HTTPS://Example.COM:443//a//b///").unwrap();
+        assert_eq!(ok.base(), "https://example.com:443//a//b");
+        assert!(!ok.loopback_ok());
+        assert!(
+            validate_endpoint_url("http://LOCALHOST:8080")
+                .unwrap()
+                .loopback_ok()
+        );
+        // `https://localhost` stays loopback-only at connect time.
+        assert!(
+            validate_endpoint_url("https://localhost")
+                .unwrap()
+                .loopback_ok()
+        );
+    }
+
+    #[test]
+    fn a_registry_cannot_inflate_the_published_count() {
+        let server =
+            FakeServer::start(|_, stream| reply_json(stream, 200, &json!({ "published": 99 })));
+        let adapter = HttpCloudRegistryAdapter::new("aws", &server.url()).unwrap();
+        let sent = [json!({ "name": "a" }), json!({ "name": "b" })];
+        assert_eq!(adapter.publish_servers(&sent).unwrap(), 2);
+        assert_eq!(adapter.publish_servers(&[]).unwrap(), 0);
+        // A smaller honest count, and a garbage one, still behave.
+        let server =
+            FakeServer::start(|_, stream| reply_json(stream, 200, &json!({ "published": 1 })));
+        let adapter = HttpCloudRegistryAdapter::new("aws", &server.url()).unwrap();
+        assert_eq!(adapter.publish_servers(&sent).unwrap(), 1);
+        let server =
+            FakeServer::start(|_, stream| reply_json(stream, 200, &json!({ "published": -3 })));
+        let adapter = HttpCloudRegistryAdapter::new("aws", &server.url()).unwrap();
+        assert_eq!(adapter.publish_servers(&sent).unwrap(), 2);
+    }
+
+    #[test]
+    fn path_segments_cannot_escape_their_route() {
+        let server = FakeServer::start(|_, stream| {
+            reply_json(stream, 200, &json!({ "doc": { "ok": true } }))
+        });
+        let adapter = HttpCloudSyncAdapter::new(&server.url()).unwrap();
+        for (collection, id, want) in [
+            ("a/b", "c", "/v1/sync/documents/a%2Fb/c"),
+            ("a", "b?x=1#f", "/v1/sync/documents/a/b%3Fx%3D1%23f"),
+            ("a", ".%2e", "/v1/sync/documents/a/.%252e"),
+            ("a", "%2e%2e", "/v1/sync/documents/a/%252e%252e"),
+            ("a", "b\\c", "/v1/sync/documents/a/b%5Cc"),
+            (
+                "a",
+                "b\r\nHost: evil",
+                "/v1/sync/documents/a/b%0D%0AHost%3A%20evil",
+            ),
+            ("\u{e9}", "x", "/v1/sync/documents/%C3%A9/x"),
+            ("a", "...", "/v1/sync/documents/a/..."),
+        ] {
+            adapter.fetch_document(collection, id).unwrap();
+            let (_, path, ..) = server.request(server.request_count() - 1);
+            assert_eq!(path, want, "{collection:?}/{id:?}");
+        }
     }
 }

@@ -311,7 +311,9 @@ export function p1363ToDer(sig: Uint8Array): Uint8Array {
 }
 
 function readStoredPasskeyMap(): Record<string, StoredClientPasskey> {
-  const merged: Record<string, StoredClientPasskey> = {};
+  // No prototype: a credential id (or a key in a tampered keystore) such as `__proto__` or
+  // `constructor` is then just a name, never a lookup that walks into `Object.prototype`.
+  const merged: Record<string, StoredClientPasskey> = Object.create(null);
   for (const [k, v] of inMemoryPasskeyStore.entries()) {
     merged[k] = v;
   }
@@ -319,9 +321,20 @@ function readStoredPasskeyMap(): Record<string, StoredClientPasskey> {
     if (typeof window !== "undefined" && window.localStorage) {
       const raw = window.localStorage.getItem(PASSKEY_KEYSTORE_STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw) as Record<string, StoredClientPasskey>;
-        if (parsed && typeof parsed === "object") {
-          Object.assign(merged, parsed);
+        const parsed: unknown = JSON.parse(raw);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          for (const [k, v] of Object.entries(parsed)) {
+            // Own entries only, and only ones shaped like a stored key.
+            if (
+              k !== "__proto__" &&
+              v &&
+              typeof v === "object" &&
+              typeof (v as StoredClientPasskey).private_jwk === "object" &&
+              (v as StoredClientPasskey).private_jwk !== null
+            ) {
+              merged[k] = v as StoredClientPasskey;
+            }
+          }
         }
       }
     }
@@ -367,6 +380,50 @@ export function getLastRegisteredPasskeyId(): string {
     return inMemoryLastPasskeyId;
   }
   return "passkey-default-0001";
+}
+
+/**
+ * A fresh, unguessable credential id: 24 random bytes as base64url (32 characters), inside the
+ * hub's 16 to 1024 character `[A-Za-z0-9_-]` rule. A clock-based id repeats when two clicks land
+ * in one millisecond and can be guessed by anyone who knows roughly when it was made.
+ */
+export function generatePasskeyCredentialId(): string {
+  const crypto = globalThis.crypto;
+  if (crypto && typeof crypto.getRandomValues === "function") {
+    return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(24)));
+  }
+  return `passkey-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+}
+
+/**
+ * The origin and relying-party id a passkey is registered and asserted under. One function for
+ * both so they cannot drift: the hub pins the registered origin and checks `clientData.origin`
+ * against it byte for byte. The page's own origin wins, as a browser would put it in
+ * `clientDataJSON`; `baseUrl` is the fallback when there is no page (a worker, a test).
+ */
+export function resolvePasskeyOrigin(baseUrl: string): {
+  origin: string;
+  hostname: string;
+} {
+  let origin = "http://localhost:9000";
+  let hostname = "localhost";
+  if (
+    typeof window !== "undefined" &&
+    window.location?.origin &&
+    window.location.origin !== "null"
+  ) {
+    origin = window.location.origin;
+    hostname = window.location.hostname || "localhost";
+  } else if (baseUrl) {
+    try {
+      const parsedUrl = new URL(baseUrl);
+      origin = parsedUrl.origin;
+      hostname = parsedUrl.hostname || "localhost";
+    } catch {
+      // Keep default localhost origin
+    }
+  }
+  return { origin, hostname };
 }
 
 export class HubApiError extends Error {
@@ -433,7 +490,10 @@ export class HubApiClient {
   }
 
   public async request<T>(path: string, init: RequestInit = {}): Promise<T> {
-    const url = `${this.baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
+    // One leading slash, always: `//host/x` or `/\\host/x` would be read as a URL for another
+    // host, and this request carries the session token.
+    const rel = (path.startsWith("/") ? path : `/${path}`).replace(/^[/\\]+/, "/");
+    const url = `${this.baseUrl}${rel}`;
     const headers = new Headers(init.headers ?? {});
     if (!headers.has("Accept")) {
       headers.set("Accept", "application/json");
@@ -1180,24 +1240,7 @@ export class HubApiClient {
         const challengeRes = await this.requestPasskeyChallenge();
         const challenge = challengeRes.challenge;
 
-        let origin = "http://localhost:9000";
-        let hostname = "localhost";
-        if (
-          typeof window !== "undefined" &&
-          window.location?.origin &&
-          window.location.origin !== "null"
-        ) {
-          origin = window.location.origin;
-          hostname = window.location.hostname || "localhost";
-        } else if (this.baseUrl) {
-          try {
-            const parsedUrl = new URL(this.baseUrl);
-            origin = parsedUrl.origin;
-            hostname = parsedUrl.hostname || "localhost";
-          } catch {
-            // Keep default localhost origin
-          }
-        }
+        const { origin, hostname } = resolvePasskeyOrigin(this.baseUrl);
 
         const clientDataJson = JSON.stringify({
           type: "webauthn.get",
@@ -1256,7 +1299,9 @@ export class HubApiClient {
 
         payload = {
           mode: "passkey",
-          credential_id: req.credential_id,
+          // The credential whose key signed, which is not `req.credential_id` when that one is
+          // unknown here and the newest key stood in for it.
+          credential_id: stored.credential_id,
           client_data_json_b64: bytesToBase64Url(clientDataBytes),
           authenticator_data_b64: bytesToBase64Url(authenticatorData),
           signature_b64: bytesToBase64Url(derSig),
@@ -1328,6 +1373,7 @@ export class HubApiClient {
     public_key_b64?: string;
   }): Promise<{ ok: boolean }> {
     let publicKeyB64 = req.public_key_b64;
+    let generated: StoredClientPasskey | null = null;
     if (
       !publicKeyB64 &&
       typeof globalThis.crypto !== "undefined" &&
@@ -1346,21 +1392,35 @@ export class HubApiClient {
         "jwk",
         keyPair.privateKey,
       );
-      saveStoredPasskey({
+      generated = {
         credential_id: req.credential_id,
         public_key_b64: publicKeyB64,
         private_jwk: privateJwk,
         sign_count: 0,
-      });
+      };
     }
-    return this.request<{ ok: boolean }>("/api/v1/auth/passkey/register", {
-      method: "POST",
-      body: JSON.stringify({
-        credential_id: req.credential_id,
-        label: req.label,
-        ...(publicKeyB64 ? { public_key_b64: publicKeyB64 } : {}),
-      }),
-    });
+    const res = await this.request<{ ok: boolean }>(
+      "/api/v1/auth/passkey/register",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          credential_id: req.credential_id,
+          label: req.label,
+          ...(publicKeyB64 ? { public_key_b64: publicKeyB64 } : {}),
+          // Pin the origin login will assert under, not the one the hub infers from its `Host`
+          // header: behind a proxy, or with `baseUrl` on another origin, those differ and every
+          // later login would fail.
+          origin: resolvePasskeyOrigin(this.baseUrl).origin,
+        }),
+      },
+    );
+    // Keep the private key only once the hub holds the public half. Saved earlier, a refused
+    // registration (duplicate id, bad origin) would leave an orphan key, and make it the
+    // "last registered" passkey that sign-in then offers.
+    if (generated) {
+      saveStoredPasskey(generated);
+    }
+    return res;
   }
 
   public async getCloudAdapters(): Promise<CloudAdaptersConfig> {
