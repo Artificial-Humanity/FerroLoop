@@ -747,12 +747,21 @@ impl LoginGuard {
 
     /// Take a verification slot, or `None` when all are busy. Never waits.
     fn try_verify_permit(&self) -> Option<VerifyPermit<'_>> {
-        self.inflight
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_INFLIGHT_VERIFICATIONS).then_some(n + 1)
-            })
-            .ok()?;
-        Some(VerifyPermit(&self.inflight))
+        // A plain CAS loop: the std atomic update helper was renamed across
+        // toolchains, so this stays warning-free on old and new Rust.
+        let mut n = self.inflight.load(Ordering::Acquire);
+        loop {
+            if n >= MAX_INFLIGHT_VERIFICATIONS {
+                return None;
+            }
+            match self
+                .inflight
+                .compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Some(VerifyPermit(&self.inflight)),
+                Err(observed) => n = observed,
+            }
+        }
     }
 
     /// Marks the start of one credential verification. A no-op outside test builds.
