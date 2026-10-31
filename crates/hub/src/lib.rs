@@ -4029,8 +4029,11 @@ mod tests {
 
     #[test]
     fn interrupt_endpoint_gates_resolves_and_reports_the_method() {
+        // The route names a tmux pane; holding the fake keeps any pane call out of other tests.
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
         install_route(tmp.path(), "ada", muse_route("ms-ada", Some("muse:ada")));
         let url = "/api/v1/sessions/ada/interrupt";
 
@@ -4099,12 +4102,17 @@ mod tests {
                 .with_body(b"{nope".to_vec()),
         );
         assert_eq!(bad_body.status, 400);
+        assert_eq!(tmux.log(), "", "an interrupt types nothing into the pane");
     }
 
     #[test]
     fn interrupt_and_model_are_owner_only_and_a_peer_changes_nothing() {
+        // The Owner's `/model` call is typed into the route's pane, so this test owns the
+        // process-wide fake tmux for its whole run.
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
         install_route(tmp.path(), "ada", muse_route("ms-ada", Some("muse:ada")));
         // A busy session, so an accepted interrupt would visibly clear the flag.
         state.mark_session_in_flight_from_turns("ms-ada", &[]);
@@ -4144,6 +4152,12 @@ mod tests {
         for key in ["ms-ada", "ada", "nobody"] {
             assert!(state.session_model_override(key).is_none(), "{key}");
         }
+        assert_eq!(
+            tmux.log(),
+            "",
+            "a rejected call must not reach the pane: {}",
+            tmux.log()
+        );
 
         // The Owner still can.
         let ok = call(
@@ -4155,6 +4169,7 @@ mod tests {
         );
         assert_eq!(ok.status, 200, "{}", error_text(&ok));
         assert!(!state.is_session_busy_from_turns("ms-ada", &[]));
+        assert_eq!(tmux.log(), "", "an interrupt types nothing into the pane");
         let ok = call(
             &state,
             "POST",
@@ -4167,6 +4182,11 @@ mod tests {
             state.session_model_override("ms-ada").unwrap().model,
             "gpt-6-sol"
         );
+        // The accepted `/model` command was typed into the route's own pane, exactly once.
+        let log = tmux.log();
+        assert_eq!(log.matches("paste-buffer").count(), 1, "{log}");
+        assert!(log.contains("paste-buffer -d -b"), "{log}");
+        assert!(log.contains("-t muse:ada"), "{log}");
     }
 
     #[test]
