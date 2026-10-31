@@ -500,16 +500,46 @@ fn concurrent_pulls_apply_each_batch_at_most_once() {
     }
 }
 
+/// The store and the peer share one sequence space, and `pull_since(after_seq)` is given the
+/// store's last committed sequence. A pull that follows `k` local commits therefore gets
+/// `k+1..=20`, and the store applies exactly that: the remote documents that land are a
+/// SUFFIX of the peer's log, not a prefix. The earlier `k` sequences are local commits.
 #[test]
-fn pull_and_local_pushes_interleave_without_losing_either_side() {
+fn a_pull_after_local_commits_lands_only_the_remote_suffix() {
     let (store, peer) = attach(SyncMode::WriteBehind);
     *peer.inbound.lock().unwrap() = (1..=20)
+        .map(|s| doc_batch(s, "remote", &format!("r{s}"), json!(s)))
+        .collect();
+    for i in 0..4 {
+        store.put_doc("local", &format!("l{i}"), &json!(i)).unwrap();
+    }
+    // A pull is refused while commits are pending, so drain them first.
+    store.sync_flush().unwrap();
+    assert_eq!(store.sync_pull().unwrap(), 20);
+    for s in 1..=4u64 {
+        assert_eq!(store.get_doc("remote", &format!("r{s}")).unwrap(), None);
+    }
+    for s in 5..=20u64 {
+        assert_eq!(
+            store.get_doc("remote", &format!("r{s}")).unwrap(),
+            Some(json!(s))
+        );
+    }
+    assert_eq!(seqs(&peer.commits()), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn pull_and_local_pushes_interleave_without_losing_either_side() {
+    const LOCAL: u64 = 100;
+    const REMOTE: u64 = 20;
+    let (store, peer) = attach(SyncMode::WriteBehind);
+    *peer.inbound.lock().unwrap() = (1..=REMOTE)
         .map(|s| doc_batch(s, "remote", &format!("r{s}"), json!(s)))
         .collect();
     thread::scope(|scope| {
         let store1 = &store;
         scope.spawn(move || {
-            for i in 0..100 {
+            for i in 0..LOCAL {
                 store1
                     .put_doc("local", &format!("l{i}"), &json!(i))
                     .unwrap();
@@ -518,33 +548,51 @@ fn pull_and_local_pushes_interleave_without_losing_either_side() {
         let store2 = &store;
         scope.spawn(move || {
             for _ in 0..50 {
+                // A pull is refused while a local commit is pending: that is allowed.
                 let _ = store2.sync_pull();
-                let _ = store2.sync_flush();
+                store2.sync_flush().unwrap();
             }
         });
     });
-    let _ = store.sync_flush();
-    for i in 0..100 {
+    // Both threads have joined, so this flush settles everything still queued.
+    store.sync_flush().unwrap();
+    assert!(!store.has_pending_sync());
+
+    // Nothing local was lost.
+    for i in 0..LOCAL {
         assert_eq!(
             store.get_doc("local", &format!("l{i}")).unwrap(),
             Some(json!(i))
         );
     }
-    // A pull is all-or-nothing per call: what landed is a contiguous prefix.
-    let landed: Vec<bool> = (1..=20u64)
+
+    // Local commits and pulled batches share one sequence space, so a pull taken after `k`
+    // local commits applies `k+1..=REMOTE` (all or nothing) and the landed remote documents
+    // are a SUFFIX of the peer's log. A pull taken once the store is already past `REMOTE`
+    // applies nothing, which is the `k == REMOTE` case.
+    let landed: Vec<bool> = (1..=REMOTE)
         .map(|s| store.get_doc("remote", &format!("r{s}")).unwrap().is_some())
         .collect();
-    let prefix = landed.iter().take_while(|present| **present).count();
-    assert!(
-        landed[prefix..].iter().all(|present| !present),
-        "{landed:?}"
-    );
-    let sent: BTreeSet<u64> = peer.commits().iter().map(|b| b.seq).collect();
-    assert_eq!(
-        sent.len(),
-        peer.commits().len(),
-        "a batch was delivered twice"
-    );
+    let k = landed.iter().take_while(|present| !**present).count();
+    assert!(landed[k..].iter().all(|present| *present), "{landed:?}");
+    for s in (k as u64 + 1)..=REMOTE {
+        assert_eq!(
+            store.get_doc("remote", &format!("r{s}")).unwrap(),
+            Some(json!(s))
+        );
+    }
+    let remote_seqs: BTreeSet<u64> = ((k as u64 + 1)..=REMOTE).collect();
+    let total = LOCAL + remote_seqs.len() as u64;
+    assert_eq!(store.synced_seq(), total, "{landed:?}");
+
+    // The peer got every local commit exactly once and in order, and never an echo of a
+    // pulled batch: the commits are exactly the sequences the pull did not take.
+    let local_seqs: Vec<u64> = (1..=total).filter(|s| !remote_seqs.contains(s)).collect();
+    let expected: Vec<SyncBatch> = (0..LOCAL)
+        .zip(&local_seqs)
+        .map(|(i, seq)| doc_batch(*seq, "local", &format!("l{i}"), json!(i)))
+        .collect();
+    assert_eq!(peer.commits(), expected, "{landed:?}");
 }
 
 // ---- local cache and cloud pre-cache --------------------------------------------------
