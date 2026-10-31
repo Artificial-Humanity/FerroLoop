@@ -339,7 +339,7 @@ fn db_path(explicit: Option<PathBuf>, configured: Option<PathBuf>) -> Result<(Pa
         (base.join("fl").join("fl.redb"), false)
     };
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)
+        fl_store::private::create_private_dir_all(dir)
             .with_context(|| format!("could not create {}", dir.display()))?;
     }
     Ok((path, confined))
@@ -827,7 +827,7 @@ fn run(cli: Cli) -> Result<i32> {
             if let Some(dir) = store_path.parent()
                 && !dir.as_os_str().is_empty()
             {
-                std::fs::create_dir_all(dir)
+                fl_store::private::create_private_dir_all(dir)
                     .with_context(|| format!("could not create {}", dir.display()))?;
             }
             let store = RedbStore::open(&store_path)
@@ -1236,7 +1236,7 @@ fn run(cli: Cli) -> Result<i32> {
                     if let Some(dir) = ws_store_path.parent()
                         && !dir.as_os_str().is_empty()
                     {
-                        std::fs::create_dir_all(dir)
+                        fl_store::private::create_private_dir_all(dir)
                             .with_context(|| format!("could not create {}", dir.display()))?;
                     }
                     Some(RedbStore::open(&ws_store_path).with_context(|| {
@@ -1271,7 +1271,7 @@ fn run(cli: Cli) -> Result<i32> {
                     if let Some(dir) = ws_store_path.parent()
                         && !dir.as_os_str().is_empty()
                     {
-                        std::fs::create_dir_all(dir)
+                        fl_store::private::create_private_dir_all(dir)
                             .with_context(|| format!("could not create {}", dir.display()))?;
                     }
                     Some(RedbStore::open(&ws_store_path).with_context(|| {
@@ -1468,5 +1468,36 @@ mod tests {
             "unrouted: as before"
         );
         assert!(refuse_routed_github_ledger(true, None).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_path_creates_a_private_directory_and_leaves_an_existing_one_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // A directory the user made keeps whatever mode it has.
+        let shared = tmp.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (path, confined) = db_path(Some(shared.join("fl.redb")), None).unwrap();
+        assert!(confined);
+        assert_eq!(path, shared.join("fl.redb"));
+        assert_eq!(
+            mode(&shared),
+            0o755,
+            "an existing directory is not chmodded"
+        );
+
+        // A directory db_path creates is private; the parent it sat in is untouched.
+        let (path, _) = db_path(Some(shared.join("fl/fl.redb")), None).unwrap();
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&shared), 0o755);
+
+        // The configured and default routes create it the same way.
+        let (path, confined) = db_path(None, Some(shared.join("cfg/app.redb"))).unwrap();
+        assert!(!confined);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
     }
 }

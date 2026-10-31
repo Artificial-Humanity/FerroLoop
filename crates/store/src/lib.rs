@@ -16,6 +16,7 @@ use std::path::Path;
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod manifest;
+pub mod private;
 pub mod state;
 pub mod workflow;
 
@@ -479,6 +480,10 @@ impl RedbStore {
     /// this with 200 retries (about 3 s).
     pub fn open_with_retries(path: &Path, retries: u32) -> Result<Self, StoreError> {
         let label = path.display().to_string();
+        // A new store file is private from its first byte: create it empty with mode 0600 so
+        // `Database::create` finds a file it already accepts as a new database. An existing file
+        // is never touched, and any error here is left to `Database::create` to report.
+        let _ = private::create_private_file(path);
         let mut attempts = 0u32;
         let db = loop {
             match Database::create(path) {
@@ -530,6 +535,9 @@ impl RedbStore {
                 });
             }
         }
+        // Only a report, and only after the open worked: a store others can reach is the owner's
+        // to fix, and a stat error here is no reason to fail the open.
+        private::warn_if_loose(path);
         Ok(Self { db, label })
     }
 

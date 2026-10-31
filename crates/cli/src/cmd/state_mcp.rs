@@ -427,7 +427,8 @@ fn open_workflow_store(
         if let Some(dir) = db.parent()
             && !dir.as_os_str().is_empty()
         {
-            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            fl_store::private::create_private_dir_all(dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         return RedbStore::open(db).map_err(|e| format!("{}: {e}", db.display()));
     }
@@ -445,7 +446,8 @@ fn open_workflow_store(
     if let Some(dir) = primary_path.parent()
         && !dir.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        fl_store::private::create_private_dir_all(dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let primary =
         RedbStore::open(&primary_path).map_err(|e| format!("{}: {e}", primary_path.display()))?;

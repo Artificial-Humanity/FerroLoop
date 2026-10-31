@@ -44,7 +44,10 @@ fl 0.1.0
 
 Every command below passes `--db <path>` explicitly so the walkthrough doesn't touch
 whatever store you already have. In real use you can skip it: `fl` falls back to
-`$FL_DB`, then an XDG data directory, creating whichever directory it lands on.
+`$FL_DB`, then an XDG data directory, creating whichever directory it lands on. A store file
+it creates is mode `0600` and a directory it creates is `0700`; an existing store or directory is
+never changed, only warned about at a terminal when others can reach it (see "Where the store
+lives" in the README).
 
 ```
 $ fl --help
