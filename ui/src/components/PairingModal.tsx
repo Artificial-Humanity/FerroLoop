@@ -9,6 +9,14 @@ export interface PairingModalProps {
   onClose: () => void;
   onPairWithCode: (code: string) => Promise<void>;
   onPairWithToken: (token: string) => Promise<void>;
+  onLoginWithPasskey?: (
+    credentialId: string,
+    totpCode?: string,
+  ) => Promise<{
+    ok?: boolean;
+    requires_totp?: boolean;
+    authority?: HubAuthority;
+  } | void>;
   onAuthenticated?: (authority?: HubAuthority) => void;
   apiClient?: HubApiClient;
   error?: string | null;
@@ -19,6 +27,7 @@ export const PairingModal: React.FC<PairingModalProps> = ({
   onClose,
   onPairWithCode,
   onPairWithToken,
+  onLoginWithPasskey,
   onAuthenticated,
   apiClient,
   error,
@@ -30,6 +39,7 @@ export const PairingModal: React.FC<PairingModalProps> = ({
   const [password, setPassword] = useState("");
   const [totpCode, setTotpCode] = useState("");
   const [passkeyId, setPasskeyId] = useState("");
+  const [passkeyTotpCode, setPasskeyTotpCode] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
 
@@ -121,18 +131,40 @@ export const PairingModal: React.FC<PairingModalProps> = ({
     setLocalError(null);
     setSubmitting(true);
     try {
-      const client = apiClient ?? new HubApiClient();
       const credentialId = passkeyId.trim() || getLastRegisteredPasskeyId();
-      const res = await client.loginWithPasskey({
-        credential_id: credentialId,
-      });
+      const trimmedTotp = passkeyTotpCode.trim() || undefined;
+      const res = onLoginWithPasskey
+        ? await onLoginWithPasskey(credentialId, trimmedTotp)
+        : await (apiClient ?? new HubApiClient()).loginWithPasskey({
+            credential_id: credentialId,
+            ...(trimmedTotp ? { totp_code: trimmedTotp } : {}),
+          });
+      if (res && res.requires_totp && !res.ok) {
+        setLocalError(
+          "Multi-factor authentication required. Please enter your 6-digit MFA / TOTP code.",
+        );
+        return;
+      }
       setPasskeyId("");
-      onAuthenticated?.(res?.authority);
+      setPasskeyTotpCode("");
+      onAuthenticated?.(res ? res.authority : undefined);
       onClose();
     } catch (err) {
-      setLocalError(
-        err instanceof Error ? err.message : "Passkey authentication failed",
-      );
+      const requiresTotp =
+        (err &&
+          typeof err === "object" &&
+          (err as { requires_totp?: boolean }).requires_totp === true) ||
+        (err instanceof Error &&
+          /totp|mfa|multi-factor/i.test(err.message));
+      if (requiresTotp) {
+        setLocalError(
+          "Multi-factor authentication required. Please enter your 6-digit MFA / TOTP code.",
+        );
+      } else {
+        setLocalError(
+          err instanceof Error ? err.message : "Passkey authentication failed",
+        );
+      }
     } finally {
       setSubmitting(false);
     }
@@ -473,6 +505,34 @@ export const PairingModal: React.FC<PairingModalProps> = ({
                 placeholder="cred-webauthn-1"
                 value={passkeyId}
                 onChange={(e) => setPasskeyId(e.target.value)}
+                disabled={submitting}
+                style={{ width: "100%" }}
+              />
+            </div>
+
+            <div>
+              <label
+                htmlFor="fd-pairing-passkey-totp-input"
+                style={{
+                  display: "block",
+                  fontSize: "11px",
+                  fontWeight: 600,
+                  color: "var(--text-muted)",
+                  marginBottom: "4px",
+                  textTransform: "uppercase",
+                }}
+              >
+                6-Digit MFA / TOTP Code (if enabled)
+              </label>
+              <input
+                id="fd-pairing-passkey-totp-input"
+                type="text"
+                inputMode="numeric"
+                data-testid="pairing-passkey-totp-input"
+                className="fd-input fd-mono"
+                placeholder="123456"
+                value={passkeyTotpCode}
+                onChange={(e) => setPasskeyTotpCode(e.target.value)}
                 disabled={submitting}
                 style={{ width: "100%" }}
               />
