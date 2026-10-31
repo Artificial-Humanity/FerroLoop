@@ -365,8 +365,14 @@ decoded size at 256 MiB") overstated it.
 **Review follow-up — what is enforced now.**
 
 * `MAX_ROWS_PER_GROUP` = 4 Mi rows, checked in `index_group_with` before anything is allocated,
-  and by the writer (`encode_row_group_with`). It is the most one `append_column_rows` call can
-  carry over the 16 MiB remote frame (smallest row, a one-cell array, is four bytes of JSON).
+  and by the writer (`encode_row_group_with`). It is more than any table with columns can receive
+  in one `append_column_rows` call over the 16 MiB remote frame: a cell is at least `{"t":"null"}`
+  (12 bytes), so a one-column row is 15 bytes with its comma and a frame carries about 1.1 M rows.
+  Only a table with no columns could exceed it (a row is `[]`, 3 bytes with its comma, about 5.6 M
+  rows per frame; such tables can still be created). Decision: the limit stays for them too. The
+  reader's per-row charge is the same for a zero-column group, so exempting them would also need a
+  reader change; a remote append of more than 4 Mi zero-column rows is refused with the usual
+  "append in several groups" error, and the row Vecs such a group costs are charged by the budget.
 * `MAX_DECODE_BYTES` = 1 GiB, one `Budget` per group shared by all its columns
   (`decode_indexed_with`). Every allocation is charged before it is made: `ROW_BYTES` plus
   `size_of::<ColumnValue>()` per row and column up front; per column a value slot per row (the
@@ -385,7 +391,24 @@ decoded size at 256 MiB") overstated it.
   or byte limit with "append in several groups", so nothing FerroStore writes is undecodable. This
   replaces the cloud commit's special-casing in `utf8_codec` and `choose_codec`.
 * Not capped: the size of the blob itself (bounded by the WAL frame and file limits), and the
-  at-most-payload-sized text each plain value allocates.
+  at-most-payload-sized text each plain value allocates. **There is no store-wide budget**: 1 GiB
+  bounds one group, not their sum. Open and `validate_row_group` decode groups one at a time (peak
+  about 1 GiB), but `scan_groups` keeps every matching row of every group it scans, so a scan over
+  N groups that each decode to that size can hold N times it. Such groups arise only from a corrupt
+  file or snapshot; the remote API's amplification is bounded by the 16 MiB JSON frame.
+* **Rollup regression (found in re-review, fixed).** `attempt_rollup` and `gate_run_rollup` scan
+  the in-memory ledger through `scan_projected`, which encoded the whole ledger as ONE row group.
+  With the new writer limits that failed ("row group would decode to more than 1073741824 bytes")
+  once the ledger passed about 2.0 M attempts (about 520 bytes charged per five-column row) or
+  about 2.4 M gate runs, and in any case past 4 Mi rows. It worked before the limits, and the
+  first version of this section and behaviour item 7a did not say so. Now `scan_projected` encodes
+  and scans in chunks of at most 2^18 rows (and never over the byte budget), in row order, and
+  appends each chunk's matches, so the rows returned are the ones a single group would return. The
+  writer limits therefore mean nothing to in-memory rollups. Only the group counters of the
+  returned `ColumnScan` count chunks; the rollups do not read them, and a ledger of at most 2^18
+  rows is one chunk, identical to before. Other internal callers of `encode_row_group`: only
+  `FerroStore::append_column_rows` (the public append, where the limits are intended) and tests;
+  nothing else routes in-memory row sets through the writer.
 
 **Behaviour change.** A store that already holds a group that decodes to more than the limits (a
 run-length or dictionary column repeated into hundreds of MiB, or more than 4 Mi rows in one
@@ -393,7 +416,8 @@ group) now fails to open with "corrupt ferrostore data: ... would decode to more
 where it used to allocate until the process died or, on a large machine, succeeded. That needs
 groups far larger than anything this code base appends, so it is very unlikely. `append_column_rows`
 with more than 4 Mi rows, or rows estimated above 1 GiB decoded, returns an error telling the
-caller to append in several groups.
+caller to append in several groups. The ledger rollups are not affected (see the rollup regression
+above).
 
 Tests (all in `columnar.rs`; limits are lowered through the internal `Limits` parameter so the
 tests allocate almost nothing):
@@ -407,10 +431,20 @@ RLE, text RLE, bytes RLE and a dictionary, each a few bytes claiming up to two m
 at a time; every size the writer accepts round-trips, the next is refused),
 `a_row_count_the_bitset_cannot_cover_is_refused_without_allocating_for_it`,
 `delta_and_run_codecs_reject_truncated_oversized_and_zero_length_runs` (includes `i64::MIN`/`MAX`
-wrapping deltas round-tripping). Mutation check: with the `decode_non_null` charge removed the
+wrapping deltas round-tripping),
+`an_in_memory_scan_over_more_rows_than_one_group_may_hold_equals_the_single_group_scan` (25 rows
+against a lowered group limit of 4: the rows do not fit one group, the chunked scan equals the
+single-group scan for four filters, a byte bound ends chunks too, and the real `scan_projected`
+matches the single-group scan, counters included, for 0, 1, 2 and 30 rows),
+`a_claim_of_one_row_over_the_real_row_limit_is_refused_from_four_bytes` (the real
+`MAX_ROWS_PER_GROUP`, from a four-byte blob),
+`a_table_without_columns_is_bound_by_the_row_limit_too`. Limits of the tests: the hostile-blob
+tests use lowered `Limits`; the real constants are exercised only by the `u32::MAX` and
+`MAX_ROWS_PER_GROUP + 1` row claims and by the plain-decoder test that builds
+`Budget::new(MAX_DECODE_BYTES)`. The 1 GiB byte budget itself is never driven to its real size. Mutation check: with the `decode_non_null` charge removed the
 hostile-payload test fails ("codec 2 decoded 2000000 values from a small blob"); with the row-limit
-check and the up-front row charge removed the row-count test fails; both were restored and the
-diff checked.
+check and the up-front row charge removed the row-count test fails; with `scan_projected_with`
+forced back to one group the rollup test fails; all were restored and the diff checked.
 
 ### I-1 — Medium — `RouteTable::save` (`crates/wire/src/identity.rs:338`)
 
@@ -628,7 +662,11 @@ Read, not fixed. None was reproduced.
    hundred milliseconds at `m = 128`, `dim` near 1000), paid again on every WAL replay of a delete.
 7a. A row group is limited to 4 Mi rows and to 1 GiB of decoded size (S-3). `append_column_rows`
    refuses a larger group (append in several), and a store that already holds one fails to open
-   with a "corrupt ferrostore data" error instead of running out of memory.
+   with a "corrupt ferrostore data" error instead of running out of memory. The limit is per group,
+   not per store: a scan over many large groups holds all their matching rows. Zero-column tables
+   are bound by the row limit too (a remote append of more than 4 Mi such rows is refused).
+   `attempt_rollup` and `gate_run_rollup` are NOT limited by it: the first version of the limits
+   made them fail past about 2 M ledger rows; they now scan in chunks (see S-3).
 8. `Git::*` functions return an error for `-`-leading arguments.
 9. **Vendor CLI limits (found in review).** `codex queue` and `agy send-message` are killed after
    60 s. The `muse exec` and `grok -p` headless fallbacks run whole turns and are killed only

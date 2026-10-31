@@ -20,10 +20,14 @@ const NAME_MAX: usize = 128;
 /// Most rows one row group may hold. A group's `row_count` is a `u32` in the blob and is
 /// otherwise bounded only by the null bitset (`row_count / 8` bytes per column), so without this
 /// a few kilobytes of blob claim billions of rows. The limit is checked before any allocation,
-/// by the writer (`encode_row_group`) and by the reader (`index_group`). 4 Mi rows is the most
-/// one `append_column_rows` call can carry over the 16 MiB remote frame (the smallest row, a
-/// one-cell array, is four bytes of JSON), so no group a remote client can send is refused;
-/// callers with more rows append several groups.
+/// by the writer (`encode_row_group`) and by the reader (`index_group`). 4 Mi rows is more than
+/// any table with columns can receive in one `append_column_rows` call over the 16 MiB remote
+/// frame: a cell is at least `{"t":"null"}` (12 bytes), so a one-column row is 15 bytes with its
+/// comma and a frame carries about 1.1 M of them. Only a table with no columns could exceed it
+/// (a row is `[]`, three bytes with its comma, about 5.6 M per frame); such a remote append of
+/// more than 4 Mi rows is refused like any other over-limit group, and the limit is kept for
+/// them because the reader's per-row charge is the same. Callers with more rows append several
+/// groups. In-memory scans of the ledger (`scan_projected`) are chunked and not bound by it.
 pub(super) const MAX_ROWS_PER_GROUP: usize = 1 << 22;
 
 /// Upper bound, shared by all columns of one row group, on the bytes decoding may allocate
@@ -40,6 +44,12 @@ pub(super) const MAX_ROWS_PER_GROUP: usize = 1 << 22;
 /// more than this now fails to open with a "corrupt ferrostore data" error where it used to
 /// allocate until the process was killed or, on a big machine, succeeded. Such a store needs
 /// groups far larger than any this code base appends (millions of rows in one call).
+///
+/// There is no store-wide budget: this bounds one group, not their sum. Opening a store and
+/// `validate_row_group` decode groups one at a time (peak about this much), but `scan_groups`
+/// keeps every matching row of every group it scans, so a scan over N groups that each decode to
+/// this size can hold N times it. Groups that large arise only from a corrupt file or snapshot
+/// (the remote API's amplification is bounded by the 16 MiB JSON frame), not from this code base.
 pub(super) const MAX_DECODE_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Bytes charged for one decoded cell: its slot in the final row vector, its slot in the
@@ -1534,17 +1544,70 @@ pub(super) fn gate_run_rollup(
     Ok(rollup)
 }
 
+/// Rows per internal chunk of an in-memory scan (see [`scan_projected`]). Bounds the memory one
+/// chunk's encoded blob and decoded rows take at once; it is not a limit on the ledger.
+const SCAN_CHUNK_ROWS: usize = 1 << 18;
+
+/// Scan rows the caller already holds in memory (the ledger rollups). The rows are encoded and
+/// scanned in chunks, so the writer limits (`MAX_ROWS_PER_GROUP`, `MAX_DECODE_BYTES`) do not
+/// bound how many rows a rollup can cover: only a stored table's group is bound by them. Chunks
+/// run in row order and their matches are appended in that order, so the rows returned are
+/// exactly what one big group would return; only the group counters count chunks.
 fn scan_projected(
     columns: &[ColumnDef],
     rows: &[Vec<ColumnValue>],
     filters: &[ColumnFilter],
 ) -> Result<ColumnScan, StoreError> {
-    let groups = if rows.is_empty() {
-        Vec::new()
-    } else {
-        vec![encode_row_group(columns, rows)?]
+    scan_projected_with(
+        columns,
+        rows,
+        filters,
+        &Limits {
+            max_rows: SCAN_CHUNK_ROWS.min(MAX_ROWS_PER_GROUP),
+            max_bytes: MAX_DECODE_BYTES,
+        },
+    )
+}
+
+/// `scan_projected` with the chunk bounds a test can lower: a chunk ends at `max_rows` rows or
+/// when the next row would take its estimated decode size over `max_bytes`.
+fn scan_projected_with(
+    columns: &[ColumnDef],
+    rows: &[Vec<ColumnValue>],
+    filters: &[ColumnFilter],
+    chunk: &Limits,
+) -> Result<ColumnScan, StoreError> {
+    let mut merged = ColumnScan {
+        rows: Vec::new(),
+        row_groups_total: 0,
+        row_groups_skipped: 0,
     };
-    scan_groups(columns, &groups, filters)
+    let mut start = 0usize;
+    while start < rows.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < rows.len() && end - start < chunk.max_rows {
+            let cost = estimated_decode_bytes(columns, &rows[end..=end]);
+            // A chunk always takes its first row; a single row over the budget is refused by the
+            // encoder below, as it always was.
+            if end > start && bytes.saturating_add(cost) > chunk.max_bytes {
+                break;
+            }
+            bytes = bytes.saturating_add(cost);
+            end += 1;
+        }
+        let blob = encode_row_group_with(columns, &rows[start..end], chunk)?;
+        let scan = scan_groups(columns, &[blob], filters)?;
+        merged.rows.extend(scan.rows);
+        merged.row_groups_total = merged
+            .row_groups_total
+            .saturating_add(scan.row_groups_total);
+        merged.row_groups_skipped = merged
+            .row_groups_skipped
+            .saturating_add(scan.row_groups_skipped);
+        start = end;
+    }
+    Ok(merged)
 }
 
 fn attempt_columns() -> Vec<ColumnDef> {
@@ -2403,6 +2466,118 @@ mod tests {
         huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = index_group(&huge, &cols).err().unwrap().to_string();
         assert!(err.contains(&MAX_ROWS_PER_GROUP.to_string()), "{err}");
+    }
+
+    /// Audit S-3 (review follow-up): the row-count check uses the real limit. A claim one over
+    /// it is refused from a four-byte blob, before any allocation sized by the claim.
+    #[test]
+    fn a_claim_of_one_row_over_the_real_row_limit_is_refused_from_four_bytes() {
+        let cols = int_col();
+        let claim = |rows: usize| u32::try_from(rows).unwrap().to_le_bytes().to_vec();
+        let err = index_group(&claim(MAX_ROWS_PER_GROUP + 1), &cols)
+            .err()
+            .expect("one row over the limit")
+            .to_string();
+        assert!(
+            err.contains(&(MAX_ROWS_PER_GROUP + 1).to_string())
+                && err.contains(&format!("limit is {MAX_ROWS_PER_GROUP}")),
+            "{err}"
+        );
+        // At the limit the row check passes; the blob is then refused for being short, not for
+        // its row count.
+        let err = index_group(&claim(MAX_ROWS_PER_GROUP), &cols)
+            .err()
+            .expect("the blob has no column data")
+            .to_string();
+        assert!(!err.contains("claims"), "{err}");
+    }
+
+    /// Audit S-3 (review follow-up): the row limit applies to a table with no columns too; such a
+    /// group holds only a row count, but the reader's per-row charge is the same, so it is
+    /// bounded the same way.
+    #[test]
+    fn a_table_without_columns_is_bound_by_the_row_limit_too() {
+        let limits = Limits {
+            max_rows: 5,
+            max_bytes: MAX_DECODE_BYTES,
+        };
+        let five = vec![Vec::new(); 5];
+        let blob = encode_row_group_with(&[], &five, &limits).unwrap();
+        validate_row_group_with(&[], &blob, &limits).unwrap();
+        let err = encode_row_group_with(&[], &vec![Vec::new(); 6], &limits)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("6 rows") && err.contains("limit is 5"),
+            "{err}"
+        );
+    }
+
+    fn rollup_columns_and_rows(n: usize) -> (Vec<ColumnDef>, Vec<Vec<ColumnValue>>) {
+        let rows = (0..n)
+            .map(|i| {
+                vec![
+                    ColumnValue::Utf8(format!("p{}", i % 3)),
+                    ColumnValue::Int64(i64::try_from(i).unwrap() * 7 % 101),
+                    ColumnValue::Int64(1),
+                    ColumnValue::Int64(2),
+                    ColumnValue::Int64(3),
+                ]
+            })
+            .collect();
+        (attempt_columns(), rows)
+    }
+
+    /// Audit S-3 (review follow-up): an in-memory rollup is not bound by the writer's group
+    /// limits. Here a "group" holds at most 4 rows, 25 rows are scanned, and the result is the
+    /// one a single group (under the real limits) gives: same rows, same order, filtered or not.
+    #[test]
+    fn an_in_memory_scan_over_more_rows_than_one_group_may_hold_equals_the_single_group_scan() {
+        let (cols, rows) = rollup_columns_and_rows(25);
+        let lowered = Limits {
+            max_rows: 4,
+            max_bytes: MAX_DECODE_BYTES,
+        };
+        // The premise: these rows do not fit one group under the lowered limits.
+        assert!(encode_row_group_with(&cols, &rows, &lowered).is_err());
+        let one_group = vec![encode_row_group(&cols, &rows).unwrap()];
+        let eq = |name: &str| {
+            vec![ColumnFilter {
+                column: "project".to_string(),
+                predicate: ColumnPredicate::Eq(ColumnValue::Utf8(name.to_string())),
+            }]
+        };
+        for filters in [Vec::new(), eq("p0"), eq("p2"), eq("absent")] {
+            let want = scan_groups(&cols, &one_group, &filters).unwrap();
+            let got = scan_projected_with(&cols, &rows, &filters, &lowered).unwrap();
+            assert_eq!(got.rows, want.rows, "{filters:?}");
+            // Seven chunks of at most four rows each; none is skipped unless its zone excludes.
+            assert_eq!(got.row_groups_total, 7);
+        }
+        // A byte bound ends a chunk too: every chunk of this budget holds fewer rows than 25.
+        let tight = Limits {
+            max_rows: 1000,
+            max_bytes: estimated_decode_bytes(&cols, &rows[..6]),
+        };
+        assert!(encode_row_group_with(&cols, &rows, &tight).is_err());
+        let got = scan_projected_with(&cols, &rows, &[], &tight).unwrap();
+        assert_eq!(got.rows, rows);
+        assert!(got.row_groups_total > 1);
+        // The real function agrees with the single group on every ledger that fits one chunk,
+        // counters included.
+        for n in [0, 1, 2, 30] {
+            let (cols, rows) = rollup_columns_and_rows(n);
+            let groups: Vec<Vec<u8>> = if rows.is_empty() {
+                Vec::new()
+            } else {
+                vec![encode_row_group(&cols, &rows).unwrap()]
+            };
+            let want = scan_groups(&cols, &groups, &eq("p1")).unwrap();
+            let got = scan_projected(&cols, &rows, &eq("p1")).unwrap();
+            assert_eq!(got.rows, want.rows, "{n}");
+            assert_eq!(got.row_groups_total, want.row_groups_total, "{n}");
+            assert_eq!(got.row_groups_skipped, want.row_groups_skipped, "{n}");
+        }
     }
 
     /// Audit S-3 (review follow-up): the budget is one for the whole group. Each of the ten
