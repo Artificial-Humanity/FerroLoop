@@ -2,7 +2,7 @@
 //! domain/method/agent ACL enforcement, SSRF blocking, and response secret scrubbing (spec §3).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::time::Duration;
 
 use base64::Engine;
@@ -32,7 +32,10 @@ pub struct ProxyRequest {
 }
 
 /// Prepared request after placeholder substitution and policy/SSRF verification.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The URL query, header values, and body carry injected plaintext, so `Debug` prints none of
+/// them: a `{:?}` of this type, or of a `Result` or log record holding one, must not leak a secret.
+#[derive(Clone, PartialEq, Eq)]
 pub struct PreparedProxyRequest {
     pub method: String,
     pub url: String,
@@ -40,6 +43,23 @@ pub struct PreparedProxyRequest {
     pub headers: BTreeMap<String, String>,
     pub body: Option<String>,
     pub injected_secrets: Vec<String>,
+}
+
+impl std::fmt::Debug for PreparedProxyRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let url_without_query = self
+            .url
+            .split_once('?')
+            .map_or(self.url.as_str(), |(u, _)| u);
+        f.debug_struct("PreparedProxyRequest")
+            .field("method", &self.method)
+            .field("url", &url_without_query)
+            .field("host", &self.host)
+            .field("header_names", &self.headers.keys().collect::<Vec<_>>())
+            .field("body_len", &self.body.as_ref().map(String::len))
+            .field("injected_secrets", &self.injected_secrets)
+            .finish()
+    }
 }
 
 /// Scrubbed HTTP response returned to the caller.
@@ -100,36 +120,47 @@ pub fn parse_url_scheme_host_port(raw_url: &str) -> Result<(String, String, u16)
         });
     }
 
+    let default_port = if scheme_lower == "https" { 443 } else { 80 };
+    let bad_url = |reason: &str| GateError::InvalidUrl {
+        url: raw_url.to_string(),
+        reason: reason.to_string(),
+    };
     let (host, port) = if authority.starts_with('[') {
         let Some(close_bracket) = authority.find(']') else {
-            return Err(GateError::InvalidUrl {
-                url: raw_url.to_string(),
-                reason: "unclosed IPv6 bracket in host".to_string(),
-            });
+            return Err(bad_url("unclosed IPv6 bracket in host"));
         };
         let h = authority[1..close_bracket].to_ascii_lowercase();
+        if h.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(bad_url("bracketed host must be a plain IPv6 address"));
+        }
         let rest_port = &authority[close_bracket + 1..];
-        let p = if let Some(p_str) = rest_port.strip_prefix(':') {
-            p_str.parse::<u16>().map_err(|_| GateError::InvalidUrl {
-                url: raw_url.to_string(),
-                reason: "invalid port number".to_string(),
-            })?
-        } else if scheme_lower == "https" {
-            443
+        let p = if rest_port.is_empty() {
+            default_port
+        } else if let Some(p_str) = rest_port.strip_prefix(':') {
+            parse_port(p_str).ok_or_else(|| bad_url("invalid port number"))?
         } else {
-            80
+            return Err(bad_url("unexpected characters after the IPv6 host"));
         };
         (h, p)
     } else if let Some((h, p_str)) = authority.rsplit_once(':') {
-        let p = p_str.parse::<u16>().map_err(|_| GateError::InvalidUrl {
-            url: raw_url.to_string(),
-            reason: "invalid port number".to_string(),
-        })?;
+        let p = parse_port(p_str).ok_or_else(|| bad_url("invalid port number"))?;
         (h.to_ascii_lowercase(), p)
     } else {
-        let p = if scheme_lower == "https" { 443 } else { 80 };
-        (authority.to_ascii_lowercase(), p)
+        (authority.to_ascii_lowercase(), default_port)
     };
+
+    // Only the characters of a DNS name or IPv4 literal may reach the allow-list match. A
+    // backslash, tab, or other byte would let `evil.com\.allowed.com` satisfy `*.allowed.com`
+    // here while a WHATWG-style client reads `\` as the end of the authority and dials `evil.com`.
+    if !authority.starts_with('[')
+        && !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(bad_url(
+            "host contains characters that are not valid in a hostname",
+        ));
+    }
 
     if host.is_empty() {
         return Err(GateError::InvalidUrl {
@@ -138,6 +169,14 @@ pub fn parse_url_scheme_host_port(raw_url: &str) -> Result<(String, String, u16)
         });
     }
     Ok((scheme_lower, host, port))
+}
+
+/// A port is one to five ASCII digits. `u16::from_str` alone also accepts a leading `+`.
+fn parse_port(raw: &str) -> Option<u16> {
+    if raw.is_empty() || !raw.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
 }
 
 /// Return `true` if `host` matches `pattern` (exact match or `*.domain.tld` wildcard).
@@ -155,30 +194,63 @@ pub fn host_matches_pattern(host: &str, pattern: &str) -> bool {
     }
 }
 
-/// Return `true` if `ip` is loopback, link-local, unspecified, multicast, or RFC1918/ULA private.
+/// Return `true` if `ip` is loopback, link-local, unspecified, multicast, reserved, or
+/// RFC1918/ULA private, including an IPv4 address embedded in an IPv6 one.
+///
+/// Judged by the embedded IPv4 address (so a wrapper around a public address stays open):
+/// mapped `::ffff:a.b.c.d`, compatible `::a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`,
+/// ISATAP (`<any /64>:0:5efe:a.b.c.d`, or `:200:5efe:` with the universal bit set), and Teredo
+/// `2001::/32` (blocked when either the server address or the client address, which Teredo stores
+/// XOR `0xffff`, is private).
+///
+/// Blocked outright, whatever they embed: NAT64 local-use `64:ff9b:1::/48` (RFC 8215, an operator
+/// may map any address into it), the IPv4 6to4 relay anycast block `192.88.99.0/24`, site-local
+/// `fec0::/10`, and the documentation range `2001:db8::/32`.
 pub fn is_private_or_loopback_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_broadcast()
-                || v4.is_documentation()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 64)
-        }
+        IpAddr::V4(v4) => is_private_v4(v4),
         IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                let [a, b] = hi.to_be_bytes();
+                let [c, d] = lo.to_be_bytes();
+                is_private_v4(Ipv4Addr::new(a, b, c, d))
+            };
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
-                || (v6.segments()[0] & 0xffc0) == 0xfe80
-                || v6
-                    .to_ipv4_mapped()
-                    .is_some_and(|v4| is_private_or_loopback_ip(IpAddr::V4(v4)))
+                || (seg[0] & 0xfe00) == 0xfc00
+                || (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] & 0xffc0) == 0xfec0
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+                || v6.to_ipv4().is_some_and(is_private_v4)
+                || (seg[0] == 0x0064
+                    && seg[1] == 0xff9b
+                    && seg[2..6] == [0; 4]
+                    && embedded(seg[6], seg[7]))
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001)
+                || (seg[0] == 0x2002 && embedded(seg[1], seg[2]))
+                || (seg[0] == 0x2001
+                    && seg[1] == 0
+                    && (embedded(seg[2], seg[3]) || embedded(seg[6] ^ 0xffff, seg[7] ^ 0xffff)))
+                || ((seg[4] & 0xfdff) == 0 && seg[5] == 0x5efe && embedded(seg[6], seg[7]))
         }
     }
+}
+
+fn is_private_v4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_documentation()
+        || v4.is_multicast()
+        || o[0] == 0
+        || o[0] >= 240
+        || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)
 }
 
 /// Check whether `host` resolves to or is a loopback/private address (SSRF guard).
@@ -190,7 +262,8 @@ pub fn verify_host_ssrf(
     if allow_private_network {
         return Ok(());
     }
-    let lower = host.trim().to_ascii_lowercase();
+    // `localhost.` and `x.internal.` name the same hosts as their dotless forms.
+    let lower = host.trim().trim_end_matches('.').to_ascii_lowercase();
     if lower == "localhost"
         || lower.ends_with(".localhost")
         || lower.ends_with(".local")
@@ -384,14 +457,7 @@ fn prepare_proxied_request_inner(
             }),
     )?;
 
-    let replace_all = |input: &str| -> String {
-        let mut out = input.to_string();
-        for (k, val) in &decrypted_map {
-            let token = format!("{PLACEHOLDER_PREFIX}{k}{PLACEHOLDER_SUFFIX}");
-            out = out.replace(&token, val);
-        }
-        out
-    };
+    let replace_all = |input: &str| substitute_placeholders(input, &decrypted_map);
 
     let final_url = replace_all(&req.url);
     let mut final_headers = BTreeMap::new();
@@ -421,6 +487,35 @@ fn prepare_proxied_request_inner(
         },
         external_plaintexts,
     })
+}
+
+/// Replace every `{{FERROGATE:KEY}}` in `input` with its value from `values`, in one pass.
+///
+/// Keys are normalized exactly as [`extract_placeholder_keys`] normalizes them, so a lowercase or
+/// padded key is replaced like the policy check resolved it. A value is never rescanned, so a
+/// secret whose text holds another placeholder is not expanded a second time.
+fn substitute_placeholders(input: &str, values: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find(PLACEHOLDER_PREFIX) {
+        out.push_str(&rest[..start]);
+        let after_prefix = &rest[start + PLACEHOLDER_PREFIX.len()..];
+        let Some(end) = after_prefix.find(PLACEHOLDER_SUFFIX) else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let whole = start + PLACEHOLDER_PREFIX.len() + end + PLACEHOLDER_SUFFIX.len();
+        match normalize_secret_name(&after_prefix[..end])
+            .ok()
+            .and_then(|key| values.get(&key))
+        {
+            Some(value) => out.push_str(value),
+            None => out.push_str(&rest[start..whole]),
+        }
+        rest = &rest[whole..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Scrub any known secret values from `vault` (plain, URL-encoded, and base64-encoded)
@@ -616,8 +711,9 @@ pub fn execute_proxied_request_with_provider(
             b.send(prepared.body.as_deref().unwrap_or("").as_bytes())
         }
         other => {
+            // `prepared.url` holds injected plaintext in its query: report the request's own URL.
             return Err(GateError::InvalidUrl {
-                url: prepared.url,
+                url: req.url.clone(),
                 reason: format!("unsupported HTTP method `{other}`"),
             });
         }
@@ -641,7 +737,15 @@ pub fn execute_proxied_request_with_provider(
         }
     }
 
-    let raw_body = resp.body_mut().read_to_string().unwrap_or_default();
+    // A body that is not UTF-8 is decoded lossily. A failed or over-limit read is an error, not
+    // an empty `200` body.
+    let raw_body = match resp.body_mut().read_to_vec() {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) => {
+            let (cause, _) = scrub_with_external(vault, &e.to_string(), &external);
+            return Err(GateError::UpstreamHttp { cause });
+        }
+    };
     let (clean_body, body_hits) = scrub_with_external(vault, &raw_body, &external);
     scrubbed_names.extend(body_hits);
 
@@ -651,4 +755,254 @@ pub fn execute_proxied_request_with_provider(
         body: clean_body,
         scrubbed_secrets: scrubbed_names.into_iter().collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vault::SetSecretArgs;
+    use tempfile::TempDir;
+
+    fn vault_with(tmp: &TempDir, name: &str, value: &str, hosts: &[&str]) -> Vault {
+        let mut vault = Vault::open(tmp.path().join("vault.enc"), [7u8; 32]).unwrap();
+        vault
+            .set(SetSecretArgs {
+                name: name.into(),
+                value: value.into(),
+                allowed_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+                allow_private_network: true,
+                ..Default::default()
+            })
+            .unwrap();
+        vault
+    }
+
+    fn request(method: &str, url: &str, headers: &[(&str, &str)]) -> ProxyRequest {
+        ProxyRequest {
+            method: method.into(),
+            url: url.into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            body: None,
+            caller_agent: None,
+            timeout_secs: Some(5),
+        }
+    }
+
+    #[test]
+    fn authorities_that_clients_read_differently_are_refused() {
+        for url in [
+            "https://evil.com\\.allowed.com/x",
+            "https://evil.com\t.allowed.com/x",
+            "https://a b.com/",
+            "https://[::1]evil/",
+            "https://[::1%25eth0]/",
+            "https://host:+80/",
+            "https://host:80x/",
+            "https://host:/",
+        ] {
+            assert!(
+                matches!(
+                    parse_url_scheme_host_port(url),
+                    Err(GateError::InvalidUrl { .. })
+                ),
+                "{url} must be refused"
+            );
+        }
+        assert_eq!(
+            parse_url_scheme_host_port("https://[::1]:8443/x").unwrap(),
+            ("https".into(), "::1".into(), 8443)
+        );
+        assert_eq!(
+            parse_url_scheme_host_port("HTTP://Example.COM?q=1").unwrap(),
+            ("http".into(), "example.com".into(), 80)
+        );
+
+        // The wildcard allow-list entry must not be satisfied by the backslash trick.
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "API_KEY", "k-1234567890", &["*.allowed.com"]);
+        let req = request(
+            "GET",
+            "https://evil.com\\.allowed.com/x",
+            &[("X-Key", "{{FERROGATE:API_KEY}}")],
+        );
+        assert!(matches!(
+            prepare_proxied_request(&vault, &req),
+            Err(GateError::InvalidUrl { .. })
+        ));
+    }
+
+    #[test]
+    fn reserved_and_embedded_addresses_count_as_private() {
+        for blocked in [
+            "0.1.2.3",
+            "240.0.0.1",
+            "255.255.255.255",
+            "192.0.0.8",
+            "198.18.0.1",
+            "198.19.255.255",
+            "169.254.169.254",
+            "::127.0.0.1",
+            "::ffff:10.0.0.1",
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "2002:7f00:1::",
+            "2001:db8::1",
+            "fec0::1",
+            // 192.88.99.0/24 (6to4 relay anycast), bare and embedded.
+            "192.88.99.1",
+            "::ffff:192.88.99.1",
+            "2002:c058:6301::",
+            // NAT64 local-use /48: blocked outright, whatever it embeds.
+            "64:ff9b:1::",
+            "64:ff9b:1::808:808",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+            // Teredo: private server address, or private client address (stored XOR 0xffff).
+            "2001:0:7f00:1::1",
+            "2001:0:a00:1::1",
+            "2001:0:808:808:0:0:80ff:fffe",
+            "2001:0:808:808:0:fdff:f5ff:fffe",
+            // ISATAP, with and without the universal bit, under a private and a public prefix.
+            "::5efe:127.0.0.1",
+            "::5efe:10.1.2.3",
+            "fe80::5efe:192.168.0.1",
+            "2606:4700::5efe:7f00:1",
+            "2606:4700::200:5efe:a9fe:a9fe",
+        ] {
+            let ip: IpAddr = blocked.parse().unwrap();
+            assert!(is_private_or_loopback_ip(ip), "{blocked} must be blocked");
+        }
+        for open in [
+            "8.8.8.8",
+            "198.20.0.1",
+            "2606:4700:4700::1111",
+            "64:ff9b::808:808",
+            "2002:808:808::",
+            "192.88.98.1",
+            "192.88.100.1",
+            "64:ff9b:2::1",
+            "2001:0:808:808:0:0:f7f7:f7f7",
+            "2001:1::1",
+            "::5efe:8.8.8.8",
+            "2606:4700::200:5efe:808:808",
+            "2606:4700::5efd:7f00:1",
+        ] {
+            let ip: IpAddr = open.parse().unwrap();
+            assert!(!is_private_or_loopback_ip(ip), "{open} must stay open");
+        }
+    }
+
+    #[test]
+    fn a_trailing_dot_does_not_dodge_the_local_name_filter() {
+        for host in [
+            "localhost.",
+            "app.localhost.",
+            "metadata.google.internal.",
+            "printer.local.",
+        ] {
+            assert!(
+                matches!(
+                    verify_host_ssrf(host, 443, false),
+                    Err(GateError::SsrfBlocked { .. })
+                ),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholders_are_replaced_as_the_policy_check_read_them() {
+        let tmp = TempDir::new().unwrap();
+        let mut vault = vault_with(&tmp, "A_KEY", "x{{FERROGATE:B_KEY}}y", &["127.0.0.1"]);
+        vault
+            .set(SetSecretArgs {
+                name: "B_KEY".into(),
+                value: "BBBB-value".into(),
+                allowed_hosts: vec!["127.0.0.1".into()],
+                allow_private_network: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Lowercase and padded names resolve in the policy check, so they must be replaced too.
+        let req = request(
+            "GET",
+            "http://127.0.0.1:9/p",
+            &[
+                ("X-One", "{{FERROGATE:b_key}}"),
+                ("X-Two", "{{FERROGATE: B_KEY }}"),
+            ],
+        );
+        let prepared = prepare_proxied_request(&vault, &req).unwrap();
+        assert_eq!(prepared.headers["X-One"], "BBBB-value");
+        assert_eq!(prepared.headers["X-Two"], "BBBB-value");
+
+        // A secret's own text is data: it is not expanded a second time.
+        let req = request(
+            "GET",
+            "http://127.0.0.1:9/p",
+            &[("X-Both", "{{FERROGATE:A_KEY}}|{{FERROGATE:B_KEY}}")],
+        );
+        let prepared = prepare_proxied_request(&vault, &req).unwrap();
+        assert_eq!(
+            prepared.headers["X-Both"],
+            "x{{FERROGATE:B_KEY}}y|BBBB-value"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_method_error_never_prints_the_injected_secret() {
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "API_KEY", "s3cr3t-value-123", &["127.0.0.1"]);
+        let req = request(
+            "OPTIONS",
+            "http://127.0.0.1:9/p?key={{FERROGATE:API_KEY}}",
+            &[],
+        );
+        let err = execute_proxied_request(&vault, &req).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, GateError::InvalidUrl { .. }), "{text}");
+        assert!(!text.contains("s3cr3t-value-123"), "{text}");
+    }
+
+    #[test]
+    fn a_non_utf8_response_body_is_decoded_not_dropped() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let _ = req.respond(tiny_http::Response::from_data(b"ok \xff\xfe tail".to_vec()));
+        });
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "API_KEY", "s3cr3t-value-123", &["127.0.0.1"]);
+        let req = request(
+            "GET",
+            &format!("http://127.0.0.1:{port}/"),
+            &[("X-Key", "{{FERROGATE:API_KEY}}")],
+        );
+        let resp = execute_proxied_request(&vault, &req).unwrap();
+        handle.join().unwrap();
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.starts_with("ok "), "{:?}", resp.body);
+        assert!(resp.body.ends_with(" tail"), "{:?}", resp.body);
+    }
+
+    #[test]
+    fn debug_of_a_prepared_request_holds_no_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        let vault = vault_with(&tmp, "API_KEY", "s3cr3t-value-123", &["127.0.0.1"]);
+        let mut req = request(
+            "POST",
+            "http://127.0.0.1:9/p?key={{FERROGATE:API_KEY}}",
+            &[("Authorization", "Bearer {{FERROGATE:API_KEY}}")],
+        );
+        req.body = Some("{\"k\":\"{{FERROGATE:API_KEY}}\"}".into());
+        let prepared = prepare_proxied_request(&vault, &req).unwrap();
+        assert!(prepared.url.contains("s3cr3t-value-123"));
+        let shown = format!("{prepared:?}");
+        assert!(!shown.contains("s3cr3t-value-123"), "{shown}");
+        assert!(shown.contains("API_KEY"), "{shown}");
+    }
 }
