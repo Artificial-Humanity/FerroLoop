@@ -367,6 +367,20 @@ impl Vault {
         self.write_file(&self.file)
     }
 
+    /// Create `vault.enc` from this instance's view only if no file exists yet, under the vault
+    /// lock; returns whether it wrote. The existence check and the write are one locked step, so
+    /// a `set` that lands after [`Vault::open`] is never overwritten by an initialising `save`.
+    /// An existing vault is left exactly as it is.
+    pub fn save_if_absent(&self) -> Result<bool, GateError> {
+        let _lock = VaultLock::acquire(&self.path)?;
+        // A symlink in the vault's place counts as present: it is never replaced here.
+        if fs::symlink_metadata(&self.path).is_ok() {
+            return Ok(false);
+        }
+        self.write_file(&self.file)?;
+        Ok(true)
+    }
+
     /// Encode and atomically replace `vault.enc` with `file`. The caller holds the [`VaultLock`].
     fn write_file(&self, file: &VaultFile) -> Result<(), GateError> {
         let encoded = serde_json::to_string_pretty(file).map_err(|e| GateError::VaultCorrupt {
@@ -1148,6 +1162,32 @@ mod tests {
         assert_eq!(names, ["FROM_OTHER", "FROM_STALE", "LATER"]);
         // A name the disk copy does not hold is not "removed" because the stale map had it.
         assert!(!other.remove("TO_REMOVE").unwrap());
+    }
+
+    #[test]
+    fn save_if_absent_creates_a_missing_vault_and_never_overwrites_an_existing_one() {
+        let tmp = TempDir::new().unwrap();
+        // `init` opens the not-yet-existing vault ...
+        let init = open_at(tmp.path());
+        // ... and another process sets a secret before `init` writes.
+        let mut other = open_at(tmp.path());
+        other.set(args("FROM_OTHER", "other-value")).unwrap();
+
+        assert!(!init.save_if_absent().unwrap());
+        let names: Vec<String> = open_at(tmp.path())
+            .list()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["FROM_OTHER"], "init must not wipe a concurrent set");
+
+        // With no file at all, it creates the vault, and a second call leaves it alone.
+        let fresh = TempDir::new().unwrap();
+        let empty = open_at(fresh.path());
+        assert!(!empty.path().exists());
+        assert!(empty.save_if_absent().unwrap());
+        assert!(empty.path().exists());
+        assert!(!empty.save_if_absent().unwrap());
     }
 
     #[test]

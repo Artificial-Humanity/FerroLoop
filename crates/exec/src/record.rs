@@ -37,8 +37,13 @@ const MOVE_LOCK_STRIPES: usize = 64;
 
 /// In-process locks that serialise the last step of a move: the re-read of the record's state
 /// and the write of the new one. One lock per hash stripe of the record id, so two moves of the
-/// SAME record always meet on one lock, and moves of different records only collide by chance
-/// (a stripe held a moment longer, never a deadlock: a move holds one stripe and nothing else).
+/// SAME record always meet on one lock, and moves of different records only collide by chance.
+///
+/// The lock spans the re-read (`Tracker::get_record`) and the write (`Tracker::set_record_state`).
+/// For a networked tracker such as GitHub those are network calls, so a slow or stalled tracker
+/// holds the stripe for that long. The stall blocks only moves of records that hash to the same
+/// stripe, and only at this last step. It cannot deadlock: a move holds one stripe and takes no
+/// other lock while it holds it.
 static MOVE_LOCKS: [Mutex<()>; MOVE_LOCK_STRIPES] = [const { Mutex::new(()) }; MOVE_LOCK_STRIPES];
 
 fn lock_record_for_move(id: &RecordId) -> MutexGuard<'static, ()> {
@@ -80,9 +85,12 @@ fn stale_move(began: &Record, now: &Record) -> ExecError {
 ///
 /// ⚠ The state check and the state write are one step. The record's state is read once before
 /// the flush (a stale move is refused before it writes any evidence) and read AGAIN, under a
-/// per-record lock, immediately before `set_record_state`; the lock is held across just that
-/// re-read and write, never across the gates or the flush, which can run for a long time and
-/// reach the network. Two concurrent moves of one record therefore cannot both pass the check
+/// per-record lock, immediately before `set_record_state`. The lock is held across just that
+/// re-read and write, never across the gates or the flush, which can run for a long time. The
+/// re-read and the write are tracker calls, and for a networked tracker (GitHub) they are
+/// network calls, so the lock can be held for as long as those take. A stall there blocks only
+/// moves of records on the same lock stripe, and cannot deadlock: no other lock is taken while
+/// it is held. Two concurrent moves of one record therefore cannot both pass the check
 /// and both write: the second sees the first's state and gets `StaleMove`. Because the flush
 /// comes before the write, a move that loses at that point has already flushed its decision:
 /// evidence with no move, the state this ordering is designed to allow.
@@ -148,7 +156,8 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
         .map_err(refused_publish)?;
 
     if allowed {
-        // Held until the write returns. `current.id` is the primary id, so a move that names
+        // Held until the write returns, so across the re-read and the write below (network
+        // calls for a networked tracker). `current.id` is the primary id, so a move that names
         // the record by an alias takes the same lock as one that names it by its id.
         let _one_move_at_a_time = lock_record_for_move(&current.id);
         let latest = roles

@@ -2545,7 +2545,7 @@ const AGENT_REGISTRY_CASES: usize = 7;
 /// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
 const STATE_STORE_CASES: usize = 10;
 /// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
-const MESSAGE_STORE_CASES: usize = 8;
+const MESSAGE_STORE_CASES: usize = 9;
 /// How many cases [`workflow_store`] runs. Update deliberately — see [`run_suite`].
 const WORKFLOW_STORE_CASES: usize = 3;
 
@@ -2588,6 +2588,7 @@ pub fn message_store<S: MessageStore + AgentRegistry + Catalog + Handles, G>(
         receipt_transitions_and_batch_imports_converge_monotonically::<S>,
         wire_import_deduplicates_and_refuses_tampered_message::<S>,
         wire_import_skips_each_bad_message_and_keeps_the_good_ones::<S>,
+        wire_import_reports_an_id_that_belongs_to_another_kind_and_imports_its_neighbours::<S>,
         offline_agent_id_collision_alias_preserves_wire_inbox_and_ack::<S>,
         prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff::<S>,
     ];
@@ -4157,6 +4158,103 @@ fn wire_import_skips_each_bad_message_and_keeps_the_good_ones<S: MessageStore>(s
         .unwrap();
     assert!(first.is_clean());
     assert_eq!(first.imported_messages, 1);
+}
+
+/// A message whose id is already taken by an object of another kind is reported as
+/// `IdCollision`, nothing is written for it (no message, no inbox receipt), and the messages
+/// around it in the batch are still imported.
+fn wire_import_reports_an_id_that_belongs_to_another_kind_and_imports_its_neighbours<
+    S: MessageStore + AgentRegistry,
+>(
+    s: &S,
+) {
+    use crate::ferrowire::{
+        MessageKind, MessageUrgency, SendWireArgs, WireAddress, WireFilter, WireImportRejectReason,
+    };
+    use crate::ids::MessageId;
+
+    let agent = s
+        .register_agent(crate::agent::RegisterAgentArgs {
+            display_name: "Collider".into(),
+            email: None,
+            project: "ferroloop".into(),
+            role: crate::agent::AgentRole::Lead,
+            extra_areas: vec![],
+            create_area: true,
+            replace: false,
+            at: At::from_unix_millis(5),
+            by: "owner".into(),
+        })
+        .unwrap();
+    let (template, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("collider".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: "Template".into(),
+            body: "Template body".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+    let with_id = |id: MessageId, subject: &str| {
+        let mut m = template.clone();
+        m.thread_id = id.clone();
+        m.id = id;
+        m.subject = subject.into();
+        m
+    };
+    let before = s.wire_messages_after(0).unwrap().len();
+    let colliding = with_id(MessageId(agent.id.iri().clone()), "Colliding");
+    let (before_a, after_b) = (
+        with_id(MessageId(seq_iri(0x7200)), "Before"),
+        with_id(MessageId(seq_iri(0x7201)), "After"),
+    );
+
+    let report = s
+        .import_wire_batch(&[before_a.clone(), colliding.clone(), after_b.clone()], &[])
+        .unwrap();
+
+    assert_eq!(report.imported_messages, 2, "{report:?}");
+    assert_eq!(report.rejected.len(), 1, "{report:?}");
+    assert!(report.rejects_message(&colliding.id));
+    assert_eq!(
+        report.rejected[0].reason,
+        WireImportRejectReason::IdCollision
+    );
+    assert!(!report.rejected[0].is_receipt);
+    assert!(
+        !report.rejected[0].detail.contains("Template body"),
+        "{:?}",
+        report.rejected[0]
+    );
+    assert!(s.get_wire_message(&colliding.id).unwrap().is_none());
+    // No receipt either (a store may answer an unknown id with an error or an empty list).
+    assert!(
+        s.list_wire_receipts(&colliding.id)
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert_eq!(s.get_wire_message(&before_a.id).unwrap().unwrap(), before_a);
+    assert_eq!(s.get_wire_message(&after_b.id).unwrap().unwrap(), after_b);
+    assert_eq!(s.wire_messages_after(0).unwrap().len(), before + 2);
+    let inbox = s
+        .list_wire_inbox(&WireFilter {
+            recipient: Some("collider".into()),
+            ..WireFilter::default()
+        })
+        .unwrap();
+    assert!(
+        inbox.iter().all(|item| item.message.id != colliding.id),
+        "a collided id must not reach the inbox"
+    );
 }
 
 fn offline_agent_id_collision_alias_preserves_wire_inbox_and_ack<

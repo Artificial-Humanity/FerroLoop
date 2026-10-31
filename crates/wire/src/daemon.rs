@@ -50,19 +50,48 @@ fn warn(line: &str) {
     eprintln!("fl-wire: warning: {line}");
 }
 
+/// The longest a peer-supplied string may be in a warning line, in characters.
+const WARN_FIELD_MAX_CHARS: usize = 80;
+
+/// How many skipped items one warning line lists before it says "and N more".
+const WARN_MAX_LISTED_SKIPS: usize = 10;
+
+/// Render a peer-controlled string for a warning line: control characters are escaped, so a peer
+/// cannot inject terminal escapes or new lines, and the text is cut to `WARN_FIELD_MAX_CHARS`
+/// characters with an ellipsis, so a peer cannot make one line unbounded.
+fn sanitize_for_warning(text: &str) -> String {
+    let mut out = String::new();
+    for (count, c) in text.chars().enumerate() {
+        if count == WARN_FIELD_MAX_CHARS {
+            out.push('\u{2026}');
+            break;
+        }
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// The warning for one peer import that skipped something or failed, or `None` for a clean one.
 /// Lists message ids and the reason for each skip, never a message body or its validation text.
+/// The peer label and ids come from the peer, so they are escaped and cut (see
+/// `sanitize_for_warning`), and at most `WARN_MAX_LISTED_SKIPS` skips are listed.
 fn import_warning(
     peer: &str,
     frame: &str,
     result: &Result<WireImportReport, fl_core::store::StoreError>,
 ) -> Option<String> {
+    let peer = sanitize_for_warning(peer);
     match result {
         Ok(report) if report.is_clean() => None,
         Ok(report) => {
-            let skipped: Vec<String> = report
+            let mut skipped: Vec<String> = report
                 .rejected
                 .iter()
+                .take(WARN_MAX_LISTED_SKIPS)
                 .map(|r| {
                     format!(
                         "{} {} ({})",
@@ -71,20 +100,27 @@ fn import_warning(
                         } else {
                             "message"
                         },
-                        r.message_id,
-                        r.reason
+                        sanitize_for_warning(r.message_id.as_str()),
+                        sanitize_for_warning(&r.reason.to_string())
                     )
                 })
                 .collect();
+            let unlisted = report.rejected.len().saturating_sub(WARN_MAX_LISTED_SKIPS);
+            if unlisted > 0 {
+                skipped.push(format!("and {unlisted} more"));
+            }
             Some(format!(
                 "{frame} from {peer}: skipped {} item(s), imported {} message(s) and {} receipt(s): {}",
-                skipped.len(),
+                report.rejected.len(),
                 report.imported_messages,
                 report.imported_receipts,
                 skipped.join("; ")
             ))
         }
-        Err(e) => Some(format!("{frame} from {peer}: import failed: {e}")),
+        Err(e) => Some(format!(
+            "{frame} from {peer}: import failed: {}",
+            sanitize_for_warning(&e.to_string())
+        )),
     }
 }
 
@@ -769,8 +805,13 @@ where
                     .store
                     .import_wire_batch(std::slice::from_ref(&message), &receipts);
                 self.warn_on_import(from_peer_id, "Publish", &imported);
-                // A message the store refused is neither forwarded nor dispatched.
-                if imported.as_ref().is_ok_and(WireImportReport::is_clean) && !known {
+                // A message the store refused is neither forwarded nor dispatched. A receipt
+                // the store refused (already warned about) does not stop the message itself:
+                // it is stored, and a later copy would see it as known and never dispatch it.
+                let message_stored = imported
+                    .as_ref()
+                    .is_ok_and(|report| !report.rejects_message(&message.id));
+                if message_stored && !known {
                     let rcpts = self
                         .store
                         .list_wire_receipts(&message.id)
@@ -1253,6 +1294,100 @@ mod tests {
         );
         assert!(published_ids(&rig.observed).is_empty());
         assert_eq!(take_warnings().len(), 1);
+    }
+
+    /// A subscriber on the rig's daemon that sees every message event.
+    fn subscribe_all(rig: &Rig) -> Receiver<LocalEvent> {
+        let (tx, rx) = mpsc::channel();
+        lock(&rig.inner.subscribers).push(Subscriber {
+            recipient: None,
+            correlation_id: None,
+            tx,
+        });
+        rx
+    }
+
+    fn message_events(rx: &Receiver<LocalEvent>) -> usize {
+        rx.try_iter()
+            .filter(|e| matches!(e, LocalEvent::Message { .. }))
+            .count()
+    }
+
+    #[test]
+    fn a_valid_publish_with_a_rejected_receipt_is_still_announced_once() {
+        let rig = rig();
+        let events = subscribe_all(&rig);
+        let (m, _) = rig
+            .source
+            .send_wire(send_args("x", "valid body", 10))
+            .unwrap();
+        let (other, other_receipts) = rig
+            .source
+            .send_wire(send_args("y", "other body", 11))
+            .unwrap();
+        // A receipt for a message the destination has never seen: the store refuses it.
+        let stray = other_receipts[0].clone();
+        assert_eq!(stray.message_id, other.id);
+        let publish = PeerFrame::Publish {
+            message: m.clone(),
+            receipts: vec![stray],
+        };
+
+        rig.inner
+            .process_incoming_peer_frame(rig.sender, publish.clone());
+
+        assert_eq!(rig.inner.store.get_wire_message(&m.id).unwrap().unwrap(), m);
+        assert_eq!(published_ids(&rig.observed), vec![m.id.clone()]);
+        assert_eq!(message_events(&events), 1);
+        let warnings = take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("receipt for") && warnings[0].contains(other.id.as_str()),
+            "{warnings:?}"
+        );
+
+        // The same publish arriving again is known: it is not announced or forwarded twice.
+        rig.inner.process_incoming_peer_frame(rig.sender, publish);
+        assert!(published_ids(&rig.observed).is_empty());
+        assert_eq!(message_events(&events), 0);
+    }
+
+    #[test]
+    fn a_warning_escapes_peer_controlled_text_and_caps_what_it_lists() {
+        use fl_core::ferrowire::{WireImportRejectReason, WireImportRejection};
+        let evil_peer = "node\u{1b}[31m@host\nforged: line";
+        let id = |text: String| MessageId(fl_core::iri::Iri::parse(&text).unwrap());
+        let long_id = id(format!("urn:m:{}", "z".repeat(500)));
+        let rejected: Vec<WireImportRejection> = (0..25)
+            .map(|i| WireImportRejection {
+                message_id: if i == 0 {
+                    long_id.clone()
+                } else {
+                    id(format!("urn:m:msg-{i}\u{1b}[2J"))
+                },
+                is_receipt: i % 2 == 1,
+                reason: WireImportRejectReason::InvalidMessage,
+                detail: "SECRET body text".into(),
+            })
+            .collect();
+        let report = WireImportReport {
+            imported_messages: 3,
+            imported_receipts: 4,
+            rejected,
+        };
+
+        let line = import_warning(evil_peer, "SyncBatch", &Ok(report)).unwrap();
+
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(line.contains("\\u{1b}") && line.contains("\\n"), "{line}");
+        assert!(line.contains("skipped 25 item(s)"), "{line}");
+        assert!(line.contains("and 15 more"), "{line}");
+        assert!(line.contains("msg-9") && !line.contains("msg-10"), "{line}");
+        assert!(!line.contains(&"z".repeat(100)), "{line}");
+        assert!(line.contains('\u{2026}'), "{line}");
+        assert!(!line.contains("SECRET"), "{line}");
+        // The whole line stays bounded however long the peer-supplied text was.
+        assert!(line.chars().count() < 1500, "{}", line.chars().count());
     }
 
     #[test]

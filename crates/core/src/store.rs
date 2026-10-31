@@ -774,7 +774,10 @@ pub trait MessageStore {
     /// stored under its id, or collides with another kind of id is skipped and listed in the
     /// returned [`WireImportReport`]; so is a receipt for a message this store does not hold. The
     /// other items are still imported. A skipped item is never stored. `Err` is for a store
-    /// failure only, and then nothing from the batch is kept.
+    /// failure only. What an `Err` leaves behind depends on the store: the redb and FerroStore
+    /// stores import the whole batch in one transaction, so nothing from the batch is kept;
+    /// `MemStore` writes item by item, so an `Err` partway through can leave the earlier
+    /// items imported. Callers must not assume an `Err` imported nothing.
     fn import_wire_batch(
         &self,
         messages: &[WireMessage],
