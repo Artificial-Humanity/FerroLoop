@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -261,6 +262,11 @@ impl Vault {
         let Some(record) = self.file.secrets.get(&key_name) else {
             return Err(GateError::NoSuchSecret { name: key_name });
         };
+        // The AAD binds `metadata.name`, not the map key. A record copied under another key
+        // would otherwise decrypt as that other secret, with its own value and policy.
+        if record.metadata.name != key_name {
+            return Err(GateError::VaultTampered { secret: key_name });
+        }
 
         if let Some(ref exp) = record.metadata.expires_at {
             let now_str = At::from_unix_millis(now_unix_millis()).to_string();
@@ -382,9 +388,12 @@ impl Vault {
             "host": host,
             "outcome": outcome,
         });
-        let Ok(line) = serde_json::to_string(&entry) else {
+        let Ok(mut line) = serde_json::to_string(&entry) else {
             return;
         };
+        // One `write_all` so an `O_APPEND` write from another thread or process cannot land
+        // between the entry and its newline.
+        line.push('\n');
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -394,7 +403,7 @@ impl Vault {
                 .mode(0o600)
                 .open(&audit_path)
             {
-                let _ = writeln!(f, "{line}");
+                let _ = f.write_all(line.as_bytes());
             }
         }
         #[cfg(not(unix))]
@@ -404,7 +413,7 @@ impl Vault {
                 .append(true)
                 .open(&audit_path)
             {
-                let _ = writeln!(f, "{line}");
+                let _ = f.write_all(line.as_bytes());
             }
         }
     }
@@ -544,9 +553,37 @@ pub fn load_or_init_master_key(key_path: &Path) -> Result<[u8; MASTER_KEY_LEN], 
     rng.fill(&mut key).map_err(|_| GateError::Crypto {
         reason: "failed to generate 256-bit vault master key".to_string(),
     })?;
+    install_new_master_key(key_path, key)
+}
+
+/// Publish `key` at `key_path` unless a key is already there; return whichever key now lives at
+/// `key_path`. Two first runs that race each generate a key, and the loser must adopt the
+/// winner's: an overwrite would orphan every secret already sealed with the first key.
+fn install_new_master_key(
+    key_path: &Path,
+    key: [u8; MASTER_KEY_LEN],
+) -> Result<[u8; MASTER_KEY_LEN], GateError> {
     let hex = encode_hex(&key);
-    write_atomic_0600(key_path, format!("{hex}\n").as_bytes())?;
-    Ok(key)
+    let tmp_path = write_tmp_0600(key_path, format!("{hex}\n").as_bytes())?;
+    let linked = fs::hard_link(&tmp_path, key_path);
+    let _ = fs::remove_file(&tmp_path);
+    match linked {
+        Ok(()) => Ok(key),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            reject_if_symlink(key_path)?;
+            let raw = fs::read_to_string(key_path).map_err(|e| GateError::Io {
+                op: "read",
+                path: key_path.to_path_buf(),
+                cause: e.to_string(),
+            })?;
+            parse_hex_master_key(raw.trim(), key_path)
+        }
+        Err(e) => Err(GateError::Io {
+            op: "link",
+            path: key_path.to_path_buf(),
+            cause: e.to_string(),
+        }),
+    }
 }
 
 fn parse_hex_master_key(hex_str: &str, path: &Path) -> Result<[u8; MASTER_KEY_LEN], GateError> {
@@ -558,6 +595,13 @@ fn parse_hex_master_key(hex_str: &str, path: &Path) -> Result<[u8; MASTER_KEY_LE
                 MASTER_KEY_LEN * 2,
                 hex_str.len()
             ),
+        });
+    }
+    // `from_str_radix` accepts a leading `+`; a key is bare hex digits and nothing else.
+    if !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(GateError::VaultCorrupt {
+            path: path.to_path_buf(),
+            cause: "master key contains non-hexadecimal characters".to_string(),
         });
     }
     let mut out = [0u8; MASTER_KEY_LEN];
@@ -596,7 +640,24 @@ pub(crate) fn reject_if_symlink(path: &Path) -> Result<(), GateError> {
     Ok(())
 }
 
-pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), GateError> {
+/// A temp path next to `path` that no other writer in this process or another one shares.
+///
+/// The process id alone made two threads saving one vault, or a key and a vault in the same
+/// directory (`vault.key` and `vault.enc` both became `vault.tmp.<pid>`), write one temp file.
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    path.with_file_name(format!(
+        ".{}.tmp.{}.{n}",
+        name.as_deref().unwrap_or("fl"),
+        std::process::id()
+    ))
+}
+
+/// Write `bytes` to a fresh `0600` temp file beside `path` and return its path. A failed write
+/// removes the temp file instead of leaving partial key or ciphertext bytes behind.
+fn write_tmp_0600(path: &Path, bytes: &[u8]) -> Result<PathBuf, GateError> {
     reject_if_symlink(path)?;
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -607,41 +668,40 @@ pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), GateErr
             cause: e.to_string(),
         })?;
     }
-    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
-    reject_if_symlink(&tmp_path)?;
-    {
-        let mut f = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp_path)
-            .map_err(|e| GateError::Io {
-                op: "write",
-                path: tmp_path.clone(),
-                cause: e.to_string(),
-            })?;
+    let tmp_path = unique_tmp_path(path);
+    let written = (|| -> std::io::Result<()> {
+        let mut opts = fs::OpenOptions::new();
+        opts.create_new(true).write(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
         }
-        f.write_all(bytes).map_err(|e| GateError::Io {
+        let mut f = opts.open(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(GateError::Io {
             op: "write",
-            path: tmp_path.clone(),
+            path: tmp_path,
             cause: e.to_string(),
-        })?;
-        f.sync_all().map_err(|e| GateError::Io {
-            op: "sync",
-            path: tmp_path.clone(),
-            cause: e.to_string(),
-        })?;
+        });
     }
-    fs::rename(&tmp_path, path).map_err(|e| GateError::Io {
-        op: "rename",
-        path: path.to_path_buf(),
-        cause: e.to_string(),
-    })?;
-    Ok(())
+    Ok(tmp_path)
+}
+
+pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), GateError> {
+    let tmp_path = write_tmp_0600(path, bytes)?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        GateError::Io {
+            op: "rename",
+            path: path.to_path_buf(),
+            cause: e.to_string(),
+        }
+    })
 }
 
 fn now_unix_millis() -> u64 {
@@ -649,4 +709,172 @@ fn now_unix_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn args(name: &str, value: &str) -> SetSecretArgs {
+        SetSecretArgs {
+            name: name.into(),
+            value: value.into(),
+            allowed_hosts: vec!["example.com".into()],
+            ..Default::default()
+        }
+    }
+
+    fn leftover_temp_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect()
+    }
+
+    #[test]
+    fn a_record_moved_under_another_name_is_not_served_as_that_secret() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let mut vault = Vault::open(&path, [3u8; 32]).unwrap();
+        vault.set(args("LOW_VALUE", "low-value-token")).unwrap();
+        vault.set(args("PROD_TOKEN", "prod-token-value")).unwrap();
+
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        raw["secrets"]["PROD_TOKEN"] = raw["secrets"]["LOW_VALUE"].clone();
+        fs::write(&path, raw.to_string()).unwrap();
+
+        let vault = Vault::open(&path, [3u8; 32]).unwrap();
+        assert!(matches!(
+            vault.decrypt_raw("PROD_TOKEN"),
+            Err(GateError::VaultTampered { .. })
+        ));
+        assert_eq!(vault.decrypt_raw("LOW_VALUE").unwrap().1, "low-value-token");
+    }
+
+    #[test]
+    fn temp_paths_are_unique_per_call_and_per_target_file() {
+        let dir = Path::new("/data/fl");
+        let key = unique_tmp_path(&dir.join("vault.key"));
+        let vault = unique_tmp_path(&dir.join("vault.enc"));
+        let vault_again = unique_tmp_path(&dir.join("vault.enc"));
+        assert_ne!(
+            key, vault,
+            "vault.key and vault.enc once shared one temp name"
+        );
+        assert_ne!(
+            vault, vault_again,
+            "two saves in one process once shared one temp name"
+        );
+        assert_eq!(key.parent(), Some(dir));
+    }
+
+    /// Stress, not a deterministic repro: before the fix concurrent saves of one path raced on a
+    /// shared `vault.tmp.<pid>` and failed with a missing-file rename or wrote interleaved bytes.
+    #[test]
+    fn concurrent_saves_of_one_vault_all_succeed_and_leave_it_readable() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        let base = Vault::open(&path, [5u8; 32]).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let mut vault = base.clone();
+                std::thread::spawn(move || {
+                    for i in 0..15 {
+                        vault.set(args(&format!("S{t}_{i}"), "value-1234")).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let reopened = Vault::open(&path, [5u8; 32]).unwrap();
+        assert!(!reopened.list().is_empty());
+        assert_eq!(leftover_temp_files(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_failed_publish_removes_its_temp_file() {
+        let tmp = TempDir::new().unwrap();
+        // Renaming a file onto a directory fails after the temp file was written.
+        let target = tmp.path().join("vault.enc");
+        fs::create_dir(&target).unwrap();
+        assert!(write_atomic_0600(&target, b"{}").is_err());
+        assert_eq!(leftover_temp_files(tmp.path()), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_files_are_born_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let tmp_path = write_tmp_0600(&tmp.path().join("vault.key"), b"k").unwrap();
+        let mode = fs::metadata(&tmp_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn the_loser_of_a_first_run_race_adopts_the_existing_master_key() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("vault.key");
+        let winner = [0xAAu8; MASTER_KEY_LEN];
+        let loser = [0xBBu8; MASTER_KEY_LEN];
+        assert_eq!(install_new_master_key(&key_path, winner).unwrap(), winner);
+        assert_eq!(install_new_master_key(&key_path, loser).unwrap(), winner);
+        assert_eq!(
+            parse_hex_master_key(fs::read_to_string(&key_path).unwrap().trim(), &key_path).unwrap(),
+            winner
+        );
+        assert_eq!(leftover_temp_files(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_master_key_must_be_bare_hex_digits() {
+        let p = Path::new("key");
+        assert!(parse_hex_master_key(&"+1".repeat(MASTER_KEY_LEN), p).is_err());
+        assert!(parse_hex_master_key(&"-1".repeat(MASTER_KEY_LEN), p).is_err());
+        assert!(parse_hex_master_key(&" 1".repeat(MASTER_KEY_LEN), p).is_err());
+        assert_eq!(
+            parse_hex_master_key(&"0f".repeat(MASTER_KEY_LEN), p).unwrap(),
+            [0x0f; MASTER_KEY_LEN]
+        );
+    }
+
+    /// Stress: with two writes per entry, concurrent appenders could split an entry from its newline.
+    #[test]
+    fn concurrent_audit_entries_stay_one_json_object_per_line() {
+        let tmp = TempDir::new().unwrap();
+        let vault =
+            std::sync::Arc::new(Vault::open(tmp.path().join("vault.enc"), [1u8; 32]).unwrap());
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let vault = vault.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        vault.append_audit_log(
+                            Some(&format!("agent{t}")),
+                            &["K".to_string()],
+                            "GET",
+                            "example.com",
+                            "allowed",
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let log = fs::read_to_string(tmp.path().join("gate-audit.jsonl")).unwrap();
+        assert!(log.ends_with('\n'));
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 200);
+        for line in lines {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+    }
 }

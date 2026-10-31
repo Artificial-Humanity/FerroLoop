@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::GateError;
 use crate::bridge::BridgeConfig;
-use crate::proxy::{ProxyRequest, ProxyResponse, execute_proxied_request};
+use crate::proxy::{PLACEHOLDER_PREFIX, ProxyRequest, ProxyResponse, execute_proxied_request};
 use crate::vault::Vault;
 
 fn default_true() -> bool {
@@ -83,7 +83,9 @@ impl ConnectorManifest {
     }
 
     pub fn validate(&self, source_path: &Path) -> Result<(), GateError> {
-        let id = self.id.trim();
+        // Checked as written: a padded id passed `trim()` yet was stored, matched, and published
+        // with its padding.
+        let id = self.id.as_str();
         if id.is_empty()
             || !id
                 .chars()
@@ -102,7 +104,17 @@ impl ConnectorManifest {
                 reason: "connector `base_url` must not be empty".to_string(),
             });
         }
+        let mut seen_tools = std::collections::BTreeSet::new();
         for tool in &self.tools {
+            if !seen_tools.insert(tool.name.as_str()) {
+                return Err(GateError::InvalidConnector {
+                    path: source_path.to_path_buf(),
+                    reason: format!(
+                        "tool `{}` is declared twice; the later one could never be called",
+                        tool.name
+                    ),
+                });
+            }
             if tool.name.trim().is_empty() {
                 return Err(GateError::InvalidConnector {
                     path: source_path.to_path_buf(),
@@ -129,6 +141,14 @@ impl ConnectorManifest {
         arguments: &Value,
         caller_agent: Option<String>,
     ) -> Result<ProxyRequest, GateError> {
+        // Only the manifest, which the operator wrote, may name a secret. A placeholder inside
+        // an agent-supplied argument would be substituted into the request body and sent upstream.
+        if let Some(found) = find_placeholder(arguments) {
+            return Err(GateError::InvalidToolArgs {
+                tool: tool.name.clone(),
+                reason: format!("arguments must not contain `{PLACEHOLDER_PREFIX}`: {found}"),
+            });
+        }
         let args_obj = arguments.as_object();
         let mut rendered_path = tool.path.clone();
 
@@ -140,6 +160,13 @@ impl ConnectorManifest {
                     tool: tool.name.clone(),
                     reason: format!("missing required path parameter `{param}`"),
                 })?;
+            // `.` and `..` survive percent-encoding and are dot-segments to the server.
+            if matches!(val_str.as_str(), "" | "." | "..") {
+                return Err(GateError::InvalidToolArgs {
+                    tool: tool.name.clone(),
+                    reason: format!("path parameter `{param}` must not be empty, `.`, or `..`"),
+                });
+            }
             let token = format!("{{{param}}}");
             rendered_path = rendered_path.replace(&token, &encode_uri_component(&val_str));
         }
@@ -280,6 +307,22 @@ fn project_value(val: &Value, fields: &[String]) -> Value {
     }
 }
 
+/// Describe the first string or object key in `v` that holds a secret placeholder.
+fn find_placeholder(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) if s.contains(PLACEHOLDER_PREFIX) => Some("a string value".to_string()),
+        Value::Array(items) => items.iter().find_map(find_placeholder),
+        Value::Object(map) => map.iter().find_map(|(k, v)| {
+            if k.contains(PLACEHOLDER_PREFIX) {
+                Some("an object key".to_string())
+            } else {
+                find_placeholder(v)
+            }
+        }),
+        _ => None,
+    }
+}
+
 fn value_to_param_string(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
@@ -350,7 +393,10 @@ fn load_connectors_from_dir(dir: &Path) -> Result<Vec<ConnectorManifest>, GateEr
     })?;
     for entry in entries.flatten() {
         let p = entry.path();
-        if p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("toml") {
+        // `symlink_metadata` so a link is still listed, and then refused, rather than skipped.
+        let is_manifest_file =
+            fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() || m.file_type().is_symlink());
+        if is_manifest_file && p.extension().and_then(|s| s.to_str()) == Some("toml") {
             paths.push(p);
         }
     }
@@ -358,6 +404,9 @@ fn load_connectors_from_dir(dir: &Path) -> Result<Vec<ConnectorManifest>, GateEr
 
     let mut manifests = Vec::with_capacity(paths.len());
     for p in paths {
+        // `toml` quotes the offending line in its error, so a manifest symlinked to a key file
+        // would print that file. The vault refuses symlinks for the same reason.
+        crate::vault::reject_if_symlink(&p)?;
         let raw = fs::read_to_string(&p).map_err(|e| GateError::Io {
             op: "read",
             path: p.clone(),
@@ -450,6 +499,7 @@ pub fn import_openapi_to_connector(
                 } else {
                     format!("{connector_id}_{raw_op_id}")
                 };
+                let tool_name = unique_tool_name(&tools, tool_name);
                 let tool_desc = op_obj
                     .get("summary")
                     .or_else(|| op_obj.get("description"))
@@ -547,6 +597,17 @@ pub fn import_openapi_to_connector(
     Ok(manifest)
 }
 
+/// `name`, or `name_2`, `name_3`, … when an earlier tool took it. Distinct paths can sanitize to one name.
+fn unique_tool_name(tools: &[ConnectorToolDef], name: String) -> String {
+    if !tools.iter().any(|t| t.name == name) {
+        return name;
+    }
+    (2..)
+        .map(|n| format!("{name}_{n}"))
+        .find(|candidate| !tools.iter().any(|t| &t.name == candidate))
+        .unwrap_or(name)
+}
+
 fn sanitize_tool_name(raw: &str) -> String {
     let mut out = String::new();
     for ch in raw.chars() {
@@ -563,5 +624,138 @@ fn sanitize_tool_name(raw: &str) -> String {
         "op".to_string()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(extra_tool: &str) -> ConnectorManifest {
+        let toml = format!(
+            r#"
+id = "chat"
+title = "Chat"
+base_url = "https://api.example.com/v1"
+default_headers = {{ Authorization = "Bearer {{{{FERROGATE:CHAT_TOKEN}}}}" }}
+
+[[tools]]
+name = "chat_get_channel"
+description = "Read a channel"
+method = "GET"
+path = "/channels/{{channel_id}}"
+path_params = ["channel_id"]
+query_params = ["filter"]
+
+[[tools]]
+name = "chat_post"
+description = "Post"
+method = "POST"
+path = "/channels/{{channel_id}}/messages"
+path_params = ["channel_id"]
+body_params = ["content"]
+{extra_tool}
+"#
+        );
+        ConnectorManifest::parse_toml(&toml, Path::new("chat.toml")).unwrap()
+    }
+
+    fn call(m: &ConnectorManifest, tool: &str, args: Value) -> Result<ProxyRequest, GateError> {
+        let tool = m.tools.iter().find(|t| t.name == tool).unwrap();
+        m.build_tool_request(tool, &args, Some("agent".into()))
+    }
+
+    #[test]
+    fn an_argument_cannot_name_a_secret() {
+        let m = manifest("");
+        for args in [
+            json!({"channel_id": "c1", "content": "{{FERROGATE:CHAT_TOKEN}}"}),
+            json!({"channel_id": "c1", "content": ["ok", {"deep": "x {{FERROGATE:CHAT_TOKEN}}"}]}),
+            json!({"channel_id": "{{FERROGATE:CHAT_TOKEN}}"}),
+            json!({"channel_id": "c1", "{{FERROGATE:CHAT_TOKEN}}": 1}),
+        ] {
+            assert!(
+                matches!(
+                    call(&m, "chat_post", args.clone()),
+                    Err(GateError::InvalidToolArgs { .. })
+                ),
+                "{args}"
+            );
+        }
+        let ok = call(
+            &m,
+            "chat_post",
+            json!({"channel_id": "c1", "content": "hello {braces}"}),
+        )
+        .unwrap();
+        assert_eq!(ok.body.as_deref(), Some(r#"{"content":"hello {braces}"}"#));
+        // The manifest's own placeholder is untouched.
+        assert!(ok.headers["Authorization"].contains("{{FERROGATE:CHAT_TOKEN}}"));
+    }
+
+    #[test]
+    fn a_path_parameter_cannot_climb_out_of_its_segment() {
+        let m = manifest("");
+        for bad in ["..", ".", ""] {
+            assert!(
+                matches!(
+                    call(&m, "chat_get_channel", json!({"channel_id": bad})),
+                    Err(GateError::InvalidToolArgs { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        let req = call(
+            &m,
+            "chat_get_channel",
+            json!({"channel_id": "a/../b", "filter": "x y"}),
+        )
+        .unwrap();
+        assert_eq!(
+            req.url,
+            "https://api.example.com/v1/channels/a%2F..%2Fb?filter=x%20y"
+        );
+        let req = call(&m, "chat_get_channel", json!({"channel_id": "..a"})).unwrap();
+        assert!(req.url.ends_with("/channels/..a"), "{}", req.url);
+    }
+
+    #[test]
+    fn ids_and_tool_names_must_be_unambiguous() {
+        let mut m = manifest("");
+        m.id = " chat".into();
+        assert!(m.validate(Path::new("x")).is_err());
+        m.id = "chat".into();
+        m.tools.push(m.tools[0].clone());
+        assert!(m.validate(Path::new("x")).is_err());
+    }
+
+    #[test]
+    fn openapi_operations_that_sanitize_alike_get_distinct_tool_names() {
+        let spec = r#"{"openapi":"3.0.0","info":{"title":"t","version":"1"},
+            "servers":[{"url":"https://api.example.com"}],
+            "paths":{"/a-b":{"get":{}},"/a_b":{"get":{}},"/a b":{"get":{}}}}"#;
+        let m = import_openapi_to_connector(spec, "svc", None).unwrap();
+        let mut names: Vec<_> = m.tools.iter().map(|t| t.name.clone()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_manifest_symlink_is_refused_and_its_target_is_never_quoted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let key = tmp.path().join("vault.key");
+        fs::write(&key, "0123456789abcdef-not-toml-master-key-material\n").unwrap();
+        let gate = tmp.path().join("repo/.fl/gate");
+        fs::create_dir_all(&gate).unwrap();
+        std::os::unix::fs::symlink(&key, gate.join("evil.toml")).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+
+        let err = discover_connectors(Some(&tmp.path().join("repo")), Some(&home)).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, GateError::Io { .. }), "{text}");
+        assert!(!text.contains("master-key-material"), "{text}");
     }
 }
