@@ -332,7 +332,18 @@ function readStoredPasskeyMap(): Record<string, StoredClientPasskey> {
               typeof (v as StoredClientPasskey).private_jwk === "object" &&
               (v as StoredClientPasskey).private_jwk !== null
             ) {
-              merged[k] = v as StoredClientPasskey;
+              // The map is keyed by credential id, so an entry that does not carry its own id
+              // (or carries a non-string) takes the key it is filed under. Without this the
+              // login would send no `credential_id` and `saveStoredPasskey` would file the
+              // entry under "undefined".
+              const entry = v as StoredClientPasskey;
+              merged[k] = {
+                ...entry,
+                credential_id:
+                  typeof entry.credential_id === "string" && entry.credential_id
+                    ? entry.credential_id
+                    : k,
+              };
             }
           }
         }
@@ -385,14 +396,19 @@ export function getLastRegisteredPasskeyId(): string {
 /**
  * A fresh, unguessable credential id: 24 random bytes as base64url (32 characters), inside the
  * hub's 16 to 1024 character `[A-Za-z0-9_-]` rule. A clock-based id repeats when two clicks land
- * in one millisecond and can be guessed by anyone who knows roughly when it was made.
+ * in one millisecond and can be guessed by anyone who knows roughly when it was made. Throws when
+ * the platform has no secure random generator.
  */
 export function generatePasskeyCredentialId(): string {
   const crypto = globalThis.crypto;
   if (crypto && typeof crypto.getRandomValues === "function") {
     return bytesToBase64Url(crypto.getRandomValues(new Uint8Array(24)));
   }
-  return `passkey-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+  // No clock-and-Math.random fallback: that id is exactly the guessable one this function
+  // exists to avoid. The caller shows the error and no passkey is registered.
+  throw new Error(
+    "Cannot register a passkey: a secure random generator is unavailable in this browser.",
+  );
 }
 
 /**

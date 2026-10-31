@@ -100,6 +100,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("p1363ToDer — WebCrypto r||s to ASN.1 DER", () => {
@@ -186,6 +187,14 @@ describe("generatePasskeyCredentialId", () => {
       seen.add(id);
     }
     expect(seen.size).toBe(200);
+  });
+
+  it("throws instead of falling back to a guessable id when no secure random generator exists", () => {
+    for (const missing of [undefined, {}, { getRandomValues: "nope" }]) {
+      vi.stubGlobal("crypto", missing);
+      expect(() => generatePasskeyCredentialId()).toThrow(/secure random generator/i);
+      vi.unstubAllGlobals();
+    }
   });
 });
 
@@ -414,6 +423,37 @@ describe("passkey keystore", () => {
     vi.resetModules();
   });
 
+  it("signs with a keystore entry that has a key but no credential_id, naming the id it is filed under", async () => {
+    // Register through one copy of the module so a real private key exists in localStorage.
+    const { fetchImpl: registerFetch } = recordingFetch(() => ok({ ok: true }));
+    const id = "keystore-entry-without-id-0001";
+    await new HubApiClient({ fetchImpl: registerFetch }).registerPasskey({
+      credential_id: id,
+      label: "k",
+    });
+    const map = JSON.parse(window.localStorage.getItem(PASSKEY_KEYSTORE_STORAGE_KEY)!);
+    expect(map[id].private_jwk).toBeTruthy();
+    delete map[id].credential_id;
+    window.localStorage.setItem(PASSKEY_KEYSTORE_STORAGE_KEY, JSON.stringify(map));
+    // A fresh copy of the module: nothing in memory, so the keystore entry is all there is.
+    vi.resetModules();
+    const fresh = await import("../api/client");
+    const { calls, fetchImpl } = recordingFetch((url) => {
+      if (url.endsWith("/passkey/challenge")) return ok({ challenge: "n".repeat(43), expires_in_secs: 300 });
+      return ok({ ok: true, session_token: "s" });
+    });
+    await new fresh.HubApiClient({ fetchImpl }).loginWithPasskey({ credential_id: id });
+    const login = calls.filter((c) => c.url.endsWith("/auth/login")).pop()!;
+    expect(login.body.credential_id).toBe(id);
+    expect(login.body.signature_b64).toBeTypeOf("string");
+    // The counter was saved under the real id, not under "undefined".
+    const saved = JSON.parse(window.localStorage.getItem(PASSKEY_KEYSTORE_STORAGE_KEY)!);
+    expect(Object.keys(saved)).not.toContain("undefined");
+    expect(saved[id].credential_id).toBe(id);
+    expect(saved[id].sign_count).toBe(1);
+    vi.resetModules();
+  });
+
   it("falls back to a sixteen-plus character default id when nothing is stored", () => {
     expect(getLastRegisteredPasskeyId().length).toBeGreaterThanOrEqual(16);
     window.localStorage.setItem(LAST_PASSKEY_ID_STORAGE_KEY, "short");
@@ -459,8 +499,18 @@ describe("SettingsModal — TOTP and passkey enrolment trust the hub, not a defa
     fireEvent.change(within(section).getByTestId("totp-verify-input"), { target: { value: "123456" } });
     fireEvent.click(within(section).getByTestId("totp-verify-btn"));
     await waitFor(() => expect(verify).toHaveBeenCalledWith("123456"));
-    await screen.findByText(/did not confirm the code/i);
+    await screen.findByText(/did not confirm the TOTP code/i);
     expect(within(section).queryByTestId("totp-verified-badge")).not.toBeInTheDocument();
+  });
+
+  it("shows an error, and registers nothing, when no secure random generator exists", async () => {
+    const client = new HubApiClient({ baseUrl: "http://localhost:9000" });
+    const section = await open(client);
+    const register = vi.spyOn(client, "registerPasskey").mockResolvedValue({ ok: true });
+    vi.stubGlobal("crypto", undefined);
+    fireEvent.click(within(section).getByTestId("register-passkey-btn"));
+    await screen.findByText(/secure random generator/i);
+    expect(register).not.toHaveBeenCalled();
   });
 
   it("registers passkeys under random credential ids", async () => {

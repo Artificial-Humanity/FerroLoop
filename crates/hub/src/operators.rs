@@ -1365,6 +1365,10 @@ fn login_token(state: &HubState, token: &str) -> HttpResponse {
     }
 }
 
+/// The throttle key shared by every login name that is not a valid username. It holds `:`, which
+/// `valid_username` refuses, so no real operator can have a login that lands in this bucket.
+const INVALID_USERNAME_THROTTLE_KEY: &str = "login-invalid:name";
+
 fn login_password(state: &HubState, login: PasswordLogin) -> HttpResponse {
     let username = login.username.trim();
     if username.len() > MAX_USERNAME_LEN
@@ -1386,9 +1390,9 @@ fn login_password(state: &HubState, login: PasswordLogin) -> HttpResponse {
     // `totp-verify:<name>`). A real username never holds `:` or a control character, so a name
     // that does is charged to one shared bucket instead of the internal key it spells: otherwise
     // an anonymous caller could lock a victim's TOTP enrolment by "logging in" as
-    // `totp-verify:<victim>`.
+    // `totp-verify:<victim>`. The bucket's own key holds a `:`, so no valid username spells it.
     let key = if name.contains(':') || name.chars().any(char::is_control) {
-        "invalid-username".to_string()
+        INVALID_USERNAME_THROTTLE_KEY.to_string()
     } else {
         name.clone()
     };
@@ -5553,6 +5557,31 @@ mod tests {
         drop(t);
         create_operator(&state, "bystander", "owner", Some(PASSWORD));
         assert_eq!(password_login(&state, "bystander", PASSWORD).status, 200);
+    }
+
+    #[test]
+    fn the_invalid_name_bucket_cannot_be_spelled_by_a_real_operator() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        // `invalid-username` is a valid username (lowercase letters and `-`).
+        assert_eq!(
+            create_operator(&state, "invalid-username", "owner", Some(PASSWORD)).status,
+            201
+        );
+        for _ in 0..8 {
+            password_login(&state, "a:b", PASSWORD);
+        }
+        // The invalid names are locked ...
+        assert_eq!(password_login(&state, "a:b", PASSWORD).status, 429);
+        // ... but the operator that happens to be named like the old bucket is not.
+        assert_eq!(
+            password_login(&state, "invalid-username", "wrong-password").status,
+            401
+        );
+        assert_eq!(
+            password_login(&state, "invalid-username", PASSWORD).status,
+            200
+        );
     }
 
     #[test]
