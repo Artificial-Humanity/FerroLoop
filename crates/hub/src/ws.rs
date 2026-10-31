@@ -13,13 +13,13 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, watch};
 
 use crate::api::{
     HttpRequest, HttpResponse, drain_ready_session_queues, handle_http_request, parse_http_request,
 };
 use crate::auth::HubAuthority;
-use crate::terminal::{self, TerminalManager};
+use crate::terminal::TerminalManager;
 use crate::{HubServerConfig, HubState, HubWsFrame};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -250,10 +250,9 @@ async fn handle_websocket_session(
     };
     write_ws_json(&mut writer, &connected).await?;
 
-    // Bounded: a client that reads slowly holds the child's output back instead of growing
-    // the hub's memory (see the `terminal` module comment).
-    let (term_tx, mut term_rx) = mpsc::channel::<HubWsFrame>(terminal::OUTPUT_QUEUE_CAPACITY);
-    let mut terminal_mgr = TerminalManager::new(term_tx);
+    // The manager owns the bounded output queue: a client that reads slowly holds the child's
+    // output back instead of growing the hub's memory (see the `terminal` module comment).
+    let mut terminal_mgr = TerminalManager::new();
     let mut tmp = [0u8; 4096];
 
     let loop_res: io::Result<()> = async {
@@ -293,7 +292,7 @@ async fn handle_websocket_session(
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                     }
                 }
-                Some(term_frame) = term_rx.recv() => {
+                Some(term_frame) = terminal_mgr.next_frame() => {
                     write_ws_json(&mut writer, &term_frame).await?;
                 }
             }
@@ -301,9 +300,8 @@ async fn handle_websocket_session(
     }
     .await;
 
-    // Close the output queue first: a reader blocked on a full queue then fails at once and the
-    // children stop, instead of the teardown waiting out their drain grace.
-    drop(term_rx);
+    // `shutdown_all` closes the output queue first, so a reader blocked on a full queue fails
+    // at once and the children stop instead of the teardown waiting for them.
     terminal_mgr.shutdown_all().await;
     loop_res
 }
@@ -339,9 +337,11 @@ async fn handle_incoming_ws_frame(
                         }
                     }
                     "terminal" => {
-                        // Written here, not queued: this loop is the output queue's only
-                        // consumer and must not wait on it.
-                        if let Some(reply) = terminal_mgr
+                        // Written here, in order, not queued: this loop is the output queue's
+                        // only consumer and must not wait on it. For a close or a replacing
+                        // open the frames start with what the old session had queued, so its
+                        // `exited` is written before the new `opened`.
+                        let replies = terminal_mgr
                             .handle_frame(
                                 authority,
                                 state.config.enable_terminal,
@@ -349,9 +349,9 @@ async fn handle_incoming_ws_frame(
                                 &ws_frame.event,
                                 &ws_frame.data,
                             )
-                            .await
-                        {
-                            write_ws_json(writer, &reply).await?;
+                            .await;
+                        for reply in &replies {
+                            write_ws_json(writer, reply).await?;
                         }
                     }
                     other => {
