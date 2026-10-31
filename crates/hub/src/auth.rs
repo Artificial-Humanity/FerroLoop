@@ -326,6 +326,27 @@ fn load_session_entry(store: &RedbStore, token_hash: &str) -> Option<StoredSessi
     serde_json::from_value(rt.value).ok()
 }
 
+/// Every persisted session entry: a prefix scan of the sensitive runtime state under the
+/// `hub-session-` slug. The persisted entries are the only index of sessions that outlive the
+/// in-memory cache, so there is no second one to keep in step.
+fn list_session_entries(store: &RedbStore) -> Vec<StoredSessionEntry> {
+    let Ok(entries) = store.list_state(Some(&StateScope::Workspace), Some(StateConcern::Runtime))
+    else {
+        return Vec::new();
+    };
+    entries
+        .into_iter()
+        .filter(|e| e.sensitive && e.slug.starts_with("hub-session-"))
+        .filter_map(|e| match e.payload {
+            StatePayload::Runtime(rt) => {
+                serde_json::from_value::<StoredSessionEntry>(rt.value).ok()
+            }
+            _ => None,
+        })
+        .filter(|e| e.kind == "hub/session")
+        .collect()
+}
+
 /// Extract `fl_hub_session` cookie value from a raw `Cookie` HTTP header.
 pub fn extract_session_cookie(cookie_header: &str) -> Option<String> {
     for part in cookie_header.split(';') {
@@ -603,6 +624,52 @@ impl AuthManager {
         }
     }
 
+    /// Revoke every live session minted for `login`, in the memory cache and in `store`, and
+    /// return how many distinct sessions that ended. `login` is matched ignoring ASCII case and
+    /// surrounding whitespace, as operator names are. A session already revoked or expired is
+    /// not counted.
+    ///
+    /// This is best effort on the store half: when `store` cannot be listed or written, the
+    /// memory half still ends the sessions this process holds.
+    pub fn revoke_sessions_for_login(&self, store: Option<&RedbStore>, login: &str) -> usize {
+        let wanted = login.trim();
+        if wanted.is_empty() {
+            return 0;
+        }
+        let now_ms = now_millis();
+        let matches = |entry: &StoredSessionEntry| {
+            !entry.revoked
+                && now_ms <= entry.expires_at_ms
+                && entry.login.trim().eq_ignore_ascii_case(wanted)
+        };
+        let mut revoked: BTreeMap<String, StoredSessionEntry> = BTreeMap::new();
+        {
+            // A poisoned lock is still the cache: failing open here would leave sessions alive.
+            let mut guard = self
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for entry in guard.sessions.values_mut() {
+                if matches(entry) {
+                    entry.revoked = true;
+                    revoked.insert(entry.token_hash.clone(), entry.clone());
+                }
+            }
+        }
+        if let Some(s) = store {
+            for mut entry in list_session_entries(s) {
+                if matches(&entry) {
+                    entry.revoked = true;
+                    revoked.insert(entry.token_hash.clone(), entry);
+                }
+            }
+            for entry in revoked.values() {
+                let _ = persist_session_entry(s, entry);
+            }
+        }
+        revoked.len()
+    }
+
     /// Authenticate an HTTP or WebSocket request following the 5-step priority order in Spec §2.2:
     /// 1. `Cookie: fl_hub_session=<token>` or `Authorization: Bearer <session_token>` -> `HubAuthority::Owner`
     /// 2. `Authorization: Bearer <owner_token>` (constant-time comparison) -> `HubAuthority::Owner`
@@ -805,6 +872,47 @@ mod tests {
             auth.verify_session_token(Some(&store), forged_token)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn revoking_a_login_ends_its_sessions_in_memory_and_in_the_store() {
+        let tmp = TempDir::new().unwrap();
+        let store = RedbStore::open(&tmp.path().join("store.redb")).unwrap();
+        let make = || AuthManager::new("lmcfarlin", Some("owner-secret".into()), None, false, 3600);
+        let auth = make();
+        let alice_1 = auth.mint_session(Some(&store), "Alice").unwrap();
+        let alice_2 = auth.mint_session(Some(&store), "alice").unwrap();
+        let bob = auth.mint_session(Some(&store), "bob").unwrap();
+        // A session that never reached the store (minted with none) is still ended.
+        let alice_memory_only = auth.mint_session(None, " ALICE ").unwrap();
+        let live = |a: &AuthManager, t: &str| a.verify_session_token(Some(&store), t).is_some();
+        assert!(live(&auth, &alice_1) && live(&auth, &alice_2) && live(&auth, &bob));
+
+        // A name that matches nothing revokes nothing, and a blank one never matches.
+        assert_eq!(auth.revoke_sessions_for_login(Some(&store), "carol"), 0);
+        assert_eq!(auth.revoke_sessions_for_login(Some(&store), "  "), 0);
+        assert!(live(&auth, &alice_1) && live(&auth, &bob));
+
+        // Case-insensitive, whitespace-tolerant, and it counts each session once.
+        assert_eq!(auth.revoke_sessions_for_login(Some(&store), " aLiCe "), 3);
+        for token in [&alice_1, &alice_2, &alice_memory_only] {
+            assert!(!live(&auth, token));
+        }
+        assert!(live(&auth, &bob), "another login's session is untouched");
+        // Already revoked sessions are not counted again.
+        assert_eq!(auth.revoke_sessions_for_login(Some(&store), "alice"), 0);
+
+        // The store holds the revocation: a manager with an empty cache (a restarted daemon)
+        // refuses the sessions too, and still accepts bob's.
+        let fresh = make();
+        assert!(!live(&fresh, &alice_1));
+        assert!(!live(&fresh, &alice_2));
+        assert!(live(&fresh, &bob));
+
+        // A session revoked from a cold cache (nothing in memory) is ended in the store.
+        let cold = make();
+        assert_eq!(cold.revoke_sessions_for_login(Some(&store), "bob"), 1);
+        assert!(!live(&make(), &bob));
     }
 
     #[test]

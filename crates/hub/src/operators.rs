@@ -26,6 +26,7 @@ use std::io::{self, Write};
 use std::num::NonZeroU32;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,6 +37,9 @@ use ring::{hmac, pbkdf2, signature};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+
+use fl_core::pr_policy::DEFAULT_OWNER_LOGIN;
+use fl_store::RedbStore;
 
 use crate::HubState;
 use crate::api::{HttpRequest, HttpResponse, hub_home_dir, percent_decode};
@@ -52,6 +56,11 @@ const MAX_TOTP_CODE_LEN: usize = 16;
 const MIN_CREDENTIAL_ID_LEN: usize = 16;
 const MAX_CREDENTIAL_ID_LEN: usize = 1024;
 const MAX_PASSKEYS_PER_OPERATOR: usize = 10;
+/// Most operators the file holds. With [`MAX_PASSKEYS_TOTAL`] it keeps the file far below
+/// [`MAX_FILE_BYTES`], so a file the hub wrote is never one it refuses to read.
+const MAX_OPERATORS: usize = 256;
+/// Most passkeys the file holds across all operators.
+const MAX_PASSKEYS_TOTAL: usize = 1024;
 /// Longest base64 field of a passkey assertion the login accepts.
 const MAX_ASSERTION_FIELD_LEN: usize = 8192;
 /// Most operator ids a path segment may name.
@@ -70,6 +79,9 @@ const PBKDF2_ITERATIONS: u32 = if cfg!(test) {
 };
 /// A stored iteration count above this is a damaged file, not a slow hash.
 const MAX_STORED_PBKDF2_ITERATIONS: u32 = 10_000_000;
+/// A stored iteration count below this is a downgraded or tampered hash and never verifies. It
+/// is the production cost; a test build keeps the cheap test constant as its floor.
+const MIN_STORED_PBKDF2_ITERATIONS: u32 = PBKDF2_ITERATIONS;
 const SALT_LEN: usize = 16;
 const HASH_LEN: usize = 32;
 static PBKDF2_ALG: pbkdf2::Algorithm = pbkdf2::PBKDF2_HMAC_SHA256;
@@ -91,6 +103,9 @@ const FAILURE_WINDOW: Duration = Duration::from_secs(300);
 const LOCKOUT: Duration = Duration::from_secs(60);
 const MAX_TRACKED_USERS: usize = 1024;
 const MAX_GLOBAL_FAILURES_PER_MINUTE: usize = 100;
+/// Credential verifications (PBKDF2, ECDSA) that may run at once, hub wide. A request that finds
+/// them all busy is answered 429 and charged nothing.
+const MAX_INFLIGHT_VERIFICATIONS: usize = 4;
 const MINUTE: Duration = Duration::from_secs(60);
 
 pub(crate) const NON_OWNER_LOGIN_MESSAGE: &str =
@@ -138,6 +153,11 @@ struct StoredPasskey {
     /// Last signature counter seen; 0 for an authenticator that keeps none.
     #[serde(default)]
     sign_count: u32,
+    /// The one origin this credential may log in from (`https://host[:port]`, or `http://` for a
+    /// loopback host), pinned at registration. A credential saved before origins were pinned has
+    /// none and is refused at login: its origin was never established, so none is guessed.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -247,6 +267,9 @@ pub(crate) enum OpError {
     /// `operators.json` exists but cannot be trusted. Never re-seeded.
     Unreadable,
     Io,
+    /// An exclusive create found the file already there. Internal: [`locked`] turns it into a
+    /// re-read, so it never reaches a response.
+    Exists,
     Rng,
     BadRequest(String),
     NotFound(String),
@@ -266,13 +289,18 @@ fn throttled(retry_after_secs: u64) -> HttpResponse {
         .with_header("Retry-After", retry_after_secs.to_string())
 }
 
+/// Every verification slot is taken. Nothing was charged and nothing was checked.
+fn busy() -> HttpResponse {
+    throttled(1)
+}
+
 fn op_error_response(err: OpError) -> HttpResponse {
     match err {
         OpError::Unreadable => error_json(
             500,
             "the operator store is unreadable; it was left untouched",
         ),
-        OpError::Io => error_json(500, "could not save the operator store"),
+        OpError::Io | OpError::Exists => error_json(500, "could not save the operator store"),
         OpError::Rng => error_json(500, "no secure randomness available"),
         OpError::BadRequest(msg) => error_json(400, &msg),
         OpError::NotFound(msg) => error_json(404, &msg),
@@ -365,7 +393,7 @@ fn verify_password(op: &StoredOperator, password: &str) -> bool {
     let (Some(hash), Some(salt)) = (hex_decode(hash), hex_decode(salt)) else {
         return false;
     };
-    if iterations > MAX_STORED_PBKDF2_ITERATIONS {
+    if !(MIN_STORED_PBKDF2_ITERATIONS..=MAX_STORED_PBKDF2_ITERATIONS).contains(&iterations) {
         return false;
     }
     let Some(iterations) = NonZeroU32::new(iterations) else {
@@ -509,12 +537,17 @@ struct UserFailures {
     last_seen: Instant,
 }
 
-/// Failed-login accounting. The clock is an argument, so a test never sleeps.
+/// Login-attempt accounting. The clock is an argument, so a test never sleeps.
 ///
-/// After [`MAX_FAILURES`] failures inside [`FAILURE_WINDOW`] a name is refused for
-/// [`LOCKOUT`]. The count is kept when the lockout ends, so every further failure locks it
-/// again. A success clears the name. Names are capped at [`MAX_TRACKED_USERS`]; a locked name
-/// is evicted last. A coarse global limit bounds the guessing rate across all names.
+/// An attempt is charged BEFORE its credential is checked: [`Throttle::reserve`] tests the limit
+/// and counts the attempt in one critical section, so concurrent requests cannot all pass a
+/// check that none of them has charged yet. A success clears the name; every other outcome
+/// leaves the charge in place, so a failure needs no later bookkeeping.
+///
+/// After [`MAX_FAILURES`] charged attempts inside [`FAILURE_WINDOW`] a name is refused for
+/// [`LOCKOUT`]. The count is kept when the lockout ends, so every further attempt locks it
+/// again. Names are capped at [`MAX_TRACKED_USERS`]; a locked name is evicted last. A coarse
+/// global limit bounds the attempt rate across all names.
 #[derive(Debug, Default)]
 pub(crate) struct Throttle {
     users: HashMap<String, UserFailures>,
@@ -555,7 +588,20 @@ impl Throttle {
         None
     }
 
-    pub(crate) fn record_failure(&mut self, key: &str, now: Instant) {
+    /// Check the limits and charge one attempt to `key`, atomically. `Err(wait)` is the seconds
+    /// to wait; nothing is charged then. Call it under the throttle mutex and BEFORE verifying
+    /// the credential.
+    pub(crate) fn reserve(&mut self, key: &str, now: Instant) -> Result<(), u64> {
+        if let Some(wait) = self.retry_after(key, now) {
+            return Err(wait);
+        }
+        self.charge(key, now);
+        Ok(())
+    }
+
+    /// Count one attempt against `key` and the whole hub, whatever the limits say. Used directly
+    /// only for a second step of a request that [`Throttle::reserve`] already admitted.
+    pub(crate) fn charge(&mut self, key: &str, now: Instant) {
         self.global.push_back(now);
         while self.global.len() > MAX_GLOBAL_FAILURES_PER_MINUTE * 4 {
             self.global.pop_front();
@@ -657,11 +703,29 @@ impl Challenges {
     }
 }
 
-/// The in-memory half of operator login: throttling and passkey challenges.
+/// The in-memory half of operator login: throttling, passkey challenges and the cap on
+/// credential verifications running at once.
 #[derive(Default)]
 pub(crate) struct LoginGuard {
     throttle: Mutex<Throttle>,
     challenges: Mutex<Challenges>,
+    inflight: AtomicUsize,
+    /// How many credential verifications started (test builds only).
+    #[cfg(test)]
+    verifications: AtomicUsize,
+    /// Run at the start of every verification (test builds only).
+    #[cfg(test)]
+    verify_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+}
+
+/// One of the [`MAX_INFLIGHT_VERIFICATIONS`] slots. Dropping it, on any path including a panic,
+/// frees the slot.
+pub(crate) struct VerifyPermit<'a>(&'a AtomicUsize);
+
+impl Drop for VerifyPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl std::fmt::Debug for LoginGuard {
@@ -679,6 +743,33 @@ impl LoginGuard {
         self.challenges
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Take a verification slot, or `None` when all are busy. Never waits.
+    fn try_verify_permit(&self) -> Option<VerifyPermit<'_>> {
+        self.inflight
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_INFLIGHT_VERIFICATIONS).then_some(n + 1)
+            })
+            .ok()?;
+        Some(VerifyPermit(&self.inflight))
+    }
+
+    /// Marks the start of one credential verification. A no-op outside test builds.
+    #[cfg(not(test))]
+    fn note_verification(&self) {}
+
+    #[cfg(test)]
+    fn note_verification(&self) {
+        self.verifications.fetch_add(1, Ordering::SeqCst);
+        let hook = self
+            .verify_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 }
 
@@ -718,6 +809,10 @@ fn write_file(home: &Path, file: &OperatorsFile, exclusive: bool) -> Result<(), 
     let dir = path.parent().ok_or(OpError::Io)?;
     fs::create_dir_all(dir).map_err(|_| OpError::Io)?;
     let bytes = serde_json::to_vec_pretty(file).map_err(|_| OpError::Io)?;
+    // Never write a file `read_file` would refuse to read back.
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(OpError::Io);
+    }
     let tmp = dir.join(format!(
         ".operators.json.tmp-{}-{}",
         std::process::id(),
@@ -741,10 +836,20 @@ fn write_file(home: &Path, file: &OperatorsFile, exclusive: bool) -> Result<(), 
         }
     });
     let _ = fs::remove_file(&tmp);
-    placed.map_err(|_| OpError::Io)
+    match placed {
+        Ok(()) => Ok(()),
+        Err(e) if exclusive && e.kind() == io::ErrorKind::AlreadyExists => Err(OpError::Exists),
+        Err(_) => Err(OpError::Io),
+    }
 }
 
+/// The first file: one owner, named `owner_login` trimmed. A blank name falls back to the
+/// default owner login, so an empty username is never seeded.
 fn seed_file(owner_login: &str) -> Result<OperatorsFile, OpError> {
+    let owner_login = match owner_login.trim() {
+        "" => DEFAULT_OWNER_LOGIN,
+        name => name,
+    };
     Ok(OperatorsFile {
         version: FILE_VERSION,
         operators: vec![StoredOperator {
@@ -765,9 +870,39 @@ fn seed_file(owner_login: &str) -> Result<OperatorsFile, OpError> {
     })
 }
 
+#[cfg(test)]
+type SeedRaceHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once, after a missing file was seen and before the seed is created (test builds
+    /// only): the place another process would win the race.
+    static SEED_RACE_HOOK: std::cell::RefCell<Option<SeedRaceHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The file as it is now, seeding it first when it is missing. The seed is created without ever
+/// replacing a file: when another process created one meanwhile, that file is read and used.
+fn read_or_seed(home: &Path, owner_login: &str) -> Result<OperatorsFile, OpError> {
+    if let Some(file) = read_file(home)? {
+        return Ok(file);
+    }
+    #[cfg(test)]
+    if let Some(hook) = SEED_RACE_HOOK.with(|h| h.borrow_mut().take()) {
+        hook(home);
+    }
+    let seed = seed_file(owner_login)?;
+    match write_file(home, &seed, true) {
+        Ok(()) => Ok(seed),
+        // Lost the race for the first file: the winner's file is the truth, not ours.
+        Err(OpError::Exists) => read_file(home)?.ok_or(OpError::Io),
+        Err(e) => Err(e),
+    }
+}
+
 /// Run `f` on the operator file under the process-wide lock. A missing file is seeded with the
-/// configured owner first, and is created without ever replacing a file that appears
-/// meanwhile. `f` returns its result and whether it changed the file; an error writes nothing.
+/// configured owner first (so it exists afterwards even when `f` fails). `f` returns its result
+/// and whether it changed the file; an error writes nothing more.
 fn locked<R>(
     home: &Path,
     owner_login: &str,
@@ -776,16 +911,9 @@ fn locked<R>(
     let _guard = OPERATORS_LOCK
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
-    let existing = read_file(home)?;
-    let existed = existing.is_some();
-    let mut file = match existing {
-        Some(file) => file,
-        None => seed_file(owner_login)?,
-    };
+    let mut file = read_or_seed(home, owner_login)?;
     let (out, changed) = f(&mut file)?;
-    if !existed {
-        write_file(home, &file, true)?;
-    } else if changed {
+    if changed {
         write_file(home, &file, false)?;
     }
     Ok(out)
@@ -807,6 +935,7 @@ fn operator_view(op: &StoredOperator) -> Value {
         "passkeys": op.passkeys.iter().map(|k| json!({
             "credential_id": k.credential_id,
             "label": k.label,
+            "origin": k.origin,
             "created_at_ms": k.created_at_ms,
         })).collect::<Vec<_>>(),
         "created_at_ms": op.created_at_ms,
@@ -880,16 +1009,17 @@ fn valid_credential_id(raw: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// The host a request addressed, lowercase, and its name without the port. `None` when the
-/// `Host` header is absent or not a plain `name[:port]`. There is no fallback: a passkey origin
-/// that cannot be established is refused, never guessed.
+/// A `host[:port]` as a browser writes it: lowercase, with its name apart from the port.
 struct HostInfo {
     host: String,
     hostname: String,
+    /// The port as written, if any.
+    port: Option<String>,
 }
 
-fn host_info(req: &HttpRequest) -> Option<HostInfo> {
-    let raw = req.headers.get("host")?.trim().to_ascii_lowercase();
+/// `raw` as a plain `name[:port]` (or `[v6][:port]`), else `None`.
+fn parse_host(raw: &str) -> Option<HostInfo> {
+    let raw = raw.trim().to_ascii_lowercase();
     if raw.is_empty()
         || raw.len() > 255
         || !raw
@@ -904,19 +1034,19 @@ fn host_info(req: &HttpRequest) -> Option<HostInfo> {
         let port = if after.is_empty() {
             None
         } else {
-            Some(after.strip_prefix(':')?)
+            Some(after.strip_prefix(':')?.to_string())
         };
         (format!("[{}]", &rest[..end]), port)
     } else {
         match raw.split_once(':') {
-            Some((h, p)) => (h.to_string(), Some(p)),
+            Some((h, p)) => (h.to_string(), Some(p.to_string())),
             None => (raw.clone(), None),
         }
     };
     if hostname.is_empty() || hostname == "[]" {
         return None;
     }
-    if let Some(port) = port
+    if let Some(port) = &port
         && (port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit()))
     {
         return None;
@@ -924,20 +1054,56 @@ fn host_info(req: &HttpRequest) -> Option<HostInfo> {
     Some(HostInfo {
         host: raw,
         hostname,
+        port,
     })
 }
 
 impl HostInfo {
-    /// `https` for any host; `http` only for a loopback host, the one place browsers run
-    /// WebAuthn without TLS.
-    fn allows_origin(&self, origin: &str) -> bool {
-        let origin = origin.to_ascii_lowercase();
-        if origin == format!("https://{}", self.host) {
-            return true;
-        }
-        let loopback = matches!(self.hostname.as_str(), "localhost" | "127.0.0.1" | "[::1]");
-        loopback && origin == format!("http://{}", self.host)
+    fn is_loopback(&self) -> bool {
+        matches!(self.hostname.as_str(), "localhost" | "127.0.0.1" | "[::1]")
     }
+}
+
+/// The origin a passkey is pinned to, and the relying-party id (its host name) that goes with it.
+#[derive(Debug, PartialEq, Eq)]
+struct PinnedOrigin {
+    /// `scheme://host[:port]`, lowercase, no default port, no path: the form a browser puts in
+    /// `clientData.origin`.
+    origin: String,
+    /// The host name without the port; the relying-party id whose SHA-256 the authenticator signs.
+    rp_id: String,
+}
+
+/// `https://<host>[:port]` for any host, `http://<host>[:port]` only for a loopback host (the one
+/// place browsers run WebAuthn without TLS). No path, query, userinfo or other scheme. A default
+/// port is dropped, as a browser drops it.
+fn parse_origin(raw: &str) -> Option<PinnedOrigin> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (scheme, rest) = match raw.strip_prefix("https://") {
+        Some(rest) => ("https", rest),
+        None => ("http", raw.strip_prefix("http://")?),
+    };
+    let host = parse_host(rest)?;
+    if scheme == "http" && !host.is_loopback() {
+        return None;
+    }
+    let default_port = if scheme == "https" { "443" } else { "80" };
+    let origin = match host.port.as_deref() {
+        Some(port) if port != default_port => format!("{scheme}://{}:{port}", host.hostname),
+        _ => format!("{scheme}://{}", host.hostname),
+    };
+    Some(PinnedOrigin {
+        origin,
+        rp_id: host.hostname,
+    })
+}
+
+/// The origin a registering request came from, by its `Host` header: `http` for a loopback host,
+/// `https` otherwise. `None` when the header is absent or not a plain `name[:port]`.
+fn origin_of_request(req: &HttpRequest) -> Option<PinnedOrigin> {
+    let host = parse_host(req.headers.get("host")?)?;
+    let scheme = if host.is_loopback() { "http" } else { "https" };
+    parse_origin(&format!("{scheme}://{}", host.host))
 }
 
 // --- passkeys -------------------------------------------------------------------------------
@@ -974,12 +1140,17 @@ struct Assertion {
 /// `authenticatorData || SHA256(clientDataJSON)`, and the counter. `Some(new_count)` only when
 /// all of them hold.
 ///
+/// The origin and the relying party come from `pinned`, the origin stored with the credential,
+/// never from the login request: a request's `Host` header is the caller's to choose, so
+/// checking an assertion against it would check the assertion against itself. `clientData.origin`
+/// must equal the pinned origin exactly, port included.
+///
 /// The counter is stricter than WebAuthn asks: once the stored count is nonzero, a new count
 /// must be greater, so a drop back to 0 is refused too.
 fn check_assertion(
     assertion: &Assertion,
     client_data: &ClientData,
-    host: &HostInfo,
+    pinned: &PinnedOrigin,
     public_key: &[u8],
     stored_count: u32,
 ) -> Option<u32> {
@@ -989,14 +1160,14 @@ fn check_assertion(
     if client_data.cross_origin == Some(true) {
         return None;
     }
-    if !host.allows_origin(client_data.origin.as_deref()?) {
+    if client_data.origin.as_deref()? != pinned.origin {
         return None;
     }
     let auth = &assertion.authenticator_data;
     if auth.len() < 37 {
         return None;
     }
-    let rp_id_hash = Sha256::digest(host.hostname.as_bytes());
+    let rp_id_hash = Sha256::digest(pinned.rp_id.as_bytes());
     if !ct_eq(&auth[..32], rp_id_hash.as_slice()) {
         return None;
     }
@@ -1017,35 +1188,73 @@ fn check_assertion(
 
 // --- login ----------------------------------------------------------------------------------
 
-/// Mint the session for a verified operator, or refuse a role that has no authority yet.
-/// A hub session is always Owner tier, so only an `owner` account may be given one.
-fn finish_login(state: &HubState, username: &str, role: Role) -> HttpResponse {
-    if role != Role::Owner {
-        return error_json(403, NON_OWNER_LOGIN_MESSAGE);
+/// How a verified login ended, decided under the operators lock.
+enum LoginResult {
+    Minted {
+        token: String,
+        username: String,
+    },
+    /// The account is not an owner (any more): it gets no session.
+    NotOwner,
+    /// The account was deleted, or its password changed, since the credential was checked.
+    Gone,
+    MintFailed,
+}
+
+/// Mint the session for operator `id`, from inside [`locked`]: the existence and the role are
+/// re-read from the very `file` the lock protects, so a delete or demotion that landed while the
+/// credential was being verified wins, and one that lands next revokes this session (the revoke
+/// runs after the lock is released). A hub session is always Owner tier, so only an `owner`
+/// account may be given one. `password_hash`, when given, is the hash the password was verified
+/// against: a different one means the password was changed meanwhile.
+fn mint_under_lock(
+    state: &HubState,
+    store: Option<&RedbStore>,
+    file: &OperatorsFile,
+    id: &str,
+    password_hash: Option<&str>,
+) -> LoginResult {
+    let Some(op) = file.operators.iter().find(|o| o.id == id) else {
+        return LoginResult::Gone;
+    };
+    if password_hash.is_some_and(|hash| op.password_hash_hex.as_deref() != Some(hash)) {
+        return LoginResult::Gone;
     }
-    let store = state.open_store().ok();
-    match state.auth.mint_session(store.as_deref(), username) {
-        Ok(token) => HttpResponse::json(
-            200,
-            json!({
-                "ok": true,
-                "authority": { "tier": "owner", "login": username, "role": role.as_str() },
-            }),
-        )
-        .with_header(
-            "Set-Cookie",
-            format_session_set_cookie(&token, state.auth.session_ttl_secs()),
-        ),
-        Err(_) => error_json(500, "could not start a session"),
+    if op.role != Role::Owner {
+        return LoginResult::NotOwner;
+    }
+    match state.auth.mint_session(store, &op.username) {
+        Ok(token) => LoginResult::Minted {
+            token,
+            username: op.username.clone(),
+        },
+        Err(_) => LoginResult::MintFailed,
     }
 }
 
-fn fail_login(state: &HubState, key: &str) -> HttpResponse {
-    state
-        .login_guard
-        .throttle()
-        .record_failure(key, Instant::now());
-    invalid_credentials()
+/// The response for a [`LoginResult`], and whether the credential was good enough to clear the
+/// name's charged attempts (it was, unless the account vanished or the mint failed).
+fn login_response(result: LoginResult, state: &HubState) -> (HttpResponse, bool) {
+    match result {
+        LoginResult::Minted { token, username } => (
+            HttpResponse::json(
+                200,
+                json!({
+                    "ok": true,
+                    "authority": { "tier": "owner", "login": username, "role": "owner" },
+                    "session_token": token,
+                }),
+            )
+            .with_header(
+                "Set-Cookie",
+                format_session_set_cookie(&token, state.auth.session_ttl_secs()),
+            ),
+            true,
+        ),
+        LoginResult::NotOwner => (error_json(403, NON_OWNER_LOGIN_MESSAGE), true),
+        LoginResult::Gone => (invalid_credentials(), false),
+        LoginResult::MintFailed => (error_json(500, "could not start a session"), false),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1080,7 +1289,7 @@ pub(crate) fn handle_post_login(state: &HubState, req: &HttpRequest) -> HttpResp
             Ok(login) => login_password(state, login),
             Err(resp) => resp,
         },
-        "passkey" => login_passkey(state, req, &body),
+        "passkey" => login_passkey(state, &body),
         _ => error_json(400, "`mode` must be token, password or passkey"),
     }
 }
@@ -1129,11 +1338,13 @@ fn login_password(state: &HubState, login: PasswordLogin) -> HttpResponse {
         Ok(home) => home,
         Err(resp) => return resp,
     };
-    if let Some(wait) = state
-        .login_guard
-        .throttle()
-        .retry_after(&key, Instant::now())
-    {
+    // Bound the verifications running at once, then charge this attempt to the name BEFORE any
+    // password is checked: the check and the charge are one critical section, so a burst of
+    // concurrent requests for one name can have at most five of them evaluated.
+    let Some(_permit) = state.login_guard.try_verify_permit() else {
+        return busy();
+    };
+    if let Err(wait) = state.login_guard.throttle().reserve(&key, Instant::now()) {
         return throttled(wait);
     }
     let owner_login = state.auth.owner_login().to_string();
@@ -1149,44 +1360,79 @@ fn login_password(state: &HubState, login: PasswordLogin) -> HttpResponse {
     };
     // An unknown name, an account with no password and a wrong password all do one PBKDF2 and
     // answer alike.
+    state.login_guard.note_verification();
     let op = match op {
-        Some(op) if op.has_password() && verify_password(&op, &login.password) => op,
-        Some(op) if op.has_password() => return fail_login(state, &key),
+        Some(op) if op.has_password() => {
+            if !verify_password(&op, &login.password) {
+                return invalid_credentials();
+            }
+            op
+        }
         _ => {
             dummy_password_check(&login.password);
-            return fail_login(state, &key);
+            return invalid_credentials();
         }
     };
-    if op.totp_enabled {
+    let store = state.open_store().ok();
+    let result = if op.totp_enabled {
         // Only a verified password reaches here, so this reveals nothing to a guesser.
         let Some(code) = login.totp_code.as_deref().filter(|c| !c.trim().is_empty()) else {
             return HttpResponse::json(200, json!({ "ok": false, "requires_totp": true }));
         };
+        // The code is a second guess inside a request that was already admitted: charge it
+        // before it is checked, but never turn the request away halfway, which would tell a
+        // guesser the password was right.
+        state.login_guard.throttle().charge(&key, Instant::now());
         let id = op.id.clone();
-        let accepted = locked(&home, &owner_login, |file| {
+        let hash = op.password_hash_hex.clone();
+        let verified = locked(&home, &owner_login, |file| {
             let Some(i) = file.operators.iter().position(|o| o.id == id) else {
-                return Ok((false, false));
+                return Ok((None, false));
             };
             let target = &mut file.operators[i];
             let secret = target.totp_secret_base32.as_deref().and_then(base32_decode);
             let step =
                 secret.and_then(|s| verify_totp(&s, code, now_unix_secs(), target.last_totp_step));
-            match step {
-                Some(step) => {
-                    target.last_totp_step = Some(step);
-                    Ok((true, true))
-                }
-                None => Ok((false, false)),
-            }
+            let Some(step) = step else {
+                return Ok((None, false));
+            };
+            target.last_totp_step = Some(step);
+            Ok((
+                Some(mint_under_lock(
+                    state,
+                    store.as_deref(),
+                    file,
+                    &id,
+                    hash.as_deref(),
+                )),
+                true,
+            ))
         });
-        match accepted {
-            Ok(true) => {}
-            Ok(false) => return fail_login(state, &key),
+        match verified {
+            Ok(Some(result)) => result,
+            Ok(None) => return invalid_credentials(),
             Err(e) => return op_error_response(e),
         }
+    } else {
+        let id = op.id.clone();
+        let hash = op.password_hash_hex.clone();
+        // The account may have been demoted or deleted while the password was hashed.
+        let minted = locked(&home, &owner_login, |file| {
+            Ok((
+                mint_under_lock(state, store.as_deref(), file, &id, hash.as_deref()),
+                false,
+            ))
+        });
+        match minted {
+            Ok(result) => result,
+            Err(e) => return op_error_response(e),
+        }
+    };
+    let (resp, verified) = login_response(result, state);
+    if verified {
+        state.login_guard.throttle().clear(&key);
     }
-    state.login_guard.throttle().clear(&key);
-    finish_login(state, &op.username, op.role)
+    resp
 }
 
 /// A string field of a passkey login body, or `None` if absent, not a string or oversized.
@@ -1197,11 +1443,20 @@ fn assertion_field<'a>(body: &'a Map<String, Value>, name: &str) -> Option<&'a s
 }
 
 /// WebAuthn-style assertion login. Every failure, a missing field included, is the same 401.
-fn login_passkey(state: &HubState, req: &HttpRequest, body: &Map<String, Value>) -> HttpResponse {
+fn login_passkey(state: &HubState, body: &Map<String, Value>) -> HttpResponse {
     let home = match home_or_500(state) {
         Ok(home) => home,
         Err(resp) => return resp,
     };
+    let Some(_permit) = state.login_guard.try_verify_permit() else {
+        return busy();
+    };
+    let now = Instant::now();
+    // This route is public and reads the operator file: a request the hub-wide limit will turn
+    // away must not cost a file read, so the limit is tested first.
+    if let Some(wait) = state.login_guard.throttle().global_retry_after(now) {
+        return throttled(wait);
+    }
     let owner_login = state.auth.owner_login().to_string();
     let credential_id = assertion_field(body, "credential_id")
         .filter(|c| c.len() <= MAX_CREDENTIAL_ID_LEN)
@@ -1218,7 +1473,8 @@ fn login_passkey(state: &HubState, req: &HttpRequest, body: &Map<String, Value>)
         Err(e) => return op_error_response(e),
     };
     // A credential nobody holds is throttled under its own id, so the 429 comes after the same
-    // five failures whether or not the credential exists.
+    // five attempts whether or not the credential exists. The attempt is charged here, before
+    // the assertion is checked.
     let key = match &known {
         Some((op, _)) => op.username.to_ascii_lowercase(),
         None => format!(
@@ -1226,8 +1482,7 @@ fn login_passkey(state: &HubState, req: &HttpRequest, body: &Map<String, Value>)
             credential_id.chars().take(64).collect::<String>()
         ),
     };
-    let now = Instant::now();
-    if let Some(wait) = state.login_guard.throttle().retry_after(&key, now) {
+    if let Err(wait) = state.login_guard.throttle().reserve(&key, now) {
         return throttled(wait);
     }
 
@@ -1256,23 +1511,29 @@ fn login_passkey(state: &HubState, req: &HttpRequest, body: &Map<String, Value>)
         if !challenge_live {
             return None;
         }
-        let host = host_info(req)?;
+        // A credential saved before origins were pinned has no origin. Its origin was never
+        // established, so it cannot be checked, and it is refused rather than guessed from the
+        // `Host` header of this request, which the caller controls.
+        let pinned = parse_origin(key_entry.origin.as_deref()?)?;
         let public_key = decode_b64_flexible(&key_entry.public_key_b64)?;
+        state.login_guard.note_verification();
         let new_count = check_assertion(
             assertion,
             client_data,
-            &host,
+            &pinned,
             &public_key,
             key_entry.sign_count,
         )?;
         Some((op.id.clone(), key_entry.credential_id.clone(), new_count))
     })();
     let Some((operator_id, credential, new_count)) = verified else {
-        return fail_login(state, &key);
+        return invalid_credentials();
     };
 
     // Persist the counter against the file as it is now: a replay that raced this login finds
-    // the stored count already moved and fails the strict-increase rule.
+    // the stored count already moved and fails the strict-increase rule. The session is minted
+    // in the same critical section, so the role it checks is the role now.
+    let store = state.open_store().ok();
     let outcome = locked(&home, &owner_login, |file| {
         let Some(i) = file.operators.iter().position(|o| o.id == operator_id) else {
             return Ok((None, false));
@@ -1290,14 +1551,18 @@ fn login_passkey(state: &HubState, req: &HttpRequest, body: &Map<String, Value>)
         }
         let changed = entry.sign_count != new_count;
         entry.sign_count = new_count;
-        Ok((Some((op.username.clone(), op.role)), changed))
+        let result = mint_under_lock(state, store.as_deref(), file, &operator_id, None);
+        Ok((Some(result), changed))
     });
     match outcome {
-        Ok(Some((username, role))) => {
-            state.login_guard.throttle().clear(&key);
-            finish_login(state, &username, role)
+        Ok(Some(result)) => {
+            let (resp, verified) = login_response(result, state);
+            if verified {
+                state.login_guard.throttle().clear(&key);
+            }
+            resp
         }
-        Ok(None) => fail_login(state, &key),
+        Ok(None) => invalid_credentials(),
         Err(e) => op_error_response(e),
     }
 }
@@ -1398,12 +1663,16 @@ pub(crate) fn handle_post_operator(
         let owners = file.owner_count();
         if let Some(i) = file.find_username(&username) {
             let op = &mut file.operators[i];
+            // Sessions of this operator, and only this one, end when it loses owner authority or
+            // its password changes: a session is a credential that outlives the one it came from.
+            let mut revoke = false;
             if let Some(role) = role {
                 if op.role == Role::Owner && role != Role::Owner && owners == 1 {
                     return Err(OpError::Conflict(
                         "cannot demote the last owner".to_string(),
                     ));
                 }
+                revoke |= op.role == Role::Owner && role != Role::Owner;
                 op.role = role;
             }
             if let Some(name) = &body.display_name {
@@ -1413,8 +1682,15 @@ pub(crate) fn handle_post_operator(
                 op.password_hash_hex = Some(hash);
                 op.password_salt_hex = Some(salt);
                 op.password_iterations = Some(iterations);
+                revoke = true;
             }
-            return Ok(((operator_view(op), false), true));
+            let revoke = revoke.then(|| op.username.clone());
+            return Ok(((operator_view(op), false, revoke), true));
+        }
+        if file.operators.len() >= MAX_OPERATORS {
+            return Err(OpError::Conflict(format!(
+                "the hub already has {MAX_OPERATORS} operators"
+            )));
         }
         if !valid_username(&username) {
             return Err(OpError::BadRequest(
@@ -1446,15 +1722,27 @@ pub(crate) fn handle_post_operator(
         }
         let view = operator_view(&op);
         file.operators.push(op);
-        Ok(((view, true), true))
+        Ok(((view, true, None), true))
     });
     match result {
-        Ok((view, created)) => {
+        Ok((view, created, revoke)) => {
+            if let Some(login) = revoke {
+                revoke_login_sessions(state, &login);
+            }
             state.broadcast("operators", "operator.updated", view.clone());
-            HttpResponse::json(if created { 201 } else { 200 }, view)
+            HttpResponse::json(if created { 201 } else { 200 }, json!({ "operator": view }))
         }
         Err(e) => op_error_response(e),
     }
+}
+
+/// End every live session minted for `login`. The login of a session is the operator's username,
+/// matched the way operators are: ignoring ASCII case.
+fn revoke_login_sessions(state: &HubState, login: &str) -> usize {
+    let store = state.open_store().ok();
+    state
+        .auth
+        .revoke_sessions_for_login(store.as_deref(), login)
 }
 
 fn display_name_or(name: &str, fallback: &str) -> String {
@@ -1481,8 +1769,7 @@ fn decode_id_segment(raw: &str) -> Result<String, HttpResponse> {
 
 /// `DELETE /api/v1/auth/operators/:id` (Owner), by id or username.
 ///
-/// Sessions are not per-operator today (`AuthManager` keys them by token alone), so deleting an
-/// operator revokes no session.
+/// Every live session of the deleted operator's login is revoked, in memory and in the store.
 pub(crate) fn handle_delete_operator(
     state: &HubState,
     authority: &HubAuthority,
@@ -1514,6 +1801,7 @@ pub(crate) fn handle_delete_operator(
     });
     match result {
         Ok((id, username)) => {
+            revoke_login_sessions(state, &username);
             state.broadcast(
                 "operators",
                 "operator.deleted",
@@ -1605,7 +1893,9 @@ struct TotpVerifyBody {
 enum TotpVerify {
     NoSecret,
     WrongCode,
-    Verified(Value),
+    /// The updated operator, and the login whose sessions end because its live secret was
+    /// replaced.
+    Verified(Value, Option<String>),
 }
 
 /// `POST /api/v1/auth/totp/verify` (Owner): check a code against the pending secret (else the
@@ -1639,11 +1929,11 @@ pub(crate) fn handle_post_totp_verify(
             .trim()
             .to_ascii_lowercase()
     );
-    if let Some(wait) = state
-        .login_guard
-        .throttle()
-        .retry_after(&key, Instant::now())
-    {
+    // Charged before the code is checked; a success clears it.
+    let Some(_permit) = state.login_guard.try_verify_permit() else {
+        return busy();
+    };
+    if let Err(wait) = state.login_guard.throttle().reserve(&key, Instant::now()) {
         return throttled(wait);
     }
     let result = locked(&home, &owner_login, |file| {
@@ -1665,26 +1955,27 @@ pub(crate) fn handle_post_totp_verify(
         let Some(step) = step else {
             return Ok((TotpVerify::WrongCode, false));
         };
+        // Replacing a live secret ends the operator's sessions; enabling TOTP the first time
+        // does not.
+        let replaced = pending.is_some() && op.totp_secret_base32.is_some();
         op.totp_secret_base32 = Some(secret_b32);
         op.totp_pending_secret_base32 = None;
         op.totp_enabled = true;
         op.last_totp_step = Some(step);
-        Ok((TotpVerify::Verified(operator_view(op)), true))
+        let revoke = replaced.then(|| op.username.clone());
+        Ok((TotpVerify::Verified(operator_view(op), revoke), true))
     });
     match result {
-        Ok(TotpVerify::Verified(view)) => {
+        Ok(TotpVerify::Verified(view, revoke)) => {
             state.login_guard.throttle().clear(&key);
+            if let Some(login) = revoke {
+                revoke_login_sessions(state, &login);
+            }
             state.broadcast("operators", "operator.updated", view);
             HttpResponse::json(200, json!({ "ok": true, "totp_enabled": true }))
         }
         Ok(TotpVerify::NoSecret) => error_json(400, "no TOTP secret to verify; enrol first"),
-        Ok(TotpVerify::WrongCode) => {
-            state
-                .login_guard
-                .throttle()
-                .record_failure(&key, Instant::now());
-            error_json(401, "invalid code")
-        }
+        Ok(TotpVerify::WrongCode) => error_json(401, "invalid code"),
         Err(e) => op_error_response(e),
     }
 }
@@ -1696,10 +1987,14 @@ struct PasskeyRegisterBody {
     label: Option<String>,
     public_key_b64: String,
     username: Option<String>,
+    /// The origin the credential was created on. Default: the origin of this request, from its
+    /// `Host` header (`http` for a loopback host, `https` otherwise).
+    origin: Option<String>,
 }
 
 /// `POST /api/v1/auth/passkey/register` (Owner). The public key is the 65-byte uncompressed
-/// SEC1 P-256 point; a COSE key is refused.
+/// SEC1 P-256 point; a COSE key is refused. The credential is pinned to one origin, and login
+/// accepts it only from there.
 pub(crate) fn handle_post_passkey_register(
     state: &HubState,
     authority: &HubAuthority,
@@ -1736,6 +2031,17 @@ pub(crate) fn handle_post_passkey_register(
             "`public_key_b64` must be a 65-byte uncompressed SEC1 P-256 point (0x04 || X || Y)",
         );
     };
+    let pinned = match body.origin.as_deref() {
+        Some(raw) => parse_origin(raw),
+        None => origin_of_request(req),
+    };
+    let Some(pinned) = pinned else {
+        return error_json(
+            400,
+            "`origin` must be https://host[:port] (http only for localhost, 127.0.0.1 or [::1]); \
+             without it the request needs a plain `Host` header",
+        );
+    };
     let home = match home_or_500(state) {
         Ok(home) => home,
         Err(resp) => return resp,
@@ -1749,6 +2055,17 @@ pub(crate) fn handle_post_passkey_register(
                 "that credential is already registered".to_string(),
             ));
         }
+        if file
+            .operators
+            .iter()
+            .map(|o| o.passkeys.len())
+            .sum::<usize>()
+            >= MAX_PASSKEYS_TOTAL
+        {
+            return Err(OpError::Conflict(format!(
+                "the hub already has {MAX_PASSKEYS_TOTAL} passkeys"
+            )));
+        }
         let op = &mut file.operators[i];
         if op.passkeys.len() >= MAX_PASSKEYS_PER_OPERATOR {
             return Err(OpError::Conflict(
@@ -1761,6 +2078,7 @@ pub(crate) fn handle_post_passkey_register(
             public_key_b64,
             created_at_ms: now_millis(),
             sign_count: 0,
+            origin: Some(pinned.origin.clone()),
         });
         Ok(((op.passkeys.len(), operator_view(op)), true))
     });
@@ -1814,6 +2132,7 @@ mod tests {
     fn authed(method: &str, path: &str, token: &str, body: &Value) -> HttpRequest {
         HttpRequest::new(method, path)
             .with_header("Authorization", format!("Bearer {token}"))
+            .with_header("Host", HOST)
             .with_json_body(body)
     }
 
@@ -1897,7 +2216,11 @@ mod tests {
     }
 
     fn stored(tmp: &TempDir) -> OperatorsFile {
-        read_file(tmp.path()).unwrap().unwrap()
+        stored_in(tmp.path())
+    }
+
+    fn stored_in(home: &Path) -> OperatorsFile {
+        read_file(home).unwrap().unwrap()
     }
 
     fn mode_of(path: &Path) -> u32 {
@@ -2065,10 +2388,10 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..4 {
             assert_eq!(t.retry_after("alice", t0), None, "attempt {i}");
-            t.record_failure("alice", t0);
+            t.charge("alice", t0);
         }
         assert_eq!(t.retry_after("alice", t0), None);
-        t.record_failure("alice", t0);
+        t.charge("alice", t0);
         assert_eq!(t.retry_after("alice", t0), Some(60));
         assert_eq!(
             t.retry_after("alice", t0 + Duration::from_secs(30)),
@@ -2079,13 +2402,13 @@ mod tests {
         // The lockout ends after 60 s, but the count is kept: one more failure locks again.
         let later = t0 + Duration::from_secs(61);
         assert_eq!(t.retry_after("alice", later), None);
-        t.record_failure("alice", later);
+        t.charge("alice", later);
         assert_eq!(t.retry_after("alice", later), Some(60));
         // A success clears it.
         t.clear("alice");
         assert_eq!(t.retry_after("alice", later), None);
         for _ in 0..4 {
-            t.record_failure("alice", later);
+            t.charge("alice", later);
         }
         assert_eq!(t.retry_after("alice", later), None);
     }
@@ -2095,10 +2418,10 @@ mod tests {
         let mut t = Throttle::default();
         let t0 = Instant::now();
         for _ in 0..4 {
-            t.record_failure("alice", t0);
+            t.charge("alice", t0);
         }
         // Slow guessing never accumulates: the fifth failure starts a fresh count.
-        t.record_failure("alice", t0 + Duration::from_secs(301));
+        t.charge("alice", t0 + Duration::from_secs(301));
         assert_eq!(t.retry_after("alice", t0 + Duration::from_secs(301)), None);
     }
 
@@ -2107,11 +2430,11 @@ mod tests {
         let mut t = Throttle::default();
         let t0 = Instant::now();
         for _ in 0..5 {
-            t.record_failure("locked-victim", t0);
+            t.charge("locked-victim", t0);
         }
         for i in 0..(MAX_TRACKED_USERS + 200) {
             let now = t0 + Duration::from_millis(i as u64 + 1);
-            t.record_failure(&format!("user-{i}"), now);
+            t.charge(&format!("user-{i}"), now);
             // Keep the global window out of the way: this test is about the name cap.
             t.global.clear();
         }
@@ -2129,7 +2452,7 @@ mod tests {
         let t0 = Instant::now();
         for i in 0..MAX_GLOBAL_FAILURES_PER_MINUTE {
             assert_eq!(t.retry_after(&format!("u{i}"), t0), None);
-            t.record_failure(&format!("u{i}"), t0);
+            t.charge(&format!("u{i}"), t0);
         }
         // A name never seen before is refused: the hub as a whole is over its rate.
         assert!(t.retry_after("fresh", t0).is_some());
@@ -2160,24 +2483,12 @@ mod tests {
 
     #[test]
     fn host_and_origin_rules() {
-        let host = |h: &str| host_info(&HttpRequest::new("GET", "/").with_header("Host", h));
-        let h = host("hub.example.ts.net").unwrap();
-        assert_eq!(h.hostname, "hub.example.ts.net");
-        assert!(h.allows_origin("https://hub.example.ts.net"));
-        assert!(h.allows_origin("HTTPS://Hub.Example.ts.net"));
-        assert!(
-            !h.allows_origin("http://hub.example.ts.net"),
-            "no http off loopback"
+        let host = |h: &str| parse_host(h);
+        assert_eq!(
+            host("hub.example.ts.net").unwrap().hostname,
+            "hub.example.ts.net"
         );
-        assert!(!h.allows_origin("https://evil.example"));
-        assert!(!h.allows_origin("https://hub.example.ts.net.evil.example"));
-        assert!(!h.allows_origin(""));
-        let l = host("localhost:8420").unwrap();
-        assert_eq!(l.hostname, "localhost");
-        assert!(l.allows_origin("http://localhost:8420"));
-        assert!(l.allows_origin("https://localhost:8420"));
-        assert!(!l.allows_origin("http://localhost:9999"));
-        assert!(!l.allows_origin("http://localhost"));
+        assert_eq!(host("localhost:8420").unwrap().hostname, "localhost");
         assert_eq!(host("[::1]:8420").unwrap().hostname, "[::1]");
         for bad in [
             "",
@@ -2194,10 +2505,63 @@ mod tests {
         ] {
             assert!(host(bad).is_none(), "{bad:?}");
         }
-        assert!(
-            host_info(&HttpRequest::new("GET", "/")).is_none(),
-            "no Host, no origin"
+        let origin = |o: &str| parse_origin(o).map(|p| (p.origin, p.rp_id));
+        let some = |o: &str, rp: &str| Some((o.to_string(), rp.to_string()));
+        assert_eq!(
+            origin("https://hub.example.ts.net"),
+            some("https://hub.example.ts.net", "hub.example.ts.net")
         );
+        assert_eq!(
+            origin("HTTPS://Hub.Example.ts.net:8443"),
+            some("https://hub.example.ts.net:8443", "hub.example.ts.net")
+        );
+        assert_eq!(
+            origin("http://localhost:8420"),
+            some("http://localhost:8420", "localhost")
+        );
+        assert_eq!(
+            origin("https://localhost:8420"),
+            some("https://localhost:8420", "localhost")
+        );
+        assert_eq!(
+            origin("http://[::1]:8420"),
+            some("http://[::1]:8420", "[::1]")
+        );
+        // A default port is what a browser leaves out.
+        assert_eq!(
+            origin("https://hub.example.ts.net:443"),
+            some("https://hub.example.ts.net", "hub.example.ts.net")
+        );
+        for bad in [
+            "http://hub.example.ts.net",
+            "ftp://localhost",
+            "hub.example.ts.net",
+            "https://",
+            "https://hub.example.ts.net/",
+            "https://hub.example.ts.net/path",
+            "https://user@hub.example.ts.net",
+            "https://hub.example.ts.net:",
+            "",
+        ] {
+            assert_eq!(origin(bad), None, "{bad:?}");
+        }
+        let req = |h: Option<&str>| {
+            let mut r = HttpRequest::new("POST", "/");
+            if let Some(h) = h {
+                r = r.with_header("Host", h);
+            }
+            origin_of_request(&r).map(|p| p.origin)
+        };
+        assert_eq!(
+            req(Some("localhost:8420")).as_deref(),
+            Some("http://localhost:8420")
+        );
+        assert_eq!(
+            req(Some("hub.example.ts.net")).as_deref(),
+            Some("https://hub.example.ts.net")
+        );
+        assert_eq!(req(Some("a b")), None);
+        assert_eq!(req(None), None, "no Host, no origin");
     }
 
     // --- persistence and the seed -----------------------------------------------------------
@@ -2428,7 +2792,11 @@ mod tests {
 
         let created = create_operator(&state, "dana", "operator", None);
         assert_eq!(created.status, 201);
-        let view = json_of(&created);
+        let view = json_of(&created)["operator"].clone();
+        assert!(
+            json_of(&created).as_object().unwrap().len() == 1,
+            "the operator is nested, and only that"
+        );
         assert_eq!(view["username"], "dana");
         assert_eq!(view["display_name"], "dana", "defaults to the username");
         assert_eq!(view["role"], "operator");
@@ -2442,7 +2810,7 @@ mod tests {
             &json!({ "username": "dana", "display_name": " Dana D ", "role": "admin", "password": PASSWORD }),
         );
         assert_eq!(updated.status, 200);
-        let view = json_of(&updated);
+        let view = json_of(&updated)["operator"].clone();
         assert_eq!(view["id"], id, "an update keeps the id");
         assert_eq!(view["display_name"], "Dana D");
         assert_eq!(view["role"], "admin");
@@ -2456,8 +2824,8 @@ mod tests {
             &json!({ "username": "dana", "password": "another password" }),
         );
         assert_eq!(again.status, 200);
-        assert_eq!(json_of(&again)["role"], "admin");
-        assert_eq!(json_of(&again)["display_name"], "Dana D");
+        assert_eq!(json_of(&again)["operator"]["role"], "admin");
+        assert_eq!(json_of(&again)["operator"]["display_name"], "Dana D");
 
         let frames = drain(&mut rx);
         let events: Vec<_> = frames
@@ -2483,7 +2851,7 @@ mod tests {
             owner(&state, "DELETE", "/api/v1/auth/operators/dana", &json!({})).status,
             404
         );
-        let eve = json_of(&create_operator(&state, "eve", "viewer", None));
+        let eve = json_of(&create_operator(&state, "eve", "viewer", None))["operator"].clone();
         let by_id = format!("/api/v1/auth/operators/{}", eve["id"].as_str().unwrap());
         assert_eq!(owner(&state, "DELETE", &by_id, &json!({})).status, 200);
         assert_eq!(stored(&tmp).operators.len(), 1);
@@ -2754,12 +3122,16 @@ mod tests {
                 assert!(!text.contains(name), "field {name} leaked in {text}");
             }
         }
-        // The view's passkeys list holds exactly these three fields.
+        // The view's passkeys list holds exactly these four fields.
         let view = operator_view(frank);
         let key = &view["passkeys"][0];
         let mut fields: Vec<_> = key.as_object().unwrap().keys().cloned().collect();
         fields.sort();
-        assert_eq!(fields, ["created_at_ms", "credential_id", "label"]);
+        assert_eq!(
+            fields,
+            ["created_at_ms", "credential_id", "label", "origin"]
+        );
+        assert_eq!(key["origin"], "http://localhost:8420");
         let mut top: Vec<_> = view.as_object().unwrap().keys().cloned().collect();
         top.sort();
         assert_eq!(
@@ -2796,12 +3168,17 @@ mod tests {
         );
         let resp = password_login(&state, "grace", PASSWORD);
         assert_eq!(resp.status, 200, "{}", body_text(&resp));
+        let body = json_of(&resp);
         assert_eq!(
-            json_of(&resp),
-            json!({ "ok": true, "authority": { "tier": "owner", "login": "grace", "role": "owner" } })
+            body["authority"],
+            json!({ "tier": "owner", "login": "grace", "role": "owner" })
         );
-        assert!(!body_text(&resp).contains("session_token"));
+        assert_eq!(body["ok"], true);
         let cookie = set_cookie(&resp).unwrap();
+        // The body carries the same token as the cookie, for a client that cannot read cookies.
+        let token = body["session_token"].as_str().unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(cookie.starts_with(&format!("fl_hub_session={token};")));
         assert!(cookie.starts_with("fl_hub_session="));
         assert!(cookie.contains("HttpOnly") && cookie.contains("SameSite=Strict"));
         let session = session_via_cookie(&state, &resp);
@@ -3069,7 +3446,14 @@ mod tests {
         secret
     }
 
+    /// Every attempt is charged before it is checked, so a test that makes many attempts for one
+    /// name clears the charge first; the lockout tests use [`totp_login_raw`].
     fn totp_login(state: &HubState, username: &str, code: Option<&str>) -> HttpResponse {
+        state.login_guard.throttle().clear(username);
+        totp_login_raw(state, username, code)
+    }
+
+    fn totp_login_raw(state: &HubState, username: &str, code: Option<&str>) -> HttpResponse {
         let mut body = json!({ "mode": "password", "username": username, "password": PASSWORD });
         if let Some(code) = code {
             body["totp_code"] = json!(code);
@@ -3325,13 +3709,14 @@ mod tests {
         let state = state(&tmp);
         create_operator(&state, "tina", "owner", Some(PASSWORD));
         let secret = enable_totp(&state, "tina");
-        for _ in 0..5 {
-            assert_eq!(totp_login(&state, "tina", Some("000000")).status, 401);
+        // A request with a code is charged twice (the password step, then the code), so the
+        // lockout lands inside the third wrong code; the fourth request is never evaluated.
+        for _ in 0..3 {
+            assert_eq!(totp_login_raw(&state, "tina", Some("000000")).status, 401);
         }
-        assert_eq!(
-            totp_login(&state, "tina", Some(&code_at(&secret, 1))).status,
-            429
-        );
+        let locked_out = totp_login_raw(&state, "tina", Some(&code_at(&secret, 1)));
+        assert_eq!(locked_out.status, 429);
+        assert!(header(&locked_out, "retry-after").is_some());
     }
 
     #[test]
@@ -3404,25 +3789,30 @@ mod tests {
         username: String,
     }
 
-    /// A hub with an operator of `role` holding one registered passkey.
+    /// A hub with an operator of `role` holding one registered passkey, pinned to the origin of
+    /// the registering request (`http://localhost:8420`).
     fn fx(role: &str) -> Fx {
+        fx_with_origin(role, None)
+    }
+
+    /// [`fx`] with an explicit pinned origin.
+    fn fx_with_origin(role: &str, origin: Option<&str>) -> Fx {
         let tmp = TempDir::new().unwrap();
         let state = state(&tmp);
         let username = format!("pk-{role}");
         assert_eq!(create_operator(&state, &username, role, None).status, 201);
         let (key, public) = new_keypair();
         let cred = URL_SAFE_NO_PAD.encode(random_array::<24>().unwrap());
-        let reg = owner(
-            &state,
-            "POST",
-            "/api/v1/auth/passkey/register",
-            &json!({
-                "username": username,
-                "credential_id": cred,
-                "label": "test key",
-                "public_key_b64": URL_SAFE_NO_PAD.encode(&public),
-            }),
-        );
+        let mut reg_body = json!({
+            "username": username,
+            "credential_id": cred,
+            "label": "test key",
+            "public_key_b64": URL_SAFE_NO_PAD.encode(&public),
+        });
+        if let Some(origin) = origin {
+            reg_body["origin"] = json!(origin);
+        }
+        let reg = owner(&state, "POST", "/api/v1/auth/passkey/register", &reg_body);
         assert_eq!(reg.status, 200, "{}", body_text(&reg));
         Fx {
             _tmp: tmp,
@@ -3502,9 +3892,17 @@ mod tests {
         let fx = fx("owner");
         let resp = passkey_login(&fx, &opts(&fx.state, 1));
         assert_eq!(resp.status, 200, "{}", body_text(&resp));
+        let body = json_of(&resp);
+        assert_eq!(body["ok"], true);
         assert_eq!(
-            json_of(&resp),
-            json!({ "ok": true, "authority": { "tier": "owner", "login": fx.username, "role": "owner" } })
+            body["authority"],
+            json!({ "tier": "owner", "login": fx.username, "role": "owner" })
+        );
+        let token = body["session_token"].as_str().unwrap();
+        assert!(
+            set_cookie(&resp)
+                .unwrap()
+                .starts_with(&format!("fl_hub_session={token};"))
         );
         let session = session_via_cookie(&fx.state, &resp);
         assert_eq!(
@@ -3521,7 +3919,7 @@ mod tests {
 
     #[test]
     fn a_passkey_over_https_on_a_real_host_logs_in() {
-        let fx = fx("owner");
+        let fx = fx_with_origin("owner", Some("https://hub.example.ts.net"));
         let mut o = opts(&fx.state, 1);
         o.origin = "https://hub.example.ts.net".into();
         o.rp_host = "hub.example.ts.net";
@@ -3673,24 +4071,207 @@ mod tests {
     }
 
     #[test]
-    fn an_origin_that_cannot_be_established_is_refused() {
+    fn the_login_ignores_the_host_header_and_uses_the_pinned_origin() {
         let fx = fx("owner");
-        let body = assertion_body(&fx.cred, &assertion_parts(&fx.key, &opts(&fx.state, 1)));
-        for host in [None, Some(""), Some("not a host"), Some("a/b")] {
+        // Whatever the login request's Host says, or does not say, the stored origin decides.
+        for host in [
+            None,
+            Some(""),
+            Some("not a host"),
+            Some("a/b"),
+            Some("evil.example"),
+        ] {
+            let body = assertion_body(&fx.cred, &assertion_parts(&fx.key, &opts(&fx.state, 0)));
             let resp = public(&fx.state, "/api/v1/auth/login", host, &body);
-            assert_refused(&fx, &resp, &format!("{host:?}"));
+            assert_eq!(resp.status, 200, "{host:?}: {}", body_text(&resp));
         }
-        // Not guessed from the configured listen address either.
-        let o = opts(&fx.state, 1);
-        let mut o = o;
-        o.origin = "http://127.0.0.1:0".into();
-        o.rp_host = "127.0.0.1";
-        let body = assertion_body(&fx.cred, &assertion_parts(&fx.key, &o));
+    }
+
+    #[test]
+    fn an_assertion_for_another_origin_is_refused_even_when_host_is_spoofed_to_match() {
+        // The key and the rp id match; only the origin differs from the pinned one.
+        for (what, origin, rp_host, host) in [
+            ("other port", "http://localhost:9999", "localhost", HOST),
+            (
+                "other port, Host spoofed to it",
+                "http://localhost:9999",
+                "localhost",
+                "localhost:9999",
+            ),
+            (
+                "other host, Host spoofed to it",
+                "https://evil.example",
+                "evil.example",
+                "evil.example",
+            ),
+            (
+                "https where http is pinned, Host spoofed",
+                "https://localhost:8420",
+                "localhost",
+                HOST,
+            ),
+            (
+                "right origin, other rp id",
+                "http://localhost:8420",
+                "evil.example",
+                HOST,
+            ),
+        ] {
+            let fx = fx("owner");
+            let mut o = opts(&fx.state, 1);
+            o.origin = origin.into();
+            o.rp_host = rp_host;
+            let body = assertion_body(&fx.cred, &assertion_parts(&fx.key, &o));
+            let resp = public(&fx.state, "/api/v1/auth/login", Some(host), &body);
+            assert_refused(&fx, &resp, what);
+        }
+    }
+
+    #[test]
+    fn the_pinned_origin_is_exact_including_port_and_works_from_any_host_header() {
+        let fx = fx_with_origin("owner", Some("https://hub.example.ts.net:8443"));
+        let mut o = opts(&fx.state, 1);
+        o.origin = "https://hub.example.ts.net".into();
+        o.rp_host = "hub.example.ts.net";
+        let no_port = assertion_body(&fx.cred, &assertion_parts(&fx.key, &o));
         assert_refused(
             &fx,
-            &public(&fx.state, "/api/v1/auth/login", None, &body),
-            "no Host",
+            &public(
+                &fx.state,
+                "/api/v1/auth/login",
+                Some("hub.example.ts.net"),
+                &no_port,
+            ),
+            "port dropped",
         );
+        // The same credential from its pinned origin, with a different Host header.
+        let mut o = opts(&fx.state, 1);
+        o.origin = "https://hub.example.ts.net:8443".into();
+        o.rp_host = "hub.example.ts.net";
+        let ok = assertion_body(&fx.cred, &assertion_parts(&fx.key, &o));
+        let resp = public(
+            &fx.state,
+            "/api/v1/auth/login",
+            Some("proxy.internal:3000"),
+            &ok,
+        );
+        assert_eq!(resp.status, 200, "{}", body_text(&resp));
+    }
+
+    #[test]
+    fn a_credential_without_a_pinned_origin_is_refused() {
+        let fx = fx("owner");
+        // Remove the field from the file, as one written before origins were pinned has it.
+        let path = file_path(&fx._tmp);
+        let mut raw: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for op in raw["operators"].as_array_mut().unwrap() {
+            for key in op["passkeys"].as_array_mut().unwrap() {
+                assert!(key.as_object_mut().unwrap().remove("origin").is_some());
+            }
+        }
+        fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let old = stored(&fx._tmp);
+        assert!(
+            old.operators
+                .iter()
+                .flat_map(|o| &o.passkeys)
+                .all(|k| k.origin.is_none())
+        );
+        let resp = passkey_login(&fx, &opts(&fx.state, 1));
+        assert_refused(&fx, &resp, "legacy credential");
+    }
+
+    #[test]
+    fn registration_pins_the_origin_from_the_body_or_the_request_and_validates_it() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let (_, public_key) = new_keypair();
+        let register_with = |cred: &str, origin: Option<&str>, host: Option<&str>| {
+            let mut body = json!({
+                "credential_id": cred,
+                "public_key_b64": URL_SAFE_NO_PAD.encode(&public_key),
+            });
+            if let Some(origin) = origin {
+                body["origin"] = json!(origin);
+            }
+            let mut req = HttpRequest::new("POST", "/api/v1/auth/passkey/register")
+                .with_header("Authorization", format!("Bearer {OWNER_TOKEN}"))
+                .with_json_body(&body);
+            if let Some(host) = host {
+                req = req.with_header("Host", host);
+            }
+            handle_http_request(&state, &req)
+        };
+        let origin_of = |cred: &str| {
+            let file = stored(&tmp);
+            let (i, j) = file.find_credential(cred).unwrap();
+            file.operators[i].passkeys[j].origin.clone()
+        };
+        assert_eq!(
+            register_with("cred-from-host-aaaa1", None, Some("localhost:8420")).status,
+            200
+        );
+        assert_eq!(
+            origin_of("cred-from-host-aaaa1").as_deref(),
+            Some("http://localhost:8420")
+        );
+        assert_eq!(
+            register_with("cred-from-host-aaaa2", None, Some("hub.example.ts.net")).status,
+            200
+        );
+        assert_eq!(
+            origin_of("cred-from-host-aaaa2").as_deref(),
+            Some("https://hub.example.ts.net")
+        );
+        // The body wins over the Host header.
+        assert_eq!(
+            register_with(
+                "cred-from-body-aaaa3",
+                Some("HTTPS://Hub.Example:8443"),
+                Some("localhost:1")
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            origin_of("cred-from-body-aaaa3").as_deref(),
+            Some("https://hub.example:8443")
+        );
+        // The listing shows it; it is not a secret.
+        let list = json_of(&owner(&state, "GET", "/api/v1/auth/operators", &json!({})));
+        assert!(
+            body_text(&owner(&state, "GET", "/api/v1/auth/operators", &json!({})))
+                .contains("https://hub.example:8443")
+        );
+        assert_eq!(
+            list["operators"][0]["passkeys"].as_array().unwrap().len(),
+            3
+        );
+        // Refused: no origin to pin, plain http off loopback, junk.
+        for (cred, origin, host) in [
+            ("cred-refused-aaaaa1", None, None),
+            ("cred-refused-aaaaa2", None, Some("a b")),
+            (
+                "cred-refused-aaaaa3",
+                Some("http://hub.example.ts.net"),
+                Some("localhost:8420"),
+            ),
+            (
+                "cred-refused-aaaaa4",
+                Some("hub.example.ts.net"),
+                Some("localhost:8420"),
+            ),
+            (
+                "cred-refused-aaaaa5",
+                Some("https://hub.example.ts.net/x"),
+                Some("localhost:8420"),
+            ),
+            ("cred-refused-aaaaa6", Some(""), Some("localhost:8420")),
+        ] {
+            let resp = register_with(cred, origin, host);
+            assert_eq!(resp.status, 400, "{cred}: {}", body_text(&resp));
+            assert!(stored(&tmp).find_credential(cred).is_none());
+        }
     }
 
     #[test]
@@ -3983,5 +4564,843 @@ mod tests {
                 .unwrap()
                 .contains("FerroLoop:boss?")
         );
+    }
+
+    // --- throttling under concurrency (charge before check) -----------------------------------
+
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    fn set_hook(state: &HubState, hook: impl Fn() + Send + Sync + 'static) {
+        *state
+            .login_guard
+            .verify_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(hook));
+    }
+
+    fn clear_hook(state: &HubState) {
+        *state
+            .login_guard
+            .verify_hook
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    fn evaluated(state: &HubState) -> usize {
+        state.login_guard.verifications.load(Ordering::SeqCst)
+    }
+
+    #[test]
+    fn a_burst_of_concurrent_logins_for_one_name_evaluates_at_most_five() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "burst", "owner", Some(PASSWORD));
+        // A slow verification, so requests overlap the way 600k-round PBKDF2 makes them.
+        set_hook(&state, || std::thread::sleep(Duration::from_millis(15)));
+        let refused = AtomicUsize::new(0);
+        let throttled_count = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..64 {
+                scope.spawn(|| {
+                    for _ in 0..40 {
+                        let resp = password_login(&state, "burst", "not the password");
+                        match resp.status {
+                            401 => refused.fetch_add(1, Ordering::SeqCst),
+                            429 => throttled_count.fetch_add(1, Ordering::SeqCst),
+                            other => panic!("unexpected status {other}"),
+                        };
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+            }
+        });
+        let seen = evaluated(&state);
+        assert!(
+            (1..=MAX_FAILURES as usize).contains(&seen),
+            "{seen} guesses were evaluated; the limit is {MAX_FAILURES}"
+        );
+        assert_eq!(
+            refused.load(Ordering::SeqCst),
+            seen,
+            "every 401 was an evaluation"
+        );
+        assert!(throttled_count.load(Ordering::SeqCst) > 0);
+        // The right password is refused too while the name is locked, and evaluates nothing.
+        assert_eq!(password_login(&state, "burst", PASSWORD).status, 429);
+        assert_eq!(evaluated(&state), seen);
+    }
+
+    #[test]
+    fn sequential_guesses_stop_being_evaluated_after_five() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "seq", "owner", Some(PASSWORD));
+        for i in 0..5 {
+            assert!(
+                is_invalid_credentials(&password_login(&state, "seq", "wrong password")),
+                "{i}"
+            );
+        }
+        assert_eq!(evaluated(&state), 5);
+        for _ in 0..3 {
+            let resp = password_login(&state, "seq", "wrong password");
+            assert_eq!(resp.status, 429);
+            assert!(header(&resp, "retry-after").is_some());
+        }
+        assert_eq!(evaluated(&state), 5, "a locked name is never evaluated");
+    }
+
+    #[test]
+    fn a_burst_cannot_exceed_the_global_inflight_cap() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        {
+            let (current, peak) = (current.clone(), peak.clone());
+            set_hook(&state, move || {
+                let now = current.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                current.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+        let busy_seen = AtomicUsize::new(0);
+        // Distinct names, so no per-name limit gets in the way: only the cap can hold them back.
+        std::thread::scope(|scope| {
+            for i in 0..48 {
+                let (state, busy_seen) = (&state, &busy_seen);
+                scope.spawn(move || {
+                    let resp = password_login(state, &format!("name{i}"), "wrong password");
+                    match resp.status {
+                        401 => {}
+                        429 => {
+                            assert_eq!(header(&resp, "retry-after").as_deref(), Some("1"));
+                            busy_seen.fetch_add(1, Ordering::SeqCst);
+                        }
+                        other => panic!("unexpected status {other}"),
+                    }
+                });
+            }
+        });
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak <= MAX_INFLIGHT_VERIFICATIONS, "peak {peak}");
+        assert!(peak >= 2, "the burst did overlap (peak {peak})");
+        assert!(busy_seen.load(Ordering::SeqCst) > 0, "the overflow got 429");
+        assert_eq!(
+            state.login_guard.inflight.load(Ordering::SeqCst),
+            0,
+            "every slot came back"
+        );
+        // A busy answer charged nothing: only the evaluated attempts are on any name.
+        assert_eq!(
+            state.login_guard.throttle().tracked_users(),
+            evaluated(&state)
+        );
+    }
+
+    #[test]
+    fn a_verification_slot_is_released_on_every_path_including_a_panic() {
+        let guard = LoginGuard::default();
+        let permits: Vec<_> = (0..MAX_INFLIGHT_VERIFICATIONS)
+            .map(|_| guard.try_verify_permit().expect("a free slot"))
+            .collect();
+        assert!(
+            guard.try_verify_permit().is_none(),
+            "never waits, never over the cap"
+        );
+        drop(permits);
+        assert!(guard.try_verify_permit().is_some());
+
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "boom", "owner", Some(PASSWORD));
+        set_hook(&state, || panic!("verifier blew up"));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            password_login(&state, "boom", "wrong password")
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(state.login_guard.inflight.load(Ordering::SeqCst), 0);
+        clear_hook(&state);
+        assert_eq!(password_login(&state, "boom", PASSWORD).status, 200);
+    }
+
+    #[test]
+    fn a_successful_login_clears_the_charged_attempts_even_on_the_last_one() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "clara", "owner", Some(PASSWORD));
+        for _ in 0..4 {
+            assert!(is_invalid_credentials(&password_login(
+                &state,
+                "clara",
+                "wrong password"
+            )));
+        }
+        assert_eq!(
+            state.login_guard.throttle().tracked_users(),
+            1,
+            "four attempts are charged"
+        );
+        // The fifth attempt is admitted (and charged, which locks the name), then it succeeds.
+        assert_eq!(password_login(&state, "clara", PASSWORD).status, 200);
+        assert_eq!(
+            state.login_guard.throttle().tracked_users(),
+            0,
+            "the success cleared them"
+        );
+        for _ in 0..4 {
+            assert!(is_invalid_credentials(&password_login(
+                &state,
+                "clara",
+                "wrong password"
+            )));
+        }
+    }
+
+    #[test]
+    fn a_burst_of_passkey_assertions_for_one_credential_evaluates_at_most_five() {
+        let fx = fx("owner");
+        let (other_key, _) = new_keypair();
+        // Fresh challenges and a signature by the wrong key; the retries reuse a body whose
+        // challenge the first request spent.
+        let bodies: Vec<Value> = (0..16)
+            .map(|_| {
+                let o = opts(&fx.state, 1);
+                assertion_body(&fx.cred, &assertion_parts(&other_key, &o))
+            })
+            .collect();
+        set_hook(&fx.state, || std::thread::sleep(Duration::from_millis(10)));
+        let refused = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for body in &bodies {
+                let (state, refused) = (&fx.state, &refused);
+                scope.spawn(move || {
+                    for _ in 0..30 {
+                        match login(state, body).status {
+                            401 => refused.fetch_add(1, Ordering::SeqCst),
+                            429 => 0,
+                            other => panic!("unexpected status {other}"),
+                        };
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+            }
+        });
+        let seen = evaluated(&fx.state);
+        assert!(seen <= MAX_FAILURES as usize, "{seen} assertions evaluated");
+        assert!(refused.load(Ordering::SeqCst) <= MAX_FAILURES as usize);
+        // The good assertion is refused now too: the credential's owner is locked.
+        assert_eq!(passkey_login(&fx, &opts(&fx.state, 1)).status, 429);
+    }
+
+    #[test]
+    fn a_burst_of_totp_verifications_for_one_operator_evaluates_at_most_five() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "tess", "owner", None);
+        let enroll = owner(
+            &state,
+            "POST",
+            "/api/v1/auth/totp/enroll",
+            &json!({ "username": "tess" }),
+        );
+        assert_eq!(enroll.status, 200);
+        let refused = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                scope.spawn(|| {
+                    for _ in 0..10 {
+                        let resp = owner(
+                            &state,
+                            "POST",
+                            "/api/v1/auth/totp/verify",
+                            &json!({ "username": "tess", "code": "000000" }),
+                        );
+                        match resp.status {
+                            401 => refused.fetch_add(1, Ordering::SeqCst),
+                            429 => 0,
+                            other => panic!("unexpected status {other}"),
+                        };
+                    }
+                });
+            }
+        });
+        assert!(refused.load(Ordering::SeqCst) <= MAX_FAILURES as usize);
+        assert!(refused.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn passkey_logins_are_turned_away_by_the_global_limit_before_any_file_is_read() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        {
+            let mut throttle = state.login_guard.throttle();
+            let now = Instant::now();
+            for i in 0..MAX_GLOBAL_FAILURES_PER_MINUTE {
+                throttle.charge(&format!("flood-{i}"), now);
+            }
+        }
+        assert!(!file_path(&tmp).exists());
+        let resp = login(
+            &state,
+            &json!({ "mode": "passkey", "credential_id": "x".repeat(24) }),
+        );
+        assert_eq!(resp.status, 429);
+        assert!(header(&resp, "retry-after").is_some());
+        // Reading the file would have seeded it.
+        assert!(
+            !file_path(&tmp).exists(),
+            "a throttled request did no file IO"
+        );
+    }
+
+    // --- session revocation -------------------------------------------------------------------
+
+    fn session_status(state: &HubState, resp: &HttpResponse) -> u16 {
+        session_via_cookie(state, resp).status
+    }
+
+    fn bearer_session_status(state: &HubState, resp: &HttpResponse) -> u16 {
+        let token = json_of(resp)["session_token"].as_str().unwrap().to_string();
+        handle_http_request(
+            state,
+            &HttpRequest::new("GET", "/api/v1/auth/session")
+                .with_header("Authorization", format!("Bearer {token}")),
+        )
+        .status
+    }
+
+    fn logged_in_owner(state: &HubState, name: &str) -> HttpResponse {
+        assert_eq!(
+            create_operator(state, name, "owner", Some(PASSWORD)).status,
+            201
+        );
+        let resp = password_login(state, name, PASSWORD);
+        assert_eq!(resp.status, 200, "{}", body_text(&resp));
+        assert_eq!(session_status(state, &resp), 200);
+        resp
+    }
+
+    #[test]
+    fn deleting_an_owner_revokes_that_operators_sessions_only() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let alpha = logged_in_owner(&state, "alpha");
+        let alpha_again = password_login(&state, "ALPHA", PASSWORD);
+        let beta = logged_in_owner(&state, "beta");
+        assert_eq!(
+            owner(&state, "DELETE", "/api/v1/auth/operators/alpha", &json!({})).status,
+            200
+        );
+        assert_eq!(session_status(&state, &alpha), 401);
+        assert_eq!(
+            bearer_session_status(&state, &alpha),
+            401,
+            "the token form too"
+        );
+        assert_eq!(
+            session_status(&state, &alpha_again),
+            401,
+            "every session of the login"
+        );
+        assert_eq!(
+            session_status(&state, &beta),
+            200,
+            "another operator is untouched"
+        );
+        // And the deleted operator cannot log in again.
+        assert!(is_invalid_credentials(&password_login(
+            &state, "alpha", PASSWORD
+        )));
+    }
+
+    #[test]
+    fn an_owner_session_that_deletes_another_owner_stays_valid() {
+        // The caller of the delete is itself a session; it stays valid.
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let alpha = logged_in_owner(&state, "alpha");
+        let beta = logged_in_owner(&state, "beta");
+        let cookie = set_cookie(&beta)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        let resp = handle_http_request(
+            &state,
+            &HttpRequest::new("DELETE", "/api/v1/auth/operators/alpha")
+                .with_header("Cookie", cookie.clone()),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(session_status(&state, &alpha), 401);
+        assert_eq!(session_status(&state, &beta), 200);
+    }
+
+    #[test]
+    fn demoting_an_owner_revokes_its_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let alpha = logged_in_owner(&state, "alpha");
+        let beta = logged_in_owner(&state, "beta");
+        let resp = owner(
+            &state,
+            "POST",
+            "/api/v1/auth/operators",
+            &json!({ "username": "alpha", "role": "viewer" }),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(session_status(&state, &alpha), 401);
+        assert_eq!(session_status(&state, &beta), 200);
+    }
+
+    #[test]
+    fn an_unrelated_update_revokes_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let alpha = logged_in_owner(&state, "alpha");
+        let beta = logged_in_owner(&state, "beta");
+        create_operator(&state, "gamma", "viewer", Some(PASSWORD));
+        for body in [
+            // A display name, a same-role update, a promotion and a demotion of someone else.
+            json!({ "username": "alpha", "display_name": "Alpha A" }),
+            json!({ "username": "alpha", "role": "owner" }),
+            json!({ "username": "gamma", "role": "admin" }),
+            json!({ "username": "gamma", "password": "gamma new password" }),
+            json!({ "username": "beta", "role": "owner", "display_name": "Beta" }),
+        ] {
+            assert_eq!(
+                owner(&state, "POST", "/api/v1/auth/operators", &body).status,
+                200
+            );
+            assert_eq!(session_status(&state, &alpha), 200, "{body}");
+            assert_eq!(session_status(&state, &beta), 200, "{body}");
+        }
+        // Enrolling and the first TOTP enable do not end sessions either.
+        enable_totp(&state, "alpha");
+        assert_eq!(session_status(&state, &alpha), 200);
+        assert_eq!(session_status(&state, &beta), 200);
+    }
+
+    #[test]
+    fn a_password_change_ends_that_operators_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let alpha = logged_in_owner(&state, "alpha");
+        let beta = logged_in_owner(&state, "beta");
+        let resp = owner(
+            &state,
+            "POST",
+            "/api/v1/auth/operators",
+            &json!({ "username": "alpha", "password": "a brand new password" }),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(session_status(&state, &alpha), 401);
+        assert_eq!(session_status(&state, &beta), 200);
+        assert_eq!(
+            password_login(&state, "alpha", "a brand new password").status,
+            200
+        );
+    }
+
+    #[test]
+    fn replacing_a_live_totp_secret_ends_that_operators_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let alpha = logged_in_owner(&state, "alpha");
+        let beta = logged_in_owner(&state, "beta");
+        // The first enable is not a replacement.
+        enable_totp(&state, "alpha");
+        assert_eq!(session_status(&state, &alpha), 200);
+        // A second secret, promoted over the live one, is.
+        let enroll = owner(
+            &state,
+            "POST",
+            "/api/v1/auth/totp/enroll",
+            &json!({ "username": "alpha" }),
+        );
+        let secret = json_of(&enroll)["secret_base32"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            session_status(&state, &alpha),
+            200,
+            "enrolling alone changes nothing"
+        );
+        let verify = owner(
+            &state,
+            "POST",
+            "/api/v1/auth/totp/verify",
+            &json!({ "username": "alpha", "code": code_at(&secret, 0) }),
+        );
+        assert_eq!(verify.status, 200, "{}", body_text(&verify));
+        assert_eq!(session_status(&state, &alpha), 401);
+        assert_eq!(session_status(&state, &beta), 200);
+    }
+
+    #[test]
+    fn revocation_survives_a_cache_drop() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let alpha = logged_in_owner(&state, "alpha");
+        let token = json_of(&alpha)["session_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let fresh = || {
+            crate::auth::AuthManager::new("lmcfarlin", Some(OWNER_TOKEN.into()), None, false, 3600)
+        };
+        {
+            let store = state.open_store().unwrap();
+            assert!(
+                fresh()
+                    .verify_session_token(Some(&*store), &token)
+                    .is_some(),
+                "control: the session is in the store"
+            );
+        }
+        assert_eq!(
+            owner(&state, "DELETE", "/api/v1/auth/operators/alpha", &json!({})).status,
+            200
+        );
+        let store = state.open_store().unwrap();
+        assert!(
+            fresh()
+                .verify_session_token(Some(&*store), &token)
+                .is_none(),
+            "a manager with an empty cache reads the revocation from the store"
+        );
+    }
+
+    #[test]
+    fn deleting_the_operator_named_like_the_token_owner_revokes_the_token_mode_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        // The seeded owner is the token owner's login; a token login mints a session for it.
+        let resp = login(&state, &json!({ "mode": "token", "token": OWNER_TOKEN }));
+        assert_eq!(resp.status, 200, "{}", body_text(&resp));
+        assert_eq!(session_status(&state, &resp), 200);
+        create_operator(&state, "successor", "owner", None);
+        assert_eq!(
+            owner(
+                &state,
+                "DELETE",
+                "/api/v1/auth/operators/lmcfarlin",
+                &json!({})
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            session_status(&state, &resp),
+            401,
+            "intended: that login no longer exists"
+        );
+        // The owner token itself is the recovery path and still works.
+        assert_eq!(
+            owner(&state, "GET", "/api/v1/auth/operators", &json!({})).status,
+            200
+        );
+    }
+
+    // --- a login that races a change ----------------------------------------------------------
+
+    /// Run `change` once, from inside the next credential verification.
+    fn change_during_verification(
+        state: &HubState,
+        change: impl Fn(&HubState) + Send + Sync + 'static,
+    ) {
+        let fired = AtomicBool::new(false);
+        let st = state.clone();
+        set_hook(state, move || {
+            if !fired.swap(true, Ordering::SeqCst) {
+                change(&st);
+            }
+        });
+    }
+
+    #[test]
+    fn an_owner_demoted_while_its_password_is_checked_gets_no_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "dora", "owner", Some(PASSWORD));
+        change_during_verification(&state, |st| {
+            let resp = owner(
+                st,
+                "POST",
+                "/api/v1/auth/operators",
+                &json!({ "username": "dora", "role": "viewer" }),
+            );
+            assert_eq!(resp.status, 200);
+        });
+        let resp = password_login(&state, "dora", PASSWORD);
+        assert_eq!(resp.status, 403, "{}", body_text(&resp));
+        assert!(set_cookie(&resp).is_none());
+    }
+
+    #[test]
+    fn an_owner_deleted_while_its_password_is_checked_gets_no_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "dora", "owner", Some(PASSWORD));
+        change_during_verification(&state, |st| {
+            assert_eq!(
+                owner(st, "DELETE", "/api/v1/auth/operators/dora", &json!({})).status,
+                200
+            );
+        });
+        assert!(is_invalid_credentials(&password_login(
+            &state, "dora", PASSWORD
+        )));
+    }
+
+    #[test]
+    fn a_password_changed_while_it_is_checked_gets_no_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "dora", "owner", Some(PASSWORD));
+        change_during_verification(&state, |st| {
+            let resp = owner(
+                st,
+                "POST",
+                "/api/v1/auth/operators",
+                &json!({ "username": "dora", "password": "changed meanwhile" }),
+            );
+            assert_eq!(resp.status, 200);
+        });
+        assert!(is_invalid_credentials(&password_login(
+            &state, "dora", PASSWORD
+        )));
+    }
+
+    #[test]
+    fn an_owner_demoted_during_the_totp_login_gets_no_session() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "dora", "owner", Some(PASSWORD));
+        let secret = enable_totp(&state, "dora");
+        change_during_verification(&state, |st| {
+            let resp = owner(
+                st,
+                "POST",
+                "/api/v1/auth/operators",
+                &json!({ "username": "dora", "role": "admin" }),
+            );
+            assert_eq!(resp.status, 200);
+        });
+        let resp = totp_login(&state, "dora", Some(&code_at(&secret, 1)));
+        assert_eq!(resp.status, 403, "{}", body_text(&resp));
+        assert!(set_cookie(&resp).is_none());
+    }
+
+    // --- limits, seed and hash floor ----------------------------------------------------------
+
+    fn extra_operator(name: &str) -> StoredOperator {
+        let mut op = seed_file(name).unwrap().operators.remove(0);
+        op.role = Role::Viewer;
+        op
+    }
+
+    #[test]
+    fn the_operator_count_is_capped_so_the_file_stays_readable() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let mut file = seed_file("lmcfarlin").unwrap();
+        for i in 1..MAX_OPERATORS {
+            file.operators.push(extra_operator(&format!("filler-{i}")));
+        }
+        assert_eq!(file.operators.len(), MAX_OPERATORS);
+        write_file(tmp.path(), &file, true).unwrap();
+        let resp = create_operator(&state, "one-too-many", "viewer", None);
+        assert_eq!(resp.status, 409, "{}", body_text(&resp));
+        assert_eq!(stored(&tmp).operators.len(), MAX_OPERATORS);
+        // An existing operator can still be updated, and one deleted makes room.
+        assert_eq!(
+            create_operator(&state, "filler-1", "admin", None).status,
+            200
+        );
+        assert_eq!(
+            owner(
+                &state,
+                "DELETE",
+                "/api/v1/auth/operators/filler-2",
+                &json!({})
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            create_operator(&state, "one-more", "viewer", None).status,
+            201
+        );
+    }
+
+    #[test]
+    fn the_total_passkey_count_is_capped_and_the_worst_file_fits_the_read_cap() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let mut file = seed_file("lmcfarlin").unwrap();
+        let (_, public) = new_keypair();
+        let key = |n: usize| StoredPasskey {
+            credential_id: format!("{n:0>1024}"),
+            label: "\u{1F511}".repeat(MAX_DISPLAY_NAME_CHARS),
+            public_key_b64: URL_SAFE_NO_PAD.encode(&public),
+            created_at_ms: 0,
+            sign_count: 0,
+            origin: Some("https://hub.example.ts.net:8443".to_string()),
+        };
+        let mut n = 0;
+        for i in 0..(MAX_PASSKEYS_TOTAL / MAX_PASSKEYS_PER_OPERATOR) {
+            let mut op = extra_operator(&format!("holder-{i}"));
+            for _ in 0..MAX_PASSKEYS_PER_OPERATOR {
+                op.passkeys.push(key(n));
+                n += 1;
+            }
+            file.operators.push(op);
+        }
+        // One short of the cap, on an operator with room: exactly one more fits.
+        let mut spare = extra_operator("spare");
+        spare.display_name = "\u{1F511}".repeat(MAX_DISPLAY_NAME_CHARS);
+        for _ in 0..(MAX_PASSKEYS_TOTAL % MAX_PASSKEYS_PER_OPERATOR - 1) {
+            spare.passkeys.push(key(n));
+            n += 1;
+        }
+        assert_eq!(n, MAX_PASSKEYS_TOTAL - 1);
+        file.operators.push(spare);
+        write_file(tmp.path(), &file, true).unwrap();
+        let register_for = |cred: &str| {
+            register(
+                &state,
+                json!({ "credential_id": cred, "public_key_b64": URL_SAFE_NO_PAD.encode(&public), "username": "spare" }),
+            )
+        };
+        assert_eq!(register_for("credential-last-one-aaa").status, 200);
+        let refused = register_for("credential-over-the-cap");
+        assert_eq!(refused.status, 409, "{}", body_text(&refused));
+        // The file with every passkey at its longest still reads back: the caps hold the size.
+        let size = fs::metadata(file_path(&tmp)).unwrap().len();
+        assert!(size < MAX_FILE_BYTES, "{size} bytes");
+        assert!(read_file(tmp.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_file_the_reader_would_refuse_is_never_written() {
+        let tmp = TempDir::new().unwrap();
+        let mut file = seed_file("lmcfarlin").unwrap();
+        file.operators[0].display_name = "x".repeat(MAX_FILE_BYTES as usize + 1);
+        assert!(matches!(
+            write_file(tmp.path(), &file, true),
+            Err(OpError::Io)
+        ));
+        assert!(!file_path(&tmp).exists());
+    }
+
+    #[test]
+    fn a_stored_hash_below_the_iteration_floor_never_verifies() {
+        let salt = [7u8; SALT_LEN];
+        let hash_with = |iterations: u32| {
+            let mut out = [0u8; HASH_LEN];
+            pbkdf2::derive(
+                PBKDF2_ALG,
+                NonZeroU32::new(iterations).unwrap(),
+                &salt,
+                PASSWORD.as_bytes(),
+                &mut out,
+            );
+            let mut op = seed_file("floor").unwrap().operators.remove(0);
+            op.password_hash_hex = Some(hex_encode(&out));
+            op.password_salt_hex = Some(hex_encode(&salt));
+            op.password_iterations = Some(iterations);
+            op
+        };
+        const { assert!(MIN_STORED_PBKDF2_ITERATIONS == PBKDF2_ITERATIONS) };
+        // At the floor it verifies; one below, with a hash honestly computed at that count, not.
+        assert!(verify_password(
+            &hash_with(MIN_STORED_PBKDF2_ITERATIONS),
+            PASSWORD
+        ));
+        assert!(!verify_password(
+            &hash_with(MIN_STORED_PBKDF2_ITERATIONS - 1),
+            PASSWORD
+        ));
+        assert!(!verify_password(&hash_with(1), PASSWORD));
+        // Over HTTP a tampered low count fails like a wrong password.
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let mut file = seed_file("lmcfarlin").unwrap();
+        let mut weak = hash_with(1);
+        weak.username = "weak".to_string();
+        weak.role = Role::Owner;
+        file.operators.push(weak);
+        write_file(tmp.path(), &file, true).unwrap();
+        assert!(is_invalid_credentials(&password_login(
+            &state, "weak", PASSWORD
+        )));
+    }
+
+    #[test]
+    fn the_seeded_owner_name_is_trimmed_and_never_empty() {
+        assert_eq!(
+            seed_file("  alice  ").unwrap().operators[0].username,
+            "alice"
+        );
+        assert_eq!(
+            seed_file("  alice  ").unwrap().operators[0].display_name,
+            "alice"
+        );
+        for blank in ["", "   ", "\t\n"] {
+            let op = seed_file(blank).unwrap().operators.remove(0);
+            assert_eq!(op.username, DEFAULT_OWNER_LOGIN, "{blank:?}");
+            assert_eq!(op.display_name, DEFAULT_OWNER_LOGIN);
+        }
+    }
+
+    #[test]
+    fn losing_the_seed_race_reads_the_winners_file_instead_of_failing() {
+        let tmp = TempDir::new().unwrap();
+        let state = state_for(&tmp, "mine");
+        // Another process creates the file between this one's check and its create.
+        SEED_RACE_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|home: &Path| {
+                write_file(home, &seed_file("racer").unwrap(), true).unwrap();
+            }));
+        });
+        let resp = owner(&state, "GET", "/api/v1/auth/operators", &json!({}));
+        assert_eq!(resp.status, 200, "{}", body_text(&resp));
+        let list = json_of(&resp);
+        assert_eq!(list["operators"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            list["operators"][0]["username"], "racer",
+            "the winner's file is the truth"
+        );
+        assert_eq!(stored(&tmp).operators[0].username, "racer");
+        let leftovers: Vec<_> = fs::read_dir(file_path(&tmp).parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n != "operators.json")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+
+        // A write on top of the lost race goes to the winner's file as well.
+        let tmp = TempDir::new().unwrap();
+        let state = state_for(&tmp, "mine");
+        SEED_RACE_HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|home: &Path| {
+                write_file(home, &seed_file("racer").unwrap(), true).unwrap();
+            }));
+        });
+        assert_eq!(
+            create_operator(&state, "newcomer", "viewer", None).status,
+            201
+        );
+        let names: Vec<_> = stored(&tmp)
+            .operators
+            .iter()
+            .map(|o| o.username.clone())
+            .collect();
+        assert_eq!(names, ["racer", "newcomer"]);
     }
 }
