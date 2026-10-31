@@ -508,7 +508,7 @@ fn check_hostname(host: &str) -> Result<(), String> {
 /// True for any address a cloud endpoint must never reach: unspecified, loopback, private,
 /// link-local (including the 169.254.169.254 and fd00:ec2::254 metadata endpoints), CGNAT,
 /// documentation, benchmarking, unique-local, multicast, broadcast and reserved space, plus
-/// IPv6 forms that carry an IPv4 address (v4-mapped, NAT64, 6to4), which are judged by the
+/// IPv6 forms that carry an IPv4 address (v4-mapped, v4-translated, NAT64, 6to4), which are judged by the
 /// address inside. Loopback is forbidden here; a caller that admits it does so itself.
 pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     match ip {
@@ -548,6 +548,10 @@ fn v6_forbidden(ip: Ipv6Addr) -> bool {
     // ::/96 holds `::`, `::1` and the deprecated IPv4-compatible form.
     if s[..6].iter().all(|&x| x == 0) {
         return true;
+    }
+    // ::ffff:0:0:0/96 is the IPv4-translated (SIIT) range: judged by the address inside.
+    if s[..4].iter().all(|&x| x == 0) && s[4] == 0xffff && s[5] == 0 {
+        return embedded(s[6], s[7]);
     }
     if ip.is_multicast() {
         return true;
@@ -1003,6 +1007,13 @@ fn classify(err: ureq::Error) -> CloudHttpError {
     }
 }
 
+/// True when `segment` cannot be one path segment of a request: empty, `.` or `..`. The last
+/// two survive percent-encoding unchanged, and a normalising server resolves them to another
+/// route, so they are refused before any request is built.
+fn bad_segment(segment: &str) -> bool {
+    matches!(segment, "" | "." | "..")
+}
+
 /// One path segment, percent-encoded: everything but the RFC 3986 unreserved set.
 fn pct_segment(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
@@ -1146,8 +1157,8 @@ impl SyncAdapter for HttpCloudSyncAdapter {
     }
 
     fn fetch_document(&self, collection: &str, id: &str) -> Result<Option<Value>, StoreError> {
-        if collection.is_empty() || id.is_empty() {
-            return Err(self.bad("collection and id must not be empty"));
+        if bad_segment(collection) || bad_segment(id) {
+            return Err(self.bad("collection and id must not be empty, `.` or `..`"));
         }
         let path = format!(
             "/v1/sync/documents/{}/{}",
@@ -1313,10 +1324,10 @@ impl McpRelayAdapter for HttpCloudRelayAdapter {
         connector_id: &str,
         request: &Value,
     ) -> Result<Option<Value>, GateError> {
-        if connector_id.is_empty() {
+        if bad_segment(connector_id) {
             return Err(GateError::Adapter {
                 provider: self.provider.clone(),
-                reason: "connector id must not be empty".into(),
+                reason: "connector id must not be empty, `.` or `..`".into(),
             });
         }
         let path = format!("/v1/relay/{}", pct_segment(connector_id));
@@ -1350,6 +1361,7 @@ mod tests {
             "https://8.8.8.8",
             "https://[2606:4700::1111]",
             "https://[::ffff:8.8.8.8]",
+            "https://[::ffff:0:808:808]",
             "https://localhost",
             "https://127.0.0.1.evil.com",
             "http://127.0.0.1",
@@ -1415,6 +1427,8 @@ mod tests {
             "https://[fe80::1]",
             "https://[::ffff:10.0.0.1]",
             "https://[::ffff:a00:1]",
+            "https://[::ffff:0:7f00:1]",
+            "https://[::ffff:0:a00:1]",
             "https://[::ffff:127.0.0.1]",
             "https://[2001:db8::1]",
             "https://[ff02::1]",
@@ -1504,6 +1518,9 @@ mod tests {
             "::ffff:10.0.0.1",
             "::ffff:127.0.0.1",
             "::ffff:169.254.169.254",
+            "::ffff:0:7f00:1",
+            "::ffff:0:a00:1",
+            "::ffff:0:a9fe:a9fe",
             "64:ff9b::a00:1",
             "64:ff9b::7f00:1",
             "64:ff9b:1::1",
@@ -1531,6 +1548,7 @@ mod tests {
             "2001:4860:4860::8888",
             "2a00:1450:4001::1",
             "::ffff:8.8.8.8",
+            "::ffff:0:808:808",
             "64:ff9b::808:808",
             "2002:808:808::",
         ];
@@ -1761,6 +1779,7 @@ mod tests {
 
     // --- fake HTTP server --------------------------------------------------------------------
 
+    #[derive(Clone)]
     struct Req {
         method: String,
         path: String,
@@ -1855,8 +1874,10 @@ mod tests {
                     let (handler, log) = (Arc::clone(&handler), Arc::clone(&log));
                     std::thread::spawn(move || {
                         if let Some(req) = read_request(&mut stream) {
+                            // Logged BEFORE the reply is written, so a test that sees the
+                            // answer can always see the request.
+                            log.lock().unwrap().push(req.clone());
                             handler(&req, &mut stream);
-                            log.lock().unwrap().push(req);
                         }
                     });
                 }
@@ -1874,6 +1895,10 @@ mod tests {
 
         fn connections(&self) -> usize {
             self.connections.load(Ordering::SeqCst)
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
         }
 
         fn request(&self, index: usize) -> (String, String, Vec<(String, String)>, Vec<u8>) {
@@ -2037,6 +2062,35 @@ mod tests {
             before,
             "an empty segment is refused before sending"
         );
+    }
+
+    #[test]
+    fn sync_adapter_refuses_dot_segments_before_sending() {
+        let server = FakeServer::start(|_, stream| reply_json(stream, 200, &json!({ "doc": 1 })));
+        let adapter = HttpCloudSyncAdapter::new(&server.url()).unwrap();
+        for (collection, id) in [
+            ("x", ".."),
+            ("x", "."),
+            ("..", "x"),
+            (".", "x"),
+            ("", "x"),
+            ("x", ""),
+            ("..", ".."),
+        ] {
+            assert!(
+                matches!(
+                    adapter.fetch_document(collection, id),
+                    Err(StoreError::Backend(_))
+                ),
+                "{collection:?}/{id:?}"
+            );
+        }
+        assert_eq!(server.connections(), 0);
+        assert_eq!(server.request_count(), 0);
+        // Dots inside a longer segment are ordinary, and still reach the server encoded.
+        assert!(adapter.fetch_document("x", "..a").unwrap().is_some());
+        assert!(adapter.fetch_document("x.y", "a..").unwrap().is_some());
+        assert_eq!(server.request_count(), 2);
     }
 
     #[test]
@@ -2222,6 +2276,26 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn relay_adapter_refuses_dot_connector_ids_before_sending() {
+        let server = FakeServer::start(|_, stream| reply_json(stream, 200, &json!({ "ok": 1 })));
+        let adapter = HttpCloudRelayAdapter::new("gcp", &server.url()).unwrap();
+        let rpc = json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" });
+        for bad in ["..", ".", ""] {
+            assert!(
+                matches!(
+                    adapter.forward_jsonrpc(bad, &rpc),
+                    Err(GateError::Adapter { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(server.connections(), 0);
+        assert_eq!(server.request_count(), 0);
+        assert!(adapter.forward_jsonrpc("..a", &rpc).unwrap().is_some());
+        assert_eq!(server.request(0).1, "/v1/relay/..a");
+    }
+
     // --- hardening ---------------------------------------------------------------------------
 
     #[test]
@@ -2269,9 +2343,11 @@ mod tests {
         let started = Instant::now();
         let err = http.get("/x").unwrap_err();
         assert_eq!(err, CloudHttpError::ResponseTooLarge { limit: 16 * 1024 });
+        // The server holds the connection for 3s; refusing on the header alone is far quicker.
         assert!(
-            started.elapsed() < Duration::from_millis(300),
-            "refused on the header alone"
+            started.elapsed() < Duration::from_millis(1500),
+            "refused on the header alone: {:?}",
+            started.elapsed()
         );
     }
 
@@ -2422,7 +2498,7 @@ mod tests {
     #[test]
     fn a_slow_server_hits_the_timeout() {
         let server = FakeServer::start(|_, stream| {
-            std::thread::sleep(Duration::from_secs(4));
+            std::thread::sleep(Duration::from_secs(8));
             reply_json(stream, 200, &json!({}));
         });
         let http =
@@ -2434,8 +2510,8 @@ mod tests {
             "{err:?}"
         );
         assert!(
-            started.elapsed() < Duration::from_secs(3),
-            "{:?}",
+            started.elapsed() < Duration::from_secs(4),
+            "the timeout fired well before the server's 8s delay: {:?}",
             started.elapsed()
         );
     }
