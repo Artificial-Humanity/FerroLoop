@@ -186,6 +186,8 @@ fn unquote(value: &str) -> String {
 /// closed `---` frontmatter block. Supports plain and quoted scalars, and folded (`>`) or
 /// literal (`|`) block scalars; other YAML is ignored.
 fn parse_frontmatter(text: &str) -> Option<(Option<String>, Option<String>)> {
+    // Some editors save UTF-8 with a byte order mark, which would hide the opening fence.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut lines = text.lines();
     if lines.next()?.trim_end() != "---" {
         return None;
@@ -558,5 +560,60 @@ mod tests {
             b.sort_by(|a, b| (&a.kind, &a.name).cmp(&(&b.kind, &b.name)));
             b
         });
+    }
+
+    #[test]
+    fn frontmatter_survives_a_byte_order_mark_and_windows_line_endings() {
+        let doc = "\u{feff}---\r\nname: win\r\ndescription: \"From Windows\"\r\n---\r\nbody";
+        let (n, d) = parse_frontmatter(doc).unwrap();
+        assert_eq!(n.as_deref(), Some("win"));
+        assert_eq!(d.as_deref(), Some("From Windows"));
+        // Only a leading mark is skipped; a fence further down is still not frontmatter.
+        assert!(parse_frontmatter("\nx\n---\nname: a\n---\n").is_none());
+    }
+
+    #[test]
+    fn skill_and_flow_names_are_restricted_to_slash_command_characters() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        for (dir, name) in [
+            ("ok", "ok-name_1.v2:x"),
+            ("space", "has space"),
+            ("slash", "a/b"),
+            ("newline", "\"a\\nb\""),
+            ("long", &"n".repeat(MAX_NAME_CHARS + 1)),
+        ] {
+            write(
+                &root.join(format!(".agents/skills/{dir}/SKILL.md")),
+                &format!("---\nname: {name}\ndescription: d\n---\n"),
+            );
+        }
+        let names: Vec<String> = discover_skills(&root.join(SKILLS_DIR))
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names, vec!["ok-name_1.v2:x"]);
+        write(&root.join(".fl/flows/bad name.toml"), "description = 'x'");
+        write(&root.join(".fl/flows/good.toml"), "description = 'x'");
+        let flows: Vec<String> = discover_flows(&root.join(FLOWS_DIR))
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(flows, vec!["good"]);
+    }
+
+    #[test]
+    fn descriptions_are_one_line_and_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let long = "word ".repeat(200);
+        write(
+            &tmp.path().join(".agents/skills/s/SKILL.md"),
+            &format!("---\nname: s\ndescription: >\n  {long}\n\n  second\n---\n"),
+        );
+        let skills = discover_skills(&tmp.path().join(SKILLS_DIR));
+        assert_eq!(skills.len(), 1);
+        let d = &skills[0].description;
+        assert!(d.chars().count() <= MAX_DESCRIPTION_CHARS);
+        assert!(!d.contains('\n') && !d.contains("  "));
     }
 }

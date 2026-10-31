@@ -94,6 +94,11 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
   const prevSelectedProjectRef = useRef<string | null | undefined>(
     selectedProject,
   );
+  // The project shown right now, and a counter that orders board loads, so a slow answer for
+  // a project the user has since left cannot replace the board that is on screen.
+  const projectRef = useRef<string>(project);
+  projectRef.current = project;
+  const loadSeqRef = useRef<number>(0);
 
   useEffect(() => {
     if (selectedProject !== prevSelectedProjectRef.current) {
@@ -106,10 +111,14 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
 
   const loadRecords = useCallback(
     async (targetProject: string) => {
+      const seq = ++loadSeqRef.current;
       setLoading(true);
       setError(null);
       try {
         const res = await apiClient.listRecords(targetProject);
+        if (seq !== loadSeqRef.current) {
+          return;
+        }
         const loadedRecords = Array.isArray(res?.records) ? res.records : [];
         setRecords(loadedRecords);
         if (
@@ -127,11 +136,17 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
           setSummary(computeSummaryFromRecords(loadedRecords, null));
         }
       } catch (err) {
-        setError(
-          err instanceof Error ? err.message : "Failed to load project records",
-        );
+        if (seq === loadSeqRef.current) {
+          setError(
+            err instanceof Error
+              ? err.message
+              : "Failed to load project records",
+          );
+        }
       } finally {
-        setLoading(false);
+        if (seq === loadSeqRef.current) {
+          setLoading(false);
+        }
       }
     },
     [apiClient],
@@ -185,15 +200,18 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
     }
     setCreating(true);
     setError(null);
+    const requestProject = project;
     try {
       const trimmedArea = newArea.trim();
       const res = await apiClient.createRecord({
-        project,
+        project: requestProject,
         title: trimmedTitle,
         ...(trimmedArea ? { area: trimmedArea } : {}),
         state: newState,
       });
-      if (res?.record) {
+      if (projectRef.current !== requestProject) {
+        // The user moved to another project meanwhile; the record belongs to the old one.
+      } else if (res?.record) {
         setRecords((prev) => {
           const next = [
             ...prev.filter(
@@ -232,12 +250,17 @@ export const RecordsBoardPane: React.FC<RecordsBoardPaneProps> = ({
     const recordIdentifier = record.id || record.display_id;
     setMovingId(record.display_id);
     setError(null);
+    const requestProject = project;
     try {
       const res = await apiClient.moveRecord(
         recordIdentifier,
         toState,
-        project,
+        requestProject,
       );
+      if (projectRef.current !== requestProject) {
+        // Another project is on screen now; its cards are not this record's to update.
+        return;
+      }
       const updatedRecord: ProjectRecordItem = res?.record ?? {
         ...record,
         state: toState,

@@ -136,4 +136,76 @@ mod tests {
             assert_eq!(r.is_err(), bad != "high\n", "{bad:?}");
         }
     }
+
+    fn session(id: &str, persona: Option<&str>) -> DiscoveredSessionSummary {
+        DiscoveredSessionSummary {
+            id: id.to_string(),
+            source: "route".to_string(),
+            adapter: "claude".to_string(),
+            persona: persona.map(str::to_string),
+            status: "active".to_string(),
+            updated_at: None,
+            cwd: None,
+            record_id: None,
+            transcript_path: None,
+            quota_usage: None,
+            model: Some("discovered-model".to_string()),
+            thinking_level: Some("low".to_string()),
+            available_models: Vec::new(),
+        }
+    }
+
+    fn over(model: &str, thinking: Option<&str>) -> ModelOverride {
+        ModelOverride {
+            model: model.to_string(),
+            thinking_level: thinking.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn overrides_match_by_id_first_then_by_lowercased_persona() {
+        let mut sessions = vec![
+            session("claude:ada", Some("Ada")),
+            session("codex:bob", Some("Bob")),
+            session("grok:cy", None),
+        ];
+        let overrides = BTreeMap::from([
+            ("claude:ada".to_string(), over("by-id", None)),
+            // A persona key that also names session 1: the id key wins.
+            ("ada".to_string(), over("by-persona-loses", Some("high"))),
+            ("bob".to_string(), over("by-persona", Some("high"))),
+        ]);
+        apply_model_overrides(&mut sessions, &overrides);
+        assert_eq!(sessions[0].model.as_deref(), Some("by-id"));
+        // No thinking level in the override: the discovered one stays.
+        assert_eq!(sessions[0].thinking_level.as_deref(), Some("low"));
+        assert_eq!(sessions[1].model.as_deref(), Some("by-persona"));
+        assert_eq!(sessions[1].thinking_level.as_deref(), Some("high"));
+        // No id match and no persona: untouched.
+        assert_eq!(sessions[2].model.as_deref(), Some("discovered-model"));
+    }
+
+    #[test]
+    fn an_uppercase_override_key_is_never_matched_by_persona() {
+        // `HubState::set_session_model_override` lowercases persona keys, so a key that still
+        // has capitals can only match a session id exactly.
+        let mut sessions = vec![session("x", Some("Ada"))];
+        let overrides = BTreeMap::from([("Ada".to_string(), over("m", None))]);
+        apply_model_overrides(&mut sessions, &overrides);
+        assert_eq!(sessions[0].model.as_deref(), Some("discovered-model"));
+    }
+
+    #[test]
+    fn model_validation_counts_characters_not_bytes_and_keeps_inner_spaces() {
+        // 128 two-byte characters are within the cap; a model may hold spaces and unicode.
+        assert!(validate_model(&"é".repeat(MAX_MODEL_CHARS)).is_ok());
+        assert!(validate_model(&"é".repeat(MAX_MODEL_CHARS + 1)).is_err());
+        assert_eq!(
+            validate_model("gpt 5 (preview)").unwrap(),
+            "gpt 5 (preview)"
+        );
+        // C1 controls (NEL and friends) are controls too.
+        assert!(validate_model("a\u{85}b").is_err());
+        assert!(validate_model("a\u{9b}31m").is_err());
+    }
 }

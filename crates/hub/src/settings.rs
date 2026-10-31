@@ -373,4 +373,79 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn concurrent_patches_to_different_fields_all_survive() {
+        let tmp = TempDir::new().unwrap();
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+        let patches = [
+            json!({ "theme_preference": "light" }),
+            json!({ "subsystems": { "ferrogate_enabled": false } }),
+            json!({ "notifications": { "sound_enabled": true } }),
+            json!({ "hub_connection": { "poll_interval_secs": 42 } }),
+            json!({ "hub_connection": { "auto_reconnect_ws": false } }),
+        ];
+        std::thread::scope(|scope| {
+            for body in &patches {
+                let home = tmp.path();
+                scope.spawn(move || {
+                    assert!(update(home, patch(body.clone())).is_ok());
+                });
+            }
+        });
+        let now = load(tmp.path());
+        assert_eq!(now.theme_preference, Theme::Light);
+        assert!(!now.subsystems.ferrogate_enabled);
+        assert!(now.notifications.sound_enabled);
+        assert_eq!(now.hub_connection.poll_interval_secs, 42);
+        assert!(!now.hub_connection.auto_reconnect_ws);
+    }
+
+    #[test]
+    fn a_rejected_patch_changes_nothing_even_for_its_valid_fields() {
+        let tmp = TempDir::new().unwrap();
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+        let res = update(
+            tmp.path(),
+            patch(json!({
+                "theme_preference": "light",
+                "hub_connection": { "poll_interval_secs": 1 },
+            })),
+        );
+        assert!(matches!(res, Err(UpdateError::Invalid(_))));
+        assert_eq!(load(tmp.path()), Settings::default());
+        assert!(
+            !settings_path(tmp.path()).exists(),
+            "no file for a refused patch"
+        );
+    }
+
+    #[test]
+    fn stored_values_outside_the_contract_fall_back_per_field() {
+        let tmp = TempDir::new().unwrap();
+        let path = settings_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (stored, want) in [
+            (json!(1.5), 10),
+            (json!(-3), 10),
+            (json!(0), 10),
+            (json!(2), 2),
+            (json!(300), 300),
+            (json!("30"), 10),
+        ] {
+            let doc = json!({ "hub_connection": { "poll_interval_secs": stored } });
+            std::fs::write(&path, doc.to_string()).unwrap();
+            assert_eq!(
+                load(tmp.path()).hub_connection.poll_interval_secs,
+                want,
+                "{stored}"
+            );
+        }
+        // Null or wrong-typed groups do not poison the others.
+        let doc = json!({ "theme_preference": null, "subsystems": [], "notifications": { "sound_enabled": true } });
+        std::fs::write(&path, doc.to_string()).unwrap();
+        let loaded = load(tmp.path());
+        assert_eq!(loaded.theme_preference, Theme::Dark);
+        assert!(loaded.notifications.sound_enabled);
+    }
 }
