@@ -159,6 +159,15 @@ holds it, searching the bound store and every store any project is bound to. `--
 `$FL_DB` stop that search: they confine the command to the one store they name, and an IRI
 that store does not hold is refused, not looked for elsewhere.
 
+A store holds hub pairing codes, session hashes and other records, so it is private to your
+Unix user. A store file `fl` creates is mode `0600`, and a store directory `fl` creates is mode
+`0700` (only the innermost directory that `fl` makes; the directories above it, such as
+`~/.local/share`, keep the default mode), whatever your umask is. `fl` never changes the mode of
+a file or directory that already exists. If an existing store file or its directory can be
+reached by your group or by other users, `fl` prints one warning per path per run on stderr with
+the fix, and still opens the store: run `chmod 600 <store file>` and `chmod 700 <directory>`
+yourself. The warning skips a directory with the sticky bit (such as `/tmp`).
+
 ---
 
 ## Next horizon

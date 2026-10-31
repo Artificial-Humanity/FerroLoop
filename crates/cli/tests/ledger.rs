@@ -13,6 +13,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as Sys;
 
+/// A scratch directory only its owner can enter. A store `fl` makes inside a directory others can
+/// enter earns a loose-permissions warning on stderr (`fl_store::private`), which these tests
+/// would read as noise; `tempfile::tempdir` uses the umask, which is 0775 or 0755.
+fn private_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
 /// What every pre-flight refusal starts with (GitHub ledger spec §2.4).
 const PREFLIGHT: &str = "refused before any gate or adapter ran: ";
 
@@ -79,7 +89,7 @@ impl World {
             repo,
             fake: FakeGithub::start("acme/widgets"),
             one: Machine {
-                home: tempfile::tempdir().unwrap(),
+                home: private_tempdir(),
             },
         };
         w.configure(&w.one, ledger);
@@ -104,7 +114,7 @@ impl World {
     /// GitHub ledger.
     fn machine(&self) -> Machine {
         let m = Machine {
-            home: tempfile::tempdir().unwrap(),
+            home: private_tempdir(),
         };
         self.configure(&m, true);
         m

@@ -199,7 +199,8 @@ fn open_hub_store_with_retry(store_path: &Path) -> Result<RedbStore, (i32, Strin
     if let Some(dir) = store_path.parent()
         && !dir.as_os_str().is_empty()
     {
-        fs::create_dir_all(dir).map_err(|e| (2, format!("{}: {e}", dir.display())))?;
+        fl_store::private::create_private_dir_all(dir)
+            .map_err(|e| (2, format!("{}: {e}", dir.display())))?;
     }
     let mut last_err = None;
     for attempt in 0..40 {
