@@ -165,6 +165,12 @@ enum InputRefused {
 impl StdinQueue {
     /// Queue `bytes` without waiting. The frame is taken whole or refused whole.
     fn try_enqueue(&self, bytes: Vec<u8>) -> Result<(), InputRefused> {
+        // A dead writer is `Closed` before the budget is looked at: its unwritten bytes are never
+        // refunded, so a budget check first could answer `Full` (retry) for input that can never
+        // be taken.
+        if self.tx.is_closed() {
+            return Err(InputRefused::Closed);
+        }
         let len = bytes.len();
         loop {
             let current = self.pending.load(Ordering::Acquire);
@@ -197,11 +203,14 @@ pub struct TerminalSession {
     pub cols: u16,
     pub rows: u16,
     input: StdinQueue,
-    stdin_task: JoinHandle<()>,
+    /// Abort handles of the writer and the two readers. Their `JoinHandle`s belong to the exit
+    /// task, which stops and awaits all three before it queues `exited`; keeping only handles here
+    /// means no handle is awaited twice.
+    stdin_task: AbortHandle,
     kill_tx: Option<oneshot::Sender<()>>,
     wait_task: Option<JoinHandle<()>>,
-    stdout_task: JoinHandle<()>,
-    stderr_task: JoinHandle<()>,
+    stdout_task: AbortHandle,
+    stderr_task: AbortHandle,
     /// Set just after the `exited` frame is queued, so a client that has seen the frame can
     /// reopen at once without the session still counting against the cap. A session whose flag
     /// is set has its `exited` frame in the queue (or already written), so reaping it never
@@ -212,17 +221,16 @@ pub struct TerminalSession {
 impl TerminalSession {
     /// Terminate the child process and wait for the session's tasks to end.
     ///
-    /// The readers and the stdin writer are stopped first and awaited, so nothing of this session
-    /// is produced after this returns except the `exited` frame, which is already in the output
-    /// queue by then. Stopping the readers first also lets the exit task skip its drain wait: a
-    /// flooding child with a full queue would otherwise hold every close for the whole grace.
+    /// The readers and the stdin writer are told to stop first; the exit task awaits them (it owns
+    /// their join handles) before it queues `exited`, and this awaits the exit task. So nothing of
+    /// this session is produced after this returns except the `exited` frame, which is already in
+    /// the output queue by then. Stopping the readers first also lets the exit task skip its drain
+    /// wait: a flooding child with a full queue would otherwise hold every close for the whole
+    /// grace.
     pub async fn shutdown(mut self) {
         self.stdin_task.abort();
         self.stdout_task.abort();
         self.stderr_task.abort();
-        let _ = (&mut self.stdin_task).await;
-        let _ = (&mut self.stdout_task).await;
-        let _ = (&mut self.stderr_task).await;
         if let Some(tx) = self.kill_tx.take() {
             let _ = tx.send(());
         }
@@ -576,7 +584,9 @@ impl TerminalManager {
         let sid_wait = session_id.clone();
         let exited = Arc::new(AtomicBool::new(false));
         let exited_flag = exited.clone();
-        let readers = [stdout_task.abort_handle(), stderr_task.abort_handle()];
+        let stdin_abort = stdin_task.abort_handle();
+        let stdout_abort = stdout_task.abort_handle();
+        let stderr_abort = stderr_task.abort_handle();
         let wait_task = tokio::spawn(async move {
             let status_res = tokio::select! {
                 res = child.wait() => res,
@@ -596,13 +606,23 @@ impl TerminalManager {
                     child.wait().await
                 }
             };
+            // The child is gone: stop the writer before anything else is decided, and wait until it
+            // has ended. Its `ChildStdin` and queue receiver are then dropped, so later `input` is
+            // refused as closed at once and the writer can queue no `error` after `exited`.
+            stdin_task.abort();
+            let _ = stdin_task.await;
             let mut drained = Box::pin(async {
                 let _ = stdout_done_rx.await;
                 let _ = stderr_done_rx.await;
             });
             drain_readers(&mut drained, &progress).await;
-            // `exited` is the session's last frame: stop any reader a lingering job kept alive.
-            stop_readers(&readers);
+            // `exited` is the session's last frame: stop any reader a lingering job kept alive and
+            // wait until it has ended (an abort alone is asynchronous: a reader between `read`
+            // and `send` could still queue an `output` after `exited`).
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
             let exit_code = status_res.ok().and_then(|s| s.code()).unwrap_or(-1);
             // Into the slot reserved at open: never waits, and is lost only if the client is
             // gone. Queued before the flag is raised (see `TerminalSession::exited`).
@@ -628,11 +648,11 @@ impl TerminalManager {
                     tx: input_tx,
                     pending,
                 },
-                stdin_task,
+                stdin_task: stdin_abort,
                 kill_tx: Some(kill_tx),
                 wait_task: Some(wait_task),
-                stdout_task,
-                stderr_task,
+                stdout_task: stdout_abort,
+                stderr_task: stderr_abort,
                 exited,
             },
         );
@@ -800,12 +820,6 @@ async fn drain_readers(
             return;
         }
         seen = now;
-    }
-}
-
-fn stop_readers(readers: &[AbortHandle]) {
-    for reader in readers {
-        reader.abort();
     }
 }
 
@@ -1453,6 +1467,165 @@ mod tests {
         w.mgr.shutdown_all().await;
     }
 
+    /// Frames of session `id` that reached the socket after its `exited` frame. Only frames at
+    /// index `from` and later count: the direct replies a test provoked on purpose come before.
+    fn frames_after_exited(w: &Wire, id: &str, from: usize) -> Vec<String> {
+        let mut after = Vec::new();
+        let mut exited = false;
+        for (i, f) in w.wire.iter().enumerate() {
+            if f.data["session_id"] != id {
+                continue;
+            }
+            if exited && i >= from {
+                after.push(format!("{} {}", f.event, f.data));
+            }
+            exited |= f.event == "exited";
+        }
+        after
+    }
+
+    /// A child that ends on its own: once `exited` is out, `input` is refused as closed on the
+    /// spot (never accepted and failed later), and nothing of the session follows `exited`.
+    async fn check_input_after_a_self_exit(id: &str, script: &str) {
+        let mut w = Wire::new();
+        pid_of(&w.open_shell(id, script).await);
+        let exited = w
+            .wait_for("exited", Duration::from_secs(10))
+            .await
+            .expect("the child exits on its own");
+        assert_eq!(exited.data["exit_code"], 0);
+
+        let started = Instant::now();
+        let reply = w
+            .call("input", json!({ "session_id": id, "data": "late\n" }))
+            .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(reply.len(), 1, "input to an exited session: {reply:?}");
+        assert_eq!(reply[0].event, "error");
+        assert_eq!(reply[0].data["status"], 500, "{:?}", reply[0].data);
+        assert!(
+            reply[0].data["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("closed")),
+            "{:?}",
+            reply[0].data
+        );
+
+        // A writer that had accepted the input would fail it now (EPIPE at once, or the 504
+        // after STDIN_WRITE_TIMEOUT when a background job holds the pipe) and queue an `error`.
+        let from = w.wire.len();
+        while w.pump(Duration::from_millis(600)).await.is_some() {}
+        assert_eq!(w.queued(), 0);
+        assert_eq!(
+            frames_after_exited(&w, id, from),
+            Vec::<String>::new(),
+            "frames of `{id}` after `exited`"
+        );
+        w.mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn input_after_the_child_exited_on_its_own_is_refused_and_queues_nothing() {
+        check_input_after_a_self_exit("self-exit", "exit 0").await;
+        check_input_after_a_self_exit("self-exit-late", "sleep 0.3; exit 0").await;
+    }
+
+    #[tokio::test]
+    async fn input_after_exit_is_refused_even_when_a_background_job_holds_stdin() {
+        // `<&0` hands the shell's stdin (the pipe) to the background job, which outlives the
+        // shell, so the pipe stays open and a write to it would stall rather than fail.
+        check_input_after_a_self_exit("held-stdin", "sleep 8 <&0 & exit 0").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_output_follows_exited_when_readers_are_cut_off_mid_send() {
+        // `yes` keeps both pipes open and keeps the readers busy while a client drains the
+        // queue, so the drain ceiling ends with a reader between `read` and `send`. The readers
+        // must have ended, not merely been told to, by the time `exited` is queued. The
+        // iterations run side by side to keep the test short.
+        const ITERATIONS: usize = 20;
+        let runs: Vec<_> = (0..ITERATIONS)
+            .map(|n| {
+                tokio::spawn(async move {
+                    let id = format!("race{n}");
+                    let mut w = Wire::new();
+                    pid_of(&w.open_shell(&id, "yes & exit 0").await);
+                    let started = Instant::now();
+                    loop {
+                        let frame = w
+                            .recv(Duration::from_secs(30))
+                            .await
+                            .expect("`exited` was never sent while output kept flowing");
+                        assert!(
+                            started.elapsed() < READER_DRAIN_CEILING + Duration::from_secs(20),
+                            "`exited` took too long"
+                        );
+                        if frame.event == "exited" {
+                            break;
+                        }
+                    }
+                    // Whatever the readers could still enqueue lands within this window.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    while w.pump(Duration::from_millis(100)).await.is_some() {}
+                    let stray = frames_after_exited(&w, &id, 0);
+                    w.mgr.shutdown_all().await;
+                    stray.len()
+                })
+            })
+            .collect();
+        let mut stray = 0;
+        for run in runs {
+            stray += run.await.expect("iteration panicked");
+        }
+        assert_eq!(stray, 0, "{stray} frames followed `exited`");
+    }
+
+    #[tokio::test]
+    async fn exited_is_sent_when_blocked_readers_are_cut_off_on_a_full_queue() {
+        let mut w = Wire::new();
+        // Nobody drains: both pipes stay open (the background job), the readers block in
+        // `send` on the full queue, and the no-progress grace ends the drain. Stopping them must
+        // not wait on the client.
+        pid_of(&w.open_shell("blocked", "yes & yes >&2 & exit 0").await);
+        wait_until_full(&w, 1).await;
+        let finished = eventually(Duration::from_secs(15), || {
+            w.mgr
+                .sessions
+                .get("blocked")
+                .is_some_and(|s| s.is_finished())
+        })
+        .await;
+        assert!(finished, "`exited` was not queued with blocked readers");
+        let mut last = None;
+        while let Some(frame) = w.pump(Duration::from_millis(200)).await {
+            last = Some(frame);
+        }
+        assert_eq!(last.expect("frames").event, "exited");
+        w.mgr.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn a_dead_writer_is_closed_not_full_whatever_the_budget() {
+        // The writer died with the whole budget unrefunded (a 504 leaves the frame it was
+        // writing, and everything queued behind it, counted).
+        let (tx, rx) = mpsc::channel::<Vec<u8>>(STDIN_QUEUE_FRAMES);
+        let queue = StdinQueue {
+            tx,
+            pending: Arc::new(AtomicUsize::new(STDIN_QUEUE_BYTES)),
+        };
+        assert!(matches!(
+            queue.try_enqueue(vec![0]),
+            Err(InputRefused::Full)
+        ));
+        drop(rx);
+        for len in [1, 64 * 1024, STDIN_QUEUE_BYTES * 2] {
+            assert!(
+                matches!(queue.try_enqueue(vec![0; len]), Err(InputRefused::Closed)),
+                "a dead writer must answer closed for {len} bytes"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_child_that_never_reads_stdin_is_refused_then_closed_without_blocking_the_loop() {
         let mut w = Wire::new();
@@ -1508,7 +1681,10 @@ mod tests {
         assert_eq!(order, ["error", "exited"], "504 comes before `exited`");
 
         // Later input is refused as closed, and the loop is free: a close and a fresh session
-        // are handled promptly.
+        // are handled promptly. The writer died with its budget unrefunded, which is the case
+        // that used to answer 503 (retry) here.
+        let unrefunded = w.mgr.sessions["deaf"].input.pending.load(Ordering::Acquire);
+        assert!(unrefunded > 0, "the budget was refunded: {unrefunded}");
         let closed = w
             .call("input", json!({ "session_id": "deaf", "data": "x" }))
             .await;
