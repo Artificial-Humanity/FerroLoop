@@ -77,10 +77,17 @@ pub(crate) fn respond_registry_v01(
     query: &BTreeMap<String, String>,
     entries: Vec<Value>,
 ) -> (u16, Value) {
-    let rest = subpath
-        .trim_start_matches('/')
-        .strip_prefix("v0.1/servers")
-        .unwrap_or("");
+    // Any other path is a 404; falling back to "" answered every unknown path with the full list.
+    let Some(rest) = subpath.trim_start_matches('/').strip_prefix("v0.1/servers") else {
+        return (
+            404,
+            json!({
+                "title": "Not Found",
+                "status": 404,
+                "detail": "Server not found"
+            }),
+        );
+    };
 
     if rest.is_empty() || rest == "/" {
         let search = query.get("search").map(|s| s.to_ascii_lowercase());
@@ -190,6 +197,7 @@ fn percent_decode(s: &str) -> String {
         let hex = bytes
             .get(i + 1..i + 3)
             .and_then(|h| std::str::from_utf8(h).ok())
+            .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
             .and_then(|h| u8::from_str_radix(h, 16).ok());
         match (bytes[i], hex) {
             (b'%', Some(b)) => {
@@ -203,4 +211,27 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_outside_v01_servers_is_not_found_instead_of_the_full_list() {
+        let entries = vec![json!({ "server": { "name": "io.ferroloop.gate/a", "version": "1" } })];
+        for path in ["/", "/other", "/v0.2/servers", "/servers"] {
+            let (status, _) = respond_registry_v01(path, &BTreeMap::new(), entries.clone());
+            assert_eq!(status, 404, "{path}");
+        }
+        let (status, body) = respond_registry_v01("/v0.1/servers", &BTreeMap::new(), entries);
+        assert_eq!(status, 200);
+        assert_eq!(body["metadata"]["count"], 1);
+    }
+
+    #[test]
+    fn percent_decoding_ignores_a_signed_pair() {
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+        assert_eq!(percent_decode("a%+1b"), "a%+1b");
+    }
 }
