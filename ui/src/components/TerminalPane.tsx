@@ -29,6 +29,16 @@ const ANSI_ESCAPE_REGEX =
   // eslint-disable-next-line no-control-regex
   /\u001b\[[0-?]*[ -/]*[@-~]|\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)|\u001b[@-Z\\-_]/g;
 
+/** Upper bound on the accessible output buffer; older output is dropped. */
+export const MAX_TERMINAL_LOG_CHARS = 200_000;
+
+export function appendTerminalLog(prev: string, chunk: string): string {
+  const next = prev + chunk;
+  return next.length > MAX_TERMINAL_LOG_CHARS
+    ? next.slice(next.length - MAX_TERMINAL_LOG_CHARS)
+    : next;
+}
+
 export function formatTerminalOutputLog(raw: string): string {
   if (!raw) {
     return "";
@@ -61,7 +71,9 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
 }) => {
   const isOwner = authority?.tier === "owner";
   const effectiveSessionId = sessionId || "default-shell";
-  const effectiveCwd = cwd || "/home/lmcfarlin/Projects/Artificial-Humanity";
+  // No hard-coded fallback: a developer's home path is wrong (and disclosing)
+  // for every other operator. When unset the hub chooses the shell's cwd.
+  const effectiveCwd = cwd || undefined;
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -82,7 +94,14 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         return;
       }
       if (wsClient) {
-        wsClient.sendFrame("terminal", event, data);
+        // Only `open` may wait for a connection. Input, resize and close are
+        // meaningful on the live shell alone; replaying buffered keystrokes
+        // into a later shell would execute stale commands.
+        if (event === "open") {
+          wsClient.sendFrame("terminal", event, data);
+        } else {
+          wsClient.sendFrame("terminal", event, data, { queueWhenDisconnected: false });
+        }
       }
     },
     [onSendTerminalFrame, wsClient],
@@ -91,6 +110,9 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   const handleIncomingFrame = useCallback(
     (frame: HubWsFrame) => {
       if (frame.channel !== "terminal") {
+        return;
+      }
+      if (!frame.data || typeof frame.data !== "object") {
         return;
       }
       if (frame.event === "opened") {
@@ -111,7 +133,7 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
         }
         const chunk = payload.data ?? payload.output ?? "";
         if (chunk) {
-          setOutputLog((prev) => prev + chunk);
+          setOutputLog((prev) => appendTerminalLog(prev, chunk));
           try {
             termRef.current?.write(chunk);
           } catch {
@@ -138,6 +160,27 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     }
     return wsClient.subscribe("terminal", handleIncomingFrame);
   }, [isOwner, wsClient, handleIncomingFrame]);
+
+  // Surface a dropped socket: the PTY output stops, and without this the badge
+  // keeps claiming "connected" for a shell nobody can reach.
+  useEffect(() => {
+    if (!isOwner || !wsClient || typeof wsClient.onStatusChange !== "function") {
+      return;
+    }
+    return wsClient.onStatusChange((connected) => {
+      if (!connected) {
+        setShellStatus("disconnected — reconnecting");
+      } else {
+        // The old PTY's fate is unknown after a drop; ask the operator
+        // rather than silently spawning or assuming a shell.
+        setShellStatus((prev) =>
+          prev.startsWith("disconnected")
+            ? "socket restored — press Reconnect / New Shell"
+            : prev,
+        );
+      }
+    });
+  }, [isOwner, wsClient]);
 
   // Process prop-supplied terminalFrames if provided
   useEffect(() => {
@@ -219,6 +262,8 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       rows: term?.rows ?? 28,
       command: ["/bin/bash", "-i"],
     };
+    // A new session must not inherit the previous session's scrollback.
+    setOutputLog("");
     setShellStatus("connecting");
     emitTerminalEvent("open", openPayload);
 
@@ -384,9 +429,11 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       >
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
           <span className="fd-badge fd-mono">{effectiveSessionId}</span>
-          <span className="fd-badge fd-mono" style={{ color: "var(--text-muted)" }}>
-            {effectiveCwd}
-          </span>
+          {effectiveCwd && (
+            <span className="fd-badge fd-mono" style={{ color: "var(--text-muted)" }}>
+              {effectiveCwd}
+            </span>
+          )}
           <span className="fd-badge" data-testid="terminal-status-badge">
             {shellStatus}
           </span>

@@ -109,6 +109,18 @@ function normalizeStatusBadge(status: string): {
   };
 }
 
+/**
+ * Strict PR-number parse. `Number.parseInt` is prefix-greedy, and
+ * `<input type="number">` accepts `1e3` / `2.5`, so "1e3" would silently
+ * merge PR #1 and "2.5" PR #2. Anything but plain decimal digits is rejected.
+ */
+export function parsePrNumber(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
 export const GitPrPane: React.FC<GitPrPaneProps> = ({
   worktrees,
   selectedWorktreeId,
@@ -273,8 +285,8 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
 
   const handleFormReviewSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const parsedNum = Number.parseInt(formPrNumber, 10);
-    if (!Number.isFinite(parsedNum) || parsedNum <= 0) {
+    const parsedNum = parsePrNumber(formPrNumber);
+    if (parsedNum === null) {
       setActionError("Enter a valid positive PR number.");
       return;
     }
@@ -298,8 +310,8 @@ export const GitPrPane: React.FC<GitPrPaneProps> = ({
   };
 
   const handleFormMergeClick = () => {
-    const parsedNum = Number.parseInt(formPrNumber, 10);
-    if (!Number.isFinite(parsedNum) || parsedNum <= 0) {
+    const parsedNum = parsePrNumber(formPrNumber);
+    if (parsedNum === null) {
       setActionError("Enter a valid positive PR number.");
       return;
     }
