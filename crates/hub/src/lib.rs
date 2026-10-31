@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use fl_core::pr_policy::DEFAULT_OWNER_LOGIN;
+use fl_core::pr_policy::{DEFAULT_OWNER_LOGIN, DEFAULT_REVIEWER_APP_LOGINS};
 use fl_core::store::StoreError;
 use fl_exec::stamp;
 use fl_store::RedbStore;
@@ -119,12 +119,24 @@ pub struct HubServerConfig {
     pub repo_root: PathBuf,
     pub ui_dir: Option<PathBuf>,
     pub owner_login: String,
+    /// GitHub logins whose reviews may carry an agent marker when `POST /api/v1/prs/:n/merge`
+    /// checks the approvals it is sent (`[github] reviewer_logins`; the Reviewer App's login by
+    /// default).
+    pub reviewer_logins: Vec<String>,
     pub owner_token: Option<String>,
     pub peer_token: Option<String>,
     pub trust_tailscale_headers: bool,
     pub enable_terminal: bool,
     pub session_ttl_secs: u64,
     pub home_override: Option<PathBuf>,
+}
+
+/// [`DEFAULT_REVIEWER_APP_LOGINS`] as owned strings, for [`HubServerConfig::reviewer_logins`].
+pub fn default_reviewer_logins() -> Vec<String> {
+    DEFAULT_REVIEWER_APP_LOGINS
+        .iter()
+        .map(|l| (*l).to_string())
+        .collect()
 }
 
 impl Default for HubServerConfig {
@@ -135,6 +147,7 @@ impl Default for HubServerConfig {
             repo_root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             ui_dir: None,
             owner_login: DEFAULT_OWNER_LOGIN.to_string(),
+            reviewer_logins: default_reviewer_logins(),
             owner_token: None,
             peer_token: None,
             trust_tailscale_headers: false,
@@ -655,6 +668,7 @@ mod tests {
             repo_root: tmp.path().to_path_buf(),
             ui_dir: Some(ui_dir),
             owner_login: "lmcfarlin".into(),
+            reviewer_logins: default_reviewer_logins(),
             owner_token: Some("owner-tok-secret".into()),
             peer_token: Some("peer-tok-secret".into()),
             trust_tailscale_headers: true,
@@ -2465,6 +2479,77 @@ mod tests {
         HttpRequest::new(method, path)
             .with_header("Authorization", format!("Bearer {token}"))
             .with_json_body(body)
+    }
+
+    #[test]
+    fn pr_merge_counts_an_agent_approval_only_from_a_reviewer_login() {
+        use fl_core::AgentRegistry;
+        use fl_core::agent::AgentRole;
+        use fl_core::pr_policy::{
+            FlReviewMarker, PrCommitSummary, PrReviewSummary, ReviewVerdict, format_review_body,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut state = test_hub_state(&tmp);
+        {
+            let store = state.open_store().unwrap();
+            for (name, role) in [
+                ("Felicia", AgentRole::Assistant),
+                ("Ferris", AgentRole::Lead),
+            ] {
+                store
+                    .register_agent(fl_core::agent::RegisterAgentArgs {
+                        display_name: name.into(),
+                        email: None,
+                        project: "ferroloop".into(),
+                        role,
+                        extra_areas: vec![],
+                        create_area: true,
+                        replace: true,
+                        at: stamp::now(),
+                        by: "owner".into(),
+                    })
+                    .unwrap();
+            }
+        }
+        // A pull request `felicia` co-authored (Lead tier): she may merge it once `ferris` approves.
+        let marker = FlReviewMarker {
+            reviewer: "ferris".into(),
+            role: AgentRole::Lead,
+            project: "ferroloop".into(),
+            head_sha: "sha1".into(),
+            verdict: ReviewVerdict::Approved,
+            at: fl_core::at::At::from_unix_millis(1),
+        };
+        let merge = |state: &HubState, login: &str| {
+            let body = json!({
+                "by": "felicia",
+                "project": "ferroloop",
+                "head_sha": "sha1",
+                "files": ["crates/core/src/lib.rs"],
+                "commits": [PrCommitSummary {
+                    sha: "sha1".into(),
+                    author_login: Some("artificially-human".into()),
+                    message: "feat: x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
+                        .into(),
+                }],
+                "reviews": [PrReviewSummary {
+                    id: 1,
+                    author_login: login.into(),
+                    state: "APPROVED".into(),
+                    body: format_review_body("ok", &marker),
+                    commit_id: Some("sha1".into()),
+                }],
+            });
+            handle_http_request(state, &authed("POST", "/api/v1/prs/1/merge", PEER, &body))
+        };
+        // The default list names the Reviewer App's login: an outsider's marker is refused.
+        assert_eq!(merge(&state, "mallory").status, 403);
+        assert_eq!(merge(&state, DEFAULT_REVIEWER_APP_LOGINS[0]).status, 200);
+        // `[github] reviewer_logins` reaches the hub through its config.
+        state.config.reviewer_logins = vec!["other-app[bot]".into()];
+        assert_eq!(merge(&state, DEFAULT_REVIEWER_APP_LOGINS[0]).status, 403);
+        assert_eq!(merge(&state, "Other-App[bot]").status, 200);
     }
 
     fn spin_up_body(persona: &str) -> Value {

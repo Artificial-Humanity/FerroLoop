@@ -37,6 +37,29 @@ private_key = "/home/you/.config/fl/widgets-app.pem"
 the absolute path of its private key file. A binding that says `"app"` with no `[github]`
 section is refused.
 
+`[github]` also takes an optional `reviewer_logins`, the GitHub logins whose reviews may carry an
+`fl-review` agent marker:
+
+```toml
+[github]
+app_id = 123456
+private_key = "/home/you/.config/fl/widgets-app.pem"
+reviewer_logins = ["widgets-reviewer[bot]"]
+```
+
+A marker names the agent it speaks for, and anyone can write one into a review body, so
+`fl github pr merge`, `verify-ci` and the hub count an agent approval only when the review comes
+from one of these logins (compared without case). An approval from any other non-owner login is
+ignored: it counts for no tier, and it cannot make `verify-ci` refuse. A `CHANGES_REQUESTED` or
+`DISMISSED` review that carries a marker still blocks whoever wrote it. The owner's reviews are
+matched by their own login and need no marker. Each entry is a GitHub login (letters, digits and
+`-`, at most 64 characters) with an optional trailing `[bot]`. Left out, the list is
+`["ferroloop-test[bot]"]`, the Reviewer App's `<slug>[bot]` login, and it applies when there is no
+`[github]` section at all (`verify-ci` can run on a machine with no App credentials). A different
+App needs its own login here; `[]` accepts no agent approval. The list ties a marker to the App,
+not to one agent: the App is shared, so telling the agents behind it apart still needs per-agent
+signing or an authenticated `--by`.
+
 Without a `tracker` key, the project's tracker is the local store, as before. The config is
 read with unknown keys refused, so an older `fl`, which has never heard of `tracker`, refuses
 the whole file rather than ignoring the key and writing records to a local tracker nobody

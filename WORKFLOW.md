@@ -39,7 +39,9 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
    by the Reviewer GitHub App (`<slug>[bot]`) with an `fl-review` marker, because the
    machine account cannot approve a pull request it opened. The command needs the App's
    credentials: `[github]` `app_id` and `private_key` in the fl `config.toml`, or
-   `$FL_GITHUB_APP_ID` and `$FL_GITHUB_PRIVATE_KEY_PATH`.
+   `$FL_GITHUB_APP_ID` and `$FL_GITHUB_PRIVATE_KEY_PATH`. `fl` counts an agent's approval
+   only from the App's login, `[github]` `reviewer_logins` in `config.toml` (default
+   `["ferroloop-test[bot]"]`), so the App's login must be listed there.
 6. Once the target reviewer that `fl github pr create` reported, or a higher tier (the Lab
    Manager for a Lead-tier pull request, or the owner), has approved and the checks pass,
    the agent who opened the pull request merges it through the pull request with

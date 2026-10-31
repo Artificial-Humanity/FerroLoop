@@ -289,6 +289,7 @@ fn cmd_serve(
         repo_root,
         ui_dir,
         owner_login: DEFAULT_OWNER_LOGIN.to_string(),
+        reviewer_logins: crate::config::reviewer_logins(env.cfg.github.as_ref()),
         owner_token,
         peer_token,
         trust_tailscale_headers,

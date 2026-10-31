@@ -90,7 +90,7 @@ Severity is my judgement of impact on a FerroLoop deployment as the docs describ
 | P-4 | Low | core | `-->` inside a review marker's JSON ends the HTML comment early | Fixed — test written |
 | M-4 | Low-Medium | mcp | Named argument with no `name` freezes to an empty word | Fixed — test written |
 | M-5 | Medium-Low | mcp | No fsync before rename in `stage` and `write_record` | Fixed — no test (not deterministic) |
-| O-1 … O-24 | — | various | Not fixed, except O-4 (see M-1) and O-13 (store permissions); see [Open items](#open-items) | Open |
+| O-1 … O-24 | — | various | Not fixed (O-4 is fixed, see M-1; O-3 is fixed, see its note below; O-13 is fixed: store permissions); see [Open items](#open-items) | Open |
 
 ## Findings
 
@@ -524,13 +524,13 @@ trade is deliberate.
 
 ## Open items
 
-Not fixed. "Read" = confirmed by reading only; nothing was run.
+Not fixed (O-3 and O-4 are fixed). "Read" = confirmed by reading only; nothing was run.
 
 | # | Sev | Where | What | Why not fixed |
 |---|---|---|---|---|
 | O-1 | Medium | `mem.rs:302`, `apply_imported_state_revision` (called by `import_state_revisions`, :1748) | **mem.** `import_state_revisions`: a same-key collision rewrites `state_entries` (alias onto `rev.entry_id`, `remove` then `insert`) before the `Tampered` immutability check, so a revision whose `entry_id` is entry A and whose slug is B's destroys A. Also mutates before it can still fail. | The function is intricate and shared with sync semantics; the right fix (check before rewrite, atomic apply) deserves its own change with a hostile-input test. |
 | O-2 | Medium | `mem.rs:1468`, `upsert_state` | **mem.** A failed `upsert_state` leaks a minted id and handle (mint before validate). | MemStore only; needs re-ordering mint and validation. |
-| O-3 | Medium (design) | `pr_policy.rs:659`, `verify_review_integrity`; `:716`, `verify_merge_approvals` | The review marker's `reviewer`/`role` come from the review body and are not bound to `review.author_login`. Any account whose APPROVED review appears on the PR can claim to be `jarvis` as lab_manager. See the note below the table. | Open for decision. Recommended fix below; it needs the configured Reviewer App login. |
+| O-3 | Medium (design) | `pr_policy.rs:659`, `verify_review_integrity`; `:716`, `verify_merge_approvals` | The review marker's `reviewer`/`role` come from the review body and are not bound to `review.author_login`. Any account whose APPROVED review appears on the PR can claim to be `jarvis` as lab_manager. See the note below the table. | **Fixed** in the follow-up: `[github] reviewer_logins` (default the Reviewer App's `<slug>[bot]`) binds markers to the App login. |
 | O-4 | Medium | `freeze.rs:864`, `runtime_argument_problem` | Registry runtime args were deny-listed, not allow-listed; docker's `--privileged`, `-v`, `--entrypoint` passed. | **Fixed** in the follow-up (see M-1). |
 | O-5 | Medium | `freeze.rs:674`, `Build::variable` | `upgrade` keeps old literal env values over the new version's `value`/`default` (`kept_env` wins), so a changed fixed value is silently pinned at v1's. | Needs a record of which literals the user supplied versus fl froze. |
 | O-6 | Medium | `catalog.rs:601`, `Editor::open`, and `:639`, `save` | `Editor::open`→`save` is a lost-update window with a registry network call in the middle (`cmd/mcp.rs` add/upgrade). `save` is now atomic but still overwrites from a stale document. | Needs a lock file plus compare-before-write; touches the CLI flow. |
@@ -553,7 +553,7 @@ Not fixed. "Read" = confirmed by reading only; nothing was run.
 | O-23 | Medium | `pr_policy.rs:346`, `evaluate_pr_policy` | A `Co-authored-by: <agent>` trailer on a commit by ANY login counts as attributed, so a foreign commit with an agent trailer gets a Lead/LabManager tier and needs no owner trailer (the P-1 laundering class). | Needs a rule for who may author an attributed commit. Fix: an allow-list of author logins for attributed commits (the owner's login and the agents' machine account), or verified signatures. |
 | O-24 | Medium | `pr_policy.rs:369`, `is_owner_commit` in `evaluate_pr_policy` | Owner authorship is decided from GitHub's `author.login`, which GitHub derives from the commit author email. The owner's noreply email is public in `git log`, so anyone can author a commit as the owner login. | Same fix as O-23 (author-login allow-list or verified signatures); it needs the signing or login policy decided. |
 
-### O-3 — review marker not bound to the review's login (Medium, open)
+### O-3 — review marker not bound to the review's login (Medium, fixed)
 
 Rated Medium, not High, after review. `verify_review_integrity` (`pr_policy.rs:659`) and
 `verify_merge_approvals` (`:716`) read `reviewer` and `role` from the marker in the review body

@@ -206,8 +206,9 @@ pub struct FlReviewMarker {
      - `RequiredTier::LabManager`: `caller` must be `AgentRole::LabManager`.
      - `RequiredTier::Owner`: always refuses agent callers with `InsufficientRole` (only `Owner` can approve/merge on GitHub).
 - **Merge Approval Check (`verify_merge_approvals`):**
-  Given `head_sha: &str`, `eval: &PrPolicyEvaluation`, `reviews: &[PrReviewSummary]`, `agents: &[AgentRecord]`, and `owner_login: &str`:
-  - `verify_merge_approvals` folds `reviews` in chronological order per logical reviewer (`format!("owner:{}", owner_login.to_ascii_lowercase())` for Owner reviews; `format!("agent:{}", marker.reviewer)` for reviews carrying a valid `FlReviewMarker`).
+  Given `head_sha: &str`, `eval: &PrPolicyEvaluation`, `reviews: &[PrReviewSummary]`, `agents: &[AgentRecord]`, `owner_login: &str`, and `reviewer_logins: &[impl AsRef<str>]` (`[github] reviewer_logins`, default `DEFAULT_REVIEWER_APP_LOGINS` = the Reviewer App's `<slug>[bot]`):
+  - A marker speaks for an agent only on a review whose `author_login` is in `reviewer_logins` (compared without case). An `"APPROVED"` review from any other non-owner login is ignored for every tier. A `"CHANGES_REQUESTED"` or `"DISMISSED"` review with a marker from any other login is folded under `format!("login:{}", author_login.to_ascii_lowercase())`, so it still blocks (when the marker names an authorized agent) but cannot erase the agent's own review.
+  - `verify_merge_approvals` folds `reviews` in chronological order per logical reviewer (`format!("owner:{}", owner_login.to_ascii_lowercase())` for Owner reviews; `format!("agent:{}", marker.reviewer)` for reviews carrying a valid `FlReviewMarker` from a `reviewer_logins` login).
   - Only state-changing review states (`"APPROVED"`, `"CHANGES_REQUESTED"`, `"DISMISSED"`) update a logical reviewer's latest state (`"COMMENTED"` reviews do not overwrite an earlier `"APPROVED"` or `"CHANGES_REQUESTED"` state, matching GitHub's semantics).
   - If any authorized reviewer's latest state-changing review is `"CHANGES_REQUESTED"`, `verify_merge_approvals` returns `Err(PolicyRefusal::MissingValidApproval { head_sha })`.
   - A logical reviewer counts as an active valid approver for `head_sha` if their **latest** state-changing review has state `"APPROVED"` and:
@@ -273,7 +274,7 @@ Endpoints used by `fl_github::pr`:
 - Opening a pull request (`create_pr`, `request_pr_reviewers`) and reading PR metadata (`get_pr`, `list_pr_commits`, `list_pr_files`, `list_pr_reviews`) use the project's bound `GithubTracker::client()`.
 - Submitting a formal review (`submit_pr_review`) and merging a pull request (`merge_pr`) use the **Reviewer App Client**:
   - If the project's `TrackerBinding` already uses `credential == Credential::App`, `gh.client()` is already authenticated as `<slug>[bot]` and is reused directly.
-  - Otherwise (`credential == Credential::Env`), `fl` constructs a dedicated `Client` with `AppCredentials::from_file` using `[github]` (`GithubApp { app_id, private_key }`) from `config.toml`, or environment overrides `$FL_GITHUB_APP_ID` and `$FL_GITHUB_PRIVATE_KEY_PATH`.
+  - Otherwise (`credential == Credential::Env`), `fl` constructs a dedicated `Client` with `AppCredentials::from_file` using `[github]` (`GithubApp { app_id, private_key, reviewer_logins }`) from `config.toml`, or environment overrides `$FL_GITHUB_APP_ID` and `$FL_GITHUB_PRIVATE_KEY_PATH`.
   - If neither `[github]` nor `$FL_GITHUB_APP_ID` + `$FL_GITHUB_PRIVATE_KEY_PATH` is configured when `fl github pr review` or `fl github pr merge` is called, `fl` returns a clear configuration error explaining that agent PR review/merge requires a GitHub App (`[github]` in `config.toml` or `$FL_GITHUB_APP_ID` / `$FL_GITHUB_PRIVATE_KEY_PATH`) so the reviewer identity (`<slug>[bot]`) is distinct from `artificially-human`.
 
 ### 2.3 In-Process Fake Support (`crates/github/src/fake.rs`)
@@ -335,7 +336,7 @@ In `crates/cli/src/main.rs`:
    ```
    - Resolves `--by <AGENT>` in `ws_store` (`AgentRegistry::agent_by_name`).
    - Fetches PR metadata, commits, files, and reviews; computes `PrPolicyEvaluation`.
-   - Runs `authorize_agent_action(&eval, &caller)` and `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, owner_login)`. On `Err(refusal)`, prints the refusal and returns `Ok(2)`.
+   - Runs `authorize_agent_action(&eval, &caller)` and `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, owner_login, &reviewer_logins)`. On `Err(refusal)`, prints the refusal and returns `Ok(2)`.
    - Calls `merge_pr` via the Reviewer App Client with `head_sha = pr.head_sha` and `method` (default `MergeMethod::Merge`).
    - Sends a FerroWire notification (`MessageKind::Mail`) to each co-author in `eval.co_authors`.
 
@@ -345,8 +346,9 @@ In `crates/cli/src/main.rs`:
    ```
    - Evaluates the PR's commits, files, and existing reviews:
      - Refuses with `Ok(2)` (`UnattributedCommitsRequireOwner`) if any commit from a non-Owner author lacks a `Co-authored-by:` trailer.
-     - Refuses with `Ok(2)` if any `<slug>[bot]` `APPROVED` review on `head_sha` carries an invalid/forged `<!-- fl-review: ... -->` marker or violates `authorize_agent_action` (e.g., self-review or protected paths).
-     - When `--require-approval` is passed, also verifies `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, owner_login)`.
+     - Refuses with `Ok(2)` if any `APPROVED` review on `head_sha` from a `reviewer_logins` login (the Reviewer App's `<slug>[bot]` by default) carries an invalid/forged `<!-- fl-review: ... -->` marker or violates `authorize_agent_action` (e.g., self-review or protected paths).
+     - Ignores an `APPROVED` review from any other non-owner login, with or without a marker.
+     - When `--require-approval` is passed, also verifies `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, owner_login, &reviewer_logins)`.
 
 ---
 

@@ -14,6 +14,10 @@ use std::fmt;
 /// Default GitHub login of the repository Owner (`lmcfarlin`).
 pub const DEFAULT_OWNER_LOGIN: &str = "lmcfarlin";
 
+/// Default GitHub logins whose reviews may carry an `fl-review` marker: the Reviewer App's
+/// `<slug>[bot]` login. `[github] reviewer_logins` in the fl config replaces it.
+pub const DEFAULT_REVIEWER_APP_LOGINS: &[&str] = &["ferroloop-test[bot]"];
+
 /// Default protected path patterns that always require `Owner` review and merge.
 pub const DEFAULT_PROTECTED_PATTERNS: &[&str] = &[".github/**", ".fl/manifest.json", ".agents/**"];
 
@@ -656,12 +660,18 @@ pub fn authorize_agent_merge(
 /// a marker with a non-approving verdict, or from an unknown, inactive, wrong-role, co-author
 /// (self-review) or under-tier agent, is refused whichever head it names. A review with no
 /// readable marker is also refused. The owner's own reviews are not checked.
+///
+/// Only a review whose `author_login` is in `reviewer_logins` (compared without case) is
+/// checked: the marker names the agent, and only the Reviewer App's login can speak for one. An
+/// approval from any other login is ignored here, so an outsider's approval can neither pass
+/// nor make this check refuse.
 pub fn verify_review_integrity(
     head_sha: &str,
     eval: &PrPolicyEvaluation,
     reviews: &[PrReviewSummary],
     agents: &[AgentRecord],
     owner_login: &str,
+    reviewer_logins: &[impl AsRef<str>],
 ) -> Result<(), PolicyRefusal> {
     let owner = if owner_login.trim().is_empty() {
         DEFAULT_OWNER_LOGIN
@@ -679,6 +689,7 @@ pub fn verify_review_integrity(
         if !review.state.trim().eq_ignore_ascii_case("APPROVED")
             || !on_head
             || review.author_login.eq_ignore_ascii_case(owner)
+            || !is_reviewer_login(&review.author_login, reviewer_logins)
         {
             continue;
         }
@@ -703,6 +714,15 @@ pub fn verify_review_integrity(
     Ok(())
 }
 
+/// Whether `login` is one of `reviewer_logins`, the logins whose reviews may carry an agent marker.
+fn is_reviewer_login(login: &str, reviewer_logins: &[impl AsRef<str>]) -> bool {
+    let login = login.trim();
+    !login.is_empty()
+        && reviewer_logins
+            .iter()
+            .any(|l| l.as_ref().trim().eq_ignore_ascii_case(login))
+}
+
 #[derive(Debug, Clone)]
 struct FoldedReviewState {
     label: String,
@@ -713,12 +733,21 @@ struct FoldedReviewState {
 
 /// Verify that `reviews` contain an active, unrevoked approval for `head_sha` from a reviewer
 /// meeting `eval.required_tier` (folding reviews chronologically per logical reviewer).
+///
+/// An agent marker names the reviewer, and only a review from a login in `reviewer_logins`
+/// (compared without case) may speak for an agent: an `APPROVED` review from any other
+/// non-owner login is ignored for every tier, whatever its marker says. A `CHANGES_REQUESTED` or
+/// `DISMISSED` review that carries a marker is still folded whoever wrote it, so a rejection
+/// keeps blocking; from a login outside `reviewer_logins` it is folded under that login, not
+/// under the agent the marker names, so it cannot erase the agent's own review. The owner's
+/// reviews are matched by login and need no marker.
 pub fn verify_merge_approvals(
     head_sha: &str,
     eval: &PrPolicyEvaluation,
     reviews: &[PrReviewSummary],
     agents: &[AgentRecord],
     owner_login: &str,
+    reviewer_logins: &[impl AsRef<str>],
 ) -> Result<String, PolicyRefusal> {
     let owner = if owner_login.trim().is_empty() {
         DEFAULT_OWNER_LOGIN
@@ -759,9 +788,18 @@ pub fn verify_merge_approvals(
             continue;
         }
 
+        let from_reviewer_app = is_reviewer_login(&review.author_login, reviewer_logins);
+        if state == "APPROVED" && !from_reviewer_app {
+            continue;
+        }
+
         if let Some(marker) = extract_review_marker(&review.body) {
             let reviewer_key = marker.reviewer.to_ascii_lowercase();
-            let key = format!("agent:{reviewer_key}");
+            let key = if from_reviewer_app {
+                format!("agent:{reviewer_key}")
+            } else {
+                format!("login:{}", review.author_login.trim().to_ascii_lowercase())
+            };
             let matched_agent = agents.iter().find(|a| {
                 a.status == AgentStatus::Active
                     && a.name_key.eq_ignore_ascii_case(&marker.reviewer)
@@ -818,6 +856,9 @@ pub fn verify_merge_approvals(
 mod tests {
     use super::*;
     use crate::ids::{AgentId, seq_iri};
+
+    /// The Reviewer App login the tests treat as allowed (the first default).
+    const APP_LOGIN: &str = DEFAULT_REVIEWER_APP_LOGINS[0];
 
     fn make_agent(
         seq: u64,
@@ -955,7 +996,8 @@ mod tests {
                 &eval,
                 &[mk(2, "APPROVED"), mk(1, "CHANGES_REQUESTED")],
                 &roster,
-                "lmcfarlin"
+                "lmcfarlin",
+                DEFAULT_REVIEWER_APP_LOGINS
             )
             .is_ok()
         );
@@ -966,7 +1008,8 @@ mod tests {
                 &eval,
                 &[mk(2, "CHANGES_REQUESTED"), mk(1, "APPROVED")],
                 &roster,
-                "lmcfarlin"
+                "lmcfarlin",
+                DEFAULT_REVIEWER_APP_LOGINS
             )
             .is_err()
         );
@@ -1283,7 +1326,7 @@ Signed-off-by: Someone <someone@example.com>
 
         let approve_review = PrReviewSummary {
             id: 10,
-            author_login: "ferroloop-reviewer[bot]".into(),
+            author_login: APP_LOGIN.into(),
             state: "APPROVED".into(),
             body: body.clone(),
             commit_id: Some("head-1".into()),
@@ -1296,7 +1339,8 @@ Signed-off-by: Someone <someone@example.com>
                 &eval,
                 std::slice::from_ref(&approve_review),
                 &agents,
-                DEFAULT_OWNER_LOGIN
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
             ),
             Ok("ferris".to_string())
         );
@@ -1308,7 +1352,8 @@ Signed-off-by: Someone <someone@example.com>
                 &eval,
                 std::slice::from_ref(&approve_review),
                 &agents,
-                DEFAULT_OWNER_LOGIN
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
             ),
             Err(PolicyRefusal::MissingValidApproval {
                 head_sha: "head-2".into()
@@ -1322,7 +1367,7 @@ Signed-off-by: Someone <someone@example.com>
         };
         let comment_review = PrReviewSummary {
             id: 11,
-            author_login: "ferroloop-reviewer[bot]".into(),
+            author_login: APP_LOGIN.into(),
             state: "COMMENTED".into(),
             body: format_review_body("One minor note", &comment_marker),
             commit_id: Some("head-1".into()),
@@ -1334,6 +1379,7 @@ Signed-off-by: Someone <someone@example.com>
                 &[approve_review.clone(), comment_review],
                 &agents,
                 DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
             ),
             Ok("ferris".to_string())
         );
@@ -1345,7 +1391,7 @@ Signed-off-by: Someone <someone@example.com>
         };
         let changes_review = PrReviewSummary {
             id: 12,
-            author_login: "ferroloop-reviewer[bot]".into(),
+            author_login: APP_LOGIN.into(),
             state: "CHANGES_REQUESTED".into(),
             body: format_review_body("Wait, found a bug", &changes_marker),
             commit_id: Some("head-1".into()),
@@ -1357,6 +1403,7 @@ Signed-off-by: Someone <someone@example.com>
                 &[approve_review.clone(), changes_review],
                 &agents,
                 DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
             ),
             Err(PolicyRefusal::MissingValidApproval {
                 head_sha: "head-1".into()
@@ -1366,7 +1413,7 @@ Signed-off-by: Someone <someone@example.com>
         // 5. Approval followed by DISMISSED fails
         let dismissed_review = PrReviewSummary {
             id: 13,
-            author_login: "ferroloop-reviewer[bot]".into(),
+            author_login: APP_LOGIN.into(),
             state: "DISMISSED".into(),
             body,
             commit_id: Some("head-1".into()),
@@ -1378,6 +1425,7 @@ Signed-off-by: Someone <someone@example.com>
                 &[approve_review, dismissed_review],
                 &agents,
                 DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
             ),
             Err(PolicyRefusal::MissingValidApproval {
                 head_sha: "head-1".into()
@@ -1517,7 +1565,7 @@ Signed-off-by: Someone <someone@example.com>
         };
         PrReviewSummary {
             id,
-            author_login: "ferroloop-reviewer[bot]".into(),
+            author_login: APP_LOGIN.into(),
             state: state.into(),
             body: format_review_body("review", &marker),
             commit_id: commit_id.map(str::to_string),
@@ -1537,8 +1585,22 @@ Signed-off-by: Someone <someone@example.com>
         reviews: &[PrReviewSummary],
         agents: &[AgentRecord],
     ) -> Result<String, PolicyRefusal> {
-        verify_review_integrity(HEAD, eval, reviews, agents, DEFAULT_OWNER_LOGIN)?;
-        verify_merge_approvals(HEAD, eval, reviews, agents, DEFAULT_OWNER_LOGIN)
+        verify_review_integrity(
+            HEAD,
+            eval,
+            reviews,
+            agents,
+            DEFAULT_OWNER_LOGIN,
+            DEFAULT_REVIEWER_APP_LOGINS,
+        )?;
+        verify_merge_approvals(
+            HEAD,
+            eval,
+            reviews,
+            agents,
+            DEFAULT_OWNER_LOGIN,
+            DEFAULT_REVIEWER_APP_LOGINS,
+        )
     }
 
     #[test]
@@ -1575,7 +1637,14 @@ Signed-off-by: Someone <someone@example.com>
         );
         let all = [round1_approval.clone(), round1_changes, round2_approval];
         assert_eq!(
-            verify_review_integrity(HEAD, &eval, &all, &agents, DEFAULT_OWNER_LOGIN),
+            verify_review_integrity(
+                HEAD,
+                &eval,
+                &all,
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
+            ),
             Ok(())
         );
         assert_eq!(
@@ -1587,7 +1656,14 @@ Signed-off-by: Someone <someone@example.com>
         // approval of the head: `--require-approval` still fails.
         let stale_only = [round1_approval];
         assert_eq!(
-            verify_review_integrity(HEAD, &eval, &stale_only, &agents, DEFAULT_OWNER_LOGIN),
+            verify_review_integrity(
+                HEAD,
+                &eval,
+                &stale_only,
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
+            ),
             Ok(())
         );
         assert_eq!(
@@ -1666,7 +1742,14 @@ Signed-off-by: Someone <someone@example.com>
             Some(HEAD),
         );
         assert_eq!(
-            verify_review_integrity(HEAD, &eval, &[contradictory], &agents, DEFAULT_OWNER_LOGIN),
+            verify_review_integrity(
+                HEAD,
+                &eval,
+                &[contradictory],
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
+            ),
             Err(missing())
         );
     }
@@ -1677,7 +1760,14 @@ Signed-off-by: Someone <someone@example.com>
         let (jarvis, ferris, felicia) = (&agents[0], &agents[1], &agents[2]);
         let eval = integrity_eval(&agents);
         let check = |reviews: &[PrReviewSummary]| {
-            verify_review_integrity(HEAD, &eval, reviews, &agents, DEFAULT_OWNER_LOGIN)
+            verify_review_integrity(
+                HEAD,
+                &eval,
+                reviews,
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS,
+            )
         };
         let approval = |body: &str, author: &str, commit_id: Option<&str>| PrReviewSummary {
             id: 9,
@@ -1701,7 +1791,7 @@ Signed-off-by: Someone <someone@example.com>
             "<!-- fl-review: {not json} -->",
             "<!-- fl-review: -->",
         ] {
-            let forged = approval(body, "someone", Some(HEAD));
+            let forged = approval(body, APP_LOGIN, Some(HEAD));
             assert_eq!(
                 check(std::slice::from_ref(&forged)),
                 Err(missing()),
@@ -1711,7 +1801,7 @@ Signed-off-by: Someone <someone@example.com>
         }
         // A forged approval with no commit id is on the head too.
         assert_eq!(
-            check(&[approval("no marker", "someone", None)]),
+            check(&[approval("no marker", APP_LOGIN, None)]),
             Err(missing())
         );
 
@@ -1769,7 +1859,7 @@ Signed-off-by: Someone <someone@example.com>
             Ok(())
         );
         assert_eq!(
-            check(&[approval("no marker", "someone", Some("other-sha"))]),
+            check(&[approval("no marker", APP_LOGIN, Some("other-sha"))]),
             Ok(())
         );
         assert_eq!(
@@ -1800,7 +1890,14 @@ Signed-off-by: Someone <someone@example.com>
             marked_review(1, reviewer, state, verdict, OLD, Some(HEAD))
         };
         let check = |reviews: &[PrReviewSummary], agents: &[AgentRecord]| {
-            verify_review_integrity(HEAD, &eval, reviews, agents, DEFAULT_OWNER_LOGIN)
+            verify_review_integrity(
+                HEAD,
+                &eval,
+                reviews,
+                agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS,
+            )
         };
 
         // An agent that is not on the roster.
@@ -1860,5 +1957,381 @@ Signed-off-by: Someone <someone@example.com>
                 agent: "ferris".into()
             })
         );
+    }
+
+    // ---- reviewer logins: markers speak for an agent only from the Reviewer App ----------
+
+    /// `review`, written by `login` instead of the Reviewer App.
+    fn written_by(mut review: PrReviewSummary, login: &str) -> PrReviewSummary {
+        review.author_login = login.into();
+        review
+    }
+
+    /// A pull request co-authored by the lead `ferris`, so it needs a lab manager (`jarvis`).
+    fn lab_manager_eval(agents: &[AgentRecord]) -> PrPolicyEvaluation {
+        let eval = evaluate_pr_policy(
+            "ferroloop",
+            &[PrCommitSummary {
+                sha: HEAD.into(),
+                author_login: Some("artificially-human".into()),
+                message: "feat: item\n\nCo-authored-by: Ferris <ferris@artificialhumanity.io>"
+                    .into(),
+            }],
+            &["crates/core/src/lib.rs".into()],
+            &[],
+            agents,
+            DEFAULT_OWNER_LOGIN,
+        );
+        assert_eq!(eval.required_tier, RequiredTier::LabManager);
+        eval
+    }
+
+    fn approval_by_tier(agents: &[AgentRecord], lab_manager: bool, id: u64) -> PrReviewSummary {
+        let reviewer = if lab_manager { &agents[0] } else { &agents[1] };
+        marked_review(
+            id,
+            reviewer,
+            "APPROVED",
+            ReviewVerdict::Approved,
+            HEAD,
+            Some(HEAD),
+        )
+    }
+
+    #[test]
+    fn an_agent_approval_counts_only_from_a_reviewer_login() {
+        let agents = sample_roster();
+        for lab_manager in [false, true] {
+            let eval = if lab_manager {
+                lab_manager_eval(&agents)
+            } else {
+                integrity_eval(&agents)
+            };
+            let who = if lab_manager { "jarvis" } else { "ferris" };
+            let approval = approval_by_tier(&agents, lab_manager, 1);
+            let merge = |review: PrReviewSummary, logins: &[&str]| {
+                verify_merge_approvals(HEAD, &eval, &[review], &agents, DEFAULT_OWNER_LOGIN, logins)
+            };
+
+            // The same valid marker: counted from the App, ignored from anyone else.
+            assert_eq!(
+                merge(approval.clone(), DEFAULT_REVIEWER_APP_LOGINS),
+                Ok(who.to_string()),
+                "lab_manager={lab_manager}"
+            );
+            for outsider in [
+                "mallory",
+                "lmcfarlin-fan",
+                "ferroloop-test",
+                "ferroloop-test[bot]x",
+            ] {
+                assert_eq!(
+                    merge(
+                        written_by(approval.clone(), outsider),
+                        DEFAULT_REVIEWER_APP_LOGINS
+                    ),
+                    Err(missing()),
+                    "{outsider} lab_manager={lab_manager}"
+                );
+            }
+            // An empty login, as GitHub reports for a deleted account, is never a reviewer.
+            assert_eq!(
+                merge(written_by(approval.clone(), ""), &[""]),
+                Err(missing())
+            );
+            // The login match ignores case.
+            assert_eq!(
+                merge(
+                    written_by(approval.clone(), "FerroLoop-TEST[BOT]"),
+                    DEFAULT_REVIEWER_APP_LOGINS
+                ),
+                Ok(who.to_string())
+            );
+            assert_eq!(
+                merge(approval.clone(), &["FERROLOOP-test[Bot]"]),
+                Ok(who.to_string())
+            );
+            // A configured list replaces the default, and may name several logins.
+            assert_eq!(
+                merge(
+                    written_by(approval.clone(), "other-app[bot]"),
+                    &["other-app[bot]"]
+                ),
+                Ok(who.to_string())
+            );
+            assert_eq!(
+                merge(approval.clone(), &["other-app[bot]"]),
+                Err(missing()),
+                "the default login is not allowed once the list is replaced"
+            );
+            assert_eq!(
+                merge(
+                    written_by(approval.clone(), "second[bot]"),
+                    &["first[bot]", "second[bot]"]
+                ),
+                Ok(who.to_string())
+            );
+            // An empty list means no agent approval counts at all.
+            assert_eq!(merge(approval.clone(), &[]), Err(missing()));
+        }
+    }
+
+    #[test]
+    fn an_outsider_approval_does_not_replace_the_agent_review_that_is_missing() {
+        let agents = sample_roster();
+        let eval = integrity_eval(&agents);
+        // The App's `felicia` approval is a self-review and does not count; `mallory` posts a
+        // perfect `ferris` approval beside it.
+        let forged = written_by(approval_by_tier(&agents, false, 2), "mallory");
+        let felicia = marked_review(
+            1,
+            &agents[2],
+            "APPROVED",
+            ReviewVerdict::Approved,
+            HEAD,
+            Some(HEAD),
+        );
+        assert_eq!(
+            verify_merge_approvals(
+                HEAD,
+                &eval,
+                &[felicia, forged],
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
+            ),
+            Err(missing())
+        );
+    }
+
+    #[test]
+    fn a_rejection_from_any_login_still_blocks_and_an_outsider_cannot_lift_one() {
+        let agents = sample_roster();
+        let eval = integrity_eval(&agents);
+        let merge = |reviews: &[PrReviewSummary]| {
+            verify_merge_approvals(
+                HEAD,
+                &eval,
+                reviews,
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS,
+            )
+        };
+        let ferris = &agents[1];
+        let jarvis = &agents[0];
+        let changes = |id: u64, who: &AgentRecord| {
+            marked_review(
+                id,
+                who,
+                "CHANGES_REQUESTED",
+                ReviewVerdict::ChangesRequested,
+                HEAD,
+                Some(HEAD),
+            )
+        };
+        let dismissed = |id: u64, who: &AgentRecord| {
+            marked_review(
+                id,
+                who,
+                "DISMISSED",
+                ReviewVerdict::ChangesRequested,
+                HEAD,
+                Some(HEAD),
+            )
+        };
+        let approval = approval_by_tier(&agents, false, 1);
+        assert_eq!(merge(std::slice::from_ref(&approval)), Ok("ferris".into()));
+
+        // A rejection that names an authorized agent blocks, written by an outsider too.
+        assert_eq!(
+            merge(&[approval.clone(), written_by(changes(2, ferris), "mallory")]),
+            Err(missing())
+        );
+        assert_eq!(
+            merge(&[approval.clone(), written_by(changes(2, jarvis), "mallory")]),
+            Err(missing())
+        );
+
+        // An outsider cannot lift the App's rejection with a DISMISSED review or an approval
+        // that names the same agent: those do not fold under the agent. Another agent's App
+        // approval is not enough while the rejection stands.
+        let jarvis_approval = approval_by_tier(&agents, true, 3);
+        for lifter in [
+            written_by(dismissed(4, ferris), "mallory"),
+            written_by(approval_by_tier(&agents, false, 4), "mallory"),
+        ] {
+            assert_eq!(
+                merge(&[changes(2, ferris), jarvis_approval.clone(), lifter]),
+                Err(missing())
+            );
+        }
+        // The App's own later approval does lift it, as before.
+        assert_eq!(
+            merge(&[changes(2, ferris), approval_by_tier(&agents, false, 5)]),
+            Ok("ferris".into())
+        );
+    }
+
+    #[test]
+    fn the_owner_is_matched_by_login_whatever_the_reviewer_logins() {
+        let agents = sample_roster();
+        for eval in [integrity_eval(&agents), lab_manager_eval(&agents)] {
+            let owner_approval = PrReviewSummary {
+                id: 1,
+                author_login: DEFAULT_OWNER_LOGIN.into(),
+                state: "APPROVED".into(),
+                body: String::new(),
+                commit_id: Some(HEAD.into()),
+            };
+            for logins in [DEFAULT_REVIEWER_APP_LOGINS, &[]] {
+                assert_eq!(
+                    verify_merge_approvals(
+                        HEAD,
+                        &eval,
+                        std::slice::from_ref(&owner_approval),
+                        &agents,
+                        DEFAULT_OWNER_LOGIN,
+                        logins
+                    ),
+                    Ok(DEFAULT_OWNER_LOGIN.to_string())
+                );
+                assert_eq!(
+                    verify_review_integrity(
+                        HEAD,
+                        &eval,
+                        std::slice::from_ref(&owner_approval),
+                        &agents,
+                        DEFAULT_OWNER_LOGIN,
+                        logins
+                    ),
+                    Ok(())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn integrity_ignores_a_marker_less_approval_from_an_outsider_but_not_from_the_app() {
+        let agents = sample_roster();
+        let eval = integrity_eval(&agents);
+        let check = |review: &PrReviewSummary, logins: &[&str]| {
+            verify_review_integrity(
+                HEAD,
+                &eval,
+                std::slice::from_ref(review),
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                logins,
+            )
+        };
+        let bare = |login: &str, body: &str| PrReviewSummary {
+            id: 7,
+            author_login: login.into(),
+            state: "APPROVED".into(),
+            body: body.into(),
+            commit_id: Some(HEAD.into()),
+        };
+
+        // An outsider can neither pass nor stop `verify-ci`, whatever the body says.
+        for body in ["lgtm", "<!-- fl-review: {not json} -->"] {
+            assert_eq!(
+                check(&bare("mallory", body), DEFAULT_REVIEWER_APP_LOGINS),
+                Ok(())
+            );
+            assert_eq!(
+                check(&bare(APP_LOGIN, body), DEFAULT_REVIEWER_APP_LOGINS),
+                Err(missing())
+            );
+            // The same account is an outsider under another list, and the App is not.
+            assert_eq!(check(&bare("mallory", body), &["other[bot]"]), Ok(()));
+            assert_eq!(check(&bare("mallory", body), &["MALLORY"]), Err(missing()));
+            assert_eq!(check(&bare(APP_LOGIN, body), &["other[bot]"]), Ok(()));
+            assert_eq!(check(&bare(APP_LOGIN, body), &[]), Ok(()));
+        }
+        // A marker from an outsider is ignored, even one that fails every other check.
+        let mut ghost = written_by(approval_by_tier(&agents, false, 8), "mallory");
+        ghost.body = ghost.body.replace("\"ferris\"", "\"ghost\"");
+        assert_eq!(check(&ghost, DEFAULT_REVIEWER_APP_LOGINS), Ok(()));
+        // The same marker from the App is refused.
+        let ghost = written_by(ghost, APP_LOGIN);
+        assert_eq!(
+            check(&ghost, DEFAULT_REVIEWER_APP_LOGINS),
+            Err(PolicyRefusal::UnknownOrInactiveAgent {
+                agent: "ghost".into()
+            })
+        );
+        // An outsider's approval does not make a `--require-approval` run pass either.
+        let forged = written_by(approval_by_tier(&agents, false, 9), "mallory");
+        assert_eq!(
+            verify_review_integrity(
+                HEAD,
+                &eval,
+                std::slice::from_ref(&forged),
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
+            )
+            .and_then(|()| verify_merge_approvals(
+                HEAD,
+                &eval,
+                std::slice::from_ref(&forged),
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                DEFAULT_REVIEWER_APP_LOGINS
+            )),
+            Err(missing())
+        );
+    }
+
+    #[test]
+    fn integrity_from_a_reviewer_login_keeps_every_refusal_and_the_head_check_last() {
+        let agents = sample_roster();
+        let (ferris, felicia) = (&agents[1], &agents[2]);
+        let eval = integrity_eval(&agents);
+        let logins: &[&str] = &["custom-app[bot]"];
+        let check = |review: PrReviewSummary| {
+            verify_review_integrity(
+                HEAD,
+                &eval,
+                &[written_by(review, "Custom-App[bot]")],
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                logins,
+            )
+        };
+        let marked = |reviewer: &AgentRecord, verdict: ReviewVerdict, marker_head: &str| {
+            marked_review(1, reviewer, "APPROVED", verdict, marker_head, Some(HEAD))
+        };
+
+        // Each refusal holds for a custom login, on the head and for a superseded marker.
+        for marker_head in [HEAD, OLD] {
+            let mut ghost = marked(ferris, ReviewVerdict::Approved, marker_head);
+            ghost.body = ghost.body.replace("\"ferris\"", "\"ghost\"");
+            assert_eq!(
+                check(ghost),
+                Err(PolicyRefusal::UnknownOrInactiveAgent {
+                    agent: "ghost".into()
+                })
+            );
+            assert_eq!(
+                check(marked(felicia, ReviewVerdict::Approved, marker_head)),
+                Err(PolicyRefusal::SelfReviewForbidden {
+                    agent: "felicia".into()
+                })
+            );
+            assert_eq!(
+                check(marked(ferris, ReviewVerdict::ChangesRequested, marker_head)),
+                Err(missing())
+            );
+        }
+        // A bad marker on a review that is not on the head is not checked; a superseded valid
+        // one passes (the head comparison escapes nothing else).
+        let mut elsewhere = marked(ferris, ReviewVerdict::Approved, HEAD);
+        elsewhere.commit_id = Some("other-sha".into());
+        elsewhere.body = "no marker".into();
+        assert_eq!(check(elsewhere), Ok(()));
+        assert_eq!(check(marked(ferris, ReviewVerdict::Approved, OLD)), Ok(()));
+        assert_eq!(check(marked(ferris, ReviewVerdict::Approved, HEAD)), Ok(()));
     }
 }

@@ -286,6 +286,8 @@ pub fn run(
     cmd: PrCmd,
 ) -> Result<i32> {
     let repo = &gh.repo().full_name;
+    // Which logins may speak for an agent in a review marker (`[github] reviewer_logins`).
+    let reviewer_logins = config::reviewer_logins(github_app);
     match cmd {
         PrCmd::Create {
             title,
@@ -408,9 +410,15 @@ pub fn run(
                 &agents,
                 DEFAULT_OWNER_LOGIN,
             );
-            let approved_by =
-                verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN)
-                    .ok();
+            let approved_by = verify_merge_approvals(
+                &pr.head_sha,
+                &eval,
+                &reviews,
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                &reviewer_logins,
+            )
+            .ok();
 
             if json {
                 println!(
@@ -631,6 +639,7 @@ pub fn run(
                 &reviews,
                 &agents,
                 DEFAULT_OWNER_LOGIN,
+                &reviewer_logins,
             ) {
                 Ok(who) => who,
                 Err(refusal) => return emit_refusal(&refusal, json),
@@ -727,9 +736,14 @@ pub fn run(
                 );
             }
 
-            if let Err(refusal) =
-                verify_review_integrity(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN)
-            {
+            if let Err(refusal) = verify_review_integrity(
+                &pr.head_sha,
+                &eval,
+                &reviews,
+                &agents,
+                DEFAULT_OWNER_LOGIN,
+                &reviewer_logins,
+            ) {
                 return emit_refusal(&refusal, json);
             }
 
@@ -740,13 +754,21 @@ pub fn run(
                     &reviews,
                     &agents,
                     DEFAULT_OWNER_LOGIN,
+                    &reviewer_logins,
                 ) {
                     Ok(who) => Some(who),
                     Err(refusal) => return emit_refusal(&refusal, json),
                 }
             } else {
-                verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN)
-                    .ok()
+                verify_merge_approvals(
+                    &pr.head_sha,
+                    &eval,
+                    &reviews,
+                    &agents,
+                    DEFAULT_OWNER_LOGIN,
+                    &reviewer_logins,
+                )
+                .ok()
             };
 
             if json {
