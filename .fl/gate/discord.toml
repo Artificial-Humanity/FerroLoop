@@ -53,6 +53,10 @@ verify_secret = "DISCORD_PUBLIC_KEY"
 bot_token_secret = "DISCORD_BOT_TOKEN"
 allowed_user_ids = ["lmcfarlin"]
 allowed_guild_ids = []
+# Connector ids senders may pick with `/model <connector>` (exact ids, no `*`, never a tool).
+# Empty refuses every inline `/model`. `verify_secret` must be provisioned (`fl vault set
+# DISCORD_PUBLIC_KEY`) or the webhook refuses every caller, owner included.
+allowed_inline_connectors = []
 default_target = "wire:ferris"
 
 [bridges.channel_routes]

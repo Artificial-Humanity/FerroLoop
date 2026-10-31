@@ -5192,11 +5192,17 @@ mod tests {
 
     /// A bridge `bridge-hook` that admits any sender id and routes to `wire:felicity`.
     fn install_wire_bridge(home: &std::path::Path) {
+        install_wire_bridge_with(home, "");
+    }
+
+    /// [`install_wire_bridge`] with `extra` TOML lines added to the `[[bridges]]` table.
+    fn install_wire_bridge_with(home: &std::path::Path, extra: &str) {
         let dir = home.join(".config").join("fl").join("gate");
         fs::create_dir_all(&dir).unwrap();
         fs::write(
             dir.join("bridge-hook.toml"),
-            r#"
+            format!(
+                r#"
 id = "bridge-hook"
 title = "Bridge hook"
 base_url = "http://127.0.0.1:1"
@@ -5207,7 +5213,9 @@ id = "bridge-hook"
 kind = "webhook"
 allowed_user_ids = ["*"]
 default_target = "wire:felicity"
-"#,
+{extra}
+"#
+            ),
         )
         .unwrap();
     }
@@ -5255,6 +5263,78 @@ default_target = "wire:felicity"
                 tmux.log()
             );
             assert_eq!(socket_from(&listener).as_deref(), Some(expect), "{body}");
+        }
+    }
+
+    #[test]
+    fn bridge_webhook_refuses_an_owner_when_verify_secret_is_unprovisioned() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let listener = install_claude_tmux_route(tmp.path(), "felicity");
+        // The vault has no `HOOK_SECRTE`: a misspelt name must not switch verification off.
+        install_wire_bridge_with(tmp.path(), r#"verify_secret = "HOOK_SECRTE""#);
+
+        let body = json!({
+            "bridge_id": "ignored",
+            "sender_id": "u1",
+            "channel_id": "chan",
+            "content": "do the thing",
+        });
+        for token in [OWNER, PEER] {
+            let resp = call(
+                &state,
+                "POST",
+                "/api/v1/gate/bridges/bridge-hook/webhook",
+                token,
+                &body,
+            );
+            let err = error_text(&resp);
+            assert_eq!(resp.status, 403, "{err}");
+            assert!(err.contains("HOOK_SECRTE"), "{err}");
+            assert!(err.contains("fl vault set HOOK_SECRTE"), "{err}");
+            let value = resp.json_value().unwrap();
+            assert!(value.get("plan").is_none() && value.get("status").is_none());
+            assert!(
+                tmux.log().is_empty(),
+                "a refused webhook touched tmux: {}",
+                tmux.log()
+            );
+            assert_eq!(socket_from(&listener), None, "a refused webhook was sent");
+        }
+    }
+
+    #[test]
+    fn bridge_webhook_refuses_inline_connector_and_tool_choices() {
+        let _lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let tmux = FakeTmux::install(tmp.path());
+        let listener = install_claude_tmux_route(tmp.path(), "felicity");
+        install_wire_bridge_with(tmp.path(), r#"allowed_inline_connectors = ["gitlab"]"#);
+
+        for content in [
+            "/model github:delete_repo drop it",
+            "/model gitlab:delete_repo drop it",
+            "/model github hello",
+        ] {
+            let body = json!({
+                "bridge_id": "ignored",
+                "sender_id": "u1",
+                "channel_id": "chan",
+                "content": content,
+            });
+            let resp = call(
+                &state,
+                "POST",
+                "/api/v1/gate/bridges/bridge-hook/webhook",
+                OWNER,
+                &body,
+            );
+            assert_eq!(resp.status, 403, "{content}: {}", error_text(&resp));
+            assert!(tmux.log().is_empty(), "{content}: {}", tmux.log());
+            assert_eq!(socket_from(&listener), None, "{content}");
         }
     }
 

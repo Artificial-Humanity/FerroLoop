@@ -147,6 +147,8 @@ verify_secret = "DISCORD_PUBLIC_KEY"
 bot_token_secret = "DISCORD_BOT_TOKEN"
 allowed_user_ids = ["owner-discord-snowflake"]
 allowed_guild_ids = []
+# Connector ids a sender may pick with `/model <connector>`; empty refuses every inline choice.
+allowed_inline_connectors = []
 default_target = "wire:ferris"
 
 [bridges.channel_routes]
@@ -176,7 +178,9 @@ Each `[[bridges]]` entry in a connector manifest supports inbound event normaliz
 1. **Allowlist Verification:**
    * Checks `sender_id` against `allowed_user_ids` (and `guild_id` against `allowed_guild_ids` when non-empty). Unlisted senders are rejected with `BridgeVerdict::UnauthorizedSender` before any agent or LLM token is invoked.
 2. **Target Resolution:**
-   * Checks explicit `@<persona>` or `/model <connector>` prefix in the message content, then `channel_routes.get(channel_id)`, then `default_target`.
+   * Checks an explicit `@<persona>` or `/model <connector>` prefix in the message content, then `channel_routes.get(channel_id)`, then `default_target`.
+   * `@<persona>` routes to `wire:<persona>`. `/model <connector> <message>` is honoured only when the bridge lists that exact connector id in `allowed_inline_connectors` (default empty: every inline `/model` is refused with an error that says why). The match is exact and case-sensitive; `*` is not a wildcard and is rejected when the manifest loads. A connector tool can never be chosen from chat text: `/model <connector>:<tool>` is always refused. Only a leading `/model` word is a directive; a connector id outside lowercase ASCII alphanumeric, `-` and `_` is refused. An operator's own `channel_routes` and `default_target` may still name `connector:<id>:<tool>`.
+   * Migration: a deployment that relied on inline `/model <connector>` must list the connector in `allowed_inline_connectors`, or its senders now get a refusal.
    * Produces a structured `BridgeDispatchPlan`:
      * `BridgeTarget::WireAgent { persona }` — dispatched by `fl-hub` via `dispatch_operator_prompt_to_route` / `FerroWire`.
      * `BridgeTarget::Connector { connector_id, tool_name }` — invoked directly through `FerroGate`'s proxy using the target LLM connector (`claude`, `gemini`, `openai`, `muse`, or local model).
