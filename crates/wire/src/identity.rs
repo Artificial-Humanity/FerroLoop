@@ -328,23 +328,33 @@ impl RouteTable {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = target.with_extension("json.tmp");
+        // A name of our own per call: two savers (the daemon and the hub, or two threads) must
+        // not truncate and rename each other's half-written file.
+        static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SAVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = target.with_extension(format!("json.tmp.{}.{seq}", std::process::id()));
         let bytes = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
-        {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp)?;
+        let written = (|| -> std::io::Result<()> {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            // The table holds CSRF tokens: the file is created private, not chmod-ed afterwards.
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = f.set_permissions(fs::Permissions::from_mode(0o600));
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
             }
+            let mut f = opts.open(&tmp)?;
             f.write_all(&bytes)?;
-            f.sync_all()?;
+            f.sync_all()
+        })();
+        if let Err(err) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
         }
-        fs::rename(&tmp, &target)?;
+        if let Err(err) = fs::rename(&tmp, &target) {
+            let _ = fs::remove_file(&tmp);
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -1435,19 +1445,21 @@ pub fn resolve_claude_key_path(
         return Some(exact);
     }
     // Fallback: any `<pid>.*.key` in `sessions_dir`
+    // `read_dir` order is unspecified; take the lexicographically first match so the same
+    // directory always resolves to the same key file.
     let prefix = format!("{pid}.");
-    if let Ok(read_dir) = fs::read_dir(sessions_dir) {
-        for entry in read_dir.flatten() {
-            let p = entry.path();
-            if let Some(name) = p.file_name().and_then(|s| s.to_str())
-                && name.starts_with(&prefix)
-                && name.ends_with(".key")
-            {
-                return Some(p);
-            }
-        }
-    }
-    None
+    let mut matches: Vec<PathBuf> = fs::read_dir(sessions_dir)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".key"))
+        })
+        .collect();
+    matches.sort();
+    matches.into_iter().next()
 }
 
 pub fn normalize_persona(raw: &str) -> Option<String> {
@@ -2255,6 +2267,7 @@ mod tests {
     use fl_core::agent::{AreaRecord, RegisterAgentArgs};
     use fl_core::mem::MemStore;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     #[test]
@@ -3600,5 +3613,220 @@ mod tests {
             other => panic!("expected agy route, got {other:?}"),
         }
         drop(listener);
+    }
+
+    #[test]
+    fn saved_route_table_is_private_round_trips_and_leaves_no_temp_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("routes.json");
+        let mut table = RouteTable::default();
+        table.upsert(
+            "Kayla",
+            VendorRoute::Agy {
+                conversation_id: "c1".into(),
+                ls_pid: None,
+                ls_address: Some("127.0.0.1:1".into()),
+                csrf_token: Some("super-secret-csrf".into()),
+                agentapi_exe: None,
+            },
+            At::from_unix_millis(5),
+        );
+        table.save(Some(&path)).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the table holds CSRF tokens");
+        let back = RouteTable::load(Some(&path));
+        assert!(back.get("kayla").is_some());
+        let leftovers: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "routes.json")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temp files left behind: {leftovers:?}"
+        );
+    }
+
+    /// Audit I-1: every save used the same `routes.json.tmp`, so concurrent savers truncated each
+    /// other's file and could rename a half-written one into place.
+    #[test]
+    fn concurrent_saves_never_leave_a_corrupt_route_table() {
+        let tmp = TempDir::new().unwrap();
+        let path = Arc::new(tmp.path().join("routes.json"));
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let path = Arc::clone(&path);
+                std::thread::spawn(move || {
+                    let mut table = RouteTable::default();
+                    for i in 0..20 {
+                        table.upsert(
+                            &format!("agent-{t}-{i}"),
+                            VendorRoute::Codex {
+                                thread_id: format!("thread-{t}-{i}"),
+                                cwd: None,
+                            },
+                            At::from_unix_millis(1 + i),
+                        );
+                    }
+                    for _ in 0..40 {
+                        table.save(Some(&path)).unwrap();
+                        let raw = fs::read_to_string(&*path).unwrap();
+                        serde_json::from_str::<RouteTable>(&raw)
+                            .expect("a reader saw a torn route table");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn route_table_load_survives_garbage_and_missing_files() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("routes.json");
+        assert!(RouteTable::load(Some(&path)).entries.is_empty());
+        for junk in [
+            "",
+            "{",
+            "[]",
+            "null",
+            "{\"entries\": 5}",
+            "\u{feff}{}",
+            "{\"x\": {}}",
+        ] {
+            fs::write(&path, junk).unwrap();
+            assert!(
+                RouteTable::load(Some(&path)).entries.is_empty(),
+                "{junk:?} produced routes"
+            );
+        }
+    }
+
+    #[test]
+    fn upsert_ignores_names_that_are_not_valid_personas() {
+        let mut table = RouteTable::default();
+        let route = || VendorRoute::Codex {
+            thread_id: "t".into(),
+            cwd: None,
+        };
+        for bad in [
+            "",
+            "   ",
+            "1abc",
+            "has space",
+            "a/b",
+            "../etc",
+            "x".repeat(65).as_str(),
+        ] {
+            table.upsert(bad, route(), At::from_unix_millis(1));
+        }
+        assert!(table.entries.is_empty());
+        table.upsert("  Mixed_Case-9  ", route(), At::from_unix_millis(1));
+        table.upsert(&"a".repeat(64), route(), At::from_unix_millis(1));
+        assert!(table.get("mixed_case-9").is_some());
+        assert!(table.get("MIXED_CASE-9").is_some());
+        assert_eq!(table.entries.len(), 2);
+        assert!(table.get("nobody").is_none());
+        assert!(table.get("").is_none());
+    }
+
+    #[test]
+    fn merge_newer_keeps_the_newer_entry_and_ties_keep_the_existing_one() {
+        let codex = |t: &str| VendorRoute::Codex {
+            thread_id: t.into(),
+            cwd: None,
+        };
+        let mut a = RouteTable::default();
+        a.upsert("old", codex("a-old"), At::from_unix_millis(10));
+        a.upsert("newer-in-a", codex("a-new"), At::from_unix_millis(50));
+        a.upsert("tie", codex("a-tie"), At::from_unix_millis(30));
+        let mut b = RouteTable::default();
+        b.upsert("old", codex("b-old"), At::from_unix_millis(20));
+        b.upsert("newer-in-a", codex("b-new"), At::from_unix_millis(40));
+        b.upsert("tie", codex("b-tie"), At::from_unix_millis(30));
+        b.upsert("only-b", codex("b-only"), At::from_unix_millis(1));
+        a.merge_newer(b);
+        let thread = |t: &RouteTable, k: &str| match &t.get(k).unwrap().route {
+            VendorRoute::Codex { thread_id, .. } => thread_id.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(thread(&a, "old"), "b-old");
+        assert_eq!(thread(&a, "newer-in-a"), "a-new");
+        assert_eq!(thread(&a, "tie"), "a-tie");
+        assert_eq!(thread(&a, "only-b"), "b-only");
+    }
+
+    #[test]
+    fn a_newer_muse_route_keeps_the_tmux_target_the_older_one_knew() {
+        let muse = |tmux: Option<&str>| VendorRoute::Muse {
+            session_id: "s".into(),
+            cwd: None,
+            tmux_target: tmux.map(str::to_string),
+            tmux_pane: tmux.map(|t| format!("{t}.%1")),
+        };
+        let mut table = RouteTable::default();
+        table.upsert("muse-a", muse(Some("sess:1")), At::from_unix_millis(10));
+        table.upsert("muse-a", muse(None), At::from_unix_millis(20));
+        match &table.get("muse-a").unwrap().route {
+            VendorRoute::Muse {
+                tmux_target,
+                tmux_pane,
+                ..
+            } => {
+                assert_eq!(tmux_target.as_deref(), Some("sess:1"));
+                assert_eq!(tmux_pane.as_deref(), Some("sess:1.%1"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Different vendors never share fields.
+        table.upsert(
+            "muse-a",
+            VendorRoute::Codex {
+                thread_id: "t".into(),
+                cwd: None,
+            },
+            At::from_unix_millis(30),
+        );
+        assert!(matches!(
+            table.get("muse-a").unwrap().route,
+            VendorRoute::Codex { .. }
+        ));
+    }
+
+    #[test]
+    fn claude_key_lookup_matches_the_exact_pid_prefix_and_is_deterministic() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("claude.sock");
+        // `12.` must not match pid 123's file, and the lexicographically first match wins.
+        for name in [
+            "123.aaa.key",
+            "12.zzz.key",
+            "12.bbb.key",
+            "12.bbb.txt",
+            "x12.q.key",
+        ] {
+            fs::write(tmp.path().join(name), "{}").unwrap();
+        }
+        for _ in 0..5 {
+            let found = resolve_claude_key_path(tmp.path(), 12, &sock).unwrap();
+            assert_eq!(found.file_name().unwrap(), "12.bbb.key");
+        }
+        assert!(resolve_claude_key_path(tmp.path(), 1, &sock).is_none());
+        assert!(resolve_claude_key_path(&tmp.path().join("missing"), 12, &sock).is_none());
+    }
+
+    #[test]
+    fn normalize_claude_session_name_rejects_the_artificial_humanity_prefix() {
+        assert_eq!(
+            normalize_claude_session_name(" Felicia "),
+            Some("felicia".into())
+        );
+        assert_eq!(normalize_claude_session_name("artificial-humanity-x"), None);
+        assert_eq!(normalize_claude_session_name("Artificial-Humanity-X"), None);
+        assert_eq!(normalize_claude_session_name(""), None);
     }
 }

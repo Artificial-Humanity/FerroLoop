@@ -4,7 +4,7 @@ use std::process::Command;
 
 pub struct Git;
 
-fn git(root: &Path, args: &[&str]) -> Result<String, ExecError> {
+fn git_raw(root: &Path, args: &[&str]) -> Result<Vec<u8>, ExecError> {
     let out = Command::new("git")
         .args(args)
         .current_dir(root)
@@ -18,7 +18,28 @@ fn git(root: &Path, args: &[&str]) -> Result<String, ExecError> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    Ok(out.stdout)
+}
+
+fn git(root: &Path, args: &[&str]) -> Result<String, ExecError> {
+    Ok(String::from_utf8_lossy(&git_raw(root, args)?)
+        .trim()
+        .to_string())
+}
+
+/// A revision, object id, remote or branch name that is safe to put on a git command line.
+///
+/// Such a value is passed as a positional argument, so one starting with `-` would be read as an
+/// option (`--output=<file>` on `git diff`, `--upload-pack=<cmd>` on `git fetch`). Git ref names
+/// cannot start with `-` or hold control characters, so refusing both loses nothing.
+fn plain_arg<'a>(what: &str, value: &'a str) -> Result<&'a str, ExecError> {
+    if value.is_empty() || value.starts_with('-') || value.bytes().any(|b| b.is_ascii_control()) {
+        return Err(ExecError::Git(format!(
+            "refusing to pass {what} `{}` to git: it is empty, starts with `-`, or has a control character",
+            value.escape_debug()
+        )));
+    }
+    Ok(value)
 }
 
 impl Git {
@@ -64,13 +85,19 @@ impl Git {
     }
 
     /// Absolute paths that differ between two commits.
+    ///
+    /// Read with `-z`: without it git quotes a path holding non-ASCII bytes, a quote or a
+    /// newline (`"caf\303\251.rs"`), and the quoted text would name a file that does not exist.
     pub fn changed_between(root: &Path, from: &str, to: &str) -> Result<Vec<PathBuf>, ExecError> {
-        let text = git(root, &["diff", "--name-only", from, to])?;
-        Ok(text
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(|l| root.join(l))
+        let (from, to) = (plain_arg("revision", from)?, plain_arg("revision", to)?);
+        let raw = git_raw(root, &["diff", "--name-only", "-z", from, to])?;
+        Ok(raw
+            .split(|b| *b == 0)
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                use std::os::unix::ffi::OsStrExt;
+                root.join(std::ffi::OsStr::from_bytes(name))
+            })
             .collect())
     }
 
@@ -82,6 +109,7 @@ impl Git {
         remote: &str,
         branch: &str,
     ) -> Result<Option<String>, ExecError> {
+        let (remote, branch) = (plain_arg("remote", remote)?, plain_arg("branch", branch)?);
         let refspec = format!("refs/heads/{branch}");
         let out = Command::new("git")
             .args(["ls-remote", "--exit-code", "--refs", remote, &refspec])
@@ -120,6 +148,11 @@ impl Git {
         branch: &str,
         local_ref: &str,
     ) -> Result<(), ExecError> {
+        let remote = plain_arg("remote", remote)?;
+        let (branch, local_ref) = (
+            plain_arg("branch", branch)?,
+            plain_arg("local ref", local_ref)?,
+        );
         let spec = format!("+refs/heads/{branch}:{local_ref}");
         git(root, &["fetch", "--no-tags", "--quiet", remote, &spec])?;
         Ok(())
@@ -127,6 +160,10 @@ impl Git {
 
     /// Return `true` iff `ancestor` is an ancestor of `descendant` in `root`'s object database.
     pub fn is_ancestor(root: &Path, ancestor: &str, descendant: &str) -> Result<bool, ExecError> {
+        let (ancestor, descendant) = (
+            plain_arg("revision", ancestor)?,
+            plain_arg("revision", descendant)?,
+        );
         let out = Command::new("git")
             .args(["merge-base", "--is-ancestor", ancestor, descendant])
             .current_dir(root)
@@ -149,8 +186,9 @@ impl Git {
         after: Option<&str>,
         tip: &str,
     ) -> Result<Vec<String>, ExecError> {
+        let tip = plain_arg("revision", tip)?;
         let range = match after {
-            Some(base) => format!("{base}..{tip}"),
+            Some(base) => format!("{}..{tip}", plain_arg("revision", base)?),
             None => tip.to_owned(),
         };
         let raw = git(root, &["rev-list", "--first-parent", "--reverse", &range])?;
@@ -162,15 +200,20 @@ impl Git {
             .collect())
     }
 
-    /// List all objects recursively under `treeish` (`git ls-tree -r <treeish>`).
+    /// List all objects recursively under `treeish` (`git ls-tree -r -z <treeish>`).
+    ///
+    /// Read with `-z` so a path with a non-ASCII byte, quote, tab or newline comes back as the
+    /// file's real name, not git's C-quoted form.
     pub fn ls_tree(root: &Path, treeish: &str) -> Result<Vec<GitTreeEntry>, ExecError> {
-        let raw = git(root, &["ls-tree", "-r", treeish])?;
+        let treeish = plain_arg("tree-ish", treeish)?;
+        let raw = git_raw(root, &["ls-tree", "-r", "-z", treeish])?;
         let mut entries = Vec::new();
-        for line in raw.lines() {
-            if line.trim().is_empty() {
+        for record in raw.split(|b| *b == 0) {
+            if record.is_empty() {
                 continue;
             }
-            let Some((meta, path)) = line.split_once('\t') else {
+            let record = String::from_utf8_lossy(record);
+            let Some((meta, path)) = record.split_once('\t') else {
                 continue;
             };
             let mut parts = meta.split_whitespace();
@@ -190,6 +233,7 @@ impl Git {
 
     /// Read raw blob bytes by object ID (`git cat-file blob <oid>`).
     pub fn cat_blob(root: &Path, oid: &str) -> Result<Vec<u8>, ExecError> {
+        let oid = plain_arg("object id", oid)?;
         let out = Command::new("git")
             .args(["cat-file", "blob", oid])
             .current_dir(root)
@@ -214,11 +258,13 @@ impl Git {
     pub fn mktree(root: &Path, entries: &[GitTreeEntry]) -> Result<String, ExecError> {
         let mut sorted = entries.to_vec();
         sorted.sort_by(|a, b| a.path.cmp(&b.path));
+        // `-z`: NUL-terminated records whose names are raw, so a name holding a quote, tab or
+        // newline is stored as written and not mangled by C-style (un)quoting.
         let mut input = String::new();
         for e in &sorted {
-            input.push_str(&format!("{} {} {}\t{}\n", e.mode, e.kind, e.oid, e.path));
+            input.push_str(&format!("{} {} {}\t{}\0", e.mode, e.kind, e.oid, e.path));
         }
-        git_with_stdin(root, &["mktree"], input.as_bytes())
+        git_with_stdin(root, &["mktree", "-z"], input.as_bytes())
     }
 
     /// Create a commit object via `git commit-tree` without touching `HEAD` or any working tree.
@@ -229,6 +275,8 @@ impl Git {
         message: &str,
         by: &str,
     ) -> Result<String, ExecError> {
+        let tree_oid = plain_arg("tree id", tree_oid)?;
+        let parent_oid = parent_oid.map(|p| plain_arg("parent id", p)).transpose()?;
         let author = if by.trim().is_empty() {
             "fl"
         } else {
@@ -268,6 +316,14 @@ impl Git {
         expected_old_oid: Option<&str>,
         new_oid: &str,
     ) -> Result<PushCasOutcome, ExecError> {
+        let (remote, branch, new_oid) = (
+            plain_arg("remote", remote)?,
+            plain_arg("branch", branch)?,
+            plain_arg("object id", new_oid)?,
+        );
+        let expected_old_oid = expected_old_oid
+            .map(|old| plain_arg("object id", old))
+            .transpose()?;
         let lease = match expected_old_oid {
             Some(old) => format!("--force-with-lease=refs/heads/{branch}:{old}"),
             None => format!("--force-with-lease=refs/heads/{branch}:"),
@@ -544,5 +600,111 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].path, "greeting.txt");
         assert_eq!(listed[0].oid, blob_oid);
+    }
+
+    #[test]
+    fn changed_between_reports_real_names_for_paths_git_would_quote() {
+        let d = repo();
+        let before = Git::head(d.path()).unwrap();
+        // Non-ASCII, a space, a double quote and a leading dash: all forms git C-quotes or that
+        // an option parser could misread.
+        let names = ["café.rs", "with space.rs", "q\"uote.rs", "-dash.rs"];
+        for name in names {
+            fs::write(d.path().join(name), "x").unwrap();
+        }
+        let after = commit(d.path(), "odd names");
+        let changed = Git::changed_between(d.path(), &before, &after).unwrap();
+        for name in names {
+            let want = d.path().join(name);
+            assert!(changed.contains(&want), "{name:?} missing from {changed:?}");
+            assert!(want.exists());
+        }
+        assert_eq!(changed.len(), names.len());
+    }
+
+    #[test]
+    fn ls_tree_and_mktree_round_trip_names_git_would_quote() {
+        let d = repo();
+        let names = ["café.rs", "tab\there.rs", "q\"uote.rs", "sp ace.rs"];
+        for name in names {
+            let Ok(()) = fs::write(d.path().join(name), "x") else {
+                continue;
+            };
+        }
+        let commit_oid = commit(d.path(), "odd names");
+        let entries = Git::ls_tree(d.path(), &commit_oid).unwrap();
+        for name in names {
+            assert!(
+                entries.iter().any(|e| e.path == name),
+                "{name:?} not listed verbatim: {:?}",
+                entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+            );
+        }
+        // Rebuild a flat tree from the listing and read it back unchanged.
+        let flat: Vec<GitTreeEntry> = entries
+            .iter()
+            .filter(|e| e.kind == "blob" && !e.path.contains('/'))
+            .cloned()
+            .collect();
+        let tree = Git::mktree(d.path(), &flat).unwrap();
+        let mut back: Vec<String> = Git::ls_tree(d.path(), &tree)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        let mut want: Vec<String> = flat.iter().map(|e| e.path.clone()).collect();
+        back.sort();
+        want.sort();
+        assert_eq!(back, want);
+    }
+
+    #[test]
+    fn values_that_git_would_read_as_options_are_refused_before_git_runs() {
+        let d = repo();
+        let head = Git::head(d.path()).unwrap();
+        let sentinel = d.path().join("pwned");
+        let evil_output = format!("--output={}", sentinel.display());
+        let evil_pack = "--upload-pack=touch pwned";
+        assert!(Git::changed_between(d.path(), &evil_output, &head).is_err());
+        assert!(Git::changed_between(d.path(), &head, &evil_output).is_err());
+        assert!(Git::ls_tree(d.path(), "-r").is_err());
+        assert!(Git::cat_blob(d.path(), "--batch").is_err());
+        assert!(Git::is_ancestor(d.path(), "--all", &head).is_err());
+        assert!(Git::rev_list_first_parent(d.path(), None, "--all").is_err());
+        assert!(Git::rev_list_first_parent(d.path(), Some("--all"), &head).is_err());
+        assert!(Git::ls_remote_branch(d.path(), evil_pack, "main").is_err());
+        assert!(Git::fetch_branch(d.path(), evil_pack, "main", "refs/x").is_err());
+        assert!(Git::push_cas(d.path(), evil_pack, "main", None, &head).is_err());
+        assert!(Git::push_cas(d.path(), "origin", "-f", None, &head).is_err());
+        assert!(Git::commit_tree(d.path(), "--help", None, "m", "t").is_err());
+        assert!(Git::commit_tree(d.path(), &head, Some("-S"), "m", "t").is_err());
+        assert!(Git::changed_between(d.path(), "", &head).is_err());
+        assert!(Git::changed_between(d.path(), "a\nb", &head).is_err());
+        assert!(!sentinel.exists(), "an option-shaped argument reached git");
+    }
+
+    #[test]
+    fn rev_list_first_parent_orders_oldest_first_and_honours_the_lower_bound() {
+        let d = repo();
+        let first = Git::head(d.path()).unwrap();
+        fs::write(d.path().join("b.rs"), "b").unwrap();
+        let second = commit(d.path(), "second");
+        fs::write(d.path().join("c.rs"), "c").unwrap();
+        let third = commit(d.path(), "third");
+        assert_eq!(
+            Git::rev_list_first_parent(d.path(), None, &third).unwrap(),
+            vec![first.clone(), second.clone(), third.clone()]
+        );
+        assert_eq!(
+            Git::rev_list_first_parent(d.path(), Some(&first), &third).unwrap(),
+            vec![second, third.clone()]
+        );
+        assert!(
+            Git::rev_list_first_parent(d.path(), Some(&third), &third)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(Git::is_ancestor(d.path(), &first, &third).unwrap());
+        assert!(!Git::is_ancestor(d.path(), &third, &first).unwrap());
     }
 }

@@ -26,7 +26,7 @@ use fl_core::workflow::{
     ApprovalTier, AssigneeRule, DEFAULT_MAX_TOTAL_STEPS, DEFAULT_STEP_MAX_ATTEMPTS,
     DEFAULT_STEP_MAX_VISITS, EdgeDef, JoinPolicy, StepAttemptReport, StepCompletion, StepDef,
     StepOutcome, WorkflowDef, WorkflowError, WorkflowRun, WorkflowRunStatus, advance_workflow,
-    authorize_step_sign_off, validate_workflow_def,
+    authorize_step_sign_off, preflight_ceiling, validate_workflow_def,
 };
 pub use fl_core::workflow::{SelectedStepAgent, select_step_agent, validate_reviewer_independence};
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,21 @@ use crate::evaluate::{GateReport, TransitionReport, run_single_gate_with_regret}
 use crate::population::{ExecError, refused_publish};
 use crate::runner::{AttemptError, AttemptSpec, Runner};
 use crate::stamp;
+
+/// Serialises the read-modify-write that commits a step's result to its stored [`WorkflowRun`].
+///
+/// A step runs for minutes between loading the run and committing, and sibling fan-out branches
+/// commit to the same stored run. Every commit therefore re-reads the run under this lock and
+/// applies only its own step's changes (see `execute_workflow_step`). It covers threads in one
+/// process, which is the only way two commits can overlap: the embedded store admits one
+/// process at a time.
+static RUN_COMMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_run_commits() -> std::sync::MutexGuard<'static, ()> {
+    RUN_COMMIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// Relative directory inside a project root holding shared workflow definitions.
 pub const FLOWS_DIR: &str = ".fl/flows";
@@ -815,6 +830,23 @@ fn ensure_isolated_worktree(
     Ok((wt_dir, branch))
 }
 
+/// Persist `local`'s copy of `step_id` onto the stored run's current state and return the result.
+fn commit_step_snapshot(
+    workflows: &dyn WorkflowStore,
+    local: &WorkflowRun,
+    step_id: &str,
+) -> Result<WorkflowRun, WorkflowExecError> {
+    let _commit = lock_run_commits();
+    let mut fresh = workflows
+        .get_workflow_run(&local.id)?
+        .ok_or_else(|| StoreError::NoSuchWorkflowRun(local.id.to_string()))?;
+    if let Some(step) = local.steps.get(step_id) {
+        fresh.steps.insert(step_id.to_string(), step.clone());
+    }
+    fresh.updated_at = local.updated_at.clone();
+    Ok(workflows.update_workflow_run(fresh)?)
+}
+
 /// Execute (or dispatch a FerroWire task offer for) an active step in `run_id` (spec §3.3).
 pub fn execute_workflow_step(
     env: WorkflowEnv<'_>,
@@ -937,7 +969,7 @@ pub fn execute_workflow_step(
         let step = run.steps.get_mut(&step_id).expect("step exists");
         step.state = State::Doing;
         run.updated_at = now;
-        run = env.workflows.update_workflow_run(run)?;
+        run = commit_step_snapshot(env.workflows, &run, &step_id)?;
         return Ok(StepExecutionReport {
             step_id,
             action: StepExecutionAction::Offered {
@@ -951,6 +983,28 @@ pub fn execute_workflow_step(
     }
 
     // 3. Adapter execution mode.
+    //
+    // Fail fast on an exhausted budget: the ceilings in `advance_workflow` are checked after an
+    // attempt has run, so without this the attempt that crosses a ceiling has already spent it.
+    if let Some(detail) = preflight_ceiling(&def, &run, &step_id) {
+        let _commit = lock_run_commits();
+        let mut fresh = env
+            .workflows
+            .get_workflow_run(&run.id)?
+            .ok_or_else(|| StoreError::NoSuchWorkflowRun(run.id.to_string()))?;
+        if !fresh.status.is_terminal() {
+            if let Some(step) = fresh.steps.get_mut(&step_id) {
+                step.state = State::NeedsHuman;
+                step.last_outcome = Some(StepOutcome::NeedsHuman);
+                step.needs_human_reason = Some(detail.clone());
+            }
+            fresh.status = WorkflowRunStatus::NeedsHuman;
+            fresh.updated_at = stamp::now();
+            env.workflows.update_workflow_run(fresh)?;
+        }
+        return Err(WorkflowError::BudgetExhausted { step_id, detail }.into());
+    }
+
     let raw_adapter = options
         .adapter_override
         .clone()
@@ -1243,21 +1297,32 @@ pub fn execute_workflow_step(
         handoff_author,
     )?;
 
-    advance_workflow(
-        &def,
-        &mut run,
-        StepAttemptReport {
-            step_id: step_id.clone(),
-            outcome: step_outcome,
-            attempt_iri: Some(attempt_id.clone()),
-            tokens_used: outcome.tokens_in.saturating_add(outcome.tokens_out),
-            cost_usd_micros: outcome.cost_usd_micros,
-            reason,
-        },
-        now,
-    )?;
-
-    run = env.workflows.update_workflow_run(run)?;
+    // Commit onto the run as it is now, not as it was when this step started: sibling branches
+    // may have committed during the attempt.
+    {
+        let _commit = lock_run_commits();
+        let mut fresh = env
+            .workflows
+            .get_workflow_run(&run.id)?
+            .ok_or_else(|| StoreError::NoSuchWorkflowRun(run.id.to_string()))?;
+        if let Some(local) = run.steps.get(&step_id) {
+            fresh.steps.insert(step_id.clone(), local.clone());
+        }
+        advance_workflow(
+            &def,
+            &mut fresh,
+            StepAttemptReport {
+                step_id: step_id.clone(),
+                outcome: step_outcome,
+                attempt_iri: Some(attempt_id.clone()),
+                tokens_used: outcome.tokens_in.saturating_add(outcome.tokens_out),
+                cost_usd_micros: outcome.cost_usd_micros,
+                reason,
+            },
+            now,
+        )?;
+        run = env.workflows.update_workflow_run(fresh)?;
+    }
 
     Ok(StepExecutionReport {
         step_id,
@@ -1285,6 +1350,7 @@ pub fn approve_workflow_step(
     note: Option<&str>,
     owner_login: &str,
 ) -> Result<WorkflowRun, WorkflowExecError> {
+    let _commit = lock_run_commits();
     let mut run = env
         .workflows
         .get_workflow_run(run_id)?
@@ -1413,6 +1479,7 @@ pub fn reject_workflow_step(
     reason: &str,
     owner_login: &str,
 ) -> Result<WorkflowRun, WorkflowExecError> {
+    let _commit = lock_run_commits();
     let mut run = env
         .workflows
         .get_workflow_run(run_id)?
@@ -1558,9 +1625,19 @@ pub fn abort_workflow_run(
     at: At,
     by: &str,
 ) -> Result<WorkflowRun, WorkflowExecError> {
+    let _commit = lock_run_commits();
     let mut run = workflows
         .get_workflow_run(run_id)?
         .ok_or_else(|| StoreError::NoSuchWorkflowRun(run_id.to_string()))?;
+    match run.status {
+        // Aborting twice is harmless.
+        WorkflowRunStatus::Canceled => return Ok(run),
+        // A finished run keeps the status it earned.
+        WorkflowRunStatus::Completed | WorkflowRunStatus::Failed => {
+            return Err(WorkflowError::RunNotRunning(run.status).into());
+        }
+        WorkflowRunStatus::Running | WorkflowRunStatus::NeedsHuman => {}
+    }
     run.status = WorkflowRunStatus::Canceled;
     run.active_steps.clear();
     run.updated_at = at;
@@ -2209,5 +2286,167 @@ on = "pass"
         assert_eq!(completed_run.status, WorkflowRunStatus::Completed);
         assert!(completed_run.active_steps.is_empty());
         assert_eq!(completed_run.steps["review"].state, State::Done);
+    }
+
+    fn one_step_def(store: &MemStore) -> WorkflowDef {
+        let repo = git_repo();
+        let head = crate::git::Git::head(repo.path()).unwrap();
+        let project = store
+            .add_project(&repo.path().display().to_string())
+            .unwrap();
+        // Keep the repo alive for the test's lifetime by leaking the temp dir handle.
+        std::mem::forget(repo);
+        store
+            .upsert_workflow_def(WorkflowDef {
+                id: WorkflowId(stamp::entry_id()),
+                project,
+                slug: "one-step".into(),
+                title: "One step".into(),
+                start_step: "only".into(),
+                steps: vec![StepDef {
+                    step_id: "only".into(),
+                    title: "Only".into(),
+                    prompt: "Do it.".into(),
+                    assignee: AssigneeRule::Agent {
+                        name: "felicia".into(),
+                    },
+                    reviews_step: None,
+                    require_different_vendor: false,
+                    completion: StepCompletion::Ungated,
+                    join_policy: JoinPolicy::All,
+                    max_attempts: 1,
+                    max_visits: 1,
+                    budget_usd_micros: None,
+                    max_tokens: None,
+                    isolate_worktree: false,
+                }],
+                edges: vec![EdgeDef {
+                    from_step: "only".into(),
+                    to_step: END_STEP.into(),
+                    on: EdgeCondition::Pass,
+                }],
+                max_total_steps: 4,
+                budget_usd_micros: None,
+                max_tokens: None,
+                declared_keys: BTreeMap::new(),
+                authored_at_commit: head,
+                authored_by: "ferris".into(),
+            })
+            .unwrap()
+    }
+
+    /// Audit X-2: `abort_workflow_run` set `Canceled` on any run, including one that had already
+    /// completed or failed, rewriting history.
+    #[test]
+    fn abort_refuses_a_finished_run_and_is_idempotent_for_a_canceled_one() {
+        let store = MemStore::default();
+        let def = one_step_def(&store);
+        let run = start_workflow_run(&store, &def, "abort me", At::from_unix_millis(5), "ferris")
+            .unwrap();
+        for terminal in [WorkflowRunStatus::Completed, WorkflowRunStatus::Failed] {
+            let mut r = store.get_workflow_run(&run.id).unwrap().unwrap();
+            r.status = terminal;
+            store.update_workflow_run(r).unwrap();
+            let err =
+                abort_workflow_run(&store, &run.id, At::from_unix_millis(6), "ferris").unwrap_err();
+            assert!(err.is_policy_refusal() || matches!(err, WorkflowExecError::Workflow(_)));
+            assert_eq!(
+                store.get_workflow_run(&run.id).unwrap().unwrap().status,
+                terminal,
+                "abort rewrote a finished run"
+            );
+        }
+        let mut r = store.get_workflow_run(&run.id).unwrap().unwrap();
+        r.status = WorkflowRunStatus::NeedsHuman;
+        store.update_workflow_run(r).unwrap();
+        let canceled =
+            abort_workflow_run(&store, &run.id, At::from_unix_millis(7), "ferris").unwrap();
+        assert_eq!(canceled.status, WorkflowRunStatus::Canceled);
+        assert!(canceled.active_steps.is_empty());
+        let again = abort_workflow_run(&store, &run.id, At::from_unix_millis(8), "owner").unwrap();
+        assert_eq!(again.status, WorkflowRunStatus::Canceled);
+        assert_eq!(
+            again.by, "ferris",
+            "a repeated abort must not rewrite the record"
+        );
+        assert!(
+            abort_workflow_run(
+                &store,
+                &WorkflowRunId(stamp::entry_id()),
+                At::from_unix_millis(9),
+                "ferris"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn handoff_summary_is_one_bounded_non_empty_line() {
+        assert_eq!(
+            sanitize_handoff_summary("\n\n  first line \nsecond", "fb"),
+            "first line"
+        );
+        assert_eq!(sanitize_handoff_summary("   \n\t", "fallback"), "fallback");
+        assert_eq!(sanitize_handoff_summary("", "  "), "Step completed");
+        let long = "é".repeat(MAX_SUMMARY_CHARS + 50);
+        let cut = sanitize_handoff_summary(&long, "fb");
+        assert_eq!(
+            cut.chars().count(),
+            MAX_SUMMARY_CHARS,
+            "truncation must be on char boundaries"
+        );
+        let exact = "x".repeat(MAX_SUMMARY_CHARS);
+        assert_eq!(sanitize_handoff_summary(&exact, "fb"), exact);
+    }
+
+    #[test]
+    fn run_and_handoff_slugs_are_deterministic_and_valid() {
+        let a = WorkflowRunId(stamp::entry_id());
+        let b = WorkflowRunId(stamp::entry_id());
+        assert_eq!(run_scope_slug(&a), run_scope_slug(&a));
+        assert_ne!(run_scope_slug(&a), run_scope_slug(&b));
+        assert!(validate_slug(&run_scope_slug(&a)).is_ok());
+        assert_eq!(step_handoff_slug("build", 3), "step-build-v3");
+        assert!(validate_slug(&step_handoff_slug("build", u32::MAX)).is_ok());
+    }
+
+    fn handoff_entry(slug: &str, summary: &str) -> StateEntry {
+        use fl_core::ids::{RevisionId, StateId};
+        StateEntry {
+            id: StateId(stamp::entry_id()),
+            scope: StateScope::Workflow("run-x".into()),
+            concern: StateConcern::Handoff,
+            slug: slug.into(),
+            sensitive: false,
+            ever_sensitive: false,
+            payload: StatePayload::Handoff(HandoffEntry {
+                summary: summary.into(),
+                shipped: vec![],
+                in_flight: vec![],
+                blockers: vec![],
+                next_steps: vec![],
+                notes: None,
+            }),
+            head_revision: RevisionId(stamp::entry_id()),
+            updated_at: At::from_unix_millis(1),
+            by: "t".into(),
+        }
+    }
+
+    #[test]
+    fn latest_handoff_picks_the_highest_visit_and_ignores_lookalike_steps() {
+        let entries = vec![
+            handoff_entry("step-build-v2", "second"),
+            handoff_entry("step-build-v10", "tenth"),
+            handoff_entry("step-build-v1", "first"),
+            // A different step whose id merely starts with `build`.
+            handoff_entry("step-build-v2-v99", "lookalike"),
+            handoff_entry("step-builder-v50", "other step"),
+            handoff_entry("step-build-vx", "not a number"),
+        ];
+        let (slug, h) = latest_handoff_for_step(&entries, "build").unwrap();
+        assert_eq!((slug, h.summary.as_str()), ("step-build-v10", "tenth"));
+        assert!(latest_handoff_for_step(&entries, "missing").is_none());
+        assert!(latest_handoff_for_step(&[], "build").is_none());
     }
 }

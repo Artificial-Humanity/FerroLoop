@@ -3,7 +3,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -98,9 +98,20 @@ pub struct WsStream {
     transport: Transport,
     is_client: bool,
     rng: SystemRandom,
+    /// Bytes read from the transport that do not yet form a whole frame. A read that times out
+    /// part-way through a frame leaves them here, so the next `read_frame` resumes the frame
+    /// instead of treating its middle as a new header.
+    rbuf: Vec<u8>,
+    /// When the last whole frame (of any opcode, pongs included) arrived.
+    last_rx: Instant,
 }
 
 impl WsStream {
+    /// `true` when this end opened the connection (and so masks the frames it sends).
+    pub fn is_client(&self) -> bool {
+        self.is_client
+    }
+
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> io::Result<()> {
         match &self.transport {
             Transport::Plain(s) => s.set_read_timeout(dur),
@@ -117,6 +128,11 @@ impl WsStream {
 
     /// Connect to a `ws://host:port[/path]` or `wss://host:port[/path]` endpoint.
     pub fn connect(url: &str, timeout: Duration) -> Result<Self, WsError> {
+        // The URL is written into the request line and `Host` header: a CR, LF or space would
+        // let it add headers of its own.
+        if url.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+            return Err(WsError::InvalidUrl(url.escape_debug().to_string()));
+        }
         let (tls, rest) = if let Some(r) = url.strip_prefix("wss://") {
             (true, r)
         } else if let Some(r) = url.strip_prefix("ws://") {
@@ -177,6 +193,8 @@ impl WsStream {
             transport,
             is_client: true,
             rng,
+            rbuf: Vec::new(),
+            last_rx: Instant::now(),
         };
 
         let req = format!(
@@ -251,55 +269,49 @@ impl WsStream {
             transport,
             is_client: false,
             rng: SystemRandom::new(),
+            rbuf: Vec::new(),
+            last_rx: Instant::now(),
         })
     }
 
+    /// How long ago the last whole frame (a pong included) arrived.
+    pub fn idle_for(&self) -> Duration {
+        self.last_rx.elapsed()
+    }
+
+    /// Read one frame. A read timeout or `WouldBlock` can surface part-way through a frame; the
+    /// bytes already read are kept, and calling `read_frame` again resumes the same frame.
     pub fn read_frame(&mut self) -> Result<WsFrame, WsError> {
-        let mut hdr = [0u8; 2];
-        if let Err(e) = self.transport.read_exact(&mut hdr) {
-            if e.kind() == io::ErrorKind::UnexpectedEof {
-                return Err(WsError::Closed);
+        loop {
+            if let Some((frame, used)) = parse_frame(&self.rbuf, self.is_client)? {
+                self.rbuf.drain(..used);
+                self.last_rx = Instant::now();
+                return Ok(frame);
             }
-            return Err(WsError::Io(e));
-        }
-        let _fin = (hdr[0] & 0x80) != 0;
-        let opcode = WsOpcode::from_u8(hdr[0] & 0x0F)?;
-        let masked = (hdr[1] & 0x80) != 0;
-        let mut len = (hdr[1] & 0x7F) as usize;
-
-        if len == 126 {
-            let mut ext = [0u8; 2];
-            self.transport.read_exact(&mut ext)?;
-            len = u16::from_be_bytes(ext) as usize;
-        } else if len == 127 {
-            let mut ext = [0u8; 8];
-            self.transport.read_exact(&mut ext)?;
-            len = usize::try_from(u64::from_be_bytes(ext))
-                .map_err(|_| WsError::Protocol("frame payload too large".into()))?;
-        }
-        if len > MAX_FRAME_PAYLOAD {
-            return Err(WsError::Protocol(format!(
-                "frame payload {len} exceeds maximum ({MAX_FRAME_PAYLOAD})"
-            )));
-        }
-
-        let mut mask = [0u8; 4];
-        if masked {
-            self.transport.read_exact(&mut mask)?;
-        }
-        let mut payload = vec![0u8; len];
-        if len > 0 {
-            self.transport.read_exact(&mut payload)?;
-        }
-        if masked {
-            for (i, b) in payload.iter_mut().enumerate() {
-                *b ^= mask[i & 3];
+            let mut chunk = [0u8; 8192];
+            let n = match self.transport.read(&mut chunk) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(WsError::Io(e)),
+            };
+            if n == 0 {
+                return Err(if self.rbuf.is_empty() {
+                    WsError::Closed
+                } else {
+                    WsError::Io(io::ErrorKind::UnexpectedEof.into())
+                });
             }
+            self.rbuf.extend_from_slice(&chunk[..n]);
         }
-        Ok(WsFrame { opcode, payload })
     }
 
     pub fn write_frame(&mut self, opcode: WsOpcode, payload: &[u8]) -> Result<(), WsError> {
+        if payload.len() > MAX_FRAME_PAYLOAD {
+            return Err(WsError::Protocol(format!(
+                "frame payload {} exceeds maximum ({MAX_FRAME_PAYLOAD})",
+                payload.len()
+            )));
+        }
         let mut buf = Vec::with_capacity(14 + payload.len());
         buf.push(0x80 | (opcode as u8));
         let mask_bit = if self.is_client { 0x80 } else { 0x00 };
@@ -365,6 +377,83 @@ impl WsStream {
     pub fn close(&mut self) -> Result<(), WsError> {
         self.write_frame(WsOpcode::Close, &[])
     }
+}
+
+/// Parse the frame at the start of `buf`: `Ok(None)` when more bytes are needed, else the frame
+/// and how many bytes it used. Everything that can be refused from the header alone is refused
+/// before the payload is waited for.
+fn parse_frame(buf: &[u8], is_client: bool) -> Result<Option<(WsFrame, usize)>, WsError> {
+    if buf.len() < 2 {
+        return Ok(None);
+    }
+    if buf[0] & 0x70 != 0 {
+        return Err(WsError::Protocol(
+            "reserved bits set without a negotiated extension".into(),
+        ));
+    }
+    let fin = (buf[0] & 0x80) != 0;
+    let opcode = WsOpcode::from_u8(buf[0] & 0x0F)?;
+    let is_control = (opcode as u8) & 0x8 != 0;
+    let masked = (buf[1] & 0x80) != 0;
+    // RFC 6455 5.1: a client must mask every frame, a server must not.
+    if masked == is_client {
+        return Err(WsError::Protocol(if masked {
+            "server frame is masked".into()
+        } else {
+            "client frame is not masked".into()
+        }));
+    }
+    let mut pos = 2usize;
+    let mut len = (buf[1] & 0x7F) as usize;
+    if len == 126 {
+        if buf.len() < pos + 2 {
+            return Ok(None);
+        }
+        len = u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos += 2;
+    } else if len == 127 {
+        if buf.len() < pos + 8 {
+            return Ok(None);
+        }
+        let mut ext = [0u8; 8];
+        ext.copy_from_slice(&buf[pos..pos + 8]);
+        len = usize::try_from(u64::from_be_bytes(ext))
+            .map_err(|_| WsError::Protocol("frame payload too large".into()))?;
+        pos += 8;
+    }
+    if is_control && (!fin || len > 125) {
+        return Err(WsError::Protocol(
+            "control frame is fragmented or longer than 125 bytes".into(),
+        ));
+    }
+    if !is_control && !fin {
+        return Err(WsError::Protocol(
+            "fragmented messages are not supported".into(),
+        ));
+    }
+    if len > MAX_FRAME_PAYLOAD {
+        return Err(WsError::Protocol(format!(
+            "frame payload {len} exceeds maximum ({MAX_FRAME_PAYLOAD})"
+        )));
+    }
+    let mut mask = [0u8; 4];
+    if masked {
+        if buf.len() < pos + 4 {
+            return Ok(None);
+        }
+        mask.copy_from_slice(&buf[pos..pos + 4]);
+        pos += 4;
+    }
+    if buf.len() < pos + len {
+        return Ok(None);
+    }
+    let mut payload = buf[pos..pos + len].to_vec();
+    if masked {
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b ^= mask[i & 3];
+        }
+    }
+    Ok(Some((WsFrame { opcode, payload }, pos + len)))
 }
 
 fn split_host_port(host_port: &str, default_port: u16) -> Option<(&str, u16)> {
@@ -512,5 +601,203 @@ mod tests {
         let reply: serde_json::Value = client.recv_json().unwrap();
         assert_eq!(reply["ack"], true);
         server.join().unwrap();
+    }
+
+    /// Raw client-to-server bytes for tests: a masked frame with a zero mask key.
+    fn masked_frame(first: u8, payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![first];
+        if payload.len() < 126 {
+            f.push(0x80 | payload.len() as u8);
+        } else {
+            f.push(0x80 | 126);
+            f.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        }
+        f.extend_from_slice(&[0, 0, 0, 0]);
+        f.extend_from_slice(payload);
+        f
+    }
+
+    /// Open a server-side `WsStream` whose peer is a raw TCP client that has finished the upgrade.
+    fn server_with_raw_client() -> (WsStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let raw = std::thread::spawn(move || {
+            let mut tcp = TcpStream::connect(addr).unwrap();
+            tcp.write_all(
+                b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+            )
+            .unwrap();
+            let mut resp = [0u8; 1];
+            let mut seen = Vec::new();
+            while !seen.ends_with(b"\r\n\r\n") {
+                tcp.read_exact(&mut resp).unwrap();
+                seen.push(resp[0]);
+            }
+            tcp
+        });
+        let (tcp, _) = listener.accept().unwrap();
+        let ws = WsStream::accept(tcp, Duration::from_secs(2)).unwrap();
+        (ws, raw.join().unwrap())
+    }
+
+    /// Audit W-2: a read timeout in the middle of a frame used to discard the bytes already read,
+    /// so the daemon's 50 ms poll desynchronised the stream on any frame that straddled it.
+    #[test]
+    fn frame_split_across_a_read_timeout_is_resumed_not_lost() {
+        let (mut ws, mut raw) = server_with_raw_client();
+        ws.set_read_timeout(Some(Duration::from_millis(40)))
+            .unwrap();
+        let body = br#"{"hello":"split"}"#;
+        let frame = masked_frame(0x81, body);
+        // Header, then the first few payload bytes, then a pause longer than the read timeout.
+        raw.write_all(&frame[..8]).unwrap();
+        raw.flush().unwrap();
+        let mut timed_out = false;
+        let mut got: Option<serde_json::Value> = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sent_rest = false;
+        while got.is_none() && Instant::now() < deadline {
+            match ws.recv_json::<serde_json::Value>() {
+                Ok(v) => got = Some(v),
+                Err(WsError::Io(e))
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    timed_out = true;
+                    if !sent_rest {
+                        raw.write_all(&frame[8..]).unwrap();
+                        sent_rest = true;
+                    }
+                }
+                Err(e) => panic!("stream desynchronised after a mid-frame timeout: {e}"),
+            }
+        }
+        assert!(timed_out, "the test never hit a mid-frame timeout");
+        assert_eq!(got.unwrap()["hello"], "split");
+    }
+
+    #[test]
+    fn two_frames_in_one_segment_are_both_delivered_in_order() {
+        let (mut ws, mut raw) = server_with_raw_client();
+        let mut both = masked_frame(0x81, br#"{"n":1}"#);
+        both.extend(masked_frame(0x81, br#"{"n":2}"#));
+        raw.write_all(&both).unwrap();
+        let a: serde_json::Value = ws.recv_json().unwrap();
+        let b: serde_json::Value = ws.recv_json().unwrap();
+        assert_eq!((a["n"].as_i64(), b["n"].as_i64()), (Some(1), Some(2)));
+    }
+
+    #[test]
+    fn oversize_length_header_is_refused_before_the_payload_arrives() {
+        let (mut ws, mut raw) = server_with_raw_client();
+        let mut hdr = vec![0x82, 0x80 | 127];
+        hdr.extend_from_slice(&((MAX_FRAME_PAYLOAD as u64) + 1).to_be_bytes());
+        hdr.extend_from_slice(&[0; 4]);
+        raw.write_all(&hdr).unwrap();
+        assert!(matches!(ws.read_frame(), Err(WsError::Protocol(_))));
+        // A length whose top bit is set must not wrap into something small.
+        let (mut ws, mut raw) = server_with_raw_client();
+        let mut hdr = vec![0x82, 0x80 | 127];
+        hdr.extend_from_slice(&u64::MAX.to_be_bytes());
+        hdr.extend_from_slice(&[0; 4]);
+        raw.write_all(&hdr).unwrap();
+        assert!(matches!(ws.read_frame(), Err(WsError::Protocol(_))));
+    }
+
+    #[test]
+    fn malformed_frames_are_protocol_errors() {
+        // (label, bytes) — each is a client frame that RFC 6455 forbids or this server rejects.
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("reserved bit set", masked_frame(0xC1, b"{}")),
+            ("fragmented text", masked_frame(0x01, b"{}")),
+            ("fragmented ping", masked_frame(0x09, b"")),
+            ("oversize ping", masked_frame(0x89, &[b'x'; 126])),
+            ("unknown opcode", masked_frame(0x83, b"{}")),
+            ("unmasked client frame", vec![0x81, 0x02, b'{', b'}']),
+        ];
+        for (label, bytes) in cases {
+            let (mut ws, mut raw) = server_with_raw_client();
+            raw.write_all(&bytes).unwrap();
+            assert!(
+                matches!(ws.read_frame(), Err(WsError::Protocol(_))),
+                "{label} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_closing_mid_frame_is_an_error_and_a_clean_close_is_closed() {
+        let (mut ws, mut raw) = server_with_raw_client();
+        raw.write_all(&masked_frame(0x81, br#"{"a":1}"#)[..5])
+            .unwrap();
+        drop(raw);
+        assert!(matches!(ws.read_frame(), Err(WsError::Io(_))));
+        let (mut ws, raw) = server_with_raw_client();
+        drop(raw);
+        assert!(matches!(ws.read_frame(), Err(WsError::Closed)));
+    }
+
+    #[test]
+    fn empty_and_126_byte_payloads_round_trip() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            let mut ws = WsStream::accept(tcp, Duration::from_secs(2)).unwrap();
+            let empty = ws.read_frame().unwrap();
+            let edge = ws.read_frame().unwrap();
+            let big = ws.read_frame().unwrap();
+            (empty.payload.len(), edge.payload.len(), big.payload.len())
+        });
+        let mut client =
+            WsStream::connect(&format!("ws://{addr}/wire"), Duration::from_secs(2)).unwrap();
+        client.write_frame(WsOpcode::Binary, &[]).unwrap();
+        client.write_frame(WsOpcode::Binary, &[7; 125]).unwrap();
+        client.write_frame(WsOpcode::Binary, &[7; 65_536]).unwrap();
+        assert_eq!(server.join().unwrap(), (0, 125, 65_536));
+        assert!(matches!(
+            client.write_frame(WsOpcode::Binary, &vec![0; MAX_FRAME_PAYLOAD + 1]),
+            Err(WsError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn connect_rejects_urls_that_could_inject_request_headers() {
+        for url in [
+            "ws://127.0.0.1:1/x\r\nX-Evil: 1",
+            "ws://127.0.0.1:1/a b",
+            "ws://127.0.0.1:1/\0",
+        ] {
+            assert!(
+                matches!(
+                    WsStream::connect(url, Duration::from_millis(50)),
+                    Err(WsError::InvalidUrl(_))
+                ),
+                "{url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_port_split_handles_bracketed_ipv6_and_bad_ports() {
+        assert_eq!(split_host_port("[::1]:9", 80), Some(("::1", 9)));
+        assert_eq!(split_host_port("[::1]", 80), Some(("::1", 80)));
+        assert_eq!(split_host_port("[::1", 80), None);
+        assert_eq!(split_host_port("[::1]x", 80), None);
+        assert_eq!(split_host_port("host:70000", 80), None);
+        assert_eq!(split_host_port("host:", 80), None);
+        assert_eq!(split_host_port("host", 443), Some(("host", 443)));
+    }
+
+    #[test]
+    fn http_header_reader_stops_at_16_kib() {
+        let mut huge = vec![b'a'; 20_000];
+        huge.extend_from_slice(b"\r\n\r\n");
+        assert!(read_http_headers(&mut huge.as_slice()).is_err());
+        let mut eof = &b"GET / HTTP/1.1\r\n"[..];
+        assert!(read_http_headers(&mut eof).is_err());
     }
 }

@@ -4377,3 +4377,90 @@ fn validate_graph_rejects_neighbors_that_are_not_distance_then_id_ordered() {
     assert!(err.to_string().contains("corrupt"), "{err}");
     super::vector::validate_graph("emb", &l2_graph(&["b", "m", "a"])).unwrap();
 }
+
+fn put_frame(seq: u64, id: &str) -> Vec<u8> {
+    layout::encode_frame(
+        seq,
+        &[Op::Put {
+            collection: "docs".into(),
+            id: id.into(),
+            doc: json!({ "n": seq }),
+        }],
+    )
+    .unwrap()
+}
+
+/// Audit S-4: boundaries of WAL decoding that recovery relies on.
+#[test]
+fn wal_decode_handles_every_truncation_point_of_a_tail_frame() {
+    let first = put_frame(1, "a");
+    let second = put_frame(2, "b");
+    let mut full = first.clone();
+    full.extend_from_slice(&second);
+    // Cutting the second frame anywhere short of whole drops exactly that frame.
+    for cut in first.len()..full.len() {
+        let frames = layout::decode_wal(&full[..cut]).unwrap();
+        assert_eq!(frames.len(), 1, "cut at {cut}");
+        assert_eq!(frames[0].0, 1);
+    }
+    assert_eq!(layout::decode_wal(&full).unwrap().len(), 2);
+    assert!(layout::decode_wal(&[]).unwrap().is_empty());
+    assert!(layout::decode_wal(&first[..7]).unwrap().is_empty());
+}
+
+#[test]
+fn wal_decode_never_allocates_for_a_length_it_does_not_have() {
+    // A header that claims 4 GiB and a good CRC field is a torn tail, not an allocation.
+    let mut buf = put_frame(1, "a");
+    buf.extend_from_slice(&u32::MAX.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    buf.extend_from_slice(&[1, 2, 3]);
+    assert_eq!(layout::decode_wal(&buf).unwrap().len(), 1);
+}
+
+#[test]
+fn wal_decode_flags_a_corrupt_middle_frame_but_not_a_corrupt_last_one() {
+    let mut a = put_frame(1, "a");
+    let b = put_frame(2, "b");
+    let c = put_frame(3, "c");
+    // Corrupt the last frame's payload: it is dropped as a torn tail.
+    let mut torn_last = a.clone();
+    torn_last.extend_from_slice(&b);
+    let n = torn_last.len();
+    torn_last[n - 1] ^= 0xff;
+    assert_eq!(layout::decode_wal(&torn_last).unwrap().len(), 1);
+    // Corrupt a frame that a whole frame follows: that is damage, and must not be skipped.
+    a[10] ^= 0xff;
+    a.extend_from_slice(&b);
+    a.extend_from_slice(&c);
+    assert!(layout::decode_wal(&a).is_err());
+}
+
+#[test]
+fn wal_decode_rejects_well_formed_frames_with_bad_contents() {
+    // An empty payload has a valid CRC (0) but no sequence number: corrupt, not a tail.
+    assert!(layout::decode_wal(&[0u8; 8]).is_err());
+    // An unknown op tag behind a valid CRC.
+    let mut payload = 1u64.to_le_bytes().to_vec();
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.push(0xEE);
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&layout::crc32(&payload).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    assert!(layout::decode_wal(&frame).is_err());
+    // An op count larger than the bytes that could hold it.
+    let mut payload = 1u64.to_le_bytes().to_vec();
+    payload.extend_from_slice(&u32::MAX.to_le_bytes());
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&layout::crc32(&payload).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    assert!(layout::decode_wal(&frame).is_err());
+    // Trailing bytes after the last op inside the payload.
+    let ok = put_frame(1, "a");
+    let mut payload = ok[8..].to_vec();
+    payload.push(0);
+    let mut frame = (payload.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&layout::crc32(&payload).to_le_bytes());
+    frame.extend_from_slice(&payload);
+    assert!(layout::decode_wal(&frame).is_err());
+}

@@ -2,13 +2,13 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fl_core::agent::RegistryEvent;
@@ -26,6 +26,51 @@ use crate::peer::{PeerFrame, handshake_peer};
 use crate::ws::{WsError, WsStream};
 
 pub const DEFAULT_LOCAL_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Longest request line the daemon reads from a local client: a send carries at most a 256 KiB
+/// body, which JSON escaping can at most roughly six-fold, plus the other fields.
+pub const MAX_LOCAL_REQUEST_BYTES: u64 = 2 * 1024 * 1024;
+
+/// How many inbound peer connections may be open (handshaking or synced) at once.
+pub const MAX_INBOUND_PEER_CONNECTIONS: usize = 64;
+
+/// Lock `m`, recovering the data if a panicking thread poisoned it. The daemon's state stays
+/// consistent across a panic (every update is one statement), and a poisoned lock must not turn
+/// one failed connection thread into a daemon that panics on every later request.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// A claimed slot among `limit`; the slot is released on drop.
+struct SlotGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> SlotGuard<'a> {
+    fn try_claim(counter: &'a AtomicUsize, limit: usize) -> Option<Self> {
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if current >= limit {
+                return None;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { counter }),
+                Err(seen) => current = seen,
+            }
+        }
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 pub fn default_socket_path() -> PathBuf {
     if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -218,9 +263,11 @@ struct DaemonInner<S> {
     store: Arc<S>,
     config: DaemonConfig,
     routes: Mutex<RouteTable>,
+    dispatch_gate: Mutex<()>,
     peers: Mutex<BTreeMap<u64, (String, Sender<PeerFrame>)>>,
     subscribers: Mutex<Vec<Subscriber>>,
     next_peer_id: Mutex<u64>,
+    inbound_peers: AtomicUsize,
     shutdown: AtomicBool,
 }
 
@@ -229,19 +276,19 @@ where
     S: MessageStore + AgentRegistry + Send + Sync + 'static,
 {
     fn register_peer(&self, label: String, tx: Sender<PeerFrame>) -> u64 {
-        let mut id_guard = self.next_peer_id.lock().unwrap();
-        *id_guard += 1;
+        let mut id_guard = lock(&self.next_peer_id);
+        *id_guard = id_guard.wrapping_add(1);
         let id = *id_guard;
-        self.peers.lock().unwrap().insert(id, (label, tx));
+        lock(&self.peers).insert(id, (label, tx));
         id
     }
 
     fn unregister_peer(&self, id: u64) {
-        self.peers.lock().unwrap().remove(&id);
+        lock(&self.peers).remove(&id);
     }
 
     fn broadcast_to_peers(&self, exclude_peer: Option<u64>, frame: &PeerFrame) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = lock(&self.peers);
         peers.retain(|&id, (_, tx)| {
             if Some(id) == exclude_peer {
                 return true;
@@ -251,7 +298,7 @@ where
     }
 
     fn notify_subscribers_message(&self, msg: &WireMessage, receipts: &[DeliveryReceipt]) {
-        let mut subs = self.subscribers.lock().unwrap();
+        let mut subs = lock(&self.subscribers);
         subs.retain(|sub| {
             let matches_corr = sub
                 .correlation_id
@@ -274,7 +321,7 @@ where
     }
 
     fn notify_subscribers_receipt(&self, rcpt: &DeliveryReceipt) {
-        let mut subs = self.subscribers.lock().unwrap();
+        let mut subs = lock(&self.subscribers);
         subs.retain(|sub| {
             if sub.correlation_id.is_some() {
                 return true;
@@ -296,16 +343,19 @@ where
     }
 
     fn dispatch_and_propagate(&self, msg: &WireMessage, now: At) {
-        let updated = {
-            let mut routes = self.routes.lock().unwrap();
-            dispatch_message_for_store(
-                self.store.as_ref(),
-                &mut routes,
-                self.config.home_override.as_deref(),
-                msg,
-                now,
-            )
-        };
+        // One dispatch at a time, so two threads cannot both push the same pending message. The
+        // `routes` lock is held only to copy the table out and to merge it back: pushing runs
+        // vendor CLIs, and `Status` and `RegisterRoute` must not wait behind one.
+        let _one_at_a_time = lock(&self.dispatch_gate);
+        let mut working = lock(&self.routes).clone();
+        let updated = dispatch_message_for_store(
+            self.store.as_ref(),
+            &mut working,
+            self.config.home_override.as_deref(),
+            msg,
+            now,
+        );
+        lock(&self.routes).merge_newer(working);
         for rcpt in updated {
             self.notify_subscribers_receipt(&rcpt);
             self.broadcast_to_peers(None, &PeerFrame::ReceiptUpdate { receipt: rcpt });
@@ -435,7 +485,7 @@ where
             }
             LocalRequest::RegisterRoute { persona, route } => {
                 {
-                    let mut routes = self.routes.lock().unwrap();
+                    let mut routes = lock(&self.routes);
                     routes.upsert(&persona, route, now.clone());
                     let _ = routes.save(self.config.routes_path.as_deref());
                 }
@@ -448,7 +498,7 @@ where
             } => {
                 let (tx, rx) = mpsc::channel();
                 let norm_rcpt = recipient.as_deref().and_then(normalize_persona);
-                self.subscribers.lock().unwrap().push(Subscriber {
+                lock(&self.subscribers).push(Subscriber {
                     recipient: norm_rcpt,
                     correlation_id,
                     tx,
@@ -456,21 +506,11 @@ where
                 (LocalResponse::Subscribed, Some(rx))
             }
             LocalRequest::Status => {
-                let connected_peers = self
-                    .peers
-                    .lock()
-                    .unwrap()
+                let connected_peers = lock(&self.peers)
                     .values()
                     .map(|(label, _)| label.clone())
                     .collect();
-                let routes = self
-                    .routes
-                    .lock()
-                    .unwrap()
-                    .entries
-                    .values()
-                    .cloned()
-                    .collect();
+                let routes = lock(&self.routes).entries.values().cloned().collect();
                 (
                     LocalResponse::Status(DaemonStatus {
                         node_id: self.config.node_id.clone(),
@@ -560,6 +600,15 @@ where
             if self.shutdown.load(Ordering::SeqCst) {
                 let _ = ws.close();
                 break Ok(());
+            }
+            // We ping every PEER_PING_INTERVAL; a live peer answers with a pong. Silence for
+            // PEER_READ_TIMEOUT means the connection is dead (or the peer is hung).
+            if ws.idle_for() >= crate::peer::PEER_READ_TIMEOUT {
+                let _ = ws.close();
+                break Err(WsError::Io(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "peer sent nothing for the read timeout",
+                )));
             }
 
             while let Ok(out_frame) = rx.try_recv() {
@@ -738,8 +787,26 @@ pub fn spawn_daemon<S>(store: Arc<S>, mut config: DaemonConfig) -> io::Result<Da
 where
     S: MessageStore + AgentRegistry + Send + Sync + 'static,
 {
+    if config.psk.is_empty() && (config.listen_addr.is_some() || !config.peers.is_empty()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a daemon that listens for or dials peers needs a non-empty pre-shared key",
+        ));
+    }
     if let Some(parent) = config.socket_path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    if let Ok(meta) = fs::symlink_metadata(&config.socket_path) {
+        use std::os::unix::fs::FileTypeExt;
+        if !meta.file_type().is_socket() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "{} exists and is not a socket; refusing to remove it",
+                    config.socket_path.display()
+                ),
+            ));
+        }
     }
     if config.socket_path.exists() {
         if LocalClient::connect(&config.socket_path, Duration::from_millis(50)).is_ok() {
@@ -777,9 +844,11 @@ where
         store,
         config: config.clone(),
         routes: Mutex::new(initial_routes),
+        dispatch_gate: Mutex::new(()),
         peers: Mutex::new(BTreeMap::new()),
         subscribers: Mutex::new(Vec::new()),
         next_peer_id: Mutex::new(0),
+        inbound_peers: AtomicUsize::new(0),
         shutdown: AtomicBool::new(false),
     });
 
@@ -815,14 +884,26 @@ where
                 did_work = true;
                 let inner_conn = Arc::clone(&inner_main);
                 std::thread::spawn(move || {
+                    // A listener in non-blocking mode can hand out non-blocking streams
+                    // (BSD and macOS do); the reads below expect blocking ones.
+                    let _ = stream.set_nonblocking(false);
                     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
                     let Ok(mut writer) = stream.try_clone() else {
                         return;
                     };
-                    let mut reader = BufReader::new(stream);
+                    let mut reader = BufReader::new(stream).take(MAX_LOCAL_REQUEST_BYTES);
                     let mut line = String::new();
                     if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    if !line.ends_with('\n') && line.len() as u64 >= MAX_LOCAL_REQUEST_BYTES {
+                        let err = LocalResponse::Error {
+                            message: format!(
+                                "request line exceeds {MAX_LOCAL_REQUEST_BYTES} bytes"
+                            ),
+                        };
+                        let _ = writeln!(writer, "{}", serde_json::to_string(&err).unwrap());
                         return;
                     }
                     let req: LocalRequest = match serde_json::from_str(&line) {
@@ -865,7 +946,15 @@ where
             {
                 did_work = true;
                 let inner_ws = Arc::clone(&inner_main);
+                let _ = stream.set_nonblocking(false);
                 std::thread::spawn(move || {
+                    // Every inbound connection costs a thread before it has proved it holds
+                    // the PSK, so the number open at once is capped.
+                    let Some(_slot) =
+                        SlotGuard::try_claim(&inner_ws.inbound_peers, MAX_INBOUND_PEER_CONNECTIONS)
+                    else {
+                        return;
+                    };
                     if let Ok(ws) = WsStream::accept(stream, Duration::from_secs(5)) {
                         let _ = inner_ws.handle_peer_connection(ws);
                     }
@@ -1074,5 +1163,313 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    fn test_config(tmp: &Path, name: &str) -> DaemonConfig {
+        DaemonConfig {
+            node_id: name.into(),
+            host: format!("host-{name}"),
+            socket_path: tmp.join(format!("{name}.sock")),
+            routes_path: Some(tmp.join(format!("routes-{name}.json"))),
+            home_override: Some(tmp.to_path_buf()),
+            listen_addr: None,
+            peers: vec![],
+            psk: b"audit-psk".to_vec(),
+        }
+    }
+
+    fn mail(to: &str, subject: &str) -> SendWireArgs {
+        SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName(to.into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: subject.into(),
+            body: "body".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        }
+    }
+
+    /// Audit D-1: the dispatch ran vendor CLIs while holding the route-table lock, so one slow
+    /// `codex` froze `Status` and `RegisterRoute` for as long as it ran.
+    #[test]
+    fn status_and_route_registration_do_not_wait_behind_a_slow_vendor_delivery() {
+        use std::os::unix::fs::PermissionsExt;
+        let _codex_lock = crate::dispatcher::CODEX_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let slow = tmp.path().join("slow-codex.sh");
+        fs::write(&slow, "#!/bin/sh\nsleep 2\n").unwrap();
+        fs::set_permissions(&slow, fs::Permissions::from_mode(0o755)).unwrap();
+        // SAFETY: serialised by CODEX_ENV_LOCK; restored below.
+        let prev = std::env::var_os("FL_WIRE_CODEX_BIN");
+        unsafe { std::env::set_var("FL_WIRE_CODEX_BIN", &slow) };
+
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let cfg = test_config(tmp.path(), "slow");
+        let sock = cfg.socket_path.clone();
+        let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
+
+        let mut reg = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
+        reg.request(&LocalRequest::RegisterRoute {
+            persona: "kayla".into(),
+            route: VendorRoute::Codex {
+                thread_id: "t1".into(),
+                cwd: None,
+            },
+        })
+        .unwrap();
+
+        let send_sock = sock.clone();
+        let sender = std::thread::spawn(move || {
+            let mut c = LocalClient::connect(&send_sock, Duration::from_secs(10)).unwrap();
+            c.request(&LocalRequest::Send {
+                args: mail("kayla", "slow one"),
+            })
+            .map(|_| ())
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        let started = Instant::now();
+        let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
+        probe.request(&LocalRequest::Status).unwrap();
+        // The daemon serves one request per connection.
+        let mut probe = LocalClient::connect(&sock, Duration::from_secs(5)).unwrap();
+        probe
+            .request(&LocalRequest::RegisterRoute {
+                persona: "other".into(),
+                route: VendorRoute::Codex {
+                    thread_id: "t2".into(),
+                    cwd: None,
+                },
+            })
+            .unwrap();
+        let waited = started.elapsed();
+
+        sender.join().unwrap().unwrap();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("FL_WIRE_CODEX_BIN", v),
+                None => std::env::remove_var("FL_WIRE_CODEX_BIN"),
+            }
+        }
+        assert!(
+            waited < Duration::from_millis(1200),
+            "Status/RegisterRoute waited {waited:?} behind a vendor delivery"
+        );
+    }
+
+    #[test]
+    fn oversize_request_line_is_refused_and_the_daemon_keeps_serving() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let cfg = test_config(tmp.path(), "big");
+        let sock = cfg.socket_path.clone();
+        let _daemon = spawn_daemon(store, cfg).unwrap();
+
+        let mut raw = UnixStream::connect(&sock).unwrap();
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let chunk = vec![b'a'; 64 * 1024];
+        let mut sent = 0u64;
+        // The daemon stops reading at the cap; writes after that may fail, which is fine.
+        while sent < MAX_LOCAL_REQUEST_BYTES + 1024 * 1024 {
+            if raw.write_all(&chunk).is_err() {
+                break;
+            }
+            sent += chunk.len() as u64;
+        }
+        let mut resp = String::new();
+        BufReader::new(&raw).read_line(&mut resp).unwrap();
+        assert!(resp.contains("exceeds"), "{resp}");
+
+        let mut ok = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            ok.request(&LocalRequest::Status).unwrap(),
+            LocalResponse::Status(_)
+        ));
+    }
+
+    #[test]
+    fn malformed_and_unknown_requests_get_an_error_not_a_dead_daemon() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let cfg = test_config(tmp.path(), "bad");
+        let sock = cfg.socket_path.clone();
+        let _daemon = spawn_daemon(store, cfg).unwrap();
+        for line in [
+            "not json\n",
+            "{}\n",
+            "{\"op\":\"nope\"}\n",
+            "{\"op\":\"send\"}\n",
+        ] {
+            let mut raw = UnixStream::connect(&sock).unwrap();
+            raw.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            raw.write_all(line.as_bytes()).unwrap();
+            let mut resp = String::new();
+            BufReader::new(&raw).read_line(&mut resp).unwrap();
+            assert!(resp.contains("invalid request JSON"), "{line:?} -> {resp}");
+        }
+        // A client that connects and hangs up sends nothing; the daemon must shrug it off.
+        drop(UnixStream::connect(&sock).unwrap());
+        let mut ok = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
+        assert!(ok.request(&LocalRequest::Status).is_ok());
+    }
+
+    #[test]
+    fn a_networked_daemon_needs_a_pre_shared_key() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let mut cfg = test_config(tmp.path(), "nopsk");
+        cfg.psk.clear();
+        cfg.listen_addr = Some("127.0.0.1:0".into());
+        let err = spawn_daemon(Arc::clone(&store), cfg.clone()).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        cfg.listen_addr = None;
+        cfg.peers = vec!["ws://127.0.0.1:1/wire".into()];
+        let err = spawn_daemon(Arc::clone(&store), cfg.clone()).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // A purely local daemon has no peer to authenticate.
+        cfg.peers.clear();
+        assert!(spawn_daemon(store, cfg).is_ok());
+    }
+
+    #[test]
+    fn startup_never_deletes_a_file_that_is_not_a_socket() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let mut cfg = test_config(tmp.path(), "file");
+        let precious = tmp.path().join("precious.txt");
+        fs::write(&precious, "keep me").unwrap();
+        cfg.socket_path = precious.clone();
+        let err = spawn_daemon(store, cfg).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&precious).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn a_second_daemon_on_a_live_socket_is_refused_and_a_stale_socket_is_replaced() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let cfg = test_config(tmp.path(), "dup");
+        let first = spawn_daemon(Arc::clone(&store), cfg.clone()).unwrap();
+        let err = spawn_daemon(Arc::clone(&store), cfg.clone()).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        drop(first);
+        // A socket file left behind by a crashed daemon is stale and gets replaced.
+        drop(UnixListener::bind(&cfg.socket_path).unwrap());
+        assert!(cfg.socket_path.exists());
+        assert!(spawn_daemon(store, cfg).is_ok());
+    }
+
+    #[test]
+    fn a_peer_with_the_wrong_psk_is_refused_and_receives_no_messages() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        store.send_wire(mail("kayla", "secret subject")).unwrap();
+        let mut cfg = test_config(tmp.path(), "guarded");
+        cfg.listen_addr = Some("127.0.0.1:0".into());
+        let daemon = spawn_daemon(store, cfg).unwrap();
+        let url = format!("ws://{}/wire", daemon.listen_addr().unwrap());
+
+        let mut intruder = WsStream::connect(&url, Duration::from_secs(2)).unwrap();
+        let outcome = handshake_peer(&mut intruder, "evil", "evil-host", b"guess", 0, 0, 0);
+        assert!(outcome.is_err());
+        // Whatever the daemon sends after a failed handshake must not be a SyncBatch.
+        intruder
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        if let Ok(frame) = intruder.recv_json::<PeerFrame>() {
+            assert!(!matches!(frame, PeerFrame::SyncBatch { .. }), "{frame:?}");
+        }
+    }
+
+    #[test]
+    fn inbound_peer_slots_are_capped_and_released() {
+        let counter = AtomicUsize::new(0);
+        let a = SlotGuard::try_claim(&counter, 2).unwrap();
+        let b = SlotGuard::try_claim(&counter, 2).unwrap();
+        assert!(SlotGuard::try_claim(&counter, 2).is_none());
+        drop(a);
+        let c = SlotGuard::try_claim(&counter, 2).unwrap();
+        drop((b, c));
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert!(SlotGuard::try_claim(&counter, 0).is_none());
+    }
+
+    #[test]
+    fn inbound_peer_slots_never_exceed_the_limit_under_contention() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let counter = Arc::clone(&counter);
+                let peak = Arc::clone(&peak);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        if let Some(_slot) = SlotGuard::try_claim(&counter, 3) {
+                            let now = counter.load(Ordering::SeqCst);
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::yield_now();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_poisoned_daemon_lock_is_recovered_not_propagated() {
+        let m = Arc::new(Mutex::new(5u32));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("poison it");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        assert_eq!(*lock(&m), 5);
+    }
+
+    #[test]
+    fn subscriber_filters_match_recipient_and_correlation_case_insensitively() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let cfg = test_config(tmp.path(), "sub");
+        let sock = cfg.socket_path.clone();
+        let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
+
+        let mut sub = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
+        sub.subscribe(Some("KAYLA".into()), None).unwrap();
+        let mut other = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
+        other.subscribe(Some("someone-else".into()), None).unwrap();
+
+        let mut sender = LocalClient::connect(&sock, Duration::from_secs(2)).unwrap();
+        sender
+            .request(&LocalRequest::Send {
+                args: mail("kayla", "for kayla"),
+            })
+            .unwrap();
+        let ev = sub.wait_for_event(Duration::from_secs(3)).unwrap();
+        assert!(matches!(ev, Some(LocalEvent::Message { .. })), "{ev:?}");
+        assert!(
+            other
+                .wait_for_event(Duration::from_millis(300))
+                .unwrap()
+                .is_none(),
+            "a subscriber for another recipient saw the message"
+        );
     }
 }

@@ -2,12 +2,23 @@ use crate::population::ExecError;
 use fl_core::model::{CommandSpec, PopulationDelivery};
 use fl_core::verdict::{FailReason, Verdict};
 use std::io::{Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const EXCERPT_LIMIT: usize = 4096;
+
+/// Most output kept per stream. The excerpt shows 4 KiB; the rest is read and thrown away so a
+/// chatty command cannot grow this process's memory without bound.
+const CAPTURE_LIMIT: usize = 256 * 1024;
+
+/// How long to keep waiting for the output pipes to close once the command itself has exited.
+/// A background process that inherited a pipe holds it open long after the command is gone.
+const PIPE_GRACE: Duration = Duration::from_millis(500);
 
 pub struct GateOutcome {
     pub verdict: Verdict,
@@ -65,15 +76,19 @@ pub fn run_command_gate(
     }
 
     let mut cmd = Command::new(&spec.program);
+    // Its own process group, so a timeout can take down everything the command started and not
+    // just the direct child.
     cmd.args(&spec.args)
         .current_dir(root)
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let paths: Vec<String> = population.iter().map(|p| p.display().to_string()).collect();
+    // Paths are handed over as the bytes they are: `Path::display` would replace anything that
+    // is not UTF-8 with U+FFFD and name a file that does not exist.
     match spec.delivery {
         PopulationDelivery::Args => {
-            cmd.args(&paths);
+            cmd.args(population);
         }
         PopulationDelivery::Stdin => {
             cmd.stdin(Stdio::piped());
@@ -85,7 +100,7 @@ pub fn run_command_gate(
     }
 
     let list_file = if matches!(spec.delivery, PopulationDelivery::FileList) {
-        match write_list(&paths) {
+        match write_list(population) {
             Ok(f) => {
                 cmd.env("FL_POPULATION_FILE", f.path());
                 Some(f)
@@ -109,10 +124,13 @@ pub fn run_command_gate(
     if matches!(spec.delivery, PopulationDelivery::Stdin)
         && let Some(mut stdin) = child.stdin.take()
     {
-        let payload = paths.join("\n");
-        let _ = stdin.write_all(payload.as_bytes());
-        let _ = stdin.write_all(b"\n");
-        // `stdin` drops here, closing the pipe so the child sees EOF.
+        // From its own thread: a command that does not read stdin, given a population larger
+        // than the pipe buffer, would block this write, and the deadline below would never start.
+        let payload = population_bytes(population);
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&payload);
+            // `stdin` drops here, closing the pipe so the child sees EOF.
+        });
     }
 
     let deadline = Duration::from_secs(spec.timeout_secs.max(1));
@@ -146,16 +164,41 @@ fn error_outcome(started: Instant, detail: String) -> GateOutcome {
     }
 }
 
-fn write_list(paths: &[String]) -> std::io::Result<tempfile::NamedTempFile> {
-    let mut f = tempfile::NamedTempFile::new()?;
+/// Every path followed by a newline, as raw bytes.
+fn population_bytes(paths: &[PathBuf]) -> Vec<u8> {
+    let mut out = Vec::new();
     for p in paths {
-        writeln!(f, "{p}")?;
+        out.extend_from_slice(p.as_os_str().as_bytes());
+        out.push(b'\n');
     }
+    out
+}
+
+fn write_list(paths: &[PathBuf]) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut f = tempfile::NamedTempFile::new()?;
+    f.write_all(&population_bytes(paths))?;
     f.flush()?;
     Ok(f)
 }
 
-/// Start a thread that reads a pipe to completion into an owned buffer.
+/// SIGKILL the process group `pgid` (the command was started as its own group leader).
+/// `kill` is the shell's built-in, so this needs no `kill` binary and no libc binding.
+fn kill_group(pgid: u32) {
+    let _ = Command::new("sh")
+        .args(["-c", &format!("kill -KILL -{pgid} 2>/dev/null")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// A pipe being read to the end on its own thread, into a buffer that can be read while the
+/// thread is still running.
+struct Drain {
+    handle: JoinHandle<()>,
+    buf: Arc<Mutex<Vec<u8>>>,
+}
+
+/// Start a thread that reads a pipe to completion.
 ///
 /// Spawned before the wait loop starts, so the pipe is always being drained
 /// while the child runs. A child that writes more than the OS pipe buffer
@@ -164,16 +207,37 @@ fn write_list(paths: &[String]) -> std::io::Result<tempfile::NamedTempFile> {
 /// `try_wait` loop without actually draining, never unblocks a child in that
 /// state — and the deadline then fires on a process that was only waiting
 /// for a reader, not doing anything wrong.
-fn spawn_drain(mut pipe: impl Read + Send + 'static) -> JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
-        buf
-    })
+fn spawn_drain(mut pipe: impl Read + Send + 'static) -> Drain {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let shared = Arc::clone(&buf);
+    let handle = std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut kept = shared.lock().unwrap_or_else(|e| e.into_inner());
+                    let room = CAPTURE_LIMIT.saturating_sub(kept.len());
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+            }
+        }
+    });
+    Drain { handle, buf }
 }
 
-fn join_drain(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
-    handle.join().unwrap_or_default()
+/// What `drain` has read so far, once its pipe has closed or `until` passes, whichever is
+/// first; `true` when the pipe closed.
+fn collect(drain: Option<Drain>, until: Instant) -> (Vec<u8>, bool) {
+    let Some(drain) = drain else {
+        return (Vec::new(), true);
+    };
+    while !drain.handle.is_finished() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let done = drain.handle.is_finished();
+    let bytes = drain.buf.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (bytes, done)
 }
 
 /// Poll the child until it exits or the deadline passes. `Ok(None)` means the
@@ -187,12 +251,17 @@ fn join_drain(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
 /// full-pipe deadlock this function exists to avoid). `std::process::Output`
 /// is a plain struct with public fields, so it can be assembled directly
 /// from the drained buffers and the status `try_wait` hands back.
+///
+/// A timeout kills the command's whole process group. After a normal exit the pipes get
+/// [`PIPE_GRACE`] to close; if something the command left running still holds them, the group
+/// is killed and the output read so far is used, instead of waiting on that process.
 fn wait_with_deadline(
     child: &mut std::process::Child,
     deadline: Duration,
 ) -> std::io::Result<Option<std::process::Output>> {
-    let stdout_handle = child.stdout.take().map(spawn_drain);
-    let stderr_handle = child.stderr.take().map(spawn_drain);
+    let stdout_drain = child.stdout.take().map(spawn_drain);
+    let stderr_drain = child.stderr.take().map(spawn_drain);
+    let pgid = child.id();
 
     let start = Instant::now();
     let status = loop {
@@ -200,17 +269,19 @@ fn wait_with_deadline(
             break status;
         }
         if start.elapsed() >= deadline {
-            // The drain threads are left running; they will see EOF and
-            // finish on their own once the caller kills the child, and a
-            // detached JoinHandle dropped without joining leaks nothing but
-            // the thread's own stack until then.
+            // The drain threads see EOF and finish on their own once the group is dead.
+            kill_group(pgid);
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(25));
     };
 
-    let stdout = stdout_handle.map(join_drain).unwrap_or_default();
-    let stderr = stderr_handle.map(join_drain).unwrap_or_default();
+    let until = Instant::now() + PIPE_GRACE;
+    let (stdout, out_closed) = collect(stdout_drain, until);
+    let (stderr, err_closed) = collect(stderr_drain, until);
+    if !(out_closed && err_closed) {
+        kill_group(pgid);
+    }
 
     Ok(Some(std::process::Output {
         status,
@@ -504,5 +575,150 @@ mod tests {
             "got {:?}",
             out.output_excerpt
         );
+    }
+
+    /// Audit C-1: the population was written to the child's stdin before the deadline clock
+    /// started. A command that never reads stdin and a population over the 64 KiB pipe buffer
+    /// blocked that write, so `timeout_secs` never applied.
+    #[test]
+    fn a_command_that_ignores_a_large_stdin_population_still_times_out() {
+        let d = tempfile::tempdir().unwrap();
+        let population: Vec<PathBuf> = (0..20_000)
+            .map(|i| d.path().join(format!("file-{i:08}.txt")))
+            .collect();
+        let mut s = spec("sleep", &["6"], PopulationDelivery::Stdin);
+        s.timeout_secs = 1;
+        let started = Instant::now();
+        let out = run_command_gate(d.path(), &s, &population, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the gate ran for {:?} against a 1 s timeout",
+            started.elapsed()
+        );
+        assert!(!out.verdict.is_pass());
+        assert!(
+            out.output_excerpt.contains("timed out") || out.output_excerpt.contains("timeout"),
+            "{}",
+            out.output_excerpt
+        );
+    }
+
+    /// Audit C-2: a gate command that leaves a background process holding its stdout pipe made
+    /// the runner wait for that process after the command itself had exited, with no deadline.
+    #[test]
+    fn a_background_process_holding_the_pipes_does_not_hold_the_gate() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a.txt"), "x").unwrap();
+        let mut s = spec(
+            "sh",
+            &["-c", "sleep 6 & echo started"],
+            PopulationDelivery::FileList,
+        );
+        s.timeout_secs = 1;
+        let started = Instant::now();
+        let out = run_command_gate(d.path(), &s, &[d.path().join("a.txt")], 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the gate waited {:?} on a background process",
+            started.elapsed()
+        );
+        assert!(out.verdict.is_pass(), "{:?}", out.verdict);
+        assert!(
+            out.output_excerpt.contains("started"),
+            "{}",
+            out.output_excerpt
+        );
+    }
+
+    #[test]
+    fn a_timeout_kills_the_whole_process_group_not_just_the_shell() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a.txt"), "x").unwrap();
+        let marker = d.path().join("grandchild-survived");
+        let script = format!("(sleep 2; touch '{}') & sleep 30", marker.display());
+        let mut s = spec("sh", &["-c", &script], PopulationDelivery::FileList);
+        s.timeout_secs = 1;
+        let out = run_command_gate(d.path(), &s, &[d.path().join("a.txt")], 1);
+        assert!(!out.verdict.is_pass());
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(!marker.exists(), "a grandchild outlived the gate's timeout");
+    }
+
+    /// Audit C-3: population paths went to the command through `Path::display`, which replaces
+    /// bytes that are not UTF-8 with U+FFFD, so the command was handed a file that does not exist.
+    #[test]
+    fn a_path_that_is_not_utf8_reaches_the_command_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tempfile::tempdir().unwrap();
+        let odd = d.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+        if fs::write(&odd, "x").is_err() {
+            return; // a filesystem that forbids non-UTF-8 names has nothing to test
+        }
+        let out = run_command_gate(
+            d.path(),
+            &spec("test", &["-e"], PopulationDelivery::Args),
+            std::slice::from_ref(&odd),
+            1,
+        );
+        assert!(
+            out.verdict.is_pass(),
+            "{:?}: {}",
+            out.verdict,
+            out.output_excerpt
+        );
+        // Stdin and the list file carry the same bytes.
+        let out = run_command_gate(
+            d.path(),
+            &spec(
+                "sh",
+                &["-c", "read p; test -e \"$p\""],
+                PopulationDelivery::Stdin,
+            ),
+            std::slice::from_ref(&odd),
+            1,
+        );
+        assert!(out.verdict.is_pass(), "stdin: {:?}", out.verdict);
+        let out = run_command_gate(
+            d.path(),
+            &spec(
+                "sh",
+                &["-c", "read p < \"$FL_POPULATION_FILE\"; test -e \"$p\""],
+                PopulationDelivery::FileList,
+            ),
+            std::slice::from_ref(&odd),
+            1,
+        );
+        assert!(out.verdict.is_pass(), "file list: {:?}", out.verdict);
+    }
+
+    #[test]
+    fn the_excerpt_is_bounded_on_a_char_boundary_and_keeps_stderr_visible_when_short() {
+        let big = "é".repeat(EXCERPT_LIMIT); // 2 bytes each: the cut lands mid-sequence at odd limits
+        let cut = excerpt(big.as_bytes(), b"");
+        assert!(cut.len() <= EXCERPT_LIMIT);
+        assert!(cut.chars().all(|c| c == 'é'));
+        assert_eq!(excerpt(b"out", b"err"), "outerr");
+        assert_eq!(excerpt(b"", b""), "");
+        assert!(excerpt(&[0xff, 0xfe, 0xfd], b"").contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn an_unrecognised_exit_code_and_a_signal_death_are_failures() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a.txt"), "x").unwrap();
+        let pop = [d.path().join("a.txt")];
+        let mut s = spec("sh", &["-c", "exit 3"], PopulationDelivery::FileList);
+        s.pass_codes = vec![0, 2];
+        assert!(!run_command_gate(d.path(), &s, &pop, 1).verdict.is_pass());
+        s.pass_codes = vec![0, 3];
+        assert!(run_command_gate(d.path(), &s, &pop, 1).verdict.is_pass());
+        // Killed by a signal: no exit code, never a pass for a gate that lists only 0.
+        let mut s = spec("sh", &["-c", "kill -KILL $$"], PopulationDelivery::FileList);
+        s.pass_codes = vec![0];
+        assert!(!run_command_gate(d.path(), &s, &pop, 1).verdict.is_pass());
+        // An empty pass list can never pass.
+        s = spec("true", &[], PopulationDelivery::FileList);
+        s.pass_codes = vec![];
+        assert!(!run_command_gate(d.path(), &s, &pop, 1).verdict.is_pass());
     }
 }

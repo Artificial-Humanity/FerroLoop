@@ -454,6 +454,8 @@ pub enum WorkflowError {
         "undeclared workflow runtime key `{key}` for workflow `{workflow}`; declare it in `declared_keys` first"
     )]
     UndeclaredWorkflowKey { workflow: String, key: String },
+    #[error("workflow budget exhausted before step `{step_id}` could run: {detail}")]
+    BudgetExhausted { step_id: String, detail: String },
 }
 
 impl WorkflowError {
@@ -480,6 +482,7 @@ impl WorkflowError {
                 | Self::SelfApprovalForbidden { .. }
                 | Self::InsufficientApprovalAuthority { .. }
                 | Self::UndeclaredWorkflowKey { .. }
+                | Self::BudgetExhausted { .. }
         )
     }
 }
@@ -851,6 +854,48 @@ fn edge_matches(on: EdgeCondition, outcome: StepOutcome) -> bool {
 }
 
 /// Pure deterministic workflow step scheduler (spec §1.4).
+/// Why `step_id` may not start another attempt: the run has already used up a ceiling that
+/// [`advance_workflow`] enforces only after an attempt has finished. `None` when it may run.
+///
+/// The ceilings are `>=` here and `>` there on purpose: `advance_workflow` lets the attempt that
+/// reaches a limit complete and flags the one that crosses it, which means the crossing attempt
+/// has already spent its budget. Refusing it up front keeps a run within its limits.
+pub fn preflight_ceiling(def: &WorkflowDef, run: &WorkflowRun, step_id: &str) -> Option<String> {
+    if run.total_steps_executed >= def.max_total_steps {
+        return Some(format!(
+            "workflow reached max_total_steps ({})",
+            def.max_total_steps
+        ));
+    }
+    if let Some(budget) = def.budget_usd_micros
+        && run.total_cost_usd_micros >= budget
+    {
+        return Some(format!("workflow reached budget_usd_micros ({budget})"));
+    }
+    if let Some(max_tok) = def.max_tokens
+        && run.total_tokens >= max_tok
+    {
+        return Some(format!("workflow reached max_tokens ({max_tok})"));
+    }
+    let step_def = def.steps.iter().find(|s| s.step_id == step_id)?;
+    let step = run.steps.get(step_id)?;
+    if let Some(step_budget) = step_def.budget_usd_micros
+        && step.cost_usd_micros >= step_budget
+    {
+        return Some(format!(
+            "step `{step_id}` reached budget_usd_micros ({step_budget})"
+        ));
+    }
+    if let Some(step_max_tok) = step_def.max_tokens
+        && step.tokens_used >= step_max_tok
+    {
+        return Some(format!(
+            "step `{step_id}` reached max_tokens ({step_max_tok})"
+        ));
+    }
+    None
+}
+
 pub fn advance_workflow(
     def: &WorkflowDef,
     run: &mut WorkflowRun,
@@ -2216,5 +2261,63 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn preflight_ceiling_refuses_a_step_once_any_limit_is_reached_not_after_it_is_crossed() {
+        let mut def = base_workflow_def();
+        let mut run = WorkflowRun::new(
+            WorkflowRunId(seq_iri(120)),
+            &def,
+            "Preflight",
+            At::from_unix_millis(1_000),
+            "ferris",
+        )
+        .unwrap();
+        assert_eq!(preflight_ceiling(&def, &run, "implement"), None);
+
+        // Steps: one below the limit may run, the limit itself may not.
+        def.max_total_steps = 3;
+        run.total_steps_executed = 2;
+        assert_eq!(preflight_ceiling(&def, &run, "implement"), None);
+        run.total_steps_executed = 3;
+        assert!(
+            preflight_ceiling(&def, &run, "implement")
+                .unwrap()
+                .contains("max_total_steps (3)")
+        );
+        run.total_steps_executed = 0;
+
+        // Workflow cost and tokens.
+        def.budget_usd_micros = Some(100);
+        run.total_cost_usd_micros = 99;
+        assert_eq!(preflight_ceiling(&def, &run, "implement"), None);
+        run.total_cost_usd_micros = 100;
+        assert!(
+            preflight_ceiling(&def, &run, "implement")
+                .unwrap()
+                .contains("budget_usd_micros")
+        );
+        run.total_cost_usd_micros = 0;
+        def.max_tokens = Some(50);
+        run.total_tokens = 50;
+        assert!(
+            preflight_ceiling(&def, &run, "implement")
+                .unwrap()
+                .contains("max_tokens (50)")
+        );
+        run.total_tokens = 0;
+
+        // Per-step limits apply to that step only.
+        def.steps[0].max_tokens = Some(10);
+        run.steps.get_mut("implement").unwrap().tokens_used = 10;
+        assert!(
+            preflight_ceiling(&def, &run, "implement")
+                .unwrap()
+                .contains("step `implement`")
+        );
+        assert_eq!(preflight_ceiling(&def, &run, "review"), None);
+        // An unknown step has no step limits to hit.
+        assert_eq!(preflight_ceiling(&def, &run, "nope"), None);
     }
 }
