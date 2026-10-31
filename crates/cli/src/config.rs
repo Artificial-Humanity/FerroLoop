@@ -606,12 +606,20 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
 }
 
 /// Whether `s` names a repository as `owner/repo`: exactly two non-empty
-/// parts and no whitespace. The config's `github = …` and a typed
+/// parts of `[A-Za-z0-9._-]`, neither `.` nor `..`. The config's `github = …` and a typed
 /// `owner/repo#41` follow the same rule.
 pub fn is_owner_repo(s: &str) -> bool {
-    s.split('/').count() == 2
-        && s.split('/').all(|p| !p.is_empty())
-        && !s.contains(char::is_whitespace)
+    // Each part is spliced into API URLs and IRIs, so it is limited to the
+    // characters GitHub names use; `.`/`..` would traverse and `?#%` would
+    // rewrite the request.
+    let part = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    s.split('/').count() == 2 && s.split('/').all(part)
 }
 
 /// Canonicalize `path`. A path that does not exist is not an error here —
@@ -739,6 +747,19 @@ pub fn mcp_entry(entries: &[McpEntry], cwd: &Path) -> Result<Option<McpEntry>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owner_repo_rejects_traversal_and_url_metacharacters() {
+        for bad in [
+            "../..", "a/..", "./b", "a/b?x=1", "a/b#c", "a/b%2f", "a\u{0}/b", "own er/b", "a/b/c",
+            "/b", "a/",
+        ] {
+            assert!(!is_owner_repo(bad), "{bad:?} must be rejected");
+        }
+        for ok in ["acme/widgets.rs", "a-b/c_d", "Org1/repo.name"] {
+            assert!(is_owner_repo(ok), "{ok:?} must be accepted");
+        }
+    }
+
     use super::*;
 
     /// `load` over a config file holding `text`.

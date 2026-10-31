@@ -36,7 +36,12 @@ impl std::str::FromStr for Ref {
                      `owner/repo#{n}`, with both parts named"
                 ));
             }
-            return Iri::parse(&format!("https://github.com/{repo}/issues/{n}"))
+            // Normalise through u64 so `#007` and `#7` are one IRI, and a
+            // number no issue can have is refused here.
+            let Ok(num) = n.parse::<u64>() else {
+                return Err(format!("`{s}` names an issue number that is too large"));
+            };
+            return Iri::parse(&format!("https://github.com/{repo}/issues/{num}"))
                 .map(Ref::Iri)
                 .map_err(|e| format!("`{s}` names an issue fl cannot address: {e}"));
         }
@@ -125,6 +130,15 @@ mod tests {
 
     fn parse(s: &str) -> Result<Ref, String> {
         s.parse()
+    }
+
+    #[test]
+    fn issue_number_is_normalised_and_bounded() {
+        match parse("acme/w#007") {
+            Ok(Ref::Iri(i)) => assert_eq!(i.as_str(), "https://github.com/acme/w/issues/7"),
+            other => panic!("expected the canonical issue URL, got {other:?}"),
+        }
+        assert!(parse("acme/w#99999999999999999999999").is_err());
     }
 
     #[test]

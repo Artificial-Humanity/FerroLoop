@@ -579,6 +579,9 @@ fn stage(target: &Target, bytes: &[u8]) -> Result<NamedTempFile, McpError> {
         let mode = fs::metadata(&target.canonical).map_err(io)?.permissions();
         fs::set_permissions(temp.path(), mode).map_err(io)?;
     }
+    // On disk before the rename: after a power loss a renamed-in file whose
+    // data never reached the disk reads back empty on some filesystems.
+    temp.as_file().sync_all().map_err(io)?;
     Ok(temp)
 }
 
@@ -766,6 +769,7 @@ fn write_record(records: &Path, file: &Path, record: &Record) -> Result<(), McpE
     bytes.push(b'\n');
     let mut temp = NamedTempFile::new_in(records).map_err(io)?;
     temp.write_all(&bytes).map_err(io)?;
+    temp.as_file().sync_all().map_err(io)?;
     temp.persist(file).map_err(|e| io(e.error))?;
     Ok(())
 }

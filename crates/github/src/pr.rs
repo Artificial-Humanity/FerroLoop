@@ -181,42 +181,33 @@ impl FromStr for MergeMethod {
 }
 
 fn get_paginated(client: &Client, initial_path: &str) -> Result<Vec<Value>, StoreError> {
-    let mut out = Vec::new();
-    let mut next = Some(initial_path.to_string());
-    while let Some(page) = next {
-        let reply = client.send(Method::Get, &page, None)?;
-        if reply.status != 200 {
-            return Err(StoreError::Backend(format!(
-                "GitHub answered {} to {page}; retry",
-                reply.status
-            )));
-        }
-        let next_url = reply.next_link().map(str::to_string);
-        let Value::Array(items) = reply.body else {
-            return Err(StoreError::Backend(format!(
-                "GitHub answered {page} with something that is not a JSON array"
-            )));
-        };
-        out.extend(items);
-        next = next_url;
-    }
-    Ok(out)
+    client.get_all(initial_path)
 }
+
+/// The login GitHub shows for a deleted account.
+const GHOST_LOGIN: &str = "ghost";
 
 fn parse_review_summary(v: &Value) -> Result<PrReviewSummary, StoreError> {
     let id = v.get("id").and_then(Value::as_u64).ok_or_else(|| {
         StoreError::Backend("GitHub sent a pull-request review without `id`".into())
     })?;
-    let author_login = v
-        .pointer("/user/login")
-        .or_else(|| v.get("author_login"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            StoreError::Backend(format!(
-                "GitHub sent pull-request review {id} without `user.login`"
-            ))
-        })?
-        .to_string();
+    // GitHub sends `"user": null` for a review whose author's account was
+    // deleted. That review must not make the whole listing fail (and with it
+    // policy, status and merge for the PR); it is attributed to GitHub's own
+    // `ghost` placeholder, which no registered agent or owner can be.
+    let author_login = match v.get("user") {
+        Some(Value::Null) => GHOST_LOGIN.to_string(),
+        _ => v
+            .pointer("/user/login")
+            .or_else(|| v.get("author_login"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                StoreError::Backend(format!(
+                    "GitHub sent pull-request review {id} without `user.login`"
+                ))
+            })?
+            .to_string(),
+    };
     let state = v
         .get("state")
         .and_then(Value::as_str)
@@ -296,6 +287,13 @@ pub fn list_pr_commits(
         client,
         &format!("/repos/{repo}/pulls/{number}/commits?per_page=100"),
     )?;
+    if items.len() >= PR_COMMITS_CAP {
+        return Err(StoreError::Backend(format!(
+            "pull request #{number} lists {} commits, the most GitHub returns; the rest cannot \
+             be checked for attribution",
+            items.len()
+        )));
+    }
     let mut commits = Vec::with_capacity(items.len());
     for item in items {
         let sha = item
@@ -330,12 +328,32 @@ pub fn list_pr_commits(
     Ok(commits)
 }
 
+/// GitHub's `GET /pulls/{n}/files` stops at this many files, without saying so.
+const PR_FILES_CAP: usize = 3000;
+/// GitHub's `GET /pulls/{n}/commits` stops at this many commits, without saying so.
+const PR_COMMITS_CAP: usize = 250;
+
 /// List all changed file paths on a pull request (`GET /repos/{owner}/{repo}/pulls/{number}/files`).
+///
+/// A renamed file is listed under BOTH its new and its old path: the old one
+/// may be protected (`.github/…` renamed out of it). A listing GitHub has cut
+/// at its cap is an error, not a short list that hides what lies past it.
 pub fn list_pr_files(client: &Client, repo: &str, number: u64) -> Result<Vec<String>, StoreError> {
     let items = get_paginated(
         client,
         &format!("/repos/{repo}/pulls/{number}/files?per_page=100"),
     )?;
+    files_from_items(&items, number)
+}
+
+fn files_from_items(items: &[Value], number: u64) -> Result<Vec<String>, StoreError> {
+    if items.len() >= PR_FILES_CAP {
+        return Err(StoreError::Backend(format!(
+            "pull request #{number} lists {} files, the most GitHub returns; the rest cannot be \
+             checked against the protected paths",
+            items.len()
+        )));
+    }
     let mut files = Vec::with_capacity(items.len());
     for item in items {
         let filename = item
@@ -347,6 +365,11 @@ pub fn list_pr_files(client: &Client, repo: &str, number: u64) -> Result<Vec<Str
                 ))
             })?
             .to_string();
+        if let Some(old) = item.get("previous_filename").and_then(Value::as_str)
+            && old != filename
+        {
+            files.push(old.to_string());
+        }
         files.push(filename);
     }
     Ok(files)
@@ -465,6 +488,35 @@ pub fn merge_pr(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_renamed_file_lists_its_old_path_too() {
+        let items = vec![serde_json::json!({
+            "filename": "x.yml",
+            "previous_filename": ".github/workflows/ci.yml",
+            "status": "renamed"
+        })];
+        let files = files_from_items(&items, 1).unwrap();
+        assert!(files.contains(&".github/workflows/ci.yml".to_string()));
+        assert!(files.contains(&"x.yml".to_string()));
+    }
+
+    #[test]
+    fn a_file_listing_at_githubs_cap_is_an_error() {
+        let items: Vec<Value> = (0..PR_FILES_CAP)
+            .map(|i| serde_json::json!({ "filename": format!("f{i}") }))
+            .collect();
+        assert!(files_from_items(&items, 1).is_err());
+        assert!(files_from_items(&items[..PR_FILES_CAP - 1], 1).is_ok());
+    }
+
+    #[test]
+    fn a_review_by_a_deleted_user_parses_as_ghost() {
+        let v = serde_json::json!({
+            "id": 9, "user": null, "state": "APPROVED", "body": "", "commit_id": "abc"
+        });
+        assert_eq!(parse_review_summary(&v).unwrap().author_login, "ghost");
+    }
+
     use super::*;
     use crate::creds::{AppCredentials, EnvToken, throwaway_key};
     use crate::fake::{APP_SLUG, FakeGithub, USER_LOGIN};

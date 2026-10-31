@@ -293,14 +293,24 @@ impl DeliveryReceipt {
         } else {
             None
         };
-        let recipient_name =
-            if !self.recipient_name.is_empty() && !self.recipient_name.starts_with("urn:") {
-                self.recipient_name.clone()
-            } else if !incoming.recipient_name.is_empty() {
-                incoming.recipient_name.clone()
+        // Order-independent: a real name beats a `urn:` placeholder, which
+        // beats none; between two of the same rank the lesser string wins, so
+        // replicas merging in opposite orders agree.
+        let rank = |n: &str| -> u8 {
+            if n.is_empty() {
+                0
+            } else if n.starts_with("urn:") {
+                1
             } else {
-                self.recipient_name.clone()
-            };
+                2
+            }
+        };
+        let (a, b) = (&self.recipient_name, &incoming.recipient_name);
+        let recipient_name = match rank(a).cmp(&rank(b)) {
+            std::cmp::Ordering::Greater => a.clone(),
+            std::cmp::Ordering::Less => b.clone(),
+            std::cmp::Ordering::Equal => a.min(b).clone(),
+        };
         DeliveryReceipt {
             message_id: self.message_id.clone(),
             recipient_id: self.recipient_id.clone(),
@@ -435,6 +445,30 @@ pub struct WireFilter {
 mod tests {
     use super::*;
     use crate::ids::seq_iri;
+
+    #[test]
+    fn receipt_merge_is_commutative_when_the_names_differ() {
+        let base = |name: &str| DeliveryReceipt {
+            message_id: MessageId(seq_iri(1)),
+            recipient_id: seq_iri(2),
+            recipient_name: name.into(),
+            status: DeliveryStatus::Delivered,
+            attempts: 1,
+            updated_at: At::from_unix_millis(5),
+            acked_at: None,
+        };
+        for (a, b) in [
+            ("alice", "bob"),
+            ("urn:x:1", "urn:x:2"),
+            ("urn:x:1", "bob"),
+            ("", "bob"),
+            ("", "urn:x:1"),
+        ] {
+            let (ra, rb) = (base(a), base(b));
+            assert_eq!(ra.merge(&rb), rb.merge(&ra), "{a:?} vs {b:?}");
+        }
+        assert_eq!(base("urn:x:1").merge(&base("bob")).recipient_name, "bob");
+    }
 
     #[test]
     fn wire_address_parses_and_round_trips_all_selector_variants() {

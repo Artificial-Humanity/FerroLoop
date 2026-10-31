@@ -838,10 +838,25 @@ pub fn apply_workspace_import<S: StateStore>(
         ..WorkspaceImportReport::default()
     };
     let mut scopes: BTreeSet<String> = BTreeSet::new();
-    for args in upserts {
+    for mut args in upserts {
         let concern = args.payload.concern();
         let scope_wire = args.scope.as_wire();
         let slug = args.slug.clone();
+        // A scan only ever says "active"; the operator's retire/supersede
+        // ruling on a memory is theirs, and re-reading the same files must
+        // neither undo it nor write a revision for nothing.
+        if let StatePayload::Memory(new) = &mut args.payload
+            && let Ok(Some(old)) = store.get_state_by_key(&args.scope, concern, &slug)
+            && let StatePayload::Memory(old) = old.payload
+        {
+            new.lifecycle = old.lifecycle;
+            new.superseded_by = old.superseded_by.clone();
+            if *new == old {
+                scopes.insert(scope_wire);
+                report.imported_memories += 1;
+                continue;
+            }
+        }
         match store.upsert_state(args) {
             Ok(_) => {
                 scopes.insert(scope_wire);
@@ -1264,6 +1279,42 @@ mod tests {
         assert_eq!(report2.imported_memories, 3);
         assert_eq!(report2.imported_handoffs, 1);
         assert_eq!(store.list_state(None, None).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn reimport_keeps_a_retired_memory_retired_and_writes_no_new_revision() {
+        let tmp = fixture();
+        let store = MemStore::default();
+        let scan = scan_workspace_import(tmp.path(), "tester", at());
+        apply_workspace_import(&store, scan.upserts, scan.skipped);
+        let victim = store
+            .list_state(Some(&StateScope::Workspace), Some(StateConcern::Memory))
+            .unwrap()
+            .remove(0);
+        store
+            .retire_memory(
+                &victim.scope,
+                &victim.slug,
+                MemoryLifecycle::Retired,
+                None,
+                at(),
+                "owner",
+            )
+            .unwrap();
+        let revisions = store.state_revisions(&victim.id).unwrap().len();
+
+        let scan = scan_workspace_import(tmp.path(), "tester", at());
+        apply_workspace_import(&store, scan.upserts, scan.skipped);
+
+        let after = store
+            .get_state_by_key(&victim.scope, StateConcern::Memory, &victim.slug)
+            .unwrap()
+            .unwrap();
+        let StatePayload::Memory(m) = after.payload else {
+            panic!("a memory")
+        };
+        assert_eq!(m.lifecycle, MemoryLifecycle::Retired);
+        assert_eq!(store.state_revisions(&victim.id).unwrap().len(), revisions);
     }
 
     #[test]

@@ -38,7 +38,29 @@ fn named(item: &Iri) -> String {
 /// resolves under the repository's new name — another directory, where
 /// recovery would find nothing and say so as success.
 pub fn recovery(item: &Iri) -> String {
-    format!("fl github ledger comment {item}")
+    format!("fl github ledger comment {}", shell_word(item.as_str()))
+}
+
+/// `s` as one word for a POSIX shell. An IRI only has to be free of
+/// whitespace, so `$(…)`, `;` or a backtick is a valid one, and the warning
+/// that prints this is a line a person or an agent is told to run: anything
+/// beyond the characters a plain URL holds is single-quoted, and a control
+/// character (a terminal escape) is shown as text instead of sent.
+fn shell_word(s: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || ":/._-@%+=,~".contains(c);
+    if !s.is_empty() && s.chars().all(plain) {
+        return s.to_string();
+    }
+    let mut out = String::from("'");
+    for c in s.chars() {
+        match c {
+            '\'' => out.push_str("'\\''"),
+            c if c.is_control() => out.extend(c.escape_default()),
+            c => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
 }
 
 /// Post the comment of each decision this command flushed (spec §4.1),
@@ -167,6 +189,22 @@ fn local_view(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_recovery_command_quotes_an_iri_with_shell_syntax() {
+        let plain = Iri::parse("https://github.com/acme/widgets/issues/7").unwrap();
+        assert_eq!(
+            recovery(&plain),
+            "fl github ledger comment https://github.com/acme/widgets/issues/7"
+        );
+        let evil = Iri::parse("urn:x:$(id);it's").unwrap();
+        assert_eq!(
+            recovery(&evil),
+            "fl github ledger comment 'urn:x:$(id);it'\\''s'"
+        );
+        let esc = Iri::parse("urn:x:\u{1b}[2J").unwrap();
+        assert!(!recovery(&esc).contains('\u{1b}'));
+    }
+
     use super::*;
     use crate::ctx::Witness;
     use crate::testing::Flushes;

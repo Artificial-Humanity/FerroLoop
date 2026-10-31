@@ -278,7 +278,13 @@ fn open_github(
 /// The store `--db`, then `$FL_DB`, names, if either does. Either one
 /// CONFINES the command to that store (see [`db_path`]).
 fn explicit_db(flag: Option<PathBuf>) -> Option<PathBuf> {
-    flag.or_else(|| std::env::var("FL_DB").ok().map(PathBuf::from))
+    explicit_db_from(flag, std::env::var_os("FL_DB"))
+}
+
+/// [`explicit_db`] with the environment value passed in. An empty `$FL_DB`
+/// (CI templates often export one) is unset, not a store named "".
+fn explicit_db_from(flag: Option<PathBuf>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    flag.or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
 }
 
 /// Resolve the store path from `explicit` (`--db`, then `$FL_DB`), then
@@ -665,13 +671,7 @@ fn main() {
                 }
             }
         }
-        Some("agent-bus-claude-hook") => match run_claude_hook_entry() {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("error: {e:#}");
-                2
-            }
-        },
+        Some("agent-bus-claude-hook") => hook_exit_code(run_claude_hook_entry()),
         Some("agent-bus-mcp") => match run_mcp_entry() {
             Ok(c) => c,
             Err(e) => {
@@ -727,6 +727,21 @@ fn run_agent_msg_entry(flag_db: Option<PathBuf>, cli: cmd::wire::AgentMsgCli) ->
         Err((code, msg)) => {
             eprintln!("error: {msg}");
             Ok(code)
+        }
+    }
+}
+
+/// The exit code of a hook entry point. ⚠ A hook that fails to START (an
+/// unreadable config, no home directory) must not exit 2: for a Stop hook that
+/// means "block, keep going", and the `stop_hook_active` guard that ends the
+/// retry loop is only read once the hook has started. 1 is a non-blocking
+/// error the vendor shows and moves past.
+fn hook_exit_code(started: Result<i32>) -> i32 {
+    match started {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            1
         }
     }
 }
@@ -1288,6 +1303,25 @@ fn run(cli: Cli) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_hook_that_cannot_start_does_not_block_the_agent() {
+        assert_eq!(hook_exit_code(Err(anyhow::anyhow!("bad config"))), 1);
+        assert_eq!(hook_exit_code(Ok(0)), 0);
+    }
+
+    #[test]
+    fn empty_fl_db_is_unset() {
+        assert_eq!(explicit_db_from(None, Some("".into())), None);
+        assert_eq!(
+            explicit_db_from(None, Some("/x/y.redb".into())),
+            Some(PathBuf::from("/x/y.redb"))
+        );
+        assert_eq!(
+            explicit_db_from(Some("/f.redb".into()), Some("/x".into())),
+            Some(PathBuf::from("/f.redb"))
+        );
+    }
+
     use super::*;
 
     #[test]

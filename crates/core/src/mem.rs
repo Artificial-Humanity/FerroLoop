@@ -1401,7 +1401,7 @@ impl AgentRegistry for MemStore {
     fn registry_events_after(&self, seq: u64) -> Result<Vec<(u64, RegistryEvent)>, StoreError> {
         let s = self.inner.borrow();
         Ok(s.registry_events
-            .range((seq + 1)..)
+            .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
             .map(|(k, v)| (*k, v.clone()))
             .collect())
     }
@@ -1740,7 +1740,7 @@ impl StateStore for MemStore {
     fn state_revisions_after(&self, seq: u64) -> Result<Vec<(u64, StateRevision)>, StoreError> {
         let s = self.inner.borrow();
         Ok(s.state_revisions
-            .range((seq + 1)..)
+            .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
             .map(|(k, v)| (*k, v.clone()))
             .collect())
     }
@@ -1823,6 +1823,11 @@ impl MessageStore for MemStore {
 
         let msg_id = match args.id {
             Some(id) => {
+                // A message is immutable once sent: reusing its id must not
+                // replace the body under receipts that already point at it.
+                if s.wire_messages.contains_key(&id) {
+                    return Err(StoreError::AlreadyExists(id.iri().clone()));
+                }
                 s.index_imported_unhanded(Kind::Message, id.iri())?;
                 id
             }
@@ -2044,7 +2049,10 @@ impl MessageStore for MemStore {
     fn wire_messages_after(&self, after_seq: u64) -> Result<Vec<(u64, WireMessage)>, StoreError> {
         let s = self.inner.borrow();
         let mut out = Vec::new();
-        for (&seq, mid) in s.wire_msg_log.range((after_seq + 1)..) {
+        for (&seq, mid) in s.wire_msg_log.range((
+            std::ops::Bound::Excluded(after_seq),
+            std::ops::Bound::Unbounded,
+        )) {
             if let Some(msg) = s.wire_messages.get(mid) {
                 out.push((seq, msg.clone()));
             }
@@ -2058,7 +2066,10 @@ impl MessageStore for MemStore {
     ) -> Result<Vec<(u64, DeliveryReceipt)>, StoreError> {
         let s = self.inner.borrow();
         Ok(s.wire_rcpt_log
-            .range((after_seq + 1)..)
+            .range((
+                std::ops::Bound::Excluded(after_seq),
+                std::ops::Bound::Unbounded,
+            ))
             .filter(|(_, rcpt)| s.wire_messages.contains_key(&rcpt.message_id))
             .map(|(&seq, rcpt)| (seq, rcpt.clone()))
             .collect())
@@ -2367,6 +2378,49 @@ impl WorkflowStore for MemStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wire_args(id: Option<MessageId>, body: &str) -> SendWireArgs {
+        use crate::ferrowire::{MessageKind, MessageUrgency, WireAddress};
+        SendWireArgs {
+            id,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: false,
+            subject: "s".into(),
+            body: body.into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        }
+    }
+
+    #[test]
+    fn a_cursor_at_u64_max_reads_nothing_instead_of_overflowing() {
+        let s = MemStore::default();
+        s.send_wire(wire_args(None, "hello")).unwrap();
+        assert!(s.wire_messages_after(u64::MAX).unwrap().is_empty());
+        assert!(s.wire_receipts_after(u64::MAX).unwrap().is_empty());
+        assert!(s.state_revisions_after(u64::MAX).unwrap().is_empty());
+        assert!(s.registry_events_after(u64::MAX).unwrap().is_empty());
+        assert_eq!(s.wire_messages_after(0).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sending_with_a_used_message_id_is_refused_and_leaves_the_first_message() {
+        let s = MemStore::default();
+        let id = MessageId(Iri::parse("urn:uuid:00000000-0000-4000-8000-000000000001").unwrap());
+        s.send_wire(wire_args(Some(id.clone()), "first")).unwrap();
+        let err = s
+            .send_wire(wire_args(Some(id.clone()), "second"))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::AlreadyExists(_)), "{err:?}");
+        assert_eq!(s.get_wire_message(&id).unwrap().unwrap().body, "first");
+    }
 
     #[test]
     fn mem_store_meets_every_role_contract() {

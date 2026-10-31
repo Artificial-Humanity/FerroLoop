@@ -243,40 +243,70 @@ pub fn parse_co_authors(message: &str) -> Vec<CommitTrailerAuthor> {
     out
 }
 
+/// Normalise a repository path for matching: `\` is a separator, `.` and empty
+/// segments vanish, `..` pops, and case is folded (a case-insensitive checkout
+/// writes `.GitHub/workflows/ci.yml` to the protected directory).
+fn normalize_policy_path(raw: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for seg in raw.trim().replace('\\', "/").split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other.to_lowercase()),
+        }
+    }
+    parts.join("/")
+}
+
 fn matches_pattern(normalized_path: &str, raw_pattern: &str) -> bool {
-    let pattern = raw_pattern
-        .trim()
-        .trim_start_matches("./")
-        .trim_matches('/');
+    let pattern = normalize_policy_path(raw_pattern);
     if pattern.is_empty() {
         return false;
     }
+    let path = normalize_policy_path(normalized_path);
     if let Some(dir) = pattern.strip_suffix("/**") {
-        let dir = dir.trim_matches('/');
-        return normalized_path == dir || normalized_path.starts_with(&format!("{dir}/"));
+        if !dir.contains(['*', '?', '[', '{']) {
+            return path == dir || path.starts_with(&format!("{dir}/"));
+        }
+    } else if !pattern.contains(['*', '?', '[', '{']) {
+        if let Some(suffix) = pattern.strip_prefix("**/") {
+            return path == suffix || path.ends_with(&format!("/{suffix}"));
+        }
+        if !pattern.contains('/') {
+            return path == pattern || path.ends_with(&format!("/{pattern}"));
+        }
+        return path == pattern;
     }
-    if let Some(suffix) = pattern.strip_prefix("**/") {
-        let suffix = suffix.trim_matches('/');
-        return normalized_path == suffix || normalized_path.ends_with(&format!("/{suffix}"));
+    // Anything else is a real glob. A pattern that does not compile fails
+    // closed: it protects its literal text rather than nothing.
+    match globset::GlobBuilder::new(&pattern)
+        .literal_separator(true)
+        .build()
+    {
+        Ok(g) => {
+            g.compile_matcher().is_match(&path)
+                || (!pattern.contains('/')
+                    && globset::Glob::new(&format!("**/{pattern}"))
+                        .is_ok_and(|g| g.compile_matcher().is_match(&path)))
+        }
+        Err(_) => path == pattern,
     }
-    if !pattern.contains('/') {
-        return normalized_path == pattern || normalized_path.ends_with(&format!("/{pattern}"));
-    }
-    normalized_path == pattern
 }
 
 /// Check whether `path` matches any default protected pattern or `extra_patterns`.
 pub fn is_protected_path(path: &str, extra_patterns: &[String]) -> bool {
-    let normalized = path.trim().trim_start_matches("./").trim_matches('/');
+    let normalized = normalize_policy_path(path);
     if normalized.is_empty() {
         return false;
     }
     DEFAULT_PROTECTED_PATTERNS
         .iter()
-        .any(|pat| matches_pattern(normalized, pat))
+        .any(|pat| matches_pattern(&normalized, pat))
         || extra_patterns
             .iter()
-            .any(|pat| matches_pattern(normalized, pat))
+            .any(|pat| matches_pattern(&normalized, pat))
 }
 
 fn find_active_agent<'a>(
@@ -334,13 +364,21 @@ pub fn evaluate_pr_policy(
             continue;
         }
 
+        let mut attributed = false;
         for trailer in trailers {
             if trailer.name_key.eq_ignore_ascii_case(owner) {
-                owner_authored_commits = true;
+                // A trailer is text anyone can write: it names the Owner only on
+                // a commit the Owner's login authored. Otherwise it attributes
+                // nothing (so it cannot launder an unattributed commit).
+                if is_owner_commit {
+                    owner_authored_commits = true;
+                    attributed = true;
+                }
                 continue;
             }
             match find_active_agent(agents, &trailer) {
                 Some(agent) => {
+                    attributed = true;
                     push_unique(&mut co_authors, agent.name_key.clone());
                     if !co_author_roles.contains(&agent.role) {
                         co_author_roles.push(agent.role.clone());
@@ -350,6 +388,9 @@ pub fn evaluate_pr_policy(
                     push_unique(&mut unknown_co_authors, trailer.name_key);
                 }
             }
+        }
+        if !attributed && !is_owner_commit {
+            push_unique(&mut unattributed_commits, commit.sha.clone());
         }
     }
 
@@ -458,7 +499,11 @@ pub fn evaluate_pr_policy(
 
 /// Format a GitHub pull-request review body with an embedded `FlReviewMarker` HTML comment.
 pub fn format_review_body(prose: &str, marker: &FlReviewMarker) -> String {
-    let json = serde_json::to_string(marker).expect("FlReviewMarker serializes to JSON");
+    // `>` only occurs inside JSON strings, where `\u003e` is the same character;
+    // it keeps a `-->` in a field from ending the HTML comment early.
+    let json = serde_json::to_string(marker)
+        .expect("FlReviewMarker serializes to JSON")
+        .replace('>', "\\u003e");
     let trimmed = prose.trim();
     if trimmed.is_empty() {
         format!("{REVIEW_MARKER_PREFIX} {json} {REVIEW_MARKER_SUFFIX}")
@@ -667,7 +712,12 @@ pub fn verify_merge_approvals(
 
     let mut latest_by_reviewer: BTreeMap<String, FoldedReviewState> = BTreeMap::new();
 
-    for review in reviews {
+    // Fold oldest first whatever order the caller listed them in: review ids
+    // only grow, and a stale review must not overwrite a later one.
+    let mut ordered: Vec<&PrReviewSummary> = reviews.iter().collect();
+    ordered.sort_by_key(|r| r.id);
+
+    for review in ordered {
         let state = review.state.trim().to_ascii_uppercase();
         if !matches!(
             state.as_str(),
@@ -773,6 +823,117 @@ mod tests {
             updated_at: At::from_unix_millis(1_000),
             by: "owner".to_string(),
         }
+    }
+
+    fn commit(sha: &str, login: Option<&str>, message: &str) -> PrCommitSummary {
+        PrCommitSummary {
+            sha: sha.into(),
+            author_login: login.map(str::to_string),
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn owner_trailer_on_a_foreign_commit_does_not_launder_it() {
+        let roster = sample_roster();
+        let commits = vec![
+            commit(
+                "good",
+                Some("machine"),
+                "x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>",
+            ),
+            commit(
+                "forged",
+                Some("mallory"),
+                "y\n\nCo-authored-by: Some Body <lmcfarlin@evil.example>",
+            ),
+        ];
+        let eval = evaluate_pr_policy(
+            "ferroloop",
+            &commits,
+            &["src/a.rs".into()],
+            &[],
+            &roster,
+            "lmcfarlin",
+        );
+        assert_eq!(eval.unattributed_commits, vec!["forged".to_string()]);
+        assert_eq!(eval.required_tier, RequiredTier::Owner);
+    }
+
+    #[test]
+    fn protected_patterns_cover_globs_case_and_dot_segments() {
+        assert!(is_protected_path("keys/server.pem", &["*.pem".into()]));
+        assert!(is_protected_path("docs/a.md", &["docs/*.md".into()]));
+        assert!(!is_protected_path("docs/sub/a.md", &["docs/*.md".into()]));
+        assert!(is_protected_path(
+            "ci/x/y.yml",
+            &[".GITHUB/**".into(), "ci/**/*.yml".into()]
+        ));
+        assert!(is_protected_path(".GitHub/workflows/ci.yml", &[]));
+        assert!(is_protected_path("./a/../.github/x.yml", &[]));
+        assert!(is_protected_path(".github\\workflows\\ci.yml", &[]));
+        assert!(!is_protected_path("src/main.rs", &["*.pem".into()]));
+    }
+
+    #[test]
+    fn review_marker_survives_an_arrow_in_a_field() {
+        let marker = FlReviewMarker {
+            project: "a-->b".into(),
+            reviewer: "ferris".into(),
+            role: AgentRole::Lead,
+            verdict: ReviewVerdict::Approved,
+            head_sha: "abc".into(),
+            at: At::from_unix_millis(5),
+        };
+        let body = format_review_body("ok", &marker);
+        assert_eq!(extract_review_marker(&body), Some(marker));
+    }
+
+    #[test]
+    fn approvals_fold_by_review_id_not_by_list_order() {
+        let roster = sample_roster();
+        let commits = vec![commit(
+            "c",
+            Some("machine"),
+            "x\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>",
+        )];
+        let eval = evaluate_pr_policy(
+            "ferroloop",
+            &commits,
+            &["src/a.rs".into()],
+            &[],
+            &roster,
+            "lmcfarlin",
+        );
+        let mk = |id: u64, state: &str| PrReviewSummary {
+            id,
+            author_login: "lmcfarlin".into(),
+            state: state.into(),
+            body: String::new(),
+            commit_id: Some("head".into()),
+        };
+        // Owner approved (id 2) after requesting changes (id 1); newest listed first.
+        assert!(
+            verify_merge_approvals(
+                "head",
+                &eval,
+                &[mk(2, "APPROVED"), mk(1, "CHANGES_REQUESTED")],
+                &roster,
+                "lmcfarlin"
+            )
+            .is_ok()
+        );
+        // Owner changed their mind (id 2) after approving (id 1); newest listed first.
+        assert!(
+            verify_merge_approvals(
+                "head",
+                &eval,
+                &[mk(2, "CHANGES_REQUESTED"), mk(1, "APPROVED")],
+                &roster,
+                "lmcfarlin"
+            )
+            .is_err()
+        );
     }
 
     fn sample_roster() -> Vec<AgentRecord> {

@@ -522,6 +522,16 @@ impl Build<'_> {
             }
         };
         for a in &p.runtime_arguments {
+            if !docker && let Some(why) = displaces_package(a) {
+                return refuse(
+                    format!(
+                        "its runtime argument `{}` {why}, so the line would not run the \
+                         pinned package",
+                        label(a)
+                    ),
+                    by_hand(n),
+                );
+            }
             if docker && a.kind == ArgumentKind::Positional {
                 return refuse(
                     format!(
@@ -573,6 +583,12 @@ impl Build<'_> {
                     "its argument `{label}` is of type `{}`, an argument type fl does not know",
                     printable(kind)
                 ),
+                by_hand(n),
+            );
+        }
+        if a.kind == ArgumentKind::Named && a.name.as_deref().is_none_or(str::is_empty) {
+            return refuse(
+                format!("its named argument `{label}` has no name, so fl cannot pass it"),
                 by_hand(n),
             );
         }
@@ -804,6 +820,38 @@ impl Build<'_> {
 
 fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
+}
+
+/// Whether a runtime argument of an `npx`/`uvx` line would make the runner
+/// start something other than the pinned package: a positional word that is
+/// not an option is taken as the package to run, and these options name one
+/// (or another index to fetch it from). `None` when it is harmless.
+fn displaces_package(a: &Argument) -> Option<&'static str> {
+    match &a.kind {
+        ArgumentKind::Positional => {
+            let v = a.value.as_deref().or(a.default.as_deref()).unwrap_or("");
+            (!v.starts_with('-')).then_some("is a bare word the runner would take as the package")
+        }
+        ArgumentKind::Named => {
+            let name = a.name.as_deref().unwrap_or("");
+            let bare = name.split('=').next().unwrap_or(name);
+            let hit = matches!(
+                bare,
+                "-p" | "--package"
+                    | "--from"
+                    | "--call"
+                    | "-c"
+                    | "--registry"
+                    | "-f"
+                    | "--find-links"
+                    | "--extra-index-url"
+            ) || bare.starts_with("--with")
+                || bare.starts_with("--index")
+                || bare.starts_with("--default-index");
+            hit.then_some("names another package or index")
+        }
+        ArgumentKind::Other(_) => None,
+    }
 }
 
 /// An argument as a message shows it: a named one's flag and template, a
@@ -1757,6 +1805,37 @@ mod tests {
             let msg = err.unwrap_err().to_string();
             assert!(msg.contains("a shape fl cannot record"), "{value}: {msg}");
         }
+    }
+
+    #[test]
+    fn a_runtime_argument_cannot_displace_the_pinned_package() {
+        for arg in [
+            json!({ "type": "positional", "value": "evil" }),
+            json!({ "type": "named", "name": "--from", "value": "evil" }),
+            json!({ "type": "named", "name": "-p", "value": "evil" }),
+            json!({ "type": "named", "name": "--index-url", "value": "https://evil.example" }),
+        ] {
+            let package = npm(json!({ "runtimeArguments": [arg.clone()] }));
+            let err = freeze(
+                &response(sample(json!([package]), json!([]))),
+                &named("sample"),
+            )
+            .expect_err(&format!("{arg} must be refused"));
+            assert!(err.to_string().contains("pinned package"), "{arg}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_named_argument_without_a_name_is_refused_not_passed_as_an_empty_word() {
+        let package = npm(json!({
+            "packageArguments": [{ "type": "named", "value": "v" }]
+        }));
+        let err = freeze(
+            &response(sample(json!([package]), json!([]))),
+            &named("sample"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("has no name"), "{err}");
     }
 
     // MCP spec §3.2 step 4: how each argument is passed.
