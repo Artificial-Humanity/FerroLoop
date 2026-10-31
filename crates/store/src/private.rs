@@ -130,6 +130,13 @@ fn quiet_value(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
 }
 
+/// The `quiet` field of the policy: a test build is never quiet by environment, so a test's
+/// outcome does not depend on the developer's own `FL_QUIET_STORE_PERMS`. A pure function so the
+/// release branch is testable from a test build.
+fn quiet_from(test_build: bool, value: Option<&std::ffi::OsStr>) -> bool {
+    !test_build && quiet_value(value)
+}
+
 /// When a warning may print, and where the process stands. The decision is data so a test can
 /// state it without a real terminal, environment or working directory.
 #[derive(Debug, Clone)]
@@ -154,8 +161,7 @@ impl Policy {
         Policy {
             always: ALWAYS.load(Ordering::Relaxed),
             stderr_is_terminal: tty,
-            // A test's outcome must not depend on the developer's own environment.
-            quiet: !cfg!(test) && quiet_value(std::env::var_os(QUIET_ENV).as_deref()),
+            quiet: quiet_from(cfg!(test), std::env::var_os(QUIET_ENV).as_deref()),
             cwd: std::env::current_dir().ok(),
         }
     }
@@ -179,32 +185,117 @@ fn claim(seen: &Mutex<BTreeSet<PathBuf>>, path: &Path) -> bool {
     true
 }
 
-/// The directory that holds `store`, as a path that names one directory from anywhere: an
-/// absolute parent as given; a relative one made absolute (canonical, else as given). `None` when
-/// that still leaves a relative path, or when the directory is the working directory or one of its
-/// ancestors: `chmod 700 .` or a chmod of a directory the person is working under is not advice
-/// to print.
+/// `path` with `.` and `..` components removed without touching the file system: a `..` removes
+/// the component before it, and one at the root is dropped. It is wrong across a symlink, so it is
+/// only the fallback for a path that cannot be canonicalised.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !path.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The one name for the directory `dir`: canonical (symlinks and `..` resolved) when it exists,
+/// else lexically normalised.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn resolved(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| lexical(dir))
+}
+
+/// `store` with its directory resolved by [`resolved`] and its own name kept as given (a symlink
+/// at the store path stays a symlink: `chmod` follows it). The path an advice prints: absolute,
+/// without `.` or `..`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn clean_store_path(store: &Path) -> PathBuf {
+    match (store.parent(), store.file_name()) {
+        (Some(parent), Some(name)) if !parent.as_os_str().is_empty() => resolved(parent).join(name),
+        _ => lexical(store),
+    }
+}
+
+/// The directory that holds `store`, as a path that names one directory from anywhere: canonical
+/// when it exists, else lexically normalised. `None` when the directory is relative and cannot be
+/// resolved, or when it is the working directory or one of its ancestors, compared in every
+/// resolved form of both (lexical and canonical, so `..` and symlinks cannot hide an ancestor):
+/// `chmod 700 .` or a chmod of a directory the person is working under is not advice to print.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn nameable_dir(store: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
     let parent = match store.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
     };
-    let dir = if parent.is_absolute() {
-        parent.to_path_buf()
-    } else {
-        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
+    let canon = std::fs::canonicalize(parent).ok();
+    let dir = match (&canon, parent.is_absolute()) {
+        (Some(c), _) => c.clone(),
+        (None, true) => lexical(parent),
+        (None, false) => return None,
     };
-    if !dir.is_absolute() {
-        return None;
-    }
     if let Some(cwd) = cwd {
-        let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-        if cwd.starts_with(&dir) || canon.starts_with(&dir) {
+        let cwd_forms = [lexical(cwd), resolved(cwd)];
+        let mut dir_forms = vec![dir.clone()];
+        if parent.is_absolute() {
+            dir_forms.push(lexical(parent));
+        }
+        if cwd_forms
+            .iter()
+            .any(|c| dir_forms.iter().any(|d| c.starts_with(d)))
+        {
             return None;
         }
     }
     Some(dir)
+}
+
+/// Whether `c` must never reach a terminal as part of a pasted command: a control character
+/// (newline, ESC, DEL, ...), or a bidirectional override that makes text read differently from
+/// what it is.
+fn unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// `s` as one POSIX shell word: in single quotes, each `'` written `'\''`. Always quoted, so the
+/// output never depends on which characters are special.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `path` as a shell word, or `None` when it cannot be pasted safely: not valid UTF-8 (the text
+/// would name a different path), or holding a character [`unsafe_char`] rejects.
+fn quoted_path(path: &Path) -> Option<String> {
+    let s = path.to_str()?;
+    (!s.chars().any(unsafe_char)).then(|| shell_quote(s))
+}
+
+/// The end of an advice, after `lead`: the runnable command for `path` when it is safe to paste,
+/// else the instruction without one. `chmod` is the command and mode, e.g. `chmod 600`.
+fn fix_clause(chmod: &str, path: &Path, lead: &str) -> String {
+    match quoted_path(path) {
+        Some(q) => format!("{lead}fix it with: {chmod} {q}"),
+        None => format!(
+            "{lead}run {chmod} on it yourself; its name contains characters that cannot be pasted safely"
+        ),
+    }
+}
+
+/// `path` for the text of a warning: as is when it is safe to print, else debug-escaped (quoted,
+/// control characters and bytes that are not UTF-8 written as escapes).
+fn shown_path(path: &Path) -> String {
+    match quoted_path(path) {
+        Some(_) => path.display().to_string(),
+        None => format!("{path:?}"),
+    }
 }
 
 /// The warnings an existing store at `store` earns under `policy`, each one only for a path `seen`
@@ -229,25 +320,26 @@ pub(crate) fn loose_warnings(
         let mut out = Vec::new();
         // A relative store path is relative to the working directory: name it in full, so the
         // advice (and a service log) reads the same from anywhere.
-        let shown = match (store.is_absolute(), policy.cwd.as_deref()) {
+        let joined = match (store.is_absolute(), policy.cwd.as_deref()) {
             (false, Some(cwd)) => cwd.join(store),
             _ => store.to_path_buf(),
         };
         // `metadata` follows a symlink: the mode that matters is the file that holds the data.
-        let Ok(file) = std::fs::metadata(&shown) else {
+        // It reads the path as the kernel does; what is printed is the clean form of it.
+        let Ok(file) = std::fs::metadata(&joined) else {
             return out;
         };
         if !file.is_file() {
             return out;
         }
+        let shown = clean_store_path(&joined);
         let file_loose = file.mode() & 0o077 != 0;
         if file_loose && claim(seen, &shown) {
             out.push(format!(
-                "warning: the store {} is mode {:03o}, so other users can read it; \
-                 fix it with: chmod 600 {}",
-                shown.display(),
+                "warning: the store {} is mode {:03o}, so other users can read it; {}",
+                shown_path(&shown),
                 file.mode() & 0o777,
-                shown.display()
+                fix_clause("chmod 600", &shown, "")
             ));
         }
         let Some(dir) = nameable_dir(&shown, policy.cwd.as_deref()) else {
@@ -270,11 +362,10 @@ pub(crate) fn loose_warnings(
                 "so other users can replace the store in it"
             };
             out.push(format!(
-                "warning: the directory {} holds a store and is mode {:03o}, {why}; \
-                 if only your own data lives there, fix it with: chmod 700 {}",
-                dir.display(),
+                "warning: the directory {} holds a store and is mode {:03o}, {why}; {}",
+                shown_path(&dir),
                 meta.mode() & 0o777,
-                dir.display()
+                fix_clause("chmod 700", &dir, "if only your own data lives there, ")
             ));
         }
         out
@@ -551,6 +642,22 @@ mod tests {
     }
 
     #[test]
+    fn the_release_policy_reads_the_environment_and_a_test_build_does_not() {
+        use std::ffi::OsStr;
+        // The release branch (`test_build` false): unset, empty and `0` are loud; the rest quiet.
+        assert!(!quiet_from(false, None));
+        assert!(!quiet_from(false, Some(OsStr::new(""))));
+        assert!(!quiet_from(false, Some(OsStr::new("0"))));
+        assert!(quiet_from(false, Some(OsStr::new("1"))));
+        assert!(quiet_from(false, Some(OsStr::new("yes"))));
+        // A test build ignores the developer's environment entirely.
+        assert!(!quiet_from(true, Some(OsStr::new("1"))));
+        assert!(!quiet_from(true, Some(OsStr::new("yes"))));
+        // And `Policy::current` in this build is never quiet, whatever the variable says.
+        assert!(!Policy::current().quiet);
+    }
+
+    #[test]
     fn a_loose_file_alone_warns_about_the_file_only() {
         let tmp = TempDir::new().unwrap();
         let path = store_at(tmp.path(), 0o700, 0o640);
@@ -621,7 +728,7 @@ mod tests {
         let w = loose_warnings(Path::new("store.redb"), &fresh(), &pol);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(
-            w[0].contains(&format!("chmod 600 {}", file.display())),
+            w[0].contains(&format!("chmod 600 '{}'", file.display())),
             "{w:?}"
         );
         assert!(w.iter().all(|t| !t.contains("chmod 700")));
@@ -646,7 +753,7 @@ mod tests {
         pol.cwd = Some(cwd);
         let w = loose_warnings(&inner, &fresh(), &pol);
         let dir_w = w.iter().find(|t| t.contains("chmod 700")).unwrap();
-        assert!(dir_w.contains(&format!("chmod 700 {}", sub.display())));
+        assert!(dir_w.contains(&format!("chmod 700 '{}'", sub.display())));
         assert!(!dir_w.contains("chmod 700 ."), "{dir_w}");
     }
 
@@ -665,11 +772,286 @@ mod tests {
             nameable_dir(store, Some(Path::new("/x/q"))),
             Some(PathBuf::from("/x/y"))
         );
+        // `..` is resolved before the comparison, in both paths.
+        assert_eq!(
+            nameable_dir(Path::new("/x/y/z/../s.redb"), Some(Path::new("/x/y/z"))),
+            None
+        );
+        assert_eq!(
+            nameable_dir(Path::new("/x/y/s.redb"), Some(Path::new("/x/y/z/.."))),
+            None
+        );
+        assert_eq!(
+            nameable_dir(Path::new("/x/y/../q/s.redb"), Some(Path::new("/x/y"))),
+            Some(PathBuf::from("/x/q"))
+        );
         assert_eq!(
             nameable_dir(store, None),
             Some(PathBuf::from("/x/y")),
             "no known working directory: named as given"
         );
+    }
+
+    /// A canonical temp root, so a printed path equals the one the test built.
+    fn root(tmp: &TempDir) -> PathBuf {
+        std::fs::canonicalize(tmp.path()).unwrap()
+    }
+
+    fn dir_mode(path: &Path, m: u32) -> PathBuf {
+        std::fs::create_dir_all(path).unwrap();
+        set_mode(path, m);
+        path.to_path_buf()
+    }
+
+    fn loose_file(path: &Path) {
+        std::fs::write(path, b"").unwrap();
+        set_mode(path, 0o644);
+    }
+
+    fn pol_in(cwd: &Path) -> Policy {
+        let mut pol = tty();
+        pol.cwd = Some(cwd.to_path_buf());
+        pol
+    }
+
+    /// No warning holds a `..` component.
+    fn no_dotdot(w: &[String]) {
+        for t in w {
+            assert!(!t.contains(".."), "a `..` in the advice: {t}");
+        }
+    }
+
+    #[test]
+    fn a_store_in_the_parent_of_the_working_directory_earns_no_directory_advice() {
+        let tmp = TempDir::new().unwrap();
+        let root = root(&tmp);
+        let u = dir_mode(&root.join("u"), 0o755);
+        let proj = dir_mode(&u.join("proj"), 0o755);
+        loose_file(&u.join("fl.redb"));
+
+        // `--db ../fl.redb`: the directory is the cwd's parent. The file is reported by its clean
+        // absolute path; the parent of the working directory is never advised.
+        let w = loose_warnings(Path::new("../fl.redb"), &fresh(), &pol_in(&proj));
+        assert_eq!(
+            w,
+            vec![format!(
+                "warning: the store {0}/fl.redb is mode 644, so other users can read it; \
+                 fix it with: chmod 600 '{0}/fl.redb'",
+                u.display()
+            )]
+        );
+        no_dotdot(&w);
+        // The same through an absolute path that holds `..`, as `FL_DB` would give.
+        let abs = proj.join("..").join("fl.redb");
+        let w = loose_warnings(&abs, &fresh(), &pol_in(&proj));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w.iter().all(|t| !t.contains("chmod 700")), "{w:?}");
+        no_dotdot(&w);
+    }
+
+    #[test]
+    fn dot_and_dotdot_inside_a_store_path_are_normalised() {
+        let tmp = TempDir::new().unwrap();
+        let root = root(&tmp);
+        let proj = dir_mode(&root.join("proj"), 0o755);
+        dir_mode(&proj.join("x"), 0o755);
+        loose_file(&proj.join("y.redb"));
+
+        // `./x/../y.redb` lands in the working directory itself: no directory advice.
+        let w = loose_warnings(Path::new("./x/../y.redb"), &fresh(), &pol_in(&proj));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains(&format!("chmod 600 '{}/y.redb'", proj.display())));
+        no_dotdot(&w);
+        assert!(!w[0].contains("/./"), "{w:?}");
+
+        // From a directory beside it, the same file's directory is advised, in clean form.
+        let side = dir_mode(&root.join("side"), 0o755);
+        let rel = Path::new("../proj/./x/../y.redb");
+        let w = loose_warnings(rel, &fresh(), &pol_in(&side));
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[1].contains(&format!("chmod 700 '{}'", proj.display())),
+            "{w:?}"
+        );
+        no_dotdot(&w);
+        assert!(w.iter().all(|t| !t.contains("/./")), "{w:?}");
+    }
+
+    #[test]
+    fn a_symlink_to_an_ancestor_of_the_working_directory_earns_no_directory_advice() {
+        let tmp = TempDir::new().unwrap();
+        let root = root(&tmp);
+        let u = dir_mode(&root.join("u"), 0o755);
+        let proj = dir_mode(&u.join("proj"), 0o755);
+        loose_file(&u.join("fl.redb"));
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&u, &link).unwrap();
+
+        // The store is named through the link; the link's target is the cwd's parent.
+        let w = loose_warnings(&link.join("fl.redb"), &fresh(), &pol_in(&proj));
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("chmod 600"), "{w:?}");
+        assert!(w.iter().all(|t| !t.contains("chmod 700")), "{w:?}");
+        // The working directory reached through the link is the same directory.
+        let w = loose_warnings(&u.join("fl.redb"), &fresh(), &pol_in(&link.join("proj")));
+        assert!(w.iter().all(|t| !t.contains("chmod 700")), "{w:?}");
+
+        // A directory beside the working directory is still advised, by a clean absolute path.
+        let sib = dir_mode(&root.join("sib"), 0o755);
+        loose_file(&sib.join("s.redb"));
+        let w = loose_warnings(Path::new("../../sib/s.redb"), &fresh(), &pol_in(&proj));
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[1].contains(&format!("chmod 700 '{}'", sib.display())),
+            "{w:?}"
+        );
+        no_dotdot(&w);
+    }
+
+    /// `shell_quote` against known vectors, then against a real `sh`: the quoted word is one
+    /// argument that equals the original.
+    #[test]
+    fn shell_quote_round_trips_through_a_real_shell() {
+        let q = '\'';
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        // A string of only quotes: each becomes `'\''`, inside the outer pair.
+        assert_eq!(shell_quote("'"), format!("{q}{q}\\{q}{q}{q}"));
+        assert_eq!(shell_quote("''"), format!("{q}{q}\\{q}{q}{q}\\{q}{q}{q}"));
+        let vectors = [
+            "",
+            "plain",
+            "with space",
+            "x; rm -rf ~",
+            "$(touch pwned)",
+            "`touch pwned`",
+            "it's",
+            "'",
+            "''",
+            "a'b'c",
+            "back\\slash",
+            "\"dq\" $HOME *?[a]",
+            "new\nline",
+            "-rf",
+            "tab\tend",
+        ];
+        for v in vectors {
+            let script = format!("printf '%s' {}", shell_quote(v));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{script}");
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), v, "{script}");
+        }
+    }
+
+    /// Directory names that need quoting, and the quoted form of each inside a full path.
+    const QUOTED: [(&str, &str); 4] = [
+        ("x; rm -rf ~", "x; rm -rf ~"),
+        ("$(touch pwned)", "$(touch pwned)"),
+        ("it's", r"it'\''s"),
+        ("with some spaces", "with some spaces"),
+    ];
+
+    #[test]
+    fn a_path_that_needs_quoting_is_quoted_in_both_advice_strings() {
+        let tmp = TempDir::new().unwrap();
+        let root = root(&tmp);
+        let base = root.display().to_string();
+        for (name, escaped) in QUOTED {
+            let dir = dir_mode(&root.join(name), 0o755);
+            let store = dir.join("s.redb");
+            loose_file(&store);
+            let w = loose_warnings(&store, &fresh(), &tty());
+            assert_eq!(
+                w,
+                vec![
+                    format!(
+                        "warning: the store {base}/{name}/s.redb is mode 644, so other users \
+                         can read it; fix it with: chmod 600 '{base}/{escaped}/s.redb'"
+                    ),
+                    format!(
+                        "warning: the directory {base}/{name} holds a store and is mode 755, \
+                         so other users can reach it; if only your own data lives there, fix \
+                         it with: chmod 700 '{base}/{escaped}'"
+                    ),
+                ],
+                "{name}"
+            );
+            // The printed command, run by a real shell with `chmod` replaced by `printf`, is
+            // one argument that equals the path.
+            for (text, want) in [(&w[0], &store), (&w[1], &dir)] {
+                let cmd = text.rsplit_once("fix it with: chmod ").unwrap().1;
+                let (_mode, arg) = cmd.split_once(' ').unwrap();
+                let out = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("printf '%s\\n' {arg}"))
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    String::from_utf8(out.stdout).unwrap(),
+                    format!("{}\n", want.display()),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    const UNSAFE_NOTE: &str = "its name contains characters that cannot be pasted safely";
+
+    #[test]
+    fn a_path_that_cannot_be_pasted_safely_gets_no_command() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = TempDir::new().unwrap();
+        let root = root(&tmp);
+        let names: [&OsStr; 3] = [
+            OsStr::new("new\nline"),
+            OsStr::new("esc\x1b[31mred"),
+            OsStr::from_bytes(b"bad\xffbytes"),
+        ];
+        for name in names {
+            let dir = dir_mode(&root.join(name), 0o755);
+            let store = dir.join("s.redb");
+            loose_file(&store);
+            let w = loose_warnings(&store, &fresh(), &tty());
+            let store_dbg = format!("{store:?}");
+            let dir_dbg = format!("{dir:?}");
+            assert_eq!(
+                w,
+                vec![
+                    format!(
+                        "warning: the store {store_dbg} is mode 644, so other users can read \
+                         it; run chmod 600 on it yourself; {UNSAFE_NOTE}"
+                    ),
+                    format!(
+                        "warning: the directory {dir_dbg} holds a store and is mode 755, so \
+                         other users can reach it; if only your own data lives there, run \
+                         chmod 700 on it yourself; {UNSAFE_NOTE}"
+                    ),
+                ],
+                "{name:?}"
+            );
+            for t in &w {
+                assert!(!t.contains("fix it with"), "{t}");
+                assert!(
+                    !t.contains("chmod 600 '") && !t.contains("chmod 700 '"),
+                    "{t}"
+                );
+                assert!(!t.chars().any(char::is_control), "raw control char: {t:?}");
+                assert!(!t.contains('\u{fffd}'), "a replacement character: {t:?}");
+            }
+        }
+        // The quoting helper agrees.
+        assert_eq!(quoted_path(Path::new("/a\nb")), None);
+        assert_eq!(quoted_path(Path::new("/a\x1bb")), None);
+        assert_eq!(quoted_path(Path::new("/a\x7fb")), None);
+        assert_eq!(quoted_path(Path::new("/a\u{202e}b")), None);
+        assert_eq!(quoted_path(Path::new(OsStr::from_bytes(b"/a\xffb"))), None);
+        assert_eq!(quoted_path(Path::new("/a b")), Some("'/a b'".to_string()));
     }
 
     #[test]

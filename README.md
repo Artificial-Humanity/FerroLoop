@@ -172,7 +172,10 @@ the warning in the service log on every start, terminal or not. Each path is war
 per process. To silence it everywhere, including the hub, set `FL_QUIET_STORE_PERMS=1` (any
 non-empty value except `0`).
 
-* A store file with a group or other permission bit is reported: `chmod 600 <store file>`.
+* A store file with a group or other permission bit is reported: `chmod 600 <store file>`. The
+  path in the command is absolute, without `.` or `..`, and in single quotes, so it pastes safely
+  whatever the directory is called. A path with a control character or bytes that are not UTF-8
+  gets no command: the warning shows it escaped and tells you to run the `chmod` yourself.
 * Its directory is reported only when the file is loose as well, or when your group or other
   users can write in the directory: `chmod 700 <directory>`. A directory that others can only
   enter or list, around a `0600` file, is not a finding, because they cannot read the file
