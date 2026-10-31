@@ -1,10 +1,11 @@
 //! `ring` AES-256-GCM encrypted secrets vault (`vault.enc`) with AEAD AAD policy binding (spec §2).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -126,26 +127,7 @@ impl Vault {
         master_key: [u8; MASTER_KEY_LEN],
     ) -> Result<Self, GateError> {
         let path = vault_path.into();
-        let file = if path.exists() {
-            reject_if_symlink(&path)?;
-            let raw = fs::read_to_string(&path).map_err(|e| GateError::Io {
-                op: "read",
-                path: path.clone(),
-                cause: e.to_string(),
-            })?;
-            serde_json::from_str::<VaultFile>(&raw).map_err(|e| GateError::VaultCorrupt {
-                path: path.clone(),
-                cause: e.to_string(),
-            })?
-        } else {
-            VaultFile::default()
-        };
-        if file.schema_version != VAULT_SCHEMA_VERSION {
-            return Err(GateError::VaultCorrupt {
-                path,
-                cause: format!("unsupported vault schema_version {}", file.schema_version),
-            });
-        }
+        let file = read_vault_file(&path)?;
         Ok(Self {
             path,
             master_key,
@@ -212,10 +194,16 @@ impl Vault {
             }
         }
 
+        // From here to the write, `vault.enc` is read, changed and replaced as one step under the
+        // vault lock. `self.file` may be stale (another `fl vault set` process, or the hub, may
+        // have saved since this `Vault` was opened), so the disk copy is the base and this one
+        // secret is applied to it: a stale in-memory map is never written back over it.
+        let _lock = VaultLock::acquire(&self.path)?;
+        let mut next = read_vault_file(&self.path)?;
+
         let now_ms = now_unix_millis();
         let now_str = At::from_unix_millis(now_ms).to_string();
-        let created_at = self
-            .file
+        let created_at = next
             .secrets
             .get(&name)
             .map(|existing| existing.metadata.created_at.clone())
@@ -268,18 +256,23 @@ impl Vault {
             nonce_b64: BASE64.encode(nonce_bytes),
             ciphertext_b64: BASE64.encode(in_out),
         };
-        self.file.secrets.insert(name, record);
-        self.save()?;
+        next.secrets.insert(name, record);
+        self.write_file(&next)?;
+        self.file = next;
         Ok(metadata)
     }
 
     /// Remove a secret from `vault.enc` and persist.
     pub fn remove(&mut self, name: &str) -> Result<bool, GateError> {
         let key = normalize_secret_name(name)?;
-        let existed = self.file.secrets.remove(&key).is_some();
+        // Same lock and same disk-first rule as `set`: the disk copy is the base.
+        let _lock = VaultLock::acquire(&self.path)?;
+        let mut next = read_vault_file(&self.path)?;
+        let existed = next.secrets.remove(&key).is_some();
         if existed {
-            self.save()?;
+            self.write_file(&next)?;
         }
+        self.file = next;
         Ok(existed)
     }
 
@@ -365,12 +358,35 @@ impl Vault {
         out
     }
 
+    /// Write this instance's view of the vault to `vault.enc`, replacing what is there, under
+    /// the vault lock. It does NOT merge: a change made by another process since this `Vault`
+    /// was opened is overwritten. Use [`Vault::set`] or [`Vault::remove`] to change a secret;
+    /// they re-read the disk copy under the lock first.
     pub fn save(&self) -> Result<(), GateError> {
-        let encoded =
-            serde_json::to_string_pretty(&self.file).map_err(|e| GateError::VaultCorrupt {
-                path: self.path.clone(),
-                cause: e.to_string(),
-            })?;
+        let _lock = VaultLock::acquire(&self.path)?;
+        self.write_file(&self.file)
+    }
+
+    /// Create `vault.enc` from this instance's view only if no file exists yet, under the vault
+    /// lock; returns whether it wrote. The existence check and the write are one locked step, so
+    /// a `set` that lands after [`Vault::open`] is never overwritten by an initialising `save`.
+    /// An existing vault is left exactly as it is.
+    pub fn save_if_absent(&self) -> Result<bool, GateError> {
+        let _lock = VaultLock::acquire(&self.path)?;
+        // A symlink in the vault's place counts as present: it is never replaced here.
+        if fs::symlink_metadata(&self.path).is_ok() {
+            return Ok(false);
+        }
+        self.write_file(&self.file)?;
+        Ok(true)
+    }
+
+    /// Encode and atomically replace `vault.enc` with `file`. The caller holds the [`VaultLock`].
+    fn write_file(&self, file: &VaultFile) -> Result<(), GateError> {
+        let encoded = serde_json::to_string_pretty(file).map_err(|e| GateError::VaultCorrupt {
+            path: self.path.clone(),
+            cause: e.to_string(),
+        })?;
         write_atomic_0600(&self.path, format!("{encoded}\n").as_bytes())
     }
 
@@ -457,6 +473,167 @@ impl Drop for Vault {
             }
         }
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Read and validate `vault.enc` at `path`; a missing file is an empty vault.
+fn read_vault_file(path: &Path) -> Result<VaultFile, GateError> {
+    let file = if path.exists() {
+        reject_if_symlink(path)?;
+        let raw = fs::read_to_string(path).map_err(|e| GateError::Io {
+            op: "read",
+            path: path.to_path_buf(),
+            cause: e.to_string(),
+        })?;
+        serde_json::from_str::<VaultFile>(&raw).map_err(|e| GateError::VaultCorrupt {
+            path: path.to_path_buf(),
+            cause: e.to_string(),
+        })?
+    } else {
+        VaultFile::default()
+    };
+    if file.schema_version != VAULT_SCHEMA_VERSION {
+        return Err(GateError::VaultCorrupt {
+            path: path.to_path_buf(),
+            cause: format!("unsupported vault schema_version {}", file.schema_version),
+        });
+    }
+    Ok(file)
+}
+
+/// The lock file beside the vault. Not `vault.enc` itself: that file is replaced by a rename on
+/// every save, so a lock on its inode would not exclude the next writer.
+const LOCK_FILE_NAME: &str = ".vault.lock";
+
+/// Lock directories held by this process. `flock` locks belong to an open file description, so
+/// two threads that each open the lock file would conflict anyway; this set makes the wait
+/// explicit and in-process, and keeps one thread from ever blocking on a description it holds
+/// itself (a `Vault` method never takes the lock twice: the helpers it calls do not lock).
+static HELD_IN_PROCESS: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
+static HELD_CHANGED: Condvar = Condvar::new();
+
+/// Membership of one path in [`HELD_IN_PROCESS`]. Dropping it wakes the waiters.
+struct ProcessSlot(PathBuf);
+
+impl ProcessSlot {
+    fn acquire(key: PathBuf) -> Self {
+        let mut held = HELD_IN_PROCESS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while held.contains(&key) {
+            held = HELD_CHANGED
+                .wait(held)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        held.insert(key.clone());
+        Self(key)
+    }
+}
+
+impl Drop for ProcessSlot {
+    fn drop(&mut self) {
+        let mut held = HELD_IN_PROCESS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        held.remove(&self.0);
+        drop(held);
+        HELD_CHANGED.notify_all();
+    }
+}
+
+#[cfg(unix)]
+mod flock {
+    use std::fs::File;
+    use std::io;
+    use std::os::unix::io::AsRawFd;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_UN: i32 = 8;
+
+    // libc `flock`. No extra crate: the process already links libc (see the same binding in
+    // `fl-store`).
+    unsafe extern "C" {
+        fn flock(fd: i32, op: i32) -> i32;
+    }
+
+    /// Block until this open file description holds the exclusive advisory lock.
+    pub(super) fn lock_exclusive(file: &File) -> io::Result<()> {
+        loop {
+            // SAFETY: the descriptor is open for as long as `file` is borrowed.
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX) } == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() != io::ErrorKind::Interrupted {
+                return Err(err);
+            }
+        }
+    }
+
+    pub(super) fn unlock(file: &File) {
+        // SAFETY: as above. Closing the file would release it too; this is explicit.
+        unsafe {
+            flock(file.as_raw_fd(), LOCK_UN);
+        }
+    }
+}
+
+/// An exclusive lock over the vault in one directory: an in-process slot plus an advisory
+/// `flock` on `.vault.lock` (mode 0600) beside the vault, so a read-modify-write of `vault.enc`
+/// excludes every other thread of this process and every other process on this machine.
+///
+/// Advisory: it binds writers that take it. It does not stop a process that edits `vault.enc`
+/// directly, and on a filesystem without working `flock` (some network mounts) it excludes only
+/// this process. Waiting is unbounded; the lock is held for one small read and one rename.
+///
+/// Field order matters: `file` drops (and unlocks) before `slot` frees the in-process entry.
+struct VaultLock {
+    #[cfg_attr(not(unix), allow(dead_code))]
+    file: fs::File,
+    _slot: ProcessSlot,
+}
+
+impl VaultLock {
+    fn acquire(vault_path: &Path) -> Result<Self, GateError> {
+        let parent = match vault_path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let lock_path = parent.join(LOCK_FILE_NAME);
+        let io_err = |op: &'static str, e: std::io::Error| GateError::Io {
+            op,
+            path: lock_path.clone(),
+            cause: e.to_string(),
+        };
+        fs::create_dir_all(&parent).map_err(|e| GateError::Io {
+            op: "create_dir_all",
+            path: parent.clone(),
+            cause: e.to_string(),
+        })?;
+        // One in-process key per directory, however the path was spelled.
+        let key = fs::canonicalize(&parent)
+            .map_err(|e| io_err("canonicalize", e))?
+            .join(LOCK_FILE_NAME);
+        let slot = ProcessSlot::acquire(key);
+        reject_if_symlink(&lock_path)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&lock_path).map_err(|e| io_err("open", e))?;
+        #[cfg(unix)]
+        flock::lock_exclusive(&file).map_err(|e| io_err("lock", e))?;
+        Ok(Self { file, _slot: slot })
+    }
+}
+
+impl Drop for VaultLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        flock::unlock(&self.file);
     }
 }
 
@@ -902,6 +1079,201 @@ mod tests {
         let reopened = Vault::open(&path, [5u8; 32]).unwrap();
         assert!(!reopened.list().is_empty());
         assert_eq!(leftover_temp_files(tmp.path()), Vec::<String>::new());
+    }
+
+    // --- cross-thread and cross-process read-modify-write ---------------------------------------
+
+    /// Env vars that turn [`lock_test_child`] into a worker of the multi-process test.
+    const CHILD_DIR: &str = "FL_VAULT_LOCK_TEST_DIR";
+    const CHILD_ID: &str = "FL_VAULT_LOCK_TEST_ID";
+    const CHILD_SECRETS: usize = 6;
+
+    fn open_at(dir: &Path) -> Vault {
+        Vault::open(dir.join("vault.enc"), [9u8; 32]).unwrap()
+    }
+
+    /// Several `Vault`s opened over one directory BEFORE any of them writes, so every one starts
+    /// from a stale (empty) view, then set distinct secrets at once. Without the lock and the
+    /// re-read each write replaces the file with that instance's own map and the others are lost.
+    #[test]
+    fn concurrent_sets_from_separate_vaults_all_survive() {
+        const THREADS: usize = 8;
+        const PER_THREAD: usize = 5;
+        for round in 0..10 {
+            let tmp = TempDir::new().unwrap();
+            let vaults: Vec<Vault> = (0..THREADS).map(|_| open_at(tmp.path())).collect();
+            let gate = std::sync::Barrier::new(THREADS);
+            std::thread::scope(|scope| {
+                for (t, mut vault) in vaults.into_iter().enumerate() {
+                    let gate = &gate;
+                    scope.spawn(move || {
+                        gate.wait();
+                        for i in 0..PER_THREAD {
+                            vault.set(args(&format!("T{t}_{i}"), "value-1234")).unwrap();
+                        }
+                    });
+                }
+            });
+            let reopened = open_at(tmp.path());
+            assert_eq!(
+                reopened.list().len(),
+                THREADS * PER_THREAD,
+                "round {round}: a concurrent set was lost"
+            );
+            for t in 0..THREADS {
+                for i in 0..PER_THREAD {
+                    assert_eq!(
+                        reopened.decrypt_raw(&format!("T{t}_{i}")).unwrap().1,
+                        "value-1234"
+                    );
+                }
+            }
+            assert_eq!(leftover_temp_files(tmp.path()), Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn a_stale_vault_applies_its_change_to_the_disk_copy() {
+        let tmp = TempDir::new().unwrap();
+        let mut stale = open_at(tmp.path());
+        let mut other = open_at(tmp.path());
+        other.set(args("FROM_OTHER", "other-value")).unwrap();
+        other.set(args("TO_REMOVE", "doomed-value")).unwrap();
+
+        // `stale` never saw either secret; its set must keep both and its view catches up.
+        stale.set(args("FROM_STALE", "stale-value")).unwrap();
+        let names: Vec<String> = open_at(tmp.path())
+            .list()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["FROM_OTHER", "FROM_STALE", "TO_REMOVE"]);
+        assert_eq!(stale.list().len(), 3);
+
+        // A remove through a stale handle removes from the disk copy and keeps the rest.
+        let mut stale_again = open_at(tmp.path());
+        other.set(args("LATER", "later-value")).unwrap();
+        assert!(stale_again.remove("TO_REMOVE").unwrap());
+        let names: Vec<String> = open_at(tmp.path())
+            .list()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["FROM_OTHER", "FROM_STALE", "LATER"]);
+        // A name the disk copy does not hold is not "removed" because the stale map had it.
+        assert!(!other.remove("TO_REMOVE").unwrap());
+    }
+
+    #[test]
+    fn save_if_absent_creates_a_missing_vault_and_never_overwrites_an_existing_one() {
+        let tmp = TempDir::new().unwrap();
+        // `init` opens the not-yet-existing vault ...
+        let init = open_at(tmp.path());
+        // ... and another process sets a secret before `init` writes.
+        let mut other = open_at(tmp.path());
+        other.set(args("FROM_OTHER", "other-value")).unwrap();
+
+        assert!(!init.save_if_absent().unwrap());
+        let names: Vec<String> = open_at(tmp.path())
+            .list()
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(names, ["FROM_OTHER"], "init must not wipe a concurrent set");
+
+        // With no file at all, it creates the vault, and a second call leaves it alone.
+        let fresh = TempDir::new().unwrap();
+        let empty = open_at(fresh.path());
+        assert!(!empty.path().exists());
+        assert!(empty.save_if_absent().unwrap());
+        assert!(empty.path().exists());
+        assert!(!empty.save_if_absent().unwrap());
+    }
+
+    #[test]
+    fn the_lock_file_sits_beside_the_vault_and_is_private() {
+        let tmp = TempDir::new().unwrap();
+        let mut vault = open_at(tmp.path());
+        vault.set(args("ANY", "value-1234")).unwrap();
+        let lock = tmp.path().join(LOCK_FILE_NAME);
+        assert!(lock.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // The lock is released after each call: a second call does not block.
+        vault.set(args("ANY_MORE", "value-1234")).unwrap();
+        vault.save().unwrap();
+        assert!(vault.remove("ANY").unwrap());
+    }
+
+    /// Worker for [`concurrent_processes_setting_secrets_all_survive`]: a no-op unless the env
+    /// vars are set, so a normal run of the suite does nothing here.
+    #[test]
+    fn lock_test_child() {
+        let (Some(dir), Some(id)) = (std::env::var_os(CHILD_DIR), std::env::var_os(CHILD_ID))
+        else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let id = id.to_string_lossy().into_owned();
+        // Open (so this view is stale once the others write), then wait for the start signal.
+        let mut vault = open_at(&dir);
+        let go = dir.join("go");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !go.exists() {
+            assert!(std::time::Instant::now() < deadline, "no start signal");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for i in 0..CHILD_SECRETS {
+            vault
+                .set(args(&format!("P{id}_{i}"), "value-1234"))
+                .unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_processes_setting_secrets_all_survive() {
+        const PROCESSES: usize = 4;
+        let exe = std::env::current_exe().unwrap();
+        for round in 0..3 {
+            let tmp = TempDir::new().unwrap();
+            let children: Vec<_> = (0..PROCESSES)
+                .map(|id| {
+                    std::process::Command::new(&exe)
+                        .args([
+                            "--exact",
+                            "vault::tests::lock_test_child",
+                            "--test-threads=1",
+                        ])
+                        .env(CHILD_DIR, tmp.path())
+                        .env(CHILD_ID, id.to_string())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::inherit())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            // Give every child time to open its (stale) view, then release them together.
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            fs::write(tmp.path().join("go"), b"").unwrap();
+            for mut child in children {
+                assert!(
+                    child.wait().unwrap().success(),
+                    "round {round}: child failed"
+                );
+            }
+            assert_eq!(
+                open_at(tmp.path()).list().len(),
+                PROCESSES * CHILD_SECRETS,
+                "round {round}: a set from another process was lost"
+            );
+        }
     }
 
     #[test]

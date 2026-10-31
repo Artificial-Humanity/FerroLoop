@@ -6,8 +6,8 @@ use crate::at::At;
 use crate::escalation::{EscalationFault, Escalations, Mark, Tombstone, escalate_command};
 use crate::ferrowire::{
     DeliveryReceipt, DeliveryStatus, MessageKind, SendWireArgs, ThreadId, WireFilter,
-    WireInboxItem, WireMessage, resolve_recipients, validate_sender_name, validate_subject,
-    validate_wire_body,
+    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, resolve_recipients,
+    validate_sender_name, validate_subject, validate_wire_body,
 };
 use crate::finding::{Finding, FindingState};
 use crate::ids::{
@@ -2079,24 +2079,48 @@ impl MessageStore for MemStore {
         &self,
         messages: &[WireMessage],
         receipts: &[DeliveryReceipt],
-    ) -> Result<(), StoreError> {
+    ) -> Result<WireImportReport, StoreError> {
+        let mut report = WireImportReport::default();
         let mut s = self.inner.borrow_mut();
         let all_agents: Vec<AgentRecord> = s.agents.values().cloned().collect();
 
         for msg in messages {
-            msg.validate()
-                .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+            // Each message stands or falls alone: a skip writes nothing for it.
+            if let Err(e) = msg.validate() {
+                report.reject(
+                    &msg.id,
+                    false,
+                    WireImportRejectReason::InvalidMessage,
+                    e.to_string(),
+                );
+                continue;
+            }
             if let Some(existing) = s.wire_messages.get(&msg.id) {
                 if existing != msg {
-                    return Err(StoreError::WireMessageTampered {
-                        id: msg.id.clone(),
-                        detail: "imported wire message differs from stored copy".into(),
-                    });
+                    report.reject(
+                        &msg.id,
+                        false,
+                        WireImportRejectReason::TamperedMessage,
+                        "imported wire message differs from stored copy",
+                    );
                 }
                 continue;
             }
-            s.index_imported_unhanded(Kind::Message, msg.id.iri())?;
+            match s.index_imported_unhanded(Kind::Message, msg.id.iri()) {
+                Ok(()) => {}
+                Err(e @ StoreError::WrongKind { .. }) => {
+                    report.reject(
+                        &msg.id,
+                        false,
+                        WireImportRejectReason::IdCollision,
+                        e.to_string(),
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
             s.append_wire_message(msg.clone());
+            report.imported_messages += 1;
 
             let resolved = resolve_recipients(
                 &msg.to,
@@ -2127,7 +2151,13 @@ impl MessageStore for MemStore {
 
         for rcpt in receipts {
             if !s.wire_messages.contains_key(&rcpt.message_id) {
-                return Err(StoreError::MessageNotFound(rcpt.message_id.clone()));
+                report.reject(
+                    &rcpt.message_id,
+                    true,
+                    WireImportRejectReason::UnknownMessage,
+                    "no such wire message",
+                );
+                continue;
             }
             let key = (rcpt.recipient_id.clone(), rcpt.message_id.clone());
             match s.wire_inbox.get(&key).cloned() {
@@ -2136,15 +2166,17 @@ impl MessageStore for MemStore {
                     if merged != existing {
                         s.wire_inbox.insert(key, merged.clone());
                         s.append_wire_receipt(merged);
+                        report.imported_receipts += 1;
                     }
                 }
                 None => {
                     s.wire_inbox.insert(key, rcpt.clone());
                     s.append_wire_receipt(rcpt.clone());
+                    report.imported_receipts += 1;
                 }
             }
         }
-        Ok(())
+        Ok(report)
     }
 
     fn prune_wire(&self, before: At) -> Result<usize, StoreError> {

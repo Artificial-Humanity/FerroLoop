@@ -62,9 +62,10 @@ pub use ferrostate::{
 };
 pub use ferrowire::{
     DeliveryReceipt, DeliveryStatus, MAX_SUBJECT_BYTES, MAX_WIRE_BODY_BYTES, MessageKind,
-    MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter, WireInboxItem, WireMessage,
-    fallback_agent_iri, parse_role_selector, resolve_recipients, validate_sender_name,
-    validate_subject, validate_wire_body,
+    MessageUrgency, SendWireArgs, ThreadId, WireAddress, WireFilter, WireImportRejectReason,
+    WireImportRejection, WireImportReport, WireInboxItem, WireMessage, fallback_agent_iri,
+    parse_role_selector, resolve_recipients, validate_sender_name, validate_subject,
+    validate_wire_body,
 };
 pub use finding::{Finding, FindingError, FindingState};
 pub use ids::{

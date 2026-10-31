@@ -186,7 +186,16 @@ fn cmd_init(as_json: bool) -> Result<i32, (i32, String)> {
     let vault_path = resolve_vault_path(None);
     let master_key = load_or_init_master_key(&key_path).map_err(|e| (1, e.to_string()))?;
     let vault = Vault::open(&vault_path, master_key).map_err(|e| (1, e.to_string()))?;
-    vault.save().map_err(|e| (1, e.to_string()))?;
+    // Write only a vault that does not exist yet, under the vault lock. A plain `save` would
+    // replace the file with the view read above, losing a secret set in between.
+    let created = vault.save_if_absent().map_err(|e| (1, e.to_string()))?;
+    let vault = if created {
+        vault
+    } else {
+        // The file existed, possibly changed since the open above: report what is on disk.
+        let master_key = load_or_init_master_key(&key_path).map_err(|e| (1, e.to_string()))?;
+        Vault::open(&vault_path, master_key).map_err(|e| (1, e.to_string()))?
+    };
 
     if as_json {
         println!(

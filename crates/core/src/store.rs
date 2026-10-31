@@ -4,7 +4,8 @@ use crate::decision::{Decision, Flushed};
 use crate::escalation::EscalationFault;
 use crate::fault::LedgerFault;
 use crate::ferrowire::{
-    DeliveryReceipt, DeliveryStatus, SendWireArgs, ThreadId, WireFilter, WireInboxItem, WireMessage,
+    DeliveryReceipt, DeliveryStatus, SendWireArgs, ThreadId, WireFilter, WireImportReport,
+    WireInboxItem, WireMessage,
 };
 use crate::finding::Finding;
 use crate::ids::{
@@ -768,11 +769,20 @@ pub trait MessageStore {
 
     /// Import messages and receipts from a remote peer or `fl/state` branch, enforcing
     /// byte-for-byte immutability on `WireMessage` and monotonic convergence on `DeliveryReceipt`.
+    ///
+    /// Every item is judged alone. A message that fails validation, differs from the copy already
+    /// stored under its id, or collides with another kind of id is skipped and listed in the
+    /// returned [`WireImportReport`]; so is a receipt for a message this store does not hold. The
+    /// other items are still imported. A skipped item is never stored. `Err` is for a store
+    /// failure only. What an `Err` leaves behind depends on the store: the redb and FerroStore
+    /// stores import the whole batch in one transaction, so nothing from the batch is kept;
+    /// `MemStore` writes item by item, so an `Err` partway through can leave the earlier
+    /// items imported. Callers must not assume an `Err` imported nothing.
     fn import_wire_batch(
         &self,
         messages: &[WireMessage],
         receipts: &[DeliveryReceipt],
-    ) -> Result<(), StoreError>;
+    ) -> Result<WireImportReport, StoreError>;
 
     /// Delete transient (`durable == false`) messages whose receipts are all `Acked` or
     /// `Expired` and whose `created_at < before`. Returns the count of pruned messages.
