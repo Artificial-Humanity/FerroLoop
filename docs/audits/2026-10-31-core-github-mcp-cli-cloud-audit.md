@@ -90,7 +90,7 @@ Severity is my judgement of impact on a FerroLoop deployment as the docs describ
 | P-4 | Low | core | `-->` inside a review marker's JSON ends the HTML comment early | Fixed — test written |
 | M-4 | Low-Medium | mcp | Named argument with no `name` freezes to an empty word | Fixed — test written |
 | M-5 | Medium-Low | mcp | No fsync before rename in `stage` and `write_record` | Fixed — no test (not deterministic) |
-| O-1 … O-24 | — | various | Not fixed (O-4 is fixed, see M-1; O-3 is fixed, see its note below); see [Open items](#open-items) | Open |
+| O-1 … O-24 | — | various | Not fixed (O-4 is fixed, see M-1; O-3 is fixed, see its note below; O-13 is fixed: store permissions); see [Open items](#open-items) | Open |
 
 ## Findings
 
@@ -540,7 +540,7 @@ Not fixed (O-3 and O-4 are fixed). "Read" = confirmed by reading only; nothing w
 | O-10 | Low | `freeze.rs:1180`, `resolve` | `resolve` substitutes sequentially over the substituted string; order-dependent. The secret check runs first, so no leak found. | No exploit; single-pass rewrite. |
 | O-11 | Low | `registry.rs:60`, `Registry::new`, and `:154`, `get` | A registry URL with `?`/`#` swallows the request path. | `Registry::new` handles the origin on purpose; whether such URLs are legal is a spec question. |
 | O-12 | Low | `catalog.rs:639`, `save`; `sync.rs:499`, `apply` | Parent directories are not fsynced after the rename. A crash between creating and renaming leaves a temp file: `.fl-mcp-*` beside the vendor file in the project root for `sync`, and `.mcp.toml-*` in `.fl/` for the catalog, where `git add .fl` can pick it up. | Platform-specific; low value. |
-| O-13 | Medium | `main.rs:328`, `db_path` (and the `create_dir_all` calls in `run`), `store/src/lib.rs:473`, `RedbStore::open` | The redb store and its directory are created with default permissions (0644 in 0755 under umask 022) while holding hub pairing and session data, wire messages and memories. The diff itself creates no new weakly-permissioned file. | **Open, not changed in this PR.** Compatibility with any shared-store setups needs a decision first. Recommendation: create the store's parent directory with `DirBuilder::mode(0o700)` when fl itself creates it; pre-create the redb file with `OpenOptions::mode(0o600)` before `Database::create`; warn when an existing store is group- or world-readable. It belongs in `db_path` and `fl_store`. |
+| O-13 | Medium | `main.rs:328`, `db_path` (and the `create_dir_all` calls in `run`), `store/src/lib.rs:473`, `RedbStore::open` | The redb store and its directory are created with default permissions (0644 in 0755 under umask 022) while holding hub pairing and session data, wire messages and memories. The diff itself creates no new weakly-permissioned file. | **Fixed.** A store file `fl` creates is mode 0600 and a directory it creates is 0700 (`fl_store::private`, used by `RedbStore::open`, `db_path`, the `run` store sites, `state`, `state_mcp`, `hub` and `HubState::open_store_at`); an existing store or directory keeps its mode and earns one stderr warning per path with the `chmod` fix, never an automatic change. No doc or script describes a store shared across Unix users, so none was kept. |
 | O-14 | Medium | `config.rs:196` (`wire.token_file`) and `:217` (`owner_token_file`) vs `hub/src/auth.rs:201`, `resolve_owner_token`, and `:220`, `resolve_peer_token` | The doc says the config `token_file` wins over `$FL_WIRE_TOKEN`/`$FL_HUB_OWNER_TOKEN`; the code does the opposite, and an unreadable `token_file` becomes `None` silently. | Lives in `hub` (out of scope); owner picks which precedence is right. |
 | O-15 | Low-Medium | `config.rs:437`, `load`, and `:681`, `bound_entry` | Two unnamed project entries with the same basename (or a named one) resolve by file order; `bound_entry` compares `(store, tracker)` only. A command can pick another project's store. | Needs a rule for ambiguous entries (reject at load). |
 | O-16 | Low | `config.rs:293`, `sync_target_for_scope`, and `load` | Store sharing is decided by literal path equality (a `..` or symlinked spelling reads as a different store, silently disabling wire/registry sync); one unresolvable root fails every command. The second is documented as deliberate. | Behaviour change; needs canonicalisation policy. |
@@ -591,7 +591,7 @@ it — callers that do must not trust it, see C-6 for one that printed it).
 Written by an autonomous cloud agent and independently reviewed twice before landing. Claims
 confirmed real and fixed: P-2, P-3, P-4, G-1 to G-6, F-1, E-2 (MemStore), E-4, M-2 to M-5, C-1
 to C-6. Partial before the review follow-up: P-1, M-1, E-3; M-1 and E-3 are fixed by the
-follow-up, P-1 stays partial (O-23, O-24). O-3 and O-13 are left open for decision. The review
+follow-up, P-1 stays partial (O-23, O-24). O-3 is left open for decision; O-13 was fixed afterwards (see the Open items table). The review
 follow-up also fixed the catalog's new-file mode, the `version()` test (M-3), the empty `--db`
 (C-4) and the P-2 literal-path narrowing, and corrected this report. Not changed, on purpose:
 `index_message_id` in the redb store (E-2) and everything in the open-items table other than O-4.

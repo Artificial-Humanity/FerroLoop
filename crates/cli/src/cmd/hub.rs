@@ -199,7 +199,8 @@ fn open_hub_store_with_retry(store_path: &Path) -> Result<RedbStore, (i32, Strin
     if let Some(dir) = store_path.parent()
         && !dir.as_os_str().is_empty()
     {
-        fs::create_dir_all(dir).map_err(|e| (2, format!("{}: {e}", dir.display())))?;
+        fl_store::private::create_private_dir_all(dir)
+            .map_err(|e| (2, format!("{}: {e}", dir.display())))?;
     }
     let mut last_err = None;
     for attempt in 0..40 {
@@ -249,6 +250,10 @@ fn cmd_serve(
     trust_tailscale_flag: bool,
     no_terminal_flag: bool,
 ) -> Result<i32, (i32, String)> {
+    // The service log is not a terminal, but it is where a loose store should be recorded: ask for
+    // the store-permission warning on every start, before any store is opened.
+    // `FL_QUIET_STORE_PERMS` still silences it.
+    fl_store::private::warn_always();
     let hub_cfg_sec = env.cfg.hub.as_ref();
     let listen = resolve_listen_addr(env, listen_flag);
     let store_path = resolve_hub_store_path(env);

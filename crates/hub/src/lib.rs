@@ -558,7 +558,7 @@ impl HubState {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
-            let _ = std::fs::create_dir_all(parent);
+            let _ = fl_store::private::create_private_dir_all(parent);
         }
         let mut last_err = None;
         for attempt in 0..200 {
@@ -2184,6 +2184,47 @@ mod tests {
         );
         drop(_guard);
         handle.join().expect("drain thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_store_the_hub_creates_is_private_and_an_existing_one_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+
+        // A new per-project store in a directory the hub creates: 0600 in 0700.
+        let path = tmp.path().join("projects").join("demo.redb");
+        drop(state.open_store_at(&path).expect("open a new store"));
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        // The hub-wide store the same way.
+        let hub_store = tmp.path().join("hub").join("store.redb");
+        drop(state.open_store_at(&hub_store).expect("open the hub store"));
+        assert_eq!(mode(&hub_store), 0o600);
+        assert_eq!(mode(hub_store.parent().unwrap()), 0o700);
+
+        // The per-project open path: `open_with_retries` creates the missing file itself, with
+        // the same private mode.
+        let second = tmp.path().join("projects").join("two.redb");
+        drop(
+            state
+                .open_project_store_at(&second)
+                .unwrap_or_else(|_| panic!("open a new project store")),
+        );
+        assert_eq!(mode(&second), 0o600);
+
+        // An existing loose store keeps its mode: it is warned about, never changed.
+        let old_dir = tmp.path().join("old");
+        fs::create_dir(&old_dir).unwrap();
+        fs::set_permissions(&old_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let old = old_dir.join("legacy.redb");
+        fs::write(&old, b"").unwrap();
+        fs::set_permissions(&old, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(state.open_store_at(&old).expect("open an existing store"));
+        assert_eq!(mode(&old), 0o644);
+        assert_eq!(mode(&old_dir), 0o755);
     }
 
     #[test]
