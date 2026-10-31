@@ -41,6 +41,25 @@ impl Peer {
     fn commits(&self) -> Vec<SyncBatch> {
         self.commits.lock().unwrap().clone()
     }
+
+    /// Atomically consume one pending injected failure, if any remain.
+    fn take_flake(&self) -> bool {
+        let mut current = self.fail_next.load(Ordering::SeqCst);
+        loop {
+            let Some(next) = current.checked_sub(1) else {
+                return false;
+            };
+            match self.fail_next.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 impl SyncAdapter for Peer {
@@ -52,11 +71,7 @@ impl SyncAdapter for Peer {
         if self.fail_commit.load(Ordering::SeqCst) {
             return Err(err("peer down"));
         }
-        if self
-            .fail_next
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if self.take_flake() {
             return Err(err("peer flaked"));
         }
         self.commits.lock().unwrap().push(batch.clone());
