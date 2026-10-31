@@ -244,7 +244,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         res.otpauth_uri.trim().length === 0
       ) {
         setTotpEnrollment(null);
-        setError("The hub did not return a TOTP secret; enrollment was not started.");
+        setError(
+          "The hub did not return a TOTP secret; enrollment was not started.",
+        );
         return;
       }
       setTotpEnrollment(res);

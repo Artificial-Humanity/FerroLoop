@@ -101,7 +101,7 @@ pub fn handle_tiered_registry_v01_get(
     // answer (earlier tiers win on a name clash) and are not asked: a failing cloud adapter
     // must not turn `?tier=local` or `?tier=hub` into a 502.
     let last_rank: i32 = match query.get("tier").map(String::as_str) {
-        Some("local") => -1,
+        Some("local") => 0,
         Some("hub") => 1,
         _ => 2,
     };
@@ -1143,5 +1143,33 @@ mod tests {
         );
         // The adapter-supplied `_meta` tier of "local" was overwritten with the real tier.
         assert_eq!(body["metadata"]["count"], 2);
+    }
+
+    #[test]
+    fn tier_local_still_lists_local_machine_adapter_rows() {
+        let attached: Vec<Arc<dyn McpRegistryAdapter>> = vec![Arc::new(ListAdapter {
+            name: "machine",
+            tier: RegistryTier::LocalMachine,
+            servers: vec![json!({
+                "name": "machine.example/only",
+                "description": "machine-doc",
+                "version": "1.0.0"
+            })],
+        })];
+        let connectors: Vec<ConnectorManifest> = Vec::new();
+        let query = BTreeMap::from([("tier".to_string(), "local".to_string())]);
+        let (status, body) = handle_tiered_registry_v01_get(
+            "/v0.1/servers",
+            &query,
+            &connectors,
+            "http://127.0.0.1:8420",
+            &attached,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["metadata"]["count"], 1);
+        let servers = body["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["server"]["name"], "machine.example/only");
+        assert_eq!(servers[0]["_meta"]["io.ferroloop.gate/tier"], "local");
     }
 }

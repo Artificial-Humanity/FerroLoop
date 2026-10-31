@@ -1,8 +1,10 @@
 # Wave A/B cloud audit — 2026-10-30
 
-Scope: FerroLoop `origin/main` at `a25021e` (PRs #98–#107): the Hub (records, artifacts,
-settings, lifecycle, session actions, commands, discovery, terminal), FerroStore sync, FerroGate
-adapters, and the FerroDeck UI (records board, pairing, settings, help, API client).
+Scope: the audit examined FerroLoop `origin/main` at `a25021e` (PRs #98–#107) and was landed on
+`0a96ad1`, which adds #108: the Hub (records, artifacts, settings, lifecycle, session actions,
+commands, discovery, terminal), FerroStore sync, FerroGate adapters, and the FerroDeck UI (records
+board, pairing, settings, help, API client). Wave C (#108: operators, login, passkeys, cloud
+adapters) was not audited.
 
 Line numbers are for the tip of branch `cloud/audit-2026-10-30-wave-ab` unless a finding says
 "pre-fix". The files this branch edits have shifted by a few lines.
@@ -52,7 +54,6 @@ paths deserve a second pass.
 | F8 | Low | hub | Terminal output: a multi-byte character split across 4096-byte reads becomes U+FFFD | Fixed, reproduced |
 | F9 | Low | gate | `?tier=local` or `?tier=hub` returns 502 when an unrelated cloud adapter fails | Fixed, reproduced |
 | F10 | Low | hub | `SKILL.md` saved with a UTF-8 BOM is not discovered | Fixed, reproduced |
-| F11 | Medium | ui/hub | UI calls 7 routes the hub does not implement | Open, read |
 | F12 | Medium | hub | Terminal: unbounded output queue and blocking stdin write | Open, read |
 | F13 | Medium | ui | Session token in URLs and passkey private key in `localStorage` | Open, delegate |
 | F14 | Low | ui | `request()` treats a non-JSON 2xx as success | Open, delegate |
@@ -209,18 +210,6 @@ so the skill was skipped. The leading BOM is now stripped.
 
 ## Open findings
 
-### F11 — UI calls routes the hub does not implement (Medium) — read
-
-Routes used by `ui/src/api/client.ts` with no match under `crates/hub/src`:
-`/api/v1/auth/login`, `/auth/operators`, `/auth/passkey/challenge`, `/auth/passkey/register`,
-`/auth/totp/enroll`, `/auth/totp/verify`, `/api/v1/cloud/adapters`.
-
-The Wave C identity and cloud screens therefore only work against mocks; against this hub each
-call is a 404. Either the server half is still to land, or the UI shipped ahead of it. Worth a
-tracking record, and a contract test that diffs the client's route list against the hub's router.
-(The check was a grep on path prefixes, so a route registered under a computed path would be
-missed.)
-
 ### F12 — Terminal resource limits (Medium) — read
 
 * `terminal.rs:119` — frames go through `mpsc::UnboundedSender`. A child that writes faster than
@@ -328,7 +317,7 @@ current state).
 ```
 cargo fmt --all -- --check                         clean
 cargo clippy --workspace --all-targets -- -D warnings   clean
-cargo test --workspace                             2106 passed, 0 failed
+cargo test --workspace                             2235 passed, 0 failed
 cd ui && npm test -- --run                         20 files, 161 tests passed
 cd ui && npx tsc --noEmit                          clean
 ```
@@ -338,8 +327,7 @@ run used a `rustup update stable` toolchain (1.99.1). The UI needed `npm ci`.
 
 ## Recommended follow-ups, in order
 
-1. F11 — decide whether Wave C server routes are coming; add a client/router route-diff test.
-2. F12 — bounded terminal output channel and a stdin write timeout.
-3. F13 — move the passkey key to a non-extractable store; stop putting the token in URLs.
-4. F17 — confirm intended authority on `interrupt` and `model`.
-5. A second review pass over `discovery.rs` transcript parsers and `lifecycle.rs` teardown.
+1. F12 — bounded terminal output channel and a stdin write timeout.
+2. F13 — move the passkey key to a non-extractable store; stop putting the token in URLs.
+3. F17 — confirm intended authority on `interrupt` and `model`.
+4. A second review pass over `discovery.rs` transcript parsers and `lifecycle.rs` teardown.
