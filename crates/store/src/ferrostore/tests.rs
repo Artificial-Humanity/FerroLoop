@@ -4390,7 +4390,9 @@ fn put_frame(seq: u64, id: &str) -> Vec<u8> {
     .unwrap()
 }
 
-/// Audit S-4: boundaries of WAL decoding that recovery relies on.
+/// Extra coverage from the 2026-10-30 audit, tied to no reported defect (the audit's S-4 is the
+/// HNSW search re-sort): these pin boundaries of WAL decoding that recovery relies on. `decode_wal` is
+/// unchanged by the audit; see O-9 for the one open question about its tail.
 #[test]
 fn wal_decode_handles_every_truncation_point_of_a_tail_frame() {
     let first = put_frame(1, "a");

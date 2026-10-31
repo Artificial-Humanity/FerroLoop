@@ -17,20 +17,98 @@ const CODEC_DICT: u8 = 4;
 const CODEC_RLE: u8 = 5;
 const NAME_MAX: usize = 128;
 
-/// Most bytes a run-length or dictionary column may expand to when decoded. Those codecs repeat
-/// one stored value many times, so a few kilobytes of blob can claim terabytes of rows
-/// (`row_count` is only bounded by the blob's null bitset); decoding must refuse before it
-/// allocates. The encoder falls back to plain storage past the same limit, so nothing it writes
-/// is undecodable.
-const MAX_EXPANDED_BYTES: usize = 256 * 1024 * 1024;
+/// Most rows one row group may hold. A group's `row_count` is a `u32` in the blob and is
+/// otherwise bounded only by the null bitset (`row_count / 8` bytes per column), so without this
+/// a few kilobytes of blob claim billions of rows. The limit is checked before any allocation,
+/// by the writer (`encode_row_group`) and by the reader (`index_group`). 4 Mi rows is the most
+/// one `append_column_rows` call can carry over the 16 MiB remote frame (the smallest row, a
+/// one-cell array, is four bytes of JSON), so no group a remote client can send is refused;
+/// callers with more rows append several groups.
+pub(super) const MAX_ROWS_PER_GROUP: usize = 1 << 22;
 
-fn check_expansion(unit_bytes: usize, repeats: usize) -> Result<(), StoreError> {
-    if unit_bytes.saturating_mul(repeats) > MAX_EXPANDED_BYTES {
-        return Err(corrupt(format!(
-            "column expands to more than {MAX_EXPANDED_BYTES} bytes"
-        )));
+/// Upper bound, shared by all columns of one row group, on the bytes decoding may allocate
+/// (1 GiB). Every decoder charges the size it is about to allocate against one [`Budget`] before
+/// it allocates, so a hostile blob is refused with an error instead of an out-of-memory abort:
+/// a 10-column group of 1 M rows whose columns each repeat a 255-byte text needs about 1.3 MiB of
+/// blob and would otherwise allocate about 5 GB. The charge counts `size_of::<ColumnValue>()`
+/// per value (not just the payload bytes), the per-row `Vec`, and the heap bytes of text and
+/// byte values, and is an upper bound of what is allocated, not of what stays alive.
+///
+/// The writer applies the same estimate (`estimated_decode_bytes`) and refuses a group over the
+/// budget, so nothing FerroStore writes is undecodable. **Behaviour change:** a store that
+/// already holds a run-length or dictionary column (or a group of very many rows) that decodes to
+/// more than this now fails to open with a "corrupt ferrostore data" error where it used to
+/// allocate until the process was killed or, on a big machine, succeeded. Such a store needs
+/// groups far larger than any this code base appends (millions of rows in one call).
+pub(super) const MAX_DECODE_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Bytes charged for one decoded cell: its slot in the final row vector, its slot in the
+/// per-column vector, and its slot in the vector the codec decodes before nulls are interleaved.
+const CELL_BYTES: usize = 3 * std::mem::size_of::<ColumnValue>();
+
+/// Bytes charged per row for the row's own `Vec` header.
+const ROW_BYTES: usize = std::mem::size_of::<Vec<ColumnValue>>();
+
+/// Row and byte limits for one group. Tests lower them so a hostile blob is refused without the
+/// test itself allocating hundreds of MiB.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Limits {
+    pub(super) max_rows: usize,
+    pub(super) max_bytes: usize,
+}
+
+impl Limits {
+    pub(super) const DEFAULT: Limits = Limits {
+        max_rows: MAX_ROWS_PER_GROUP,
+        max_bytes: MAX_DECODE_BYTES,
+    };
+}
+
+/// Bytes still available to one group's decoder; shared by all of its columns.
+pub(super) struct Budget {
+    left: usize,
+    limit: usize,
+}
+
+impl Budget {
+    pub(super) fn new(limit: usize) -> Self {
+        Self { left: limit, limit }
     }
-    Ok(())
+
+    /// Charge `bytes` before allocating them.
+    fn charge(&mut self, bytes: usize, what: &str) -> Result<(), StoreError> {
+        if bytes > self.left {
+            return Err(corrupt(format!(
+                "row group would decode to more than {} bytes ({what})",
+                self.limit
+            )));
+        }
+        self.left -= bytes;
+        Ok(())
+    }
+}
+
+fn mul(a: usize, b: usize, what: &str) -> Result<usize, StoreError> {
+    a.checked_mul(b)
+        .ok_or_else(|| corrupt(format!("{what} overflows")))
+}
+
+/// Upper bound of what `decode_indexed` charges for these rows, so the writer refuses what the
+/// reader would refuse: `ROW_BYTES` per row, `CELL_BYTES` per cell, and every text or byte
+/// value's length plus its four-byte prefix (at least what a plain, run-length or dictionary
+/// decoder charges for it).
+fn estimated_decode_bytes(columns: &[ColumnDef], rows: &[Vec<ColumnValue>]) -> usize {
+    let per_row = ROW_BYTES.saturating_add(columns.len().saturating_mul(CELL_BYTES));
+    let heap = rows
+        .iter()
+        .flatten()
+        .map(|cell| match cell {
+            ColumnValue::Utf8(text) => text.len().saturating_add(4),
+            ColumnValue::Bytes(bytes) => bytes.len().saturating_add(4),
+            _ => 0,
+        })
+        .fold(0usize, usize::saturating_add);
+    rows.len().saturating_mul(per_row).saturating_add(heap)
 }
 
 fn backend(err: impl std::fmt::Display) -> StoreError {
@@ -197,8 +275,16 @@ pub(super) fn check_name(kind: &str, name: &str) -> Result<(), StoreError> {
 /// Decode `bytes` against `columns`. A bad header, a bad codec, or a row
 /// count of zero is rejected here, before a frame is published.
 pub(super) fn validate_row_group(columns: &[ColumnDef], bytes: &[u8]) -> Result<(), StoreError> {
-    let indexed = index_group(bytes, columns)?;
-    decode_indexed(columns, &indexed)?;
+    validate_row_group_with(columns, bytes, &Limits::DEFAULT)
+}
+
+fn validate_row_group_with(
+    columns: &[ColumnDef],
+    bytes: &[u8],
+    limits: &Limits,
+) -> Result<(), StoreError> {
+    let indexed = index_group_with(bytes, columns, limits)?;
+    decode_indexed_with(columns, &indexed, limits)?;
     Ok(())
 }
 
@@ -206,7 +292,28 @@ pub(super) fn encode_row_group(
     columns: &[ColumnDef],
     rows: &[Vec<ColumnValue>],
 ) -> Result<Vec<u8>, StoreError> {
+    encode_row_group_with(columns, rows, &Limits::DEFAULT)
+}
+
+fn encode_row_group_with(
+    columns: &[ColumnDef],
+    rows: &[Vec<ColumnValue>],
+    limits: &Limits,
+) -> Result<Vec<u8>, StoreError> {
+    if rows.len() > limits.max_rows {
+        return Err(backend(format!(
+            "{} rows in one group; the limit is {}, append in several groups",
+            rows.len(),
+            limits.max_rows
+        )));
+    }
     validate_rows(columns, rows)?;
+    if estimated_decode_bytes(columns, rows) > limits.max_bytes {
+        return Err(backend(format!(
+            "row group would decode to more than {} bytes; append in several groups",
+            limits.max_bytes
+        )));
+    }
     let mut buf = Vec::new();
     let row_count = u32::try_from(rows.len()).map_err(|_| backend("too many rows in one group"))?;
     write_u32(&mut buf, row_count);
@@ -357,10 +464,7 @@ fn choose_codec(ty: ColumnType, values: &[ColumnValue]) -> Result<u8, StoreError
         }
         ColumnType::Bytes => {
             let blobs = collect_bytes(values)?;
-            if blobs.len() >= 3
-                && blobs.iter().all(|blob| blob == &blobs[0])
-                && check_expansion(blobs[0].len(), blobs.len()).is_ok()
-            {
+            if blobs.len() >= 3 && blobs.iter().all(|blob| blob == &blobs[0]) {
                 Ok(CODEC_RLE)
             } else {
                 Ok(CODEC_PLAIN)
@@ -371,12 +475,6 @@ fn choose_codec(ty: ColumnType, values: &[ColumnValue]) -> Result<u8, StoreError
 }
 
 fn utf8_codec(texts: &[String]) -> u8 {
-    // Decoding RLE or a dictionary clones values, so past the expansion limit the column is
-    // stored plain, which decodes at the size it is stored.
-    let total: usize = texts.iter().map(String::len).fold(0, usize::saturating_add);
-    if total > MAX_EXPANDED_BYTES {
-        return CODEC_PLAIN;
-    }
     if texts.len() >= 3 && texts.iter().all(|text| text == &texts[0]) {
         return CODEC_RLE;
     }
@@ -647,6 +745,14 @@ fn value_type(value: &ColumnValue) -> Option<ColumnType> {
 }
 
 fn index_group<'a>(blob: &'a [u8], columns: &[ColumnDef]) -> Result<IndexedGroup<'a>, StoreError> {
+    index_group_with(blob, columns, &Limits::DEFAULT)
+}
+
+fn index_group_with<'a>(
+    blob: &'a [u8],
+    columns: &[ColumnDef],
+    limits: &Limits,
+) -> Result<IndexedGroup<'a>, StoreError> {
     let mut cur = Cur::new(blob);
     let row_count_u32 = cur.u32()?;
     if row_count_u32 == 0 {
@@ -654,6 +760,13 @@ fn index_group<'a>(blob: &'a [u8], columns: &[ColumnDef]) -> Result<IndexedGroup
     }
     let row_count =
         usize::try_from(row_count_u32).map_err(|_| corrupt("row count does not fit"))?;
+    // Before any allocation sized by the claim.
+    if row_count > limits.max_rows {
+        return Err(corrupt(format!(
+            "row group claims {row_count} rows; the limit is {}",
+            limits.max_rows
+        )));
+    }
     let mut indexed = Vec::with_capacity(columns.len());
     for column in columns {
         let zone = read_zone(&mut cur, column.ty)?;
@@ -677,14 +790,35 @@ fn decode_indexed(
     columns: &[ColumnDef],
     indexed: &IndexedGroup<'_>,
 ) -> Result<Vec<Vec<ColumnValue>>, StoreError> {
+    decode_indexed_with(columns, indexed, &Limits::DEFAULT)
+}
+
+fn decode_indexed_with(
+    columns: &[ColumnDef],
+    indexed: &IndexedGroup<'_>,
+    limits: &Limits,
+) -> Result<Vec<Vec<ColumnValue>>, StoreError> {
+    // One budget for the whole group: the columns are decoded one after another and every one
+    // of them is charged against what the earlier ones left.
+    let mut budget = Budget::new(limits.max_bytes);
+    let rows_count = indexed.row_count;
+    budget.charge(
+        mul(
+            rows_count,
+            ROW_BYTES + columns.len() * std::mem::size_of::<ColumnValue>(),
+            "row count",
+        )?,
+        "rows",
+    )?;
     let mut decoded = Vec::with_capacity(columns.len());
     for (column, indexed_column) in columns.iter().zip(&indexed.columns) {
         let values = decode_column(
             column.ty,
-            indexed.row_count,
+            rows_count,
             &indexed_column.zone,
             indexed_column.codec,
             indexed_column.body,
+            &mut budget,
         )?;
         let computed = zone_map(&values);
         if !same_zone(&indexed_column.zone, &computed) {
@@ -692,7 +826,9 @@ fn decode_indexed(
         }
         decoded.push(values);
     }
-    let mut rows = vec![Vec::with_capacity(columns.len()); indexed.row_count];
+    let mut rows: Vec<Vec<ColumnValue>> = (0..rows_count)
+        .map(|_| Vec::with_capacity(columns.len()))
+        .collect();
     for column in decoded {
         for (row, value) in rows.iter_mut().zip(column) {
             row.push(value);
@@ -707,6 +843,7 @@ fn decode_column(
     zone: &ZoneMap,
     codec: u8,
     body: &[u8],
+    budget: &mut Budget,
 ) -> Result<Vec<ColumnValue>, StoreError> {
     let bit_len = row_count.div_ceil(8);
     if body.len() < bit_len {
@@ -732,43 +869,55 @@ fn decode_column(
         return Err(corrupt("null count exceeds the row count"));
     }
     let non_null_count = row_count - nulls;
-    let non_null = decode_non_null(ty, codec, payload, non_null_count)?;
+    let non_null = decode_non_null(ty, codec, payload, non_null_count, budget)?;
+    budget.charge(
+        mul(row_count, std::mem::size_of::<ColumnValue>(), "row count")?,
+        "column",
+    )?;
     let mut out = Vec::with_capacity(row_count);
-    let mut cursor = 0usize;
+    // Values move out of `non_null`; a text or byte value is not copied a second time.
+    let mut values = non_null.into_iter();
     for index in 0..row_count {
         let is_null = bits[index / 8] & (1 << (index % 8)) != 0;
         if is_null {
             out.push(ColumnValue::Null);
             continue;
         }
-        let Some(value) = non_null.get(cursor) else {
+        let Some(value) = values.next() else {
             return Err(corrupt("column ran out of non-null values"));
         };
-        out.push(value.clone());
-        cursor += 1;
+        out.push(value);
     }
-    if cursor != non_null.len() {
+    if values.next().is_some() {
         return Err(corrupt("column has unused non-null values"));
     }
     Ok(out)
 }
 
+/// Decode `n` non-null values. The decoders trust nothing the blob claims: `n` is charged against
+/// the group's budget before the first allocation, and plain encodings, whose values each take a
+/// known minimum of bytes, are also checked against the payload that carries them.
 fn decode_non_null(
     ty: ColumnType,
     codec: u8,
     payload: &[u8],
     n: usize,
+    budget: &mut Budget,
 ) -> Result<Vec<ColumnValue>, StoreError> {
+    budget.charge(
+        mul(n, std::mem::size_of::<ColumnValue>(), "value count")?,
+        "values",
+    )?;
     match (ty, codec) {
         (ColumnType::Int64 | ColumnType::TimestampMs, CODEC_DELTA) => decode_delta(ty, payload, n),
         (ColumnType::Int64 | ColumnType::TimestampMs, CODEC_DELTA_RLE) => {
             decode_delta_rle(ty, payload, n)
         }
         (ColumnType::Utf8, CODEC_PLAIN) => decode_plain_text(payload, n),
-        (ColumnType::Utf8, CODEC_DICT) => decode_dict_text(payload, n),
-        (ColumnType::Utf8, CODEC_RLE) => decode_rle_text(payload, n),
+        (ColumnType::Utf8, CODEC_DICT) => decode_dict_text(payload, n, budget),
+        (ColumnType::Utf8, CODEC_RLE) => decode_rle_text(payload, n, budget),
         (ColumnType::Bytes, CODEC_PLAIN) => decode_plain_bytes(payload, n),
-        (ColumnType::Bytes, CODEC_RLE) => decode_rle_bytes(payload, n),
+        (ColumnType::Bytes, CODEC_RLE) => decode_rle_bytes(payload, n, budget),
         (ColumnType::Float64, CODEC_PLAIN) => decode_plain_f64(payload, n),
         (ColumnType::Float64, CODEC_RLE) => decode_rle_f64(payload, n),
         (ColumnType::Bool, CODEC_RLE) => decode_rle_bool(payload, n),
@@ -778,20 +927,33 @@ fn decode_non_null(
     }
 }
 
+/// A plain encoding of `n` values takes at least `min_each` bytes per value, so `n` cannot be
+/// larger than the payload allows; refuse before `Vec::with_capacity(n)`.
+fn check_plain_count(payload: &[u8], n: usize, min_each: usize) -> Result<(), StoreError> {
+    if mul(n, min_each, "value count")? > payload.len() {
+        return Err(corrupt(format!(
+            "{n} values need at least {min_each} bytes each but the payload has {}",
+            payload.len()
+        )));
+    }
+    Ok(())
+}
+
 fn decode_delta(ty: ColumnType, payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, StoreError> {
     if n == 0 {
         return empty_payload(payload, "delta");
     }
+    check_plain_count(payload, n, 8)?;
     let mut cur = Cur::new(payload);
     let mut prev = cur.i64()?;
-    let mut ints = Vec::with_capacity(n);
-    ints.push(prev);
+    let mut out = Vec::with_capacity(n);
+    out.push(int_value(ty, prev));
     for _ in 1..n {
         prev = prev.wrapping_add(zigzag_decode(cur.u64()?));
-        ints.push(prev);
+        out.push(int_value(ty, prev));
     }
     cur.finish()?;
-    Ok(ints.into_iter().map(|value| int_value(ty, value)).collect())
+    Ok(out)
 }
 
 fn decode_delta_rle(
@@ -804,21 +966,23 @@ fn decode_delta_rle(
     }
     let mut cur = Cur::new(payload);
     let mut prev = cur.i64()?;
-    let mut ints = Vec::with_capacity(n);
-    ints.push(prev);
-    while ints.len() < n {
+    // `n` is already charged to the budget; the vector holds the values directly, with no
+    // intermediate `Vec<i64>`.
+    let mut out = Vec::with_capacity(n);
+    out.push(int_value(ty, prev));
+    while out.len() < n {
         let delta = zigzag_decode(cur.u64()?);
         let len = usize::try_from(cur.u32()?).map_err(|_| corrupt("delta run does not fit"))?;
-        if len == 0 || ints.len() + len > n {
+        if len == 0 || len > n - out.len() {
             return Err(corrupt("delta run length is outside the column"));
         }
         for _ in 0..len {
             prev = prev.wrapping_add(delta);
-            ints.push(prev);
+            out.push(int_value(ty, prev));
         }
     }
     cur.finish()?;
-    Ok(ints.into_iter().map(|value| int_value(ty, value)).collect())
+    Ok(out)
 }
 
 fn empty_payload(payload: &[u8], codec: &str) -> Result<Vec<ColumnValue>, StoreError> {
@@ -830,6 +994,7 @@ fn empty_payload(payload: &[u8], codec: &str) -> Result<Vec<ColumnValue>, StoreE
 }
 
 fn decode_plain_text(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, StoreError> {
+    check_plain_count(payload, n, 4)?;
     let mut cur = Cur::new(payload);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -839,45 +1004,65 @@ fn decode_plain_text(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, Store
     Ok(out)
 }
 
-fn decode_dict_text(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, StoreError> {
+fn decode_dict_text(
+    payload: &[u8],
+    n: usize,
+    budget: &mut Budget,
+) -> Result<Vec<ColumnValue>, StoreError> {
     let mut cur = Cur::new(payload);
     let dict_len =
         usize::try_from(cur.u32()?).map_err(|_| corrupt("dictionary count does not fit"))?;
-    if dict_len > cur.remaining() {
+    // Every entry is at least its four-byte length prefix.
+    if mul(dict_len, 4, "dictionary count")? > cur.remaining() {
         return Err(corrupt("dictionary count exceeds the payload"));
     }
     let mut dict = Vec::with_capacity(dict_len);
     for _ in 0..dict_len {
         dict.push(cur.lp_str()?);
     }
-    let mut out = Vec::with_capacity(n);
+    // The indexes are the rest of the payload, four bytes each; sum what they expand to before
+    // allocating any of it.
+    let index_bytes = cur.take(mul(n, 4, "value count")?)?;
+    cur.finish()?;
     let mut expanded = 0usize;
+    let mut indexes = Cur::new(index_bytes);
     for _ in 0..n {
-        let index =
-            usize::try_from(cur.u32()?).map_err(|_| corrupt("dictionary index does not fit"))?;
+        let index = usize::try_from(indexes.u32()?)
+            .map_err(|_| corrupt("dictionary index does not fit"))?;
         let Some(text) = dict.get(index) else {
             return Err(corrupt("dictionary index is out of range"));
         };
         expanded = expanded.saturating_add(text.len());
-        check_expansion(expanded, 1)?;
-        out.push(ColumnValue::Utf8(text.clone()));
     }
-    cur.finish()?;
+    budget.charge(expanded, "dictionary text")?;
+    let mut out = Vec::with_capacity(n);
+    let mut indexes = Cur::new(index_bytes);
+    for _ in 0..n {
+        // Every index was range-checked above.
+        let index = usize::try_from(indexes.u32()?)
+            .map_err(|_| corrupt("dictionary index does not fit"))?;
+        out.push(ColumnValue::Utf8(dict[index].clone()));
+    }
     Ok(out)
 }
 
-fn decode_rle_text(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, StoreError> {
+fn decode_rle_text(
+    payload: &[u8],
+    n: usize,
+    budget: &mut Budget,
+) -> Result<Vec<ColumnValue>, StoreError> {
     if n == 0 {
         return empty_payload(payload, "rle");
     }
     let mut cur = Cur::new(payload);
     let text = cur.lp_str()?;
     cur.finish()?;
-    check_expansion(text.len(), n)?;
+    budget.charge(mul(text.len(), n, "run length")?, "repeated text")?;
     Ok(vec![ColumnValue::Utf8(text); n])
 }
 
 fn decode_plain_bytes(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, StoreError> {
+    check_plain_count(payload, n, 4)?;
     let mut cur = Cur::new(payload);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -887,18 +1072,23 @@ fn decode_plain_bytes(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, Stor
     Ok(out)
 }
 
-fn decode_rle_bytes(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, StoreError> {
+fn decode_rle_bytes(
+    payload: &[u8],
+    n: usize,
+    budget: &mut Budget,
+) -> Result<Vec<ColumnValue>, StoreError> {
     if n == 0 {
         return empty_payload(payload, "rle");
     }
     let mut cur = Cur::new(payload);
     let blob = cur.lp()?.to_vec();
     cur.finish()?;
-    check_expansion(blob.len(), n)?;
+    budget.charge(mul(blob.len(), n, "run length")?, "repeated bytes")?;
     Ok(vec![ColumnValue::Bytes(blob); n])
 }
 
 fn decode_plain_f64(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, StoreError> {
+    check_plain_count(payload, n, 8)?;
     let mut cur = Cur::new(payload);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -927,7 +1117,7 @@ fn decode_rle_bool(payload: &[u8], n: usize) -> Result<Vec<ColumnValue>, StoreEr
             return Err(corrupt("bool run is not 0 or 1"));
         }
         let len = usize::try_from(cur.u32()?).map_err(|_| corrupt("bool run does not fit"))?;
-        if len == 0 || out.len() + len > n {
+        if len == 0 || len > n - out.len() {
             return Err(corrupt("bool run length is outside the column"));
         }
         out.extend(std::iter::repeat_n(ColumnValue::Bool(bit == 1), len));
@@ -2170,60 +2360,247 @@ mod tests {
         out
     }
 
-    /// Audit S-3: `row_count` is bounded only by the null bitset, and run-length and dictionary
-    /// columns clone one stored value per row, so a blob of a few megabytes could ask the decoder
-    /// for terabytes (an out-of-memory abort while opening a store or replaying its WAL).
-    #[test]
-    fn run_length_and_dictionary_columns_refuse_to_expand_past_the_limit() {
-        // 1 MiB repeated 300 times is 300 MiB, over the 256 MiB limit.
-        let big = vec![b'x'; 1024 * 1024];
-        let rle_text = lp(&big);
-        let err = decode_rle_text(&rle_text, 300).unwrap_err().to_string();
-        assert!(err.contains("expands"), "{err}");
-        assert!(
-            decode_rle_bytes(&rle_text, 300)
-                .unwrap_err()
-                .to_string()
-                .contains("expands")
-        );
-        // Just under the limit still decodes.
-        assert_eq!(decode_rle_bytes(&rle_text, 4).unwrap().len(), 4);
-        // A hostile row count with a small value: 2^31 rows of one byte is 2 GiB.
-        let tiny = lp(b"x");
-        assert!(decode_rle_text(&tiny, 1 << 31).is_err());
-        assert!(decode_rle_bytes(&tiny, usize::MAX / 2).is_err());
+    fn kib(n: usize) -> usize {
+        n * 1024
+    }
 
-        // Dictionary: one 1 MiB entry referenced 300 times (1.2 KB of indexes).
+    fn rle_text_group(columns: usize, rows: usize, text_len: usize) -> (Vec<ColumnDef>, Vec<u8>) {
+        let cols: Vec<ColumnDef> = (0..columns)
+            .map(|i| ColumnDef {
+                name: format!("c{i}"),
+                ty: ColumnType::Utf8,
+            })
+            .collect();
+        let row = vec![ColumnValue::Utf8("x".repeat(text_len)); columns];
+        let blob = encode_row_group(&cols, &vec![row; rows]).unwrap();
+        (cols, blob)
+    }
+
+    /// Audit S-3 (review follow-up): `row_count` is bounded only by the null bitset, so the
+    /// number of rows a blob can claim is checked against a fixed limit before anything is
+    /// allocated for them.
+    #[test]
+    fn a_row_count_over_the_limit_is_refused_before_allocating_for_it() {
+        let (cols, blob) = rle_text_group(1, 20, 4);
+        let limits = Limits {
+            max_rows: 20,
+            max_bytes: kib(64),
+        };
+        validate_row_group_with(&cols, &blob, &limits).unwrap();
+        let mut hostile = blob;
+        hostile[..4].copy_from_slice(&21u32.to_le_bytes());
+        let err = index_group_with(&hostile, &cols, &limits)
+            .err()
+            .expect("21 rows is over a limit of 20")
+            .to_string();
+        assert!(
+            err.contains("claims 21 rows") && err.contains("limit is 20"),
+            "{err}"
+        );
+        // The real limit refuses a claim of 4 billion rows from a few bytes, and its error
+        // names the limit rather than an allocation failure.
+        let mut huge = hostile;
+        huge[..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = index_group(&huge, &cols).err().unwrap().to_string();
+        assert!(err.contains(&MAX_ROWS_PER_GROUP.to_string()), "{err}");
+    }
+
+    /// Audit S-3 (review follow-up): the budget is one for the whole group. Each of the ten
+    /// columns below fits the budget alone; together they do not.
+    #[test]
+    fn the_decode_budget_is_shared_across_the_columns_of_a_group() {
+        let limits = Limits {
+            max_rows: 1000,
+            max_bytes: kib(48),
+        };
+        let (one_col, one) = rle_text_group(1, 100, 200);
+        validate_row_group_with(&one_col, &one, &limits).unwrap();
+        let (ten_cols, ten) = rle_text_group(10, 100, 200);
+        // Ten columns of 200 repeated bytes are a few hundred bytes of blob per column.
+        assert!(ten.len() < kib(8), "{}", ten.len());
+        let err = validate_row_group_with(&ten_cols, &ten, &limits)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would decode to more than"), "{err}");
+        // An all-null column is not free either: it still costs a value per row.
+        let cols = int_col();
+        let blob = encode_row_group(&cols, &vec![vec![ColumnValue::Null]; 400]).unwrap();
+        let err = validate_row_group_with(
+            &cols,
+            &blob,
+            &Limits {
+                max_rows: 1000,
+                max_bytes: kib(8),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("would decode to more than"), "{err}");
+    }
+
+    /// Audit S-3 (review follow-up): every codec that expands a few bytes into many values
+    /// charges the budget before it allocates. Each payload below is a few bytes and claims
+    /// two million values; with a 1 MiB budget each must be refused, and none of them gets to
+    /// allocate (an unguarded decoder would build a 64 MB vector, which is the point of the
+    /// check).
+    #[test]
+    fn every_expanding_codec_refuses_a_small_hostile_payload_before_allocating() {
+        const N: usize = 2_000_000;
+        let refused = |ty: ColumnType, codec: u8, payload: &[u8], n: usize| {
+            let mut budget = Budget::new(kib(1024));
+            let err = decode_non_null(ty, codec, payload, n, &mut budget)
+                .err()
+                .unwrap_or_else(|| panic!("codec {codec} decoded {n} values from a small blob"))
+                .to_string();
+            assert!(
+                err.contains("would decode to more than"),
+                "codec {codec}: {err}"
+            );
+        };
+        let mut delta_rle = 5i64.to_le_bytes().to_vec();
+        delta_rle.extend_from_slice(&2u64.to_le_bytes());
+        delta_rle.extend_from_slice(&u32::try_from(N - 1).unwrap().to_le_bytes());
+        refused(ColumnType::Int64, CODEC_DELTA_RLE, &delta_rle, N);
+        refused(ColumnType::TimestampMs, CODEC_DELTA_RLE, &delta_rle, N);
+        refused(ColumnType::Float64, CODEC_RLE, &1.5f64.to_le_bytes(), N);
+        let mut bools = vec![1u8];
+        bools.extend_from_slice(&u32::try_from(N).unwrap().to_le_bytes());
+        refused(ColumnType::Bool, CODEC_RLE, &bools, N);
+        refused(ColumnType::Utf8, CODEC_RLE, &lp(b"x"), N);
+        refused(ColumnType::Bytes, CODEC_RLE, &lp(b"x"), N);
+        // A dictionary of one 64 KiB entry referenced 300 times: 1.2 KB of indexes, 19 MB of
+        // text, and the sum is taken before any of it is cloned.
+        let big = vec![b'x'; kib(64)];
         let mut dict = 1u32.to_le_bytes().to_vec();
         dict.extend(lp(&big));
         for _ in 0..300 {
             dict.extend_from_slice(&0u32.to_le_bytes());
         }
-        let err = decode_dict_text(&dict, 300).unwrap_err().to_string();
-        assert!(err.contains("expands"), "{err}");
+        refused(ColumnType::Utf8, CODEC_DICT, &dict, 300);
+        // Just under the limit still decodes, and a hostile run length past n is still corrupt.
+        let mut budget = Budget::new(kib(1024));
+        assert_eq!(
+            decode_non_null(ColumnType::Bytes, CODEC_RLE, &lp(&big), 4, &mut budget)
+                .unwrap()
+                .len(),
+            4
+        );
+        let mut budget = Budget::new(kib(1024));
+        assert!(decode_non_null(ColumnType::Utf8, CODEC_DICT, &dict, 4, &mut budget).is_err());
+    }
+
+    /// Audit S-3 (review follow-up): a plain encoding cannot hold more values than its payload
+    /// has bytes for, so `n` is checked against the payload before `Vec::with_capacity(n)`.
+    #[test]
+    fn plain_decoders_bound_the_value_count_by_the_payload() {
+        let mut budget = Budget::new(MAX_DECODE_BYTES);
+        for (ty, codec, min_each) in [
+            (ColumnType::Utf8, CODEC_PLAIN, 4),
+            (ColumnType::Bytes, CODEC_PLAIN, 4),
+            (ColumnType::Float64, CODEC_PLAIN, 8),
+            (ColumnType::Int64, CODEC_DELTA, 8),
+        ] {
+            // Four bytes of payload cannot hold a million values of any plain encoding.
+            let err = decode_non_null(ty, codec, &[0; 4], 1_000_000, &mut budget)
+                .err()
+                .unwrap_or_else(|| panic!("codec {codec} accepted a million values"))
+                .to_string();
+            assert!(
+                err.contains(&format!("at least {min_each} bytes")),
+                "codec {codec}: {err}"
+            );
+        }
         assert!(
-            decode_dict_text(&dict, 4).is_err(),
-            "trailing indexes are corrupt, not a pass"
+            decode_non_null(ColumnType::Utf8, CODEC_PLAIN, &[], 0, &mut budget)
+                .unwrap()
+                .is_empty()
         );
     }
 
+    /// The writer applies the reader's estimate and limits, so what it accepts always decodes:
+    /// grow a mixed-codec group (nulls, run-length, dictionary and plain columns) one row at a
+    /// time under lowered limits; every size up to the largest the writer accepts must validate
+    /// and decode back to the same rows, and the next size must be refused by the writer.
     #[test]
-    fn the_encoder_stays_plain_where_rle_or_a_dictionary_could_not_be_read_back() {
-        // Each value is 100 MiB of zero-cost sharing for RLE, so keep the test cheap by checking
-        // the decision on lengths alone through the same helper the encoder uses.
-        assert!(check_expansion(MAX_EXPANDED_BYTES, 1).is_ok());
-        assert!(check_expansion(MAX_EXPANDED_BYTES, 2).is_err());
-        assert!(check_expansion(usize::MAX, 2).is_err());
-        assert!(check_expansion(0, usize::MAX).is_ok());
-        // Small identical values still pick RLE, distinct ones plain, repeated ones a dictionary.
-        let same: Vec<String> = vec!["a".into(); 5];
-        assert_eq!(utf8_codec(&same), CODEC_RLE);
-        let few: Vec<String> = ["a", "b", "a", "b", "a", "b"].map(String::from).to_vec();
-        assert_eq!(utf8_codec(&few), CODEC_DICT);
-        let distinct: Vec<String> = ["a", "b", "c"].map(String::from).to_vec();
-        assert_eq!(utf8_codec(&distinct), CODEC_PLAIN);
-        assert_eq!(utf8_codec(&[]), CODEC_PLAIN);
-        assert_eq!(utf8_codec(&["only".to_string()]), CODEC_PLAIN);
+    fn the_largest_group_the_writer_accepts_decodes_under_the_same_limits() {
+        let cols: Vec<ColumnDef> = [
+            ColumnType::Int64,
+            ColumnType::TimestampMs,
+            ColumnType::Float64,
+            ColumnType::Bool,
+            ColumnType::Utf8,
+            ColumnType::Utf8,
+            ColumnType::Bytes,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, ty)| ColumnDef {
+            name: format!("c{i}"),
+            ty,
+        })
+        .collect();
+        let row = |i: usize| {
+            vec![
+                ColumnValue::Int64(i64::try_from(i).unwrap() * 3),
+                ColumnValue::TimestampMs(1_000),
+                if i.is_multiple_of(5) {
+                    ColumnValue::Null
+                } else {
+                    ColumnValue::Float64(0.5)
+                },
+                ColumnValue::Bool(i % 7 < 3),
+                ColumnValue::Utf8(format!("name-{}", i % 3)),
+                ColumnValue::Utf8(format!("distinct-{i}")),
+                ColumnValue::Bytes(vec![7; 40]),
+            ]
+        };
+        let limits = Limits {
+            max_rows: 400,
+            max_bytes: kib(200),
+        };
+        let mut accepted = 0usize;
+        let mut refused_at = None;
+        for n in 1..=limits.max_rows + 1 {
+            let rows: Vec<Vec<ColumnValue>> = (0..n).map(row).collect();
+            match encode_row_group_with(&cols, &rows, &limits) {
+                Ok(blob) => {
+                    assert!(refused_at.is_none(), "{n} accepted after a smaller refusal");
+                    validate_row_group_with(&cols, &blob, &limits)
+                        .unwrap_or_else(|err| panic!("{n} rows encoded but do not decode: {err}"));
+                    let indexed = index_group_with(&blob, &cols, &limits).unwrap();
+                    assert_eq!(decode_indexed_with(&cols, &indexed, &limits).unwrap(), rows);
+                    accepted = n;
+                }
+                Err(err) => {
+                    refused_at.get_or_insert((n, err.to_string()));
+                }
+            }
+        }
+        let (refused, why) = refused_at.expect("the byte budget must bind before 401 rows");
+        assert_eq!(refused, accepted + 1);
+        assert!(why.contains("would decode to more than"), "{why}");
+        assert!(
+            accepted > 100,
+            "the budget is not absurdly tight: {accepted}"
+        );
+        // The row limit binds on its own too.
+        let few = Limits {
+            max_rows: 5,
+            max_bytes: MAX_DECODE_BYTES,
+        };
+        let six: Vec<Vec<ColumnValue>> = (0..6).map(row).collect();
+        let err = encode_row_group_with(&cols, &six, &few)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("6 rows") && err.contains("limit is 5"),
+            "{err}"
+        );
+        // And a group of ordinary size round-trips through the real limits.
+        let rows: Vec<Vec<ColumnValue>> = (0..20_000).map(row).collect();
+        let blob = encode_row_group(&cols, &rows).unwrap();
+        let indexed = index_group(&blob, &cols).unwrap();
+        assert_eq!(decode_indexed(&cols, &indexed).unwrap(), rows);
     }
 
     #[test]
@@ -2253,7 +2630,7 @@ mod tests {
         );
         // n == 0 requires an empty payload for every codec.
         assert!(decode_delta(ColumnType::Int64, &[0], 0).is_err());
-        assert!(decode_rle_text(&[0], 0).is_err());
+        assert!(decode_rle_text(&[0], 0, &mut Budget::new(1024)).is_err());
         assert!(decode_delta(ColumnType::Int64, &[], 0).unwrap().is_empty());
         // Wrapping deltas at the i64 boundary round-trip.
         let rows: Vec<Vec<ColumnValue>> = [i64::MIN, i64::MAX, 0, i64::MIN, i64::MAX]

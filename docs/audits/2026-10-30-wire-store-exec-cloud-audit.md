@@ -5,7 +5,9 @@ Scope: written by an autonomous cloud agent against FerroLoop `origin/main` at `
 landed one: branch `felicity/cloud-wire-store-exec-audit`, merged with `origin/main` at `fcb61f7`.
 The `file:line` citations in the wire, exec and core parts were re-derived from the files as they
 stand on that branch; where a line could not be pinned down the function is named instead. The
-store sections are as the cloud agent wrote them.
+store sections (S-2, S-3, S-4, O-8, O-9) were written by the cloud agent, then corrected in a second
+review pass: their citations are re-derived from the current files and each carries a "Review
+follow-up".
 
 ## Scope differences from the task
 
@@ -48,8 +50,8 @@ Severity is my judgement of impact on a FerroLoop deployment as the docs describ
 | C-1 | **High** | exec | Gate `timeout_secs` never starts if stdin delivery blocks | Fixed — reproduced |
 | C-2 | **High** | exec | A background process holding the output pipes holds the gate past its timeout | Fixed — reproduced |
 | H-1 | **High** | exec | Attempt spend ceiling is only compared with zero, never enforced | Fixed — test written |
-| S-2 | **High** | store | HNSW delete strands the survivors (97% unfindable in the worst case) | Fixed — reproduced (residual noted, O-8) |
-| S-3 | **High** | store | Run-length/dictionary columns can claim terabytes from a small blob | Fixed — test written |
+| S-2 | **High** | store | HNSW delete strands the survivors (97% unfindable in the worst case) | Fixed — reproduced (partial: residual stranding remains, O-8) |
+| S-3 | **High** | store | Row groups can claim far more rows/bytes than their blob carries (RLE, dictionary, null columns) | Partly fixed by the cloud commit; enforced in the review follow-up — tests written, hostile-blob test mutation-checked |
 | X-3 | Medium | exec | `max_total_steps`/budget ceilings are checked after the attempt that crosses them | Fixed — reproduced |
 | I-1 | Medium | wire | Route-table save: shared temp name races, secrets file created world-readable first | Fixed — reproduced |
 | D-2 | Medium | wire | Local socket request line unbounded; daemon thread per connection | Fixed — test written |
@@ -63,7 +65,7 @@ Severity is my judgement of impact on a FerroLoop deployment as the docs describ
 | W-4 | Low | wire | WebSocket: FIN, RSV, control-frame length, masking rules not enforced; URL header injection | Fixed — test written |
 | W-5 | Low | wire | tmux paste leaves a zombie when the stdin write fails; vendor CLIs have no timeout | Fixed (CLIs, zombie) — test written for CLI timeout (see the review follow-up below: the first timeout was too short for headless turns) |
 | H-3 | Low | exec | `GitSnapshot` reads whole dirty files into memory to hash them | Fixed — test written |
-| S-4 | Low | store | HNSW search re-sorts its result list for every node visited | Fixed (no test; covered by existing equivalence tests) |
+| S-4 | Low | store | HNSW search re-sorts its result list for every node visited | Fixed — equivalent result, modest gain (no test of its own; covered by existing equivalence tests) |
 | O-1 … O-17 | — | various | Not fixed; see [Open items](#open-items) | Open — read |
 
 ## Findings
@@ -265,7 +267,7 @@ than after it. Test: `a_step_is_refused_before_it_runs_once_max_total_steps_is_u
 (failed before; the stub CLI records each launch, so "did not run" is observed, not inferred),
 plus `core::workflow::tests::preflight_ceiling_refuses_a_step_once_any_limit_is_reached_not_after_it_is_crossed`.
 
-### S-2 — High — HNSW delete strands the survivors (`crates/store/src/ferrostore/vector.rs:621`)
+### S-2 — High — HNSW delete strands the survivors (`crates/store/src/ferrostore/vector.rs`, `remove_node`)
 
 `remove_node` removed the node and its back-links and did nothing for the nodes that had been
 reachable only through it. Measured with a search wider than the collection (so a miss means
@@ -273,11 +275,13 @@ reachable only through it. Measured with a search wider than the collection (so 
 250** survivors that a search for their own value never returned; at `m = 4`, 5 of 150. They
 remain `get`-able and are counted, which is why nothing complained.
 
-Fix: `repair_layer` (`:649`) reconnects the deleted node's former neighbours on each layer —
+Fix: `repair_layer` reconnects the deleted node's former neighbours on each layer —
 each keeps its closest `max_links` among its own links plus the other orphans, links stay
 reciprocal, over-full nodes are pruned, and a chain through the orphans (by id, deterministic)
 keeps them one component, evicting a full node's farthest link only if the victim keeps at least
-two. Result on the same data: 11 of 250 (a fresh build of the same 250 vectors loses 5).
+two. Result on the same data: 11 of 250. The cloud agent compared that with 5, which was a fresh
+build of 250 *different* random vectors; a fresh build of the very same 250 survivors loses 16.
+So after the repair a collection with deletes is no worse than one built fresh, not "11 against 5".
 
 The repository already knew part of this: `search_still_fills_the_limit_after_random_deletes`
 in `columnar_vector_stress.rs` was `#[ignore]`d as a "known gap: HNSW delete does not reconnect
@@ -286,7 +290,7 @@ connectivity; it passes with this fix and is now enabled.
 
 Test: `crates/store/tests/vector_delete_connectivity.rs` — compares reachability after deletes
 with a fresh build of the survivors (allowed: control + 5%), checks the repaired graph survives
-`checkpoint()` and reopen (`validate_graph`, `vector.rs:1201`, re-checks symmetry, link caps and
+`checkpoint()` and reopen (`validate_graph` re-checks symmetry, link caps and
 ordering — an invariant slip here would be a corrupt-on-reload store), and deletes to empty and
 reinserts. The unrepaired code fails the first test by a wide margin.
 
@@ -295,26 +299,118 @@ Snapshots store the graph, so existing stores are unaffected until they replay n
 two replicas on different versions replaying the same deletes would differ in graph shape
 (never in stored vectors or `get` results). See O-8 for what remains.
 
-### S-3 — High — decode amplification in RLE/dictionary columns (`crates/store/src/ferrostore/columnar.rs:25`)
+**Review follow-up (S-2 is REAL, the fix PARTIAL).** The independent review confirmed the defect
+and that the repair works, with three corrections.
 
-A row group's `row_count` is bounded only by its null bitset (`row_count / 8` bytes), and the
-RLE/dictionary decoders clone one stored value per row (`vec![value; n]`, dictionary lookups).
-A blob of a few MiB can therefore ask for terabytes: 1 MiB of bitset allows 8 M rows, times a
-1 KiB value is 8 GB. `validate_row_group` runs on WAL replay (`state.rs:137`) and on snapshot
-decode (`layout.rs:551`), so a corrupt or hostile `.fls` file (or a synced `AppendColumnGroup`)
-aborts the process with an allocation failure while opening the store.
+* *Repair could itself strand a node.* In `repair_layer`'s first stage an orphan dropped every
+  link outside its closest `max_links` on both sides, with no "the neighbour keeps at least two
+  links" guard (`make_room` had one, stage 1 did not), so a non-orphan whose only link was the
+  orphan lost it. Fixed here: a current link whose other end holds two links or fewer is kept
+  first, and the closest candidates fill the rest of the room. Measured over 480 delete
+  configurations (40 seeds, `m` 2..4, delete every 2nd/3rd of 60/120 vectors) the number of
+  unreachable survivors went from 668 to 642, better in 26 configurations and worse in 3. On the
+  500-vector `m = 2` case above the residual is **11 before and 11 after**: the guard does not
+  explain it. `tests/vector_delete_connectivity.rs::repairing_a_delete_does_not_cut_off_the_neighbour_it_relinks`
+  pins six discriminating configurations: the repair as the cloud commit left it (without the
+  guard) leaves 1, 3, 1, 2, 3 and 3 survivors unreachable where the test allows 0, 0, 0, 1, 1 and
+  2, so all six fail without the guard.
+* *`ensure_edge` could leave a node one link short.* It ran `make_room(a)`, which evicts a link on
+  both sides, then `make_room(b)` could refuse and return. It now gives the evicted link back
+  when `b` cannot make room, so a refused edge changes nothing (unit tests
+  `a_refused_edge_leaves_both_nodes_as_they_were`, `an_edge_both_sides_can_make_room_for_is_made`
+  in `vector.rs`; the first fails without the rollback).
+* *Errors are no longer swallowed.* `prune`, `sort_layer` and the distance computations in the
+  repair return their error through `remove_node`, `delete_id` and `upsert`. A delete is applied
+  to a staged copy of the state and committed only on success, so an error leaves no half repaired
+  graph; it can only occur if a stored vector no longer decodes.
 
-Fix: `check_expansion` (`columnar.rs:25`) caps decoded size at 256 MiB for `decode_rle_text`,
-`decode_rle_bytes` and `decode_dict_text`, *before* allocating. The encoder (`utf8_codec`,
-`choose_codec` for `Bytes`) falls back to plain storage past the same limit, so nothing FerroStore
-writes becomes undecodable.
+O-8 (insert-only graphs strand nodes at small `m`) is unchanged and still the larger residual.
+The earlier control was also weaker than it looked (it still deleted `v0000`); the test now builds
+the control from the survivors alone, with no delete in its history. Run against the code before
+the audit (`origin/main`'s `vector.rs`), of the five parameter cases in
+`vectors_stay_findable_after_neighbours_are_deleted` only `(inserted 500, every 2nd, m 2)` fails
+(243 of 250 unreachable, a fresh build of the same survivors loses 16); the other four
+(`300/2/4`, `300/3/4`, `300/2/8`, `800/4/4`) pass there and are kept as coverage, as is
+`a_collection_with_deletes_checkpoints_and_reopens`. `deleting_everything_then_reinserting_works`
+now asserts `hits.len() == min(i, 3)` (it was only an upper bound) and fails on that code.
 
-Tests: `run_length_and_dictionary_columns_refuse_to_expand_past_the_limit`,
-`the_encoder_stays_plain_where_rle_or_a_dictionary_could_not_be_read_back`,
+**Cost of the repair (not changed).** A delete, and a replacing upsert (which deletes the old node
+first), re-link each layer's former neighbours: about `k^2` dequantizing distance computations
+for `k` neighbours, roughly 5 thousand at `m = 16` and 500 thousand at `m = 128`, each over `dim`
+values. At `dim` near 1000 and `m = 128` that is several hundred milliseconds per delete, and a
+WAL replay pays it again for every delete it replays. This is bounded, and it is documented at
+`remove_node`; the algorithm is deliberately unchanged.
+
+### S-3 — High — decode amplification in row groups (`crates/store/src/ferrostore/columnar.rs`, `MAX_ROWS_PER_GROUP`, `MAX_DECODE_BYTES`)
+
+A row group's `row_count` is bounded only by its null bitset (`row_count / 8` bytes per column).
+The RLE/dictionary decoders cloned one stored value per row (`vec![value; n]`, dictionary
+lookups), and the other codecs sized `Vec::with_capacity(n)` from the claim. A blob of a few MiB
+could therefore ask for gigabytes: 1 MiB of bitset allows 8 M rows, times a 1 KiB value is 8 GB.
+`validate_row_group` runs on WAL replay (`state.rs`, `Op::AppendColumnGroup`) and on snapshot
+decode (`layout.rs`), so a corrupt or hostile `.fls` file, or a synced `AppendColumnGroup`, aborts
+the process with an allocation failure while opening the store.
+
+What the cloud commit did (partial): `check_expansion` capped the *payload bytes*
+(`text.len() * n`) of one column at 256 MiB for `decode_rle_text`, `decode_rle_bytes` and
+`decode_dict_text`. That did not bound the decoded size: it ignored the 32 bytes per
+`ColumnValue` and the per-row `Vec`, applied per column rather than per group, cloned every
+non-null value (peak about twice the cap), left `row_count` itself unbounded (so an all-null
+column still cost about 256 times its bitset), and left `decode_rle_f64`, `decode_rle_bool`,
+`decode_delta_rle`, the `Vec::with_capacity(n)` calls in the plain decoders and the per-row
+vectors uncapped. A 10-column group of 1 M rows with a 255-byte RLE text per column needs about
+1.3 MiB of blob and would still have allocated about 5 GB. The report's earlier wording ("caps
+decoded size at 256 MiB") overstated it.
+
+**Review follow-up — what is enforced now.**
+
+* `MAX_ROWS_PER_GROUP` = 4 Mi rows, checked in `index_group_with` before anything is allocated,
+  and by the writer (`encode_row_group_with`). It is the most one `append_column_rows` call can
+  carry over the 16 MiB remote frame (smallest row, a one-cell array, is four bytes of JSON).
+* `MAX_DECODE_BYTES` = 1 GiB, one `Budget` per group shared by all its columns
+  (`decode_indexed_with`). Every allocation is charged before it is made: `ROW_BYTES` plus
+  `size_of::<ColumnValue>()` per row and column up front; per column a value slot per row (the
+  column vector), a value slot per non-null value (what the codec decodes) in `decode_non_null`
+  — this covers `decode_rle_f64`, `decode_rle_bool`, `decode_delta_rle` and every other codec —
+  and, for repeated text or bytes (`decode_rle_text`, `decode_rle_bytes`) `len * n`, and for a
+  dictionary the sum of the entries its indexes reference, taken from the index bytes before any
+  text is cloned (`decode_dict_text`). The charge is an upper bound of the bytes allocated, not of
+  the peak that is live at once. A hostile 1 GiB group is refused at the next charge; the largest
+  allocation an accepted group makes is the one the budget allows.
+* Plain encodings (`decode_plain_text`, `_bytes`, `_f64`, `decode_delta`) refuse a value count the
+  payload cannot hold (`check_plain_count`) before `with_capacity(n)`.
+* The decoders no longer clone twice: non-null values move into the column, and the delta codecs
+  build the final values without an intermediate `Vec<i64>`.
+* The writer applies the same estimate (`estimated_decode_bytes`) and refuses a group over the row
+  or byte limit with "append in several groups", so nothing FerroStore writes is undecodable. This
+  replaces the cloud commit's special-casing in `utf8_codec` and `choose_codec`.
+* Not capped: the size of the blob itself (bounded by the WAL frame and file limits), and the
+  at-most-payload-sized text each plain value allocates.
+
+**Behaviour change.** A store that already holds a group that decodes to more than the limits (a
+run-length or dictionary column repeated into hundreds of MiB, or more than 4 Mi rows in one
+group) now fails to open with "corrupt ferrostore data: ... would decode to more than ... bytes"
+where it used to allocate until the process died or, on a large machine, succeeded. That needs
+groups far larger than anything this code base appends, so it is very unlikely. `append_column_rows`
+with more than 4 Mi rows, or rows estimated above 1 GiB decoded, returns an error telling the
+caller to append in several groups.
+
+Tests (all in `columnar.rs`; limits are lowered through the internal `Limits` parameter so the
+tests allocate almost nothing):
+`a_row_count_over_the_limit_is_refused_before_allocating_for_it`,
+`the_decode_budget_is_shared_across_the_columns_of_a_group` (ten columns, each of which fits alone;
+an all-null column),
+`every_expanding_codec_refuses_a_small_hostile_payload_before_allocating` (delta-RLE, f64 RLE, bool
+RLE, text RLE, bytes RLE and a dictionary, each a few bytes claiming up to two million values),
+`plain_decoders_bound_the_value_count_by_the_payload`,
+`the_largest_group_the_writer_accepts_decodes_under_the_same_limits` (grows a mixed group one row
+at a time; every size the writer accepts round-trips, the next is refused),
 `a_row_count_the_bitset_cannot_cover_is_refused_without_allocating_for_it`,
 `delta_and_run_codecs_reject_truncated_oversized_and_zero_length_runs` (includes `i64::MIN`/`MAX`
-wrapping deltas round-tripping). I did **not** run the amplification test against the old
-decoder: the attack allocates what it claims.
+wrapping deltas round-tripping). Mutation check: with the `decode_non_null` charge removed the
+hostile-payload test fails ("codec 2 decoded 2000000 values from a small blob"); with the row-limit
+check and the up-front row charge removed the row-count test fails; both were restored and the
+diff checked.
 
 ### I-1 — Medium — `RouteTable::save` (`crates/wire/src/identity.rs:338`)
 
@@ -464,8 +560,12 @@ Tests: `abort_refuses_a_finished_run_and_is_idempotent_for_a_canceled_one`,
 * **H-3.** `hash_worktree_path` (`harness.rs:806`) hashed dirty files with `std::fs::read`, i.e.
   whole files in memory, twice per attempt, for every dirty or untracked file in the repo. It
   streams in 64 KiB chunks; the digest (`sha256("file:" + bytes)`) is unchanged.
-* **S-4.** `search_layer` (`vector.rs:975`) pushed then re-sorted `best` for every visited
+* **S-4.** `search_layer` (`vector.rs`) pushed then re-sorted `best` for every visited
   node (O(ef log ef) each). It now inserts at `partition_point` — same order, same result.
+  *Review follow-up:* equivalent, with a modest gain (a binary search and a shift instead of a
+  sort per visited node); no test of its own, and the search-equivalence tests cover it. The WAL
+  decode tests in `ferrostore/tests.rs` that an earlier draft labelled "S-4" correspond to no
+  reported defect; they are extra coverage of `decode_wal`, which this audit did not change.
 
 ## Checked and not a defect
 
@@ -481,9 +581,9 @@ Tests: `abort_refuses_a_finished_run_and_is_idempotent_for_a_canceled_one`,
 * `decode_wal`: every truncation point of a tail frame drops exactly that frame; a corrupt
   non-final frame is an error; a 4 GiB length claim is a torn tail, not an allocation; unknown
   tags, counts larger than the payload, and trailing bytes are errors (new tests pin all of it).
-* Columnar delta/RLE/dictionary decoders bound `Vec::with_capacity` by payload size (apart from
-  S-3's value cloning) and reject zero-length and past-the-end runs; wrapping `i64` deltas
-  round-trip at `MIN`/`MAX`.
+* Columnar delta/RLE decoders reject zero-length and past-the-end runs, and wrapping `i64` deltas
+  round-trip at `MIN`/`MAX`. (An earlier draft also said the decoders bound `Vec::with_capacity`
+  by payload size; that was wrong, see S-3 for what is bounded now.)
 * `import_wire_batch` validates every message (`WireMessage::validate`) and refuses a message
   that differs from the stored copy (`WireMessageTampered`); receipt merge is monotonic.
 * `RouteTable::upsert` and `get` normalise persona names; invalid names are ignored.
@@ -501,8 +601,8 @@ Read, not fixed. None was reproduced.
 | O-5 | Low | `dispatcher.rs` (muse/grok) | `tmux_target` may be a session/window name; `tmux -t <name>` resolves to the *active* pane, which need not be the agent's (the Claude path already restricts to `%<id>`). |
 | O-6 | Low | `write_workflow_fact`, `workflow.rs:416` | `write_workflow_fact` reports a state-store failure as `WorkflowError::InvalidStepLimits`. |
 | O-7 | Low | `workflow.rs:1092` | `expect("adapter thread did not panic")` / runtime build `expect` turn an adapter panic into a panic of the caller (the hub request thread). |
-| O-8 | Medium | `vector.rs` | Even insert-only HNSW graphs strand nodes at small `m` (37 of 499 at `m = 2`, 1 of 299 at `m = 4`): the strictly reciprocal link rule lets a neighbour's prune drop a new node's only link. S-2's repair cannot fix what insertion already lost. Needs a "never prune a node's last link" rule in `link_layer`/`prune`; I held back because it changes the persisted graph shape for every insert. |
-| O-9 | Low | `layout.rs:664`, `mod.rs:2081` | `decode_wal` runs on the superblock-committed extent only, so a short or CRC-bad *final* frame inside it is data the superblock said was durable; it is dropped silently as a "torn tail". That is probably right after a crash between WAL write and superblock write, but it also hides truncation of committed bytes. Worth a log line or a stricter check keyed on the superblock's recorded frame count if it has one. |
+| O-8 | Medium | `vector.rs` (`link_layer`, `prune`) | Even insert-only HNSW graphs strand nodes at small `m` (37 of 499 at `m = 2`, 1 of 299 at `m = 4`): the strictly reciprocal link rule lets a neighbour's prune drop a new node's only link. S-2's repair cannot fix what insertion already lost; the review follow-up left this unchanged. Needs a "never prune a node's last link" rule in `link_layer`/`prune`; I held back because it changes the persisted graph shape for every insert. |
+| O-9 | Low | `layout.rs:664` (`decode_wal`), `mod.rs:2099` (`read_consistent`) | `decode_wal` runs on the superblock-committed extent only, so a short or CRC-bad *final* frame inside it is data the superblock said was durable; it is dropped silently as a "torn tail". That is probably right after a crash between WAL write and superblock write, but it also hides truncation of committed bytes. Worth a log line or a stricter check keyed on the superblock's recorded frame count if it has one. |
 | O-10 | Low | `ws.rs:239` (`WsStream::accept`) | `WsStream::accept` upgrades on any request carrying `Sec-WebSocket-Key`; it does not check method, `Upgrade`, `Connection` or version. |
 | O-11 | Low | `dispatcher.rs` | `tmux display-message`, `send-keys`, `capture-pane` run with no timeout; a wedged tmux server blocks dispatch (now only dispatch, not `Status`). |
 | O-12 | Low | `excerpt`, `command.rs:35` | The output excerpt is stdout then stderr, cut at 4 KiB: a command with > 4 KiB on stdout never shows its stderr. |
@@ -524,6 +624,11 @@ Read, not fixed. None was reproduced.
 5. `abort_workflow_run` errors on a Completed/Failed run.
 6. Gate commands, and the agent processes the harness starts, run in their own process group.
 7. Deleting a vector now re-links its neighbours (graph shape differs from before after deletes).
+   The repair costs about `k^2` distance computations per delete and per replacing upsert (several
+   hundred milliseconds at `m = 128`, `dim` near 1000), paid again on every WAL replay of a delete.
+7a. A row group is limited to 4 Mi rows and to 1 GiB of decoded size (S-3). `append_column_rows`
+   refuses a larger group (append in several), and a store that already holds one fails to open
+   with a "corrupt ferrostore data" error instead of running out of memory.
 8. `Git::*` functions return an error for `-`-leading arguments.
 9. **Vendor CLI limits (found in review).** `codex queue` and `agy send-message` are killed after
    60 s. The `muse exec` and `grok -p` headless fallbacks run whole turns and are killed only
