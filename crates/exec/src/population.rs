@@ -36,6 +36,11 @@ pub enum ExecError {
          then decide again"
     )]
     PublishRefused(String),
+    /// ⚠ The record is marked escalating or was escalated (routing spec §3.3 step 1, §3.6), so
+    /// the store refused the state change. Kept apart from [`ExecError::Store`] so a caller can
+    /// tell a refusal from a fault.
+    #[error("{0}")]
+    Escalation(String),
     #[error("command `{0}` could not be run: {1}")]
     Spawn(String, String),
     /// ⚠ A population command that exits non-zero has told you nothing about

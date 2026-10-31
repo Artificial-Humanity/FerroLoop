@@ -3,7 +3,7 @@ use crate::evaluate::{TransitionReport, evaluate_transition};
 use crate::population::{ExecError, refused_publish};
 use fl_core::decision::Flushed;
 use fl_core::model::{Record, State, Transition};
-use fl_core::store::Roles;
+use fl_core::store::{Roles, StoreError};
 
 pub struct MoveReport {
     pub transitions: Vec<TransitionReport>,
@@ -95,7 +95,12 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
         roles
             .tracker
             .set_record_state(&record.id, to)
-            .map_err(store_err)?;
+            .map_err(|e| match e {
+                StoreError::Escalating { .. } | StoreError::Escalated { .. } => {
+                    ExecError::Escalation(e.to_string())
+                }
+                e => store_err(e),
+            })?;
     }
     Ok(MoveReport {
         transitions,
