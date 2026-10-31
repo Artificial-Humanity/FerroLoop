@@ -841,6 +841,25 @@ mod tests {
         path
     }
 
+    /// `run_version` on a script this test just wrote. Writing a script and executing it races
+    /// with every other test thread that forks: a child forked while the script's write fd is
+    /// still open holds that fd until its own exec, and `execve` of a file that any process has
+    /// open for writing fails with ETXTBSY. The race lives in the fixture, so the retry lives
+    /// here: only that exact spawn error is retried, bounded, and every other result is returned.
+    #[cfg(unix)]
+    fn run_fixture_version(path: &Path, timeout: Duration) -> Result<String, String> {
+        let mut attempts = 0;
+        loop {
+            let result = run_version(path, timeout);
+            let busy = matches!(&result, Err(e) if e.starts_with("spawn failed:") && e.contains("Text file busy"));
+            attempts += 1;
+            if !busy || attempts >= 200 {
+                return result;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn inputs(path_env: &str, home: Option<&Path>) -> ProbeInputs {
         ProbeInputs {
             path_env: path_env.to_string(),
@@ -965,7 +984,7 @@ mod tests {
             "echo '1.2.3 (Claude Code)'; echo second",
         );
         assert_eq!(
-            run_version(&p, Duration::from_secs(2)).unwrap(),
+            run_fixture_version(&p, Duration::from_secs(2)).unwrap(),
             "1.2.3 (Claude Code)"
         );
     }
@@ -975,16 +994,19 @@ mod tests {
     fn version_probe_falls_back_to_stderr_and_reports_failure() {
         let dir = TempDir::new().unwrap();
         let p = write_script(dir.path(), "a", "echo v9 >&2");
-        assert_eq!(run_version(&p, Duration::from_secs(2)).unwrap(), "v9");
+        assert_eq!(
+            run_fixture_version(&p, Duration::from_secs(2)).unwrap(),
+            "v9"
+        );
         let bad = write_script(dir.path(), "b", "exit 3");
         assert!(
-            run_version(&bad, Duration::from_secs(2))
+            run_fixture_version(&bad, Duration::from_secs(2))
                 .unwrap_err()
                 .contains("exited")
         );
         let empty = write_script(dir.path(), "c", "exit 0");
         assert!(
-            run_version(&empty, Duration::from_secs(2))
+            run_fixture_version(&empty, Duration::from_secs(2))
                 .unwrap_err()
                 .contains("nothing")
         );
@@ -999,7 +1021,7 @@ mod tests {
         let body = format!("(sleep 1; touch '{}') &\nsleep 30", marker.display());
         let p = write_script(dir.path(), "slow", &body);
         let started = Instant::now();
-        let err = run_version(&p, Duration::from_millis(200)).unwrap_err();
+        let err = run_fixture_version(&p, Duration::from_millis(200)).unwrap_err();
         assert!(err.contains("timed out"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(1400));
@@ -1014,7 +1036,10 @@ mod tests {
         // The script exits at once, but its background child would touch the marker after 1s.
         let body = format!("(sleep 1; touch '{}') &\necho v1", marker.display());
         let p = write_script(dir.path(), "wrapper", &body);
-        assert_eq!(run_version(&p, Duration::from_secs(2)).unwrap(), "v1");
+        assert_eq!(
+            run_fixture_version(&p, Duration::from_secs(2)).unwrap(),
+            "v1"
+        );
         std::thread::sleep(Duration::from_millis(1400));
         assert!(!marker.exists(), "grandchild survived the group kill");
     }
