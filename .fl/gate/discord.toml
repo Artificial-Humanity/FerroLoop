@@ -53,9 +53,12 @@ verify_secret = "DISCORD_PUBLIC_KEY"
 bot_token_secret = "DISCORD_BOT_TOKEN"
 allowed_user_ids = ["lmcfarlin"]
 allowed_guild_ids = []
-# Connector ids senders may pick with `/model <connector>` (exact ids, no `*`, never a tool).
-# Empty refuses every inline `/model`. `verify_secret` must be provisioned (`fl vault set
-# DISCORD_PUBLIC_KEY`) or the webhook refuses every caller, owner included.
+# Connector ids senders may pick with `/model <connector>` (exact, case-sensitive ids; no `*`,
+# never a tool). Empty refuses every inline `/model`. A bad entry makes this manifest, and with it
+# connector discovery, fail to load. The hub runs an allowed connector's FIRST tool with the
+# sender's text, so list only connectors whose first tool is safe for that.
+# `verify_secret` must be provisioned (`fl vault set DISCORD_PUBLIC_KEY`) or the webhook refuses
+# every caller, owner included; an empty `verify_secret` also refuses every caller.
 allowed_inline_connectors = []
 default_target = "wire:ferris"
 
