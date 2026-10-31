@@ -6,6 +6,8 @@ import {
   type ArchitectureResponse,
   type ArtifactListResponse,
   type ArtifactPreviewResponse,
+  type ArtifactVersionsResponse,
+  type OfficePreviewResponse,
   type AuthSessionResponse,
   type BulkSessionAction,
   type BulkSessionActionResponse,
@@ -1077,6 +1079,58 @@ export class HubApiClient {
   public async getArtifactPreview(path: string): Promise<ArtifactPreviewResponse> {
     const qs = new URLSearchParams({ path, mode: "json" });
     return this.request<ArtifactPreviewResponse>(`/api/v1/artifacts/preview?${qs.toString()}`);
+  }
+
+  /** Recorded content revisions of an artifact, oldest first. */
+  public async getArtifactVersions(path: string): Promise<ArtifactVersionsResponse> {
+    const qs = new URLSearchParams({ path });
+    return this.request<ArtifactVersionsResponse>(
+      `/api/v1/artifacts/versions?${qs.toString()}`,
+    );
+  }
+
+  /** The stored text of one revision of an artifact. */
+  public async getArtifactVersionContent(path: string, version: number): Promise<string> {
+    const qs = new URLSearchParams({ path, version: String(version) });
+    const headers = new Headers();
+    const tok = this.getToken();
+    if (tok) {
+      headers.set("Authorization", `Bearer ${tok}`);
+    }
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/api/v1/artifacts/version-raw?${qs.toString()}`,
+      { headers, credentials: "same-origin" },
+    );
+    const text = await response.text();
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const parsed = JSON.parse(text) as { error?: unknown };
+        if (typeof parsed.error === "string" && parsed.error) message = parsed.error;
+      } catch {
+        // Not JSON: keep the status line.
+      }
+      throw new HubApiError(response.status, message);
+    }
+    return text;
+  }
+
+  /** URL of the stored bytes of one revision, with the session token for `<img>` and links. */
+  public getArtifactVersionRawUrl(path: string, version: number): string {
+    const qs = new URLSearchParams({ path, version: String(version) });
+    const tok = this.getToken();
+    if (tok) {
+      qs.set("token", tok);
+    }
+    return `${this.baseUrl}/api/v1/artifacts/version-raw?${qs.toString()}`;
+  }
+
+  /** Structured preview of a .docx, .xlsx or .pptx artifact. */
+  public async getOfficePreview(path: string): Promise<OfficePreviewResponse> {
+    const qs = new URLSearchParams({ path });
+    return this.request<OfficePreviewResponse>(
+      `/api/v1/artifacts/office-preview?${qs.toString()}`,
+    );
   }
 
   public async listSessionArtifacts(sessionId?: string | null): Promise<ArtifactListResponse> {

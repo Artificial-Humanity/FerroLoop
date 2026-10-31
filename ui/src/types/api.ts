@@ -80,6 +80,8 @@ export interface ArtifactPreviewResponse {
   size_bytes: number;
   kind: ArtifactKind;
   content?: string | null;
+  /** A structured .docx/.xlsx/.pptx preview supplied with the preview itself. */
+  office_preview?: OfficePreview | null;
   raw_url: string;
   download_url: string;
 }
@@ -92,6 +94,73 @@ export interface ArtifactSummaryItem {
   size_bytes: number;
   status?: "live" | "archived";
   original_path?: string;
+}
+
+/** One recorded content revision of an artifact (`GET /api/v1/artifacts/versions`). */
+export interface ArtifactVersionInfo {
+  version: number;
+  sha256: string;
+  size_bytes: number;
+  recorded_at_ms: number;
+  is_current: boolean;
+  /** False when the revision was above the archive cap and only its digest was kept. */
+  has_content?: boolean;
+}
+
+export interface ArtifactVersionsResponse {
+  ok: boolean;
+  path: string;
+  versions: ArtifactVersionInfo[];
+}
+
+export type OfficeBlock =
+  | { type: "heading"; level: number; text: string }
+  | { type: "paragraph"; text: string }
+  | { type: "table"; rows: string[][] };
+
+export interface DocxPreview {
+  kind: "docx";
+  blocks: OfficeBlock[];
+  truncated?: boolean;
+}
+
+export interface XlsxSheet {
+  name: string;
+  rows: string[][];
+  row_count?: number;
+  col_count?: number;
+  truncated?: boolean;
+}
+
+export interface XlsxPreview {
+  kind: "xlsx";
+  sheets: XlsxSheet[];
+  truncated?: boolean;
+}
+
+export interface PptxSlide {
+  index: number;
+  title: string;
+  bullets: string[];
+  notes: string;
+}
+
+export interface PptxPreview {
+  kind: "pptx";
+  slides: PptxSlide[];
+  truncated?: boolean;
+}
+
+export type OfficePreview = DocxPreview | XlsxPreview | PptxPreview;
+
+/** `GET /api/v1/artifacts/office-preview`. */
+export interface OfficePreviewResponse {
+  ok: boolean;
+  path: string;
+  name?: string;
+  ext?: string;
+  size_bytes?: number;
+  preview: OfficePreview;
 }
 
 export interface ArtifactListResponse {

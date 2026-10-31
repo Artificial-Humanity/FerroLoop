@@ -515,6 +515,11 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET", "/api/v1/architecture") => handle_get_architecture(state, req),
         ("GET" | "HEAD", "/api/v1/artifacts/preview") => handle_get_artifact_preview(state, req),
         ("GET", "/api/v1/artifacts/list") => handle_get_artifacts_list(state, req),
+        ("GET", "/api/v1/artifacts/versions") => handle_get_artifact_versions(state, req),
+        ("GET", "/api/v1/artifacts/version-raw") => handle_get_artifact_version_raw(state, req),
+        ("GET", "/api/v1/artifacts/office-preview") => {
+            handle_get_artifact_office_preview(state, req)
+        }
         ("POST", "/api/v1/artifacts/prune") => handle_post_artifacts_prune(state, &authority, req),
         ("GET", "/api/v1/records") => records::handle_get_records(state, req),
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
@@ -2800,6 +2805,7 @@ fn artifact_entry(canon: &Path, size_bytes: u64, session_id: Option<&str>) -> Ar
         session_id: session_id.map(str::to_string),
         status: artifacts::STATUS_LIVE.to_string(),
         updated_at_ms: artifacts::now_ms(),
+        versions: Vec::new(),
     }
 }
 
@@ -2892,6 +2898,8 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
             registry.reconcile(&artifacts::managed_dir(&root), session_ids.as_deref())
         });
         pruned_count = outcome.pruned;
+        let live_paths: Vec<PathBuf> = live.iter().map(|(p, _)| p.clone()).collect();
+        record_artifact_versions(state, &root, &live_paths);
         for entry in &outcome.archived {
             if items.len() >= MAX_ARTIFACT_LIST_ITEMS {
                 break;
@@ -2904,6 +2912,179 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
         200,
         json!({ "artifacts": items, "pruned_count": pruned_count }),
     )
+}
+
+/// Record the current content of each live artifact as a revision when it changed. Failures
+/// (a file that vanished, grew past the cap, or no longer passes vetting) are skipped.
+fn record_artifact_versions(state: &HubState, root: &Path, files: &[PathBuf]) {
+    let allowed_roots = allowed_artifact_roots(state);
+    let still_vetted = |resolved: &Path| {
+        vet_artifact_file(&allowed_roots, resolved).is_some_and(|(canon, _)| canon == resolved)
+    };
+    for canon in files {
+        let _ = artifacts::record_version(root, canon, &still_vetted);
+    }
+}
+
+/// `GET /api/v1/artifacts/versions?path=` (Track E): the recorded revisions of one artifact,
+/// oldest first. A live file is registered and its current content recorded first, so history
+/// exists even when the artifact was never listed.
+fn handle_get_artifact_versions(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    let raw_path = req.query.get("path").map(String::as_str).unwrap_or("");
+    let canonical = match resolve_artifact_candidate_path(state, raw_path) {
+        Ok(p) => p,
+        Err((status, msg)) => return HttpResponse::json(status, json!({ "error": msg })),
+    };
+    let meta = match fs::metadata(&canonical) {
+        Ok(m) if m.is_file() => m,
+        _ => return HttpResponse::json(404, json!({ "error": "artifact file not found" })),
+    };
+    let Some(root) = artifacts_root(state) else {
+        return HttpResponse::json(
+            200,
+            json!({ "ok": true, "path": canonical.display().to_string(), "versions": [] }),
+        );
+    };
+    let canon_str = canonical.display().to_string();
+    let managed_copy =
+        fs::canonicalize(artifacts::managed_dir(&root)).is_ok_and(|dir| canonical.starts_with(dir));
+    if !managed_copy {
+        artifacts::with_registry(&root, |reg| {
+            if reg.entries.iter().all(|e| e.canonical_path != canon_str) {
+                reg.upsert(artifact_entry(&canonical, meta.len(), None));
+            }
+        });
+        record_artifact_versions(state, &root, std::slice::from_ref(&canonical));
+    }
+    let versions = artifacts::with_registry(&root, |reg| {
+        reg.find_for_path(&canonical)
+            .map(|e| e.versions.clone())
+            .unwrap_or_default()
+    });
+    let latest = versions.last().map(|v| v.version);
+    let rows: Vec<Value> = versions
+        .iter()
+        .map(|v| {
+            json!({
+                "version": v.version,
+                "sha256": v.sha256,
+                "size_bytes": v.size_bytes,
+                "recorded_at_ms": v.recorded_at_ms,
+                "is_current": Some(v.version) == latest,
+                "has_content": v.snapshot_path.is_some(),
+            })
+        })
+        .collect();
+    HttpResponse::json(
+        200,
+        json!({ "ok": true, "path": canon_str, "versions": rows }),
+    )
+}
+
+/// `GET /api/v1/artifacts/version-raw?path=&version=` (Track E): the stored bytes of one
+/// revision. The path is vetted like every artifact path; the snapshot is read only from the
+/// hub's versions directory and within the archive size cap.
+fn handle_get_artifact_version_raw(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    let raw_path = req.query.get("path").map(String::as_str).unwrap_or("");
+    let canonical = match resolve_artifact_candidate_path(state, raw_path) {
+        Ok(p) => p,
+        Err((status, msg)) => return HttpResponse::json(status, json!({ "error": msg })),
+    };
+    let version = match req
+        .query
+        .get("version")
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|v| *v >= 1)
+    {
+        Some(v) => v,
+        None => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": "missing or invalid query parameter `version`" }),
+            );
+        }
+    };
+    let Some(root) = artifacts_root(state) else {
+        return HttpResponse::json(404, json!({ "error": "version not found" }));
+    };
+    let entry = artifacts::with_registry(&root, |reg| reg.find_for_path(&canonical).cloned());
+    let Some(entry) = entry else {
+        return HttpResponse::json(404, json!({ "error": "version not found" }));
+    };
+    match artifacts::read_version_bytes(&root, &entry, version) {
+        Ok(bytes) => {
+            let mime = match mime_type_for_path(&canonical) {
+                // Never serve a recorded revision as active content.
+                "text/html; charset=utf-8" | "application/javascript; charset=utf-8" => {
+                    "text/plain; charset=utf-8"
+                }
+                other => other,
+            };
+            HttpResponse::bytes(200, mime, bytes)
+                .with_header("X-Content-Type-Options", "nosniff")
+                .with_header(
+                    "Content-Security-Policy",
+                    "script-src 'none'; object-src 'none'",
+                )
+        }
+        Err(msg) => {
+            let status = if msg.contains("exceeds") { 413 } else { 404 };
+            HttpResponse::json(status, json!({ "error": msg }))
+        }
+    }
+}
+
+/// `GET /api/v1/artifacts/office-preview?path=` (Track E): a structured preview of a `.docx`,
+/// `.xlsx` or `.pptx`, read by the bounded in-process ZIP/XML reader in `artifacts.rs`.
+fn handle_get_artifact_office_preview(state: &HubState, req: &HttpRequest) -> HttpResponse {
+    let raw_path = req.query.get("path").map(String::as_str).unwrap_or("");
+    let canonical = match resolve_artifact_candidate_path(state, raw_path) {
+        Ok(p) => p,
+        Err((status, msg)) => return HttpResponse::json(status, json!({ "error": msg })),
+    };
+    let ext = canonical
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "docx" | "xlsx" | "pptx") {
+        return HttpResponse::json(
+            400,
+            json!({ "error": "office preview supports only .docx, .xlsx and .pptx files" }),
+        );
+    }
+    let meta = match fs::metadata(&canonical) {
+        Ok(m) if m.is_file() => m,
+        _ => return HttpResponse::json(404, json!({ "error": "artifact file not found" })),
+    };
+    if meta.len() > MAX_ARTIFACT_PREVIEW_BYTES {
+        return HttpResponse::json(
+            413,
+            json!({
+                "error": "artifact exceeds 16 MiB preview limit",
+                "size_bytes": meta.len(),
+                "max_bytes": MAX_ARTIFACT_PREVIEW_BYTES,
+            }),
+        );
+    }
+    let bytes = match fs::read(&canonical) {
+        Ok(b) => b,
+        Err(e) => return HttpResponse::json(500, json!({ "error": e.to_string() })),
+    };
+    match artifacts::office_preview(&ext, &bytes) {
+        Ok(preview) => HttpResponse::json(
+            200,
+            json!({
+                "ok": true,
+                "path": canonical.display().to_string(),
+                "name": canonical.file_name().and_then(|n| n.to_str()).unwrap_or("artifact"),
+                "ext": ext,
+                "size_bytes": meta.len(),
+                "preview": preview,
+            }),
+        ),
+        Err(err) => HttpResponse::json(422, json!({ "error": err.to_string() })),
+    }
 }
 
 /// What `preserve_artifacts` archives.
@@ -3017,6 +3198,8 @@ fn preserve_artifacts(state: &HubState, root: &Path, plan: &ArtifactPreservation
             }
         }
     });
+    let archived: Vec<PathBuf> = copies.iter().map(|(canon, _)| canon.clone()).collect();
+    record_artifact_versions(state, root, &archived);
     copies.len()
 }
 
@@ -5925,6 +6108,187 @@ mod tests {
         for token in SECRET_TOKENS {
             assert!(serialized_owner.contains(token), "{serialized_owner}");
         }
+    }
+
+    /// A stored (uncompressed) ZIP holding one entry, enough for the office reader.
+    fn tiny_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let off = out.len() as u32;
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&[20, 0, 0, 0, 0, 0]);
+            out.extend_from_slice(&[0; 8]);
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&0u16.to_le_bytes());
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(data);
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0]);
+            central.extend_from_slice(&[0; 8]);
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0; 12]);
+            central.extend_from_slice(&off.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_off = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_off.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out
+    }
+
+    #[test]
+    fn artifact_versions_and_office_preview_endpoints_serve_vetted_paths_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("repo");
+        let home_dir = tmp.path().join("home");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+        let cfg = crate::HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: repo_root.clone(),
+            owner_token: Some("owner-test-tok".to_string()),
+            home_override: Some(home_dir),
+            ..crate::HubServerConfig::default()
+        };
+        let state = HubState::new(cfg);
+        let get = |target: &str| -> HttpResponse {
+            let mut req = HttpRequest::new("GET", target);
+            req.headers.insert(
+                "authorization".to_string(),
+                "Bearer owner-test-tok".to_string(),
+            );
+            handle_http_request(&state, &req)
+        };
+        let json_of = |r: &HttpResponse| -> Value { serde_json::from_slice(&r.body).unwrap() };
+        let enc = |p: &Path| percent_encode_query_value(&p.display().to_string());
+
+        // Office preview.
+        let docx = repo_root.join("brief.docx");
+        let body = br#"<w:document><w:body><w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Hi</w:t></w:r></w:p></w:body></w:document>"#;
+        fs::write(&docx, tiny_zip(&[("word/document.xml", body)])).unwrap();
+        let r = get(&format!(
+            "/api/v1/artifacts/office-preview?path={}",
+            enc(&docx)
+        ));
+        assert_eq!(r.status, 200);
+        let v = json_of(&r);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["ext"], "docx");
+        assert_eq!(
+            v["preview"]["blocks"][0],
+            json!({"type":"heading","level":2,"text":"Hi"})
+        );
+        // Not an office extension, a corrupt file, a missing file, a forbidden path.
+        let md = repo_root.join("note.md");
+        fs::write(&md, "# n").unwrap();
+        let r = get(&format!(
+            "/api/v1/artifacts/office-preview?path={}",
+            enc(&md)
+        ));
+        assert_eq!(r.status, 400);
+        let bad = repo_root.join("bad.xlsx");
+        fs::write(&bad, "this is not a zip file at all").unwrap();
+        let r = get(&format!(
+            "/api/v1/artifacts/office-preview?path={}",
+            enc(&bad)
+        ));
+        assert_eq!(r.status, 422);
+        let r = get(&format!(
+            "/api/v1/artifacts/office-preview?path={}",
+            enc(&repo_root.join("nope.docx"))
+        ));
+        assert_eq!(r.status, 404);
+        let env = repo_root.join(".env");
+        fs::write(&env, "T=1").unwrap();
+        let r = get(&format!(
+            "/api/v1/artifacts/office-preview?path={}",
+            enc(&env)
+        ));
+        assert_eq!(r.status, 403);
+        assert_eq!(get("/api/v1/artifacts/office-preview").status, 400);
+
+        // Version history: first request registers and records v1.
+        let r = get(&format!("/api/v1/artifacts/versions?path={}", enc(&md)));
+        assert_eq!(r.status, 200);
+        let v = json_of(&r);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["versions"].as_array().unwrap().len(), 1);
+        assert_eq!(v["versions"][0]["version"], 1);
+        assert_eq!(v["versions"][0]["is_current"], true);
+        assert_eq!(v["versions"][0]["size_bytes"], 3);
+        assert_eq!(v["versions"][0]["sha256"].as_str().unwrap().len(), 64);
+        // Unchanged: still one. Changed: two, and only the newest is current.
+        let r = get(&format!("/api/v1/artifacts/versions?path={}", enc(&md)));
+        assert_eq!(json_of(&r)["versions"].as_array().unwrap().len(), 1);
+        fs::write(&md, "# new text").unwrap();
+        let r = get(&format!("/api/v1/artifacts/versions?path={}", enc(&md)));
+        let v = json_of(&r);
+        let rows = v["versions"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0]["is_current"].clone(), rows[1]["is_current"].clone()),
+            (json!(false), json!(true))
+        );
+        assert_ne!(rows[0]["sha256"], rows[1]["sha256"]);
+
+        // Raw content of each revision.
+        let raw = |n: &str| {
+            get(&format!(
+                "/api/v1/artifacts/version-raw?path={}&version={n}",
+                enc(&md)
+            ))
+        };
+        let r = raw("1");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body, b"# n");
+        assert_eq!(raw("2").body, b"# new text");
+        assert_eq!(raw("3").status, 404);
+        assert_eq!(raw("0").status, 400);
+        assert_eq!(raw("abc").status, 400);
+        assert_eq!(
+            get(&format!("/api/v1/artifacts/version-raw?path={}", enc(&md))).status,
+            400
+        );
+        // Path vetting applies to both endpoints.
+        for ep in ["versions", "version-raw"] {
+            let r = get(&format!(
+                "/api/v1/artifacts/{ep}?path={}&version=1",
+                enc(&env)
+            ));
+            assert_eq!(r.status, 403, "{ep}");
+            let r = get(&format!(
+                "/api/v1/artifacts/{ep}?path=%2Fetc%2Fpasswd&version=1"
+            ));
+            assert_eq!(r.status, 403, "{ep}");
+        }
+        // A listed-but-never-recorded path has no revision to serve.
+        let other = repo_root.join("other.md");
+        fs::write(&other, "o").unwrap();
+        assert_eq!(
+            get(&format!(
+                "/api/v1/artifacts/version-raw?path={}&version=1",
+                enc(&other)
+            ))
+            .status,
+            404
+        );
+        // Both need authentication.
+        let unauth = HttpRequest::new(
+            "GET",
+            format!("/api/v1/artifacts/versions?path={}", enc(&md)),
+        );
+        assert_ne!(handle_http_request(&state, &unauth).status, 200);
     }
 
     #[test]
