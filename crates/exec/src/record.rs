@@ -2,8 +2,12 @@ use crate::decision;
 use crate::evaluate::{TransitionReport, evaluate_transition};
 use crate::population::{ExecError, refused_publish};
 use fl_core::decision::Flushed;
+use fl_core::ids::RecordId;
 use fl_core::model::{Record, State, Transition};
 use fl_core::store::{Roles, StoreError};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 pub struct MoveReport {
     pub transitions: Vec<TransitionReport>,
@@ -29,6 +33,32 @@ fn store_err(e: impl std::fmt::Display) -> ExecError {
     ExecError::Store(e.to_string())
 }
 
+const MOVE_LOCK_STRIPES: usize = 64;
+
+/// In-process locks that serialise the last step of a move: the re-read of the record's state
+/// and the write of the new one. One lock per hash stripe of the record id, so two moves of the
+/// SAME record always meet on one lock, and moves of different records only collide by chance
+/// (a stripe held a moment longer, never a deadlock: a move holds one stripe and nothing else).
+static MOVE_LOCKS: [Mutex<()>; MOVE_LOCK_STRIPES] = [const { Mutex::new(()) }; MOVE_LOCK_STRIPES];
+
+fn lock_record_for_move(id: &RecordId) -> MutexGuard<'static, ()> {
+    let mut hasher = DefaultHasher::new();
+    id.as_str().hash(&mut hasher);
+    let stripe = (hasher.finish() % MOVE_LOCK_STRIPES as u64) as usize;
+    MOVE_LOCKS[stripe]
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn stale_move(began: &Record, now: &Record) -> ExecError {
+    ExecError::StaleMove(format!(
+        "record {} is now `{}`, not `{}` as when the move began; nothing was moved",
+        began.id,
+        now.state.as_wire(),
+        began.state.as_wire()
+    ))
+}
+
 /// Move a record, running every transition that covers `(record.state, to)`.
 ///
 /// ⚠ This used to be `set_record_state` and nothing else. `check` would
@@ -47,6 +77,20 @@ fn store_err(e: impl std::fmt::Display) -> ExecError {
 /// only after both does the tracker state change. A failed flush refuses
 /// the move. A crash in between leaves evidence and no move, which is safe
 /// to retry. The reverse order would leave a move with no evidence.
+///
+/// ⚠ The state check and the state write are one step. The record's state is read once before
+/// the flush (a stale move is refused before it writes any evidence) and read AGAIN, under a
+/// per-record lock, immediately before `set_record_state`; the lock is held across just that
+/// re-read and write, never across the gates or the flush, which can run for a long time and
+/// reach the network. Two concurrent moves of one record therefore cannot both pass the check
+/// and both write: the second sees the first's state and gets `StaleMove`. Because the flush
+/// comes before the write, a move that loses at that point has already flushed its decision:
+/// evidence with no move, the state this ordering is designed to allow.
+///
+/// What this does NOT guarantee: the lock lives in this process. Two `fl` processes (or a
+/// process and a hub) moving one record can still interleave between the re-read and the write,
+/// because the tracker offers a read and a write, not a compare-and-set. Closing that needs a
+/// conditional `set_record_state` on every tracker, GitHub's included.
 pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveReport, ExecError> {
     let declared: Vec<Transition> = roles
         .catalog
@@ -86,12 +130,7 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
         .map_err(store_err)?
         .ok_or_else(|| store_err(StoreError::NoSuchRecord(record.id.clone())))?;
     if current.state != record.state {
-        return Err(ExecError::StaleMove(format!(
-            "record {} is now `{}`, not `{}` as when the move began; nothing was moved",
-            record.id,
-            current.state.as_wire(),
-            record.state.as_wire()
-        )));
+        return Err(stale_move(record, &current));
     }
 
     let outcome = if declared.is_empty() {
@@ -109,6 +148,17 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
         .map_err(refused_publish)?;
 
     if allowed {
+        // Held until the write returns. `current.id` is the primary id, so a move that names
+        // the record by an alias takes the same lock as one that names it by its id.
+        let _one_move_at_a_time = lock_record_for_move(&current.id);
+        let latest = roles
+            .tracker
+            .get_record(&record.id)
+            .map_err(store_err)?
+            .ok_or_else(|| store_err(StoreError::NoSuchRecord(record.id.clone())))?;
+        if latest.state != record.state {
+            return Err(stale_move(record, &latest));
+        }
         roles
             .tracker
             .set_record_state(&record.id, to)
@@ -131,12 +181,14 @@ mod tests {
     use super::*;
     use crate::journal::Journal;
     use fl_core::decision::Outcome;
+    use fl_core::finding::Finding;
     use fl_core::iri::Iri;
     use fl_core::log::{Attempt, GateRun};
     use fl_core::model::{CommandSpec, GateKind, PopulationDelivery, Regret, Selector, Transition};
     use fl_core::store::{Catalog, Ledger, StoreError, Tracker};
-    use fl_core::{GateId, MemStore, ProjectId};
+    use fl_core::{FindingId, GateId, MemStore, ProjectId};
     use std::process::Command;
+    use std::sync::Mutex;
 
     fn repo() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
@@ -500,5 +552,221 @@ mod tests {
             "a refused-as-stale move must not flush a decision: {:?}",
             journal.events()
         );
+    }
+
+    // --- the check and the write are one step ------------------------------------------------
+
+    /// A store that can be shared between threads: one record behind a mutex, no catalog (every
+    /// move is ungated), and a flush that can rendezvous the movers or move the record.
+    struct Shared {
+        record: Mutex<Record>,
+        /// Every mover waits here during its flush, so all have passed the pre-flush check
+        /// before any of them writes.
+        at_flush: Option<std::sync::Barrier>,
+        /// Run during the flush, as if another mover finished meanwhile.
+        on_flush: Option<fn(&Shared)>,
+        /// Widens the window between a read and the write that follows it.
+        read_pause: std::time::Duration,
+    }
+
+    impl Shared {
+        fn new(at_flush: Option<std::sync::Barrier>, on_flush: Option<fn(&Shared)>) -> Self {
+            Self {
+                record: Mutex::new(Record {
+                    id: RecordId(fl_core::ids::seq_iri(1)),
+                    project: ProjectId(fl_core::ids::seq_iri(2)),
+                    title: "t".into(),
+                    state: State::Todo,
+                    also_known_as: vec![],
+                    area: None,
+                }),
+                at_flush,
+                on_flush,
+                read_pause: std::time::Duration::from_millis(2),
+            }
+        }
+        fn snapshot(&self) -> Record {
+            self.record.lock().unwrap().clone()
+        }
+        fn roles(&self) -> Roles<'_> {
+            Roles {
+                catalog: self,
+                tracker: self,
+                ledger: self,
+            }
+        }
+    }
+
+    impl fl_core::store::Catalog for Shared {
+        fn add_project(&self, _: &str) -> Result<ProjectId, StoreError> {
+            unreachable!("not used")
+        }
+        fn get_project(
+            &self,
+            _: &ProjectId,
+        ) -> Result<Option<fl_core::model::Project>, StoreError> {
+            unreachable!("not used")
+        }
+        fn list_projects(&self) -> Result<Vec<fl_core::model::Project>, StoreError> {
+            unreachable!("not used")
+        }
+        fn add_gate(
+            &self,
+            _: &ProjectId,
+            _: &str,
+            _: GateKind,
+            _: Selector,
+            _: u64,
+            _: &str,
+            _: &str,
+        ) -> Result<GateId, StoreError> {
+            unreachable!("not used")
+        }
+        fn get_gate(&self, _: &GateId) -> Result<Option<fl_core::model::GateDef>, StoreError> {
+            unreachable!("not used")
+        }
+        fn list_gates(&self, _: &ProjectId) -> Result<Vec<fl_core::model::GateDef>, StoreError> {
+            unreachable!("not used")
+        }
+        fn update_gate(&self, _: &fl_core::model::GateDef) -> Result<(), StoreError> {
+            unreachable!("not used")
+        }
+        fn add_transition(&self, _: Transition) -> Result<(), StoreError> {
+            unreachable!("not used")
+        }
+        fn get_transition(&self, _: &ProjectId, _: &str) -> Result<Option<Transition>, StoreError> {
+            unreachable!("not used")
+        }
+        fn list_transitions(&self, _: &ProjectId) -> Result<Vec<Transition>, StoreError> {
+            Ok(vec![])
+        }
+        fn kind_of(&self, _: &Iri) -> Result<fl_core::ids::Kind, StoreError> {
+            unreachable!("not used")
+        }
+    }
+
+    impl Tracker for Shared {
+        fn add_record_with_area(
+            &self,
+            _: &ProjectId,
+            _: &str,
+            _: Option<&str>,
+        ) -> Result<RecordId, StoreError> {
+            unreachable!("not used")
+        }
+        fn get_record(&self, _: &RecordId) -> Result<Option<Record>, StoreError> {
+            let seen = self.snapshot();
+            // The stale answer is returned after a pause, as a slow tracker would.
+            std::thread::sleep(self.read_pause);
+            Ok(Some(seen))
+        }
+        fn list_records(&self, _: &ProjectId) -> Result<Vec<Record>, StoreError> {
+            unreachable!("not used")
+        }
+        fn set_record_state(&self, _: &RecordId, state: State) -> Result<(), StoreError> {
+            self.record.lock().unwrap().state = state;
+            Ok(())
+        }
+        fn add_finding(&self, _: Finding) -> Result<FindingId, StoreError> {
+            unreachable!("not used")
+        }
+        fn add_finding_checked(
+            &self,
+            _: Finding,
+            _: fl_core::routing::ForeignRecord,
+        ) -> Result<FindingId, StoreError> {
+            unreachable!("not used")
+        }
+        fn get_finding(&self, _: &FindingId) -> Result<Option<Finding>, StoreError> {
+            unreachable!("not used")
+        }
+        fn update_finding(&self, _: &Finding) -> Result<(), StoreError> {
+            unreachable!("not used")
+        }
+        fn list_findings(&self, _: &ProjectId) -> Result<Vec<Finding>, StoreError> {
+            unreachable!("not used")
+        }
+        fn withdrawals_by(&self, _: &str) -> Result<u64, StoreError> {
+            unreachable!("not used")
+        }
+        fn add_alias(&self, _: &Iri, _: Iri) -> Result<(), StoreError> {
+            unreachable!("not used")
+        }
+    }
+
+    impl Ledger for Shared {
+        fn append_gate_run(&self, _: GateRun) -> Result<(), StoreError> {
+            unreachable!("not used")
+        }
+        fn append_attempt(&self, _: Attempt) -> Result<(), StoreError> {
+            unreachable!("not used")
+        }
+        fn gate_runs(&self, _: &GateId) -> Result<Vec<GateRun>, StoreError> {
+            unreachable!("not used")
+        }
+        fn attempts(&self, _: &ProjectId) -> Result<Vec<Attempt>, StoreError> {
+            unreachable!("not used")
+        }
+        fn flush(&self, _: fl_core::decision::Decision) -> Result<Flushed, StoreError> {
+            if let Some(hook) = self.on_flush {
+                hook(self);
+            }
+            if let Some(barrier) = &self.at_flush {
+                barrier.wait();
+            }
+            Ok(Flushed::NOTHING)
+        }
+    }
+
+    /// The window the old code left open: the state was checked BEFORE the flush and written
+    /// after it with no second look, so a mover that finished during the flush was overwritten.
+    #[test]
+    fn a_record_moved_during_the_flush_is_not_overwritten() {
+        let store = Shared::new(
+            None,
+            Some(|s| s.record.lock().unwrap().state = State::Doing),
+        );
+        let began = store.snapshot();
+        let err = match move_record(store.roles(), &began, State::Done) {
+            Err(e) => e,
+            Ok(_) => panic!("a move over a state that changed during the flush was written"),
+        };
+        assert!(matches!(err, ExecError::StaleMove(_)), "{err:?}");
+        assert_eq!(store.snapshot().state, State::Doing);
+    }
+
+    /// Two movers start from one stale snapshot (`todo`) toward different targets. Both pass the
+    /// pre-flush check and meet at the flush, then race for the write. Exactly one may win; the
+    /// other must get `StaleMove`. Repeated, because without the lock the loser only sometimes
+    /// reads the record before the winner has written.
+    #[test]
+    fn two_concurrent_moves_of_one_record_let_exactly_one_write() {
+        for round in 0..100 {
+            let store = Shared::new(Some(std::sync::Barrier::new(2)), None);
+            let began = store.snapshot();
+            let results: Vec<Result<MoveReport, ExecError>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = [State::Doing, State::Done]
+                    .into_iter()
+                    .map(|to| {
+                        let (store, began) = (&store, &began);
+                        scope.spawn(move || move_record(store.roles(), began, to))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let won: Vec<State> = [State::Doing, State::Done]
+                .into_iter()
+                .zip(&results)
+                .filter(|(_, r)| r.is_ok())
+                .map(|(to, _)| to)
+                .collect();
+            let stale = results
+                .iter()
+                .filter(|r| matches!(r, Err(ExecError::StaleMove(_))))
+                .count();
+            assert_eq!(won.len(), 1, "round {round}: both movers wrote ({won:?})");
+            assert_eq!(stale, 1, "round {round}: the loser did not get StaleMove");
+            assert_eq!(store.snapshot().state, won[0], "round {round}");
+        }
     }
 }
