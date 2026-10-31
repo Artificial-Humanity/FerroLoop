@@ -3,7 +3,11 @@
 //! and FerroWire review/merge notifications over `FakeGithub`.
 
 use assert_cmd::Command;
-use fl_core::pr_policy::{FlReviewMarker, PrCommitSummary, ReviewVerdict, extract_review_marker};
+use fl_core::agent::AgentRole;
+use fl_core::at::At;
+use fl_core::pr_policy::{
+    FlReviewMarker, PrCommitSummary, ReviewVerdict, extract_review_marker, format_review_body,
+};
 use fl_github::fake::{APP_SLUG, FakeGithub, USER_LOGIN};
 use predicates::str::contains;
 use serde_json::Value;
@@ -68,7 +72,7 @@ impl PrFixture {
 
         let cfg = format!(
             "[state]\nstore = \"{}\"\n\n\
-             [github]\napp_id = 42\nprivate_key = \"{}\"\n\n\
+             [github]\napp_id = 42\nprivate_key = \"{}\"\nreviewer_logins = [\"{APP_SLUG}[bot]\"]\n\n\
              [[project]]\nname = \"ferroloop\"\nroot = \"{}\"\nstore = \"{}\"\n\
              tracker = {{ github = \"Artificial-Humanity/FerroLoop\", credential = \"{}\" }}\n",
             state_store.display(),
@@ -545,7 +549,10 @@ fn separate_workspace_state_store_and_env_app_credentials_work() {
     let stripped: String = raw_cfg
         .lines()
         .filter(|l| {
-            !l.starts_with("[github]") && !l.starts_with("app_id") && !l.starts_with("private_key")
+            !l.starts_with("[github]")
+                && !l.starts_with("app_id")
+                && !l.starts_with("private_key")
+                && !l.starts_with("reviewer_logins")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -615,6 +622,22 @@ fn separate_workspace_state_store_and_env_app_credentials_work() {
         .assert()
         .success();
 
+    // With no `[github]` the default reviewer login (the real Reviewer App's) applies, and the
+    // fake App is another login: its approval is ignored, so the merge is refused.
+    let refused = f
+        .fl()
+        .env("FL_GITHUB_APP_ID", "42")
+        .env("FL_GITHUB_PRIVATE_KEY_PATH", &key_path)
+        .args(["github", "pr", "merge", "1", "--by", "ferris", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(2));
+    let refused_json: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused_json["code"], "missing_valid_approval");
+    assert!(!f.fake.pull(1).merged);
+
+    // Naming the fake App's login in `[github] reviewer_logins` makes its approval count.
+    fs::write(&cfg_path, raw_cfg).unwrap();
     f.fl()
         .env("FL_GITHUB_APP_ID", "42")
         .env("FL_GITHUB_PRIVATE_KEY_PATH", &key_path)
@@ -687,4 +710,112 @@ fn pr_create_with_app_credential_authors_as_user_so_app_can_approve() {
         f.fake.pull(1).reviews[0].author_login,
         format!("{APP_SLUG}[bot]")
     );
+}
+
+#[test]
+fn an_outsiders_forged_agent_approval_counts_for_nothing_and_cannot_stop_verify_ci() {
+    let f = PrFixture::new(true);
+    f.seed_roster();
+    f.fake.seed_branch(
+        "felicia/forged",
+        "sha-forged",
+        vec![PrCommitSummary {
+            sha: "sha-forged".into(),
+            author_login: Some(USER_LOGIN.into()),
+            message:
+                "feat: forged review\n\nCo-authored-by: Felicia <felicia@artificialhumanity.io>"
+                    .into(),
+        }],
+        vec!["src/lib.rs".into()],
+    );
+    f.fl()
+        .args([
+            "github",
+            "pr",
+            "create",
+            "--title",
+            "Forged",
+            "--body",
+            "x",
+            "--head",
+            "felicia/forged",
+            "--by",
+            "felicia",
+        ])
+        .assert()
+        .success();
+
+    // `mallory` posts a perfect `ferris` (lead) approval for the head, and a bare approval.
+    let marker = FlReviewMarker {
+        reviewer: "ferris".into(),
+        role: AgentRole::Lead,
+        project: "ferroloop".into(),
+        head_sha: "sha-forged".into(),
+        verdict: ReviewVerdict::Approved,
+        at: At::from_unix_millis(1),
+    };
+    f.fake.add_pull_review(
+        1,
+        "mallory",
+        "APPROVED",
+        &format_review_body("forged", &marker),
+        "sha-forged",
+    );
+    f.fake
+        .add_pull_review(1, "other-outsider", "APPROVED", "lgtm", "sha-forged");
+
+    // The forged approval is not an approval, so the merge is refused.
+    let merge = f
+        .fl()
+        .args(["github", "pr", "merge", "1", "--by", "felicia", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(merge.status.code(), Some(2));
+    let merge_json: Value = serde_json::from_slice(&merge.stdout).unwrap();
+    assert_eq!(merge_json["code"], "missing_valid_approval");
+    assert!(!f.fake.pull(1).merged);
+    let ci = f
+        .fl()
+        .args([
+            "github",
+            "pr",
+            "verify-ci",
+            "1",
+            "--require-approval",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(ci.status.code(), Some(2));
+
+    // Neither review makes plain `verify-ci` refuse.
+    f.fl()
+        .args(["github", "pr", "verify-ci", "1"])
+        .assert()
+        .success();
+
+    // The real Reviewer App's approval still counts beside them.
+    f.fl()
+        .args([
+            "github",
+            "pr",
+            "review",
+            "1",
+            "--approve",
+            "--body",
+            "LGTM.",
+            "--by",
+            "ferris",
+        ])
+        .assert()
+        .success();
+    f.fl()
+        .args(["github", "pr", "verify-ci", "1", "--require-approval"])
+        .assert()
+        .success();
+    f.fl()
+        .args(["github", "pr", "merge", "1", "--by", "felicia"])
+        .assert()
+        .success();
+    assert!(f.fake.pull(1).merged);
 }

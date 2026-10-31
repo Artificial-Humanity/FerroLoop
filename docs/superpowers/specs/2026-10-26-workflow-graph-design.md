@@ -530,7 +530,7 @@ To match the workspace Author-Owned Merge rule (`.agents` commit `6c0e738`), `cr
    - `caller.status == AgentStatus::Active` (else `UnknownOrInactiveAgent`).
    - `eval.unattributed_commits.is_empty()` and `eval.unknown_co_authors.is_empty()`.
    - `caller` is a recorded commit co-author in `eval.co_authors` (author-owned merge across all tiers, including `Lead`, `LabManager`, and `Owner`-reviewed PRs touching protected paths once `lmcfarlin` approves on GitHub), OR `authorize_agent_action(eval, caller)` succeeds.
-3. `PrCmd::Merge` in `crates/cli/src/cmd/pr.rs` calls `authorize_agent_merge(&eval, &caller)` followed by `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN)`.
+3. `PrCmd::Merge` in `crates/cli/src/cmd/pr.rs` calls `authorize_agent_merge(&eval, &caller)` followed by `verify_merge_approvals(&pr.head_sha, &eval, &reviews, &agents, DEFAULT_OWNER_LOGIN, &reviewer_logins)`.
 
 ---
 
