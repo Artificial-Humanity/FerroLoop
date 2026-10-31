@@ -86,7 +86,7 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
         .map_err(store_err)?
         .ok_or_else(|| store_err(StoreError::NoSuchRecord(record.id.clone())))?;
     if current.state != record.state {
-        return Err(store_err(format!(
+        return Err(ExecError::StaleMove(format!(
             "record {} is now `{}`, not `{}` as when the move began; nothing was moved",
             record.id,
             current.state.as_wire(),
@@ -483,7 +483,14 @@ mod tests {
             Err(e) => e,
             Ok(_) => panic!("a stale move was carried out"),
         };
-        assert!(err.to_string().contains("nothing was moved"), "{err}");
+        assert!(matches!(err, ExecError::StaleMove(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "record {} is now `doing`, not `todo` as when the move began; nothing was moved",
+                stale.id
+            )
+        );
         assert_eq!(
             store.get_record(&stale.id).unwrap().unwrap().state,
             State::Doing

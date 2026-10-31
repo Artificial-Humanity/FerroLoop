@@ -173,12 +173,73 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
 #[cfg(test)]
 pub(crate) static CODEX_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Longest a vendor CLI (`codex`, `muse`, `grok`, `agy`) may run for one delivery. A hung CLI
-/// would otherwise hold the dispatch thread, and with it every later delivery, indefinitely.
-const VENDOR_CLI_TIMEOUT: Duration = Duration::from_secs(60);
+/// Longest a quick enqueue call (`codex queue`, `agy agentapi send-message`) may run. These
+/// hand the text to a live session and return; a hung one would otherwise hold the dispatch
+/// thread, and with it every later delivery, indefinitely.
+const ENQUEUE_CLI_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn run_status_with_etxtbsy_retry(cmd: &mut Command) -> std::io::Result<std::process::ExitStatus> {
-    run_status_with_timeout(cmd, VENDOR_CLI_TIMEOUT)
+/// Default ceiling for the headless fallbacks (`muse exec`, `grok -p`), which run a whole agent
+/// turn to completion. A normal turn can take many minutes, and killing one mid-run fails the
+/// delivery, leaves the receipt `Pending`, and re-sends the same prompt on the next attempt.
+const HEADLESS_CLI_TIMEOUT_DEFAULT: Duration = Duration::from_secs(15 * 60);
+/// Environment variable that overrides [`HEADLESS_CLI_TIMEOUT_DEFAULT`], in seconds.
+const HEADLESS_CLI_TIMEOUT_ENV: &str = "FL_WIRE_HEADLESS_TIMEOUT_SECS";
+/// Bounds applied to the override: never below the enqueue ceiling, never beyond a day.
+const HEADLESS_CLI_TIMEOUT_MIN_SECS: u64 = 60;
+const HEADLESS_CLI_TIMEOUT_MAX_SECS: u64 = 24 * 60 * 60;
+
+/// Which ceiling a vendor CLI invocation gets.
+#[derive(Clone, Copy)]
+enum CliKind {
+    /// A quick hand-off that returns at once.
+    Enqueue,
+    /// A whole agent turn run to completion.
+    Headless,
+}
+
+/// Parse the headless-timeout override: unset, empty or unparsable falls back to the default;
+/// a number is clamped into the allowed range.
+fn parse_headless_timeout(raw: Option<&str>) -> Duration {
+    match raw.map(str::trim).and_then(|s| s.parse::<u64>().ok()) {
+        Some(secs) => Duration::from_secs(
+            secs.clamp(HEADLESS_CLI_TIMEOUT_MIN_SECS, HEADLESS_CLI_TIMEOUT_MAX_SECS),
+        ),
+        None => HEADLESS_CLI_TIMEOUT_DEFAULT,
+    }
+}
+
+/// The headless ceiling, read from the environment once per process.
+fn headless_cli_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        parse_headless_timeout(std::env::var(HEADLESS_CLI_TIMEOUT_ENV).ok().as_deref())
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread `(enqueue, headless)` ceilings so a test can shorten them without touching
+    /// process-global state.
+    static CLI_TIMEOUT_OVERRIDE: std::cell::Cell<Option<(Duration, Duration)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn cli_timeout(kind: CliKind) -> Duration {
+    #[cfg(test)]
+    if let Some((enqueue, headless)) = CLI_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return match kind {
+            CliKind::Enqueue => enqueue,
+            CliKind::Headless => headless,
+        };
+    }
+    match kind {
+        CliKind::Enqueue => ENQUEUE_CLI_TIMEOUT,
+        CliKind::Headless => headless_cli_timeout(),
+    }
+}
+
+fn run_vendor_cli(cmd: &mut Command, kind: CliKind) -> std::io::Result<std::process::ExitStatus> {
+    run_status_with_timeout(cmd, cli_timeout(kind))
 }
 
 /// Spawn `cmd` (retrying `ETXTBSY`, which a just-written script can raise) and wait up to
@@ -235,26 +296,46 @@ fn deliver_to_codex_route(
 
     let mut last_err = String::new();
     for bin in bins {
-        let mut cmd = Command::new(&bin);
-        cmd.args(["queue", "--thread", thread_id, "--message", text])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        if let Some(dir) = cwd
-            && dir.exists()
-        {
-            cmd.current_dir(dir);
-        }
-        match run_status_with_etxtbsy_retry(&mut cmd) {
-            Ok(status) if status.success() => return Ok(()),
-            Ok(status) => {
-                return Err(format!("codex queue exited with {status}"));
-            }
-            Err(e) => {
-                last_err = format!("failed to spawn codex queue: {e}");
-            }
+        match run_codex_queue(&bin, thread_id, cwd, text) {
+            Ok(()) => return Ok(()),
+            Err(CodexQueueError::Spawn(e)) => last_err = e,
+            Err(CodexQueueError::Exit(e)) => return Err(e),
         }
     }
     Err(last_err)
+}
+
+/// Why one `codex queue` attempt failed: a spawn or timeout failure lets the caller try the
+/// next candidate binary; a non-zero exit is final.
+enum CodexQueueError {
+    Spawn(String),
+    Exit(String),
+}
+
+fn run_codex_queue(
+    bin: &Path,
+    thread_id: &str,
+    cwd: Option<&PathBuf>,
+    text: &str,
+) -> Result<(), CodexQueueError> {
+    let mut cmd = Command::new(bin);
+    cmd.args(["queue", "--thread", thread_id, "--message", text])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(dir) = cwd
+        && dir.exists()
+    {
+        cmd.current_dir(dir);
+    }
+    match run_vendor_cli(&mut cmd, CliKind::Enqueue) {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(CodexQueueError::Exit(format!(
+            "codex queue exited with {status}"
+        ))),
+        Err(e) => Err(CodexQueueError::Spawn(format!(
+            "failed to spawn codex queue: {e}"
+        ))),
+    }
 }
 
 /// Deliver a human operator chat prompt from FerroDeck directly to a live vendor session
@@ -288,7 +369,17 @@ fn deliver_to_muse_route(
     let bin = std::env::var_os("FL_WIRE_MUSE_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("muse"));
-    let mut cmd = Command::new(&bin);
+    run_muse_exec(&bin, session_id, cwd, text)
+}
+
+/// The non-tmux fallback: `muse exec` runs the whole turn, so it gets the headless ceiling.
+fn run_muse_exec(
+    bin: &Path,
+    session_id: &str,
+    cwd: Option<&PathBuf>,
+    text: &str,
+) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
     cmd.env("MUSE_NO_AUTO_UPDATE", "1");
     cmd.args(["exec", "--session-id", session_id, "--json", text])
         .stdout(std::process::Stdio::null())
@@ -298,7 +389,7 @@ fn deliver_to_muse_route(
     {
         cmd.current_dir(dir);
     }
-    let status = run_status_with_etxtbsy_retry(&mut cmd)
+    let status = run_vendor_cli(&mut cmd, CliKind::Headless)
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
     if !status.success() {
         return Err(format!("muse exec exited with {status}"));
@@ -335,7 +426,17 @@ fn deliver_to_grok_route(
     let bin = std::env::var_os("FL_WIRE_GROK_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("grok"));
-    let mut cmd = Command::new(&bin);
+    run_grok_headless(&bin, session_id, cwd, text)
+}
+
+/// The non-tmux fallback: `grok -p` runs the whole turn, so it gets the headless ceiling.
+fn run_grok_headless(
+    bin: &Path,
+    session_id: &str,
+    cwd: Option<&PathBuf>,
+    text: &str,
+) -> Result<(), String> {
+    let mut cmd = Command::new(bin);
     cmd.args([
         "--no-auto-update",
         "--no-alt-screen",
@@ -352,7 +453,7 @@ fn deliver_to_grok_route(
     {
         cmd.current_dir(dir);
     }
-    let status = run_status_with_etxtbsy_retry(&mut cmd)
+    let status = run_vendor_cli(&mut cmd, CliKind::Headless)
         .map_err(|e| format!("failed to spawn {}: {e}", bin.display()))?;
     if !status.success() {
         return Err(format!("grok exited with {status}"));
@@ -404,7 +505,7 @@ fn deliver_to_agy_route(
     if !csrf.is_empty() {
         cmd.env("ANTIGRAVITY_CSRF_TOKEN", &csrf);
     }
-    let status = run_status_with_etxtbsy_retry(&mut cmd)
+    let status = run_vendor_cli(&mut cmd, CliKind::Enqueue)
         .map_err(|e| format!("failed to spawn {}: {e}", exe.display()))?;
     if !status.success() {
         return Err(format!("agy send-message exited with {status}"));
@@ -2967,6 +3068,87 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[test]
+    fn headless_fallbacks_are_not_killed_by_the_enqueue_timeout() {
+        // Enqueue ceiling 300 ms, headless 20 s; the fake CLIs run for 1.2 s, as a long agent
+        // turn would. They must complete, not be killed and re-delivered.
+        CLI_TIMEOUT_OVERRIDE.with(|c| {
+            c.set(Some((Duration::from_millis(300), Duration::from_secs(20))));
+        });
+        let tmp = TempDir::new().unwrap();
+        let slow_ok = write_script(tmp.path(), "slow-ok.sh", "sleep 1.2");
+        let muse = run_muse_exec(&slow_ok, "sess", None, "hello");
+        let grok = run_grok_headless(&slow_ok, "sess", None, "hello");
+        CLI_TIMEOUT_OVERRIDE.with(|c| c.set(None));
+        muse.expect("muse exec outlives the enqueue ceiling");
+        grok.expect("grok -p outlives the enqueue ceiling");
+    }
+
+    #[test]
+    fn a_hung_headless_cli_is_still_killed_at_the_headless_ceiling() {
+        CLI_TIMEOUT_OVERRIDE.with(|c| {
+            c.set(Some((Duration::from_secs(20), Duration::from_millis(300))));
+        });
+        let tmp = TempDir::new().unwrap();
+        let hung = write_script(tmp.path(), "hung.sh", "exec sleep 30");
+        let started = Instant::now();
+        let muse = run_muse_exec(&hung, "sess", None, "hello");
+        let grok = run_grok_headless(&hung, "sess", None, "hello");
+        CLI_TIMEOUT_OVERRIDE.with(|c| c.set(None));
+        assert!(muse.unwrap_err().contains("did not finish"));
+        assert!(grok.unwrap_err().contains("did not finish"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_hung_quick_enqueue_cli_is_killed_at_the_short_timeout() {
+        CLI_TIMEOUT_OVERRIDE.with(|c| {
+            c.set(Some((Duration::from_millis(300), Duration::from_secs(20))));
+        });
+        let tmp = TempDir::new().unwrap();
+        let hung = write_script(tmp.path(), "hung-codex.sh", "exec sleep 30");
+        let started = Instant::now();
+        let result = run_codex_queue(&hung, "thread", None, "hello");
+        CLI_TIMEOUT_OVERRIDE.with(|c| c.set(None));
+        match result {
+            Err(CodexQueueError::Spawn(e)) => assert!(e.contains("did not finish"), "{e}"),
+            _ => panic!("expected a timeout from the hung enqueue CLI"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn headless_timeout_override_is_parsed_and_clamped() {
+        assert_eq!(parse_headless_timeout(None), HEADLESS_CLI_TIMEOUT_DEFAULT);
+        assert_eq!(
+            parse_headless_timeout(Some("")),
+            HEADLESS_CLI_TIMEOUT_DEFAULT
+        );
+        assert_eq!(
+            parse_headless_timeout(Some("abc")),
+            HEADLESS_CLI_TIMEOUT_DEFAULT
+        );
+        assert_eq!(
+            parse_headless_timeout(Some(" 120 ")),
+            Duration::from_secs(120)
+        );
+        assert_eq!(parse_headless_timeout(Some("1")), Duration::from_secs(60));
+        assert_eq!(parse_headless_timeout(Some("0")), Duration::from_secs(60));
+        assert_eq!(
+            parse_headless_timeout(Some("999999999")),
+            Duration::from_secs(24 * 60 * 60)
+        );
+        const { assert!(HEADLESS_CLI_TIMEOUT_DEFAULT.as_secs() > ENQUEUE_CLI_TIMEOUT.as_secs()) };
     }
 
     #[test]

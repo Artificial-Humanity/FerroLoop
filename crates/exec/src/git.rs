@@ -204,6 +204,10 @@ impl Git {
     ///
     /// Read with `-z` so a path with a non-ASCII byte, quote, tab or newline comes back as the
     /// file's real name, not git's C-quoted form.
+    ///
+    /// Limit: [`GitTreeEntry::path`] is a `String`, so a path that is not valid UTF-8 is read
+    /// lossily (invalid bytes become U+FFFD) and is not the file's exact name. Such a name cannot
+    /// round-trip through [`Git::mktree`].
     pub fn ls_tree(root: &Path, treeish: &str) -> Result<Vec<GitTreeEntry>, ExecError> {
         let treeish = plain_arg("tree-ish", treeish)?;
         let raw = git_raw(root, &["ls-tree", "-r", "-z", treeish])?;
@@ -212,6 +216,7 @@ impl Git {
             if record.is_empty() {
                 continue;
             }
+            // Lossy on purpose: see the UTF-8 limit in the doc comment.
             let record = String::from_utf8_lossy(record);
             let Some((meta, path)) = record.split_once('\t') else {
                 continue;

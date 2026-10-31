@@ -65,6 +65,13 @@ pub struct PeerHandshakeOutcome {
 /// Both ends run the same handshake, so without a role in the MAC input a peer could ask the
 /// victim to sign a challenge on one connection and replay that answer on another (a reflection
 /// attack that needs no PSK). A MAC made by a `Server` never verifies as a `Client` MAC.
+///
+/// Residual (not fixed here): the role tag stops an off-path attacker who opens two connections.
+/// It does not stop an attacker ON THE PATH of a plaintext `ws://` connection the victim dials
+/// while the victim also listens: the attacker can pick its server nonce equal to the victim's
+/// listener nonce and relay frames between the two connections. The handshake also gives no
+/// channel binding and the frames after it carry no MAC, so a plaintext path attacker can hijack
+/// an established session regardless. Use `wss://` for any non-loopback peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRole {
     Client,

@@ -709,6 +709,9 @@ pub fn assign_workflow_step(
     at: At,
     by: &str,
 ) -> Result<WorkflowRun, WorkflowExecError> {
+    // Read-modify-write of the stored run: serialised with every other commit (approve, reject,
+    // abort and step results) so a concurrent one is not overwritten with this stale copy.
+    let _commit = lock_run_commits();
     let mut run = workflows
         .get_workflow_run(run_id)?
         .ok_or_else(|| StoreError::NoSuchWorkflowRun(run_id.to_string()))?;
@@ -2333,6 +2336,43 @@ on = "pass"
                 authored_by: "ferris".into(),
             })
             .unwrap()
+    }
+
+    /// `assign_workflow_step` rewrites the stored run, so it must wait for the run-commit lock
+    /// like approve, reject and abort do. Another thread holds the lock for 400 ms; the call
+    /// must not return before it is released.
+    #[test]
+    fn assigning_a_step_waits_for_the_run_commit_lock() {
+        let store = MemStore::default();
+        let def = one_step_def(&store);
+        let run = start_workflow_run(&store, &def, "assign me", At::from_unix_millis(5), "ferris")
+            .unwrap();
+        let hold = std::time::Duration::from_millis(400);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _held = lock_run_commits();
+            tx.send(()).unwrap();
+            std::thread::sleep(hold);
+        });
+        rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        let _ = assign_workflow_step(
+            &store,
+            &store,
+            &def,
+            &run.id,
+            "only",
+            "nobody",
+            None,
+            At::from_unix_millis(6),
+            "ferris",
+        );
+        assert!(
+            started.elapsed() >= hold - std::time::Duration::from_millis(100),
+            "assign_workflow_step ran while the run-commit lock was held: {:?}",
+            started.elapsed()
+        );
+        holder.join().unwrap();
     }
 
     /// Audit X-2: `abort_workflow_run` set `Canceled` on any run, including one that had already

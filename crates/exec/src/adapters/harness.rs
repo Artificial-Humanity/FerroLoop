@@ -25,6 +25,38 @@ const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How often a running attempt's spend is compared with its ceiling.
 const BUDGET_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Decides which ticks of the supervision loop also send a heartbeat. It counts ticks instead of
+/// comparing wall-clock time: the loop ticks every `check_every`, and a clock comparison taken
+/// just after the previous heartbeat always came out a hair under the interval, so every second
+/// check was skipped and heartbeats arrived at twice the configured interval.
+struct HeartbeatPacer {
+    ticks_per_beat: u32,
+    ticks: u32,
+}
+
+impl HeartbeatPacer {
+    fn new(heartbeat_interval: Duration, check_every: Duration) -> Self {
+        let ratio = heartbeat_interval
+            .as_nanos()
+            .div_ceil(check_every.as_nanos().max(1));
+        Self {
+            ticks_per_beat: u32::try_from(ratio).unwrap_or(u32::MAX).max(1),
+            ticks: 0,
+        }
+    }
+
+    /// Call once per tick; true when this tick should send a heartbeat.
+    fn tick(&mut self) -> bool {
+        self.ticks += 1;
+        if self.ticks >= self.ticks_per_beat {
+            self.ticks = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedOutput {
     pub excerpt_text: String,
@@ -228,7 +260,7 @@ impl<D: CliDialect> ProcessHarness<D> {
         let check_every = self.heartbeat_interval.min(BUDGET_CHECK_INTERVAL);
         let mut interval = tokio::time::interval(check_every);
         interval.tick().await; // consume immediate first tick
-        let mut last_heartbeat = Instant::now();
+        let mut pacer = HeartbeatPacer::new(self.heartbeat_interval, check_every);
         let mut over_budget = false;
 
         let wait_result = loop {
@@ -250,8 +282,7 @@ impl<D: CliDialect> ProcessHarness<D> {
                         partial.tokens_out,
                         partial.vendor_cost_usd_micros,
                     );
-                    if last_heartbeat.elapsed() >= self.heartbeat_interval {
-                        last_heartbeat = Instant::now();
+                    if pacer.tick() {
                         hb.heartbeat_at = now_at();
                         hb.duration_ms = started.elapsed().as_millis() as u64;
                         hb.tokens_in = partial.tokens_in;
@@ -803,6 +834,26 @@ fn hash_worktree_path(full_path: &Path) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heartbeats_fire_every_interval_not_every_second_one() {
+        // Default shape: heartbeat every 5 s, supervision tick every 1 s.
+        let mut pacer = HeartbeatPacer::new(Duration::from_secs(5), Duration::from_secs(1));
+        let beats: Vec<u32> = (1..=20).filter(|_| pacer.tick()).collect();
+        assert_eq!(beats.len(), 4, "one heartbeat per 5 ticks over 20 ticks");
+        let mut pacer = HeartbeatPacer::new(Duration::from_secs(5), Duration::from_secs(1));
+        let at: Vec<u32> = (1..=20).filter(|_| pacer.tick()).collect();
+        assert_eq!(at, vec![5, 10, 15, 20]);
+        // Interval at or below the check period: every tick beats.
+        let mut fast = HeartbeatPacer::new(Duration::from_millis(50), Duration::from_millis(50));
+        assert!((0..10).all(|_| fast.tick()));
+        // Not a whole multiple: rounds up, never beats early.
+        let mut odd = HeartbeatPacer::new(Duration::from_millis(1500), Duration::from_secs(1));
+        assert_eq!(
+            (1..=4).map(|_| odd.tick()).collect::<Vec<_>>(),
+            [false, true, false, true]
+        );
+    }
+
     use super::*;
     use fl_core::ids::{RecordId, seq_iri};
     use std::sync::Mutex;

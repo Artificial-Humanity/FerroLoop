@@ -81,6 +81,10 @@ pub fn run_command_gate(
     cmd.args(&spec.args)
         .current_dir(root)
         .process_group(0)
+        // No inherited stdin: in its own process group the command is a background job, and a
+        // read from a controlling terminal would stop it (SIGTTIN) until its timeout. Only
+        // `Stdin` delivery, below, gives it a pipe.
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -304,6 +308,36 @@ mod tests {
             delivery,
             timeout_secs: 10,
             pass_codes: vec![0],
+        }
+    }
+
+    /// A gate that reads stdin but is not given the population on it must see EOF at once, not
+    /// the caller's terminal or pipe (which, from a separate process group, would stall it).
+    #[test]
+    fn a_gate_that_is_not_given_stdin_delivery_sees_closed_stdin_at_once() {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(d.path().join("a.txt"), "x").unwrap();
+        let pop = vec![d.path().join("a.txt")];
+        for delivery in [PopulationDelivery::Args, PopulationDelivery::FileList] {
+            let mut gate = spec("sh", &["-c", "cat >/dev/null; echo drained"], delivery);
+            gate.timeout_secs = 20;
+            let started = Instant::now();
+            let out = run_command_gate(d.path(), &gate, &pop, 1);
+            assert_eq!(
+                out.verdict,
+                Verdict::from_predicate(true, 1),
+                "{}",
+                out.output_excerpt
+            );
+            assert!(
+                out.output_excerpt.contains("drained"),
+                "{}",
+                out.output_excerpt
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "{delivery:?}: the gate waited on an inherited stdin"
+            );
         }
     }
 

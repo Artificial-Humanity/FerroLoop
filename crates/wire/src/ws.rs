@@ -478,7 +478,13 @@ fn read_http_headers<R: Read>(reader: &mut R) -> Result<String, WsError> {
     let mut buf = Vec::with_capacity(512);
     let mut byte = [0u8; 1];
     while buf.len() < 16_384 {
-        let n = reader.read(&mut byte)?;
+        // A signal (a child's SIGCHLD is enough) interrupts a read on a socket with a receive
+        // timeout and Linux does not restart it; no byte was consumed, so read again.
+        let n = match reader.read(&mut byte) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        };
         if n == 0 {
             return Err(WsError::Handshake("unexpected EOF reading headers".into()));
         }
@@ -570,6 +576,41 @@ fn sha1_digest(data: &[u8]) -> [u8; 20] {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    /// Yields `Interrupted` before every real byte, as a signal-hit socket read does.
+    struct InterruptedThenBytes {
+        data: Vec<u8>,
+        pos: usize,
+        pending_interrupt: bool,
+    }
+
+    impl Read for InterruptedThenBytes {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pending_interrupt {
+                self.pending_interrupt = false;
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+            self.pending_interrupt = true;
+            let Some(&b) = self.data.get(self.pos) else {
+                return Ok(0);
+            };
+            buf[0] = b;
+            self.pos += 1;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn header_reads_survive_interrupted_syscalls() {
+        let raw = b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n";
+        let mut reader = InterruptedThenBytes {
+            data: raw.to_vec(),
+            pos: 0,
+            pending_interrupt: true,
+        };
+        let headers = read_http_headers(&mut reader).expect("Interrupted is retried");
+        assert_eq!(headers.as_bytes(), raw);
+    }
 
     #[test]
     fn rfc6455_accept_key_matches_spec_test_vector() {

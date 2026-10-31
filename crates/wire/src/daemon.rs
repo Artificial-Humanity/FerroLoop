@@ -347,7 +347,8 @@ where
         // `routes` lock is held only to copy the table out and to merge it back: pushing runs
         // vendor CLIs, and `Status` and `RegisterRoute` must not wait behind one.
         let _one_at_a_time = lock(&self.dispatch_gate);
-        let mut working = lock(&self.routes).clone();
+        let base = lock(&self.routes).clone();
+        let mut working = base.clone();
         let updated = dispatch_message_for_store(
             self.store.as_ref(),
             &mut working,
@@ -355,7 +356,8 @@ where
             msg,
             now,
         );
-        lock(&self.routes).merge_newer(working);
+        // Discovery inside the dispatch also prunes dead routes; carry those removals back.
+        lock(&self.routes).merge_dispatch_result(&base, working);
         for rcpt in updated {
             self.notify_subscribers_receipt(&rcpt);
             self.broadcast_to_peers(None, &PeerFrame::ReceiptUpdate { receipt: rcpt });
@@ -1197,6 +1199,67 @@ mod tests {
         }
     }
 
+    /// A dispatch runs route discovery on a working copy; routes it prunes (a derived Claude
+    /// session name, a dead pid) must leave the live table, `Status` and the saved file too.
+    #[test]
+    fn a_route_pruned_during_dispatch_leaves_status_and_the_saved_file() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join(".claude").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("4242.json"),
+            r#"{"sessionId":"s-derived","name":"lmcfarlin-e6","nameSource":"derived"}"#,
+        )
+        .unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("s.redb")).unwrap());
+        let cfg = test_config(tmp.path(), "prune");
+        let sock = cfg.socket_path.clone();
+        let routes_file = cfg.routes_path.clone().unwrap();
+        let _daemon = spawn_daemon(Arc::clone(&store), cfg).unwrap();
+        let request = |req: LocalRequest| {
+            LocalClient::connect(&sock, Duration::from_secs(5))
+                .unwrap()
+                .request(&req)
+                .unwrap()
+        };
+        let status_personas = || match request(LocalRequest::Status) {
+            LocalResponse::Status(st) => {
+                st.routes.into_iter().map(|r| r.persona).collect::<Vec<_>>()
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+        request(LocalRequest::RegisterRoute {
+            persona: "lmcfarlin-e6".into(),
+            route: VendorRoute::Claude {
+                pid: 4242,
+                session_id: "s-derived".into(),
+                socket_path: tmp.path().join("claude.sock"),
+                key_path: None,
+            },
+        });
+        assert_eq!(status_personas(), vec!["lmcfarlin-e6"]);
+
+        // Any send runs a dispatch, whose discovery prunes the derived route.
+        request(LocalRequest::Send {
+            args: mail("kayla", "prune"),
+        });
+        assert!(
+            status_personas().is_empty(),
+            "the pruned route must not linger in Status"
+        );
+        // The next RegisterRoute saves the live table; the pruned route must not come back.
+        request(LocalRequest::RegisterRoute {
+            persona: "other".into(),
+            route: VendorRoute::Codex {
+                thread_id: "t".into(),
+                cwd: None,
+            },
+        });
+        let saved = fs::read_to_string(&routes_file).unwrap();
+        assert!(saved.contains("other"), "{saved}");
+        assert!(!saved.contains("lmcfarlin-e6"), "{saved}");
+    }
+
     /// Audit D-1: the dispatch ran vendor CLIs while holding the route-table lock, so one slow
     /// `codex` froze `Status` and `RegisterRoute` for as long as it ran.
     #[test]
@@ -1338,7 +1401,8 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         // A purely local daemon has no peer to authenticate.
         cfg.peers.clear();
-        assert!(spawn_daemon(store, cfg).is_ok());
+        let r = spawn_daemon(store, cfg);
+        assert!(r.is_ok(), "{:?}", r.err());
     }
 
     #[test]
@@ -1354,6 +1418,12 @@ mod tests {
         assert_eq!(fs::read_to_string(&precious).unwrap(), "keep me");
     }
 
+    /// Flake cause (reproduced, see the audit report): another test thread forks a child
+    /// (`Command::spawn`) while this test's listener exists. The child holds a copy of the
+    /// listener fd until it execs, so after the listener is dropped the socket file still
+    /// accepts connections for a short while, `spawn_daemon` correctly reports `AddrInUse`, and
+    /// a one-shot assertion fails under load. A socket that only a leaked fd keeps alive becomes
+    /// stale once the child execs, so the replacement is retried within a bound.
     #[test]
     fn a_second_daemon_on_a_live_socket_is_refused_and_a_stale_socket_is_replaced() {
         let tmp = TempDir::new().unwrap();
@@ -1366,7 +1436,16 @@ mod tests {
         // A socket file left behind by a crashed daemon is stale and gets replaced.
         drop(UnixListener::bind(&cfg.socket_path).unwrap());
         assert!(cfg.socket_path.exists());
-        assert!(spawn_daemon(store, cfg).is_ok());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let replaced = loop {
+            match spawn_daemon(Arc::clone(&store), cfg.clone()) {
+                Err(e) if e.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                other => break other,
+            }
+        };
+        assert!(replaced.is_ok(), "{:?}", replaced.err());
     }
 
     #[test]

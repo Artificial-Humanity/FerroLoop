@@ -41,6 +41,11 @@ pub enum ExecError {
     /// tell a refusal from a fault.
     #[error("{0}")]
     Escalation(String),
+    /// ⚠ The record was moved by someone else while this move's gates ran, so writing the new
+    /// state would skip the gates that cover its real state. Nothing was moved. A conflict, not
+    /// a fault: kept apart from [`ExecError::Store`] so a caller can answer it as one.
+    #[error("{0}")]
+    StaleMove(String),
     #[error("command `{0}` could not be run: {1}")]
     Spawn(String, String),
     /// ⚠ A population command that exits non-zero has told you nothing about

@@ -479,7 +479,7 @@ fn find_record(store: &(impl Tracker + Handles), id: &str) -> Result<Record, Htt
 fn exec_error_response(err: &ExecError) -> HttpResponse {
     let status = match err {
         ExecError::Unpublished(_) => 503,
-        ExecError::PublishRefused(_) | ExecError::Escalation(_) => 409,
+        ExecError::PublishRefused(_) | ExecError::Escalation(_) | ExecError::StaleMove(_) => 409,
         ExecError::BadSelector(_) => 422,
         _ => 500,
     };
@@ -1414,6 +1414,12 @@ mod tests {
             exec_error_response(&ExecError::BadSelector("x".into())).status,
             422
         );
+        // A record moved by someone else mid-gate is a conflict, not a server fault.
+        let stale = exec_error_response(&ExecError::StaleMove("record moved".into()));
+        assert_eq!(stale.status, 409);
+        let body = stale.json_value().unwrap();
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "record moved");
         for e in [
             ExecError::Store("x".into()),
             ExecError::Git("x".into()),

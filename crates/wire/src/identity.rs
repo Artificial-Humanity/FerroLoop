@@ -281,6 +281,20 @@ impl RouteTable {
         }
     }
 
+    /// Fold the result of a dispatch back into the live table. `working` started as a clone of
+    /// `base` and went through `discover_routes`, which both adds routes and prunes dead ones.
+    /// A route that `base` held but `working` dropped is removed here too, unless the live table
+    /// changed it meanwhile (a concurrent `RegisterRoute`), in which case the live entry wins.
+    /// Everything else merges as in [`RouteTable::merge_newer`].
+    pub fn merge_dispatch_result(&mut self, base: &Self, working: Self) {
+        for (key, base_entry) in &base.entries {
+            if !working.entries.contains_key(key) && self.entries.get(key) == Some(base_entry) {
+                self.entries.remove(key);
+            }
+        }
+        self.merge_newer(working);
+    }
+
     fn load_file(path: &Path) -> Option<Self> {
         let raw = fs::read_to_string(path).ok()?;
         if let Ok(table) = serde_json::from_str::<RouteTable>(&raw) {
@@ -3758,6 +3772,34 @@ mod tests {
         assert_eq!(thread(&a, "newer-in-a"), "a-new");
         assert_eq!(thread(&a, "tie"), "a-tie");
         assert_eq!(thread(&a, "only-b"), "b-only");
+    }
+
+    #[test]
+    fn merge_dispatch_result_carries_pruned_routes_back_unless_changed_meanwhile() {
+        let codex = |t: &str| VendorRoute::Codex {
+            thread_id: t.into(),
+            cwd: None,
+        };
+        let mut live = RouteTable::default();
+        live.upsert("dead", codex("d"), At::from_unix_millis(10));
+        live.upsert("changed", codex("c1"), At::from_unix_millis(10));
+        live.upsert("kept", codex("k"), At::from_unix_millis(10));
+        let base = live.clone();
+        // The dispatch pruned "dead" and "changed" and discovered "found".
+        let mut working = base.clone();
+        working.entries.remove("dead");
+        working.entries.remove("changed");
+        working.upsert("found", codex("f"), At::from_unix_millis(20));
+        // Meanwhile a RegisterRoute rewrote "changed" in the live table.
+        live.upsert("changed", codex("c2"), At::from_unix_millis(15));
+        live.merge_dispatch_result(&base, working);
+        assert!(live.get("dead").is_none(), "pruned route must be removed");
+        assert!(live.get("kept").is_some());
+        assert!(live.get("found").is_some());
+        assert!(
+            live.get("changed").is_some(),
+            "a route re-registered during the dispatch survives"
+        );
     }
 
     #[test]

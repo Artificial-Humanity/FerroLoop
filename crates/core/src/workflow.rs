@@ -853,7 +853,6 @@ fn edge_matches(on: EdgeCondition, outcome: StepOutcome) -> bool {
     }
 }
 
-/// Pure deterministic workflow step scheduler (spec §1.4).
 /// Why `step_id` may not start another attempt: the run has already used up a ceiling that
 /// [`advance_workflow`] enforces only after an attempt has finished. `None` when it may run.
 ///
@@ -896,6 +895,7 @@ pub fn preflight_ceiling(def: &WorkflowDef, run: &WorkflowRun, step_id: &str) ->
     None
 }
 
+/// Pure deterministic workflow step scheduler (spec §1.4).
 pub fn advance_workflow(
     def: &WorkflowDef,
     run: &mut WorkflowRun,
