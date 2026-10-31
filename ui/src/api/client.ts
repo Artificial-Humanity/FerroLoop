@@ -1,4 +1,5 @@
 import {
+  DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
   DEFAULT_SLASH_COMMANDS,
   type AgentsResponse,
@@ -10,14 +11,18 @@ import {
   type BulkSessionActionResponse,
   type ClearSessionMode,
   type ClearSessionResponse,
+  type CloudAdaptersConfig,
   type DecommissionMode,
   type DecommissionSessionResponse,
   type DiscoveredSessionSummary,
   type HealthResponse,
+  type HubAuthority,
   type HubSettings,
   type HubStatsResponse,
   type InterruptSessionResponse,
   type LivenessResponse,
+  type OperatorAccount,
+  type OperatorRole,
   type PrMergeRequest,
   type PrMergeResponse,
   type PromptAttachment,
@@ -35,6 +40,7 @@ import {
   type SlashCommandEntry,
   type SpinUpSessionRequest,
   type SpinUpSessionResponse,
+  type TotpEnrollmentResponse,
   type CodeSearchKind,
   type CodeSearchResponse,
   type ImportWorkspaceStateResponse,
@@ -147,6 +153,83 @@ export function normalizeHubSettings(
         connRaw.poll_interval_secs > 0
           ? connRaw.poll_interval_secs
           : fallback.hub_connection.poll_interval_secs,
+    },
+  };
+}
+
+export function normalizeCloudAdaptersConfig(
+  raw: unknown,
+  fallback: CloudAdaptersConfig = DEFAULT_CLOUD_ADAPTERS_CONFIG,
+): CloudAdaptersConfig {
+  const obj =
+    raw && typeof raw === "object"
+      ? ("adapters" in (raw as Record<string, unknown>) &&
+        (raw as Record<string, unknown>).adapters &&
+        typeof (raw as Record<string, unknown>).adapters === "object"
+          ? ((raw as Record<string, unknown>).adapters as Record<string, unknown>)
+          : (raw as Record<string, unknown>))
+      : {};
+
+  const storeRaw =
+    obj.store_sync && typeof obj.store_sync === "object"
+      ? (obj.store_sync as Record<string, unknown>)
+      : {};
+  const gateRaw =
+    obj.gate_cloud && typeof obj.gate_cloud === "object"
+      ? (obj.gate_cloud as Record<string, unknown>)
+      : {};
+
+  const provider: CloudAdaptersConfig["store_sync"]["provider"] =
+    storeRaw.provider === "none" ||
+    storeRaw.provider === "gcp" ||
+    storeRaw.provider === "aws" ||
+    storeRaw.provider === "azure"
+      ? storeRaw.provider
+      : fallback.store_sync.provider;
+
+  const sync_mode: CloudAdaptersConfig["store_sync"]["sync_mode"] =
+    storeRaw.sync_mode === "write_through" ||
+    storeRaw.sync_mode === "write_behind" ||
+    storeRaw.sync_mode === "local_cache" ||
+    storeRaw.sync_mode === "cloud_pre_cache"
+      ? storeRaw.sync_mode
+      : fallback.store_sync.sync_mode;
+
+  const registry_provider: CloudAdaptersConfig["gate_cloud"]["registry_provider"] =
+    gateRaw.registry_provider === "none" ||
+    gateRaw.registry_provider === "gcp" ||
+    gateRaw.registry_provider === "aws" ||
+    gateRaw.registry_provider === "azure"
+      ? gateRaw.registry_provider
+      : fallback.gate_cloud.registry_provider;
+
+  return {
+    store_sync: {
+      provider,
+      sync_mode,
+      endpoint_url:
+        typeof storeRaw.endpoint_url === "string"
+          ? storeRaw.endpoint_url
+          : fallback.store_sync.endpoint_url,
+      enabled:
+        typeof storeRaw.enabled === "boolean"
+          ? storeRaw.enabled
+          : fallback.store_sync.enabled,
+    },
+    gate_cloud: {
+      registry_provider,
+      relay_endpoint_url:
+        typeof gateRaw.relay_endpoint_url === "string"
+          ? gateRaw.relay_endpoint_url
+          : fallback.gate_cloud.relay_endpoint_url,
+      secret_manager_enabled:
+        typeof gateRaw.secret_manager_enabled === "boolean"
+          ? gateRaw.secret_manager_enabled
+          : fallback.gate_cloud.secret_manager_enabled,
+      model_armor_enabled:
+        typeof gateRaw.model_armor_enabled === "boolean"
+          ? gateRaw.model_armor_enabled
+          : fallback.gate_cloud.model_armor_enabled,
     },
   };
 }
@@ -895,6 +978,127 @@ export class HubApiClient {
         body: JSON.stringify(body),
       },
     );
+  }
+
+  public async loginWithPassword(req: {
+    username: string;
+    password: string;
+    totp_code?: string;
+  }): Promise<{
+    ok: boolean;
+    authority?: HubAuthority;
+    requires_totp?: boolean;
+    session_token?: string;
+  }> {
+    const res = await this.request<{
+      ok: boolean;
+      authority?: HubAuthority;
+      requires_totp?: boolean;
+      session_token?: string;
+    }>("/api/v1/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ mode: "password", ...req }),
+    });
+    if (res?.session_token) {
+      this.setToken(res.session_token);
+    }
+    return res;
+  }
+
+  public async loginWithPasskey(req: {
+    credential_id: string;
+    assertion?: string;
+  }): Promise<{
+    ok: boolean;
+    authority?: HubAuthority;
+    session_token?: string;
+  }> {
+    const res = await this.request<{
+      ok: boolean;
+      authority?: HubAuthority;
+      session_token?: string;
+    }>("/api/v1/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ mode: "passkey", ...req }),
+    });
+    if (res?.session_token) {
+      this.setToken(res.session_token);
+    }
+    return res;
+  }
+
+  public async listOperators(): Promise<{ operators: OperatorAccount[] }> {
+    return this.request<{ operators: OperatorAccount[] }>(
+      "/api/v1/auth/operators",
+    );
+  }
+
+  public async createOperator(req: {
+    username: string;
+    display_name?: string;
+    role: OperatorRole;
+    password?: string;
+  }): Promise<{ operator: OperatorAccount }> {
+    return this.request<{ operator: OperatorAccount }>(
+      "/api/v1/auth/operators",
+      {
+        method: "POST",
+        body: JSON.stringify(req),
+      },
+    );
+  }
+
+  public async deleteOperator(id: string): Promise<{ ok: boolean }> {
+    return this.request<{ ok: boolean }>(
+      `/api/v1/auth/operators/${encodeURIComponent(id)}`,
+      {
+        method: "DELETE",
+      },
+    );
+  }
+
+  public async enrollTotp(): Promise<TotpEnrollmentResponse> {
+    return this.request<TotpEnrollmentResponse>("/api/v1/auth/totp/enroll", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+  }
+
+  public async verifyTotp(code: string): Promise<{ ok: boolean }> {
+    return this.request<{ ok: boolean }>("/api/v1/auth/totp/verify", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    });
+  }
+
+  public async registerPasskey(req: {
+    credential_id: string;
+    label: string;
+    public_key_b64?: string;
+  }): Promise<{ ok: boolean }> {
+    return this.request<{ ok: boolean }>("/api/v1/auth/passkey/register", {
+      method: "POST",
+      body: JSON.stringify(req),
+    });
+  }
+
+  public async getCloudAdapters(): Promise<CloudAdaptersConfig> {
+    const raw = await this.request<unknown>("/api/v1/cloud/adapters");
+    return normalizeCloudAdaptersConfig(raw, DEFAULT_CLOUD_ADAPTERS_CONFIG);
+  }
+
+  public async updateCloudAdapters(
+    cfg: Partial<CloudAdaptersConfig> | CloudAdaptersConfig,
+  ): Promise<CloudAdaptersConfig> {
+    const mergedFallback = normalizeCloudAdaptersConfig(
+      cfg,
+      DEFAULT_CLOUD_ADAPTERS_CONFIG,
+    );
+    const raw = await this.request<unknown>("/api/v1/cloud/adapters", {
+      method: "PUT",
+      body: JSON.stringify(cfg),
+    });
+    return normalizeCloudAdaptersConfig(raw, mergedFallback);
   }
 }
 

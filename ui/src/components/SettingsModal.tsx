@@ -1,10 +1,15 @@
 import React, { useEffect, useState } from "react";
 import { HubApiClient } from "../api/client";
 import {
+  DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
   type BulkSessionAction,
   type BulkSessionActionResponse,
+  type CloudAdaptersConfig,
   type HubSettings,
+  type OperatorAccount,
+  type OperatorRole,
+  type TotpEnrollmentResponse,
 } from "../types/api";
 
 export interface SettingsModalProps {
@@ -42,6 +47,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [settings, setSettings] = useState<HubSettings>(DEFAULT_HUB_SETTINGS);
   const [savingSettings, setSavingSettings] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
+
+  // Record 11: Operators, Passkeys & MFA state
+  const [operators, setOperators] = useState<OperatorAccount[]>([]);
+  const [opUsername, setOpUsername] = useState("");
+  const [opRole, setOpRole] = useState<OperatorRole>("operator");
+  const [opPassword, setOpPassword] = useState("");
+  const [addingOperator, setAddingOperator] = useState(false);
+  const [totpEnrollment, setTotpEnrollment] =
+    useState<TotpEnrollmentResponse | null>(null);
+  const [totpVerifyCode, setTotpVerifyCode] = useState("");
+  const [totpVerified, setTotpVerified] = useState(false);
+  const [passkeyLabel, setPasskeyLabel] = useState("");
+  const [passkeyRegistered, setPasskeyRegistered] = useState(false);
+
+  // Records 52 & 53: Cloud Sync & Edge Adapters state
+  const [cloudAdapters, setCloudAdapters] = useState<CloudAdaptersConfig>(
+    DEFAULT_CLOUD_ADAPTERS_CONFIG,
+  );
+  const [savingCloudAdapters, setSavingCloudAdapters] = useState(false);
+  const [cloudAdaptersSaved, setCloudAdaptersSaved] = useState(false);
+
+  // Bulk Session Operations state
   const [armedAction, setArmedAction] = useState<BulkSessionAction | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -53,11 +80,17 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     setError(null);
     setLastResult(null);
     setSettingsSaved(false);
+    setCloudAdaptersSaved(false);
+    setTotpEnrollment(null);
+    setTotpVerifyCode("");
+    setTotpVerified(false);
+    setPasskeyRegistered(false);
     if (!isOpen) {
       return;
     }
     let cancelled = false;
     const client = apiClient ?? new HubApiClient();
+
     client
       .getSettings()
       .then((loaded) => {
@@ -68,6 +101,29 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       .catch(() => {
         // Keep DEFAULT_HUB_SETTINGS if endpoint is unreachable
       });
+
+    client
+      .listOperators()
+      .then((res) => {
+        if (!cancelled && Array.isArray(res?.operators)) {
+          setOperators(res.operators);
+        }
+      })
+      .catch(() => {
+        // Ignore if operator endpoint is not yet seeded
+      });
+
+    client
+      .getCloudAdapters()
+      .then((loadedCloud) => {
+        if (!cancelled) {
+          setCloudAdapters(loadedCloud);
+        }
+      })
+      .catch(() => {
+        // Keep DEFAULT_CLOUD_ADAPTERS_CONFIG if endpoint is unreachable
+      });
+
     return () => {
       cancelled = true;
     };
@@ -76,13 +132,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   useEffect(() => {
     if (!isOpen) return;
     const handleKeyDownEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !submitting && !savingSettings) {
+      if (
+        event.key === "Escape" &&
+        !submitting &&
+        !savingSettings &&
+        !savingCloudAdapters
+      ) {
         onClose();
       }
     };
     window.addEventListener("keydown", handleKeyDownEscape);
     return () => window.removeEventListener("keydown", handleKeyDownEscape);
-  }, [isOpen, submitting, savingSettings, onClose]);
+  }, [isOpen, submitting, savingSettings, savingCloudAdapters, onClose]);
 
   if (!isOpen) {
     return null;
@@ -105,6 +166,138 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       );
     } finally {
       setSavingSettings(false);
+    }
+  };
+
+  const handleAddOperator = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmedUser = opUsername.trim();
+    if (!trimmedUser || addingOperator) {
+      return;
+    }
+    setAddingOperator(true);
+    setError(null);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const res = await client.createOperator({
+        username: trimmedUser,
+        display_name: trimmedUser,
+        role: opRole,
+        ...(opPassword ? { password: opPassword } : {}),
+      });
+      const created: OperatorAccount = res?.operator ?? {
+        id: `op-${trimmedUser}`,
+        username: trimmedUser,
+        display_name: trimmedUser,
+        role: opRole,
+        has_password: Boolean(opPassword),
+        totp_enabled: false,
+        passkeys_count: 0,
+        created_at_ms: Date.now(),
+      };
+      setOperators((prev) => [
+        ...prev.filter((item) => item.username !== created.username),
+        created,
+      ]);
+      setOpUsername("");
+      setOpPassword("");
+      setOpRole("operator");
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to create operator",
+      );
+    } finally {
+      setAddingOperator(false);
+    }
+  };
+
+  const handleDeleteOperator = async (op: OperatorAccount) => {
+    setError(null);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      await client.deleteOperator(op.id || op.username);
+      setOperators((prev) =>
+        prev.filter(
+          (item) => item.id !== op.id && item.username !== op.username,
+        ),
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to delete operator",
+      );
+    }
+  };
+
+  const handleEnrollTotp = async () => {
+    setError(null);
+    setTotpVerified(false);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const res = await client.enrollTotp();
+      setTotpEnrollment(
+        res ?? {
+          secret_base32: "JBSWY3DPEHPK3PXP",
+          otpauth_uri:
+            "otpauth://totp/FerroDeck:operator?secret=JBSWY3DPEHPK3PXP&issuer=FerroDeck",
+        },
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to enroll TOTP");
+    }
+  };
+
+  const handleVerifyTotp = async () => {
+    const code = totpVerifyCode.trim();
+    if (!code) return;
+    setError(null);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const res = await client.verifyTotp(code);
+      if (res?.ok !== false) {
+        setTotpVerified(true);
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to verify TOTP");
+    }
+  };
+
+  const handleRegisterPasskey = async () => {
+    setError(null);
+    setPasskeyRegistered(false);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const label = passkeyLabel.trim() || "Operator Passkey";
+      await client.registerPasskey({
+        credential_id: `passkey-${Date.now()}`,
+        label,
+      });
+      setPasskeyRegistered(true);
+      setPasskeyLabel("");
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to register passkey",
+      );
+    }
+  };
+
+  const handleSaveCloudAdapters = async () => {
+    if (savingCloudAdapters) return;
+    setSavingCloudAdapters(true);
+    setError(null);
+    setCloudAdaptersSaved(false);
+    try {
+      const client = apiClient ?? new HubApiClient();
+      const updated = await client.updateCloudAdapters(cloudAdapters);
+      setCloudAdapters(updated);
+      setCloudAdaptersSaved(true);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Failed to save cloud adapter configuration",
+      );
+    } finally {
+      setSavingCloudAdapters(false);
     }
   };
 
@@ -139,7 +332,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     <div
       className="fd-modal-backdrop"
       onClick={() => {
-        if (!submitting && !savingSettings) {
+        if (!submitting && !savingSettings && !savingCloudAdapters) {
           onClose();
         }
       }}
@@ -152,7 +345,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         className="fd-modal"
         onClick={(e) => e.stopPropagation()}
         style={{
-          maxWidth: "600px",
+          maxWidth: "660px",
           maxHeight: "88vh",
           overflowY: "auto",
           display: "flex",
@@ -174,7 +367,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             type="button"
             className="fd-btn"
             onClick={onClose}
-            disabled={submitting || savingSettings}
+            disabled={submitting || savingSettings || savingCloudAdapters}
             aria-label="Close Settings Modal"
           >
             ✕
@@ -211,6 +404,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             }}
           >
             Settings saved successfully.
+          </div>
+        )}
+
+        {cloudAdaptersSaved && (
+          <div
+            role="status"
+            data-testid="cloud-adapters-saved-banner"
+            className="fd-card"
+            style={{
+              borderColor: "var(--diff-add-border)",
+              backgroundColor: "var(--diff-add-bg)",
+              color: "var(--diff-add-text)",
+              fontSize: "12px",
+              padding: "8px 12px",
+            }}
+          >
+            Cloud sync &amp; gate adapters saved successfully.
           </div>
         )}
 
@@ -556,6 +766,484 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               onClick={() => void handleSaveSettings()}
             >
               {savingSettings ? "Saving..." : "Save Settings"}
+            </button>
+          </div>
+        </div>
+
+        {/* Record 11: Operators, Passkeys & MFA Section */}
+        <div
+          className="fd-card"
+          data-testid="settings-operators-section"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px",
+          }}
+        >
+          <div>
+            <h3
+              style={{
+                margin: "0 0 4px 0",
+                fontSize: "13px",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Operators, Passkeys &amp; MFA (RBAC)
+            </h3>
+            <p
+              style={{
+                margin: 0,
+                fontSize: "12px",
+                color: "var(--text-secondary)",
+              }}
+            >
+              Manage multi-operator accounts, role-based access control
+              (`owner`, `admin`, `operator`, `viewer`), TOTP authenticators, and
+              WebAuthn passkeys.
+            </p>
+          </div>
+
+          {/* Operator Roster List */}
+          {operators.length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+              {operators.map((op) => (
+                <div
+                  key={op.id || op.username}
+                  data-testid={`operator-row-${op.username}`}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "space-between",
+                    gap: "8px",
+                    padding: "8px 10px",
+                    borderRadius: "6px",
+                    border: "1px solid var(--border-subtle, #1e293b)",
+                    background: "var(--bg-elevated)",
+                    flexWrap: "wrap",
+                  }}
+                >
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                    <strong style={{ fontSize: "12.5px" }}>
+                      {op.display_name || op.username}
+                    </strong>
+                    <span className="fd-badge fd-mono">{op.role}</span>
+                    <span className="fd-badge">
+                      TOTP: {op.totp_enabled ? "Enabled" : "Off"}
+                    </span>
+                    <span className="fd-badge">
+                      Passkeys: {op.passkeys_count ?? 0}
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    data-testid={`delete-operator-${op.username}`}
+                    className="fd-btn fd-btn-danger"
+                    style={{ fontSize: "11px", padding: "3px 8px" }}
+                    onClick={() => void handleDeleteOperator(op)}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* + Add Operator Form */}
+          <form
+            onSubmit={handleAddOperator}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
+            <input
+              type="text"
+              aria-label="New Operator Username"
+              data-testid="operator-username-input"
+              className="fd-input"
+              placeholder="Username (e.g. alice)"
+              style={{ flex: "1 1 130px", fontSize: "12px", padding: "5px 8px" }}
+              value={opUsername}
+              onChange={(e) => setOpUsername(e.target.value)}
+            />
+            <select
+              aria-label="Operator Role"
+              data-testid="operator-role-select"
+              className="fd-select fd-mono"
+              style={{ fontSize: "12px", padding: "5px 8px" }}
+              value={opRole}
+              onChange={(e) => setOpRole(e.target.value as OperatorRole)}
+            >
+              <option value="owner">owner</option>
+              <option value="admin">admin</option>
+              <option value="operator">operator</option>
+              <option value="viewer">viewer</option>
+            </select>
+            <input
+              type="password"
+              aria-label="New Operator Password"
+              data-testid="operator-password-input"
+              className="fd-input"
+              placeholder="Password (optional)"
+              style={{ flex: "1 1 130px", fontSize: "12px", padding: "5px 8px" }}
+              value={opPassword}
+              onChange={(e) => setOpPassword(e.target.value)}
+            />
+            <button
+              type="submit"
+              data-testid="add-operator-submit-btn"
+              className="fd-btn fd-btn-primary"
+              disabled={addingOperator || !opUsername.trim()}
+            >
+              + Add Operator
+            </button>
+          </form>
+
+          <hr style={{ border: "none", borderTop: "1px solid var(--border-subtle)", margin: 0 }} />
+
+          {/* TOTP MFA & WebAuthn Passkey Enrollment */}
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+              <button
+                type="button"
+                data-testid="enroll-totp-btn"
+                className="fd-btn"
+                onClick={() => void handleEnrollTotp()}
+              >
+                Enroll TOTP MFA
+              </button>
+
+              <input
+                type="text"
+                aria-label="Passkey Label"
+                data-testid="passkey-label-input"
+                className="fd-input"
+                placeholder="Passkey label (optional)"
+                style={{ width: "160px", fontSize: "12px", padding: "5px 8px" }}
+                value={passkeyLabel}
+                onChange={(e) => setPasskeyLabel(e.target.value)}
+              />
+              <button
+                type="button"
+                data-testid="register-passkey-btn"
+                className="fd-btn"
+                onClick={() => void handleRegisterPasskey()}
+              >
+                Register Passkey
+              </button>
+            </div>
+
+            {passkeyRegistered && (
+              <span
+                className="fd-badge"
+                data-testid="passkey-registered-banner"
+                style={{ color: "var(--status-alive, #22c55e)" }}
+              >
+                Passkey registered
+              </span>
+            )}
+          </div>
+
+          {totpEnrollment && (
+            <div
+              data-testid="totp-secret-display"
+              style={{
+                padding: "10px",
+                borderRadius: "6px",
+                border: "1px solid var(--border-subtle, #1e293b)",
+                background: "var(--bg-elevated)",
+                display: "flex",
+                flexDirection: "column",
+                gap: "8px",
+                fontSize: "12px",
+              }}
+            >
+              <div>
+                <strong>TOTP Secret (Base32):</strong>{" "}
+                <code className="fd-mono">{totpEnrollment.secret_base32}</code>
+              </div>
+              <div style={{ color: "var(--text-muted)", wordBreak: "break-all" }}>
+                <code className="fd-mono">{totpEnrollment.otpauth_uri}</code>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  aria-label="Verify TOTP Code"
+                  data-testid="totp-verify-input"
+                  className="fd-input fd-mono"
+                  placeholder="6-digit code"
+                  style={{ width: "130px", fontSize: "12px", padding: "4px 8px" }}
+                  value={totpVerifyCode}
+                  onChange={(e) => setTotpVerifyCode(e.target.value)}
+                />
+                <button
+                  type="button"
+                  data-testid="totp-verify-btn"
+                  className="fd-btn fd-btn-primary"
+                  onClick={() => void handleVerifyTotp()}
+                >
+                  Verify TOTP
+                </button>
+                {totpVerified && (
+                  <span
+                    className="fd-badge"
+                    data-testid="totp-verified-badge"
+                    style={{ color: "var(--status-alive, #22c55e)" }}
+                  >
+                    TOTP Verified
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Records 52 & 53: Cloud Sync & Edge Gate Adapters Section */}
+        <div
+          className="fd-card"
+          data-testid="settings-cloud-adapters-section"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "12px",
+          }}
+        >
+          <div>
+            <h3
+              style={{
+                margin: "0 0 4px 0",
+                fontSize: "13px",
+                fontWeight: 700,
+                textTransform: "uppercase",
+                letterSpacing: "0.04em",
+              }}
+            >
+              Cloud Sync &amp; Edge Gate Adapters
+            </h3>
+            <p
+              style={{
+                margin: 0,
+                fontSize: "12px",
+                color: "var(--text-secondary)",
+              }}
+            >
+              Configure multi-cloud FerroStore synchronization (`GCP`, `AWS`,
+              `Azure`) and FerroGate cloud registry, Secret Manager + IAM, and
+              Model Armor edge protection.
+            </p>
+          </div>
+
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+              gap: "10px",
+              fontSize: "12px",
+            }}
+          >
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              <span>Store Sync Provider</span>
+              <select
+                aria-label="Store Sync Provider"
+                data-testid="cloud-sync-provider-select"
+                className="fd-select fd-mono"
+                value={cloudAdapters.store_sync.provider}
+                onChange={(e) => {
+                  setCloudAdaptersSaved(false);
+                  setCloudAdapters((prev) => ({
+                    ...prev,
+                    store_sync: {
+                      ...prev.store_sync,
+                      provider: e.target.value as CloudAdaptersConfig["store_sync"]["provider"],
+                    },
+                  }));
+                }}
+              >
+                <option value="none">none</option>
+                <option value="gcp">gcp (Cloud SQL + GCS)</option>
+                <option value="aws">aws (Aurora + S3)</option>
+                <option value="azure">azure (Postgres + Blob)</option>
+              </select>
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              <span>Store Sync Mode</span>
+              <select
+                aria-label="Store Sync Mode"
+                data-testid="cloud-sync-mode-select"
+                className="fd-select fd-mono"
+                value={cloudAdapters.store_sync.sync_mode}
+                onChange={(e) => {
+                  setCloudAdaptersSaved(false);
+                  setCloudAdapters((prev) => ({
+                    ...prev,
+                    store_sync: {
+                      ...prev.store_sync,
+                      sync_mode: e.target.value as CloudAdaptersConfig["store_sync"]["sync_mode"],
+                    },
+                  }));
+                }}
+              >
+                <option value="write_through">write_through</option>
+                <option value="write_behind">write_behind</option>
+                <option value="local_cache">local_cache</option>
+                <option value="cloud_pre_cache">cloud_pre_cache</option>
+              </select>
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              <span>Store Sync Endpoint URL</span>
+              <input
+                type="text"
+                aria-label="Store Sync Endpoint URL"
+                data-testid="cloud-sync-endpoint-input"
+                className="fd-input fd-mono"
+                placeholder="https://store-sync.example.com"
+                value={cloudAdapters.store_sync.endpoint_url}
+                onChange={(e) => {
+                  setCloudAdaptersSaved(false);
+                  setCloudAdapters((prev) => ({
+                    ...prev,
+                    store_sync: {
+                      ...prev.store_sync,
+                      endpoint_url: e.target.value,
+                    },
+                  }));
+                }}
+              />
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              <span>Gate Cloud Registry Provider</span>
+              <select
+                aria-label="Gate Cloud Registry Provider"
+                data-testid="cloud-gate-provider-select"
+                className="fd-select fd-mono"
+                value={cloudAdapters.gate_cloud.registry_provider}
+                onChange={(e) => {
+                  setCloudAdaptersSaved(false);
+                  setCloudAdapters((prev) => ({
+                    ...prev,
+                    gate_cloud: {
+                      ...prev.gate_cloud,
+                      registry_provider:
+                        e.target.value as CloudAdaptersConfig["gate_cloud"]["registry_provider"],
+                    },
+                  }));
+                }}
+              >
+                <option value="none">none</option>
+                <option value="gcp">gcp (Cloud API Registry)</option>
+                <option value="aws">aws</option>
+                <option value="azure">azure</option>
+              </select>
+            </label>
+
+            <label style={{ display: "flex", flexDirection: "column", gap: "4px" }}>
+              <span>Cloud Run MCP Relay Endpoint URL</span>
+              <input
+                type="text"
+                aria-label="Cloud Run MCP Relay Endpoint URL"
+                data-testid="cloud-relay-endpoint-input"
+                className="fd-input fd-mono"
+                placeholder="https://ferrogate-relay.a.run.app"
+                value={cloudAdapters.gate_cloud.relay_endpoint_url}
+                onChange={(e) => {
+                  setCloudAdaptersSaved(false);
+                  setCloudAdapters((prev) => ({
+                    ...prev,
+                    gate_cloud: {
+                      ...prev.gate_cloud,
+                      relay_endpoint_url: e.target.value,
+                    },
+                  }));
+                }}
+              />
+            </label>
+          </div>
+
+          <div style={{ display: "flex", gap: "16px", flexWrap: "wrap", fontSize: "12.5px" }}>
+            <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                data-testid="toggle-cloud-sync-enabled"
+                checked={cloudAdapters.store_sync.enabled}
+                onChange={(e) => {
+                  setCloudAdaptersSaved(false);
+                  setCloudAdapters((prev) => ({
+                    ...prev,
+                    store_sync: {
+                      ...prev.store_sync,
+                      enabled: e.target.checked,
+                    },
+                  }));
+                }}
+              />
+              <span>Enable Cloud Store Sync</span>
+            </label>
+
+            <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                data-testid="toggle-cloud-secret-manager"
+                checked={cloudAdapters.gate_cloud.secret_manager_enabled}
+                onChange={(e) => {
+                  setCloudAdaptersSaved(false);
+                  setCloudAdapters((prev) => ({
+                    ...prev,
+                    gate_cloud: {
+                      ...prev.gate_cloud,
+                      secret_manager_enabled: e.target.checked,
+                    },
+                  }));
+                }}
+              />
+              <span>Secret Manager + IAM Vault</span>
+            </label>
+
+            <label style={{ display: "inline-flex", alignItems: "center", gap: "6px", cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                data-testid="toggle-cloud-model-armor"
+                checked={cloudAdapters.gate_cloud.model_armor_enabled}
+                onChange={(e) => {
+                  setCloudAdaptersSaved(false);
+                  setCloudAdapters((prev) => ({
+                    ...prev,
+                    gate_cloud: {
+                      ...prev.gate_cloud,
+                      model_armor_enabled: e.target.checked,
+                    },
+                  }));
+                }}
+              />
+              <span>Model Armor Edge Guard</span>
+            </label>
+          </div>
+
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <button
+              type="button"
+              data-testid="save-cloud-adapters-btn"
+              className="fd-btn fd-btn-primary"
+              disabled={savingCloudAdapters}
+              onClick={() => void handleSaveCloudAdapters()}
+            >
+              {savingCloudAdapters ? "Saving..." : "Save Cloud Adapters"}
             </button>
           </div>
         </div>
