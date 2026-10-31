@@ -14,7 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use fl_core::agent::RegistryEvent;
 use fl_core::at::At;
 use fl_core::ferrowire::{
-    DeliveryReceipt, DeliveryStatus, SendWireArgs, WireFilter, WireInboxItem, WireMessage,
+    DeliveryReceipt, DeliveryStatus, SendWireArgs, WireFilter, WireImportReport, WireInboxItem,
+    WireMessage,
 };
 use fl_core::ids::MessageId;
 use fl_core::store::{AgentRegistry, MessageStore};
@@ -39,6 +40,52 @@ pub const MAX_INBOUND_PEER_CONNECTIONS: usize = 64;
 /// one failed connection thread into a daemon that panics on every later request.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Write one daemon warning line to stderr, where the daemon's other diagnostics go. A test
+/// build also records the line, so a test can assert what was warned without capturing stderr.
+fn warn(line: &str) {
+    #[cfg(test)]
+    tests::WARNINGS.with(|w| w.borrow_mut().push(line.to_string()));
+    eprintln!("fl-wire: warning: {line}");
+}
+
+/// The warning for one peer import that skipped something or failed, or `None` for a clean one.
+/// Lists message ids and the reason for each skip, never a message body or its validation text.
+fn import_warning(
+    peer: &str,
+    frame: &str,
+    result: &Result<WireImportReport, fl_core::store::StoreError>,
+) -> Option<String> {
+    match result {
+        Ok(report) if report.is_clean() => None,
+        Ok(report) => {
+            let skipped: Vec<String> = report
+                .rejected
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} {} ({})",
+                        if r.is_receipt {
+                            "receipt for"
+                        } else {
+                            "message"
+                        },
+                        r.message_id,
+                        r.reason
+                    )
+                })
+                .collect();
+            Some(format!(
+                "{frame} from {peer}: skipped {} item(s), imported {} message(s) and {} receipt(s): {}",
+                skipped.len(),
+                report.imported_messages,
+                report.imported_receipts,
+                skipped.join("; ")
+            ))
+        }
+        Err(e) => Some(format!("{frame} from {peer}: import failed: {e}")),
+    }
 }
 
 /// A claimed slot among `limit`; the slot is released on drop.
@@ -643,6 +690,26 @@ where
         res
     }
 
+    fn peer_label(&self, id: u64) -> String {
+        lock(&self.peers)
+            .get(&id)
+            .map(|(label, _)| label.clone())
+            .unwrap_or_else(|| format!("peer #{id}"))
+    }
+
+    /// Warn about a peer import that skipped an item or failed.
+    fn warn_on_import(
+        &self,
+        from_peer_id: u64,
+        frame: &str,
+        result: &Result<WireImportReport, fl_core::store::StoreError>,
+    ) {
+        let peer = self.peer_label(from_peer_id);
+        if let Some(line) = import_warning(&peer, frame, result) {
+            warn(&line);
+        }
+    }
+
     fn process_incoming_peer_frame(&self, from_peer_id: u64, frame: PeerFrame) {
         let now = now_at();
         match frame {
@@ -651,8 +718,13 @@ where
                 messages,
                 receipts,
             } => {
-                if !registry_events.is_empty() {
-                    let _ = self.store.import_registry_events(&registry_events);
+                if !registry_events.is_empty()
+                    && let Err(e) = self.store.import_registry_events(&registry_events)
+                {
+                    let peer = self.peer_label(from_peer_id);
+                    warn(&format!(
+                        "SyncBatch from {peer}: registry import failed: {e}"
+                    ));
                 }
                 let mut new_msgs = Vec::new();
                 for m in &messages {
@@ -660,7 +732,13 @@ where
                         new_msgs.push(m.clone());
                     }
                 }
-                if self.store.import_wire_batch(&messages, &receipts).is_ok() {
+                let imported = self.store.import_wire_batch(&messages, &receipts);
+                self.warn_on_import(from_peer_id, "SyncBatch", &imported);
+                // One bad item no longer drops the batch, so what is announced and dispatched
+                // is exactly what was stored: a message the store refused is never forwarded
+                // to subscribers or peers and never dispatched to a vendor CLI.
+                if let Ok(report) = imported {
+                    new_msgs.retain(|m| !report.rejects_message(&m.id));
                     for m in new_msgs {
                         let rcpts = self.store.list_wire_receipts(&m.id).unwrap_or_default();
                         self.notify_subscribers_message(&m, &rcpts);
@@ -674,7 +752,9 @@ where
                         self.dispatch_and_propagate(&m, now.clone());
                     }
                     for r in receipts {
-                        self.notify_subscribers_receipt(&r);
+                        if !report.rejects(&r.message_id) {
+                            self.notify_subscribers_receipt(&r);
+                        }
                     }
                 }
             }
@@ -685,12 +765,12 @@ where
                     .ok()
                     .flatten()
                     .is_some();
-                if self
+                let imported = self
                     .store
-                    .import_wire_batch(std::slice::from_ref(&message), &receipts)
-                    .is_ok()
-                    && !known
-                {
+                    .import_wire_batch(std::slice::from_ref(&message), &receipts);
+                self.warn_on_import(from_peer_id, "Publish", &imported);
+                // A message the store refused is neither forwarded nor dispatched.
+                if imported.as_ref().is_ok_and(WireImportReport::is_clean) && !known {
                     let rcpts = self
                         .store
                         .list_wire_receipts(&message.id)
@@ -720,10 +800,11 @@ where
                             .map(|r| r.status.rank())
                     })
                     .unwrap_or(0);
-                if self
+                let imported = self
                     .store
-                    .import_wire_batch(&[], std::slice::from_ref(&receipt))
-                    .is_ok()
+                    .import_wire_batch(&[], std::slice::from_ref(&receipt));
+                self.warn_on_import(from_peer_id, "ReceiptUpdate", &imported);
+                if imported.as_ref().is_ok_and(WireImportReport::is_clean)
                     && receipt.status.rank() > prev_rank
                 {
                     self.notify_subscribers_receipt(&receipt);
@@ -984,6 +1065,195 @@ mod tests {
     use fl_core::ferrowire::{MessageKind, MessageUrgency, WireAddress};
     use fl_store::RedbStore;
     use tempfile::TempDir;
+
+    thread_local! {
+        /// The warning lines `warn` wrote on this thread.
+        pub(super) static WARNINGS: std::cell::RefCell<Vec<String>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn take_warnings() -> Vec<String> {
+        WARNINGS.with(|w| std::mem::take(&mut *w.borrow_mut()))
+    }
+
+    fn send_args(subject: &str, body: &str, ms: u64) -> SendWireArgs {
+        SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: Some("node-a".into()),
+            to: WireAddress::AgentName("kayla".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: subject.into(),
+            body: body.into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(ms),
+        }
+    }
+
+    /// A daemon core over a fresh store (no sockets), one "sender" peer and one "observer" peer
+    /// whose channel shows what the daemon forwards.
+    struct Rig {
+        _tmp: TempDir,
+        inner: DaemonInner<RedbStore>,
+        sender: u64,
+        observed: Receiver<PeerFrame>,
+        source: RedbStore,
+    }
+
+    fn rig() -> Rig {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(RedbStore::open(&tmp.path().join("dest.redb")).unwrap());
+        let source = RedbStore::open(&tmp.path().join("src.redb")).unwrap();
+        let inner = DaemonInner {
+            store,
+            config: DaemonConfig {
+                node_id: "node-b".into(),
+                host: "host-b".into(),
+                socket_path: tmp.path().join("b.sock"),
+                routes_path: Some(tmp.path().join("routes-b.json")),
+                home_override: Some(tmp.path().to_path_buf()),
+                listen_addr: None,
+                peers: vec![],
+                psk: b"top-secret-psk".to_vec(),
+            },
+            routes: Mutex::new(RouteTable::load(None)),
+            dispatch_gate: Mutex::new(()),
+            peers: Mutex::new(BTreeMap::new()),
+            subscribers: Mutex::new(Vec::new()),
+            next_peer_id: Mutex::new(0),
+            inbound_peers: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+        };
+        let (tx, _unused) = mpsc::channel();
+        let sender = inner.register_peer("peer-a".into(), tx);
+        let (tx, observed) = mpsc::channel();
+        inner.register_peer("observer".into(), tx);
+        take_warnings();
+        Rig {
+            _tmp: tmp,
+            inner,
+            sender,
+            observed,
+            source,
+        }
+    }
+
+    fn published_ids(rx: &Receiver<PeerFrame>) -> Vec<MessageId> {
+        rx.try_iter()
+            .filter_map(|f| match f {
+                PeerFrame::Publish { message, .. } => Some(message.id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bad_message_in_a_sync_batch_is_skipped_warned_and_never_forwarded() {
+        let rig = rig();
+        let store = &rig.inner.store;
+        let (existing, _) = store.send_wire(send_args("held", "held body", 5)).unwrap();
+        let (good_a, _) = rig
+            .source
+            .send_wire(send_args("one", "first good body", 10))
+            .unwrap();
+        let (good_b, _) = rig
+            .source
+            .send_wire(send_args("two", "second good body", 11))
+            .unwrap();
+        let (bad_new, _) = rig
+            .source
+            .send_wire(send_args("bad", "valid when sent", 12))
+            .unwrap();
+        let mut tampered = existing.clone();
+        tampered.body = "SECRET tampered body".into();
+        let mut invalid = bad_new.clone();
+        invalid.body = "   ".into();
+
+        rig.inner.process_incoming_peer_frame(
+            rig.sender,
+            PeerFrame::SyncBatch {
+                registry_events: vec![],
+                messages: vec![good_a.clone(), tampered, invalid.clone(), good_b.clone()],
+                receipts: vec![],
+            },
+        );
+
+        // Both good messages were imported around the two bad ones.
+        assert_eq!(store.get_wire_message(&good_a.id).unwrap().unwrap(), good_a);
+        assert_eq!(store.get_wire_message(&good_b.id).unwrap().unwrap(), good_b);
+        // The tampered copy did not replace the stored one, and the invalid one was not stored.
+        assert_eq!(
+            store.get_wire_message(&existing.id).unwrap().unwrap(),
+            existing
+        );
+        assert!(store.get_wire_message(&invalid.id).unwrap().is_none());
+        // Only what was stored is forwarded; a refused message never reaches peers (or dispatch).
+        let forwarded = published_ids(&rig.observed);
+        assert_eq!(forwarded.len(), 2, "{forwarded:?}");
+        assert!(forwarded.contains(&good_a.id) && forwarded.contains(&good_b.id));
+        // One warning names the peer, the frame and both skipped ids, and never a body.
+        let warnings = take_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        let line = &warnings[0];
+        assert!(
+            line.contains("SyncBatch") && line.contains("peer-a"),
+            "{line}"
+        );
+        assert!(line.contains("skipped 2 item(s)"), "{line}");
+        assert!(line.contains(existing.id.as_str()) && line.contains(invalid.id.as_str()));
+        assert!(
+            !line.contains("SECRET") && !line.contains("tampered body"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_clean_sync_batch_imports_everything_and_warns_about_nothing() {
+        let rig = rig();
+        let (a, _) = rig.source.send_wire(send_args("a", "body a", 10)).unwrap();
+        let (b, _) = rig.source.send_wire(send_args("b", "body b", 11)).unwrap();
+        rig.inner.process_incoming_peer_frame(
+            rig.sender,
+            PeerFrame::SyncBatch {
+                registry_events: vec![],
+                messages: vec![a.clone(), b.clone()],
+                receipts: vec![],
+            },
+        );
+        assert!(rig.inner.store.get_wire_message(&a.id).unwrap().is_some());
+        assert!(rig.inner.store.get_wire_message(&b.id).unwrap().is_some());
+        assert_eq!(published_ids(&rig.observed).len(), 2);
+        assert!(take_warnings().is_empty());
+    }
+
+    #[test]
+    fn a_single_published_message_that_fails_validation_is_not_forwarded() {
+        let rig = rig();
+        let (m, _) = rig.source.send_wire(send_args("x", "body x", 10)).unwrap();
+        let mut invalid = m.clone();
+        invalid.body = "  ".into();
+        rig.inner.process_incoming_peer_frame(
+            rig.sender,
+            PeerFrame::Publish {
+                message: invalid.clone(),
+                receipts: vec![],
+            },
+        );
+        assert!(
+            rig.inner
+                .store
+                .get_wire_message(&invalid.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(published_ids(&rig.observed).is_empty());
+        assert_eq!(take_warnings().len(), 1);
+    }
 
     #[test]
     fn two_daemons_sync_over_websocket_push_to_webhook_and_propagate_ack_and_reply() {

@@ -2545,7 +2545,7 @@ const AGENT_REGISTRY_CASES: usize = 7;
 /// How many cases [`state_store`] runs. Update deliberately — see [`run_suite`].
 const STATE_STORE_CASES: usize = 10;
 /// How many cases [`message_store`] runs. Update deliberately — see [`run_suite`].
-const MESSAGE_STORE_CASES: usize = 7;
+const MESSAGE_STORE_CASES: usize = 8;
 /// How many cases [`workflow_store`] runs. Update deliberately — see [`run_suite`].
 const WORKFLOW_STORE_CASES: usize = 3;
 
@@ -2587,6 +2587,7 @@ pub fn message_store<S: MessageStore + AgentRegistry + Catalog + Handles, G>(
         ask_reply_and_thread_indexing_validate_and_correlate::<S>,
         receipt_transitions_and_batch_imports_converge_monotonically::<S>,
         wire_import_deduplicates_and_refuses_tampered_message::<S>,
+        wire_import_skips_each_bad_message_and_keeps_the_good_ones::<S>,
         offline_agent_id_collision_alias_preserves_wire_inbox_and_ack::<S>,
         prune_wire_removes_only_acked_or_expired_transient_messages_before_cutoff::<S>,
     ];
@@ -4021,11 +4022,141 @@ fn wire_import_deduplicates_and_refuses_tampered_message<S: MessageStore>(s: &S)
     assert_eq!(s.wire_messages_after(0).unwrap().len(), msg_log_len);
     assert_eq!(s.wire_receipts_after(0).unwrap().len(), rcpt_log_len);
 
-    // Tampering with an existing message ID is refused.
+    // Tampering with an existing message ID is refused: reported, not stored.
     let mut tampered = msg.clone();
     tampered.body = "Tampered body".into();
-    let err = s.import_wire_batch(&[tampered], &[]).unwrap_err();
-    assert!(matches!(err, StoreError::WireMessageTampered { .. }));
+    let report = s.import_wire_batch(&[tampered], &[]).unwrap();
+    assert_eq!(report.imported_messages, 0);
+    assert_eq!(report.rejected.len(), 1);
+    assert!(report.rejects_message(&msg.id));
+    assert!(matches!(
+        report.first_rejection_error(),
+        Some(StoreError::WireMessageTampered { .. })
+    ));
+    assert_eq!(s.get_wire_message(&msg.id).unwrap().unwrap(), msg);
+}
+
+/// One bad message in a batch is skipped and reported; the good ones around it are still
+/// imported, and nothing skipped is stored.
+fn wire_import_skips_each_bad_message_and_keeps_the_good_ones<S: MessageStore>(s: &S) {
+    use crate::ferrowire::{
+        DeliveryReceipt, DeliveryStatus, MessageKind, MessageUrgency, SendWireArgs, WireAddress,
+        WireImportRejectReason,
+    };
+    use crate::ids::MessageId;
+
+    let (stored, _) = s
+        .send_wire(SendWireArgs {
+            id: None,
+            sender_id: None,
+            sender_name: "jarvis".into(),
+            sender_host: None,
+            to: WireAddress::AgentName("ferris".into()),
+            kind: MessageKind::Mail,
+            urgency: MessageUrgency::Normal,
+            durable: true,
+            subject: "Stored".into(),
+            body: "Stored body".into(),
+            reply_to: None,
+            thread_id: None,
+            deadline_at: None,
+            at: At::from_unix_millis(10),
+        })
+        .unwrap();
+    let with_id = |n: u64| {
+        let mut m = stored.clone();
+        m.id = MessageId(seq_iri(0x7000 + n));
+        m.thread_id = m.id.clone();
+        m.subject = format!("Peer message {n}");
+        m
+    };
+    let (good_a, good_b) = (with_id(1), with_id(2));
+    let mut invalid = with_id(3);
+    invalid.body = "   ".into();
+    let mut tampered = stored.clone();
+    tampered.body = "Tampered body".into();
+
+    // Good, tampered, invalid, good: both good ones land, the other two are reported.
+    let report = s
+        .import_wire_batch(
+            &[good_a.clone(), tampered, invalid.clone(), good_b.clone()],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(report.imported_messages, 2);
+    assert_eq!(report.rejected.len(), 2, "{report:?}");
+    assert!(!report.is_clean());
+    let reasons = |id: &MessageId| {
+        report
+            .rejected
+            .iter()
+            .find(|r| &r.message_id == id)
+            .map(|r| r.reason)
+    };
+    assert_eq!(
+        reasons(&stored.id),
+        Some(WireImportRejectReason::TamperedMessage)
+    );
+    assert_eq!(
+        reasons(&invalid.id),
+        Some(WireImportRejectReason::InvalidMessage)
+    );
+    // The report never carries a message body.
+    for r in &report.rejected {
+        assert!(!r.detail.contains("Tampered body"), "{r:?}");
+    }
+    assert_eq!(s.get_wire_message(&good_a.id).unwrap().unwrap(), good_a);
+    assert_eq!(s.get_wire_message(&good_b.id).unwrap().unwrap(), good_b);
+    assert!(
+        s.get_wire_message(&invalid.id).unwrap().is_none(),
+        "a message that failed validation is never stored"
+    );
+    assert_eq!(
+        s.get_wire_message(&stored.id).unwrap().unwrap(),
+        stored,
+        "the stored copy wins over a tampered one"
+    );
+
+    // Receipts are judged alone too: one for a message nobody holds is skipped, one for a
+    // stored message is merged.
+    let receipt_for = |m: &MessageId| DeliveryReceipt {
+        message_id: m.clone(),
+        recipient_id: seq_iri(0x7100),
+        recipient_name: "ferris".into(),
+        status: DeliveryStatus::Delivered,
+        attempts: 1,
+        updated_at: At::from_unix_millis(30),
+        acked_at: None,
+    };
+    let report = s
+        .import_wire_batch(&[], &[receipt_for(&invalid.id), receipt_for(&good_a.id)])
+        .unwrap();
+    assert_eq!(report.imported_receipts, 1, "{report:?}");
+    assert_eq!(report.rejected.len(), 1);
+    assert!(report.rejected[0].is_receipt);
+    assert_eq!(
+        report.rejected[0].reason,
+        WireImportRejectReason::UnknownMessage
+    );
+    assert!(
+        s.list_wire_receipts(&good_a.id)
+            .unwrap()
+            .iter()
+            .any(|r| r.status == DeliveryStatus::Delivered)
+    );
+
+    // An all-good batch, repeated, is clean and imports nothing new.
+    let again = s
+        .import_wire_batch(&[good_a.clone(), good_b.clone()], &[])
+        .unwrap();
+    assert!(again.is_clean(), "{again:?}");
+    assert_eq!(again.imported_messages, 0);
+    let fresh = with_id(4);
+    let first = s
+        .import_wire_batch(std::slice::from_ref(&fresh), &[])
+        .unwrap();
+    assert!(first.is_clean());
+    assert_eq!(first.imported_messages, 1);
 }
 
 fn offline_agent_id_collision_alias_preserves_wire_inbox_and_ack<

@@ -4,8 +4,8 @@ use fl_core::agent::{AgentRecord, AgentStatus};
 use fl_core::at::At;
 use fl_core::ferrowire::{
     DeliveryReceipt, DeliveryStatus, MessageKind, SendWireArgs, ThreadId, WireFilter,
-    WireInboxItem, WireMessage, resolve_recipients, validate_sender_name, validate_subject,
-    validate_wire_body,
+    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, resolve_recipients,
+    validate_sender_name, validate_subject, validate_wire_body,
 };
 use fl_core::ids::{Kind, MessageId};
 use fl_core::iri::Iri;
@@ -883,17 +883,26 @@ impl MessageStore for RedbStore {
         &self,
         messages: &[WireMessage],
         receipts: &[DeliveryReceipt],
-    ) -> Result<(), StoreError> {
+    ) -> Result<WireImportReport, StoreError> {
         if messages.is_empty() && receipts.is_empty() {
-            return Ok(());
+            return Ok(WireImportReport::default());
         }
+        let mut report = WireImportReport::default();
         let tx = self.db.begin_write().map_err(backend)?;
         raise_format(&tx, FORMAT_WITH_WIRE)?;
         let all_agents = self.all_agents_in_wtx(&tx)?;
 
         for msg in messages {
-            msg.validate()
-                .map_err(|e| StoreError::InvalidState(e.to_string()))?;
+            // Each message stands or falls alone: a skip writes nothing for it.
+            if let Err(e) = msg.validate() {
+                report.reject(
+                    &msg.id,
+                    false,
+                    WireImportRejectReason::InvalidMessage,
+                    e.to_string(),
+                );
+                continue;
+            }
             let existing: Option<WireMessage> = {
                 let t = tx.open_table(WIRE_MESSAGES).map_err(backend)?;
                 match t.get(msg.id.as_str()).map_err(backend)? {
@@ -903,15 +912,30 @@ impl MessageStore for RedbStore {
             };
             if let Some(ex) = existing {
                 if &ex != msg {
-                    return Err(StoreError::WireMessageTampered {
-                        id: msg.id.clone(),
-                        detail: "imported wire message differs from stored copy".into(),
-                    });
+                    report.reject(
+                        &msg.id,
+                        false,
+                        WireImportRejectReason::TamperedMessage,
+                        "imported wire message differs from stored copy",
+                    );
                 }
                 continue;
             }
-            self.index_message_id_in(&tx, msg.id.iri())?;
+            match self.index_message_id_in(&tx, msg.id.iri()) {
+                Ok(()) => {}
+                Err(e @ StoreError::WrongKind { .. }) => {
+                    report.reject(
+                        &msg.id,
+                        false,
+                        WireImportRejectReason::IdCollision,
+                        e.to_string(),
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
             self.append_wire_message_in(&tx, msg)?;
+            report.imported_messages += 1;
 
             let resolved = resolve_recipients(
                 &msg.to,
@@ -958,7 +982,13 @@ impl MessageStore for RedbStore {
                 .map_err(backend)?
                 .is_some();
             if !msg_exists {
-                return Err(StoreError::MessageNotFound(rcpt.message_id.clone()));
+                report.reject(
+                    &rcpt.message_id,
+                    true,
+                    WireImportRejectReason::UnknownMessage,
+                    "no such wire message",
+                );
+                continue;
             }
             let existing: Option<DeliveryReceipt> = {
                 let inbox = tx.open_table(WIRE_INBOX).map_err(backend)?;
@@ -983,6 +1013,7 @@ impl MessageStore for RedbStore {
                             )
                             .map_err(backend)?;
                         self.append_wire_receipt_in(&tx, &merged)?;
+                        report.imported_receipts += 1;
                     }
                 }
                 None => {
@@ -995,12 +1026,13 @@ impl MessageStore for RedbStore {
                         )
                         .map_err(backend)?;
                     self.append_wire_receipt_in(&tx, rcpt)?;
+                    report.imported_receipts += 1;
                 }
             }
         }
 
         tx.commit().map_err(backend)?;
-        Ok(())
+        Ok(report)
     }
 
     fn prune_wire(&self, before: At) -> Result<usize, StoreError> {

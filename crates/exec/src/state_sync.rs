@@ -897,7 +897,14 @@ where
         let imported_revisions = ordered_remote_revs.len();
 
         let (imported_wire_messages, imported_wire_receipts) = if target.sync_wire {
-            store.import_wire_batch(&base_snapshot.wire_messages, &base_snapshot.wire_receipts)?;
+            // The wire import skips a bad item and keeps the rest. A state sync is not a peer
+            // stream: a bad item in the branch means the branch is wrong, so it still fails the
+            // sync (the good items stay imported; they are idempotent and converge).
+            let report = store
+                .import_wire_batch(&base_snapshot.wire_messages, &base_snapshot.wire_receipts)?;
+            if let Some(err) = report.first_rejection_error() {
+                return Err(err.into());
+            }
             (
                 base_snapshot.wire_messages.len(),
                 base_snapshot.wire_receipts.len(),

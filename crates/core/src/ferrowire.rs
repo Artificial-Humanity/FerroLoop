@@ -323,6 +323,108 @@ impl DeliveryReceipt {
     }
 }
 
+/// Why one item of an imported wire batch was skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireImportRejectReason {
+    /// The message fails [`WireMessage::validate`]. It was not stored.
+    InvalidMessage,
+    /// A different message is already stored under this id. The stored copy is kept.
+    TamperedMessage,
+    /// The message id is already used by an object of another kind. It was not stored.
+    IdCollision,
+    /// A receipt for a message this store does not hold. It was not stored.
+    UnknownMessage,
+}
+
+impl fmt::Display for WireImportRejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidMessage => "message failed validation",
+            Self::TamperedMessage => "differs from the stored copy",
+            Self::IdCollision => "id belongs to another kind of object",
+            Self::UnknownMessage => "receipt for an unknown message",
+        })
+    }
+}
+
+/// One message or receipt of an imported batch that was skipped, and why.
+///
+/// `detail` is the validation text, never a message body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireImportRejection {
+    pub message_id: MessageId,
+    /// `true` for a receipt, `false` for a message.
+    pub is_receipt: bool,
+    pub reason: WireImportRejectReason,
+    pub detail: String,
+}
+
+/// What [`MessageStore::import_wire_batch`](crate::store::MessageStore::import_wire_batch)
+/// did with a batch. Every item is judged alone: a bad one is listed in `rejected` and skipped,
+/// and the good ones are still imported. A skipped item is never stored, so a rejection never
+/// means an unchecked message got in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WireImportReport {
+    /// Messages stored for the first time by this call.
+    pub imported_messages: usize,
+    /// Receipts stored or advanced by this call.
+    pub imported_receipts: usize,
+    pub rejected: Vec<WireImportRejection>,
+}
+
+impl WireImportReport {
+    pub fn is_clean(&self) -> bool {
+        self.rejected.is_empty()
+    }
+
+    /// Whether the message `id`, or a receipt for it, was skipped.
+    pub fn rejects(&self, id: &MessageId) -> bool {
+        self.rejected.iter().any(|r| &r.message_id == id)
+    }
+
+    /// Whether the message `id` itself was skipped (not just a receipt for it).
+    pub fn rejects_message(&self, id: &MessageId) -> bool {
+        self.rejected
+            .iter()
+            .any(|r| !r.is_receipt && &r.message_id == id)
+    }
+
+    /// The first rejection as the error a strict caller would have got from the old
+    /// all-or-nothing import, or `None` for a clean batch.
+    pub fn first_rejection_error(&self) -> Option<crate::store::StoreError> {
+        use crate::store::StoreError;
+        let r = self.rejected.first()?;
+        Some(match r.reason {
+            WireImportRejectReason::TamperedMessage => StoreError::WireMessageTampered {
+                id: r.message_id.clone(),
+                detail: "imported wire message differs from stored copy".into(),
+            },
+            WireImportRejectReason::UnknownMessage => {
+                StoreError::MessageNotFound(r.message_id.clone())
+            }
+            WireImportRejectReason::InvalidMessage | WireImportRejectReason::IdCollision => {
+                StoreError::InvalidState(r.detail.clone())
+            }
+        })
+    }
+
+    /// Record a skipped item. For store implementations.
+    pub fn reject(
+        &mut self,
+        message_id: &MessageId,
+        is_receipt: bool,
+        reason: WireImportRejectReason,
+        detail: impl Into<String>,
+    ) {
+        self.rejected.push(WireImportRejection {
+            message_id: message_id.clone(),
+            is_receipt,
+            reason,
+            detail: detail.into(),
+        });
+    }
+}
+
 /// Resolve `to` against the current `AgentRegistry` roster (spec §1.2).
 /// Returns `(recipient_id, recipient_name)` pairs in deterministic order.
 pub fn resolve_recipients(

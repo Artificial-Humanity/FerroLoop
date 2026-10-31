@@ -10,8 +10,8 @@ use fl_core::agent::{AgentRecord, AgentStatus};
 use fl_core::at::At;
 use fl_core::ferrowire::{
     DeliveryReceipt, DeliveryStatus, MessageKind, SendWireArgs, ThreadId, WireFilter,
-    WireInboxItem, WireMessage, resolve_recipients, validate_sender_name, validate_subject,
-    validate_wire_body,
+    WireImportRejectReason, WireImportReport, WireInboxItem, WireMessage, resolve_recipients,
+    validate_sender_name, validate_subject, validate_wire_body,
 };
 use fl_core::ids::{Kind, MessageId};
 use fl_core::iri::Iri;
@@ -464,31 +464,55 @@ impl MessageStore for FerroStore {
         &self,
         messages: &[WireMessage],
         receipts: &[DeliveryReceipt],
-    ) -> Result<(), StoreError> {
+    ) -> Result<WireImportReport, StoreError> {
         if messages.is_empty() && receipts.is_empty() {
-            return Ok(());
+            return Ok(WireImportReport::default());
         }
         let messages = messages.to_vec();
         let receipts = receipts.to_vec();
         self.with_write(|txn| {
+            let mut report = WireImportReport::default();
             doc::raise_format(txn, FORMAT_WITH_WIRE)?;
             let all_agents = doc::scan_json::<AgentRecord>(txn, AGENTS)?;
             for msg in &messages {
-                msg.validate()
-                    .map_err(|err| StoreError::InvalidState(err.to_string()))?;
+                // Each message stands or falls alone: a skip writes nothing for it.
+                if let Err(err) = msg.validate() {
+                    report.reject(
+                        &msg.id,
+                        false,
+                        WireImportRejectReason::InvalidMessage,
+                        err.to_string(),
+                    );
+                    continue;
+                }
                 if let Some(existing) =
                     doc::get_json::<WireMessage>(txn, WIRE_MESSAGES, msg.id.as_str())?
                 {
                     if &existing != msg {
-                        return Err(StoreError::WireMessageTampered {
-                            id: msg.id.clone(),
-                            detail: "imported wire message differs from stored copy".into(),
-                        });
+                        report.reject(
+                            &msg.id,
+                            false,
+                            WireImportRejectReason::TamperedMessage,
+                            "imported wire message differs from stored copy",
+                        );
                     }
                     continue;
                 }
-                index_message_id(txn, msg.id.iri())?;
+                match index_message_id(txn, msg.id.iri()) {
+                    Ok(()) => {}
+                    Err(err @ StoreError::WrongKind { .. }) => {
+                        report.reject(
+                            &msg.id,
+                            false,
+                            WireImportRejectReason::IdCollision,
+                            err.to_string(),
+                        );
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
                 append_wire_message(txn, msg)?;
+                report.imported_messages += 1;
                 let resolved = resolve_recipients(
                     &msg.to,
                     msg.sender_id.as_ref(),
@@ -520,7 +544,13 @@ impl MessageStore for FerroStore {
                 if doc::get_json::<WireMessage>(txn, WIRE_MESSAGES, rcpt.message_id.as_str())?
                     .is_none()
                 {
-                    return Err(StoreError::MessageNotFound(rcpt.message_id.clone()));
+                    report.reject(
+                        &rcpt.message_id,
+                        true,
+                        WireImportRejectReason::UnknownMessage,
+                        "no such wire message",
+                    );
+                    continue;
                 }
                 let key = doc::pair(rcpt.recipient_id.as_str(), rcpt.message_id.as_str());
                 match doc::get_json::<DeliveryReceipt>(txn, WIRE_INBOX, &key)? {
@@ -529,15 +559,17 @@ impl MessageStore for FerroStore {
                         if merged != existing {
                             doc::put_json(txn, WIRE_INBOX, &key, &merged)?;
                             append_wire_receipt(txn, &merged)?;
+                            report.imported_receipts += 1;
                         }
                     }
                     None => {
                         doc::put_json(txn, WIRE_INBOX, &key, rcpt)?;
                         append_wire_receipt(txn, rcpt)?;
+                        report.imported_receipts += 1;
                     }
                 }
             }
-            Ok(())
+            Ok(report)
         })
     }
 
