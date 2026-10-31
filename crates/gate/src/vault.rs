@@ -44,7 +44,10 @@ pub struct VaultSecretMetadata {
 }
 
 /// Parameters for inserting or updating a secret in [`Vault`].
-#[derive(Debug, Clone, Default)]
+///
+/// `value` is plaintext, so `Debug` redacts it: a `{:?}` of this type, or of a `Result` or log
+/// record holding one, must not print the secret.
+#[derive(Clone, Default)]
 pub struct SetSecretArgs {
     pub name: String,
     pub value: String,
@@ -54,6 +57,21 @@ pub struct SetSecretArgs {
     pub allowed_agents: Vec<String>,
     pub allow_private_network: bool,
     pub lease_ttl_secs: Option<u64>,
+}
+
+impl std::fmt::Debug for SetSecretArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetSecretArgs")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .field("description", &self.description)
+            .field("allowed_hosts", &self.allowed_hosts)
+            .field("allowed_methods", &self.allowed_methods)
+            .field("allowed_agents", &self.allowed_agents)
+            .field("allow_private_network", &self.allow_private_network)
+            .field("lease_ttl_secs", &self.lease_ttl_secs)
+            .finish()
+    }
 }
 
 /// On-disk encrypted record inside `vault.enc`.
@@ -82,11 +100,23 @@ impl Default for VaultFile {
 }
 
 /// Zero-knowledge AES-256-GCM encrypted secrets vault (`crates/gate/src/vault.rs`).
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints the path and the number of secrets, never the master key: a `{:?}` of a
+/// `Vault`, or of a `Result` that holds one (`unwrap_err` on an `Ok` prints it), must not leak it.
+#[derive(Clone)]
 pub struct Vault {
     path: PathBuf,
     master_key: [u8; MASTER_KEY_LEN],
     file: VaultFile,
+}
+
+impl std::fmt::Debug for Vault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vault")
+            .field("path", &self.path)
+            .field("secrets", &self.file.secrets.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Vault {
@@ -563,11 +593,37 @@ fn install_new_master_key(
     key_path: &Path,
     key: [u8; MASTER_KEY_LEN],
 ) -> Result<[u8; MASTER_KEY_LEN], GateError> {
-    let hex = encode_hex(&key);
-    let tmp_path = write_tmp_0600(key_path, format!("{hex}\n").as_bytes())?;
-    let linked = fs::hard_link(&tmp_path, key_path);
+    install_new_master_key_with(key_path, key, |from, to| fs::hard_link(from, to))
+}
+
+/// Whether a failed `link` leaves the exclusive-create fallback to try. Only `AlreadyExists`
+/// means another process holds the key; anything else (a filesystem with no hard links, such as
+/// some FUSE, SMB or bind mounts, says `Unsupported` or `PermissionDenied`) says nothing about
+/// the destination.
+fn link_failure_needs_fallback(kind: std::io::ErrorKind) -> bool {
+    kind != std::io::ErrorKind::AlreadyExists
+}
+
+/// [`install_new_master_key`] with the publish step injected, so a test can stand in for a
+/// filesystem without hard links.
+fn install_new_master_key_with(
+    key_path: &Path,
+    key: [u8; MASTER_KEY_LEN],
+    link: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<[u8; MASTER_KEY_LEN], GateError> {
+    let contents = format!("{}\n", encode_hex(&key));
+    let tmp_path = write_tmp_0600(key_path, contents.as_bytes())?;
+    let linked = link(&tmp_path, key_path);
     let _ = fs::remove_file(&tmp_path);
-    match linked {
+    let published = match linked {
+        Err(e) if link_failure_needs_fallback(e.kind()) => {
+            // No hard links here: create the key file exclusively and write the whole key into
+            // it. `create_new` still fails with `AlreadyExists` when another process won.
+            create_new_0600(key_path, contents.as_bytes())
+        }
+        other => other,
+    };
+    match published {
         Ok(()) => Ok(key),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             reject_if_symlink(key_path)?;
@@ -584,6 +640,24 @@ fn install_new_master_key(
             cause: e.to_string(),
         }),
     }
+}
+
+/// Create `path` with `create_new` (so it never replaces or follows anything) and mode `0600`,
+/// and write `bytes`. A failed write removes the file this call created.
+fn create_new_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    let written = f.write_all(bytes).and_then(|()| f.sync_all());
+    if written.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    written
 }
 
 fn parse_hex_master_key(hex_str: &str, path: &Path) -> Result<[u8; MASTER_KEY_LEN], GateError> {
@@ -655,9 +729,24 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
     ))
 }
 
+/// How many temp names `write_tmp_0600` tries before it gives up.
+const TMP_NAME_ATTEMPTS: usize = 8;
+
 /// Write `bytes` to a fresh `0600` temp file beside `path` and return its path. A failed write
 /// removes the temp file instead of leaving partial key or ciphertext bytes behind.
 fn write_tmp_0600(path: &Path, bytes: &[u8]) -> Result<PathBuf, GateError> {
+    write_tmp_0600_with(path, bytes, || unique_tmp_path(path))
+}
+
+/// [`write_tmp_0600`] with the name source injected.
+///
+/// A name that already exists is skipped, never reused or removed: after a crash leaves
+/// `.vault.enc.tmp.<pid>.0` behind, a later process with the same pid asks for that name again.
+fn write_tmp_0600_with(
+    path: &Path,
+    bytes: &[u8],
+    mut next_name: impl FnMut() -> PathBuf,
+) -> Result<PathBuf, GateError> {
     reject_if_symlink(path)?;
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
@@ -668,8 +757,9 @@ fn write_tmp_0600(path: &Path, bytes: &[u8]) -> Result<PathBuf, GateError> {
             cause: e.to_string(),
         })?;
     }
-    let tmp_path = unique_tmp_path(path);
-    let written = (|| -> std::io::Result<()> {
+    let mut last_taken = None;
+    for _ in 0..TMP_NAME_ATTEMPTS {
+        let tmp_path = next_name();
         let mut opts = fs::OpenOptions::new();
         opts.create_new(true).write(true);
         #[cfg(unix)]
@@ -677,19 +767,36 @@ fn write_tmp_0600(path: &Path, bytes: &[u8]) -> Result<PathBuf, GateError> {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp_path)?;
-        f.write_all(bytes)?;
-        f.sync_all()
-    })();
-    if let Err(e) = written {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(GateError::Io {
-            op: "write",
-            path: tmp_path,
-            cause: e.to_string(),
-        });
+        let mut f = match opts.open(&tmp_path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_taken = Some(tmp_path);
+                continue;
+            }
+            Err(e) => {
+                return Err(GateError::Io {
+                    op: "write",
+                    path: tmp_path,
+                    cause: e.to_string(),
+                });
+            }
+        };
+        if let Err(e) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(GateError::Io {
+                op: "write",
+                path: tmp_path,
+                cause: e.to_string(),
+            });
+        }
+        return Ok(tmp_path);
     }
-    Ok(tmp_path)
+    Err(GateError::Io {
+        op: "write",
+        path: last_taken.unwrap_or_else(|| path.to_path_buf()),
+        cause: format!("{TMP_NAME_ATTEMPTS} temp file names in a row already exist"),
+    })
 }
 
 pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<(), GateError> {
@@ -876,5 +983,152 @@ mod tests {
         for line in lines {
             serde_json::from_str::<serde_json::Value>(line).unwrap();
         }
+    }
+
+    /// Every way a `Vault` or its `set` arguments can reach a formatter must hide the master key
+    /// and the plaintext value.
+    #[test]
+    fn debug_of_a_vault_and_of_set_args_holds_no_key_or_value() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("vault.enc");
+        // Bytes 201..=232: `[u8; 32]`'s derived Debug would print `201, 202, 203`; the hex form
+        // is what `vault.key` holds.
+        let key: [u8; MASTER_KEY_LEN] = std::array::from_fn(|i| 201 + i as u8);
+        let key_hex = encode_hex(&key);
+        let mut vault = Vault::open(&path, key).unwrap();
+        vault
+            .set(args("API_TOKEN", "plaintext-sentinel-4242"))
+            .unwrap();
+
+        let set_args = args("API_TOKEN", "plaintext-sentinel-4242");
+        let ok: Result<Vault, GateError> = Ok(vault.clone());
+        let panic_text = |f: &dyn Fn()| {
+            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_err();
+            err.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_default()
+        };
+        let shown = [
+            format!("{vault:?}"),
+            format!("{vault:#?}"),
+            format!("{ok:?}"),
+            format!("{ok:#?}"),
+            // `unwrap_err` / `expect_err` on an `Ok` print the `Ok` value in the panic message.
+            panic_text(&|| {
+                let _ = Vault::open(&path, key).unwrap_err();
+            }),
+            panic_text(&|| {
+                let _ = Vault::open(&path, key).expect_err("opened");
+            }),
+            format!("{set_args:?}"),
+            format!("{set_args:#?}"),
+            format!("{:?}", Some(set_args.clone())),
+        ];
+        for text in &shown {
+            for needle in [
+                "plaintext-sentinel-4242",
+                "201, 202",
+                "201,\n",
+                key_hex.as_str(),
+                "master_key",
+            ] {
+                assert!(!text.contains(needle), "`{needle}` leaked in: {text}");
+            }
+        }
+        assert!(shown[0].contains("vault.enc") && shown[0].contains("secrets: 1"));
+        assert!(shown[6].contains("API_TOKEN") && shown[6].contains("<redacted>"));
+    }
+
+    #[test]
+    fn only_already_exists_skips_the_exclusive_create_fallback() {
+        use std::io::ErrorKind::*;
+        assert!(!link_failure_needs_fallback(AlreadyExists));
+        for kind in [Unsupported, PermissionDenied, Other, NotFound] {
+            assert!(link_failure_needs_fallback(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_filesystem_without_hard_links_still_gets_a_private_master_key() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("vault.key");
+        let key = [0xC3u8; MASTER_KEY_LEN];
+        let no_links = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        };
+        assert_eq!(
+            install_new_master_key_with(&key_path, key, no_links).unwrap(),
+            key
+        );
+        assert_eq!(
+            parse_hex_master_key(fs::read_to_string(&key_path).unwrap().trim(), &key_path).unwrap(),
+            key
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        assert_eq!(leftover_temp_files(tmp.path()), Vec::<String>::new());
+    }
+
+    /// The fallback must stay exclusive: a key that appeared between the failed link and the
+    /// `create_new` belongs to the winner, and is adopted rather than replaced.
+    #[test]
+    fn the_fallback_still_adopts_a_key_that_another_process_won() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("vault.key");
+        let winner = [0x11u8; MASTER_KEY_LEN];
+        let loser = [0x22u8; MASTER_KEY_LEN];
+        fs::write(&key_path, format!("{}\n", encode_hex(&winner))).unwrap();
+        let no_links = |_: &Path, _: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        };
+        assert_eq!(
+            install_new_master_key_with(&key_path, loser, no_links).unwrap(),
+            winner
+        );
+        assert_eq!(
+            fs::read_to_string(&key_path).unwrap().trim(),
+            encode_hex(&winner)
+        );
+        assert_eq!(leftover_temp_files(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_leftover_temp_file_from_a_crashed_process_does_not_block_a_save() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("vault.enc");
+        let stale = tmp.path().join(".vault.enc.tmp.1234.0");
+        fs::write(&stale, "stale bytes from a crash").unwrap();
+        let fresh = tmp.path().join(".vault.enc.tmp.1234.1");
+        let mut names = vec![fresh.clone(), stale.clone()];
+        let got = write_tmp_0600_with(&target, b"new", || names.pop().unwrap()).unwrap();
+        assert_eq!(got, fresh);
+        assert_eq!(fs::read(&fresh).unwrap(), b"new");
+        // The colliding file is not ours: it is neither truncated nor removed.
+        assert_eq!(
+            fs::read_to_string(&stale).unwrap(),
+            "stale bytes from a crash"
+        );
+    }
+
+    #[test]
+    fn temp_name_retries_are_bounded() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path().join("vault.enc");
+        let taken = tmp.path().join(".vault.enc.tmp.1.0");
+        fs::write(&taken, "x").unwrap();
+        let mut calls = 0;
+        let err = write_tmp_0600_with(&target, b"new", || {
+            calls += 1;
+            taken.clone()
+        })
+        .unwrap_err();
+        assert_eq!(calls, TMP_NAME_ATTEMPTS);
+        assert!(matches!(err, GateError::Io { op: "write", .. }), "{err}");
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "x");
     }
 }

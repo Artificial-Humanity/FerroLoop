@@ -195,8 +195,17 @@ pub fn host_matches_pattern(host: &str, pattern: &str) -> bool {
 }
 
 /// Return `true` if `ip` is loopback, link-local, unspecified, multicast, reserved, or
-/// RFC1918/ULA private, including an IPv4 address embedded in an IPv6 one (mapped, compatible,
-/// NAT64 `64:ff9b::/96`, 6to4 `2002::/16`).
+/// RFC1918/ULA private, including an IPv4 address embedded in an IPv6 one.
+///
+/// Judged by the embedded IPv4 address (so a wrapper around a public address stays open):
+/// mapped `::ffff:a.b.c.d`, compatible `::a.b.c.d`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`,
+/// ISATAP (`<any /64>:0:5efe:a.b.c.d`, or `:200:5efe:` with the universal bit set), and Teredo
+/// `2001::/32` (blocked when either the server address or the client address, which Teredo stores
+/// XOR `0xffff`, is private).
+///
+/// Blocked outright, whatever they embed: NAT64 local-use `64:ff9b:1::/48` (RFC 8215, an operator
+/// may map any address into it), the IPv4 6to4 relay anycast block `192.88.99.0/24`, site-local
+/// `fec0::/10`, and the documentation range `2001:db8::/32`.
 pub fn is_private_or_loopback_ip(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_private_v4(v4),
@@ -219,7 +228,12 @@ pub fn is_private_or_loopback_ip(ip: IpAddr) -> bool {
                     && seg[1] == 0xff9b
                     && seg[2..6] == [0; 4]
                     && embedded(seg[6], seg[7]))
+                || (seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001)
                 || (seg[0] == 0x2002 && embedded(seg[1], seg[2]))
+                || (seg[0] == 0x2001
+                    && seg[1] == 0
+                    && (embedded(seg[2], seg[3]) || embedded(seg[6] ^ 0xffff, seg[7] ^ 0xffff)))
+                || ((seg[4] & 0xfdff) == 0 && seg[5] == 0x5efe && embedded(seg[6], seg[7]))
         }
     }
 }
@@ -235,6 +249,7 @@ fn is_private_v4(v4: Ipv4Addr) -> bool {
         || o[0] >= 240
         || (o[0] == 100 && (o[1] & 0b1100_0000) == 64)
         || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
         || (o[0] == 198 && (o[1] & 0xfe) == 18)
 }
 
@@ -836,6 +851,25 @@ mod tests {
             "2002:7f00:1::",
             "2001:db8::1",
             "fec0::1",
+            // 192.88.99.0/24 (6to4 relay anycast), bare and embedded.
+            "192.88.99.1",
+            "::ffff:192.88.99.1",
+            "2002:c058:6301::",
+            // NAT64 local-use /48: blocked outright, whatever it embeds.
+            "64:ff9b:1::",
+            "64:ff9b:1::808:808",
+            "64:ff9b:1:ffff:ffff:ffff:ffff:ffff",
+            // Teredo: private server address, or private client address (stored XOR 0xffff).
+            "2001:0:7f00:1::1",
+            "2001:0:a00:1::1",
+            "2001:0:808:808:0:0:80ff:fffe",
+            "2001:0:808:808:0:fdff:f5ff:fffe",
+            // ISATAP, with and without the universal bit, under a private and a public prefix.
+            "::5efe:127.0.0.1",
+            "::5efe:10.1.2.3",
+            "fe80::5efe:192.168.0.1",
+            "2606:4700::5efe:7f00:1",
+            "2606:4700::200:5efe:a9fe:a9fe",
         ] {
             let ip: IpAddr = blocked.parse().unwrap();
             assert!(is_private_or_loopback_ip(ip), "{blocked} must be blocked");
@@ -846,6 +880,14 @@ mod tests {
             "2606:4700:4700::1111",
             "64:ff9b::808:808",
             "2002:808:808::",
+            "192.88.98.1",
+            "192.88.100.1",
+            "64:ff9b:2::1",
+            "2001:0:808:808:0:0:f7f7:f7f7",
+            "2001:1::1",
+            "::5efe:8.8.8.8",
+            "2606:4700::200:5efe:808:808",
+            "2606:4700::5efd:7f00:1",
         ] {
             let ip: IpAddr = open.parse().unwrap();
             assert!(!is_private_or_loopback_ip(ip), "{open} must stay open");

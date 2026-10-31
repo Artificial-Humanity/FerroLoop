@@ -64,6 +64,46 @@ pub struct ConnectorToolDef {
     pub input_schema: Value,
 }
 
+/// A parse error as `line L, column C: message`, with no source text.
+///
+/// `toml::de::Error`'s `Display` quotes the offending source line, so a manifest that is (or
+/// links to) another file would print that file's content into an error an agent can read. This
+/// keeps the position and the parser's message, and hides the key or value the message quotes
+/// (`unknown field `…``, `invalid type: string "…"`): either can be a pasted token. What follows
+/// `, expected` and `missing field` name this crate's own schema, so they stay.
+fn toml_error_reason(raw: &str, e: &toml::de::Error) -> String {
+    let at = e.span().map_or(0, |s| s.start);
+    let (mut line, mut column) = (1usize, 1usize);
+    for (_, c) in raw.char_indices().take_while(|&(i, _)| i < at) {
+        if c == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    format!(
+        "line {line}, column {column}: {}",
+        redact_toml_message(e.message().trim_end())
+    )
+}
+
+fn redact_toml_message(message: &str) -> String {
+    if message.starts_with("missing field ") {
+        return message.to_string();
+    }
+    let split = message.rfind(", expected").unwrap_or(message.len());
+    let (head, tail) = message.split_at(split);
+    // From the first quote to the last, so a value that holds a quote of its own is hidden whole.
+    match (head.find(['`', '"']), head.rfind(['`', '"'])) {
+        (Some(first), Some(last)) if last > first => {
+            format!("{}<value>{}{tail}", &head[..first], &head[last + 1..])
+        }
+        (Some(first), _) => format!("{}<value>{tail}", &head[..first]),
+        _ => message.to_string(),
+    }
+}
+
 fn default_input_schema() -> Value {
     json!({
         "type": "object",
@@ -76,7 +116,7 @@ impl ConnectorManifest {
     pub fn parse_toml(raw: &str, source_path: &Path) -> Result<Self, GateError> {
         let manifest: Self = toml::from_str(raw).map_err(|e| GateError::InvalidConnector {
             path: source_path.to_path_buf(),
-            reason: e.to_string(),
+            reason: toml_error_reason(raw, &e),
         })?;
         manifest.validate(source_path)?;
         Ok(manifest)
@@ -345,13 +385,43 @@ fn encode_uri_component(s: &str) -> String {
     out
 }
 
+/// Connectors found by [`discover_connectors_with_warnings`], and what it skipped.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConnectorDiscovery {
+    pub connectors: Vec<ConnectorManifest>,
+    /// One line per directory or manifest that was skipped on purpose (a symbolic link). Each
+    /// names the path only: never the link's target and never any file content.
+    pub warnings: Vec<String>,
+}
+
 /// Discover all `.fl/gate/*.toml` (project) and `~/.config/fl/gate/*.toml` (user) connector manifests.
 /// Project-level connectors take precedence over user-level connectors with the same `id`.
+///
+/// Symbolic links are never followed: a manifest that is a link is skipped, and so is a connector
+/// directory that is a link (see [`discover_connectors_with_warnings`]). Each skip is reported once
+/// per process on stderr; call [`discover_connectors_with_warnings`] to receive the warnings.
 pub fn discover_connectors(
     project_root: Option<&Path>,
     home_override: Option<&Path>,
 ) -> Result<Vec<ConnectorManifest>, GateError> {
+    let found = discover_connectors_with_warnings(project_root, home_override)?;
+    warn_once(&found.warnings);
+    Ok(found.connectors)
+}
+
+/// [`discover_connectors`] that returns the skip warnings instead of printing them.
+///
+/// A symlinked manifest, a symlinked connector directory (`.fl/gate`, `~/.config/fl/gate`) and a
+/// symlinked `.fl` inside a project are skipped with a warning and the rest still load. They are
+/// not errors, and nothing behind the link is opened: `toml` quotes source in its errors and the
+/// link can point at a key file or another tool's config. A manifest that is a regular file but
+/// malformed is still an error, and its text names the position and the parser's message only.
+pub fn discover_connectors_with_warnings(
+    project_root: Option<&Path>,
+    home_override: Option<&Path>,
+) -> Result<ConnectorDiscovery, GateError> {
     let mut by_id = BTreeMap::new();
+    let mut warnings = Vec::new();
 
     let user_dir = if let Some(home) = home_override {
         home.join(".config").join("fl").join("gate")
@@ -366,25 +436,66 @@ pub fn discover_connectors(
         home.join(".config").join("fl").join("gate")
     };
 
-    if user_dir.is_dir() {
-        for manifest in load_connectors_from_dir(&user_dir)? {
+    if connector_dir_usable(&user_dir, &[], &mut warnings) {
+        for manifest in load_connectors_from_dir(&user_dir, &mut warnings)? {
             by_id.insert(manifest.id.clone(), manifest);
         }
     }
 
     if let Some(root) = project_root {
-        let proj_dir = root.join(".fl").join("gate");
-        if proj_dir.is_dir() {
-            for manifest in load_connectors_from_dir(&proj_dir)? {
+        let fl_dir = root.join(".fl");
+        let proj_dir = fl_dir.join("gate");
+        if connector_dir_usable(&proj_dir, &[&fl_dir], &mut warnings) {
+            for manifest in load_connectors_from_dir(&proj_dir, &mut warnings)? {
                 by_id.insert(manifest.id.clone(), manifest);
             }
         }
     }
 
-    Ok(by_id.into_values().collect())
+    Ok(ConnectorDiscovery {
+        connectors: by_id.into_values().collect(),
+        warnings,
+    })
 }
 
-fn load_connectors_from_dir(dir: &Path) -> Result<Vec<ConnectorManifest>, GateError> {
+/// Whether `dir` is a real directory to scan. A missing one is skipped silently; a symbolic link,
+/// either `dir` itself or one of `parents` (the project's `.fl`, which a repository controls), is
+/// skipped with a warning. `Path::is_dir` follows links, so it cannot make this decision.
+fn connector_dir_usable(dir: &Path, parents: &[&Path], warnings: &mut Vec<String>) -> bool {
+    for link in parents.iter().copied().chain(std::iter::once(dir)) {
+        if let Ok(meta) = fs::symlink_metadata(link)
+            && meta.file_type().is_symlink()
+        {
+            warnings.push(format!(
+                "skipped connector directory {}: it is a symbolic link, which fl does not follow",
+                link.display()
+            ));
+            return false;
+        }
+    }
+    fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir())
+}
+
+/// Print each distinct warning once per process: the hub calls discovery on every registry request.
+fn warn_once(warnings: &[String]) {
+    use std::collections::BTreeSet;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    for w in warnings {
+        if seen.insert(w.clone()) {
+            eprintln!("fl gate: {w}");
+        }
+    }
+}
+
+fn load_connectors_from_dir(
+    dir: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<ConnectorManifest>, GateError> {
     let mut paths = Vec::new();
     let entries = fs::read_dir(dir).map_err(|e| GateError::Io {
         op: "read_dir",
@@ -393,20 +504,25 @@ fn load_connectors_from_dir(dir: &Path) -> Result<Vec<ConnectorManifest>, GateEr
     })?;
     for entry in entries.flatten() {
         let p = entry.path();
-        // `symlink_metadata` so a link is still listed, and then refused, rather than skipped.
-        let is_manifest_file =
-            fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() || m.file_type().is_symlink());
-        if is_manifest_file && p.extension().and_then(|s| s.to_str()) == Some("toml") {
-            paths.push(p);
+        if p.extension().and_then(|s| s.to_str()) != Some("toml") {
+            continue;
+        }
+        // `symlink_metadata`, so a link is seen as a link. A link is skipped with a warning (it
+        // must not abort the other manifests); regular files only are read, so a FIFO is not opened.
+        match fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_symlink() => warnings.push(format!(
+                "skipped connector manifest {}: it is a symbolic link, which fl does not follow",
+                p.display()
+            )),
+            Ok(m) if m.is_file() => paths.push(p),
+            _ => {}
         }
     }
     paths.sort();
+    warnings.sort();
 
     let mut manifests = Vec::with_capacity(paths.len());
     for p in paths {
-        // `toml` quotes the offending line in its error, so a manifest symlinked to a key file
-        // would print that file. The vault refuses symlinks for the same reason.
-        crate::vault::reject_if_symlink(&p)?;
         let raw = fs::read_to_string(&p).map_err(|e| GateError::Io {
             op: "read",
             path: p.clone(),
@@ -741,21 +857,126 @@ body_params = ["content"]
         assert_eq!(names.len(), 3, "{names:?}");
     }
 
+    const VALID: &str = "id = \"ok\"\ntitle = \"Ok\"\nbase_url = \"https://api.example.com\"\n";
+
     #[cfg(unix)]
-    #[test]
-    fn a_manifest_symlink_is_refused_and_its_target_is_never_quoted() {
+    fn tree_with_symlinked_manifest() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let tmp = tempfile::TempDir::new().unwrap();
         let key = tmp.path().join("vault.key");
         fs::write(&key, "0123456789abcdef-not-toml-master-key-material\n").unwrap();
         let gate = tmp.path().join("repo/.fl/gate");
         fs::create_dir_all(&gate).unwrap();
+        fs::write(gate.join("good.toml"), VALID).unwrap();
         std::os::unix::fs::symlink(&key, gate.join("evil.toml")).unwrap();
         let home = tmp.path().join("home");
         fs::create_dir_all(&home).unwrap();
+        let repo = tmp.path().join("repo");
+        (tmp, repo, home)
+    }
 
-        let err = discover_connectors(Some(&tmp.path().join("repo")), Some(&home)).unwrap_err();
-        let text = err.to_string();
-        assert!(matches!(err, GateError::Io { .. }), "{text}");
-        assert!(!text.contains("master-key-material"), "{text}");
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_manifest_is_skipped_with_a_warning_and_the_rest_still_load() {
+        let (_tmp, repo, home) = tree_with_symlinked_manifest();
+        let found = discover_connectors_with_warnings(Some(&repo), Some(&home)).unwrap();
+        let ids: Vec<_> = found.connectors.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["ok"]);
+        assert_eq!(found.warnings.len(), 1, "{:?}", found.warnings);
+        let w = &found.warnings[0];
+        assert!(
+            w.contains("evil.toml") && w.contains("symbolic link"),
+            "{w}"
+        );
+        assert!(
+            !w.contains("master-key-material") && !w.contains("vault.key"),
+            "the link target must not appear: {w}"
+        );
+        // The plain entry point agrees and does not fail either.
+        let plain = discover_connectors(Some(&repo), Some(&home)).unwrap();
+        assert_eq!(plain, found.connectors);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_connector_directory_is_not_followed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(
+            elsewhere.join("other-tool.toml"),
+            "token = = \"hunter2-sentinel\"\n",
+        )
+        .unwrap();
+        fs::write(elsewhere.join("good.toml"), VALID).unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(repo.join(".fl")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, repo.join(".fl/gate")).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(home.join(".config/fl")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(".config/fl/gate")).unwrap();
+
+        let found = discover_connectors_with_warnings(Some(&repo), Some(&home)).unwrap();
+        assert!(found.connectors.is_empty(), "{:?}", found.connectors);
+        assert_eq!(found.warnings.len(), 2, "{:?}", found.warnings);
+        for w in &found.warnings {
+            assert!(w.contains("symbolic link") && !w.contains("hunter2"), "{w}");
+        }
+
+        // A project whose `.fl` is the link is refused the same way.
+        let repo2 = tmp.path().join("repo2");
+        fs::create_dir_all(&repo2).unwrap();
+        fs::create_dir_all(tmp.path().join("real-fl")).unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.parent().unwrap().join("real-fl"),
+            repo2.join(".fl"),
+        )
+        .unwrap();
+        fs::create_dir_all(tmp.path().join("real-fl/gate")).unwrap();
+        fs::write(tmp.path().join("real-fl/gate/good.toml"), VALID).unwrap();
+        let found = discover_connectors_with_warnings(Some(&repo2), Some(&home)).unwrap();
+        assert!(found.connectors.is_empty());
+        assert!(
+            found.warnings.iter().any(|w| w.contains(".fl")),
+            "{:?}",
+            found.warnings
+        );
+    }
+
+    #[test]
+    fn a_malformed_manifest_error_quotes_no_source() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let gate = tmp.path().join("repo/.fl/gate");
+        fs::create_dir_all(&gate).unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        for (body, line) in [
+            ("id = \"ok\"\ntitle = SOURCE-LINE-SENTINEL-1 nope\n", 2),
+            ("id = 42424242\ntitle = \"t\"\nbase_url = \"u\"\n", 1),
+            (
+                "id = \"ok\"\ntitle = \"t\"\nbase_url = \"u\"\nSENTINEL-KEY = \"pasted-token-9\"\ntitle = \"x\"\n",
+                5,
+            ),
+            ("pasted-token-9 = 1\n[tools]\n", 0),
+        ] {
+            fs::write(gate.join("bad.toml"), body).unwrap();
+            let err =
+                discover_connectors_with_warnings(Some(&tmp.path().join("repo")), Some(&home))
+                    .unwrap_err();
+            let text = err.to_string();
+            assert!(matches!(err, GateError::InvalidConnector { .. }), "{text}");
+            assert!(text.contains("line "), "{text}");
+            if line > 0 {
+                assert!(text.contains(&format!("line {line},")), "{text}");
+            }
+            for leaked in [
+                "SOURCE-LINE-SENTINEL",
+                "SENTINEL-KEY",
+                "pasted-token-9",
+                "42424242",
+                " | ",
+            ] {
+                assert!(!text.contains(leaked), "`{leaked}` leaked: {text}");
+            }
+        }
     }
 }
