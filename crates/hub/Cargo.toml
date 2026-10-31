@@ -14,6 +14,7 @@ fl-gate = { path = "../gate" }
 fl-github = { path = "../github" }
 fl-store = { path = "../store" }
 fl-wire = { path = "../wire" }
+flate2 = "1.1"
 globset.workspace = true
 libc.workspace = true
 ring.workspace = true

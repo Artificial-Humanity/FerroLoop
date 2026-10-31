@@ -5617,6 +5617,7 @@ default_target = "wire:felicity"
                 session_id: None,
                 status: "live".into(),
                 updated_at_ms: 1,
+                versions: Vec::new(),
             });
         });
         let listed = list_artifacts(&state);
@@ -5815,6 +5816,7 @@ default_target = "wire:felicity"
             session_id: None,
             status: "live".into(),
             updated_at_ms: 1,
+            versions: Vec::new(),
         };
         let canon_wt = fs::canonicalize(&wt).unwrap();
         crate::artifacts::with_registry(&artifacts_root_of(&tmp), |reg| {
@@ -5984,6 +5986,7 @@ default_target = "wire:felicity"
                 session_id: Some(session.into()),
                 status: "live".into(),
                 updated_at_ms: 1,
+                versions: Vec::new(),
             });
         });
     }
