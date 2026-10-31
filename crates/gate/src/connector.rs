@@ -111,6 +111,15 @@ fn default_input_schema() -> Value {
     })
 }
 
+/// A connector id is lowercase ASCII alphanumeric, `-`, or `_`, and never empty. Checked as written,
+/// without trimming.
+pub(crate) fn is_valid_connector_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
 impl ConnectorManifest {
     /// Parse and validate a [`ConnectorManifest`] from TOML text.
     pub fn parse_toml(raw: &str, source_path: &Path) -> Result<Self, GateError> {
@@ -126,11 +135,7 @@ impl ConnectorManifest {
         // Checked as written: a padded id passed `trim()` yet was stored, matched, and published
         // with its padding.
         let id = self.id.as_str();
-        if id.is_empty()
-            || !id
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
-        {
+        if !is_valid_connector_id(id) {
             return Err(GateError::InvalidConnector {
                 path: source_path.to_path_buf(),
                 reason: format!(
@@ -143,6 +148,31 @@ impl ConnectorManifest {
                 path: source_path.to_path_buf(),
                 reason: "connector `base_url` must not be empty".to_string(),
             });
+        }
+        for bridge in &self.bridges {
+            for entry in &bridge.allowed_inline_connectors {
+                let entry = entry.trim();
+                if entry == "*" {
+                    return Err(GateError::InvalidConnector {
+                        path: source_path.to_path_buf(),
+                        reason: format!(
+                            "bridge `{}` allowed_inline_connectors must list connector ids; `*` is \
+                             not a wildcard",
+                            bridge.id
+                        ),
+                    });
+                }
+                if !is_valid_connector_id(entry) {
+                    return Err(GateError::InvalidConnector {
+                        path: source_path.to_path_buf(),
+                        reason: format!(
+                            "bridge `{}` allowed_inline_connectors entry `{entry}` is not a valid \
+                             connector id (lowercase ASCII alphanumeric, `-`, or `_`)",
+                            bridge.id
+                        ),
+                    });
+                }
+            }
         }
         let mut seen_tools = std::collections::BTreeSet::new();
         for tool in &self.tools {

@@ -147,6 +147,8 @@ verify_secret = "DISCORD_PUBLIC_KEY"
 bot_token_secret = "DISCORD_BOT_TOKEN"
 allowed_user_ids = ["owner-discord-snowflake"]
 allowed_guild_ids = []
+# Connector ids a sender may pick with `/model <connector>`; empty refuses every inline choice.
+allowed_inline_connectors = []
 default_target = "wire:ferris"
 
 [bridges.channel_routes]
@@ -173,10 +175,21 @@ default_target = "wire:ferris"
 ## 5. Dual-Mode Event Bridge (`crates/gate/src/bridge.rs`)
 
 Each `[[bridges]]` entry in a connector manifest supports inbound event normalization and routing:
-1. **Allowlist Verification:**
+1. **Webhook Verification (`verify_inbound_bridge_webhook`, before the allowlist):**
+   * When the bridge sets `verify_secret`, the named secret must be provisioned in the vault and the request must carry it in the `x-ferrogate-secret` or `x-webhook-secret` header (compared in constant time), for owner and peer callers alike. With no `verify_secret`, owner callers are accepted and peer callers are refused.
+   * Fail closed: a `verify_secret` whose secret is not in the vault refuses every caller, owner included, with HTTP 403 and this reason: ``webhook secret `<NAME>` named by `verify_secret` is not provisioned in the vault; provision it with `fl vault set <NAME>` or correct the `verify_secret` spelling``. An empty `verify_secret` (or one that is only spaces) also refuses every caller: `` `verify_secret` is set but empty; name the vault secret that signs this webhook, or remove `verify_secret` ``. Neither message contains a secret value.
+   * Migration: a bridge that sets `verify_secret` (the shipped `.fl/gate/discord.toml` sample uses `DISCORD_PUBLIC_KEY`) now refuses every caller, owner included, until that secret is provisioned with `fl vault set <NAME>`. Previously an owner caller was accepted without a header when the secret was missing, so a misspelt `verify_secret` name silently disabled verification; that is why it now refuses. A provisioned secret keeps the old rules: the header is required and must match, for owner and peer alike. To run a bridge without header verification, remove `verify_secret` from the manifest instead of leaving it unprovisioned.
+2. **Allowlist Verification:**
    * Checks `sender_id` against `allowed_user_ids` (and `guild_id` against `allowed_guild_ids` when non-empty). Unlisted senders are rejected with `BridgeVerdict::UnauthorizedSender` before any agent or LLM token is invoked.
-2. **Target Resolution:**
-   * Checks explicit `@<persona>` or `/model <connector>` prefix in the message content, then `channel_routes.get(channel_id)`, then `default_target`.
+3. **Target Resolution:**
+   * Checks an explicit `@<persona>` or `/model <connector>` prefix in the message content, then `channel_routes.get(channel_id)`, then `default_target`.
+   * `@<persona>` routes to `wire:<persona>`. `/model <connector> <message>` is honoured only when the bridge lists that exact connector id in `allowed_inline_connectors` (default empty: every inline `/model` is refused with an error that says why). The match is exact and case-sensitive; `*` is not a wildcard and is rejected when the manifest loads. A connector tool can never be chosen from chat text: `/model <connector>:<tool>` is always refused. Only a leading `/model` word is a directive; a connector id outside lowercase ASCII alphanumeric, `-` and `_` is refused. An operator's own `channel_routes` and `default_target` may still name `connector:<id>:<tool>`.
+   * Migration: a deployment that relied on inline `/model <connector>` must list the connector in `allowed_inline_connectors`, or its senders now get a refusal.
+   * Migration (case): a connector id after `/model` used to be lowercased and accepted. It is now matched exactly and case-sensitively against `allowed_inline_connectors`, so `/model Github` is refused (an id outside lowercase ASCII alphanumeric, `-` and `_` is refused before the list is checked). Write the id the way the connector manifest spells it.
+   * Migration (bare `/model`): a message that is only `/model`, or `/model` followed by whitespace, used to be sent as plain text to the default target. It now returns an error (`` `/model` needs a connector id: `/model <connector> <message>` ``).
+   * Migration (manifest): an `allowed_inline_connectors` entry that is not a valid connector id (`"Github"`, `"*"`, `""`, or anything outside lowercase ASCII alphanumeric, `-` and `_`; surrounding spaces are trimmed first) makes the manifest fail to load. A manifest that fails to load fails the whole connector discovery, not only that file: the hub's `GET /api/v1/gate/connectors` and bridge webhook routes return 500, and its MCP and registry routes load no connectors. Fix the entry; do not ignore the error.
+   * Operator note: for an allowed inline connector the hub runs that connector's FIRST tool with the sender's text as `prompt` and `content`. List only connectors whose first tool is safe for sender-chosen text.
+   * Operator note: `sender_id`, `guild_id`, `channel_id` and the message text all come from the webhook caller's JSON. The `channel_routes` lookup uses that `channel_id`, so an authenticated webhook caller picks which `channel_routes` entry (or `default_target`) applies. When the target is a connector, the same caller-supplied `channel_id` is passed to the connector's tool as its `channel_id` argument. `allowed_user_ids` therefore filters the identity the caller reports; it is not proof of who typed the message. The webhook secret (below) and the hub authority are what authenticate the caller.
    * Produces a structured `BridgeDispatchPlan`:
      * `BridgeTarget::WireAgent { persona }` — dispatched by `fl-hub` via `dispatch_operator_prompt_to_route` / `FerroWire`.
      * `BridgeTarget::Connector { connector_id, tool_name }` — invoked directly through `FerroGate`'s proxy using the target LLM connector (`claude`, `gemini`, `openai`, `muse`, or local model).

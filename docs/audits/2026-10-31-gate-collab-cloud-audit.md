@@ -55,7 +55,7 @@ requested branch name (`cloud/audit-2026-10-31-gate-collab`).
 | O-2 | Medium | No cross-process lock: concurrent `fl vault` writers lose each other's updates | **Open** |
 | O-3 | Low | A vault file can be rolled back to an older, broader policy | **Open** |
 | O-4 | Low | `ferrogate_list_secrets` ignores `allowed_agents` and the IAM provider | **Open** |
-| O-5 | Low (cloud rating); the review rates it the most dangerous open item | A bridge sender can pick the connector and tool inline; owner bypass when `verify_secret` is unprovisioned | **Open** |
+| O-5 | Low (cloud rating); rated the most dangerous item before this change | A bridge sender can pick the connector and tool inline; owner bypass when `verify_secret` is unprovisioned | **Partly fixed** (inline routing and owner bypass fixed; `bridge_id` compare open) |
 | O-6 | Low | Response scrubbing misses secrets under 4 bytes and secrets inside larger base64 | **Open** |
 | O-7 | Info | The registry route is unauthenticated; duplicate tool names across connectors; audit-log limits | **Open** |
 
@@ -412,13 +412,57 @@ values, but it tells an agent which secrets and hosts exist, including those who
 
 ### O-5 — Bridge routing and webhook trust (Low)
 
-* An allow-listed sender can override `channel_routes` with `/model <connector>[:tool]` or
-  `@persona` in the message (`bridge.rs:247`), including naming a connector tool. Allow-listing a
-  user therefore means trusting them with every connector the hub knows.
-* `evaluate_inbound_bridge_event` never compares `event.bridge_id` with `bridge.id`.
-* When `verify_secret` names a secret that is not in the vault, an **owner** caller is accepted
-  without any header (`bridge.rs:32`), as documented. A misspelt name therefore disables
-  verification for owner-authenticated callers.
+* **FIXED.** An allow-listed sender could override `channel_routes` with `/model <connector>[:tool]`
+  in the message, including naming a connector tool. A connector tool can no longer be chosen from
+  chat text, and `/model <connector>` is honoured only for an id the bridge lists in the new
+  `allowed_inline_connectors` (default empty, exact ids, `*` rejected at manifest load). `@persona`
+  is unchanged.
+* **Still open.** `evaluate_inbound_bridge_event` never compares `event.bridge_id` with
+  `bridge.id`. The hub route resolves the bridge by the path id and overwrites `event.bridge_id`
+  with it, and existing hub tests post a placeholder `bridge_id`, so the check is left for a
+  follow-up that also changes those callers.
+* **FIXED.** When `verify_secret` named a secret that is not in the vault, an owner caller was
+  accepted without any header. An unprovisioned or empty `verify_secret` now refuses every caller,
+  owner included, with an error naming the bridge and the secret name (never a value).
+
+**Migration notes (O-5).** These change behaviour for existing bridge configurations.
+
+* **`verify_secret` must be provisioned.** A bridge that sets `verify_secret` (the shipped
+  `.fl/gate/discord.toml` sample uses `DISCORD_PUBLIC_KEY`) now refuses EVERY caller, owner
+  included, until that secret is provisioned with `fl vault set <NAME>`. The hub answers 403 with
+  this reason: ``webhook secret `<NAME>` named by `verify_secret` is not provisioned in the vault;
+  provision it with `fl vault set <NAME>` or correct the `verify_secret` spelling``. Before, an
+  owner caller was accepted without a header when the secret was missing, which also meant a
+  misspelt `verify_secret` name silently disabled verification. An empty `verify_secret` (or one of
+  only spaces) also refuses every caller: `` `verify_secret` is set but empty; name the vault secret
+  that signs this webhook, or remove `verify_secret` ``. A provisioned secret keeps today's rules:
+  the `x-ferrogate-secret` or `x-webhook-secret` header must be present and match, for owner and
+  peer callers alike. To run a bridge without header verification, remove `verify_secret` instead
+  of leaving it unprovisioned.
+* **Connector ids are case-sensitive.** A connector id after `/model` used to be lowercased and
+  accepted. It is now matched exactly against `allowed_inline_connectors`, so `/model Github` is
+  refused.
+* **A bare `/model` is an error.** `/model`, or `/model` followed only by whitespace, used to be
+  sent as plain text to the default target. It now returns an error.
+* **A bad `allowed_inline_connectors` entry stops connector loading.** An entry such as
+  `"Github"`, `"*"` or `""`, or anything that is not a valid connector id (lowercase ASCII
+  alphanumeric, `-` or `_`; surrounding spaces are trimmed first), makes the manifest fail to load.
+  A manifest that fails to load fails the whole connector discovery, not only that file: the hub's
+  `GET /api/v1/gate/connectors` and bridge webhook routes return 500, and its MCP and registry
+  routes load no connectors. Fix the entry; do not ignore the error.
+
+**Operator notes (O-5).**
+
+* For an allowed inline connector, the hub runs the connector's FIRST tool with the sender's text
+  as the `prompt` and `content` arguments. List only connectors whose first tool is safe for
+  sender-chosen text.
+* `sender_id`, `guild_id`, `channel_id` and the message text come from the webhook caller's JSON
+  (`api.rs`, `handle_post_gate_bridge_webhook`). The `channel_routes` lookup uses that
+  `channel_id`, so an authenticated webhook caller picks which `channel_routes` entry (or
+  `default_target`) applies, and a connector target receives the same caller-supplied `channel_id`
+  as its `channel_id` argument. `allowed_user_ids` filters the identity the caller reports; it does
+  not prove who typed the message. Only the webhook secret and the hub authority authenticate the
+  caller. This is unchanged by this fix.
 
 ### O-6 — Scrubber coverage (Low)
 
@@ -493,8 +537,9 @@ completes them (and the F-8 and F-9 side effects). The F-8, F-9 and F-14 tests d
 races; they are detectors or direct tests of the new code. This branch lands the result as a fresh
 commit, not the cloud commit.
 
-Most dangerous open item in practice, by the review's rating: **O-5**. A bridge sender can choose
-the connector and the tool inline from chat text, and the owner bypass skips verification when
-`verify_secret` is misspelt or unprovisioned. F-1 stops such a sender naming a secret, but they can
-still drive any connector tool with its vault credentials. **O-2** (silent loss of secrets under
+Most dangerous item in practice, by the review's rating: **O-5**. A bridge sender could choose
+the connector and the tool inline from chat text, and the owner bypass skipped verification when
+`verify_secret` was misspelt or unprovisioned. F-1 stops such a sender naming a secret, but they
+could still drive any connector tool with its vault credentials. Both holes are now closed; only
+the `bridge_id` compare is open. **O-2** (silent loss of secrets under
 concurrent `fl vault` writers) is the most likely to happen, but it is not a security hole.
