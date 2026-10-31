@@ -4302,15 +4302,22 @@ fn optional_reason(req: &HttpRequest) -> Result<Option<String>, HttpResponse> {
 }
 
 /// `POST /api/v1/sessions/:id/interrupt` (Record 47): stop the turn the session is running.
-/// Any authenticated token may call it, as for clear. 404 when the session has no live route;
-/// 502 when the interrupt cannot be delivered. See [`session_actions::interrupt_route`] for
-/// the per-vendor mechanism and the test-mode no-op.
+/// Owner only (403 for a Peer, checked before anything else), unlike prompt and clear: it
+/// cancels another actor's work. 404 when the session has no live route; 502 when the
+/// interrupt cannot be delivered. See [`session_actions::interrupt_route`] for the per-vendor
+/// mechanism and the test-mode no-op.
 fn handle_post_session_interrupt(
     state: &HubState,
     authority: &HubAuthority,
     session_id: &str,
     req: &HttpRequest,
 ) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may interrupt a session" }),
+        );
+    }
     let reason = match optional_reason(req) {
         Ok(reason) => reason,
         Err(resp) => return resp,
@@ -4369,16 +4376,22 @@ fn hosted_record_for(
 }
 
 /// `POST /api/v1/sessions/:id/model` (Records 48 and 57): switch the model of a session.
-/// Any authenticated token may call it, as for clear. The choice is kept in `HubState` and
-/// overlaid on `GET /api/v1/sessions` (in memory: gone after a hub restart), written to the
-/// hosted-session record when one exists, and sent to a live CLI as `/model <id>`.
-/// Antigravity is not sent anything: its method is `override-only`.
+/// Owner only (403 for a Peer, checked before the body is read), unlike prompt and clear. The
+/// choice is kept in `HubState` and overlaid on `GET /api/v1/sessions` (in memory: gone after
+/// a hub restart), written to the hosted-session record when one exists, and sent to a live
+/// CLI as `/model <id>`. Antigravity is not sent anything: its method is `override-only`.
 fn handle_post_session_model(
     state: &HubState,
     authority: &HubAuthority,
     session_id: &str,
     req: &HttpRequest,
 ) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change a session's model" }),
+        );
+    }
     let body = match json_object_body(req) {
         Ok(body) => body,
         Err(resp) => return resp,
