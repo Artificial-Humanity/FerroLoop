@@ -77,6 +77,23 @@ pub fn move_record(roles: Roles<'_>, record: &Record, to: State) -> Result<MoveR
         transitions.push(report);
     }
 
+    // The gates may have run for a long time. The transitions were chosen from `record.state`;
+    // if the record has since been moved (or deleted) they no longer describe this move, and
+    // writing `to` would skip whatever gates cover the record's real state.
+    let current = roles
+        .tracker
+        .get_record(&record.id)
+        .map_err(store_err)?
+        .ok_or_else(|| store_err(StoreError::NoSuchRecord(record.id.clone())))?;
+    if current.state != record.state {
+        return Err(ExecError::StaleMove(format!(
+            "record {} is now `{}`, not `{}` as when the move began; nothing was moved",
+            record.id,
+            current.state.as_wire(),
+            record.state.as_wire()
+        )));
+    }
+
     let outcome = if declared.is_empty() {
         MoveOutcome::Ungated
     } else if worst != 0 {
@@ -448,6 +465,40 @@ mod tests {
         assert_eq!(
             store.get_record(&record.id).unwrap().unwrap().state,
             State::Todo
+        );
+    }
+
+    /// Audit R-1: the transitions were picked from the caller's snapshot of the record and the
+    /// new state was then written without looking again, so a record that had moved meanwhile
+    /// was moved on by gates that belong to a state it was no longer in.
+    #[test]
+    fn a_move_from_a_stale_snapshot_is_refused_and_writes_nothing() {
+        let d = repo();
+        let store = MemStore::default();
+        let stale = gated_record(&store, d.path());
+        // Someone else moves the record on while this move's snapshot is in flight.
+        store.set_record_state(&stale.id, State::Doing).unwrap();
+        let journal = Journal::new(&store);
+        let err = match move_record(journal.roles(), &stale, State::Done) {
+            Err(e) => e,
+            Ok(_) => panic!("a stale move was carried out"),
+        };
+        assert!(matches!(err, ExecError::StaleMove(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "record {} is now `doing`, not `todo` as when the move began; nothing was moved",
+                stale.id
+            )
+        );
+        assert_eq!(
+            store.get_record(&stale.id).unwrap().unwrap().state,
+            State::Doing
+        );
+        assert!(
+            !journal.events().contains(&"flush"),
+            "a refused-as-stale move must not flush a decision: {:?}",
+            journal.events()
         );
     }
 }

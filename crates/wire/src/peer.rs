@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ws::{WsError, WsStream};
 
-pub const WIRE_PROTOCOL_VERSION: u32 = 1;
+/// Version 2 binds each handshake MAC to the role of the side that produced it (see [`PeerRole`]).
+pub const WIRE_PROTOCOL_VERSION: u32 = 2;
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 pub const PEER_PING_INTERVAL: Duration = Duration::from_secs(15);
 pub const PEER_READ_TIMEOUT: Duration = Duration::from_secs(45);
@@ -59,39 +60,84 @@ pub struct PeerHandshakeOutcome {
     pub remote_last_agent_seq: u64,
 }
 
-fn build_mac_input(remote_nonce: &[u8], local_nonce: &[u8], host: &str) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(11 + remote_nonce.len() + local_nonce.len() + host.len());
-    msg.extend_from_slice(b"fl-wire-v1:");
-    msg.extend_from_slice(remote_nonce);
-    msg.extend_from_slice(local_nonce);
-    msg.extend_from_slice(host.as_bytes());
+/// Which end of the TCP connection produced a handshake MAC.
+///
+/// Both ends run the same handshake, so without a role in the MAC input a peer could ask the
+/// victim to sign a challenge on one connection and replay that answer on another (a reflection
+/// attack that needs no PSK). A MAC made by a `Server` never verifies as a `Client` MAC.
+///
+/// Residual (not fixed here): the role tag stops an off-path attacker who opens two connections.
+/// It does not stop an attacker ON THE PATH of a plaintext `ws://` connection the victim dials
+/// while the victim also listens: the attacker can pick its server nonce equal to the victim's
+/// listener nonce and relay frames between the two connections. The handshake also gives no
+/// channel binding and the frames after it carry no MAC, so a plaintext path attacker can hijack
+/// an established session regardless. Use `wss://` for any non-loopback peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRole {
+    Client,
+    Server,
+}
+
+impl PeerRole {
+    fn tag(self) -> &'static [u8] {
+        match self {
+            Self::Client => b"client:",
+            Self::Server => b"server:",
+        }
+    }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Client => Self::Server,
+            Self::Server => Self::Client,
+        }
+    }
+}
+
+fn build_mac_input(
+    prover: PeerRole,
+    verifier_nonce: &[u8],
+    prover_nonce: &[u8],
+    prover_host: &str,
+) -> Vec<u8> {
+    let mut msg =
+        Vec::with_capacity(18 + verifier_nonce.len() + prover_nonce.len() + prover_host.len());
+    msg.extend_from_slice(b"fl-wire-v2:");
+    msg.extend_from_slice(prover.tag());
+    msg.extend_from_slice(verifier_nonce);
+    msg.extend_from_slice(prover_nonce);
+    msg.extend_from_slice(prover_host.as_bytes());
     msg
 }
 
+/// MAC proving that the `prover` end holds `token`, over the nonce the verifier issued, the
+/// nonce the prover issued and the prover's host name.
 pub fn compute_psk_mac(
     token: &[u8],
-    remote_nonce: &[u8],
-    local_nonce: &[u8],
-    host: &str,
+    prover: PeerRole,
+    verifier_nonce: &[u8],
+    prover_nonce: &[u8],
+    prover_host: &str,
 ) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA256, token);
-    let input = build_mac_input(remote_nonce, local_nonce, host);
+    let input = build_mac_input(prover, verifier_nonce, prover_nonce, prover_host);
     let tag = hmac::sign(&key, &input);
     BASE64.encode(tag.as_ref())
 }
 
 pub fn verify_psk_mac(
     token: &[u8],
-    remote_nonce: &[u8],
-    local_nonce: &[u8],
-    host: &str,
+    prover: PeerRole,
+    verifier_nonce: &[u8],
+    prover_nonce: &[u8],
+    prover_host: &str,
     mac_b64: &str,
 ) -> bool {
     let Ok(mac_bytes) = BASE64.decode(mac_b64.trim()) else {
         return false;
     };
     let key = hmac::Key::new(hmac::HMAC_SHA256, token);
-    let input = build_mac_input(remote_nonce, local_nonce, host);
+    let input = build_mac_input(prover, verifier_nonce, prover_nonce, prover_host);
     hmac::verify(&key, &input, &mac_bytes).is_ok()
 }
 
@@ -147,7 +193,12 @@ pub fn handshake_peer(
         return Err(WsError::Handshake("remote nonce must be 32 bytes".into()));
     }
 
-    let local_mac = compute_psk_mac(psk, &remote_nonce, &local_nonce, local_host);
+    let local_role = if ws.is_client() {
+        PeerRole::Client
+    } else {
+        PeerRole::Server
+    };
+    let local_mac = compute_psk_mac(psk, local_role, &remote_nonce, &local_nonce, local_host);
     ws.send_json(&PeerFrame::Auth {
         mac: local_mac,
         last_msg_seq,
@@ -167,9 +218,16 @@ pub fn handshake_peer(
         return Err(WsError::Handshake("expected PeerFrame::Auth".into()));
     };
 
-    // Remote computed its MAC over (remote's view of remote_nonce = local_nonce,
-    // remote's view of local_nonce = remote_nonce, remote_host)
-    if !verify_psk_mac(psk, &local_nonce, &remote_nonce, &remote_host, &remote_mac) {
+    // The remote proved itself over the nonce we issued, its own nonce and its host, in the
+    // role opposite to ours.
+    if !verify_psk_mac(
+        psk,
+        local_role.opposite(),
+        &local_nonce,
+        &remote_nonce,
+        &remote_host,
+        &remote_mac,
+    ) {
         let _ = ws.close();
         return Err(WsError::Handshake(
             "PSK HMAC-SHA256 authentication failed".into(),
@@ -227,5 +285,87 @@ mod tests {
         let res_a = handshake_peer(&mut cli2, "node-a", "host-a", b"wrong-secret", 0, 0, 0);
         let res_b = srv2.join().unwrap();
         assert!(res_a.is_err() || res_b.is_err());
+    }
+
+    /// Audit W-1: the handshake MAC carried no role binding, so a server that signs its own
+    /// challenge response on one connection can be replayed against itself on another. The
+    /// attacker needs no PSK: it asks the victim to answer a challenge built from the nonce the
+    /// victim issued on a second connection, then presents that answer back as its own.
+    #[test]
+    fn psk_handshake_is_not_open_to_a_reflection_attack() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let victim = std::thread::spawn(move || {
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().unwrap();
+                handles.push(std::thread::spawn(move || {
+                    let mut ws = WsStream::accept(tcp, Duration::from_secs(2)).unwrap();
+                    handshake_peer(&mut ws, "victim", "victim-host", b"real-secret", 0, 0, 0)
+                        .map(|_| ())
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        let url = format!("ws://{addr}/wire");
+        let mut oracle = WsStream::connect(&url, Duration::from_secs(2)).unwrap();
+        let mut target = WsStream::connect(&url, Duration::from_secs(2)).unwrap();
+        let PeerFrame::Challenge {
+            nonce: oracle_nonce,
+            ..
+        } = oracle.recv_json::<PeerFrame>().unwrap()
+        else {
+            panic!("expected a challenge on the oracle connection");
+        };
+        let PeerFrame::Challenge {
+            nonce: target_nonce,
+            ..
+        } = target.recv_json::<PeerFrame>().unwrap()
+        else {
+            panic!("expected a challenge on the target connection");
+        };
+
+        // Oracle connection: claim the nonce the victim issued on the target connection.
+        oracle
+            .send_json(&PeerFrame::Challenge {
+                protocol_version: WIRE_PROTOCOL_VERSION,
+                node_id: "attacker".into(),
+                host: "attacker-host".into(),
+                nonce: target_nonce,
+            })
+            .unwrap();
+        let PeerFrame::Auth { mac, .. } = oracle.recv_json::<PeerFrame>().unwrap() else {
+            panic!("expected the victim's Auth on the oracle connection");
+        };
+        drop(oracle);
+
+        // Target connection: present the oracle's nonce, the victim's own host, and its MAC.
+        target
+            .send_json(&PeerFrame::Challenge {
+                protocol_version: WIRE_PROTOCOL_VERSION,
+                node_id: "attacker".into(),
+                host: "victim-host".into(),
+                nonce: oracle_nonce,
+            })
+            .unwrap();
+        let _victim_auth = target.recv_json::<PeerFrame>().unwrap();
+        target
+            .send_json(&PeerFrame::Auth {
+                mac,
+                last_msg_seq: 0,
+                last_rcpt_seq: 0,
+                last_agent_seq: 0,
+            })
+            .unwrap();
+
+        let results = victim.join().unwrap();
+        assert!(
+            results[1].is_err(),
+            "reflected MAC authenticated an attacker that does not hold the PSK"
+        );
     }
 }

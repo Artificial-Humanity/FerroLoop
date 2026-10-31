@@ -22,6 +22,40 @@ pub const EXCERPT_LIMIT: usize = 8192;
 const SPAWN_RETRY_LIMIT: u32 = 20;
 const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(2);
 const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a running attempt's spend is compared with its ceiling.
+const BUDGET_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Decides which ticks of the supervision loop also send a heartbeat. It counts ticks instead of
+/// comparing wall-clock time: the loop ticks every `check_every`, and a clock comparison taken
+/// just after the previous heartbeat always came out a hair under the interval, so every second
+/// check was skipped and heartbeats arrived at twice the configured interval.
+struct HeartbeatPacer {
+    ticks_per_beat: u32,
+    ticks: u32,
+}
+
+impl HeartbeatPacer {
+    fn new(heartbeat_interval: Duration, check_every: Duration) -> Self {
+        let ratio = heartbeat_interval
+            .as_nanos()
+            .div_ceil(check_every.as_nanos().max(1));
+        Self {
+            ticks_per_beat: u32::try_from(ratio).unwrap_or(u32::MAX).max(1),
+            ticks: 0,
+        }
+    }
+
+    /// Call once per tick; true when this tick should send a heartbeat.
+    fn tick(&mut self) -> bool {
+        self.ticks += 1;
+        if self.ticks >= self.ticks_per_beat {
+            self.ticks = 0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParsedOutput {
@@ -150,6 +184,9 @@ impl<D: CliDialect> ProcessHarness<D> {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Its own process group, so a timeout or a spend-ceiling kill reaches the tools the
+        // agent started (a build, a test run) and not just the agent's own process.
+        cmd.process_group(0);
 
         let mut retries = 0u32;
         let mut child = loop {
@@ -218,8 +255,13 @@ impl<D: CliDialect> ProcessHarness<D> {
 
         let limit = Duration::from_secs(spec.timeout_secs.max(1));
         let deadline = tokio::time::Instant::now() + limit;
-        let mut interval = tokio::time::interval(self.heartbeat_interval);
+        // Spend is checked at least once a second even when heartbeats are sent less often: a
+        // ceiling noticed only every few seconds is a ceiling that can be overshot by minutes.
+        let check_every = self.heartbeat_interval.min(BUDGET_CHECK_INTERVAL);
+        let mut interval = tokio::time::interval(check_every);
         interval.tick().await; // consume immediate first tick
+        let mut pacer = HeartbeatPacer::new(self.heartbeat_interval, check_every);
+        let mut over_budget = false;
 
         let wait_result = loop {
             tokio::select! {
@@ -240,17 +282,26 @@ impl<D: CliDialect> ProcessHarness<D> {
                         partial.tokens_out,
                         partial.vendor_cost_usd_micros,
                     );
-                    hb.heartbeat_at = now_at();
-                    hb.duration_ms = started.elapsed().as_millis() as u64;
-                    hb.tokens_in = partial.tokens_in;
-                    hb.tokens_out = partial.tokens_out;
-                    hb.cost_usd_micros = partial_cost;
-                    emit(&hb);
+                    if pacer.tick() {
+                        hb.heartbeat_at = now_at();
+                        hb.duration_ms = started.elapsed().as_millis() as u64;
+                        hb.tokens_in = partial.tokens_in;
+                        hb.tokens_out = partial.tokens_out;
+                        hb.cost_usd_micros = partial_cost;
+                        emit(&hb);
+                    }
+                    if partial_cost > spec.budget_usd_micros {
+                        over_budget = true;
+                        break None;
+                    }
                 }
             }
         };
 
         if wait_result.is_none() {
+            if let Some(pid) = child.id() {
+                kill_process_group(pid).await;
+            }
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
@@ -275,16 +326,29 @@ impl<D: CliDialect> ProcessHarness<D> {
 
         let (status, raw_excerpt) = match wait_result {
             None => {
-                let prefix = format!(
-                    "`{}` exceeded its {}s timeout",
-                    self.binary, spec.timeout_secs
-                );
+                let (status, prefix) = if over_budget {
+                    (
+                        AttemptStatus::Crashed,
+                        format!(
+                            "`{}` was stopped: it passed its spend ceiling of {} micro-USD",
+                            self.binary, spec.budget_usd_micros
+                        ),
+                    )
+                } else {
+                    (
+                        AttemptStatus::Timeout,
+                        format!(
+                            "`{}` exceeded its {}s timeout",
+                            self.binary, spec.timeout_secs
+                        ),
+                    )
+                };
                 let excerpt = if parsed.excerpt_text.trim().is_empty() {
                     prefix
                 } else {
                     format!("{prefix}\n{}", parsed.excerpt_text)
                 };
-                (AttemptStatus::Timeout, excerpt)
+                (status, excerpt)
             }
             Some(Err(e)) => (AttemptStatus::Crashed, e.to_string()),
             Some(Ok(exit_status)) => {
@@ -320,6 +384,17 @@ impl<D: CliDialect> ProcessHarness<D> {
             paths_touched,
         }
     }
+}
+
+/// SIGKILL the process group `pgid`. `kill` is the shell's built-in, so this needs no `kill`
+/// binary and no libc binding. Failure is ignored: the direct child is killed separately.
+async fn kill_process_group(pgid: u32) {
+    let _ = Command::new("sh")
+        .args(["-c", &format!("kill -KILL -{pgid} 2>/dev/null")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
 }
 
 fn read_pipe<R: AsyncRead + Unpin>(
@@ -738,10 +813,20 @@ fn hash_worktree_path(full_path: &Path) -> Option<[u8; 32]> {
         return Some(hasher.finalize().into());
     }
     if meta.is_file() {
-        let bytes = std::fs::read(full_path).ok()?;
+        // Streamed: an untracked build artifact can be gigabytes, and `fs::read` would hold the
+        // whole file in memory (twice, before and after the attempt).
+        use std::io::Read;
+        let mut file = std::fs::File::open(full_path).ok()?;
         let mut hasher = Sha256::new();
         hasher.update(b"file:");
-        hasher.update(&bytes);
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let n = file.read(&mut chunk).ok()?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&chunk[..n]);
+        }
         return Some(hasher.finalize().into());
     }
     None
@@ -749,6 +834,26 @@ fn hash_worktree_path(full_path: &Path) -> Option<[u8; 32]> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heartbeats_fire_every_interval_not_every_second_one() {
+        // Default shape: heartbeat every 5 s, supervision tick every 1 s.
+        let mut pacer = HeartbeatPacer::new(Duration::from_secs(5), Duration::from_secs(1));
+        let beats: Vec<u32> = (1..=20).filter(|_| pacer.tick()).collect();
+        assert_eq!(beats.len(), 4, "one heartbeat per 5 ticks over 20 ticks");
+        let mut pacer = HeartbeatPacer::new(Duration::from_secs(5), Duration::from_secs(1));
+        let at: Vec<u32> = (1..=20).filter(|_| pacer.tick()).collect();
+        assert_eq!(at, vec![5, 10, 15, 20]);
+        // Interval at or below the check period: every tick beats.
+        let mut fast = HeartbeatPacer::new(Duration::from_millis(50), Duration::from_millis(50));
+        assert!((0..10).all(|_| fast.tick()));
+        // Not a whole multiple: rounds up, never beats early.
+        let mut odd = HeartbeatPacer::new(Duration::from_millis(1500), Duration::from_secs(1));
+        assert_eq!(
+            (1..=4).map(|_| odd.tick()).collect::<Vec<_>>(),
+            [false, true, false, true]
+        );
+    }
+
     use super::*;
     use fl_core::ids::{RecordId, seq_iri};
     use std::sync::Mutex;
@@ -917,5 +1022,181 @@ mod tests {
         assert_eq!(last.tokens_out, 25);
         assert_eq!(last.cost_usd_micros, 250);
         assert!(last.exit_at.is_some());
+    }
+
+    fn write_script(dir: &Path, name: &str, body: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    fn priced_harness(bin: String) -> ProcessHarness<StubDialect> {
+        ProcessHarness::new(bin, StubDialect)
+            .with_rate_card(Some(RateCard {
+                input_usd_micros_per_mtok: 2_000_000,
+                output_usd_micros_per_mtok: 4_000_000,
+            }))
+            .with_heartbeat_interval(Duration::from_secs(60))
+    }
+
+    fn spec_in(dir: &Path, timeout_secs: u64, budget_usd_micros: u64) -> AttemptSpec {
+        AttemptSpec {
+            project_root: dir.to_path_buf(),
+            record: RecordId(seq_iri(30)),
+            instruction: "test".into(),
+            timeout_secs,
+            budget_usd_micros,
+        }
+    }
+
+    /// Audit H-1: `budget_usd_micros` was only compared with zero. An attempt that had already
+    /// spent past its ceiling ran on until it finished or timed out.
+    #[tokio::test]
+    async fn an_attempt_that_passes_its_spend_ceiling_is_stopped_not_left_to_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        // 75 * 2 + 25 * 4 = 250 micro-USD, then a 30 s hang.
+        let bin = write_script(
+            tmp.path(),
+            "spend_then_hang.sh",
+            "#!/bin/sh\nprintf '%s\\n' '{\"text\":\"spent\",\"usage\":{\"input_tokens\":75,\"output_tokens\":25}}'\nsleep 30\n",
+        );
+        let started = Instant::now();
+        // The harness is configured with a 60 s heartbeat, so only the budget check can stop it.
+        let outcome = priced_harness(bin).run(spec_in(tmp.path(), 25, 100)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "ran {:?} past a spend ceiling",
+            started.elapsed()
+        );
+        assert_eq!(outcome.status, AttemptStatus::Crashed);
+        assert_eq!(outcome.cost_usd_micros, 250);
+        assert!(
+            outcome.output_excerpt.contains("spend ceiling of 100"),
+            "{}",
+            outcome.output_excerpt
+        );
+        assert!(outcome.output_excerpt.contains("spent"));
+    }
+
+    #[tokio::test]
+    async fn spending_exactly_the_ceiling_is_allowed_and_a_zero_ceiling_starts_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = write_script(
+            tmp.path(),
+            "spend_exactly.sh",
+            "#!/bin/sh\nprintf '%s\\n' '{\"text\":\"ok\",\"usage\":{\"input_tokens\":75,\"output_tokens\":25}}'\n",
+        );
+        let ok = priced_harness(bin.clone())
+            .run(spec_in(tmp.path(), 10, 250))
+            .await;
+        assert_eq!(ok.status, AttemptStatus::Completed);
+        assert_eq!(ok.cost_usd_micros, 250);
+        let refused = priced_harness(bin).run(spec_in(tmp.path(), 10, 0)).await;
+        assert_eq!(refused.status, AttemptStatus::Refused);
+        assert_eq!(refused.cost_usd_micros, 0);
+    }
+
+    #[tokio::test]
+    async fn a_missing_binary_is_refused_and_a_nonzero_exit_is_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = priced_harness("/nonexistent/fl-audit-agent".into())
+            .run(spec_in(tmp.path(), 5, 1_000))
+            .await;
+        assert_eq!(missing.status, AttemptStatus::Refused);
+        assert!(missing.output_excerpt.contains("could not start"));
+        let bin = write_script(tmp.path(), "fail.sh", "#!/bin/sh\necho boom >&2\nexit 3\n");
+        let crashed = priced_harness(bin).run(spec_in(tmp.path(), 5, 1_000)).await;
+        assert_eq!(crashed.status, AttemptStatus::Crashed);
+    }
+
+    /// Audit H-2: only the agent's own process was killed at the timeout, so a build or test run
+    /// it had started kept going (and kept spending) after the attempt was reported over.
+    #[tokio::test]
+    async fn a_timeout_also_kills_what_the_agent_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("orphan-survived");
+        let bin = write_script(
+            tmp.path(),
+            "spawn_orphan.sh",
+            &format!(
+                "#!/bin/sh\n(sleep 2; touch '{}') &\nsleep 30\n",
+                marker.display()
+            ),
+        );
+        let outcome = priced_harness(bin).run(spec_in(tmp.path(), 1, 1_000)).await;
+        assert_eq!(outcome.status, AttemptStatus::Timeout);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !marker.exists(),
+            "a process the agent started outlived the attempt"
+        );
+    }
+
+    /// Audit H-3: a dirty file was read into memory whole to be hashed; the digest must stay what
+    /// it was (`sha256("file:" + bytes)`) while being computed in constant memory.
+    #[test]
+    fn worktree_hash_streams_large_files_and_keeps_its_digest_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let big = tmp.path().join("big.bin");
+        let bytes: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&big, &bytes).unwrap();
+        let mut want = Sha256::new();
+        want.update(b"file:");
+        want.update(&bytes);
+        assert_eq!(hash_worktree_path(&big), Some(want.finalize().into()));
+
+        let empty = tmp.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let mut want = Sha256::new();
+        want.update(b"file:");
+        assert_eq!(hash_worktree_path(&empty), Some(want.finalize().into()));
+
+        // Missing paths and directories have no digest; a symlink hashes its target text.
+        assert_eq!(hash_worktree_path(&tmp.path().join("nope")), None);
+        assert_eq!(hash_worktree_path(tmp.path()), None);
+        let link_a = tmp.path().join("a");
+        let link_b = tmp.path().join("b");
+        std::os::unix::fs::symlink("target-one", &link_a).unwrap();
+        std::os::unix::fs::symlink("target-two", &link_b).unwrap();
+        assert!(hash_worktree_path(&link_a).is_some());
+        assert_ne!(hash_worktree_path(&link_a), hash_worktree_path(&link_b));
+    }
+
+    #[tokio::test]
+    async fn snapshot_delta_sees_a_revert_to_head_a_deletion_a_rename_and_ignores_fl_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        run_git(root, &["init", "-q"]);
+        std::fs::write(root.join("kept.txt"), "head\n").unwrap();
+        std::fs::write(root.join("gone.txt"), "bye\n").unwrap();
+        std::fs::write(root.join("old name.txt"), "rename me\n").unwrap();
+        std::fs::write(root.join("untouched.txt"), "same\n").unwrap();
+        run_git(root, &["add", "-A"]);
+        run_git(root, &["commit", "-qm", "init"]);
+        // Already dirty before the attempt.
+        std::fs::write(root.join("kept.txt"), "dirty before\n").unwrap();
+
+        let before = GitSnapshot::capture(root).await.unwrap();
+        // The agent reverts the pre-existing edit, deletes one file and renames another.
+        std::fs::write(root.join("kept.txt"), "head\n").unwrap();
+        std::fs::remove_file(root.join("gone.txt")).unwrap();
+        std::fs::rename(root.join("old name.txt"), root.join("new name.txt")).unwrap();
+        run_git(root, &["add", "-A"]);
+        std::fs::create_dir_all(root.join(".fl")).unwrap();
+        std::fs::write(root.join(".fl/state.json"), "{}").unwrap();
+
+        let touched = before.diff_after(root).await;
+        assert_eq!(
+            touched,
+            vec![
+                "gone.txt".to_owned(),
+                "kept.txt".to_owned(),
+                "new name.txt".to_owned(),
+                "old name.txt".to_owned(),
+            ]
+        );
     }
 }

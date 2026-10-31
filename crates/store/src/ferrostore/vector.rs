@@ -557,7 +557,7 @@ impl VectorCollection {
         check_vector_id(&id)?;
         check_stored(self.storage, self.dim, &bytes)?;
         if self.vectors.contains_key(&id) {
-            self.remove_node(&id);
+            self.remove_node(&id)?;
         }
         let level = vector_level(&id, self.m);
         let query = dequantize(self.storage, &bytes)?;
@@ -613,21 +613,33 @@ impl VectorCollection {
     pub(super) fn delete_id(&mut self, id: &str) -> Result<(), StoreError> {
         check_vector_id(id)?;
         if self.vectors.contains_key(id) {
-            self.remove_node(id);
+            self.remove_node(id)?;
         }
         Ok(())
     }
 
-    fn remove_node(&mut self, id: &str) {
+    /// Remove `id` and re-link its former neighbours. A delete, and a replacing upsert (which
+    /// removes the old node first), pay for the repair: it is bounded but not cheap. For each
+    /// layer with `k` former neighbours it ranks up to `k - 1 + max_links` candidates per
+    /// neighbour (`k` is at most `max_links`, i.e. `m`, or `2m` on layer 0), so about `k^2`
+    /// dequantizing distance computations: roughly 5 thousand at `m = 16`, 500 thousand at
+    /// `m = 128`, each over `dim` values. At `dim` near 1000 and `m = 128` that is several hundred
+    /// milliseconds per delete, and a WAL replay pays it again for every delete it replays. The
+    /// repair stays this simple on purpose: it must give the same graph on every replica.
+    ///
+    /// An error here (a stored vector that no longer decodes) aborts the operation. For a delete
+    /// the caller applies it to a staged copy and commits nothing on error, so the graph is never
+    /// left half repaired.
+    fn remove_node(&mut self, id: &str) -> Result<(), StoreError> {
         let Some(record) = self.vectors.get(id) else {
-            return;
+            return Ok(());
         };
         let neighbors = record.neighbors.clone();
-        for (layer, nids) in neighbors.into_iter().enumerate() {
+        for (layer, nids) in neighbors.iter().enumerate() {
             for nid in nids {
                 if let Some(slot) = self
                     .vectors
-                    .get_mut(&nid)
+                    .get_mut(nid)
                     .and_then(|rec| rec.neighbors.get_mut(layer))
                 {
                     slot.retain(|other| other != id);
@@ -635,7 +647,228 @@ impl VectorCollection {
             }
         }
         self.vectors.remove(id);
+        // Dropping the node's links alone can leave a neighbour whose only way in was this node
+        // unreachable from the entry point: still stored, never returned by a search.
+        for (layer, nids) in neighbors.iter().enumerate() {
+            self.repair_layer(nids, layer)?;
+        }
         self.recompute_entry();
+        Ok(())
+    }
+
+    /// Reconnect `orphans`, the former neighbours of a deleted node on `layer`: each may link to
+    /// the others (they were all one hop from the deleted node), keeping its `max_links` closest
+    /// links, and every link stays reciprocal. An orphan never drops a link that would leave the
+    /// node at the other end with fewer than two links (the same rule `make_room` applies), or the
+    /// repair would itself strand a neighbour whose only way in was that orphan.
+    fn repair_layer(&mut self, orphans: &[String], layer: usize) -> Result<(), StoreError> {
+        let max = max_links(self.m, layer);
+        let present: Vec<&String> = orphans
+            .iter()
+            .filter(|nid| {
+                self.vectors
+                    .get(*nid)
+                    .is_some_and(|rec| rec.neighbors.len() > layer)
+            })
+            .collect();
+        let mut touched: BTreeSet<String> = BTreeSet::new();
+        for nid in &present {
+            let current = self
+                .vectors
+                .get(*nid)
+                .and_then(|rec| rec.neighbors.get(layer))
+                .cloned()
+                .unwrap_or_default();
+            let mut pool: BTreeSet<String> = current.iter().cloned().collect();
+            pool.extend(present.iter().filter(|o| *o != nid).map(|o| (*o).clone()));
+            let origin = self.stored(nid)?;
+            let mut ranked = Vec::with_capacity(pool.len());
+            for candidate in pool {
+                let distance = self.pair_distance(&origin, &candidate)?;
+                ranked.push((distance, candidate));
+            }
+            ranked.sort_by(|left, right| cmp_distance_then_id(left.0, &left.1, right.0, &right.1));
+            // A current link whose other end has no link to spare is kept first; the rest of the
+            // room goes to the closest candidates.
+            let protected = |col: &Self, candidate: &String| {
+                current.contains(candidate)
+                    && col
+                        .vectors
+                        .get(candidate)
+                        .and_then(|rec| rec.neighbors.get(layer))
+                        .is_some_and(|slot| slot.len() <= 2)
+            };
+            let mut keep: Vec<String> = ranked
+                .iter()
+                .filter(|(_, candidate)| protected(self, candidate))
+                .map(|(_, candidate)| candidate.clone())
+                .collect();
+            for (_, candidate) in &ranked {
+                if keep.len() >= max {
+                    break;
+                }
+                if !keep.contains(candidate) {
+                    keep.push(candidate.clone());
+                }
+            }
+            // A link this node gives up must also leave the other side, or that side keeps a
+            // one-way link that dangles once this node is deleted.
+            for dropped in current.iter().filter(|other| !keep.contains(other)) {
+                if let Some(slot) = self
+                    .vectors
+                    .get_mut(dropped)
+                    .and_then(|rec| rec.neighbors.get_mut(layer))
+                {
+                    slot.retain(|other| other != *nid);
+                }
+            }
+            for candidate in &keep {
+                if let Some(slot) = self
+                    .vectors
+                    .get_mut(candidate)
+                    .and_then(|rec| rec.neighbors.get_mut(layer))
+                    && !slot.iter().any(|other| other == *nid)
+                {
+                    slot.push((*nid).clone());
+                    touched.insert(candidate.clone());
+                }
+            }
+            if let Some(slot) = self
+                .vectors
+                .get_mut(*nid)
+                .and_then(|rec| rec.neighbors.get_mut(layer))
+            {
+                *slot = keep;
+            }
+            touched.insert((*nid).clone());
+        }
+        for nid in &touched {
+            self.prune(nid, layer)?;
+        }
+        for nid in &touched {
+            self.ensure_reciprocal(nid, layer);
+        }
+        // Closest-link selection can split the orphans into clusters that were joined only by
+        // the deleted node. A chain through all of them (by id, so it is deterministic) keeps
+        // them one component.
+        let mut chain: Vec<&String> = present;
+        chain.sort();
+        for pair in chain.windows(2) {
+            self.ensure_edge(pair[0], pair[1], layer, &mut touched)?;
+        }
+        for nid in &touched {
+            self.sort_layer(nid, layer)?;
+        }
+        Ok(())
+    }
+
+    /// Link `a` and `b` on `layer` in both directions. A full node first gives up its farthest
+    /// link, but never one that would leave that neighbour with fewer than two links. If either
+    /// side cannot make room, nothing changes: a room already made for `a` is given back before
+    /// returning, so a refused edge never leaves `a` one link short.
+    fn ensure_edge(
+        &mut self,
+        a: &str,
+        b: &str,
+        layer: usize,
+        touched: &mut BTreeSet<String>,
+    ) -> Result<(), StoreError> {
+        if a == b {
+            return Ok(());
+        }
+        let linked = |col: &Self, x: &str, y: &str| {
+            col.vectors
+                .get(x)
+                .and_then(|rec| rec.neighbors.get(layer))
+                .is_some_and(|slot| slot.iter().any(|other| other == y))
+        };
+        if linked(self, a, b) {
+            return Ok(());
+        }
+        let Some(evicted_for_a) = self.make_room(a, b, layer, touched)? else {
+            return Ok(());
+        };
+        let Some(_) = self.make_room(b, a, layer, touched)? else {
+            // `a` made room (evicting `victim`) but `b` cannot: put the evicted link back. The
+            // nodes are in `touched`, whose lists are re-sorted at the end of the repair.
+            if let Some(victim) = evicted_for_a {
+                for (from, back) in [(a, victim.as_str()), (victim.as_str(), a)] {
+                    if let Some(slot) = self
+                        .vectors
+                        .get_mut(from)
+                        .and_then(|rec| rec.neighbors.get_mut(layer))
+                    {
+                        slot.push(back.to_string());
+                    }
+                }
+            }
+            return Ok(());
+        };
+        for (x, y) in [(a, b), (b, a)] {
+            if let Some(slot) = self
+                .vectors
+                .get_mut(x)
+                .and_then(|rec| rec.neighbors.get_mut(layer))
+            {
+                slot.push(y.to_string());
+                touched.insert(x.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Make room on `layer` for one more link on `x`. `Ok(None)`: it cannot (nothing changed);
+    /// `Ok(Some(None))`: it already had room; `Ok(Some(Some(victim)))`: the link to `victim` was
+    /// removed on both sides.
+    fn make_room(
+        &mut self,
+        x: &str,
+        keep: &str,
+        layer: usize,
+        touched: &mut BTreeSet<String>,
+    ) -> Result<Option<Option<String>>, StoreError> {
+        let max = max_links(self.m, layer);
+        let Some(current) = self
+            .vectors
+            .get(x)
+            .and_then(|rec| rec.neighbors.get(layer))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if current.len() < max {
+            return Ok(Some(None));
+        }
+        let origin = self.stored(x)?;
+        let mut ranked = Vec::with_capacity(current.len());
+        for nid in current {
+            let distance = self.pair_distance(&origin, &nid)?;
+            ranked.push((distance, nid));
+        }
+        // Farthest first.
+        ranked.sort_by(|left, right| cmp_distance_then_id(right.0, &right.1, left.0, &left.1));
+        let victim = ranked.into_iter().map(|(_, nid)| nid).find(|nid| {
+            nid != keep
+                && self
+                    .vectors
+                    .get(nid)
+                    .and_then(|rec| rec.neighbors.get(layer))
+                    .is_some_and(|slot| slot.len() > 2)
+        });
+        let Some(victim) = victim else {
+            return Ok(None);
+        };
+        for (from, gone) in [(x, victim.as_str()), (victim.as_str(), x)] {
+            if let Some(slot) = self
+                .vectors
+                .get_mut(from)
+                .and_then(|rec| rec.neighbors.get_mut(layer))
+            {
+                slot.retain(|other| other != gone);
+                touched.insert(from.to_string());
+            }
+        }
+        Ok(Some(Some(victim)))
     }
 
     fn recompute_entry(&mut self) {
@@ -843,8 +1076,10 @@ fn search_layer(
             };
             if fits {
                 candidates.push(std::cmp::Reverse(rank.clone()));
-                best.push(rank);
-                best.sort();
+                // `best` is kept sorted, so insert in place: re-sorting it for every visited
+                // node made a wide search quadratic in `ef`.
+                let at = best.partition_point(|held| *held < rank);
+                best.insert(at, rank);
                 if best.len() > ef {
                     best.truncate(ef);
                 }
@@ -1475,4 +1710,93 @@ pub(super) fn parse_get(value: &Value) -> Result<Option<(Vec<f32>, Option<Value>
     )?;
     let metadata = value.get("metadata").cloned();
     Ok(Some((values, metadata)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-dimensional collection (`m = 1`, so a layer-0 node holds at most 2 links) with the
+    /// given `(id, value, links)`.
+    fn graph(nodes: &[(&str, f32, &[&str])]) -> VectorCollection {
+        let mut col = VectorCollection::empty(1, VectorStorage::F32, VectorMetric::L2, 1, 8, 8);
+        for (id, value, links) in nodes {
+            col.vectors.insert(
+                (*id).to_string(),
+                VectorRecord {
+                    bytes: quantize(VectorStorage::F32, &[*value]).unwrap(),
+                    metadata: None,
+                    level: 0,
+                    neighbors: vec![links.iter().map(|l| (*l).to_string()).collect()],
+                },
+            );
+        }
+        col
+    }
+
+    fn links(col: &VectorCollection, id: &str) -> Vec<String> {
+        let mut out = col.vectors[id].neighbors[0].clone();
+        out.sort();
+        out
+    }
+
+    /// Review follow-up to audit S-2: `ensure_edge` used to make room on `a` (evicting a link on
+    /// both sides) and only then find that `b` could not, leaving `a` one link short and no new
+    /// edge. A refused edge must change nothing.
+    #[test]
+    fn a_refused_edge_leaves_both_nodes_as_they_were() {
+        // `a` is full (2 links) and both its neighbours have a spare; `b` is full and both of
+        // its neighbours are down to two links, so `b` cannot give one up.
+        let col = graph(&[
+            ("a", 0.0, &["p", "q"]),
+            ("p", 1.0, &["a", "f1", "f2"]),
+            ("q", 2.0, &["a", "f1", "f2"]),
+            ("f1", 3.0, &["p", "q"]),
+            ("f2", 4.0, &["p", "q"]),
+            ("b", 10.0, &["r", "s"]),
+            ("r", 9.0, &["b", "s"]),
+            ("s", 11.0, &["b", "r"]),
+        ]);
+        let before = col.clone();
+        let mut after = col;
+        let mut touched = BTreeSet::new();
+        after.ensure_edge("a", "b", 0, &mut touched).unwrap();
+        for id in ["a", "p", "q", "f1", "f2", "b", "r", "s"] {
+            assert_eq!(links(&after, id), links(&before, id), "links of {id}");
+        }
+        assert!(!links(&after, "a").iter().any(|l| l == "b"));
+    }
+
+    /// The edge is made when both sides can make room, and the evicted links go on both sides.
+    #[test]
+    fn an_edge_both_sides_can_make_room_for_is_made() {
+        let col = graph(&[
+            ("a", 0.0, &["p", "q"]),
+            ("p", 1.0, &["a", "f1", "f2"]),
+            ("q", 2.0, &["a", "f1", "f2"]),
+            ("f1", 3.0, &["p", "q", "r", "s"]),
+            ("f2", 4.0, &["p", "q"]),
+            ("b", 10.0, &["r", "s"]),
+            ("r", 9.0, &["b", "s", "f1"]),
+            ("s", 11.0, &["b", "r", "f1"]),
+        ]);
+        let mut col = col;
+        let mut touched = BTreeSet::new();
+        col.ensure_edge("a", "b", 0, &mut touched).unwrap();
+        assert!(links(&col, "a").iter().any(|l| l == "b"));
+        assert!(links(&col, "b").iter().any(|l| l == "a"));
+        assert_eq!(links(&col, "a").len(), 2);
+        assert_eq!(links(&col, "b").len(), 2);
+        // Whatever each side evicted is gone from the other end too.
+        for id in ["a", "b", "p", "q", "r", "s"] {
+            for other in &col.vectors[id].neighbors[0] {
+                assert!(
+                    col.vectors[other.as_str()].neighbors[0]
+                        .iter()
+                        .any(|l| l == id),
+                    "{id} -> {other} is one-way"
+                );
+            }
+        }
+    }
 }
