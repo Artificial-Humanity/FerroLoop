@@ -40,7 +40,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -50,7 +50,10 @@ use fl_store::{RecordEnvelope, SyncAdapter, SyncBatch};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
-use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
+use ureq::unversioned::transport::time::Duration as UreqDuration;
+use ureq::unversioned::transport::{
+    Buffers, ConnectionDetails, Connector, DefaultConnector, NextTimeout, Transport,
+};
 
 /// Cloud providers a config may name. `none` is the off position.
 pub const PROVIDERS: [&str; 4] = ["none", "gcp", "aws", "azure"];
@@ -743,6 +746,71 @@ impl std::fmt::Display for SsrfRefusal {
 
 impl std::error::Error for SsrfRefusal {}
 
+/// Connects as [`DefaultConnector`] does and hands back transports that retry an interrupted
+/// read. A signal (`SIGCHLD` from a child the hub spawned is enough) interrupts a blocking
+/// `read(2)` on a socket with `SO_RCVTIMEO` set, and Linux never restarts such a read, not even
+/// under `SA_RESTART`; ureq would report it as a transport failure.
+#[derive(Debug)]
+struct RetryInterruptedConnector(DefaultConnector);
+
+impl Connector<()> for RetryInterruptedConnector {
+    type Out = RetryInterrupted<Box<dyn Transport>>;
+
+    fn connect(
+        &self,
+        details: &ConnectionDetails,
+        chained: Option<()>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(self.0.connect(details, chained)?.map(RetryInterrupted))
+    }
+}
+
+/// A [`Transport`] that repeats a read `EINTR` cut short. `EINTR` means the call consumed no
+/// data, so the repeat can neither lose nor duplicate a byte, whatever the request. Writes are
+/// left alone: they go through `write_all`, which already retries `Interrupted`, and a TLS
+/// layer must not see a write repeated behind its back.
+#[derive(Debug)]
+struct RetryInterrupted<T>(T);
+
+impl<T: Transport> Transport for RetryInterrupted<T> {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.0.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        self.0.transmit_output(amount, timeout)
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let started = Instant::now();
+        let asked = timeout.after;
+        let mut timeout = timeout;
+        loop {
+            match self.0.await_input(timeout) {
+                Err(ureq::Error::Io(e)) if e.kind() == io::ErrorKind::Interrupted => {}
+                other => return other,
+            }
+            // Each repeat gets only what is left, so a storm of signals cannot stretch the
+            // deadline ureq asked for.
+            if let UreqDuration::Exact(total) = asked {
+                let left = total.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return Err(ureq::Error::Timeout(timeout.reason));
+                }
+                timeout.after = UreqDuration::Exact(left);
+            }
+        }
+    }
+
+    fn is_open(&mut self) -> bool {
+        self.0.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.0.is_tls()
+    }
+}
+
 /// Resolves for ureq and refuses a forbidden answer. See the module docs.
 #[derive(Debug)]
 struct GuardedResolver {
@@ -887,7 +955,11 @@ impl CloudHttp {
             lookup,
             timeout: limits.connect,
         };
-        let agent = ureq::Agent::with_parts(config, DefaultConnector::new(), resolver);
+        let agent = ureq::Agent::with_parts(
+            config,
+            RetryInterruptedConnector(DefaultConnector::new()),
+            resolver,
+        );
         Ok(Self {
             agent,
             base: url.base(),
@@ -1355,7 +1427,6 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Instant;
     use tempfile::TempDir;
 
     // --- URL validation ----------------------------------------------------------------------
@@ -2523,6 +2594,198 @@ mod tests {
             "the timeout fired well before the server's 8s delay: {:?}",
             started.elapsed()
         );
+    }
+
+    // --- interrupted reads -------------------------------------------------------------------
+
+    /// A transport whose reads fail with `Interrupted` `interrupts` times, then deliver `data`
+    /// once, or fail with `fatal` when that is set.
+    #[derive(Debug)]
+    struct ScriptedTransport {
+        buffers: ureq::unversioned::transport::LazyBuffers,
+        interrupts: usize,
+        fatal: Option<io::ErrorKind>,
+        data: &'static [u8],
+        reads: usize,
+        timeouts: Vec<UreqDuration>,
+    }
+
+    impl ScriptedTransport {
+        fn new(interrupts: usize, fatal: Option<io::ErrorKind>) -> Self {
+            Self {
+                buffers: ureq::unversioned::transport::LazyBuffers::new(64, 64),
+                interrupts,
+                fatal,
+                data: b"hello",
+                reads: 0,
+                timeouts: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for ScriptedTransport {
+        fn buffers(&mut self) -> &mut dyn Buffers {
+            &mut self.buffers
+        }
+
+        fn transmit_output(&mut self, _: usize, _: NextTimeout) -> Result<(), ureq::Error> {
+            Ok(())
+        }
+
+        fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+            self.reads += 1;
+            self.timeouts.push(timeout.after);
+            if self.interrupts > 0 {
+                self.interrupts -= 1;
+                // Time passes in the interrupted wait, as it would behind a real signal.
+                std::thread::sleep(Duration::from_millis(10));
+                return Err(io::Error::from(io::ErrorKind::Interrupted).into());
+            }
+            if let Some(kind) = self.fatal {
+                return Err(io::Error::from(kind).into());
+            }
+            let append = self.buffers.input_append_buf();
+            append[..self.data.len()].copy_from_slice(self.data);
+            self.buffers.input_appended(self.data.len());
+            Ok(true)
+        }
+
+        fn is_open(&mut self) -> bool {
+            true
+        }
+    }
+
+    fn next_timeout(after: Duration) -> NextTimeout {
+        NextTimeout {
+            after: UreqDuration::Exact(after),
+            reason: ureq::Timeout::RecvResponse,
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_repeated_without_losing_or_repeating_bytes() {
+        let mut transport = RetryInterrupted(ScriptedTransport::new(3, None));
+        let got = transport.await_input(next_timeout(Duration::from_secs(5)));
+        assert!(matches!(got, Ok(true)), "{got:?}");
+        assert_eq!(transport.0.reads, 4, "three interrupts, then the real read");
+        assert_eq!(transport.buffers().input(), b"hello");
+    }
+
+    #[test]
+    fn a_repeated_read_gets_only_the_time_that_is_left() {
+        let mut transport = RetryInterrupted(ScriptedTransport::new(2, None));
+        transport
+            .await_input(next_timeout(Duration::from_secs(5)))
+            .unwrap();
+        let timeouts: Vec<Duration> = transport.0.timeouts.iter().map(|t| **t).collect();
+        assert_eq!(timeouts[0], Duration::from_secs(5));
+        assert!(
+            timeouts[1] <= timeouts[0] - Duration::from_millis(10),
+            "{timeouts:?}"
+        );
+        assert!(
+            timeouts[2] <= timeouts[0] - Duration::from_millis(20),
+            "{timeouts:?}"
+        );
+    }
+
+    #[test]
+    fn interrupts_past_the_deadline_become_the_timeout() {
+        let mut transport = RetryInterrupted(ScriptedTransport::new(usize::MAX, None));
+        let started = Instant::now();
+        let got = transport.await_input(next_timeout(Duration::from_millis(50)));
+        assert!(
+            matches!(got, Err(ureq::Error::Timeout(ureq::Timeout::RecvResponse))),
+            "{got:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_read_error_that_is_not_an_interrupt_is_not_repeated() {
+        let mut transport = RetryInterrupted(ScriptedTransport::new(
+            1,
+            Some(io::ErrorKind::ConnectionReset),
+        ));
+        let got = transport.await_input(next_timeout(Duration::from_secs(5)));
+        assert!(
+            matches!(got, Err(ureq::Error::Io(ref e)) if e.kind() == io::ErrorKind::ConnectionReset),
+            "{got:?}"
+        );
+        assert_eq!(transport.0.reads, 2, "one interrupt, then the fatal error");
+    }
+
+    extern "C" fn ignore_signal(_: libc::c_int) {}
+
+    /// Signals the thread that built it until dropped. The handler is installed WITHOUT
+    /// `SA_RESTART`, which is also how Linux treats a read under `SO_RCVTIMEO` whatever the
+    /// flag says.
+    struct SignalStorm {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SignalStorm {
+        fn aim_at_this_thread() -> Self {
+            // SAFETY: `act` is zeroed then filled in; the handler does nothing, so it is
+            // async-signal-safe; SIGUSR1 has no other user in this process.
+            unsafe {
+                let mut act: libc::sigaction = std::mem::zeroed();
+                act.sa_sigaction = ignore_signal as extern "C" fn(libc::c_int) as usize;
+                libc::sigemptyset(&mut act.sa_mask);
+                act.sa_flags = 0;
+                assert_eq!(
+                    libc::sigaction(libc::SIGUSR1, &act, std::ptr::null_mut()),
+                    0
+                );
+            }
+            // SAFETY: reads the calling thread's own id.
+            let target = unsafe { libc::pthread_self() };
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !flag.load(Ordering::SeqCst) {
+                    // SAFETY: the target thread outlives the storm; `Drop` joins this thread
+                    // before the test returns.
+                    unsafe { libc::pthread_kill(target, libc::SIGUSR1) };
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            });
+            Self {
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for SignalStorm {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    fn a_signal_during_the_wait_for_the_reply_does_not_fail_the_request() {
+        let server = FakeServer::start(|_, stream| {
+            std::thread::sleep(Duration::from_millis(200));
+            reply_json(stream, 200, &json!({ "ok": true }));
+        });
+        let http =
+            CloudHttp::with_lookup(&server.url(), Arc::new(SystemLookup), fast_limits()).unwrap();
+        let reply = {
+            // Aimed at this thread, which spends the server's 200ms parked in `read(2)` on a
+            // socket with a receive timeout while the signals land.
+            let _storm = SignalStorm::aim_at_this_thread();
+            http.post("/x", &json!({ "n": 1 }))
+        };
+        let reply = reply.expect("an interrupted read is repeated, not reported");
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.body, Some(json!({ "ok": true })));
+        assert_eq!(server.connections(), 1);
+        assert_eq!(server.request_count(), 1, "the request was not repeated");
     }
 
     #[derive(Debug)]
