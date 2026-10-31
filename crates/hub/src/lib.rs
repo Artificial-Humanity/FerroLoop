@@ -3990,19 +3990,23 @@ mod tests {
         };
         let telemetry = json!({
             "status": "busy", "active_tasks": 2, "load_avg": 1.5,
-            "environment_kind": "linux-worker", "federated_subsystems": ["ferrostate"]
+            "environment_kind": "linux-worker", "federated_subsystems": ["ferrostate"],
+            "capabilities": ["gpu"], "labels": ["rack-1"]
         });
         let own = beat(Some(token.as_str()), telemetry.clone());
         assert_eq!(own["reported_status"], "busy");
         let before = node_row();
         assert_eq!(before["environment_kind"], "linux-worker");
         assert_eq!(before["federated_subsystems"], json!(["ferrostate"]));
+        assert_eq!(before["capabilities"], json!(["gpu"]));
+        assert_eq!(before["labels"], json!(["rack-1"]));
 
         // A peer's heartbeat keeps the node alive and changes nothing it reports.
         std::thread::sleep(Duration::from_millis(20));
         let forged = json!({
             "status": "draining", "active_tasks": 9, "load_avg": 8.0,
-            "environment_kind": "ai-lab", "federated_subsystems": ["ferrodeck"]
+            "environment_kind": "ai-lab", "federated_subsystems": ["ferrodeck"],
+            "capabilities": ["forged"], "labels": ["forged"]
         });
         let by_peer = beat(peer, forged.clone());
         assert!(
@@ -4016,6 +4020,8 @@ mod tests {
             "load_avg",
             "environment_kind",
             "federated_subsystems",
+            "capabilities",
+            "labels",
         ] {
             assert_eq!(after[field], before[field], "{field}");
         }
@@ -4030,6 +4036,17 @@ mod tests {
         );
         assert_eq!(after["environment_kind"], "ai-lab");
         assert_eq!(after["federated_subsystems"], json!(["ferrodeck"]));
+        assert_eq!(after["capabilities"], json!(["forged"]));
+        assert_eq!(after["labels"], json!(["forged"]));
+
+        // The node's own bearer sets them too.
+        beat(
+            Some(token.as_str()),
+            json!({ "capabilities": ["gpu", "cpu"], "labels": ["rack-2"] }),
+        );
+        let after = node_row();
+        assert_eq!(after["capabilities"], json!(["gpu", "cpu"]));
+        assert_eq!(after["labels"], json!(["rack-2"]));
     }
 
     #[test]

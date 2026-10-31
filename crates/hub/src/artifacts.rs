@@ -688,6 +688,12 @@ const MAX_OFFICE_TEXT_BYTES: usize = 64 * 1024;
 const MAX_OFFICE_CELL_BYTES: usize = 4 * 1024;
 /// Bytes charged against the output budget for each item, on top of its text (JSON framing).
 const OFFICE_ITEM_OVERHEAD: usize = 16;
+/// Longest sheet name kept in a preview. Excel allows 31 characters; this leaves room for
+/// multi-byte names.
+const MAX_SHEET_NAME_BYTES: usize = 256;
+/// What each empty padding cell of a sparse sheet costs the output budget: the `"",` it
+/// serializes to, rounded up.
+const OFFICE_PAD_COST: usize = 4;
 
 /// Why an office file could not be previewed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1094,6 +1100,17 @@ impl TextBudget {
         self.left -= cost;
         Some(text)
     }
+
+    /// Charge `cost` bytes for output that is not a string, such as padding. `false` once the
+    /// budget cannot cover it; every later charge then also fails.
+    fn charge(&mut self, cost: usize) -> bool {
+        if self.exhausted || cost > self.left {
+            self.exhausted = true;
+            return false;
+        }
+        self.left -= cost;
+        true
+    }
 }
 
 /// The value of attribute `key` (compared by local name) in a raw attribute string.
@@ -1389,6 +1406,12 @@ fn sheet_grid(xml: &str, strings: &[String], budget: &mut TextBudget) -> (Vec<Ve
                     }
                     let r = &mut grid[row_idx];
                     if r.len() <= col_idx {
+                        // Padding is output too: a lone cell at the last column of every row
+                        // would otherwise cost nothing for the 99 empty cells before it.
+                        let pad = col_idx + 1 - r.len();
+                        if !budget.charge(pad.saturating_mul(OFFICE_PAD_COST)) {
+                            break;
+                        }
                         r.resize(col_idx + 1, String::new());
                     }
                     r[col_idx] = text;
@@ -1400,9 +1423,11 @@ fn sheet_grid(xml: &str, strings: &[String], budget: &mut TextBudget) -> (Vec<Ve
     (grid, truncated || toks.truncated() || budget.exhausted)
 }
 
-/// Id to target pairs of a `.rels` part.
-fn relationships(xml: &str) -> Vec<(String, String, String)> {
-    xml_tokens(xml)
+/// Id, target and type of each relationship in a `.rels` part. The flag is whether the part
+/// was cut short.
+fn relationships(xml: &str) -> (Vec<(String, String, String)>, bool) {
+    let mut toks = xml_tokens(xml);
+    let rels = (&mut toks)
         .filter_map(|t| match t {
             Xml::Start { name, attrs, .. } if name == "Relationship" => Some((
                 xml_attr(&attrs, "Id")?,
@@ -1411,7 +1436,8 @@ fn relationships(xml: &str) -> Vec<(String, String, String)> {
             )),
             _ => None,
         })
-        .collect()
+        .collect();
+    (rels, toks.truncated())
 }
 
 /// Resolve a relationship `target` against the directory of the part holding the rels.
@@ -1438,22 +1464,29 @@ fn xlsx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
         .map(|x| shared_strings(&x))
         .unwrap_or_default();
     let workbook = read_utf8(zip, "xl/workbook.xml", budget)?.unwrap_or_default();
-    let rels = read_utf8(zip, "xl/_rels/workbook.xml.rels", budget)?
+    let (rels, rels_cut) = read_utf8(zip, "xl/_rels/workbook.xml.rels", budget)?
         .map(|x| relationships(&x))
         .unwrap_or_default();
-    let declared: Vec<(String, Option<String>)> = xml_tokens(&workbook)
+    let mut workbook_toks = xml_tokens(&workbook);
+    // One past `MAX_SHEETS` is enough to know the list was cut; names are clipped as read.
+    let declared: Vec<(String, Option<String>)> = (&mut workbook_toks)
         .filter_map(|t| match t {
             Xml::Start { name, attrs, .. } if name == "sheet" => Some((
-                xml_attr(&attrs, "name").unwrap_or_default(),
+                clip_text(
+                    &xml_attr(&attrs, "name").unwrap_or_default(),
+                    MAX_SHEET_NAME_BYTES,
+                ),
                 xml_attr(&attrs, "id"),
             )),
             _ => None,
         })
+        .take(MAX_SHEETS + 1)
         .collect();
     let ordinal = numbered_parts(zip, "xl/worksheets/", "sheet");
     let mut sheets = Vec::new();
     let mut text = TextBudget::new();
-    let mut any_truncated = declared.len() > MAX_SHEETS || strings_cut;
+    let mut any_truncated =
+        declared.len() > MAX_SHEETS || strings_cut || rels_cut || workbook_toks.truncated();
     // Sheets named by the workbook, with their part found by relationship, else by position.
     let count = if declared.is_empty() {
         ordinal.len()
@@ -1469,6 +1502,11 @@ fn xlsx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
             .get(i)
             .cloned()
             .unwrap_or_else(|| (format!("Sheet{}", i + 1), None));
+        // The name is output too: charge it to the same budget as the cells.
+        let Some(name) = text.take(&name, MAX_SHEET_NAME_BYTES) else {
+            any_truncated = true;
+            break;
+        };
         let by_rel = rid.and_then(|id| {
             rels.iter()
                 .find(|(rid, _, _)| *rid == id)
@@ -1588,8 +1626,9 @@ fn pptx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
         // The notes part is named by the slide's relationships, else by the same number.
         let rels_name = format!("ppt/slides/_rels/slide{n}.xml.rels");
         let by_rel = read_utf8(zip, &rels_name, budget)?.and_then(|x| {
-            relationships(&x)
-                .into_iter()
+            let (rels, rels_cut) = relationships(&x);
+            cut |= rels_cut;
+            rels.into_iter()
                 .find(|(_, _, ty)| ty.ends_with("/notesSlide"))
                 .map(|(_, target, _)| resolve_target("ppt/slides", &target))
         });
@@ -2621,6 +2660,84 @@ mod tests {
         let p = office_preview("pptx", &zip).unwrap();
         assert!(serde_json::to_string(&p).unwrap().len() < 4 * 1024 * 1024);
         assert_eq!(p["truncated"], true);
+    }
+
+    #[test]
+    fn xlsx_preview_charges_padding_cells_to_the_output_budget() {
+        // One cell in the last column of every row, over the most sheets and rows allowed:
+        // 99 empty cells of padding per row would be ~19 MB of JSON if they were free.
+        let mut sheet = String::from("<worksheet><sheetData>");
+        for r in 1..=MAX_SHEET_ROWS {
+            sheet.push_str(&format!(r#"<row r="{r}"><c r="CV{r}"><v>x</v></c></row>"#));
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        let names: Vec<String> = (1..=MAX_SHEETS)
+            .map(|i| format!("xl/worksheets/sheet{i}.xml"))
+            .collect();
+        let mut entries: Vec<(&str, &[u8])> = vec![("xl/workbook.xml", b"<workbook/>")];
+        entries.extend(names.iter().map(|n| (n.as_str(), sheet.as_bytes())));
+        let zip = build_zip(&entries, true);
+        let p = office_preview("xlsx", &zip).unwrap();
+        let size = serde_json::to_string(&p).unwrap().len();
+        assert!(size < 3 * 1024 * 1024, "{size} bytes of output");
+        assert_eq!(p["truncated"], true);
+    }
+
+    #[test]
+    fn xlsx_preview_clips_sheet_names_and_flags_cut_workbook_and_rels_parts() {
+        // Huge sheet names are clipped before they reach the output.
+        let long = "n".repeat(1024 * 1024);
+        let workbook = format!(
+            "<workbook><sheets>{}</sheets></workbook>",
+            (0..8)
+                .map(|i| format!(r#"<sheet name="{long}{i}" sheetId="{i}"/>"#))
+                .collect::<String>()
+        );
+        let zip = build_zip(&[("xl/workbook.xml", workbook.as_bytes())], true);
+        let p = office_preview("xlsx", &zip).unwrap();
+        let sheets = p["sheets"].as_array().unwrap();
+        assert_eq!(sheets.len(), 8);
+        for sheet in sheets {
+            assert!(sheet["name"].as_str().unwrap().len() <= MAX_SHEET_NAME_BYTES);
+        }
+        assert!(serde_json::to_string(&p).unwrap().len() < 64 * 1024);
+
+        // A workbook.xml past the part cap loses its later sheets: say so.
+        let filler = "a".repeat(MAX_XML_PART_BYTES + 1024);
+        let cut_workbook = format!(
+            r#"<workbook><sheets><sheet name="A"/><!--{filler}--><sheet name="B"/></sheets></workbook>"#
+        );
+        let zip = build_zip(&[("xl/workbook.xml", cut_workbook.as_bytes())], true);
+        let p = office_preview("xlsx", &zip).unwrap();
+        assert_eq!(p["sheets"].as_array().unwrap().len(), 1);
+        assert_eq!(p["truncated"], true);
+
+        // So does a relationships part past the cap.
+        let cut_rels = format!("<Relationships><!--{filler}--></Relationships>");
+        let zip = build_zip(
+            &[
+                (
+                    "xl/workbook.xml",
+                    br#"<workbook><sheets><sheet name="A"/></sheets></workbook>"#,
+                ),
+                ("xl/_rels/workbook.xml.rels", cut_rels.as_bytes()),
+            ],
+            true,
+        );
+        assert_eq!(office_preview("xlsx", &zip).unwrap()["truncated"], true);
+
+        // Control: intact parts are not flagged.
+        let zip = build_zip(
+            &[
+                (
+                    "xl/workbook.xml",
+                    br#"<workbook><sheets><sheet name="A"/></sheets></workbook>"#,
+                ),
+                ("xl/_rels/workbook.xml.rels", b"<Relationships/>"),
+            ],
+            true,
+        );
+        assert_eq!(office_preview("xlsx", &zip).unwrap()["truncated"], false);
     }
 
     #[test]

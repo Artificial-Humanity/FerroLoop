@@ -917,11 +917,11 @@ fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str)
         Ok(body) => body,
         Err(resp) => return resp,
     };
-    let capabilities = match json_optional_string_array(&body, "capabilities") {
+    let mut capabilities = match json_optional_string_array(&body, "capabilities") {
         Ok(capabilities) => capabilities,
         Err(error) => return HttpResponse::json(400, json!({ "error": error })),
     };
-    let labels = match json_optional_string_array(&body, "labels") {
+    let mut labels = match json_optional_string_array(&body, "labels") {
         Ok(labels) => labels,
         Err(error) => return HttpResponse::json(400, json!({ "error": error })),
     };
@@ -930,10 +930,13 @@ fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str)
         Err(error) => return HttpResponse::json(400, json!({ "error": error })),
     };
     // Any authenticated caller keeps a node alive (`last_seen`), but only the owner and the
-    // node itself may set what the fleet view shows: status, load and profile. Otherwise a peer
-    // could mark another node draining or rewrite what it federates.
+    // node itself may set what the fleet view shows: status, load, capabilities, labels and the
+    // rest of the profile. Otherwise a peer could mark another node draining or rewrite what it
+    // advertises or federates.
     if caller == NodeCaller::Other {
         fields = HeartbeatFields::default();
+        capabilities = None;
+        labels = None;
     }
     match touch_node(
         &store,
