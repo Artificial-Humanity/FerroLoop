@@ -89,6 +89,7 @@ use crate::nodes::{
     list_visible_nodes, local_hostname, mint_enroll_token, node_id_from_hostname, node_state_slug,
     node_token_matches, revoke_node, touch_node,
 };
+use crate::operators;
 use crate::records;
 use crate::session_actions::{
     self, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, ModelOverride, route_vendor,
@@ -231,6 +232,7 @@ fn status_reason(status: u16) -> &'static str {
         409 => "Conflict",
         413 => "Payload Too Large",
         422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
@@ -352,6 +354,15 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         return handle_auth_pair(state, req);
     }
 
+    // Operator login (`token`, `password` or `passkey` mode) and the public passkey challenge.
+    // Both throttle themselves; neither needs a session.
+    if method == "POST" && path == "/api/v1/auth/login" {
+        return operators::handle_post_login(state, req);
+    }
+    if method == "POST" && path == "/api/v1/auth/passkey/challenge" {
+        return operators::handle_post_passkey_challenge(state, req);
+    }
+
     // Public worker enrollment. A one-time code is the credential.
     if method == "POST" && path == "/api/v1/nodes/enroll" {
         return handle_post_node_enroll(state, req);
@@ -399,6 +410,19 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
             }),
         ),
         ("POST", "/api/v1/auth/logout") => handle_auth_logout(state, req),
+        ("GET", "/api/v1/auth/operators") => operators::handle_get_operators(state),
+        ("POST", "/api/v1/auth/operators") => {
+            operators::handle_post_operator(state, &authority, req)
+        }
+        ("POST", "/api/v1/auth/totp/enroll") => {
+            operators::handle_post_totp_enroll(state, &authority, req)
+        }
+        ("POST", "/api/v1/auth/totp/verify") => {
+            operators::handle_post_totp_verify(state, &authority, req)
+        }
+        ("POST", "/api/v1/auth/passkey/register") => {
+            operators::handle_post_passkey_register(state, &authority, req)
+        }
         ("GET", "/api/v1/agents") => handle_get_agents(state, req),
         ("GET", "/api/v1/agents/liveness") => handle_get_agents_liveness(state, req),
         ("GET", "/api/v1/sessions") => handle_get_sessions(state),
@@ -3304,6 +3328,17 @@ fn handle_dynamic_api_routes(
             return HttpResponse::bytes(200, mime_type_for_path(&path), bytes);
         }
         return HttpResponse::json(404, json!({ "error": "attachment not found" }));
+    }
+
+    // /api/v1/auth/operators/:id
+    if method == "DELETE"
+        && segments.len() == 5
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "auth"
+        && segments[3] == "operators"
+    {
+        return operators::handle_delete_operator(state, authority, segments[4]);
     }
 
     // /api/v1/records/:id/move

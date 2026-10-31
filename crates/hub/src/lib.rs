@@ -10,6 +10,7 @@ mod direct_quota;
 pub mod discovery;
 pub mod lifecycle;
 pub mod nodes;
+mod operators;
 mod records;
 pub mod session_actions;
 mod settings;
@@ -156,6 +157,8 @@ pub struct HubState {
     path_locks: Arc<Mutex<HashMap<PathBuf, Arc<PathLock>>>>,
     prompt_queues: Arc<Mutex<PromptQueueState>>,
     model_overrides: Arc<Mutex<BTreeMap<String, session_actions::ModelOverride>>>,
+    /// Login throttling and passkey challenges, in memory only.
+    login_guard: Arc<operators::LoginGuard>,
 }
 
 /// How long a per-project open may take in all: the wait for the file's in-process lock plus
@@ -259,6 +262,7 @@ impl HubState {
             path_locks: Arc::new(Mutex::new(HashMap::new())),
             prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
             model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
+            login_guard: Arc::new(operators::LoginGuard::default()),
         }
     }
 
