@@ -626,6 +626,39 @@ function splitBareUrlSuffix(token: string): { cleanUrl: string; suffix: string }
   return { cleanUrl, suffix };
 }
 
+export function shouldShowLinkDomainBadge(
+  cleanedLabel: string,
+  targetHostname: string,
+): boolean {
+  const normalizedTarget = targetHostname.trim().toLowerCase();
+  if (!normalizedTarget) {
+    return false;
+  }
+
+  const urlTokens = cleanedLabel.match(/https?:\/\/[^\s<>()[\]"']+/gi);
+  if (urlTokens && urlTokens.length > 0) {
+    for (const rawUrl of urlTokens) {
+      const { cleanUrl } = splitBareUrlSuffix(rawUrl);
+      try {
+        const parsedHost = new URL(cleanUrl).hostname.toLowerCase();
+        if (parsedHost !== normalizedTarget) {
+          return true;
+        }
+      } catch {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const escapedTarget = normalizedTarget.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const boundaryPattern = new RegExp(
+    `(?:^|[^a-z0-9.-])(?:[a-z0-9-]+\\.)*${escapedTarget}(?=$|[^a-z0-9.-]|\\.(?![a-z0-9-]))`,
+    "i",
+  );
+  return !boundaryPattern.test(cleanedLabel);
+}
+
 export function renderInlineMarkdown(
   text: string,
   keyPrefix = "inline",
@@ -698,9 +731,10 @@ export function renderInlineMarkdown(
         } catch {
           targetHostname = "";
         }
-        const showDomainBadge =
-          Boolean(targetHostname) &&
-          !cleanedLabel.toLowerCase().includes(targetHostname.toLowerCase());
+        const showDomainBadge = shouldShowLinkDomainBadge(
+          cleanedLabel,
+          targetHostname,
+        );
         nodes.push(
           <a
             key={key}

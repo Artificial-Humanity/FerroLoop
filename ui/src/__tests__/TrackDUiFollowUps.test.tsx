@@ -340,12 +340,58 @@ describe("Track D UI Follow-ups — Wave C F-3 & FerroDeck UI Audit O-3, O-4, O-
       expect(afterStore[legacyId].private_jwk).toBeUndefined();
     });
 
+    it("falls back gracefully to JWK storage when indexedDB.open rejects (e.g. Firefox Private Browsing SecurityError)", async () => {
+      const rejectingOpen = vi.fn(() => {
+        const req: {
+          result: unknown;
+          error: DOMException | null;
+          onupgradeneeded: ((ev: Event) => void) | null;
+          onsuccess: ((ev: Event) => void) | null;
+          onerror: ((ev: Event) => void) | null;
+        } = {
+          result: null,
+          error: new DOMException("The operation is insecure.", "SecurityError"),
+          onupgradeneeded: null,
+          onsuccess: null,
+          onerror: null,
+        };
+        queueMicrotask(() => {
+          req.onerror?.(new Event("error"));
+        });
+        return req as unknown as IDBOpenDBRequest;
+      });
+      vi.stubGlobal("indexedDB", { open: rejectingOpen } as unknown as IDBFactory);
+
+      const fetchImpl: typeof fetch = vi.fn(async () => {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      });
+
+      const client = new HubApiClient({ baseUrl: "http://localhost:9000", fetchImpl });
+      const credentialId = "passkey-idb-reject-fallback-0001";
+
+      await expect(
+        client.registerPasskey({
+          credential_id: credentialId,
+          label: "Private Browsing Key",
+        }),
+      ).resolves.toEqual({ ok: true });
+
+      const rawKeystore = window.localStorage.getItem(PASSKEY_KEYSTORE_STORAGE_KEY);
+      expect(rawKeystore).toBeTruthy();
+      const parsedKeystore = JSON.parse(rawKeystore!);
+      expect(parsedKeystore[credentialId]).toBeDefined();
+      expect(parsedKeystore[credentialId].private_jwk).toBeDefined();
+    });
+
     it("renders pairing-passkey-totp-input in PairingModal, passes totpCode to onLoginWithPasskey, and prompts on requires_totp", async () => {
       const onLoginWithPasskey = vi
         .fn()
         .mockResolvedValueOnce({ ok: false, requires_totp: true })
         .mockRejectedValueOnce(
           new HubApiError(401, "TOTP code is required for this account", undefined, true),
+        )
+        .mockRejectedValueOnce(
+          new HubApiError(401, "Invalid TOTP code", undefined, false),
         )
         .mockResolvedValueOnce({
           ok: true,
@@ -389,8 +435,16 @@ describe("Track D UI Follow-ups — Wave C F-3 & FerroDeck UI Audit O-3, O-4, O-
         /Multi-factor authentication required.*6-digit MFA/i,
       );
 
-      // 3. Enter 6-digit MFA code in pairing-passkey-totp-input and submit
+      // 3. Enter an invalid 6-digit MFA code: surfaces the server error instead of generic prompt
       const totpInput = screen.getByTestId("pairing-passkey-totp-input");
+      fireEvent.change(totpInput, { target: { value: "000000" } });
+      fireEvent.click(screen.getByTestId("auth-passkey-submit-btn"));
+      await waitFor(() => {
+        expect(onLoginWithPasskey).toHaveBeenCalledWith("cred-mfa-passkey-01", "000000");
+      });
+      expect(await screen.findByRole("alert")).toHaveTextContent("Invalid TOTP code");
+
+      // 4. Enter valid 6-digit MFA code in pairing-passkey-totp-input and submit
       fireEvent.change(totpInput, { target: { value: "482910" } });
       fireEvent.click(screen.getByTestId("auth-passkey-submit-btn"));
 
@@ -681,6 +735,30 @@ describe("Track D UI Follow-ups — Wave C F-3 & FerroDeck UI Audit O-3, O-4, O-
         <RichMarkdown text="Visit [docs.example.com guide](https://docs.example.com/getting-started)" />,
       );
       expect(screen.queryByTestId("markdown-link-domain-badge")).toBeNull();
+
+      // Spoofed query parameter containing targetHostname still renders the (evil.example) badge
+      rerender(
+        <RichMarkdown text="Sign in at [https://bank.example/login?next=evil.example](https://evil.example/phish)" />,
+      );
+      expect(screen.getByTestId("markdown-link-domain-badge")).toHaveTextContent(
+        "(evil.example)",
+      );
+
+      // Spoofed subdomain prefix containing targetHostname still renders the (evil.example) badge
+      rerender(
+        <RichMarkdown text="Visit [evil.example.bank.example](https://evil.example/phish)" />,
+      );
+      expect(screen.getByTestId("markdown-link-domain-badge")).toHaveTextContent(
+        "(evil.example)",
+      );
+
+      // Hyphenated prefix lookalike (not-evil.example) still renders the (evil.example) badge
+      rerender(
+        <RichMarkdown text="Visit [not-evil.example](https://evil.example/phish)" />,
+      );
+      expect(screen.getByTestId("markdown-link-domain-badge")).toHaveTextContent(
+        "(evil.example)",
+      );
     });
   });
 });

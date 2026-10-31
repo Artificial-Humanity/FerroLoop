@@ -723,6 +723,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!targetSessionOrAgent || interrupting) {
       return;
     }
+    const submittedTarget = targetSessionOrAgent;
     disarmInterrupt();
     setInterrupting(true);
     setCompactFeedback(null);
@@ -731,19 +732,25 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (onInterruptSession) {
         await onInterruptSession();
       } else if (apiClient) {
-        await apiClient.interruptSession(targetSessionOrAgent);
-        setInternalIsBusy(false);
+        await apiClient.interruptSession(submittedTarget);
+        if (currentTargetRef.current === submittedTarget) {
+          setInternalIsBusy(false);
+        }
         if (onRefresh) {
           onRefresh();
         }
       } else {
         throw new Error("No session route is configured for interrupt.");
       }
-      setCompactFeedback("Stopped session");
+      if (currentTargetRef.current === submittedTarget) {
+        setCompactFeedback("Stopped session");
+      }
     } catch (err) {
-      setSubmitError(
-        err instanceof Error ? err.message : "Failed to interrupt session",
-      );
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(
+          err instanceof Error ? err.message : "Failed to interrupt session",
+        );
+      }
     } finally {
       setInterrupting(false);
     }
@@ -925,6 +932,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!targetSessionOrAgent || decommissioning) {
       return;
     }
+    const submittedTarget = targetSessionOrAgent;
     setDecommissioning(true);
     setCompactFeedback(null);
     setSubmitError(null);
@@ -932,13 +940,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (onDecommissionSession) {
         await onDecommissionSession(mode);
       } else if (apiClient) {
-        await apiClient.decommissionSession(targetSessionOrAgent, mode);
-        if (mode === "teardown") {
-          setInternalTurns([]);
-          setInternalQueue([]);
-          setInternalIsBusy(false);
-        } else if (turns === undefined) {
-          void fetchTranscript();
+        await apiClient.decommissionSession(submittedTarget, mode);
+        if (currentTargetRef.current === submittedTarget) {
+          if (mode === "teardown") {
+            setInternalTurns([]);
+            setInternalQueue([]);
+            setInternalIsBusy(false);
+          } else if (turns === undefined) {
+            void fetchTranscript();
+          }
         }
         if (onRefresh) {
           onRefresh();
@@ -947,13 +957,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         throw new Error("No session route is configured for decommissioning.");
       }
       handleCloseDecommissionModal();
-      setCompactFeedback(
-        mode === "prepare" ? "Prepared decommission" : "Tore down session",
-      );
+      if (currentTargetRef.current === submittedTarget) {
+        setCompactFeedback(
+          mode === "prepare" ? "Prepared decommission" : "Tore down session",
+        );
+      }
     } catch (err) {
-      setSubmitError(
-        err instanceof Error ? err.message : `Failed to ${mode} session`,
-      );
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(
+          err instanceof Error ? err.message : `Failed to ${mode} session`,
+        );
+      }
       handleCloseDecommissionModal();
     } finally {
       setDecommissioning(false);

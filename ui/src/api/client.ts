@@ -250,6 +250,7 @@ export interface StoredClientPasskey {
 }
 
 const inMemoryPasskeyStore = new Map<string, StoredClientPasskey>();
+const inMemoryPasskeyCryptoKeys = new Map<string, CryptoKey>();
 let inMemoryLastPasskeyId: string | null = null;
 
 function hasIndexedDbSupport(): boolean {
@@ -282,6 +283,7 @@ async function putPasskeyInIdb(
   credentialId: string,
   privateKey: CryptoKey,
 ): Promise<boolean> {
+  inMemoryPasskeyCryptoKeys.set(credentialId, privateKey);
   if (!hasIndexedDbSupport()) {
     return false;
   }
@@ -313,7 +315,7 @@ async function putPasskeyInIdb(
 
 async function getPasskeyFromIdb(credentialId: string): Promise<CryptoKey | null> {
   if (!hasIndexedDbSupport()) {
-    return null;
+    return inMemoryPasskeyCryptoKeys.get(credentialId) ?? null;
   }
   let db: IDBDatabase | null = null;
   try {
@@ -327,7 +329,7 @@ async function getPasskeyFromIdb(credentialId: string): Promise<CryptoKey | null
         reject(getReq.error ?? new Error("Failed to read passkey from IndexedDB"));
     });
     if (!raw || typeof raw !== "object") {
-      return null;
+      return inMemoryPasskeyCryptoKeys.get(credentialId) ?? null;
     }
     if (
       "type" in (raw as CryptoKey) &&
@@ -343,9 +345,9 @@ async function getPasskeyFromIdb(credentialId: string): Promise<CryptoKey | null
     ) {
       return (raw as { privateKey: CryptoKey }).privateKey;
     }
-    return null;
+    return inMemoryPasskeyCryptoKeys.get(credentialId) ?? null;
   } catch {
-    return null;
+    return inMemoryPasskeyCryptoKeys.get(credentialId) ?? null;
   } finally {
     try {
       db?.close();
@@ -1579,14 +1581,18 @@ export class HubApiClient {
     ) {
       let useIdb = false;
       if (hasIndexedDbSupport()) {
-        const probeDb = await openPasskeyIdb();
-        if (probeDb) {
-          useIdb = true;
-          try {
-            probeDb.close();
-          } catch {
-            // Ignore close errors
+        try {
+          const probeDb = await openPasskeyIdb();
+          if (probeDb) {
+            useIdb = true;
+            try {
+              probeDb.close();
+            } catch {
+              // Ignore close errors
+            }
           }
+        } catch {
+          useIdb = false;
         }
       }
 
@@ -1642,10 +1648,18 @@ export class HubApiClient {
     // registration (duplicate id, bad origin) would leave an orphan key, and make it the
     // "last registered" passkey that sign-in then offers.
     if (generated) {
+      let canSaveMetadata = !generatedPrivateKey;
       if (generatedPrivateKey) {
-        await putPasskeyInIdb(req.credential_id, generatedPrivateKey);
+        const storedInIdb = await putPasskeyInIdb(
+          req.credential_id,
+          generatedPrivateKey,
+        );
+        canSaveMetadata =
+          storedInIdb || inMemoryPasskeyCryptoKeys.has(req.credential_id);
       }
-      saveStoredPasskey(generated);
+      if (canSaveMetadata) {
+        saveStoredPasskey(generated);
+      }
     }
     return res;
   }

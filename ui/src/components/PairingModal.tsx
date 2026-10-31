@@ -130,9 +130,9 @@ export const PairingModal: React.FC<PairingModalProps> = ({
     e.preventDefault();
     setLocalError(null);
     setSubmitting(true);
+    const trimmedTotp = passkeyTotpCode.trim() || undefined;
     try {
       const credentialId = passkeyId.trim() || getLastRegisteredPasskeyId();
-      const trimmedTotp = passkeyTotpCode.trim() || undefined;
       const res = onLoginWithPasskey
         ? await onLoginWithPasskey(credentialId, trimmedTotp)
         : await (apiClient ?? new HubApiClient()).loginWithPasskey({
@@ -151,11 +151,16 @@ export const PairingModal: React.FC<PairingModalProps> = ({
       onClose();
     } catch (err) {
       const requiresTotp =
-        (err &&
-          typeof err === "object" &&
-          (err as { requires_totp?: boolean }).requires_totp === true) ||
+        Boolean(
+          err &&
+            typeof err === "object" &&
+            (err as { requires_totp?: boolean }).requires_totp === true,
+        ) ||
+        (!trimmedTotp &&
+          err instanceof Error &&
+          /totp|mfa|multi-factor/i.test(err.message)) ||
         (err instanceof Error &&
-          /totp|mfa|multi-factor/i.test(err.message));
+          /(?:requires?|missing).*totp|totp.*required/i.test(err.message));
       if (requiresTotp) {
         setLocalError(
           "Multi-factor authentication required. Please enter your 6-digit MFA / TOTP code.",
