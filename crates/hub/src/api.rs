@@ -74,6 +74,7 @@ use crate::auth::{
     HubAuthority, constant_time_eq, extract_bearer_token, extract_session_cookie,
     format_logout_set_cookie, format_session_set_cookie, sha256_hex,
 };
+use crate::cloud_adapters;
 use crate::discovery::{
     DiscoveryStoreSnapshot, discover_route_sessions_without_model_info,
     discover_sessions_from_snapshot, list_git_worktrees, read_session_context_usage_from_snapshot,
@@ -89,6 +90,7 @@ use crate::nodes::{
     list_visible_nodes, local_hostname, mint_enroll_token, node_id_from_hostname, node_state_slug,
     node_token_matches, revoke_node, touch_node,
 };
+use crate::operators;
 use crate::records;
 use crate::session_actions::{
     self, METHOD_OPERATOR_PROMPT, METHOD_OVERRIDE_ONLY, ModelOverride, route_vendor,
@@ -231,6 +233,7 @@ fn status_reason(status: u16) -> &'static str {
         409 => "Conflict",
         413 => "Payload Too Large",
         422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
@@ -352,6 +355,15 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         return handle_auth_pair(state, req);
     }
 
+    // Operator login (`token`, `password` or `passkey` mode) and the public passkey challenge.
+    // Both throttle themselves; neither needs a session.
+    if method == "POST" && path == "/api/v1/auth/login" {
+        return operators::handle_post_login(state, req);
+    }
+    if method == "POST" && path == "/api/v1/auth/passkey/challenge" {
+        return operators::handle_post_passkey_challenge(state, req);
+    }
+
     // Public worker enrollment. A one-time code is the credential.
     if method == "POST" && path == "/api/v1/nodes/enroll" {
         return handle_post_node_enroll(state, req);
@@ -399,6 +411,19 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
             }),
         ),
         ("POST", "/api/v1/auth/logout") => handle_auth_logout(state, req),
+        ("GET", "/api/v1/auth/operators") => operators::handle_get_operators(state),
+        ("POST", "/api/v1/auth/operators") => {
+            operators::handle_post_operator(state, &authority, req)
+        }
+        ("POST", "/api/v1/auth/totp/enroll") => {
+            operators::handle_post_totp_enroll(state, &authority, req)
+        }
+        ("POST", "/api/v1/auth/totp/verify") => {
+            operators::handle_post_totp_verify(state, &authority, req)
+        }
+        ("POST", "/api/v1/auth/passkey/register") => {
+            operators::handle_post_passkey_register(state, &authority, req)
+        }
         ("GET", "/api/v1/agents") => handle_get_agents(state, req),
         ("GET", "/api/v1/agents/liveness") => handle_get_agents_liveness(state, req),
         ("GET", "/api/v1/sessions") => handle_get_sessions(state),
@@ -495,6 +520,8 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
         ("GET", "/api/v1/settings") => handle_get_settings(state),
         ("PUT", "/api/v1/settings") => handle_put_settings(state, &authority, req),
+        ("GET", "/api/v1/cloud/adapters") => handle_get_cloud_adapters(state),
+        ("PUT", "/api/v1/cloud/adapters") => handle_put_cloud_adapters(state, &authority, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
         ("POST", "/api/v1/gate/secrets") => handle_post_gate_secret(state, &authority, req),
         ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
@@ -3269,6 +3296,69 @@ fn handle_put_settings(
     }
 }
 
+/// `GET /api/v1/cloud/adapters` (Records 52 and 53): the saved cloud adapter config, or the
+/// defaults. A saved file that cannot be used is a 500, never a silent reset.
+fn handle_get_cloud_adapters(state: &HubState) -> HttpResponse {
+    let Some(home) = hub_home_dir(state) else {
+        return HttpResponse::json(200, json!(cloud_adapters::CloudAdaptersConfig::default()));
+    };
+    match cloud_adapters::load(&home) {
+        Ok(config) => HttpResponse::json(200, json!(config)),
+        Err(cloud_adapters::Unreadable) => {
+            HttpResponse::json(500, json!({ "error": cloud_adapters::UNREADABLE_MESSAGE }))
+        }
+    }
+}
+
+/// `PUT /api/v1/cloud/adapters`: merge a full or partial body into the saved config and
+/// validate the merged result. Owner only, checked before any file access. Broadcasts
+/// `cloud_adapters.updated` on the `cloud_adapters` channel.
+fn handle_put_cloud_adapters(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change cloud adapter settings" }),
+        );
+    }
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let patch: cloud_adapters::CloudAdaptersPatch = match serde_json::from_value(body) {
+        Ok(patch) => patch,
+        Err(e) => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": format!("invalid cloud adapter settings: {e}") }),
+            );
+        }
+    };
+    let Some(home) = hub_home_dir(state) else {
+        return HttpResponse::json(500, json!({ "error": "home directory unavailable" }));
+    };
+    match cloud_adapters::update(&home, patch) {
+        Ok(updated) => {
+            let data = json!(updated);
+            state.broadcast("cloud_adapters", "cloud_adapters.updated", data.clone());
+            HttpResponse::json(200, data)
+        }
+        Err(cloud_adapters::UpdateError::Invalid(msg)) => {
+            HttpResponse::json(400, json!({ "error": msg }))
+        }
+        Err(cloud_adapters::UpdateError::Unreadable) => {
+            HttpResponse::json(500, json!({ "error": cloud_adapters::UNREADABLE_MESSAGE }))
+        }
+        Err(cloud_adapters::UpdateError::Io(_)) => HttpResponse::json(
+            500,
+            json!({ "error": "could not save cloud adapter settings" }),
+        ),
+    }
+}
+
 fn handle_dynamic_api_routes(
     state: &HubState,
     authority: &HubAuthority,
@@ -3304,6 +3394,17 @@ fn handle_dynamic_api_routes(
             return HttpResponse::bytes(200, mime_type_for_path(&path), bytes);
         }
         return HttpResponse::json(404, json!({ "error": "attachment not found" }));
+    }
+
+    // /api/v1/auth/operators/:id
+    if method == "DELETE"
+        && segments.len() == 5
+        && segments[0] == "api"
+        && segments[1] == "v1"
+        && segments[2] == "auth"
+        && segments[3] == "operators"
+    {
+        return operators::handle_delete_operator(state, authority, segments[4]);
     }
 
     // /api/v1/records/:id/move
