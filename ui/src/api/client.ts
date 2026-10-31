@@ -80,6 +80,7 @@ import {
   type RecordState,
   type RecordsListResponse,
 } from "../types/api";
+import { canAttachTokenTo, isSafeLinkUrl } from "../lib/safeUrl";
 
 export function normalizeHubSettings(
   raw: unknown,
@@ -1249,11 +1250,13 @@ export class HubApiClient {
   /** URL of the stored bytes of one revision, with the session token for `<img>` and links. */
   public getArtifactVersionRawUrl(path: string, version: number): string {
     const qs = new URLSearchParams({ path, version: String(version) });
+    const base = `${this.baseUrl}/api/v1/artifacts/version-raw?${qs.toString()}`;
     const tok = this.getToken();
-    if (tok) {
+    if (tok && isSafeLinkUrl(base) && canAttachTokenTo(base, this.baseUrl)) {
       qs.set("token", tok);
+      return `${this.baseUrl}/api/v1/artifacts/version-raw?${qs.toString()}`;
     }
-    return `${this.baseUrl}/api/v1/artifacts/version-raw?${qs.toString()}`;
+    return base;
   }
 
   /** Structured preview of a .docx, .xlsx or .pptx artifact. */

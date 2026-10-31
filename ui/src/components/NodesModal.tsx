@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { HubApiClient } from "../api/client";
 import type {
   EnrolledNode,
@@ -98,7 +98,8 @@ export const NodesModal: React.FC<NodesModalProps> = ({
   const [matrixError, setMatrixError] = useState<string | null>(null);
   const [taskDrafts, setTaskDrafts] = useState<Record<string, { command: string; project: string }>>({});
   const [tasksByNode, setTasksByNode] = useState<Record<string, FederatedTask[]>>({});
-  const [dispatchingId, setDispatchingId] = useState<string | null>(null);
+  const [dispatchingByNode, setDispatchingByNode] = useState<Record<string, boolean>>({});
+  const matrixReqIdRef = useRef(0);
 
   const isControlled = propNodes !== undefined;
   const effectiveNodes = isControlled ? propNodes : localNodes;
@@ -128,17 +129,25 @@ export const NodesModal: React.FC<NodesModalProps> = ({
 
   const loadMatrix = useCallback(
     async (probe: boolean) => {
+      const reqId = ++matrixReqIdRef.current;
       const client = apiClient ?? new HubApiClient();
       setMatrixError(null);
       if (probe) setProbing(true);
       else setMatrixLoading(true);
       try {
-        setMatrix(probe ? await client.probeRuntimes() : await client.fetchRuntimeMatrix());
+        const nextMatrix = probe ? await client.probeRuntimes() : await client.fetchRuntimeMatrix();
+        if (matrixReqIdRef.current === reqId) {
+          setMatrix(nextMatrix);
+        }
       } catch (err) {
-        setMatrixError(err instanceof Error ? err.message : "Failed to probe runtimes");
+        if (matrixReqIdRef.current === reqId) {
+          setMatrixError(err instanceof Error ? err.message : "Failed to probe runtimes");
+        }
       } finally {
-        setProbing(false);
-        setMatrixLoading(false);
+        if (matrixReqIdRef.current === reqId) {
+          setProbing(false);
+          setMatrixLoading(false);
+        }
       }
     },
     [apiClient],
@@ -173,7 +182,12 @@ export const NodesModal: React.FC<NodesModalProps> = ({
 
   useEffect(() => {
     if (!isOpen) {
+      matrixReqIdRef.current += 1;
       setTab("nodes");
+      setError(null);
+      setMatrixError(null);
+      setProbing(false);
+      setMatrixLoading(false);
     }
   }, [isOpen]);
 
@@ -256,11 +270,12 @@ export const NodesModal: React.FC<NodesModalProps> = ({
   };
 
   const handleDispatch = async (nodeId: string) => {
+    if (dispatchingByNode[nodeId]) return;
     const draft = taskDrafts[nodeId];
     const command = draft?.command.trim() ?? "";
     if (!command) return;
     setError(null);
-    setDispatchingId(nodeId);
+    setDispatchingByNode((prev) => ({ ...prev, [nodeId]: true }));
     try {
       const client = apiClient ?? new HubApiClient();
       const task = await client.dispatchNodeTask(nodeId, {
@@ -273,7 +288,11 @@ export const NodesModal: React.FC<NodesModalProps> = ({
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to dispatch task");
     } finally {
-      setDispatchingId(null);
+      setDispatchingByNode((prev) => {
+        const next = { ...prev };
+        delete next[nodeId];
+        return next;
+      });
     }
   };
 
@@ -641,12 +660,12 @@ export const NodesModal: React.FC<NodesModalProps> = ({
                           className="fd-btn fd-btn-primary"
                           data-testid="dispatch-node-task-btn"
                           disabled={
-                            dispatchingId === node.node_id ||
+                            Boolean(dispatchingByNode[node.node_id]) ||
                             node.status === "offline" ||
                             !(taskDrafts[node.node_id]?.command ?? "").trim()
                           }
                         >
-                          {dispatchingId === node.node_id ? "Dispatching..." : "Dispatch Federated Task"}
+                          {dispatchingByNode[node.node_id] ? "Dispatching..." : "Dispatch Federated Task"}
                         </button>
                       </form>
                       {(tasksByNode[node.node_id] ?? []).length > 0 && (

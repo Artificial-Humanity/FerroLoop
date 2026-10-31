@@ -175,7 +175,7 @@ export const OfficeDocxView: React.FC<{ preview: DocxPreview }> = ({ preview }) 
     )}
     {preview.blocks.map((block, i) => {
       if (block.type === "heading") {
-        const level = Math.min(6, Math.max(1, block.level));
+        const level = Math.min(6, Math.max(1, Math.trunc(Number(block.level) || 1)));
         const Tag = `h${level}` as "h1";
         return (
           <Tag
@@ -243,7 +243,7 @@ export const OfficeXlsxView: React.FC<{ preview: XlsxPreview }> = ({ preview }) 
   const sheets = preview.sheets;
   const sheet = sheets[Math.min(active, Math.max(0, sheets.length - 1))];
   const cols = sheet
-    ? Math.max(sheet.col_count ?? 0, ...sheet.rows.map((r) => r.length), 1)
+    ? sheet.rows.reduce((max, r) => Math.max(max, r.length), Math.max(sheet.col_count ?? 0, 1))
     : 1;
   const cellStyle: React.CSSProperties = {
     border: "1px solid var(--border-subtle)",
@@ -587,6 +587,7 @@ export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ childre
         }}
         onWheel={(e) => {
           if (e.ctrlKey || e.metaKey) {
+            if (e.deltaY === 0) return;
             zoomTo(nextZoomStep(scale, e.deltaY < 0 ? 1 : -1));
           }
         }}
@@ -1081,6 +1082,9 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     | { mode: "diff"; before: number; after: number };
   const versionPath =
     artifact && !artifact.path.startsWith("inline://") ? artifact.path : null;
+  const versionPathRef = React.useRef<string | null>(versionPath);
+  versionPathRef.current = versionPath;
+  const [prevVersionPath, setPrevVersionPath] = useState<string | null>(versionPath);
   const [versions, setVersions] = useState<ArtifactVersionInfo[] | null>(null);
   const [historyOpen, setHistoryOpen] = useState<boolean>(false);
   const [versionView, setVersionView] = useState<VersionView>({ mode: "current" });
@@ -1088,6 +1092,17 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   const [versionTexts, setVersionTexts] = useState<Record<number, string>>({});
   const [versionError, setVersionError] = useState<string | null>(null);
   const [versionLoading, setVersionLoading] = useState<boolean>(false);
+
+  if (prevVersionPath !== versionPath) {
+    setPrevVersionPath(versionPath);
+    setVersions(null);
+    setHistoryOpen(false);
+    setVersionView({ mode: "current" });
+    setCompareSel([]);
+    setVersionTexts({});
+    setVersionError(null);
+    setVersionLoading(false);
+  }
 
   useEffect(() => {
     setVersions(null);
@@ -1115,11 +1130,14 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     const next = !historyOpen;
     setHistoryOpen(next);
     if (next && versionPath) {
+      const requestedPath = versionPath;
       // Pick up revisions recorded since the artifact was loaded.
       apiClient
-        .getArtifactVersions(versionPath)
+        .getArtifactVersions(requestedPath)
         .then((res) => {
-          if (Array.isArray(res?.versions)) setVersions(res.versions);
+          if (versionPathRef.current === requestedPath && Array.isArray(res?.versions)) {
+            setVersions(res.versions);
+          }
         })
         .catch(() => undefined);
     }
@@ -1137,7 +1155,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
 
   useEffect(() => {
     // Only text artifacts are fetched as text; other kinds link to the raw revision.
-    if (!versionPath || wantedVersions.length === 0) return;
+    if (!versionPath || prevVersionPath !== versionPath || wantedVersions.length === 0) return;
     if (!artifact || !TEXT_ARTIFACT_KINDS.has(artifact.kind)) return;
     const missing = wantedVersions.filter((v) => versionTexts[v] === undefined);
     if (missing.length === 0) return;
@@ -1165,7 +1183,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [apiClient, artifact, versionPath, wantedVersions, versionTexts]);
+  }, [apiClient, artifact, prevVersionPath, versionPath, wantedVersions, versionTexts]);
 
   const currentVersionNo = useMemo(
     () => versions?.find((v) => v.is_current)?.version ?? null,
@@ -1211,6 +1229,15 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
       const tok = apiClient.getToken();
       const hubBase =
         typeof apiClient.getBaseUrl === "function" ? apiClient.getBaseUrl() : "";
+      if (!canAttachTokenTo(base, hubBase) && /[?&]token=/i.test(base)) {
+        try {
+          const parsed = new URL(base);
+          parsed.searchParams.delete("token");
+          return parsed.toString();
+        } catch {
+          return "";
+        }
+      }
       if (tok && !base.includes("token=") && canAttachTokenTo(base, hubBase)) {
         const sep = base.includes("?") ? "&" : "?";
         return `${base}${sep}token=${encodeURIComponent(tok)}`;
@@ -1747,10 +1774,17 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                       <div data-testid="artifact-version-content">{renderCodeLines(text)}</div>
                     );
                   }
-                  const rawVersionUrl = apiClient.getArtifactVersionRawUrl(artifact.path, n);
+                  const rawVersionUrl = resolveHubUrl(
+                    apiClient.getArtifactVersionRawUrl(artifact.path, n),
+                    () =>
+                      `/api/v1/artifacts/version-raw?${new URLSearchParams({
+                        path: artifact.path,
+                        version: String(n),
+                      }).toString()}`,
+                  );
                   return (
                     <div data-testid="artifact-version-content" className="fd-card" style={{ display: "flex", flexDirection: "column", gap: "8px", alignItems: "center" }}>
-                      {artifact.kind === "image" && (
+                      {artifact.kind === "image" && rawVersionUrl && (
                         <img
                           data-testid="artifact-version-image"
                           src={rawVersionUrl}
@@ -1758,7 +1792,14 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                           style={{ maxWidth: "100%", maxHeight: "60vh" }}
                         />
                       )}
-                      <a href={rawVersionUrl} target="_blank" rel="noopener noreferrer" className="fd-btn" style={{ textDecoration: "none" }}>
+                      <a
+                        href={rawVersionUrl || undefined}
+                        aria-disabled={!rawVersionUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="fd-btn"
+                        style={{ textDecoration: "none" }}
+                      >
                         Open raw v{n}
                       </a>
                     </div>
@@ -1888,7 +1929,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
               </div>
             )}
 
-            {officeExt && officeFetched && <OfficePreviewView preview={officeFetched} />}
+            {officeExt && officeFetched && <OfficePreviewView key={artifact.path} preview={officeFetched} />}
 
             {officeExt && officeError && (
               <div role="alert" data-testid="artifact-office-error" className="fd-card" style={{ color: "#FCA5A5", fontSize: "12px" }}>
