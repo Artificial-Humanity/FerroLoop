@@ -235,6 +235,139 @@ export function normalizeCloudAdaptersConfig(
 }
 
 export const DEFAULT_TOKEN_STORAGE_KEY = "fl_hub_session_token";
+export const PASSKEY_KEYSTORE_STORAGE_KEY = "fl_hub_passkey_keystore";
+export const LAST_PASSKEY_ID_STORAGE_KEY = "fl_hub_last_passkey_credential_id";
+
+export interface StoredClientPasskey {
+  credential_id: string;
+  public_key_b64: string;
+  private_jwk: JsonWebKey;
+  sign_count: number;
+}
+
+const inMemoryPasskeyStore = new Map<string, StoredClientPasskey>();
+let inMemoryLastPasskeyId: string | null = null;
+
+export function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+export function base64UrlToBytes(b64: string): Uint8Array {
+  const trimmed = b64.trim().replace(/-/g, "+").replace(/_/g, "/");
+  const padLen = (4 - (trimmed.length % 4)) % 4;
+  const padded = trimmed + "=".repeat(padLen);
+  const binary = atob(padded);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    out[i] = binary.charCodeAt(i);
+  }
+  return out;
+}
+
+function encodeDerInteger(raw: Uint8Array): Uint8Array {
+  let start = 0;
+  while (start < raw.length - 1 && raw[start] === 0) {
+    start++;
+  }
+  const trimmed = raw.subarray(start);
+  const needsLeadingZero = (trimmed[0] & 0x80) !== 0;
+  const bodyLen = trimmed.length + (needsLeadingZero ? 1 : 0);
+  const out = new Uint8Array(2 + bodyLen);
+  out[0] = 0x02;
+  out[1] = bodyLen;
+  if (needsLeadingZero) {
+    out[2] = 0x00;
+    out.set(trimmed, 3);
+  } else {
+    out.set(trimmed, 2);
+  }
+  return out;
+}
+
+/**
+ * Converts a 64-byte WebCrypto IEEE P1363 ECDSA P-256 signature (`r || s`)
+ * into an ASN.1 DER-encoded ECDSA signature (`0x30 len 0x02 rlen r 0x02 slen s`).
+ */
+export function p1363ToDer(sig: Uint8Array): Uint8Array {
+  if (sig.length !== 64) {
+    return sig;
+  }
+  const rDer = encodeDerInteger(sig.subarray(0, 32));
+  const sDer = encodeDerInteger(sig.subarray(32, 64));
+  const seqLen = rDer.length + sDer.length;
+  const out = new Uint8Array(2 + seqLen);
+  out[0] = 0x30;
+  out[1] = seqLen;
+  out.set(rDer, 2);
+  out.set(sDer, 2 + rDer.length);
+  return out;
+}
+
+function readStoredPasskeyMap(): Record<string, StoredClientPasskey> {
+  const merged: Record<string, StoredClientPasskey> = {};
+  for (const [k, v] of inMemoryPasskeyStore.entries()) {
+    merged[k] = v;
+  }
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const raw = window.localStorage.getItem(PASSKEY_KEYSTORE_STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Record<string, StoredClientPasskey>;
+        if (parsed && typeof parsed === "object") {
+          Object.assign(merged, parsed);
+        }
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  return merged;
+}
+
+function saveStoredPasskey(entry: StoredClientPasskey): void {
+  inMemoryPasskeyStore.set(entry.credential_id, entry);
+  inMemoryLastPasskeyId = entry.credential_id;
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const current = readStoredPasskeyMap();
+      current[entry.credential_id] = entry;
+      window.localStorage.setItem(
+        PASSKEY_KEYSTORE_STORAGE_KEY,
+        JSON.stringify(current),
+      );
+      window.localStorage.setItem(
+        LAST_PASSKEY_ID_STORAGE_KEY,
+        entry.credential_id,
+      );
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function getLastRegisteredPasskeyId(): string {
+  try {
+    if (typeof window !== "undefined" && window.localStorage) {
+      const stored = window.localStorage.getItem(LAST_PASSKEY_ID_STORAGE_KEY);
+      if (stored && stored.trim().length >= 16) {
+        return stored.trim();
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+  if (inMemoryLastPasskeyId && inMemoryLastPasskeyId.length >= 16) {
+    return inMemoryLastPasskeyId;
+  }
+  return "passkey-default-0001";
+}
 
 export class HubApiError extends Error {
   public readonly status: number;
@@ -1005,21 +1138,139 @@ export class HubApiClient {
     return res;
   }
 
+  public async requestPasskeyChallenge(): Promise<{
+    challenge: string;
+    expires_in_secs: number;
+  }> {
+    return this.request<{ challenge: string; expires_in_secs: number }>(
+      "/api/v1/auth/passkey/challenge",
+      {
+        method: "POST",
+        body: JSON.stringify({}),
+      },
+    );
+  }
+
   public async loginWithPasskey(req: {
     credential_id: string;
     assertion?: string;
+    client_data_json_b64?: string;
+    authenticator_data_b64?: string;
+    signature_b64?: string;
   }): Promise<{
     ok: boolean;
     authority?: HubAuthority;
     session_token?: string;
   }> {
+    let payload: Record<string, unknown> = { mode: "passkey", ...req };
+
+    if (
+      (!req.signature_b64 ||
+        !req.client_data_json_b64 ||
+        !req.authenticator_data_b64) &&
+      typeof globalThis.crypto !== "undefined" &&
+      globalThis.crypto?.subtle
+    ) {
+      const store = readStoredPasskeyMap();
+      const stored =
+        store[req.credential_id] ??
+        (inMemoryLastPasskeyId ? store[inMemoryLastPasskeyId] : undefined);
+
+      if (stored?.private_jwk) {
+        const challengeRes = await this.requestPasskeyChallenge();
+        const challenge = challengeRes.challenge;
+
+        let origin = "http://localhost:9000";
+        let hostname = "localhost";
+        if (
+          typeof window !== "undefined" &&
+          window.location?.origin &&
+          window.location.origin !== "null"
+        ) {
+          origin = window.location.origin;
+          hostname = window.location.hostname || "localhost";
+        } else if (this.baseUrl) {
+          try {
+            const parsedUrl = new URL(this.baseUrl);
+            origin = parsedUrl.origin;
+            hostname = parsedUrl.hostname || "localhost";
+          } catch {
+            // Keep default localhost origin
+          }
+        }
+
+        const clientDataJson = JSON.stringify({
+          type: "webauthn.get",
+          challenge,
+          origin,
+          crossOrigin: false,
+        });
+        const encoder = new TextEncoder();
+        const clientDataBytes = encoder.encode(clientDataJson);
+
+        const rpIdHash = new Uint8Array(
+          await globalThis.crypto.subtle.digest(
+            "SHA-256",
+            encoder.encode(hostname),
+          ),
+        );
+        const nextCount = (stored.sign_count || 0) + 1;
+        saveStoredPasskey({
+          ...stored,
+          sign_count: nextCount,
+        });
+
+        const authenticatorData = new Uint8Array(37);
+        authenticatorData.set(rpIdHash.subarray(0, 32), 0);
+        authenticatorData[32] = 0x01; // UP (User Present) flag
+        authenticatorData[33] = (nextCount >>> 24) & 0xff;
+        authenticatorData[34] = (nextCount >>> 16) & 0xff;
+        authenticatorData[35] = (nextCount >>> 8) & 0xff;
+        authenticatorData[36] = nextCount & 0xff;
+
+        const clientDataHash = new Uint8Array(
+          await globalThis.crypto.subtle.digest("SHA-256", clientDataBytes),
+        );
+
+        const signedData = new Uint8Array(
+          authenticatorData.length + clientDataHash.length,
+        );
+        signedData.set(authenticatorData, 0);
+        signedData.set(clientDataHash, authenticatorData.length);
+
+        const privateKey = await globalThis.crypto.subtle.importKey(
+          "jwk",
+          stored.private_jwk,
+          { name: "ECDSA", namedCurve: "P-256" },
+          false,
+          ["sign"],
+        );
+        const p1363Sig = new Uint8Array(
+          await globalThis.crypto.subtle.sign(
+            { name: "ECDSA", hash: "SHA-256" },
+            privateKey,
+            signedData,
+          ),
+        );
+        const derSig = p1363ToDer(p1363Sig);
+
+        payload = {
+          mode: "passkey",
+          credential_id: req.credential_id,
+          client_data_json_b64: bytesToBase64Url(clientDataBytes),
+          authenticator_data_b64: bytesToBase64Url(authenticatorData),
+          signature_b64: bytesToBase64Url(derSig),
+        };
+      }
+    }
+
     const res = await this.request<{
       ok: boolean;
       authority?: HubAuthority;
       session_token?: string;
     }>("/api/v1/auth/login", {
       method: "POST",
-      body: JSON.stringify({ mode: "passkey", ...req }),
+      body: JSON.stringify(payload),
     });
     if (res?.session_token) {
       this.setToken(res.session_token);
@@ -1076,9 +1327,39 @@ export class HubApiClient {
     label: string;
     public_key_b64?: string;
   }): Promise<{ ok: boolean }> {
+    let publicKeyB64 = req.public_key_b64;
+    if (
+      !publicKeyB64 &&
+      typeof globalThis.crypto !== "undefined" &&
+      globalThis.crypto?.subtle
+    ) {
+      const keyPair = await globalThis.crypto.subtle.generateKey(
+        { name: "ECDSA", namedCurve: "P-256" },
+        true,
+        ["sign", "verify"],
+      );
+      const rawPub = new Uint8Array(
+        await globalThis.crypto.subtle.exportKey("raw", keyPair.publicKey),
+      );
+      publicKeyB64 = bytesToBase64Url(rawPub);
+      const privateJwk = await globalThis.crypto.subtle.exportKey(
+        "jwk",
+        keyPair.privateKey,
+      );
+      saveStoredPasskey({
+        credential_id: req.credential_id,
+        public_key_b64: publicKeyB64,
+        private_jwk: privateJwk,
+        sign_count: 0,
+      });
+    }
     return this.request<{ ok: boolean }>("/api/v1/auth/passkey/register", {
       method: "POST",
-      body: JSON.stringify(req),
+      body: JSON.stringify({
+        credential_id: req.credential_id,
+        label: req.label,
+        ...(publicKeyB64 ? { public_key_b64: publicKeyB64 } : {}),
+      }),
     });
   }
 

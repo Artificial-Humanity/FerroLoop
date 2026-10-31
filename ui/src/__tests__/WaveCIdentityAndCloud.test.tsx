@@ -1,6 +1,9 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
-import { HubApiClient } from "../api/client";
+import {
+  HubApiClient,
+  base64UrlToBytes,
+} from "../api/client";
 import { PairingModal } from "../components/PairingModal";
 import { SettingsModal } from "../components/SettingsModal";
 import type {
@@ -326,6 +329,100 @@ describe("Wave C UI — Record 11 (Multi-Operator Auth, Passkeys, TOTP & RBAC) +
       expect(
         await screen.findByTestId("cloud-adapters-saved-banner"),
       ).toBeInTheDocument();
+    });
+  });
+
+  describe("Record 11 — WebCrypto P-256 Passkey Registration & Challenge-Signed Assertion Login", () => {
+    it("generates a 65-byte SEC1 P-256 public_key_b64 in registerPasskey and signs POST /api/v1/auth/passkey/challenge with ASN.1 DER in loginWithPasskey", async () => {
+      const capturedRegisterBody: Record<string, unknown> = {};
+      const capturedLoginBody: Record<string, unknown> = {};
+
+      const mockFetch = vi.fn(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = String(input);
+          if (url.endsWith("/api/v1/auth/passkey/register")) {
+            Object.assign(
+              capturedRegisterBody,
+              JSON.parse(String(init?.body ?? "{}")),
+            );
+            return new Response(JSON.stringify({ ok: true }), { status: 200 });
+          }
+          if (url.endsWith("/api/v1/auth/passkey/challenge")) {
+            return new Response(
+              JSON.stringify({
+                challenge: "test-challenge-base64url-0123456789abcdef",
+                expires_in_secs: 300,
+              }),
+              { status: 200 },
+            );
+          }
+          if (url.endsWith("/api/v1/auth/login")) {
+            Object.assign(
+              capturedLoginBody,
+              JSON.parse(String(init?.body ?? "{}")),
+            );
+            return new Response(
+              JSON.stringify({
+                ok: true,
+                authority: { tier: "owner", login: "lmcfarlin" },
+                session_token: "sess-passkey-real",
+              }),
+              { status: 200 },
+            );
+          }
+          return new Response(JSON.stringify({}), { status: 200 });
+        },
+      );
+
+      const client = new HubApiClient({
+        baseUrl: "http://localhost:9000",
+        fetchImpl: mockFetch as unknown as typeof fetch,
+      });
+
+      const credId = "passkey-webcrypto-test-0001";
+      await client.registerPasskey({
+        credential_id: credId,
+        label: "Lab YubiKey",
+      });
+
+      expect(capturedRegisterBody.credential_id).toBe(credId);
+      const pubKeyB64 = String(capturedRegisterBody.public_key_b64 ?? "");
+      expect(pubKeyB64.length).toBeGreaterThan(80);
+      const pubKeyBytes = base64UrlToBytes(pubKeyB64);
+      expect(pubKeyBytes.length).toBe(65);
+      expect(pubKeyBytes[0]).toBe(0x04);
+
+      const loginRes = await client.loginWithPasskey({
+        credential_id: credId,
+      });
+      expect(loginRes.ok).toBe(true);
+      expect(capturedLoginBody.mode).toBe("passkey");
+      expect(capturedLoginBody.credential_id).toBe(credId);
+
+      const clientDataBytes = base64UrlToBytes(
+        String(capturedLoginBody.client_data_json_b64 ?? ""),
+      );
+      const clientData = JSON.parse(
+        new TextDecoder().decode(clientDataBytes),
+      ) as Record<string, unknown>;
+      expect(clientData.type).toBe("webauthn.get");
+      expect(clientData.challenge).toBe(
+        "test-challenge-base64url-0123456789abcdef",
+      );
+      expect(clientData.crossOrigin).toBe(false);
+
+      const authDataBytes = base64UrlToBytes(
+        String(capturedLoginBody.authenticator_data_b64 ?? ""),
+      );
+      expect(authDataBytes.length).toBe(37);
+      expect(authDataBytes[32]).toBe(0x01); // UP flag
+      expect(authDataBytes[36]).toBe(1); // signCount === 1
+
+      const sigDerBytes = base64UrlToBytes(
+        String(capturedLoginBody.signature_b64 ?? ""),
+      );
+      expect(sigDerBytes[0]).toBe(0x30); // ASN.1 SEQUENCE
+      expect(sigDerBytes[2]).toBe(0x02); // ASN.1 INTEGER (r)
     });
   });
 });
