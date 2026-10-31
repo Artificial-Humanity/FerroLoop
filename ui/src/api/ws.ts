@@ -9,7 +9,22 @@ export interface HubWsClientOptions {
   webSocketFactory?: (url: string) => WebSocket;
   autoReconnect?: boolean;
   reconnectDelayMs?: number;
+  /** Upper bound for the exponential reconnect backoff. Defaults to 30s. */
+  maxReconnectDelayMs?: number;
 }
+
+export interface SendFrameOptions {
+  /**
+   * When the socket is not open, keep the frame and replay it after the next
+   * connect (default). Pass `false` for frames that are only meaningful on the
+   * live connection (interactive terminal input, resize, close): replaying
+   * keystrokes into a later shell is unsafe.
+   */
+  queueWhenDisconnected?: boolean;
+}
+
+/** Cap on frames buffered while disconnected so a long outage cannot grow without bound. */
+export const MAX_PENDING_FRAMES = 256;
 
 export class HubWsClient {
   private readonly baseUrl?: string;
@@ -17,6 +32,8 @@ export class HubWsClient {
   private readonly webSocketFactory: (url: string) => WebSocket;
   private readonly autoReconnect: boolean;
   private readonly reconnectDelayMs: number;
+  private readonly maxReconnectDelayMs: number;
+  private reconnectAttempts = 0;
 
   private ws: WebSocket | null = null;
   private connected = false;
@@ -33,10 +50,19 @@ export class HubWsClient {
     this.webSocketFactory = options.webSocketFactory ?? ((url: string) => new WebSocket(url));
     this.autoReconnect = options.autoReconnect ?? true;
     this.reconnectDelayMs = options.reconnectDelayMs ?? 1500;
+    this.maxReconnectDelayMs = Math.max(
+      this.reconnectDelayMs,
+      options.maxReconnectDelayMs ?? 30_000,
+    );
   }
 
   public setToken(token: string | null): void {
-    this.token = token && token.trim().length > 0 ? token.trim() : null;
+    const next = token && token.trim().length > 0 ? token.trim() : null;
+    if (next !== this.token) {
+      // Frames queued under another identity must never be replayed under this one.
+      this.pendingFrames = [];
+    }
+    this.token = next;
   }
 
   public isConnected(): boolean {
@@ -67,35 +93,53 @@ export class HubWsClient {
       this.reconnectTimer = null;
     }
     if (this.ws) {
+      const previous = this.ws;
+      this.ws = null;
       try {
-        this.ws.close();
+        previous.close();
       } catch {
         // Ignore close errors.
       }
-      this.ws = null;
     }
 
     const url = this.buildWsUrl();
     const socket = this.webSocketFactory(url);
     this.ws = socket;
 
+    // A superseded socket (replaced by a later connect() or by disconnect())
+    // can still deliver open/message/close events. Every handler must ignore
+    // them, otherwise a stale close schedules a duplicate reconnect that tears
+    // down the live socket, and stale frames are dispatched twice.
+    const isCurrent = () => this.ws === socket;
+
     socket.onopen = () => {
+      if (!isCurrent()) {
+        return;
+      }
+      this.reconnectAttempts = 0;
       this.setConnected(true);
       this.flushPendingFrames();
     };
 
     socket.onmessage = (event: MessageEvent) => {
+      if (!isCurrent()) {
+        return;
+      }
       const rawData = typeof event.data === "string" ? event.data : String(event.data ?? "");
       if (!rawData) {
         return;
       }
+      let frame: HubWsFrame | null = null;
       try {
-        const frame = JSON.parse(rawData) as HubWsFrame;
-        if (frame && typeof frame.channel === "string" && typeof frame.event === "string") {
-          this.dispatchFrame(frame);
+        const parsed = JSON.parse(rawData) as HubWsFrame;
+        if (parsed && typeof parsed.channel === "string" && typeof parsed.event === "string") {
+          frame = parsed;
         }
       } catch {
         // Ignore malformed frames.
+      }
+      if (frame) {
+        this.dispatchFrame(frame);
       }
     };
 
@@ -104,23 +148,30 @@ export class HubWsClient {
     };
 
     socket.onclose = () => {
-      if (this.ws === socket) {
-        this.ws = null;
+      if (!isCurrent()) {
+        return;
       }
+      this.ws = null;
       this.setConnected(false);
       if (!this.manualClose && this.autoReconnect) {
+        const delay = Math.min(
+          this.maxReconnectDelayMs,
+          this.reconnectDelayMs * 2 ** Math.min(this.reconnectAttempts, 16),
+        );
+        this.reconnectAttempts += 1;
         this.reconnectTimer = setTimeout(() => {
           this.reconnectTimer = null;
           if (!this.manualClose) {
             this.connect();
           }
-        }, this.reconnectDelayMs);
+        }, delay);
       }
     };
   }
 
   public disconnect(): void {
     this.manualClose = true;
+    this.reconnectAttempts = 0;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -164,7 +215,12 @@ export class HubWsClient {
     };
   }
 
-  public sendFrame<T = unknown>(channel: string, event: string, data: T): boolean {
+  public sendFrame<T = unknown>(
+    channel: string,
+    event: string,
+    data: T,
+    options: SendFrameOptions = {},
+  ): boolean {
     const payload = JSON.stringify({
       channel,
       event,
@@ -176,7 +232,12 @@ export class HubWsClient {
       return true;
     }
 
-    this.pendingFrames.push(payload);
+    if (options.queueWhenDisconnected !== false) {
+      this.pendingFrames.push(payload);
+      if (this.pendingFrames.length > MAX_PENDING_FRAMES) {
+        this.pendingFrames.splice(0, this.pendingFrames.length - MAX_PENDING_FRAMES);
+      }
+    }
     return false;
   }
 
@@ -198,17 +259,18 @@ export class HubWsClient {
       this.flushPendingFrames();
     }
 
+    // One misbehaving subscriber must not starve the others.
     const direct = this.channelSubscribers.get(frame.channel);
     if (direct) {
       for (const cb of Array.from(direct)) {
-        cb(frame);
+        this.safely(() => cb(frame));
       }
     }
 
     const wildcard = this.channelSubscribers.get("*");
     if (wildcard) {
       for (const cb of Array.from(wildcard)) {
-        cb(frame);
+        this.safely(() => cb(frame));
       }
     }
   }
@@ -219,7 +281,15 @@ export class HubWsClient {
     }
     this.connected = state;
     for (const cb of Array.from(this.statusSubscribers)) {
-      cb(state);
+      this.safely(() => cb(state));
+    }
+  }
+
+  private safely(fn: () => void): void {
+    try {
+      fn();
+    } catch (err) {
+      console.error("HubWsClient subscriber threw", err);
     }
   }
 }

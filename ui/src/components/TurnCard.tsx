@@ -1,3 +1,4 @@
+import { isSafeInlineImageUrl, isSafeLinkUrl } from "../lib/safeUrl";
 import React from "react";
 import type { TranscriptTurn } from "../types/api";
 import { dispatchOpenArtifact, MermaidDiagram, RichMarkdown } from "./RichMarkdown";
@@ -722,7 +723,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                 <span className="fd-mono" style={{ color: "var(--text-secondary)" }}>
                   {att.name}
                 </span>
-                {att.url && (
+                {att.url && isSafeLinkUrl(att.url) && (
                   <a
                     href={att.url}
                     target="_blank"
@@ -739,7 +740,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
                   </a>
                 )}
               </div>
-              {att.isImage && (
+              {att.isImage && isSafeInlineImageUrl(att.url || att.path) && (
                 <img
                   src={att.url || att.path}
                   alt={att.name}

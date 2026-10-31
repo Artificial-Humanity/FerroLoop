@@ -42,6 +42,11 @@ export function parseUnifiedDiff(rawDiff: string): ParsedDiffFile[] {
   }
 
   const lines = rawDiff.replace(/\r\n/g, "\n").split("\n");
+  // A diff ends with a newline, so split() yields a final "" that is not a
+  // diff line; left in, it renders as a phantom numbered context row.
+  if (lines.length > 0 && lines[lines.length - 1] === "") {
+    lines.pop();
+  }
   const files: ParsedDiffFile[] = [];
   let currentFile: ParsedDiffFile | null = null;
   let currentHunk: ParsedDiffHunk | null = null;

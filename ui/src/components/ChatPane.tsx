@@ -454,6 +454,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setPromptText(draft.promptText);
     setAttachments(draft.attachments);
   }
+  // Tracks the live target so async completions can tell whether the composer
+  // still belongs to the agent/session they were started for.
+  const currentTargetRef = React.useRef<string>(targetSessionOrAgent);
+  currentTargetRef.current = targetSessionOrAgent;
   const [submitting, setSubmitting] = React.useState<boolean>(false);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
 
@@ -1294,6 +1298,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       ...(alwaysSendNow ? { send_now: true } : {}),
     };
 
+    const submittedTarget = targetSessionOrAgent;
     setSubmitting(true);
     setSubmitError(null);
     try {
@@ -1331,16 +1336,23 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         }
         await fetchTranscript();
       }
-      clearSessionDraft(targetSessionOrAgent);
-      setPromptText("");
-      setAttachments([]);
-      if (!wasQueued) {
-        scrollToBottom("smooth");
-        // Run again after the optimistic turn and live indicator render.
-        requestAnimationFrame(() => scrollToBottom("smooth"));
+      clearSessionDraft(submittedTarget);
+      // The operator may have switched agents while the request was in
+      // flight: the composer now holds another target's draft, which must
+      // not be wiped (or scrolled) on behalf of the finished send.
+      if (currentTargetRef.current === submittedTarget) {
+        setPromptText("");
+        setAttachments([]);
+        if (!wasQueued) {
+          scrollToBottom("smooth");
+          // Run again after the optimistic turn and live indicator render.
+          requestAnimationFrame(() => scrollToBottom("smooth"));
+        }
       }
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to send message");
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(err instanceof Error ? err.message : "Failed to send message");
+      }
     } finally {
       setSubmitting(false);
     }

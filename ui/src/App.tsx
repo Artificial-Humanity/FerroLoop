@@ -27,6 +27,7 @@ import {
   DEFAULT_WORKSPACE_AGENTS,
   type AgentLivenessItem,
   type AgentRecord,
+  type AuthSessionResponse,
   type ArchitectureResponse,
   type BulkSessionAction,
   type CockpitTab,
@@ -361,6 +362,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     useState<SessionQuotaUsage | null>(null);
   const optimisticPromptRef = useRef<OptimisticPrompt | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
+  const pairInFlightRef = useRef<Promise<AuthSessionResponse> | null>(null);
   const [lastSeenAssistantTurnIndex, setLastSeenAssistantTurnIndex] =
     useState<Record<string, number>>(readInitialLastSeenAssistantTurn);
   const [backgroundTranscripts, setBackgroundTranscripts] = useState<
@@ -468,7 +470,9 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   // every window on every poll.
   const scanBackgroundTranscripts = useCallback(
     async (list: DiscoveredSessionSummary[]) => {
-      const selectedKey = selectedAgentName.trim().toLowerCase();
+      // Read through the ref so this callback stays referentially stable;
+      // see the WebSocket effect, which depends on it.
+      const selectedKey = selectedAgentNameRef.current.trim().toLowerCase();
       const scannedPersonas = new Set<string>();
       for (const session of list) {
         const persona = (session.persona ?? "").trim().toLowerCase();
@@ -489,12 +493,21 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         }
       }
     },
-    [apiClient, selectedAgentName, recordTranscript],
+    [apiClient, recordTranscript],
   );
+
+  // A refresh requested while one is in flight is coalesced into a single
+  // trailing run instead of being dropped (a dropped post-send or post-switch
+  // refresh leaves the transcript stale until the next poll tick).
+  const refreshQueuedRef = useRef<{ override: string | null | undefined } | null>(null);
+  const refreshSessionsAndTranscriptRef = useRef<
+    (sessionOverride?: string | null) => Promise<void>
+  >(async () => {});
 
   const refreshSessionsAndTranscript = useCallback(
     async (sessionOverride?: string | null) => {
       if (refreshInFlightRef.current) {
+        refreshQueuedRef.current = { override: sessionOverride };
         return;
       }
       refreshInFlightRef.current = true;
@@ -550,10 +563,18 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         // Ignore
       } finally {
         refreshInFlightRef.current = false;
+        const queued = refreshQueuedRef.current;
+        if (queued) {
+          refreshQueuedRef.current = null;
+          void refreshSessionsAndTranscriptRef.current(queued.override);
+        }
       }
     },
-    [apiClient, selectedSessionId, selectedAgentName, applyTranscriptTurns, scanBackgroundTranscripts, recordTranscript],
+    // Selection is read through refs so the identity is stable across agent
+    // and session switches (the WebSocket effect depends on this callback).
+    [apiClient, applyTranscriptTurns, scanBackgroundTranscripts, recordTranscript],
   );
+  refreshSessionsAndTranscriptRef.current = refreshSessionsAndTranscript;
 
   const refreshWorkflows = useCallback(async () => {
     try {
@@ -695,28 +716,46 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         const params = new URLSearchParams(window.location.search);
         const pairCode = params.get("pair") || params.get("code");
         if (pairCode && pairCode.trim()) {
-          try {
-            const pairRes = await apiClient.pair({ code: pairCode.trim() });
-            if (!cancelled) {
-              if (pairRes.authority) {
-                setAuthority(pairRes.authority);
-              }
-              wsClient.setToken(apiClient.getToken());
-              wsClient.connect();
-            }
-          } catch (err) {
-            if (!cancelled) {
-              setPairingError(err instanceof Error ? err.message : "Pairing code rejected");
-              setPairingOpen(true);
-            }
-          } finally {
-            params.delete("pair");
-            params.delete("code");
-            const nextQuery = params.toString();
-            const cleanUrl = `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ""}${
+          // Strip the single-use credential from the address bar before any
+          // await: a second bootstrap run (React StrictMode remount) would
+          // otherwise re-submit the same code and surface a spurious
+          // "rejected" error, and the code would linger in history meanwhile.
+          params.delete("pair");
+          params.delete("code");
+          const nextQuery = params.toString();
+          window.history.replaceState(
+            {},
+            "",
+            `${window.location.pathname}${nextQuery ? `?${nextQuery}` : ""}${
               window.location.hash || ""
-            }`;
-            window.history.replaceState({}, "", cleanUrl);
+            }`,
+          );
+          pairInFlightRef.current = apiClient.pair({ code: pairCode.trim() });
+        }
+      }
+
+      // The in-flight pairing lives in a ref so a remounted bootstrap run
+      // (which no longer sees the code in the URL) still waits for it rather
+      // than racing getAuthSession ahead of the session cookie.
+      const pendingPair = pairInFlightRef.current;
+      if (pendingPair) {
+        try {
+          const pairRes = await pendingPair;
+          if (!cancelled) {
+            if (pairRes.authority) {
+              setAuthority(pairRes.authority);
+            }
+            wsClient.setToken(apiClient.getToken());
+            wsClient.connect();
+          }
+        } catch (err) {
+          if (!cancelled) {
+            setPairingError(err instanceof Error ? err.message : "Pairing code rejected");
+            setPairingOpen(true);
+          }
+        } finally {
+          if (pairInFlightRef.current === pendingPair) {
+            pairInFlightRef.current = null;
           }
         }
       }
@@ -970,6 +1009,29 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     setAuthority(null);
     wsClient.setToken(null);
     wsClient.disconnect();
+    // Drop everything fetched under the old identity so the next principal
+    // to pair on this browser never sees (or polls against) it.
+    optimisticPromptRef.current = null;
+    backgroundTranscriptsRef.current = {};
+    backgroundStampRef.current = {};
+    setBackgroundTranscripts({});
+    setTranscriptTurns([]);
+    setSessionQueue([]);
+    setIsSessionBusy(false);
+    setSessionContextUsage(null);
+    setSessionQuotaUsage(null);
+    setSessions([]);
+    setRoutes([]);
+    setLiveness([]);
+    setWireMessages([]);
+    setWorktrees([]);
+    setWorktreeDiff(null);
+    setPrs([]);
+    setWorkflows([]);
+    setWorkflowRuns([]);
+    setArchitecture(null);
+    setStats(null);
+    setNodes([]);
     setPairingOpen(true);
   };
 
@@ -1252,7 +1314,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           <TerminalPane
             authority={authority}
             sessionId={activeSession?.id ?? selectedAgent?.name_key ?? "shell"}
-            cwd={activeSession?.cwd ?? "/home/lmcfarlin/Projects/Artificial-Humanity"}
+            cwd={activeSession?.cwd ?? null}
             wsClient={wsClient}
             onOpenPairing={() => setPairingOpen(true)}
           />

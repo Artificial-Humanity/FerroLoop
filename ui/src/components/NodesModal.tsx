@@ -55,6 +55,7 @@ export const NodesModal: React.FC<NodesModalProps> = ({
   const [enrolling, setEnrolling] = useState(false);
   const [enrollToken, setEnrollToken] = useState<NodeEnrollTokenResponse | null>(null);
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const [revokingId, setRevokingId] = useState<string | null>(null);
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
@@ -93,6 +94,28 @@ export const NodesModal: React.FC<NodesModalProps> = ({
     return () => clearInterval(timer);
   }, [isOpen, enrollToken]);
 
+  // The join command embeds a live enrollment credential. Forget it as soon
+  // as the modal closes so reopening later (or another operator at the same
+  // console) does not find a usable, possibly stale, secret on screen.
+  useEffect(() => {
+    if (!isOpen) {
+      setEnrollToken(null);
+      setCopied(false);
+      setCopyFailed(false);
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onClose]);
+
   if (!isOpen) {
     return null;
   }
@@ -102,6 +125,7 @@ export const NodesModal: React.FC<NodesModalProps> = ({
     setError(null);
     setEnrolling(true);
     setCopied(false);
+    setCopyFailed(false);
     const trimmedLabel = labelInput.trim() || undefined;
     try {
       let tokenRes: NodeEnrollTokenResponse;
@@ -125,12 +149,17 @@ export const NodesModal: React.FC<NodesModalProps> = ({
   const handleCopyCommand = async () => {
     if (!enrollToken?.join_command) return;
     try {
-      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(enrollToken.join_command);
+      if (typeof navigator === "undefined" || !navigator.clipboard?.writeText) {
+        throw new Error("Clipboard API unavailable");
       }
+      await navigator.clipboard.writeText(enrollToken.join_command);
+      setCopyFailed(false);
       setCopied(true);
     } catch {
-      setCopied(true);
+      // Never claim "Copied" when nothing reached the clipboard (insecure
+      // context, denied permission): the operator would paste a stale value.
+      setCopied(false);
+      setCopyFailed(true);
     }
   };
 
@@ -471,7 +500,7 @@ export const NodesModal: React.FC<NodesModalProps> = ({
                   data-testid="copy-join-command-btn"
                   onClick={() => void handleCopyCommand()}
                 >
-                  {copied ? "Copied" : "Copy"}
+                  {copied ? "Copied" : copyFailed ? "Copy failed — select the command manually" : "Copy"}
                 </button>
               </div>
             </div>

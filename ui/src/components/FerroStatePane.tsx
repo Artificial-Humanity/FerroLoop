@@ -205,11 +205,17 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
     }
   }, [entries, noteScopes]);
 
+  const explorerSeqRef = React.useRef(0);
+  const codeSeqRef = React.useRef(0);
+
   const runExplorer = useCallback(
     async (q: string, scope: string, concern: string) => {
       if (!apiClient) {
         return;
       }
+      // Last request wins: responses can arrive out of order, and a slow
+      // earlier query must not overwrite (or clear the spinner of) a later one.
+      const seq = ++explorerSeqRef.current;
       setInternalLoading(true);
       setInternalError(null);
       try {
@@ -220,6 +226,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             concern: concern || undefined,
             limit: 50,
           });
+          if (seq !== explorerSeqRef.current) return;
           setHits(res.hits ?? []);
           noteScopes((res.hits ?? []).map((hit) => hit.entry));
         } else {
@@ -227,6 +234,7 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
             scope: scope || undefined,
             concern: concern || undefined,
           });
+          if (seq !== explorerSeqRef.current) return;
           setHits(null);
           if (entries === undefined) {
             setInternalEntries(res.entries ?? []);
@@ -237,9 +245,13 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
           noteScopes(res.entries ?? []);
         }
       } catch (err) {
-        setInternalError(errorMessage(err, "Failed to load FerroState entries"));
+        if (seq === explorerSeqRef.current) {
+          setInternalError(errorMessage(err, "Failed to load FerroState entries"));
+        }
       } finally {
-        setInternalLoading(false);
+        if (seq === explorerSeqRef.current) {
+          setInternalLoading(false);
+        }
       }
     },
     [apiClient, entries, noteScopes],
@@ -472,18 +484,24 @@ export const FerroStatePane: React.FC<FerroStatePaneProps> = ({
       setActionError("No FerroState API client is configured.");
       return;
     }
+    const codeSeq = ++codeSeqRef.current;
     setCodeLoading(true);
     try {
       const res = await apiClient.searchCodeIndex({ q, kind: codeKind, limit: 50 });
+      if (codeSeq !== codeSeqRef.current) return;
       setSymbols(res.symbols ?? []);
       setTokensSavedThisQuery(res.tokens_saved_this_query ?? 0);
       if (res.token_gain) {
         setTokenGain(res.token_gain);
       }
     } catch (err) {
-      setActionError(errorMessage(err, "Code index search failed"));
+      if (codeSeq === codeSeqRef.current) {
+        setActionError(errorMessage(err, "Code index search failed"));
+      }
     } finally {
-      setCodeLoading(false);
+      if (codeSeq === codeSeqRef.current) {
+        setCodeLoading(false);
+      }
     }
   };
 
