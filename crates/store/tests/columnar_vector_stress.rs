@@ -443,8 +443,12 @@ fn float_zone_maps_handle_infinities_negative_zero_and_nan() {
     assert_eq!(count(ColumnPredicate::Le(ColumnValue::Float64(5e-324))), 5);
 }
 
+/// No-panic smoke test: appending NaN may be accepted or refused (both are allowed and
+/// neither is pinned). It only pins that nothing panics and that, in whichever branch is
+/// taken, a scan stays consistent (NaN never satisfies a range predicate; a refusal
+/// leaves the table empty).
 #[test]
-fn nan_is_either_stored_faithfully_or_refused_but_never_corrupts_a_scan() {
+fn nan_append_and_scan_does_not_panic_and_stays_consistent() {
     let store = FerroStore::in_memory();
     store
         .create_column_table("t", &[col("f", ColumnType::Float64)])
@@ -756,8 +760,11 @@ fn bad_schemas_rows_and_filters_are_refused_without_writing() {
     );
 }
 
+/// No-panic smoke test: creating, appending to and scanning a zero-column table may
+/// succeed or fail (both are allowed and the results are deliberately not inspected). It
+/// only pins that none of those calls panics.
 #[test]
-fn a_zero_column_table_is_handled_deliberately() {
+fn a_zero_column_table_does_not_panic() {
     let store = FerroStore::in_memory();
     match store.create_column_table("empty", &[]) {
         Ok(()) => {
@@ -1292,8 +1299,12 @@ fn replacing_and_deleting_vectors_keeps_the_graph_searchable() {
 /// Known gap, not a regression: delete unlinks a node without reconnecting its
 /// neighbours, so the graph can fragment and a search then returns fewer than `limit`
 /// hits although enough vectors remain. Run with `--ignored` to see it.
+///
+/// This passes once `delete_vector` repairs connectivity (reconnects the deleted node's
+/// neighbours to each other) so that a search returns `min(limit, remaining)` hits after
+/// any sequence of deletes; then drop the `#[ignore]`.
 #[test]
-#[ignore = "delete does not repair HNSW connectivity (see docs/ferrostore-spec.md, Delete unlinks it)"]
+#[ignore = "known gap: HNSW delete does not reconnect neighbours, search can return fewer than the limit; see Notes/FerroLoop or file an issue"]
 fn search_still_fills_the_limit_after_random_deletes() {
     let store = FerroStore::in_memory();
     store

@@ -217,10 +217,14 @@ fn write_behind_with_concurrent_flushers_sends_each_batch_exactly_once() {
                 }
             });
         }
-        for writer in writers {
-            writer.join().unwrap();
-        }
+        // Join without unwrapping: a panicking writer must not leave the flushers spinning
+        // (thread::scope would wait on them forever). Stop them first, then assert.
+        let results: Vec<_> = writers.into_iter().map(|writer| writer.join()).collect();
         done.store(true, Ordering::SeqCst);
+        assert!(
+            results.iter().all(Result::is_ok),
+            "a writer thread panicked"
+        );
     });
     store.sync_flush().unwrap();
     let total = (THREADS * PER_THREAD) as u64;
@@ -896,9 +900,17 @@ fn searching_while_the_remote_flaps_and_writers_run_never_errors() {
                 })
             })
             .collect();
-        for h in writers.into_iter().chain(searchers) {
-            h.join().unwrap();
-        }
+        // Join without unwrapping: a panicking worker must not leave the flapper spinning
+        // (thread::scope would wait on it forever). Stop it first, then assert.
+        let results: Vec<_> = writers
+            .into_iter()
+            .chain(searchers)
+            .map(|h| h.join())
+            .collect();
         stop.store(true, Ordering::SeqCst);
+        assert!(
+            results.iter().all(Result::is_ok),
+            "a worker thread panicked"
+        );
     });
 }

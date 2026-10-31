@@ -721,9 +721,12 @@ fn the_relay_recovers_after_an_outage_and_stays_correct_under_threads() {
     assert!(forward_mcp_relay(relay.as_ref(), "c", &json!({"id": 1})).is_err());
     *relay.mode.lock().unwrap() = RelayMode::Slow;
     let failures = AtomicUsize::new(0);
+    // Thread 0 alone flips the mode, and does so between its own calls, so the ids it sees
+    // fail are exactly the ones in its blip window: deterministic, no timing involved.
+    let blip_failed_ids = Mutex::new(Vec::new());
     thread::scope(|scope| {
         for t in 0..8 {
-            let (relay, failures) = (&relay, &failures);
+            let (relay, failures, blip_failed_ids) = (&relay, &failures, &blip_failed_ids);
             scope.spawn(move || {
                 for i in 0..100 {
                     // Flip the relay down for a window while the others keep calling.
@@ -742,6 +745,9 @@ fn the_relay_recovers_after_an_outage_and_stays_correct_under_threads() {
                         Err(GateError::Adapter { reason, .. }) => {
                             assert!(["blip", "down"].contains(&reason.as_str()));
                             failures.fetch_add(1, Ordering::SeqCst);
+                            if t == 0 {
+                                blip_failed_ids.lock().unwrap().push(i);
+                            }
                         }
                         Err(other) => panic!("{other}"),
                     }
@@ -750,7 +756,19 @@ fn the_relay_recovers_after_an_outage_and_stays_correct_under_threads() {
         }
     });
     assert_eq!(relay.calls.load(Ordering::SeqCst), 1 + 800);
-    assert!(failures.load(Ordering::SeqCst) <= 800);
+    // Thread 0 sets the blip before call 50 and clears it before call 60, so exactly its
+    // calls 50..60 fail; every other thread's failures (if any) come on top of those.
+    assert_eq!(
+        *blip_failed_ids.lock().unwrap(),
+        (50..60).collect::<Vec<_>>(),
+        "the blip window was not observed exactly"
+    );
+    assert!(failures.load(Ordering::SeqCst) >= 10);
+    // After the switch back to Echo the relay is healthy again and routes correctly.
+    let reply = forward_mcp_relay(relay.as_ref(), "after", &json!({"id": 4242}))
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply["id"], 4242);
 }
 
 // ============================ secret provider ==========================================
