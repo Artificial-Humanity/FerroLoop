@@ -1925,4 +1925,122 @@ mod tests {
         });
         drop(held);
     }
+
+    #[test]
+    fn requests_queued_behind_a_held_project_all_get_their_turn() {
+        // Four waiters share one `notify_one` per release: each must pass the baton on, none
+        // may sleep through the wake-up and time out while the file is free.
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        let path = fl_dir(&tmp).join("queue.redb");
+        seed(&path, &[("only", State::Todo)]);
+        let held = state.open_project_store_at(&path).unwrap();
+        let got = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let store = state.open_project_store_at(&path).map_err(|_| "busy")?;
+                        std::thread::sleep(Duration::from_millis(40));
+                        let n = store.list_projects().map(|p| p.len()).map_err(|_| "err")?;
+                        Ok::<usize, &str>(n)
+                    })
+                })
+                .collect();
+            std::thread::sleep(Duration::from_millis(150));
+            drop(held);
+            workers
+                .into_iter()
+                .map(|w| w.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(got, vec![Ok(1); 4], "{got:?}");
+    }
+
+    #[test]
+    fn concurrent_creates_on_one_project_neither_lose_nor_duplicate_records() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        seed(&fl_dir(&tmp).join("busy.redb"), &[]);
+        const WRITERS: usize = 8;
+        let statuses: Vec<(u16, Value)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..WRITERS)
+                .map(|i| {
+                    let state = &state;
+                    scope.spawn(move || {
+                        let req = owner("POST", "/api/v1/records").with_json_body(
+                            &json!({ "project": "busy", "title": format!("r{i}") }),
+                        );
+                        call(state, &req)
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        let created: Vec<&Value> = statuses
+            .iter()
+            .filter(|(status, _)| *status == 201)
+            .map(|(_, body)| &body["record"])
+            .collect();
+        for (status, body) in &statuses {
+            assert!(matches!(*status, 201 | 503), "{status} {body}");
+        }
+        assert!(!created.is_empty());
+        let mut handles: Vec<u64> = created
+            .iter()
+            .map(|r| r["handle"].as_u64().unwrap())
+            .collect();
+        handles.sort_unstable();
+        handles.dedup();
+        assert_eq!(handles.len(), created.len(), "handles must be unique");
+        let (_, listed) = call(&state, &owner("GET", "/api/v1/records?project=busy"));
+        assert_eq!(
+            listed["records"].as_array().unwrap().len(),
+            created.len(),
+            "every 201 is listed, and nothing else is"
+        );
+        assert_eq!(listed["summary"]["total_count"], created.len());
+    }
+
+    #[test]
+    fn a_move_to_the_state_a_record_is_already_in_is_harmless() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        seed(&fl_dir(&tmp).join("same.redb"), &[("a", State::Doing)]);
+        let (status, body) = call(
+            &state,
+            &owner("POST", "/api/v1/records/1/move?project=same")
+                .with_json_body(&json!({ "to": "doing" })),
+        );
+        assert!(matches!(status, 200 | 409 | 422), "{status} {body}");
+        let (_, listed) = call(&state, &owner("GET", "/api/v1/records?project=same"));
+        assert_eq!(listed["records"][0]["state"], "doing");
+    }
+
+    #[test]
+    fn project_slug_tricks_in_query_and_body_never_reach_another_path() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_state(&tmp);
+        // A store outside `.local/share/fl` that a traversal would reach.
+        let outside = tmp.path().join("outside.redb");
+        seed(&outside, &[("secret", State::Todo)]);
+        for target in [
+            "/api/v1/records?project=..%2F..%2F..%2Foutside",
+            "/api/v1/records?project=%2e%2e",
+            "/api/v1/records?project=a%00b",
+            "/api/v1/records?project=%2Ftmp%2Foutside",
+        ] {
+            let (status, body) = call(&state, &owner("GET", target));
+            assert_eq!(status, 400, "{target}: {body}");
+        }
+        let req = owner("POST", "/api/v1/records")
+            .with_json_body(&json!({ "project": "../../outside", "title": "x" }));
+        assert_eq!(call(&state, &req).0, 400);
+        let req = owner("POST", "/api/v1/records/1/move")
+            .with_json_body(&json!({ "project": "..\\outside", "to": "done" }));
+        assert_eq!(call(&state, &req).0, 400);
+        // The outside store is untouched.
+        let store = RedbStore::open(&outside).unwrap();
+        let project = store.list_projects().unwrap().remove(0);
+        assert_eq!(store.list_records(&project.id).unwrap().len(), 1);
+    }
 }

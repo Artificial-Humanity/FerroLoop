@@ -5352,6 +5352,27 @@ default_target = "wire:felicity"
     }
 
     #[test]
+    fn artifact_prune_treats_dotdot_worktrees_the_same_whether_or_not_they_exist() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let root = tmp.path().display().to_string();
+        let status = |wt: &str| prune(&state, OWNER, &json!({ "worktree_path": wt })).status;
+        // A missing path inside the root is "nothing to archive"; the prune still runs.
+        assert_eq!(status(&format!("{root}/not-created-yet")), 200);
+        // Climbing out answers the same whether the target exists or not: refused (a `..`
+        // is forbidden before any existence check, so nothing outside the roots is revealed).
+        let sibling_missing = format!("{root}/../fl-audit-no-such-dir-1f3a");
+        let sibling_exists = format!("{root}/..");
+        assert_eq!(status(&sibling_missing), 403);
+        assert_eq!(status(&sibling_exists), 403);
+        assert_eq!(status("../fl-audit-no-such-dir-1f3a"), 403);
+        assert_eq!(
+            status(&format!("{root}/a/../../fl-audit-no-such-dir-1f3a")),
+            403
+        );
+    }
+
+    #[test]
     fn artifact_prune_copies_only_small_user_facing_files_inside_the_worktree() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);

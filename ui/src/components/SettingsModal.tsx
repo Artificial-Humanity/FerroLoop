@@ -234,13 +234,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       const client = apiClient ?? new HubApiClient();
       const res = await client.enrollTotp();
-      setTotpEnrollment(
-        res ?? {
-          secret_base32: "JBSWY3DPEHPK3PXP",
-          otpauth_uri:
-            "otpauth://totp/FerroDeck:operator?secret=JBSWY3DPEHPK3PXP&issuer=FerroDeck",
-        },
-      );
+      // Never show a secret the hub did not issue: one made up here (or an empty answer
+      // rendered as blanks) would leave the operator with an authenticator entry that
+      // protects nothing.
+      if (
+        typeof res?.secret_base32 !== "string" ||
+        res.secret_base32.trim().length === 0 ||
+        typeof res.otpauth_uri !== "string" ||
+        res.otpauth_uri.trim().length === 0
+      ) {
+        setTotpEnrollment(null);
+        setError(
+          "The hub did not return a TOTP secret; enrollment was not started.",
+        );
+        return;
+      }
+      setTotpEnrollment(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to enroll TOTP");
     }
@@ -253,8 +262,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     try {
       const client = apiClient ?? new HubApiClient();
       const res = await client.verifyTotp(code);
-      if (res?.ok !== false) {
+      // An answer that does not say `ok: true` (an empty body, a proxy's page) is not proof.
+      if (res?.ok === true) {
         setTotpVerified(true);
+      } else {
+        setError("The hub did not confirm the TOTP code.");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to verify TOTP");

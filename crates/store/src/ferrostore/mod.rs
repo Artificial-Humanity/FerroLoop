@@ -944,7 +944,7 @@ impl FerroStore {
                     None => return Ok(slot.synced_seq),
                 }
             };
-            let result = adapter.on_commit(&batch);
+            let result = self.call_on_commit(&adapter, &batch);
             let mut slot = lock_mutex(&self.sync);
             slot.notify_in_flight = false;
             slot.notify_owner = None;
@@ -1580,6 +1580,33 @@ impl FerroStore {
         }
     }
 
+    /// Run `adapter.on_commit(batch)` for a caller that has set `notify_in_flight`.
+    ///
+    /// If the adapter panics, the flag, the owner and the queue are put right before the panic
+    /// goes on: the batch stays queued, so a later `sync_flush` sends it. Without this, the flag
+    /// would stay set for good and every other thread's `sync_flush` would wait on `sync_cv`
+    /// forever, while `attach`, `detach` and `sync_pull` would refuse for good.
+    fn call_on_commit(
+        &self,
+        adapter: &Arc<dyn SyncAdapter>,
+        batch: &SyncBatch,
+    ) -> Result<(), StoreError> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| adapter.on_commit(batch))) {
+            Ok(result) => result,
+            Err(payload) => {
+                let mut slot = lock_mutex(&self.sync);
+                slot.notify_in_flight = false;
+                slot.notify_owner = None;
+                if !slot.pending.iter().any(|p| p.seq == batch.seq) {
+                    slot.pending.insert(0, batch.clone());
+                }
+                self.sync_cv.notify_all();
+                drop(slot);
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
     /// Call `on_commit` after the commit gate has been released.
     /// Later pending batches stay queued for `sync_flush`.
     fn deliver_owned(
@@ -1589,7 +1616,7 @@ impl FerroStore {
         let Some((adapter, batch)) = owned else {
             return Ok(());
         };
-        let result = adapter.on_commit(&batch);
+        let result = self.call_on_commit(&adapter, &batch);
         let mut slot = lock_mutex(&self.sync);
         slot.notify_in_flight = false;
         slot.notify_owner = None;
