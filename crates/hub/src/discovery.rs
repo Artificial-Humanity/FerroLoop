@@ -309,17 +309,20 @@ fn discover_sessions_impl(
                     conversation_id.clone(),
                     (ls_address.clone(), csrf_token.clone()),
                 );
-                let tpath = home.as_deref().and_then(|h| {
-                    let p = h
-                        .join(".gemini")
-                        .join("antigravity-cli")
-                        .join("brain")
-                        .join(conversation_id)
-                        .join(".system_generated")
-                        .join("logs")
-                        .join("transcript.jsonl");
-                    p.is_file().then(|| p.display().to_string())
-                });
+                let tpath = home
+                    .as_deref()
+                    .filter(|_| is_safe_path_component(conversation_id))
+                    .and_then(|h| {
+                        let p = h
+                            .join(".gemini")
+                            .join("antigravity-cli")
+                            .join("brain")
+                            .join(conversation_id)
+                            .join(".system_generated")
+                            .join("logs")
+                            .join("transcript.jsonl");
+                        p.is_file().then(|| p.display().to_string())
+                    });
                 ("antigravity", conversation_id.clone(), None, tpath)
             }
             VendorRoute::Codex { thread_id, cwd } => {
@@ -907,6 +910,50 @@ fn agy_live_model_info(
 
 // --- Claude -----------------------------------------------------------------
 
+/// Largest transcript the hub reads whole. A bigger file is read from its tail, so the newest
+/// turns survive and one runaway log cannot exhaust memory.
+const TRANSCRIPT_READ_MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// A JSONL line longer than this is skipped, not parsed.
+const TRANSCRIPT_LINE_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// Newest bytes of a vendor log (such as Grok's `unified.jsonl`) read for a quota poll.
+const QUOTA_LOG_TAIL_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Whether `id` is one plain path component. A session id comes from a route table, a request
+/// or a transcript, so it must not climb out of the directory it is joined onto.
+fn is_safe_path_component(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 255 && id != "." && id != ".." && !id.contains(['/', '\\', '\0'])
+}
+
+/// A transcript as lossy UTF-8. Invalid bytes become U+FFFD, so one bad line cannot hide the
+/// whole file. Only a regular file is opened (a FIFO would block the caller), and a file over
+/// `max_bytes` is read from its tail with the cut-off first line dropped.
+fn read_transcript_lossy(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    if !fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut file = fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let truncated = len > max_bytes;
+    if truncated {
+        file.seek(SeekFrom::Start(len - max_bytes))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes).read_to_end(&mut bytes)?;
+    let mut body = bytes.as_slice();
+    if truncated {
+        body = body
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(&[][..], |nl| &body[nl + 1..]);
+    }
+    Ok(String::from_utf8_lossy(body).into_owned())
+}
+
+fn read_transcript(path: impl AsRef<Path>) -> std::io::Result<String> {
+    read_transcript_lossy(path.as_ref(), TRANSCRIPT_READ_MAX_BYTES)
+}
+
 /// Read at most the last `max_bytes` of a file as lossy UTF-8.
 fn read_file_tail(path: &Path, max_bytes: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
@@ -1096,6 +1143,9 @@ fn grok_model_info(transcript_path: Option<&str>, home: Option<&Path>) -> Sessio
 }
 
 fn find_transcript_file_in_home(home: &Path, session_id: &str) -> Option<String> {
+    if !is_safe_path_component(session_id) {
+        return None;
+    }
     let agy = home
         .join(".gemini")
         .join("antigravity-cli")
@@ -1293,6 +1343,9 @@ fn parse_utc_offset_minutes(raw: &str) -> Option<i32> {
         let rest = raw.strip_prefix('-')?;
         (-1, rest)
     };
+    if !rest.is_ascii() {
+        return None;
+    }
     let (hours, minutes) = if let Some((h, m)) = rest.split_once(':') {
         (h, m)
     } else if rest.len() == 4 {
@@ -1388,7 +1441,11 @@ fn codex_quota_from_rollout(raw: &str) -> Option<SessionQuotaUsage> {
 }
 
 fn grok_quota_from_home(home: &Path) -> Option<SessionQuotaUsage> {
-    let raw = fs::read_to_string(home.join(".grok").join("logs").join("unified.jsonl")).ok()?;
+    let raw = read_transcript_lossy(
+        &home.join(".grok").join("logs").join("unified.jsonl"),
+        QUOTA_LOG_TAIL_BYTES,
+    )
+    .ok()?;
     let mut latest = None;
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -1522,8 +1579,8 @@ fn antigravity_context_from_transcript(raw: &str) -> Option<SessionContextUsage>
             continue;
         }
         let used_tokens = json_u64_token(val.get("input_tokens"))
-            + json_u64_token(val.get("cache_read_tokens"))
-            + json_u64_token(val.get("output_tokens"));
+            .saturating_add(json_u64_token(val.get("cache_read_tokens")))
+            .saturating_add(json_u64_token(val.get("output_tokens")));
         if used_tokens > 0 {
             latest = Some(SessionContextUsage {
                 used_tokens,
@@ -1590,7 +1647,7 @@ fn quota_for_resolved_route_locked(
     match adapter {
         "codex" => {
             let path = transcript_path?;
-            let raw = fs::read_to_string(path).ok()?;
+            let raw = read_transcript(path).ok()?;
             codex_quota_from_rollout(&raw)
         }
         "grok" => {
@@ -1600,7 +1657,7 @@ fn quota_for_resolved_route_locked(
         }
         "muse" => {
             let disk = transcript_path.and_then(|path| {
-                let raw = fs::read_to_string(path).ok()?;
+                let raw = read_transcript(path).ok()?;
                 muse_quota_from_session(&raw)
             });
             let account = crate::direct_quota::muse_account_quota(home_override);
@@ -1608,7 +1665,7 @@ fn quota_for_resolved_route_locked(
         }
         "claude" => {
             let disk = transcript_path.and_then(|path| {
-                let raw = fs::read_to_string(path).ok()?;
+                let raw = read_transcript(path).ok()?;
                 let reason = crate::direct_quota::claude_rate_limit_reason(&raw)?;
                 Some(SessionQuotaUsage {
                     tier: None,
@@ -1622,7 +1679,7 @@ fn quota_for_resolved_route_locked(
         }
         "antigravity" => {
             let disk = transcript_path.and_then(|path| {
-                let raw = fs::read_to_string(path).ok()?;
+                let raw = read_transcript(path).ok()?;
                 let reason = crate::direct_quota::antigravity_exhausted_reason(&raw)?;
                 Some(SessionQuotaUsage {
                     tier: None,
@@ -1747,7 +1804,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.to_string_lossy().contains(".codex")
-        && let Ok(raw) = fs::read_to_string(&tpath)
+        && let Ok(raw) = read_transcript(&tpath)
     {
         let configured_max = read_codex_configured_context_window(&tpath);
         for line in raw.lines().rev() {
@@ -1795,7 +1852,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.file_name().and_then(|s| s.to_str()) == Some("session.jsonl")
-        && let Ok(raw) = fs::read_to_string(&tpath)
+        && let Ok(raw) = read_transcript(&tpath)
     {
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
@@ -1819,8 +1876,8 @@ pub fn read_session_context_usage_from_snapshot(
                     .pointer("/payload/event/estimated_prompt_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                let used_tokens = if input + output > 0 {
-                    input + output
+                let used_tokens = if input.saturating_add(output) > 0 {
+                    input.saturating_add(output)
                 } else {
                     estimated
                 };
@@ -1835,7 +1892,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if tpath.to_string_lossy().contains(".claude")
-        && let Ok(raw) = fs::read_to_string(&tpath)
+        && let Ok(raw) = read_transcript(&tpath)
     {
         for line in raw.lines().rev() {
             let trimmed_line = line.trim();
@@ -1865,7 +1922,10 @@ pub fn read_session_context_usage_from_snapshot(
                     .get("output_tokens")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                let used_tokens = input + cache_create + cache_read + output;
+                let used_tokens = input
+                    .saturating_add(cache_create)
+                    .saturating_add(cache_read)
+                    .saturating_add(output);
                 if used_tokens > 0 {
                     return Some(SessionContextUsage {
                         used_tokens,
@@ -1877,7 +1937,7 @@ pub fn read_session_context_usage_from_snapshot(
     }
 
     if is_antigravity_transcript(&tpath)
-        && let Ok(raw) = fs::read_to_string(&tpath)
+        && let Ok(raw) = read_transcript(&tpath)
         && let Some(usage) = antigravity_context_from_transcript(&raw)
     {
         return Some(usage);
@@ -1917,7 +1977,7 @@ pub fn read_session_transcript_from_snapshot(
     for s in &sessions {
         if (s.id == trimmed || s.persona.as_deref() == Some(trimmed))
             && let Some(ref tpath) = s.transcript_path
-            && let Ok(raw) = fs::read_to_string(tpath)
+            && let Ok(raw) = read_transcript(tpath)
         {
             let turns = parse_jsonl_transcript(&raw);
             if !turns.is_empty() {
@@ -1931,7 +1991,7 @@ pub fn read_session_transcript_from_snapshot(
         .or_else(|| std::env::var_os("HOME").map(PathBuf::from));
     if let Some(ref h) = home
         && let Some(tpath) = find_transcript_file_in_home(h, trimmed)
-        && let Ok(raw) = fs::read_to_string(tpath)
+        && let Ok(raw) = read_transcript(tpath)
     {
         let turns = parse_jsonl_transcript(&raw);
         if !turns.is_empty() {
@@ -2009,7 +2069,7 @@ pub fn parse_jsonl_transcript(text: &str) -> Vec<TranscriptTurn> {
     let mut step_zero_turn: Option<TranscriptTurn> = None;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.len() > TRANSCRIPT_LINE_MAX_BYTES {
             continue;
         }
         let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
@@ -2619,6 +2679,9 @@ fn clean_subagent_handback(text: &str) -> String {
     body.to_string()
 }
 
+/// First words of the harness preamble in front of a `<SYSTEM_MESSAGE>` block.
+const SYSTEM_MESSAGE_PREAMBLE: &str = "The following is a <SYSTEM_MESSAGE>";
+
 fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     if role != "system" && role != "user" {
         return (role.to_string(), content.to_string());
@@ -2628,8 +2691,11 @@ fn normalize_system_turn(role: &str, content: &str) -> (String, String) {
     let content = unwrapped.as_str();
     let trimmed_content = content.trim();
     let is_notice = trimmed_content.starts_with("[Notice] ");
-    let has_system_msg_block =
-        trimmed_content.starts_with("<SYSTEM_MESSAGE>") || content.contains("\n<SYSTEM_MESSAGE>");
+    // A block in the middle of the text counts only after the harness's own preamble (or in a
+    // `system` turn). An operator message that merely quotes the tag keeps its own text.
+    let has_system_msg_block = trimmed_content.starts_with("<SYSTEM_MESSAGE>")
+        || ((role == "system" || trimmed_content.starts_with(SYSTEM_MESSAGE_PREAMBLE))
+            && content.contains("\n<SYSTEM_MESSAGE>"));
     let has_claude_peer_wrapper =
         trimmed_content.starts_with("Another Claude session sent a message:");
     let has_wire_or_operator_prefix = trimmed_content.starts_with("[Operator Prompt via FerroDeck")
@@ -6551,5 +6617,437 @@ mod tests {
                 .unwrap_or(0);
             assert_eq!(hits, 1);
         });
+    }
+
+    // ---- audit 2026-10-30 regressions ----
+
+    fn write_transcript(home: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let path = home.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn user_line(text: &str) -> String {
+        serde_json::json!({ "role": "user", "content": text }).to_string()
+    }
+
+    #[test]
+    fn utc_offset_with_multibyte_text_is_rejected_not_a_panic() {
+        // `+1é1` is four bytes after the sign, so a byte split at 2 lands inside `é`.
+        for raw in [
+            "2026-01-01T00:00:00+1\u{e9}1",
+            "2026-01-01T00:00:00-\u{e9}\u{e9}",
+            "2026-01-01T00:00:00+\u{1f600}",
+            "2026-01-01T00:00:00+\u{ff11}\u{ff12}",
+        ] {
+            assert_eq!(parse_iso8601_unix_millis(raw), None, "{raw:?}");
+        }
+        assert_eq!(parse_utc_offset_minutes("+0530"), Some(330));
+        assert_eq!(parse_utc_offset_minutes("-05:30"), Some(-330));
+        // The same input reaches the parser through a Muse reset hint.
+        assert_eq!(
+            parse_reset_instant_from_reason("quota resets at 2026-01-01T00:00:00+1\u{e9}1 soon"),
+            None
+        );
+    }
+
+    #[test]
+    fn token_sums_saturate_instead_of_overflowing() {
+        let max = u64::MAX;
+        // Antigravity: a float token count saturates to `u64::MAX`, and three of them add up.
+        let agy = format!(
+            "{}\n",
+            serde_json::json!({
+                "step_index": 1, "type": "PLANNER_RESPONSE",
+                "input_tokens": 1e30, "cache_read_tokens": max, "output_tokens": max
+            })
+        );
+        assert_eq!(
+            antigravity_context_from_transcript(&agy).map(|u| u.used_tokens),
+            Some(max)
+        );
+
+        let home = TempDir::new().unwrap();
+        let claude = serde_json::json!({
+            "type": "assistant",
+            "message": { "usage": {
+                "input_tokens": max, "cache_creation_input_tokens": max,
+                "cache_read_input_tokens": max, "output_tokens": 7
+            } }
+        });
+        write_transcript(
+            home.path(),
+            ".claude/projects/p/claude-sat.jsonl",
+            format!("{claude}\n").as_bytes(),
+        );
+        let snap = DiscoveryStoreSnapshot::default();
+        let usage =
+            read_session_context_usage_from_snapshot("claude-sat", &snap, Some(home.path()))
+                .unwrap();
+        assert_eq!(usage.used_tokens, max);
+
+        let muse = serde_json::json!({
+            "payload": { "event": { "kind": "model_completed",
+                "usage": { "input_tokens": max, "output_tokens": max } } }
+        });
+        write_transcript(
+            home.path(),
+            ".local/share/muse/sessions/muse-sat/session.jsonl",
+            format!("{muse}\n").as_bytes(),
+        );
+        let usage =
+            read_session_context_usage_from_snapshot("muse-sat", &snap, Some(home.path())).unwrap();
+        assert_eq!(usage.used_tokens, max);
+    }
+
+    #[test]
+    fn session_ids_that_climb_out_of_the_vendor_dirs_find_no_transcript() {
+        let home = TempDir::new().unwrap();
+        // A readable `.jsonl` outside every vendor directory.
+        write_transcript(
+            home.path(),
+            "outside/secret.jsonl",
+            user_line("secret").as_bytes(),
+        );
+        fs::create_dir_all(home.path().join(".grok/sessions")).unwrap();
+        let snap = DiscoveryStoreSnapshot::default();
+        for id in [
+            "../../outside/secret",
+            "../outside/secret",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "x\0y",
+        ] {
+            assert_eq!(
+                find_transcript_file_in_home(home.path(), id),
+                None,
+                "{id:?}"
+            );
+            assert!(
+                read_session_transcript_from_snapshot(id, &snap, Some(home.path())).is_empty(),
+                "{id:?}"
+            );
+            assert_eq!(
+                read_session_context_usage_from_snapshot(id, &snap, Some(home.path())),
+                None
+            );
+        }
+        assert_eq!(
+            find_transcript_file_in_home(home.path(), &"a".repeat(300)),
+            None
+        );
+        assert!(is_safe_path_component("claude:ada"));
+        assert!(is_safe_path_component(
+            "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
+        ));
+        assert!(!is_safe_path_component(""));
+    }
+
+    #[test]
+    fn an_antigravity_route_cannot_name_a_transcript_outside_the_brain_dir() {
+        let home = TempDir::new().unwrap();
+        write_transcript(
+            home.path(),
+            ".system_generated/logs/transcript.jsonl",
+            user_line("secret").as_bytes(),
+        );
+        fs::create_dir_all(home.path().join(".gemini/antigravity-cli/brain")).unwrap();
+        let mut routes = RouteTable::default();
+        routes.upsert(
+            "ada",
+            VendorRoute::Agy {
+                conversation_id: "../../..".to_string(),
+                ls_pid: None,
+                ls_address: None,
+                csrf_token: None,
+                agentapi_exe: None,
+            },
+            fl_core::at::At::from_unix_millis(1),
+        );
+        let path = home.path().join(".cache/agent-bus/routes.json");
+        routes.save(Some(&path)).unwrap();
+        let found =
+            discover_sessions_from_snapshot(&DiscoveryStoreSnapshot::default(), Some(home.path()));
+        let agy = found.iter().find(|s| s.adapter == "antigravity").unwrap();
+        assert_eq!(agy.transcript_path, None);
+    }
+
+    #[test]
+    fn invalid_utf8_in_one_line_does_not_hide_the_transcript() {
+        let home = TempDir::new().unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(user_line("before").as_bytes());
+        bytes.extend_from_slice(b"\n{\"role\":\"user\",\"content\":\"bad \xff\xfe bytes\"}\n");
+        bytes.extend_from_slice(user_line("after").as_bytes());
+        bytes.push(b'\n');
+        write_transcript(home.path(), ".claude/projects/p/utf8-sess.jsonl", &bytes);
+        let turns = read_session_transcript_from_snapshot(
+            "utf8-sess",
+            &DiscoveryStoreSnapshot::default(),
+            Some(home.path()),
+        );
+        let contents: Vec<&str> = turns.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(contents.len(), 3, "{contents:?}");
+        assert_eq!(contents[0], "before");
+        assert!(contents[1].contains('\u{fffd}'));
+        assert_eq!(contents[2], "after");
+    }
+
+    #[test]
+    fn a_transcript_over_the_cap_is_read_from_its_tail_without_the_cut_line() {
+        let dir = TempDir::new().unwrap();
+        let path = write_transcript(dir.path(), "t.jsonl", b"aaaa\nbbbb\ncccc\n");
+        assert_eq!(
+            read_transcript_lossy(&path, 1024).unwrap(),
+            "aaaa\nbbbb\ncccc\n"
+        );
+        // Starts inside `bbbb`: the cut-off first line goes, the whole lines stay.
+        assert_eq!(read_transcript_lossy(&path, 8).unwrap(), "cccc\n");
+        // One line longer than the cap leaves nothing, never half a line.
+        let long = write_transcript(dir.path(), "long.jsonl", &[b'x'; 64]);
+        assert_eq!(read_transcript_lossy(&long, 8).unwrap(), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_transcript_is_refused_instead_of_blocking_the_reader() {
+        let dir = TempDir::new().unwrap();
+        let fifo = dir.path().join("pipe.jsonl");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_transcript_lossy(&fifo, 1024).is_err());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "reading a FIFO must fail fast, not wait for a writer"
+        );
+        assert!(read_transcript_lossy(dir.path(), 1024).is_err());
+    }
+
+    #[test]
+    fn an_oversized_line_is_skipped_and_its_neighbours_survive() {
+        let huge = user_line(&"x".repeat(TRANSCRIPT_LINE_MAX_BYTES + 1));
+        let text = format!("{}\n{huge}\n{}\n", user_line("one"), user_line("two"));
+        let turns = parse_jsonl_transcript(&text);
+        let contents: Vec<&str> = turns.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(contents, ["one", "two"]);
+        assert_eq!(turns[1].index, 1);
+    }
+
+    #[test]
+    fn malformed_truncated_and_deeply_nested_lines_are_skipped() {
+        let deep_array = "[".repeat(200_000);
+        let deep_object = format!("{}1{}", "{\"a\":".repeat(500), "}".repeat(500));
+        // `tool_result` content nested far past the JSON parser's depth limit.
+        let deep_result = format!(
+            "{{\"role\":\"user\",\"content\":{}\"x\"{}}}",
+            "[{\"type\":\"tool_result\",\"content\":".repeat(300),
+            "}]".repeat(300)
+        );
+        let deep_args = format!(
+            "{{\"role\":\"assistant\",\"tool_calls\":[{{\"name\":\"t\",\"arguments\":\"{}\"}}]}}",
+            "[".repeat(10_000)
+        );
+        let lines = [
+            user_line("first"),
+            deep_array,
+            deep_object,
+            deep_result,
+            "{\"role\":\"user\",\"content\":\"trunc".to_string(),
+            "null".to_string(),
+            "\"just a string\"".to_string(),
+            "[1,2,3]".to_string(),
+            "{\"role\":\"user\"}".to_string(),
+            "{\"role\":\"user\",\"content\":[null,1,[],{}]}".to_string(),
+            deep_args,
+            user_line("last"),
+        ];
+        let turns = parse_jsonl_transcript(&lines.join("\n"));
+        let contents: Vec<&str> = turns.iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(contents.first(), Some(&"first"));
+        assert_eq!(contents.last(), Some(&"last"));
+        // Too-deep arguments stay a plain string instead of failing the turn.
+        let call = turns.iter().flat_map(|t| &t.tool_calls).next().unwrap();
+        assert!(call.arguments.is_string());
+        for (i, turn) in turns.iter().enumerate() {
+            assert_eq!(turn.index, i);
+        }
+    }
+
+    #[test]
+    fn nested_tool_result_content_below_the_depth_limit_still_flattens() {
+        let depth = 40;
+        let line = format!(
+            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":{}\"deep\"{}}}}}",
+            "[{\"type\":\"tool_result\",\"content\":".repeat(depth),
+            "}]".repeat(depth)
+        );
+        let turns = parse_jsonl_transcript(&line);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "tool");
+        assert_eq!(turns[0].content, "deep");
+    }
+
+    #[test]
+    fn an_operator_message_that_quotes_a_system_message_tag_keeps_its_text() {
+        let quoted = "Please explain this:\n<SYSTEM_MESSAGE>\nfoo\n</SYSTEM_MESSAGE>";
+        let (role, content) = normalize_system_turn("user", quoted);
+        assert_eq!(role, "user");
+        assert_eq!(content, quoted);
+        let turns = parse_jsonl_transcript(&user_line(quoted));
+        assert_eq!(turns[0].role, "user");
+        assert!(turns[0].content.starts_with("Please explain this:"));
+
+        // The harness preamble in front of a real block is still dropped.
+        let real = "The following is a <SYSTEM_MESSAGE> not actually sent by the user.\n\n\
+                    <SYSTEM_MESSAGE>\n[Notice] disk is full\n</SYSTEM_MESSAGE>";
+        let (role, content) = normalize_system_turn("system", real);
+        assert_eq!(role, "system");
+        assert_eq!(content, "[Notice] disk is full");
+        // An unterminated block is not a panic either.
+        let (_, content) = normalize_system_turn("system", "x\n<SYSTEM_MESSAGE>\nno close");
+        assert_eq!(content, "no close");
+    }
+
+    #[test]
+    fn agent_message_tag_spellings_and_malformed_tags() {
+        for open in ["<agent-message from=\"w\">", "<\\agent-message from=\"w\">"] {
+            for close in [
+                "</agent-message>",
+                "<\\/agent-message>",
+                "</\\agent-message>",
+            ] {
+                let (role, content) =
+                    normalize_system_turn("user", &format!("{open}\nreport body\n{close}"));
+                assert_eq!(role, "wire:subagent", "{open} {close}");
+                assert_eq!(content, "report body");
+            }
+        }
+        // Not a hand-back: tag name continues, tag never closes, or the tag is quoted mid-text.
+        for text in [
+            "<agent-messages>hi</agent-messages>",
+            "<agent-message from=\"w\" never closed",
+            "<agent-message",
+            "see <agent-message from=\"w\">x</agent-message> above",
+        ] {
+            let (role, content) = normalize_system_turn("user", text);
+            assert_eq!(role, "user", "{text:?}");
+            assert_eq!(content, text);
+        }
+    }
+
+    #[test]
+    fn harness_notice_openers_only_count_at_the_start() {
+        for opener in [
+            "<task-notification>",
+            "<local-command-caveat>",
+            "<local-command-stdout>",
+        ] {
+            let (role, _) = normalize_system_turn("user", &format!("  {opener}\nx"));
+            assert_eq!(role, "system", "{opener}");
+            let quoted = format!("I saw {opener} in the log");
+            assert_eq!(normalize_system_turn("user", &quoted).0, "user");
+        }
+    }
+
+    #[test]
+    fn agy_wrappers_handle_unclosed_nested_mixed_case_and_multibyte_text() {
+        // Unclosed: left as it is.
+        assert_eq!(
+            strip_agy_user_request_wrapper("<USER_REQUEST>no close"),
+            "<USER_REQUEST>no close"
+        );
+        // Mixed case and multibyte text around the tags keep the byte offsets right.
+        assert_eq!(
+            strip_agy_user_request_wrapper(
+                "<User_Request>\u{130}\u{e9}\u{1f600} hi</USER_REQUEST>"
+            ),
+            "\u{130}\u{e9}\u{1f600} hi"
+        );
+        assert_eq!(
+            strip_agy_user_request_wrapper(
+                "<USER_REQUEST>a</USER_REQUEST>\u{e9}<ADDITIONAL_METADATA>m</ADDITIONAL_METADATA>"
+            ),
+            "a\u{e9}"
+        );
+        // Nested same-name tags: non-greedy, so the first close ends the block.
+        assert_eq!(
+            strip_agy_user_request_wrapper(
+                "<USER_REQUEST><USER_REQUEST>a</USER_REQUEST>b</USER_REQUEST>"
+            ),
+            "<USER_REQUEST>ab</USER_REQUEST>"
+        );
+        // Text that only quotes a tag is untouched.
+        assert_eq!(
+            strip_agy_user_request_wrapper("say <USER_REQUEST>x</USER_REQUEST>"),
+            "say <USER_REQUEST>x</USER_REQUEST>"
+        );
+        // A long run of opens with no close must stay linear.
+        let many = "<user_request>".repeat(100_000);
+        let started = std::time::Instant::now();
+        assert_eq!(strip_agy_user_request_wrapper(&many), many);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // A closed ephemeral block is a system notice.
+        let (role, content) = normalize_system_turn(
+            "user",
+            "<EPHEMERAL_MESSAGE>\nheads up\n</EPHEMERAL_MESSAGE>",
+        );
+        assert_eq!((role.as_str(), content.as_str()), ("system", "heads up"));
+    }
+
+    #[test]
+    fn nats_and_wire_headers_with_odd_bytes_never_panic() {
+        for text in [
+            "[Incoming NATS Message",
+            "[Incoming NATS Message\nFrom: \u{e9}\u{e9}\nSubject:\n\n",
+            "[fl-wire ] from \u{1f600} (",
+            "[fl-wire ] from ",
+            "[fl-wire x",
+            "[Message] sender=\u{e9} content=",
+            "[Message] content=",
+            "[Message]",
+            "<SYSTEM_MESSAGE>\n[Message] sender=\"'\u{e9}\"' content=[fl-wire a] from \u{e9}: x\n</SYSTEM_MESSAGE>",
+        ] {
+            for role in ["user", "system"] {
+                let _ = normalize_system_turn(role, text);
+            }
+        }
+    }
+
+    #[test]
+    fn grok_quota_reads_only_the_tail_of_a_huge_log() {
+        let home = TempDir::new().unwrap();
+        let log = home.path().join(".grok/logs/unified.jsonl");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let billing = |tier: &str| {
+            serde_json::json!({
+                "msg": "billing: fetched credits config",
+                "ctx": { "subscriptionTier": tier, "config": { "creditUsagePercent": 12.5 } }
+            })
+            .to_string()
+        };
+        let mut body = format!("{}\n", billing("stale-tier"));
+        let filler = format!(
+            "{}\n",
+            serde_json::json!({ "msg": "tick", "pad": "p".repeat(900) })
+        );
+        while (body.len() as u64) < QUOTA_LOG_TAIL_BYTES + 64 * 1024 {
+            body.push_str(&filler);
+        }
+        fs::write(&log, &body).unwrap();
+        // The only billing line is older than the tail window, so it is not read.
+        assert_eq!(grok_quota_from_home(home.path()), None);
+        body.push_str(&format!("{}\n", billing("fresh-tier")));
+        fs::write(&log, body).unwrap();
+        let quota = grok_quota_from_home(home.path()).unwrap();
+        assert_eq!(quota.tier.as_deref(), Some("fresh-tier"));
     }
 }
