@@ -4,7 +4,12 @@ import type {
   ArtifactKind,
   ArtifactPreviewResponse,
   ArtifactSummaryItem,
+  ArtifactVersionInfo,
+  DocxPreview,
+  OfficePreview,
+  PptxPreview,
   TranscriptTurn,
+  XlsxPreview,
 } from "../types/api";
 import {
   MermaidDiagram,
@@ -21,11 +26,15 @@ export interface ArtifactPreviewPaneProps {
   recentPaths?: string[];
   sessionId?: string | null;
   turns?: TranscriptTurn[];
+  /**
+   * A structured .docx/.xlsx/.pptx preview supplied directly. When set, the pane renders it
+   * and does not ask the hub for one.
+   */
+  officePreview?: OfficePreview | null;
   onSelectPath?: (path: string) => void;
   onClose?: () => void;
 }
 
-type ZoomPreset = "fit" | 50 | 100 | 150 | 200;
 export type ArtifactFilterMode = "user-docs" | "all";
 
 const USER_DOC_EXTENSIONS = new Set([
@@ -40,6 +49,9 @@ const USER_DOC_EXTENSIONS = new Set([
   ".gif",
   ".svg",
   ".pdf",
+  ".docx",
+  ".xlsx",
+  ".pptx",
 ]);
 
 export function isUserFacingArtifactPath(rawPath: string): boolean {
@@ -106,12 +118,708 @@ export function discoverArtifactsFromTurns(turns: TranscriptTurn[] = []): string
   return discovered;
 }
 
+/* ------------------------------------------------------------------ */
+/* Office documents (.docx / .xlsx / .pptx)                            */
+/* ------------------------------------------------------------------ */
+
+const TEXT_ARTIFACT_KINDS = new Set<ArtifactKind>(["markdown", "mermaid", "svg", "code"]);
+
+export type OfficeExt = "docx" | "xlsx" | "pptx";
+
+export function officeExtOf(ext: string | undefined, name?: string): OfficeExt | null {
+  const fromExt = (ext ?? "").trim().toLowerCase().replace(/^\./, "");
+  const fromName = (name ?? "").toLowerCase().split(".").pop() ?? "";
+  const e = fromExt || fromName;
+  return e === "docx" || e === "xlsx" || e === "pptx" ? e : null;
+}
+
+const OFFICE_LABELS: Record<OfficeExt, string> = {
+  docx: "Word",
+  xlsx: "Excel",
+  pptx: "PowerPoint",
+};
+
+/** Spreadsheet column letters: 0 -> A, 25 -> Z, 26 -> AA. */
+export function spreadsheetColumnLabel(index: number): string {
+  let n = index + 1;
+  let out = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    out = String.fromCharCode(65 + rem) + out;
+    n = Math.floor((n - 1) / 26);
+  }
+  return out;
+}
+
+const docxHeadingSizes = [26, 22, 19, 17, 15, 14];
+
+export const OfficeDocxView: React.FC<{ preview: DocxPreview }> = ({ preview }) => (
+  <div
+    data-testid="artifact-office-docx"
+    style={{
+      background: "#ffffff",
+      color: "#1f2328",
+      fontFamily: 'Georgia, "Times New Roman", serif',
+      fontSize: "14px",
+      lineHeight: 1.65,
+      padding: "40px 52px",
+      borderRadius: "var(--radius-md)",
+      boxShadow: "0 2px 14px rgba(0,0,0,0.35)",
+      maxWidth: "820px",
+      width: "100%",
+      margin: "0 auto",
+    }}
+  >
+    {preview.blocks.length === 0 && (
+      <div style={{ color: "#6b7280", fontStyle: "italic" }}>This document has no text.</div>
+    )}
+    {preview.blocks.map((block, i) => {
+      if (block.type === "heading") {
+        const level = Math.min(6, Math.max(1, block.level));
+        const Tag = `h${level}` as "h1";
+        return (
+          <Tag
+            key={i}
+            data-testid="artifact-docx-heading"
+            data-level={level}
+            style={{
+              fontSize: `${docxHeadingSizes[level - 1]}px`,
+              margin: "1.1em 0 0.4em",
+              lineHeight: 1.25,
+              fontWeight: 700,
+            }}
+          >
+            {block.text}
+          </Tag>
+        );
+      }
+      if (block.type === "table") {
+        return (
+          <table
+            key={i}
+            data-testid="artifact-docx-table"
+            style={{ borderCollapse: "collapse", margin: "12px 0", width: "100%" }}
+          >
+            <tbody>
+              {block.rows.map((row, r) => (
+                <tr key={r}>
+                  {row.map((cell, c) => (
+                    <td
+                      key={c}
+                      style={{
+                        border: "1px solid #c9ced6",
+                        padding: "6px 10px",
+                        verticalAlign: "top",
+                        whiteSpace: "pre-wrap",
+                      }}
+                    >
+                      {cell}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        );
+      }
+      return (
+        <p
+          key={i}
+          data-testid="artifact-docx-paragraph"
+          style={{ margin: "0 0 0.8em", whiteSpace: "pre-wrap" }}
+        >
+          {block.text}
+        </p>
+      );
+    })}
+    {preview.truncated && (
+      <div style={{ color: "#6b7280", fontSize: "12px" }}>Preview truncated.</div>
+    )}
+  </div>
+);
+
+export const OfficeXlsxView: React.FC<{ preview: XlsxPreview }> = ({ preview }) => {
+  const [active, setActive] = useState(0);
+  const sheets = preview.sheets;
+  const sheet = sheets[Math.min(active, Math.max(0, sheets.length - 1))];
+  const cols = sheet
+    ? Math.max(sheet.col_count ?? 0, ...sheet.rows.map((r) => r.length), 1)
+    : 1;
+  const cellStyle: React.CSSProperties = {
+    border: "1px solid var(--border-subtle)",
+    padding: "3px 8px",
+    whiteSpace: "nowrap",
+    fontSize: "12px",
+    maxWidth: "320px",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  };
+  const headStyle: React.CSSProperties = {
+    ...cellStyle,
+    background: "var(--bg-surface)",
+    color: "var(--text-muted)",
+    textAlign: "center",
+    position: "sticky",
+    top: 0,
+    fontWeight: 600,
+  };
+  return (
+    <div
+      data-testid="artifact-office-xlsx"
+      style={{ display: "flex", flexDirection: "column", gap: "8px", minHeight: 0 }}
+    >
+      <div role="tablist" style={{ display: "flex", gap: "4px", flexWrap: "wrap" }}>
+        {sheets.map((s, i) => (
+          <button
+            key={`${s.name}-${i}`}
+            type="button"
+            role="tab"
+            aria-selected={i === active}
+            data-testid={`artifact-xlsx-tab-${i}`}
+            className={`fd-btn${i === active ? " fd-btn-active" : ""}`}
+            onClick={() => setActive(i)}
+            style={{ fontSize: "11px", padding: "3px 10px" }}
+          >
+            {s.name || `Sheet${i + 1}`}
+          </button>
+        ))}
+      </div>
+      {sheet ? (
+        <div
+          className="fd-card"
+          style={{ padding: 0, overflow: "auto", maxHeight: "68vh", background: "var(--bg-input)" }}
+        >
+          <table data-testid="artifact-xlsx-grid" style={{ borderCollapse: "collapse" }}>
+            <thead>
+              <tr>
+                <th style={{ ...headStyle, left: 0, zIndex: 2 }} />
+                {Array.from({ length: cols }, (_, c) => (
+                  <th key={c} data-testid="artifact-xlsx-col-header" style={headStyle}>
+                    {spreadsheetColumnLabel(c)}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {sheet.rows.map((row, r) => (
+                <tr key={r}>
+                  <th
+                    data-testid="artifact-xlsx-row-header"
+                    style={{ ...headStyle, position: "sticky", left: 0, top: "auto" }}
+                  >
+                    {r + 1}
+                  </th>
+                  {Array.from({ length: cols }, (_, c) => (
+                    <td key={c} style={cellStyle} title={row[c] || undefined}>
+                      {row[c] ?? ""}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {sheet.rows.length === 0 && (
+            <div style={{ padding: "16px", color: "var(--text-muted)", fontSize: "12px" }}>
+              This sheet is empty.
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="fd-card" style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+          This workbook has no sheets.
+        </div>
+      )}
+      {(sheet?.truncated || preview.truncated) && (
+        <div style={{ fontSize: "11px", color: "var(--text-muted)" }}>
+          Preview truncated: only the first rows and columns are shown.
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const OfficePptxView: React.FC<{ preview: PptxPreview }> = ({ preview }) => {
+  const [current, setCurrent] = useState(0);
+  const slides = preview.slides;
+  const count = slides.length;
+  const idx = Math.min(current, Math.max(0, count - 1));
+  const slide = slides[idx];
+  if (!slide) {
+    return (
+      <div data-testid="artifact-office-pptx" className="fd-card" style={{ fontSize: "12px" }}>
+        This presentation has no slides.
+      </div>
+    );
+  }
+  return (
+    <div
+      data-testid="artifact-office-pptx"
+      style={{ display: "flex", gap: "12px", alignItems: "flex-start", flexWrap: "wrap" }}
+    >
+      <div
+        data-testid="artifact-pptx-thumbs"
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          gap: "6px",
+          width: "132px",
+          maxHeight: "68vh",
+          overflowY: "auto",
+        }}
+      >
+        {slides.map((s, i) => (
+          <button
+            key={i}
+            type="button"
+            data-testid={`artifact-pptx-thumb-${i}`}
+            aria-label={`Go to slide ${i + 1}`}
+            aria-current={i === idx ? "true" : undefined}
+            className={`fd-btn${i === idx ? " fd-btn-active" : ""}`}
+            onClick={() => setCurrent(i)}
+            style={{
+              textAlign: "left",
+              padding: "6px",
+              fontSize: "10px",
+              lineHeight: 1.3,
+              display: "block",
+              aspectRatio: "16 / 9",
+              overflow: "hidden",
+            }}
+          >
+            <strong style={{ display: "block" }}>{i + 1}</strong>
+            {s.title || `Slide ${i + 1}`}
+          </button>
+        ))}
+      </div>
+      <div style={{ flex: 1, minWidth: "260px", display: "flex", flexDirection: "column", gap: "8px" }}>
+        <div
+          data-testid="artifact-pptx-slide"
+          style={{
+            background: "#ffffff",
+            color: "#1f2328",
+            borderRadius: "var(--radius-md)",
+            boxShadow: "0 2px 14px rgba(0,0,0,0.35)",
+            aspectRatio: "16 / 9",
+            padding: "5% 6%",
+            overflow: "auto",
+          }}
+        >
+          <h2 data-testid="artifact-pptx-title" style={{ margin: "0 0 0.6em", fontSize: "26px" }}>
+            {slide.title || `Slide ${slide.index || idx + 1}`}
+          </h2>
+          <ul style={{ margin: 0, paddingLeft: "1.3em", fontSize: "16px", lineHeight: 1.5 }}>
+            {slide.bullets.map((b, i) => (
+              <li key={i} data-testid="artifact-pptx-bullet" style={{ whiteSpace: "pre-wrap" }}>
+                {b}
+              </li>
+            ))}
+          </ul>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <button
+            type="button"
+            data-testid="artifact-pptx-prev"
+            className="fd-btn"
+            disabled={idx === 0}
+            onClick={() => setCurrent(idx - 1)}
+          >
+            ← Prev
+          </button>
+          <span data-testid="artifact-pptx-counter" className="fd-mono" style={{ fontSize: "12px" }}>
+            Slide {idx + 1} / {count}
+          </span>
+          <button
+            type="button"
+            data-testid="artifact-pptx-next"
+            className="fd-btn"
+            disabled={idx >= count - 1}
+            onClick={() => setCurrent(idx + 1)}
+          >
+            Next →
+          </button>
+        </div>
+        <div
+          data-testid="artifact-pptx-notes"
+          className="fd-card"
+          style={{ fontSize: "12px", whiteSpace: "pre-wrap" }}
+        >
+          <div style={{ fontWeight: 600, marginBottom: "4px" }}>Speaker notes</div>
+          {slide.notes ? slide.notes : <span style={{ color: "var(--text-muted)" }}>No notes.</span>}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export const OfficePreviewView: React.FC<{ preview: OfficePreview }> = ({ preview }) => {
+  switch (preview.kind) {
+    case "docx":
+      return <OfficeDocxView preview={preview} />;
+    case "xlsx":
+      return <OfficeXlsxView preview={preview} />;
+    case "pptx":
+      return <OfficePptxView preview={preview} />;
+    default:
+      return null;
+  }
+};
+
+/* ------------------------------------------------------------------ */
+/* Zoom / pan canvas                                                   */
+/* ------------------------------------------------------------------ */
+
+export const ZOOM_MIN = 25;
+export const ZOOM_MAX = 400;
+const ZOOM_STEPS = [25, 50, 75, 100, 125, 150, 200, 300, 400];
+const ZOOM_PRESETS = [50, 100, 150, 200];
+
+export function clampZoom(percent: number): number {
+  if (!Number.isFinite(percent)) return 100;
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(percent)));
+}
+
+export function nextZoomStep(current: number, direction: 1 | -1): number {
+  if (direction > 0) {
+    return ZOOM_STEPS.find((s) => s > current) ?? ZOOM_MAX;
+  }
+  for (let i = ZOOM_STEPS.length - 1; i >= 0; i--) {
+    if (ZOOM_STEPS[i] < current) return ZOOM_STEPS[i];
+  }
+  return ZOOM_MIN;
+}
+
+/**
+ * Zoom and pan wrapper for images, SVGs and diagrams. The content is laid out at its fit size
+ * and scaled with a CSS transform, so 100% is the fitted view; dragging pans.
+ */
+export const ZoomPanCanvas: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  const [scale, setScale] = useState(100);
+  const [offset, setOffset] = useState({ x: 0, y: 0 });
+  const [dragging, setDragging] = useState(false);
+  const dragRef = React.useRef<{ x: number; y: number; ox: number; oy: number } | null>(null);
+
+  const zoomTo = (next: number) => setScale(clampZoom(next));
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: "8px", flex: 1 }}>
+      <div
+        data-testid="artifact-zoom-toolbar"
+        style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap" }}
+      >
+        <button
+          type="button"
+          data-testid="artifact-zoom-out"
+          aria-label="Zoom Out"
+          className="fd-btn"
+          disabled={scale <= ZOOM_MIN}
+          onClick={() => zoomTo(nextZoomStep(scale, -1))}
+          style={{ fontSize: "11px", padding: "3px 8px" }}
+        >
+          Zoom Out
+        </button>
+        <button
+          type="button"
+          data-testid="artifact-zoom-in"
+          aria-label="Zoom In"
+          className="fd-btn"
+          disabled={scale >= ZOOM_MAX}
+          onClick={() => zoomTo(nextZoomStep(scale, 1))}
+          style={{ fontSize: "11px", padding: "3px 8px" }}
+        >
+          Zoom In
+        </button>
+        {ZOOM_PRESETS.map((preset) => (
+          <button
+            key={preset}
+            type="button"
+            data-testid={`artifact-zoom-${preset}`}
+            className={`fd-btn${scale === preset ? " fd-btn-active" : ""}`}
+            onClick={() => zoomTo(preset)}
+            style={{ fontSize: "11px", padding: "3px 8px" }}
+          >
+            {preset}%
+          </button>
+        ))}
+        <button
+          type="button"
+          data-testid="artifact-zoom-fit"
+          className="fd-btn"
+          onClick={() => {
+            setScale(100);
+            setOffset({ x: 0, y: 0 });
+          }}
+          style={{ fontSize: "11px", padding: "3px 8px" }}
+        >
+          Fit
+        </button>
+        <span
+          data-testid="artifact-zoom-badge"
+          className="fd-badge fd-mono"
+          aria-live="polite"
+          title="Zoom level"
+        >
+          {scale}%
+        </span>
+      </div>
+      <div
+        data-testid="artifact-zoom-canvas"
+        data-scale={scale}
+        data-offset-x={offset.x}
+        data-offset-y={offset.y}
+        className="fd-card"
+        onMouseDown={(e) => {
+          if (e.button !== 0) return;
+          dragRef.current = { x: e.clientX, y: e.clientY, ox: offset.x, oy: offset.y };
+          setDragging(true);
+        }}
+        onMouseMove={(e) => {
+          const d = dragRef.current;
+          if (!d) return;
+          setOffset({ x: d.ox + (e.clientX - d.x), y: d.oy + (e.clientY - d.y) });
+        }}
+        onMouseUp={() => {
+          dragRef.current = null;
+          setDragging(false);
+        }}
+        onMouseLeave={() => {
+          dragRef.current = null;
+          setDragging(false);
+        }}
+        onWheel={(e) => {
+          if (e.ctrlKey || e.metaKey) {
+            zoomTo(nextZoomStep(scale, e.deltaY < 0 ? 1 : -1));
+          }
+        }}
+        style={{
+          flex: 1,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          overflow: "hidden",
+          padding: "16px",
+          backgroundColor: "var(--bg-input)",
+          minHeight: "280px",
+          cursor: dragging ? "grabbing" : "grab",
+          userSelect: "none",
+        }}
+      >
+        <div
+          data-testid="artifact-zoom-content"
+          style={{
+            transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale / 100})`,
+            transformOrigin: "center center",
+            transition: dragging ? "none" : "transform 80ms ease-out",
+            maxWidth: "100%",
+          }}
+        >
+          {children}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+/* ------------------------------------------------------------------ */
+/* Version history                                                     */
+/* ------------------------------------------------------------------ */
+
+export interface DiffRow {
+  kind: "same" | "add" | "del" | "change";
+  left: string | null;
+  right: string | null;
+  leftNo: number | null;
+  rightNo: number | null;
+}
+
+function splitDiffLines(text: string): string[] {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+const MAX_DIFF_CELLS = 4_000_000;
+
+/** Line diff of two texts, aligned for a side-by-side view. */
+export function diffLines(before: string, after: string): DiffRow[] {
+  const a = splitDiffLines(before);
+  const b = splitDiffLines(after);
+  let start = 0;
+  while (start < a.length && start < b.length && a[start] === b[start]) start++;
+  let endA = a.length;
+  let endB = b.length;
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--;
+    endB--;
+  }
+  const midA = a.slice(start, endA);
+  const midB = b.slice(start, endB);
+  const n = midA.length;
+  const m = midB.length;
+
+  type Op = { t: "=" | "-" | "+"; line: string };
+  const ops: Op[] = [];
+  if (n * m > MAX_DIFF_CELLS) {
+    midA.forEach((line) => ops.push({ t: "-", line }));
+    midB.forEach((line) => ops.push({ t: "+", line }));
+  } else {
+    const width = m + 1;
+    const lcs = new Uint32Array((n + 1) * width);
+    for (let i = n - 1; i >= 0; i--) {
+      for (let j = m - 1; j >= 0; j--) {
+        lcs[i * width + j] =
+          midA[i] === midB[j]
+            ? lcs[(i + 1) * width + j + 1] + 1
+            : Math.max(lcs[(i + 1) * width + j], lcs[i * width + j + 1]);
+      }
+    }
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+      if (midA[i] === midB[j]) {
+        ops.push({ t: "=", line: midA[i] });
+        i++;
+        j++;
+      } else if (lcs[(i + 1) * width + j] >= lcs[i * width + j + 1]) {
+        ops.push({ t: "-", line: midA[i++] });
+      } else {
+        ops.push({ t: "+", line: midB[j++] });
+      }
+    }
+    while (i < n) ops.push({ t: "-", line: midA[i++] });
+    while (j < m) ops.push({ t: "+", line: midB[j++] });
+  }
+
+  const rows: DiffRow[] = [];
+  let leftNo = 0;
+  let rightNo = 0;
+  const same = (line: string) => {
+    leftNo++;
+    rightNo++;
+    rows.push({ kind: "same", left: line, right: line, leftNo, rightNo });
+  };
+  while (leftNo < start) same(a[leftNo]);
+  for (let k = 0; k < ops.length; ) {
+    if (ops[k].t === "=") {
+      same(ops[k].line);
+      k++;
+      continue;
+    }
+    const dels: string[] = [];
+    const adds: string[] = [];
+    while (k < ops.length && ops[k].t !== "=") {
+      (ops[k].t === "-" ? dels : adds).push(ops[k].line);
+      k++;
+    }
+    for (let r = 0; r < Math.max(dels.length, adds.length); r++) {
+      const left = r < dels.length ? dels[r] : null;
+      const right = r < adds.length ? adds[r] : null;
+      rows.push({
+        kind: left !== null && right !== null ? "change" : left !== null ? "del" : "add",
+        left,
+        right,
+        leftNo: left !== null ? ++leftNo : null,
+        rightNo: right !== null ? ++rightNo : null,
+      });
+    }
+  }
+  for (let t = endA; t < a.length; t++) same(a[t]);
+  return rows;
+}
+
+export function shortSha(sha: string): string {
+  return sha.slice(0, 8);
+}
+
+export function formatVersionTime(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return "unknown time";
+  return new Date(ms).toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+}
+
+const DIFF_COLORS = {
+  del: "rgba(239, 68, 68, 0.18)",
+  add: "rgba(34, 197, 94, 0.18)",
+  change: "rgba(234, 179, 8, 0.16)",
+} as const;
+
+export const ArtifactDiffView: React.FC<{
+  before: string;
+  after: string;
+  beforeLabel: string;
+  afterLabel: string;
+}> = ({ before, after, beforeLabel, afterLabel }) => {
+  const rows = useMemo(() => diffLines(before, after), [before, after]);
+  const changed = rows.filter((r) => r.kind !== "same").length;
+  const cell = (
+    no: number | null,
+    text: string | null,
+    bg: string | undefined,
+  ): React.ReactNode[] => [
+    <td
+      key="n"
+      style={{
+        userSelect: "none",
+        textAlign: "right",
+        padding: "1px 8px",
+        color: "var(--text-dim)",
+        width: "1%",
+        backgroundColor: bg,
+      }}
+    >
+      {no ?? ""}
+    </td>,
+    <td
+      key="t"
+      style={{
+        padding: "1px 10px",
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+        width: "49%",
+        backgroundColor: bg,
+        borderRight: "1px solid var(--border-subtle)",
+      }}
+    >
+      {text ?? ""}
+    </td>,
+  ];
+  return (
+    <div data-testid="artifact-diff-view" className="fd-card fd-mono" style={{ padding: 0, overflowX: "auto", fontSize: "12px", lineHeight: 1.5 }}>
+      <div
+        data-testid="artifact-diff-summary"
+        style={{ padding: "6px 10px", borderBottom: "1px solid var(--border-subtle)", color: "var(--text-muted)" }}
+      >
+        {changed === 0 ? "No differences" : `${changed} changed ${changed === 1 ? "line" : "lines"}`}
+      </div>
+      <table style={{ borderCollapse: "collapse", width: "100%", tableLayout: "fixed" }}>
+        <thead>
+          <tr>
+            <th colSpan={2} style={{ textAlign: "left", padding: "4px 10px" }} data-testid="artifact-diff-left-label">
+              {beforeLabel}
+            </th>
+            <th colSpan={2} style={{ textAlign: "left", padding: "4px 10px" }} data-testid="artifact-diff-right-label">
+              {afterLabel}
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, i) => (
+            <tr key={i} data-testid="artifact-diff-row" data-kind={row.kind}>
+              {cell(row.leftNo, row.left, row.kind === "del" || row.kind === "change" ? (row.kind === "del" ? DIFF_COLORS.del : DIFF_COLORS.change) : undefined)}
+              {cell(row.rightNo, row.right, row.kind === "add" || row.kind === "change" ? (row.kind === "add" ? DIFF_COLORS.add : DIFF_COLORS.change) : undefined)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+};
+
 export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   apiClient,
   activePath = null,
   recentPaths = [],
   sessionId = null,
   turns = [],
+  officePreview: officePreviewProp = null,
   onSelectPath,
   onClose,
 }) => {
@@ -122,7 +830,6 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
   const [viewMode, setViewMode] = useState<"rendered" | "source">("rendered");
-  const [zoom, setZoom] = useState<ZoomPreset>("fit");
   const [artifactFilter, setArtifactFilter] = useState<ArtifactFilterMode>("user-docs");
   const [pruning, setPruning] = useState<boolean>(false);
   const [pruneStatus, setPruneStatus] = useState<string | null>(null);
@@ -145,7 +852,6 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
         normalized.startsWith("mermaid://") ? "Inline Mermaid Diagram" : normalized,
       );
       setViewMode("rendered");
-      setZoom("fit");
       if (onSelectPath) {
         onSelectPath(normalized);
       }
@@ -328,6 +1034,167 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
     };
   }, [apiClient, selectedPath]);
 
+  // Office documents: a structured preview from the hub, unless one was supplied directly.
+  const officeExt = artifact ? officeExtOf(artifact.ext, artifact.name) : null;
+  const [officeFetched, setOfficeFetched] = useState<OfficePreview | null>(null);
+  const [officeLoading, setOfficeLoading] = useState<boolean>(false);
+  const [officeError, setOfficeError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setOfficeFetched(null);
+    setOfficeError(null);
+    setOfficeLoading(false);
+    if (!artifact || !officeExt) return;
+    const direct = officePreviewProp ?? artifact.office_preview ?? null;
+    if (direct) {
+      setOfficeFetched(direct);
+      return;
+    }
+    if (typeof apiClient.getOfficePreview !== "function") return;
+    let cancelled = false;
+    setOfficeLoading(true);
+    apiClient
+      .getOfficePreview(artifact.path)
+      .then((res) => {
+        if (!cancelled) {
+          if (res?.preview) setOfficeFetched(res.preview);
+          else setOfficeError("The hub returned no document preview");
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setOfficeError(err instanceof Error ? err.message : "Failed to load document preview");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setOfficeLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiClient, artifact, officeExt, officePreviewProp]);
+
+  // Version history of the loaded artifact.
+  type VersionView =
+    | { mode: "current" }
+    | { mode: "version"; version: number }
+    | { mode: "diff"; before: number; after: number };
+  const versionPath =
+    artifact && !artifact.path.startsWith("inline://") ? artifact.path : null;
+  const [versions, setVersions] = useState<ArtifactVersionInfo[] | null>(null);
+  const [historyOpen, setHistoryOpen] = useState<boolean>(false);
+  const [versionView, setVersionView] = useState<VersionView>({ mode: "current" });
+  const [compareSel, setCompareSel] = useState<number[]>([]);
+  const [versionTexts, setVersionTexts] = useState<Record<number, string>>({});
+  const [versionError, setVersionError] = useState<string | null>(null);
+  const [versionLoading, setVersionLoading] = useState<boolean>(false);
+
+  useEffect(() => {
+    setVersions(null);
+    setHistoryOpen(false);
+    setVersionView({ mode: "current" });
+    setCompareSel([]);
+    setVersionTexts({});
+    setVersionError(null);
+    if (!versionPath || typeof apiClient.getArtifactVersions !== "function") return;
+    let cancelled = false;
+    apiClient
+      .getArtifactVersions(versionPath)
+      .then((res) => {
+        if (!cancelled && Array.isArray(res?.versions)) setVersions(res.versions);
+      })
+      .catch(() => {
+        // History is optional: an older hub has no such endpoint.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiClient, versionPath]);
+
+  const toggleHistory = () => {
+    const next = !historyOpen;
+    setHistoryOpen(next);
+    if (next && versionPath) {
+      // Pick up revisions recorded since the artifact was loaded.
+      apiClient
+        .getArtifactVersions(versionPath)
+        .then((res) => {
+          if (Array.isArray(res?.versions)) setVersions(res.versions);
+        })
+        .catch(() => undefined);
+    }
+  };
+
+  const wantedVersions = useMemo(
+    () =>
+      versionView.mode === "version"
+        ? [versionView.version]
+        : versionView.mode === "diff"
+          ? [versionView.before, versionView.after]
+          : [],
+    [versionView],
+  );
+
+  useEffect(() => {
+    // Only text artifacts are fetched as text; other kinds link to the raw revision.
+    if (!versionPath || wantedVersions.length === 0) return;
+    if (!artifact || !TEXT_ARTIFACT_KINDS.has(artifact.kind)) return;
+    const missing = wantedVersions.filter((v) => versionTexts[v] === undefined);
+    if (missing.length === 0) return;
+    let cancelled = false;
+    setVersionLoading(true);
+    setVersionError(null);
+    Promise.all(
+      missing.map((v) =>
+        apiClient.getArtifactVersionContent(versionPath, v).then((text) => [v, text] as const),
+      ),
+    )
+      .then((pairs) => {
+        if (!cancelled) {
+          setVersionTexts((prev) => ({ ...prev, ...Object.fromEntries(pairs) }));
+        }
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setVersionError(err instanceof Error ? err.message : "Failed to load version content");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setVersionLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiClient, artifact, versionPath, wantedVersions, versionTexts]);
+
+  const currentVersionNo = useMemo(
+    () => versions?.find((v) => v.is_current)?.version ?? null,
+    [versions],
+  );
+
+  const toggleCompare = (version: number) =>
+    setCompareSel((prev) =>
+      prev.includes(version)
+        ? prev.filter((v) => v !== version)
+        : prev.length >= 2
+          ? [prev[1], version]
+          : [...prev, version],
+    );
+
+  const startDiff = () => {
+    if (compareSel.length === 2) {
+      const [x, y] = [...compareSel].sort((p, q) => p - q);
+      setVersionView({ mode: "diff", before: x, after: y });
+    } else if (compareSel.length === 1 && currentVersionNo !== null && compareSel[0] !== currentVersionNo) {
+      const [x, y] = [compareSel[0], currentVersionNo].sort((p, q) => p - q);
+      setVersionView({ mode: "diff", before: x, after: y });
+    }
+  };
+
+  const diffEnabled =
+    compareSel.length === 2 ||
+    (compareSel.length === 1 && currentVersionNo !== null && compareSel[0] !== currentVersionNo);
+
   /**
    * Resolve a hub-supplied artifact URL for use in href/src/iframe. Locally
    * generated `data:` URLs pass through. Anything that is not http(s) or
@@ -471,7 +1338,7 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                     backgroundColor: "var(--badge-assistant-bg)",
                   }}
                 >
-                  {formatArtifactKindLabel(artifact.kind)}
+                  {officeExt ? OFFICE_LABELS[officeExt] : formatArtifactKindLabel(artifact.kind)}
                 </span>
                 <span className="fd-badge fd-mono">
                   {formatByteSize(artifact.size_bytes)}
@@ -497,6 +1364,18 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
           <div style={{ display: "flex", alignItems: "center", gap: "6px", flexWrap: "wrap", marginLeft: "auto" }}>
             {artifact && (
               <>
+                {versions !== null && (
+                  <button
+                    type="button"
+                    data-testid="artifact-history-toggle"
+                    className={`fd-btn${historyOpen ? " fd-btn-active" : ""}`}
+                    aria-expanded={historyOpen}
+                    onClick={toggleHistory}
+                    title="Show the recorded revisions of this artifact"
+                  >
+                    History ({versions.length})
+                  </button>
+                )}
                 {(artifact.kind === "markdown" || artifact.kind === "svg") &&
                   typeof artifact.content === "string" && (
                     <div style={{ display: "inline-flex", gap: "4px" }}>
@@ -751,6 +1630,164 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
 
         {artifact && (
           <>
+            {historyOpen && versions && (
+              <div
+                data-testid="artifact-version-history"
+                className="fd-card"
+                style={{ display: "flex", flexDirection: "column", gap: "8px", fontSize: "12px" }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <strong>Version history</strong>
+                  <button
+                    type="button"
+                    data-testid="artifact-version-current-btn"
+                    className={`fd-btn${versionView.mode === "current" ? " fd-btn-active" : ""}`}
+                    onClick={() => setVersionView({ mode: "current" })}
+                  >
+                    Current
+                  </button>
+                  <button
+                    type="button"
+                    data-testid="artifact-version-diff-btn"
+                    className={`fd-btn${versionView.mode === "diff" ? " fd-btn-active" : ""}`}
+                    disabled={!diffEnabled}
+                    onClick={startDiff}
+                    title="Select two versions (or one, to compare with the current version)"
+                  >
+                    Diff
+                  </button>
+                </div>
+                {versions.length === 0 && (
+                  <div style={{ color: "var(--text-muted)" }}>No versions recorded yet.</div>
+                )}
+                <ol
+                  data-testid="artifact-version-list"
+                  style={{ listStyle: "none", margin: 0, padding: 0, display: "flex", flexDirection: "column", gap: "4px" }}
+                >
+                  {[...versions].reverse().map((v) => (
+                    <li
+                      key={v.version}
+                      data-testid={`artifact-version-row-${v.version}`}
+                      style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}
+                    >
+                      <input
+                        type="checkbox"
+                        data-testid={`artifact-version-compare-${v.version}`}
+                        aria-label={`Compare v${v.version}`}
+                        checked={compareSel.includes(v.version)}
+                        onChange={() => toggleCompare(v.version)}
+                      />
+                      <span className="fd-mono" style={{ fontWeight: 700 }}>
+                        v{v.version}
+                      </span>
+                      {v.is_current && (
+                        <span className="fd-badge" data-testid="artifact-version-current-badge">
+                          Current
+                        </span>
+                      )}
+                      <span className="fd-mono" title={v.sha256} style={{ color: "var(--text-muted)" }}>
+                        {shortSha(v.sha256)}
+                      </span>
+                      <span className="fd-mono" style={{ color: "var(--text-muted)" }}>
+                        {formatByteSize(v.size_bytes)}
+                      </span>
+                      <span className="fd-mono" style={{ color: "var(--text-dim)" }}>
+                        {formatVersionTime(v.recorded_at_ms)}
+                      </span>
+                      <button
+                        type="button"
+                        data-testid={`artifact-version-view-${v.version}`}
+                        className={`fd-btn${versionView.mode === "version" && versionView.version === v.version ? " fd-btn-active" : ""}`}
+                        onClick={() => setVersionView({ mode: "version", version: v.version })}
+                        style={{ fontSize: "11px", padding: "2px 8px" }}
+                      >
+                        View
+                      </button>
+                    </li>
+                  ))}
+                </ol>
+              </div>
+            )}
+
+            {versionView.mode !== "current" && (
+              <div
+                data-testid="artifact-version-panel"
+                style={{ display: "flex", flexDirection: "column", gap: "8px", flex: 1 }}
+              >
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+                  <span className="fd-badge fd-mono" data-testid="artifact-version-banner">
+                    {versionView.mode === "version"
+                      ? `Viewing v${versionView.version}`
+                      : `Comparing v${versionView.before} and v${versionView.after}`}
+                  </span>
+                  <button
+                    type="button"
+                    data-testid="artifact-version-back-btn"
+                    className="fd-btn"
+                    onClick={() => setVersionView({ mode: "current" })}
+                  >
+                    Back to Current
+                  </button>
+                </div>
+                {versionError && (
+                  <div role="alert" data-testid="artifact-version-error" className="fd-card" style={{ color: "#FCA5A5", fontSize: "12px" }}>
+                    {versionError}
+                  </div>
+                )}
+                {versionLoading && !versionError && (
+                  <div data-testid="artifact-version-loading" style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                    Loading version…
+                  </div>
+                )}
+                {!versionError && versionView.mode === "version" && (() => {
+                  const n = versionView.version;
+                  if (TEXT_ARTIFACT_KINDS.has(artifact.kind)) {
+                    const text = versionTexts[n];
+                    return text === undefined ? null : (
+                      <div data-testid="artifact-version-content">{renderCodeLines(text)}</div>
+                    );
+                  }
+                  const rawVersionUrl = apiClient.getArtifactVersionRawUrl(artifact.path, n);
+                  return (
+                    <div data-testid="artifact-version-content" className="fd-card" style={{ display: "flex", flexDirection: "column", gap: "8px", alignItems: "center" }}>
+                      {artifact.kind === "image" && (
+                        <img
+                          data-testid="artifact-version-image"
+                          src={rawVersionUrl}
+                          alt={`${artifact.name} v${n}`}
+                          style={{ maxWidth: "100%", maxHeight: "60vh" }}
+                        />
+                      )}
+                      <a href={rawVersionUrl} target="_blank" rel="noopener noreferrer" className="fd-btn" style={{ textDecoration: "none" }}>
+                        Open raw v{n}
+                      </a>
+                    </div>
+                  );
+                })()}
+                {!versionError && versionView.mode === "diff" && (() => {
+                  if (!TEXT_ARTIFACT_KINDS.has(artifact.kind)) {
+                    return (
+                      <div data-testid="artifact-diff-unsupported" className="fd-card" style={{ fontSize: "12px" }}>
+                        Diff is available for text artifacts only. Open each version to inspect it.
+                      </div>
+                    );
+                  }
+                  const before = versionTexts[versionView.before];
+                  const after = versionTexts[versionView.after];
+                  return before === undefined || after === undefined ? null : (
+                    <ArtifactDiffView
+                      before={before}
+                      after={after}
+                      beforeLabel={`v${versionView.before}`}
+                      afterLabel={`v${versionView.after}`}
+                    />
+                  );
+                })()}
+              </div>
+            )}
+
+            {versionView.mode === "current" && (
+          <>
             {artifact.kind === "markdown" && (
               viewMode === "source" ? (
                 renderCodeLines(artifact.content ?? "")
@@ -773,85 +1810,34 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
             )}
 
             {artifact.kind === "mermaid" && (
-              <MermaidDiagram
-                code={artifact.content ?? ""}
-                title={artifact.name}
-                onOpenArtifact={handleSelectPath}
-                showPreviewInArtifactsButton={false}
-              />
+              <ZoomPanCanvas key={artifact.path}>
+                <MermaidDiagram
+                  code={artifact.content ?? ""}
+                  title={artifact.name}
+                  onOpenArtifact={handleSelectPath}
+                  showPreviewInArtifactsButton={false}
+                />
+              </ZoomPanCanvas>
             )}
 
             {(artifact.kind === "svg" || artifact.kind === "image") && (
               viewMode === "source" && artifact.kind === "svg" && artifact.content ? (
                 renderCodeLines(artifact.content)
               ) : (
-                <div
-                  style={{
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: "8px",
-                    flex: 1,
-                  }}
-                >
-                  <div
-                    data-testid="artifact-zoom-toolbar"
+                <ZoomPanCanvas key={artifact.path}>
+                  <img
+                    data-testid="artifact-image-preview"
+                    src={imagePreviewSrc}
+                    alt={artifact.name}
+                    draggable={false}
                     style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: "6px",
-                      flexWrap: "wrap",
+                      display: "block",
+                      maxWidth: "100%",
+                      maxHeight: "72vh",
+                      objectFit: "contain",
                     }}
-                  >
-                    <span className="fd-mono" style={{ fontSize: "11px", color: "var(--text-muted)" }}>
-                      Zoom:
-                    </span>
-                    {([50, 100, 150, 200, "fit"] as ZoomPreset[]).map((preset) => (
-                      <button
-                        key={String(preset)}
-                        type="button"
-                        data-testid={`artifact-zoom-${preset}`}
-                        className={`fd-btn${zoom === preset ? " fd-btn-active" : ""}`}
-                        onClick={() => setZoom(preset)}
-                        style={{ fontSize: "11px", padding: "3px 8px" }}
-                      >
-                        {preset === "fit" ? "Fit" : `${preset}%`}
-                      </button>
-                    ))}
-                  </div>
-
-                  <div
-                    data-testid="artifact-image-canvas"
-                    className="fd-card"
-                    style={{
-                      flex: 1,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      overflow: "auto",
-                      padding: "16px",
-                      backgroundColor: "var(--bg-input)",
-                      minHeight: "280px",
-                    }}
-                  >
-                    <img
-                      data-testid="artifact-image-preview"
-                      src={imagePreviewSrc}
-                      alt={artifact.name}
-                      style={
-                        zoom === "fit"
-                          ? {
-                              maxWidth: "100%",
-                              maxHeight: "72vh",
-                              objectFit: "contain",
-                            }
-                          : {
-                              width: `${zoom}%`,
-                              height: "auto",
-                            }
-                      }
-                    />
-                  </div>
-                </div>
+                  />
+                </ZoomPanCanvas>
               )
             )}
 
@@ -896,7 +1882,21 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
 
             {artifact.kind === "code" && renderCodeLines(artifact.content ?? "")}
 
-            {artifact.kind === "binary" && (
+            {officeExt && officeLoading && (
+              <div data-testid="artifact-office-loading" className="fd-card" style={{ fontSize: "12px", color: "var(--text-muted)" }}>
+                Loading document preview…
+              </div>
+            )}
+
+            {officeExt && officeFetched && <OfficePreviewView preview={officeFetched} />}
+
+            {officeExt && officeError && (
+              <div role="alert" data-testid="artifact-office-error" className="fd-card" style={{ color: "#FCA5A5", fontSize: "12px" }}>
+                {officeError}
+              </div>
+            )}
+
+            {artifact.kind === "binary" && !(officeExt && (officeLoading || officeFetched)) && (
               <div
                 data-testid="artifact-binary-card"
                 className="fd-card"
@@ -923,6 +1923,8 @@ export const ArtifactPreviewPane: React.FC<ArtifactPreviewPaneProps> = ({
                   ↓ Download {artifact.name}
                 </a>
               </div>
+            )}
+          </>
             )}
           </>
         )}

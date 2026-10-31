@@ -6,6 +6,8 @@ import {
   type ArchitectureResponse,
   type ArtifactListResponse,
   type ArtifactPreviewResponse,
+  type ArtifactVersionsResponse,
+  type OfficePreviewResponse,
   type AuthSessionResponse,
   type BulkSessionAction,
   type BulkSessionActionResponse,
@@ -56,7 +58,10 @@ import {
   type WireSendRequest,
   type WireSendResponse,
   type DeleteGateSecretResponse,
+  type DispatchNodeTaskInput,
   type EnrolledNode,
+  type FederatedTask,
+  type RuntimeMatrix,
   type GateConnectorsResponse,
   type GateSecretResponse,
   type GateSecretsResponse,
@@ -1207,6 +1212,58 @@ export class HubApiClient {
     return this.request<ArtifactPreviewResponse>(`/api/v1/artifacts/preview?${qs.toString()}`);
   }
 
+  /** Recorded content revisions of an artifact, oldest first. */
+  public async getArtifactVersions(path: string): Promise<ArtifactVersionsResponse> {
+    const qs = new URLSearchParams({ path });
+    return this.request<ArtifactVersionsResponse>(
+      `/api/v1/artifacts/versions?${qs.toString()}`,
+    );
+  }
+
+  /** The stored text of one revision of an artifact. */
+  public async getArtifactVersionContent(path: string, version: number): Promise<string> {
+    const qs = new URLSearchParams({ path, version: String(version) });
+    const headers = new Headers();
+    const tok = this.getToken();
+    if (tok) {
+      headers.set("Authorization", `Bearer ${tok}`);
+    }
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/api/v1/artifacts/version-raw?${qs.toString()}`,
+      { headers, credentials: "same-origin" },
+    );
+    const text = await response.text();
+    if (!response.ok) {
+      let message = `HTTP ${response.status}`;
+      try {
+        const parsed = JSON.parse(text) as { error?: unknown };
+        if (typeof parsed.error === "string" && parsed.error) message = parsed.error;
+      } catch {
+        // Not JSON: keep the status line.
+      }
+      throw new HubApiError(response.status, message);
+    }
+    return text;
+  }
+
+  /** URL of the stored bytes of one revision, with the session token for `<img>` and links. */
+  public getArtifactVersionRawUrl(path: string, version: number): string {
+    const qs = new URLSearchParams({ path, version: String(version) });
+    const tok = this.getToken();
+    if (tok) {
+      qs.set("token", tok);
+    }
+    return `${this.baseUrl}/api/v1/artifacts/version-raw?${qs.toString()}`;
+  }
+
+  /** Structured preview of a .docx, .xlsx or .pptx artifact. */
+  public async getOfficePreview(path: string): Promise<OfficePreviewResponse> {
+    const qs = new URLSearchParams({ path });
+    return this.request<OfficePreviewResponse>(
+      `/api/v1/artifacts/office-preview?${qs.toString()}`,
+    );
+  }
+
   public async listSessionArtifacts(sessionId?: string | null): Promise<ArtifactListResponse> {
     const qs = new URLSearchParams();
     if (sessionId && sessionId.trim().length > 0) {
@@ -1278,6 +1335,36 @@ export class HubApiClient {
       method: "POST",
       body: JSON.stringify({ label, ttl_secs: ttlSecs }),
     });
+  }
+
+  public async fetchRuntimeMatrix(): Promise<RuntimeMatrix> {
+    return this.request<RuntimeMatrix>("/api/v1/runtimes/matrix");
+  }
+
+  /** Re-probe runtimes. `target` narrows to a tier, runtime, provider or engine. */
+  public async probeRuntimes(target?: string): Promise<RuntimeMatrix> {
+    return this.request<RuntimeMatrix>("/api/v1/runtimes/probe", {
+      method: "POST",
+      body: JSON.stringify(target ? { target } : {}),
+    });
+  }
+
+  public async fetchNodeTasks(nodeId: string): Promise<FederatedTask[]> {
+    const data = await this.request<{ tasks?: FederatedTask[] }>(
+      `/api/v1/nodes/${encodeURIComponent(nodeId)}/tasks`,
+    );
+    return data.tasks ?? [];
+  }
+
+  public async dispatchNodeTask(
+    nodeId: string,
+    input: DispatchNodeTaskInput,
+  ): Promise<FederatedTask> {
+    const data = await this.request<{ task: FederatedTask }>(
+      `/api/v1/nodes/${encodeURIComponent(nodeId)}/dispatch`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+    return data.task;
   }
 
   public async revokeNode(nodeId: string): Promise<void> {
