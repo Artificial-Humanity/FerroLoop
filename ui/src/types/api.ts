@@ -153,6 +153,58 @@ export type HubAuthority =
   | { tier: "owner"; login: string }
   | { tier: "peer"; agent?: string | null };
 
+export type OperatorRole = "owner" | "admin" | "operator" | "viewer";
+
+export interface OperatorAccount {
+  id: string;
+  username: string;
+  display_name: string;
+  role: OperatorRole;
+  has_password: boolean;
+  totp_enabled: boolean;
+  passkeys_count: number;
+  created_at_ms: number;
+}
+
+export interface TotpEnrollmentResponse {
+  secret_base32: string;
+  otpauth_uri: string;
+}
+
+export interface CloudAdaptersConfig {
+  store_sync: {
+    provider: "none" | "gcp" | "aws" | "azure";
+    sync_mode:
+      | "write_through"
+      | "write_behind"
+      | "local_cache"
+      | "cloud_pre_cache";
+    endpoint_url: string;
+    enabled: boolean;
+  };
+  gate_cloud: {
+    registry_provider: "none" | "gcp" | "aws" | "azure";
+    relay_endpoint_url: string;
+    secret_manager_enabled: boolean;
+    model_armor_enabled: boolean;
+  };
+}
+
+export const DEFAULT_CLOUD_ADAPTERS_CONFIG: CloudAdaptersConfig = {
+  store_sync: {
+    provider: "none",
+    sync_mode: "write_through",
+    endpoint_url: "",
+    enabled: false,
+  },
+  gate_cloud: {
+    registry_provider: "none",
+    relay_endpoint_url: "",
+    secret_manager_enabled: false,
+    model_armor_enabled: false,
+  },
+};
+
 export interface AuthSessionResponse {
   authenticated: boolean;
   authority?: HubAuthority;

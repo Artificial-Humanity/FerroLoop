@@ -1503,6 +1503,16 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         onClose={() => setPairingOpen(false)}
         onPairWithCode={handlePairWithCode}
         onPairWithToken={handlePairWithToken}
+        onAuthenticated={(auth) => {
+          if (auth) {
+            setAuthority(auth);
+          }
+          wsClient.setToken(apiClient.getToken());
+          wsClient.connect();
+          setPairingOpen(false);
+          void loadAllInitialState();
+        }}
+        apiClient={apiClient}
         error={pairingError}
       />
 
