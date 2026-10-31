@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use fl_core::agent::{AgentRecord, AgentRole, AgentStatus, RegisterAgentArgs};
 use fl_core::state::{
@@ -359,10 +360,17 @@ pub fn find_hosted_session<S: StateStore>(
     let exact = records
         .iter()
         .find(|r| keys.iter().any(|k| r.session_id == k.trim()));
+    // A live record wins over a decommissioned one of the same persona (another vendor's),
+    // which sorts first only by chance.
     let by_persona = || {
-        records
+        let mut matches = records
             .iter()
-            .find(|r| keys.iter().any(|k| persona_key_matches(r, k)))
+            .filter(|r| keys.iter().any(|k| persona_key_matches(r, k)));
+        let first = matches.next();
+        first
+            .filter(|r| is_live_hosted(r))
+            .or_else(|| matches.find(|r| is_live_hosted(r)))
+            .or(first)
     };
     Ok(exact.or_else(by_persona).cloned())
 }
@@ -479,14 +487,39 @@ fn register_spun_up_agent<S: AgentRegistry>(
     })?)
 }
 
+/// Longest a `tmux` call may run. Lifecycle calls run while the caller holds the store guard, so
+/// a wedged tmux server must not hold it for good.
+const TMUX_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn tmux_ok(args: &[&str]) -> bool {
-    Command::new("tmux")
-        .args(args)
+    let mut cmd = Command::new("tmux");
+    cmd.args(args);
+    command_succeeds_within(&mut cmd, TMUX_TIMEOUT)
+}
+
+/// Run `cmd` with no stdio. `true` only when it exits 0 within `timeout`; a command still
+/// running at the deadline is killed and reaped.
+fn command_succeeds_within(cmd: &mut Command, timeout: Duration) -> bool {
+    let Ok(mut child) = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 /// Best-effort detached `tmux` session. `false` when tmux is absent or the session exists.
@@ -625,7 +658,11 @@ pub fn spin_up<S: AgentRegistry + StateStore>(
         tmux_target: Some(tmux_target.clone()),
         cwd: v.cwd.clone(),
         hydration_dispatched: false,
-        runtime_spawned: previous.as_ref().is_some_and(|r| r.runtime_spawned),
+        // A decommissioned record's runtime is gone; the tmux session now under the name, if any,
+        // is someone else's and a later teardown must not kill it.
+        runtime_spawned: previous
+            .as_ref()
+            .is_some_and(|r| r.runtime_spawned && is_live_hosted(r)),
         created_at_ms: previous.as_ref().map_or(now, |r| r.created_at_ms),
         updated_at_ms: now,
         decommission_prepared_at_ms: None,
@@ -1035,7 +1072,10 @@ pub fn teardown_session<S: AgentRegistry + StateStore>(
 
     let runtime_stopped = match (&record.tmux_target, record.runtime_spawned) {
         (Some(tmux_target), true) if env.spawn_runtime => {
-            kill_tmux_runtime(tmux_session_name(tmux_target))
+            let gone = kill_tmux_runtime(tmux_session_name(tmux_target));
+            // The runtime is gone, so the decommissioned record must not claim it any more.
+            record.runtime_spawned &= !gone;
+            gone
         }
         // Still running for the sessions that share it: report that truthfully.
         _ if shared_runtime => false,
@@ -2319,5 +2359,241 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- audit 2026-10-30 regressions ----
+
+    fn hosted_record(
+        vendor: &str,
+        persona: &str,
+        status: &str,
+        spawned: bool,
+    ) -> HostedSessionRecord {
+        HostedSessionRecord {
+            session_id: format!("{vendor}:{persona}"),
+            persona: persona.into(),
+            project: "FerroLoop".into(),
+            role: "assistant".into(),
+            vendor: vendor.into(),
+            model: None,
+            node_id: DEFAULT_NODE_ID.into(),
+            hosted: true,
+            status: status.into(),
+            restart_policy: "on-failure".into(),
+            restart_count: 0,
+            tmux_target: Some(format!("{}:{vendor}", capitalize(persona))),
+            cwd: None,
+            hydration_dispatched: false,
+            runtime_spawned: spawned,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            decommission_prepared_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn command_succeeds_within_reports_exit_status_and_kills_a_wedged_command() {
+        let t = Duration::from_secs(5);
+        assert!(command_succeeds_within(&mut Command::new("true"), t));
+        assert!(!command_succeeds_within(&mut Command::new("false"), t));
+        assert!(!command_succeeds_within(
+            &mut Command::new("fl-no-such-binary-for-test"),
+            t
+        ));
+        let started = Instant::now();
+        let mut hung = Command::new("sleep");
+        hung.arg("60");
+        assert!(!command_succeeds_within(
+            &mut hung,
+            Duration::from_millis(200)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a wedged tmux must not hold the store guard"
+        );
+    }
+
+    #[test]
+    fn respin_of_a_decommissioned_record_does_not_inherit_runtime_ownership() {
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        // The tmux session this record owned was stopped by the teardown. Whatever tmux session
+        // bears the name now belongs to someone else, and a later teardown must not kill it.
+        persist_hosted_session(
+            &store,
+            &hosted_record("claude", "ada", STATUS_DECOMMISSIONED, true),
+            "owner",
+        )
+        .unwrap();
+        spin_up(
+            &store,
+            &env(&home),
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let rec = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.status, STATUS_RUNNING);
+        assert!(!rec.runtime_spawned);
+    }
+
+    #[test]
+    fn respin_of_a_live_record_keeps_runtime_ownership() {
+        let home = TempDir::new().unwrap();
+        let store = MemStore::default();
+        persist_hosted_session(
+            &store,
+            &hosted_record("claude", "ada", STATUS_RUNNING, true),
+            "owner",
+        )
+        .unwrap();
+        spin_up(
+            &store,
+            &env(&home),
+            &req("ada", "assistant", "claude"),
+            "owner",
+            Caller::Owner,
+        )
+        .unwrap();
+        let rec = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert!(rec.runtime_spawned);
+    }
+
+    #[test]
+    fn bare_persona_prefers_a_live_record_over_a_decommissioned_sibling() {
+        let store = MemStore::default();
+        // `claude:ada` sorts first, but it is history; `codex:ada` is the live session.
+        persist_hosted_session(
+            &store,
+            &hosted_record("claude", "ada", STATUS_DECOMMISSIONED, false),
+            "owner",
+        )
+        .unwrap();
+        persist_hosted_session(
+            &store,
+            &hosted_record("codex", "ada", STATUS_RUNNING, false),
+            "owner",
+        )
+        .unwrap();
+        let found = find_hosted_session(&store, &["ada"]).unwrap().unwrap();
+        assert_eq!(found.session_id, "codex:ada");
+        // An exact id still reaches the decommissioned record.
+        let exact = find_hosted_session(&store, &["claude:ada"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact.status, STATUS_DECOMMISSIONED);
+        // With only decommissioned matches the first one is still returned.
+        persist_hosted_session(
+            &store,
+            &hosted_record("codex", "ada", STATUS_DECOMMISSIONED, false),
+            "owner",
+        )
+        .unwrap();
+        let found = find_hosted_session(&store, &["ada"]).unwrap().unwrap();
+        assert_eq!(found.session_id, "claude:ada");
+    }
+
+    #[test]
+    fn bare_persona_with_two_live_records_resolves_to_the_first_by_session_id() {
+        // Open finding A4: the pick is deterministic but not the caller's choice. Pinned so a
+        // change to ambiguity handling is deliberate.
+        let store = MemStore::default();
+        for vendor in ["codex", "claude"] {
+            persist_hosted_session(
+                &store,
+                &hosted_record(vendor, "ada", STATUS_RUNNING, false),
+                "owner",
+            )
+            .unwrap();
+        }
+        let found = find_hosted_session(&store, &["ada"]).unwrap().unwrap();
+        assert_eq!(found.session_id, "claude:ada");
+    }
+
+    #[test]
+    fn spin_up_rejects_hostile_persona_and_text_fields() {
+        let ok = req("ada", "assistant", "claude");
+        assert!(ok.validate().is_ok());
+        for persona in [
+            "-tfoo",         // would read as a tmux option
+            "ada\0",         // NUL
+            "ada\nlead",     // newline
+            "ada lead",      // inner space
+            "ada;rm",        // shell metacharacter
+            "ada/../x",      // path separators
+            "\u{ff41}da",    // full-width letter
+            "ad\u{430}",     // Cyrillic homoglyph
+            "Ada",           // upper case
+            "9ada",          // leading digit
+            &"a".repeat(37), // one over the slug budget
+        ] {
+            let bad = SpinUpRequest {
+                persona: persona.into(),
+                ..ok.clone()
+            };
+            assert!(
+                bad.validate().is_err(),
+                "persona {persona:?} must be refused"
+            );
+        }
+        for (field, bad) in [
+            (
+                "cwd",
+                SpinUpRequest {
+                    cwd: Some("/tmp\n-x".into()),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "cwd",
+                SpinUpRequest {
+                    cwd: Some("/tmp/\0x".into()),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "model",
+                SpinUpRequest {
+                    model: Some("m\u{1b}[2J".into()),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "node_id",
+                SpinUpRequest {
+                    node_id: Some("../etc".into()),
+                    ..ok.clone()
+                },
+            ),
+            (
+                "node_id",
+                SpinUpRequest {
+                    node_id: Some("n".repeat(65)),
+                    ..ok.clone()
+                },
+            ),
+        ] {
+            assert!(bad.validate().is_err(), "{field} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_hostile_or_oversized_session_id_is_rejected_before_any_side_effect() {
+        let store = MemStore::default();
+        for raw in [
+            "claude:../../etc".to_string(),
+            "claude:ada\0".to_string(),
+            "claude:-x".to_string(),
+            format!("claude:{}", "a".repeat(1024 * 1024)),
+        ] {
+            let err = SessionTarget::resolve(&store, &raw, None).unwrap_err();
+            assert!(matches!(err, LifecycleError::Invalid(_)), "{err:?}");
+        }
+        assert!(list_hosted_sessions(&store).unwrap().is_empty());
     }
 }
