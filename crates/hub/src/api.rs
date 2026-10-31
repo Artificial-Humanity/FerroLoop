@@ -532,7 +532,9 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
         ("POST", "/api/v1/gate/call") => handle_post_gate_call(state, &authority, req),
         ("POST", "/api/v1/gate/mcp") => handle_post_gate_mcp(state, &authority, None, req),
-        ("GET", "/api/v1/runtimes/matrix") => crate::runtime_matrix::handle_get_matrix(state),
+        ("GET", "/api/v1/runtimes/matrix") => {
+            crate::runtime_matrix::handle_get_matrix(state, &authority)
+        }
         ("POST", "/api/v1/runtimes/probe") => {
             crate::runtime_matrix::handle_post_probe(state, &authority, req)
         }
@@ -767,12 +769,22 @@ enum NodeAccess {
     Heartbeat,
 }
 
+/// Who `authorize_node_caller` let in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NodeCaller {
+    Owner,
+    /// The node's own bearer token (revoked too, for a heartbeat).
+    Node,
+    /// Any other authenticated caller; only `NodeAccess::Heartbeat` admits one.
+    Other,
+}
+
 fn authorize_node_caller<'a>(
     state: &'a HubState,
     req: &HttpRequest,
     node_id: &str,
     access: NodeAccess,
-) -> Result<HubStoreGuard<'a>, HttpResponse> {
+) -> Result<(HubStoreGuard<'a>, NodeCaller), HttpResponse> {
     let owner_only = access == NodeAccess::Owner;
     let accept_revoked = access == NodeAccess::Heartbeat;
     let authority = authenticate_api_request(state, req).ok();
@@ -781,8 +793,8 @@ fn authorize_node_caller<'a>(
         Err(()) => return Err(store_open_failure()),
     };
     match authority {
-        Some(authority) if authority.is_owner() => return Ok(store),
-        Some(_) if access == NodeAccess::Heartbeat => return Ok(store),
+        Some(authority) if authority.is_owner() => return Ok((store, NodeCaller::Owner)),
+        Some(_) if access == NodeAccess::Heartbeat => return Ok((store, NodeCaller::Other)),
         Some(_) => {
             return Err(HttpResponse::json(
                 403,
@@ -800,12 +812,12 @@ fn authorize_node_caller<'a>(
         .and_then(|header| extract_bearer_token(header))
         .unwrap_or_default();
     match node_token_matches(&store, node_id, &bearer) {
-        Ok(true) => Ok(store),
+        Ok(true) => Ok((store, NodeCaller::Node)),
         Ok(false) if !accept_revoked => {
             Err(HttpResponse::json(401, json!({ "error": "unauthorized" })))
         }
         Ok(false) => match revoked_node_bearer_matches(&store, node_id, &bearer) {
-            Ok(true) => Ok(store),
+            Ok(true) => Ok((store, NodeCaller::Node)),
             Ok(false) => Err(HttpResponse::json(401, json!({ "error": "unauthorized" }))),
             Err(err) => Err(HttpResponse::json(500, json!({ "error": err }))),
         },
@@ -897,8 +909,8 @@ fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str)
         Ok(node_id) => node_id,
         Err(resp) => return resp,
     };
-    let store = match authorize_node_caller(state, req, &node_id, NodeAccess::Heartbeat) {
-        Ok(store) => store,
+    let (store, caller) = match authorize_node_caller(state, req, &node_id, NodeAccess::Heartbeat) {
+        Ok(authorized) => authorized,
         Err(resp) => return resp,
     };
     let body = match json_object_body(req) {
@@ -913,10 +925,16 @@ fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str)
         Ok(labels) => labels,
         Err(error) => return HttpResponse::json(400, json!({ "error": error })),
     };
-    let fields = match heartbeat_fields(&body) {
+    let mut fields = match heartbeat_fields(&body) {
         Ok(fields) => fields,
         Err(error) => return HttpResponse::json(400, json!({ "error": error })),
     };
+    // Any authenticated caller keeps a node alive (`last_seen`), but only the owner and the
+    // node itself may set what the fleet view shows: status, load and profile. Otherwise a peer
+    // could mark another node draining or rewrite what it federates.
+    if caller == NodeCaller::Other {
+        fields = HeartbeatFields::default();
+    }
     match touch_node(
         &store,
         HeartbeatUpdate {
@@ -953,6 +971,7 @@ fn handle_post_node_heartbeat(state: &HubState, req: &HttpRequest, raw_id: &str)
     }
 }
 
+#[derive(Default)]
 struct HeartbeatFields {
     environment_kind: Option<String>,
     federated_subsystems: Option<Vec<String>>,
@@ -1009,7 +1028,7 @@ fn handle_post_node_dispatch(state: &HubState, req: &HttpRequest, raw_id: &str) 
         Err(resp) => return resp,
     };
     let store = match authorize_node_caller(state, req, &node_id, NodeAccess::Owner) {
-        Ok(store) => store,
+        Ok((store, _)) => store,
         Err(resp) => return resp,
     };
     let body = match json_object_body(req) {
@@ -1041,7 +1060,7 @@ fn handle_get_node_tasks(state: &HubState, req: &HttpRequest, raw_id: &str) -> H
         Err(resp) => return resp,
     };
     let store = match authorize_node_caller(state, req, &node_id, NodeAccess::OwnerOrNode) {
-        Ok(store) => store,
+        Ok((store, _)) => store,
         Err(resp) => return resp,
     };
     match list_node_tasks(&store, &node_id) {
@@ -1062,7 +1081,7 @@ fn handle_post_node_task_result(
     };
     let task_id = percent_decode(raw_task_id);
     let store = match authorize_node_caller(state, req, &node_id, NodeAccess::OwnerOrNode) {
-        Ok(store) => store,
+        Ok((store, _)) => store,
         Err(resp) => return resp,
     };
     let body = match json_object_body(req) {
@@ -3139,18 +3158,26 @@ fn handle_get_artifacts_list(state: &HubState, req: &HttpRequest) -> HttpRespons
 /// Record the current content of each live artifact as a revision when it changed. Failures
 /// (a file that vanished, grew past the cap, or no longer passes vetting) are skipped.
 fn record_artifact_versions(state: &HubState, root: &Path, files: &[PathBuf]) {
-    let allowed_roots = allowed_artifact_roots(state);
-    let still_vetted = |resolved: &Path| {
-        vet_artifact_file(&allowed_roots, resolved).is_some_and(|(canon, _)| canon == resolved)
-    };
+    let still_vetted = artifact_still_vetted(state);
     for canon in files {
         let _ = artifacts::record_version(root, canon, &still_vetted);
     }
 }
 
+/// The vetting `record_version` runs again on the path it opened.
+fn artifact_still_vetted(state: &HubState) -> impl Fn(&Path) -> bool {
+    let allowed_roots = allowed_artifact_roots(state);
+    move |resolved: &Path| {
+        vet_artifact_file(&allowed_roots, resolved).is_some_and(|(canon, _)| canon == resolved)
+    }
+}
+
 /// `GET /api/v1/artifacts/versions?path=` (Track E): the recorded revisions of one artifact,
-/// oldest first. A live file is registered and its current content recorded first, so history
-/// exists even when the artifact was never listed.
+/// oldest first. A live file of a type the artifact store keeps is registered and its current
+/// content recorded first, so history exists even when the artifact was never listed. The
+/// registration happens only once the file passes vetting, and the registry and the stored
+/// snapshots are capped (see `artifacts::MAX_REGISTRY_ENTRIES`): past the cap the route answers
+/// 507 instead of registering.
 fn handle_get_artifact_versions(state: &HubState, req: &HttpRequest) -> HttpResponse {
     let raw_path = req.query.get("path").map(String::as_str).unwrap_or("");
     let canonical = match resolve_artifact_candidate_path(state, raw_path) {
@@ -3171,12 +3198,26 @@ fn handle_get_artifact_versions(state: &HubState, req: &HttpRequest) -> HttpResp
     let managed_copy =
         fs::canonicalize(artifacts::managed_dir(&root)).is_ok_and(|dir| canonical.starts_with(dir));
     if !managed_copy {
-        artifacts::with_registry(&root, |reg| {
-            if reg.entries.iter().all(|e| e.canonical_path != canon_str) {
-                reg.upsert(artifact_entry(&canonical, meta.len(), None));
-            }
+        let registered = artifacts::with_registry(&root, |reg| {
+            reg.entries.iter().any(|e| e.canonical_path == canon_str)
         });
-        record_artifact_versions(state, &root, std::slice::from_ref(&canonical));
+        let still_vetted = artifact_still_vetted(state);
+        if registered {
+            let _ = artifacts::record_version(&root, &canonical, &still_vetted);
+        } else if !artifacts::has_archive_ext(&canonical) {
+            return HttpResponse::json(
+                415,
+                json!({ "error": "artifacts of this type have no version history" }),
+            );
+        } else if let Err(err) = artifacts::register_and_record_version(
+            &root,
+            &canonical,
+            artifact_entry(&canonical, meta.len(), None),
+            &still_vetted,
+        ) && err.kind() == std::io::ErrorKind::QuotaExceeded
+        {
+            return HttpResponse::json(507, json!({ "error": err.to_string() }));
+        }
     }
     let versions = artifacts::with_registry(&root, |reg| {
         reg.find_for_path(&canonical)
@@ -6511,6 +6552,65 @@ mod tests {
             format!("/api/v1/artifacts/versions?path={}", enc(&md)),
         );
         assert_ne!(handle_http_request(&state, &unauth).status, 200);
+    }
+
+    #[test]
+    fn the_versions_route_registers_only_kept_types_and_stops_at_the_registry_cap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_root = tmp.path().join("repo");
+        let home_dir = tmp.path().join("home");
+        fs::create_dir_all(&repo_root).unwrap();
+        fs::create_dir_all(&home_dir).unwrap();
+        let cfg = crate::HubServerConfig {
+            store_path: tmp.path().join("store.redb"),
+            repo_root: repo_root.clone(),
+            owner_token: Some("owner-test-tok".to_string()),
+            home_override: Some(home_dir),
+            ..crate::HubServerConfig::default()
+        };
+        let state = HubState::new(cfg);
+        let get = |p: &Path| -> HttpResponse {
+            let target = format!(
+                "/api/v1/artifacts/versions?path={}",
+                percent_encode_query_value(&p.display().to_string())
+            );
+            let mut req = HttpRequest::new("GET", target);
+            req.headers.insert(
+                "authorization".to_string(),
+                "Bearer owner-test-tok".to_string(),
+            );
+            handle_http_request(&state, &req)
+        };
+        let root = artifacts_root(&state).unwrap();
+        let entries = || artifacts::with_registry(&root, |reg| reg.entries.len());
+
+        // A type the store does not keep is refused and leaves no registry entry.
+        let code = repo_root.join("main.rs");
+        fs::write(&code, "fn main() {}").unwrap();
+        assert_eq!(get(&code).status, 415);
+        assert_eq!(entries(), 0);
+
+        // A kept type registers.
+        let md = repo_root.join("note.md");
+        fs::write(&md, "# n").unwrap();
+        assert_eq!(get(&md).status, 200);
+        assert_eq!(entries(), 1);
+
+        // With the registry full, a new file is refused and nothing is added; a registered one
+        // still answers.
+        artifacts::with_registry(&root, |reg| {
+            for i in 0..artifacts::MAX_REGISTRY_ENTRIES {
+                let mut e = artifact_entry(Path::new(&format!("/gone/{i}.md")), 1, None);
+                e.status = artifacts::STATUS_ARCHIVED.to_string();
+                reg.entries.push(e);
+            }
+        });
+        let full = entries();
+        let other = repo_root.join("other.md");
+        fs::write(&other, "o").unwrap();
+        assert_eq!(get(&other).status, 507);
+        assert_eq!(entries(), full);
+        assert_eq!(get(&md).status, 200);
     }
 
     #[test]

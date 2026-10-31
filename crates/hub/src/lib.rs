@@ -178,6 +178,8 @@ pub struct HubState {
     model_overrides: Arc<Mutex<BTreeMap<String, session_actions::ModelOverride>>>,
     /// Login throttling and passkey challenges, in memory only.
     login_guard: Arc<operators::LoginGuard>,
+    /// One runtime probe at a time, and the last result (see [`runtime_matrix::ProbeGate`]).
+    probe_gate: Arc<runtime_matrix::ProbeGate>,
 }
 
 /// How long a per-project open may take in all: the wait for the file's in-process lock plus
@@ -282,6 +284,7 @@ impl HubState {
             prompt_queues: Arc::new(Mutex::new(PromptQueueState::default())),
             model_overrides: Arc::new(Mutex::new(BTreeMap::new())),
             login_guard: Arc::new(operators::LoginGuard::default()),
+            probe_gate: Arc::new(runtime_matrix::ProbeGate::default()),
         }
     }
 
@@ -3930,6 +3933,106 @@ mod tests {
     }
 
     #[test]
+    fn http_heartbeat_telemetry_is_only_taken_from_the_owner_or_the_node_itself() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let owner = Some("owner-tok-secret");
+        let peer = Some("peer-tok-secret");
+        let code = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll-token",
+            owner,
+            Some(&json!({ "label": "hb" })),
+        )
+        .json_value()
+        .unwrap()["code"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let enrolled = http_call(
+            &state,
+            "POST",
+            "/api/v1/nodes/enroll",
+            None,
+            Some(&json!({
+                "code": code, "node_id": "hb-a", "display_name": "HB A",
+                "hostname": "h", "os": "linux", "arch": "x86_64",
+                "environment_kind": "cloud-worker", "federated_subsystems": ["ferrowire"]
+            })),
+        );
+        assert_eq!(enrolled.status, 200, "{}", response_text(&enrolled));
+        let token = enrolled.json_value().unwrap()["node_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let beat = |bearer: Option<&str>, body: Value| {
+            let resp = http_call(
+                &state,
+                "POST",
+                "/api/v1/nodes/hb-a/heartbeat",
+                bearer,
+                Some(&body),
+            );
+            assert_eq!(resp.status, 200, "{}", response_text(&resp));
+            resp.json_value().unwrap()
+        };
+        let node_row = || {
+            let listed = http_call(&state, "GET", "/api/v1/nodes", owner, None);
+            let nodes = listed.json_value().unwrap()["nodes"].clone();
+            nodes
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["node_id"] == "hb-a")
+                .unwrap()
+                .clone()
+        };
+        let telemetry = json!({
+            "status": "busy", "active_tasks": 2, "load_avg": 1.5,
+            "environment_kind": "linux-worker", "federated_subsystems": ["ferrostate"]
+        });
+        let own = beat(Some(token.as_str()), telemetry.clone());
+        assert_eq!(own["reported_status"], "busy");
+        let before = node_row();
+        assert_eq!(before["environment_kind"], "linux-worker");
+        assert_eq!(before["federated_subsystems"], json!(["ferrostate"]));
+
+        // A peer's heartbeat keeps the node alive and changes nothing it reports.
+        std::thread::sleep(Duration::from_millis(20));
+        let forged = json!({
+            "status": "draining", "active_tasks": 9, "load_avg": 8.0,
+            "environment_kind": "ai-lab", "federated_subsystems": ["ferrodeck"]
+        });
+        let by_peer = beat(peer, forged.clone());
+        assert!(
+            by_peer["last_seen_at_ms"].as_u64() > before["last_seen_at_ms"].as_u64(),
+            "a peer heartbeat must still count as liveness"
+        );
+        let after = node_row();
+        for field in [
+            "reported_status",
+            "active_tasks",
+            "load_avg",
+            "environment_kind",
+            "federated_subsystems",
+        ] {
+            assert_eq!(after[field], before[field], "{field}");
+        }
+
+        // The owner may set them.
+        let by_owner = beat(owner, forged);
+        assert_eq!(by_owner["reported_status"], "draining");
+        let after = node_row();
+        assert_eq!(
+            (after["active_tasks"].clone(), after["load_avg"].clone()),
+            (json!(9), json!(8.0))
+        );
+        assert_eq!(after["environment_kind"], "ai-lab");
+        assert_eq!(after["federated_subsystems"], json!(["ferrodeck"]));
+    }
+
+    #[test]
     fn http_runtime_matrix_and_probe() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
@@ -3940,7 +4043,12 @@ mod tests {
             http_call(&state, "GET", "/api/v1/runtimes/matrix", None, None).status,
             401
         );
-        let matrix = http_call(&state, "GET", "/api/v1/runtimes/matrix", peer, None);
+        // Probing spawns CLIs, so it is owner only for GET as well as POST.
+        assert_eq!(
+            http_call(&state, "GET", "/api/v1/runtimes/matrix", peer, None).status,
+            403
+        );
+        let matrix = http_call(&state, "GET", "/api/v1/runtimes/matrix", owner, None);
         assert_eq!(matrix.status, 200, "{}", response_text(&matrix));
         let matrix = matrix.json_value().unwrap();
         let names: Vec<_> = matrix["cli_runtimes"]
@@ -4007,6 +4115,23 @@ mod tests {
             let resp = http_call(&state, "POST", "/api/v1/runtimes/probe", owner, Some(&bad));
             assert_eq!(resp.status, 400, "{}", response_text(&resp));
         }
+    }
+
+    #[test]
+    fn http_runtime_matrix_get_does_not_create_the_vault_key() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let key = fl_gate::resolve_master_key_path(Some(tmp.path()));
+        assert!(!key.exists());
+        let matrix = http_call(
+            &state,
+            "GET",
+            "/api/v1/runtimes/matrix",
+            Some("owner-tok-secret"),
+            None,
+        );
+        assert_eq!(matrix.status, 200, "{}", response_text(&matrix));
+        assert!(!key.exists(), "a read created the vault master key");
     }
 
     #[test]

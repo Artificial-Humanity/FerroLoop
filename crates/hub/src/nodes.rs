@@ -790,6 +790,11 @@ pub fn find_hub_node(store: &RedbStore) -> Result<Option<NodeRecord>, String> {
 }
 
 fn to_view(rec: &NodeRecord, now_ms: u64) -> NodeView {
+    let status = node_status(&rec.role, rec.revoked, rec.last_seen_at_ms, now_ms);
+    // Telemetry is what the node last reported. Once it stops heartbeating, "busy" or "3 tasks"
+    // is stale, so only an online node shows it. (Tasks may still be queued for an offline
+    // worker: it pulls them when it returns.)
+    let live = status == "online";
     NodeView {
         node_id: rec.node_id.clone(),
         display_name: rec.display_name.clone(),
@@ -800,7 +805,7 @@ fn to_view(rec: &NodeRecord, now_ms: u64) -> NodeView {
         listen_addr: rec.listen_addr.clone(),
         capabilities: rec.capabilities.clone(),
         labels: rec.labels.clone(),
-        status: node_status(&rec.role, rec.revoked, rec.last_seen_at_ms, now_ms).to_string(),
+        status: status.to_string(),
         enrolled_at_ms: rec.enrolled_at_ms,
         last_seen_at_ms: rec.last_seen_at_ms,
         environment_kind: if rec.environment_kind.is_empty() {
@@ -809,9 +814,13 @@ fn to_view(rec: &NodeRecord, now_ms: u64) -> NodeView {
             rec.environment_kind.clone()
         },
         federated_subsystems: rec.federated_subsystems.clone(),
-        active_tasks: rec.active_tasks,
-        load_avg: rec.load_avg,
-        reported_status: rec.reported_status.clone(),
+        active_tasks: if live { rec.active_tasks } else { 0 },
+        load_avg: if live { rec.load_avg } else { None },
+        reported_status: if live {
+            rec.reported_status.clone()
+        } else {
+            None
+        },
     }
 }
 
@@ -1792,6 +1801,43 @@ mod tests {
         let view = &list_visible_nodes(&store, 2_000).unwrap()[0];
         assert_eq!(view.environment_kind, "cloud-worker");
         assert_eq!(view.federated_subsystems, ["ferrowire"]);
+    }
+
+    #[test]
+    fn a_node_that_stopped_heartbeating_does_not_show_its_last_telemetry() {
+        let (_tmp, store) = open_store();
+        enroll_worker_node(&store, "w1");
+        touch_node(
+            &store,
+            HeartbeatUpdate {
+                node_id: "w1".to_string(),
+                reported_status: Some("busy".to_string()),
+                active_tasks: Some(4),
+                load_avg: Some(2.25),
+                now_ms: 9_000,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let at = |now: u64| {
+            list_visible_nodes(&store, now)
+                .unwrap()
+                .into_iter()
+                .find(|v| v.node_id == "w1")
+                .unwrap()
+        };
+        let online = at(9_000 + ONLINE_WINDOW_MS);
+        assert_eq!(online.status, "online");
+        assert_eq!(online.reported_status.as_deref(), Some("busy"));
+        assert_eq!((online.active_tasks, online.load_avg), (4, Some(2.25)));
+        for now in [9_000 + ONLINE_WINDOW_MS + 1, 9_000 + STALE_WINDOW_MS + 1] {
+            let gone = at(now);
+            assert_ne!(gone.status, "online");
+            assert_eq!(gone.reported_status, None);
+            assert_eq!((gone.active_tasks, gone.load_avg), (0, None));
+        }
+        // The worker pulls its queue when it returns, so a task for it may be queued meanwhile.
+        dispatch_task(&store, "w1", task_args("echo later")).unwrap();
     }
 
     #[test]

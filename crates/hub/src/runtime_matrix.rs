@@ -9,17 +9,18 @@
 //! 3. local inference engines (Ollama, Lemonade) on loopback: reachability, latency and models.
 //!
 //! Every probe is bounded. The three tiers and every item inside them run concurrently, so the
-//! worst case is one probe timeout, not the sum of all of them.
+//! worst case is one probe timeout, not the sum of all of them. Probing is owner only and goes
+//! through a [`ProbeGate`]: one probe at a time, and a fresh result is served again.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use fl_exec::stamp;
-use fl_gate::{Vault, VaultSecretMetadata};
+use fl_gate::{MASTER_KEY_LEN, Vault, VaultSecretMetadata, resolve_vault_path};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -47,6 +48,9 @@ const MAX_PROBE_OUTPUT: usize = 4096;
 const MAX_LOCAL_BODY: usize = 256 * 1024;
 const MAX_LOCAL_MODELS: usize = 100;
 const MAX_TARGET_LEN: usize = 64;
+/// A probe result younger than this is served again for the same target, so a burst of requests
+/// spawns each CLI once.
+const PROBE_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Loopback inference engine to probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +347,7 @@ fn probe_cli(name: &str, inputs: &ProbeInputs, timeout: Duration) -> CliRuntimeS
 
 /// `<path> --version` with a hard deadline. The child leads its own process group, and the whole
 /// group is killed on timeout and after exit, so a wrapper script cannot leave a grandchild behind.
+/// The group is only signalled while the leader is still unreaped (see [`exited_unreaped`]).
 pub fn run_version(path: &Path, timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new(path);
     cmd.arg("--version")
@@ -360,23 +365,28 @@ pub fn run_version(path: &Path, timeout: Duration) -> Result<String, String> {
     let err_rx = drain_pipe(child.stderr.take());
 
     let deadline = Instant::now() + timeout;
-    let exit = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) if Instant::now() >= deadline => break None,
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+    let exited = loop {
+        match exited_unreaped(&mut child) {
+            Ok(true) => break true,
+            Ok(false) if Instant::now() >= deadline => break false,
+            Ok(false) => std::thread::sleep(Duration::from_millis(10)),
             Err(e) => {
-                kill_group(pid, &mut child);
+                // The state of the leader is unknown, so no group signal: it may be reaped.
+                let _ = child.kill();
+                let _ = child.wait();
                 return Err(format!("wait failed: {e}"));
             }
         }
     };
-    kill_group(pid, &mut child);
-    let Some(exit) = exit else {
+    let exit = kill_group(pid, &mut child);
+    if !exited {
         return Err(format!(
             "--version timed out after {}ms",
             timeout.as_millis()
         ));
+    }
+    let Ok(exit) = exit else {
+        return Err("wait failed".to_string());
     };
     let stdout = out_rx
         .recv_timeout(Duration::from_millis(200))
@@ -411,18 +421,49 @@ fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Strin
     rx
 }
 
-/// SIGKILL the child's process group, then reap the child.
-fn kill_group(pid: u32, child: &mut std::process::Child) {
+/// Whether the child has exited, without reaping it. An exited but unreaped leader is a zombie
+/// that still owns its pid, so `kill_group` can signal `-pid` knowing no other process holds that
+/// id; once a leader is reaped (`try_wait`, `wait`) and its group is empty, the id can be reused.
+#[cfg(unix)]
+fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+    // SAFETY: `waitid` with `WNOHANG | WNOWAIT` only fills `info` and leaves the child waitable;
+    // an all-zero `siginfo_t` is a valid value to pass in. `si_pid` stays 0 while the child runs.
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(info.si_pid() != 0)
+    }
+}
+
+#[cfg(not(unix))]
+fn exited_unreaped(child: &mut std::process::Child) -> std::io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+/// SIGKILL the child's process group, then reap the child. Call it only while the leader is
+/// unreaped, so `-pid` still names the child's own group.
+fn kill_group(
+    pid: u32,
+    child: &mut std::process::Child,
+) -> std::io::Result<std::process::ExitStatus> {
     #[cfg(unix)]
     if let Ok(pid) = i32::try_from(pid) {
         // SAFETY: plain `kill(2)` on a negative pid targets the process group the child created
-        // with `process_group(0)`. No memory is touched; ESRCH after a clean exit is ignored.
+        // with `process_group(0)`. No memory is touched; ESRCH is ignored.
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait()
 }
 
 // ---------------------------------------------------------------- tier 2: vault
@@ -582,6 +623,93 @@ fn elapsed_ms(since: Instant) -> u64 {
 
 // ---------------------------------------------------------------- HTTP handlers
 
+/// Serializes probes and remembers the last result. A probe spawns `<binary> --version` for each
+/// CLI, so a second request while one runs gets `429` instead of a second set of children, and a
+/// request within [`PROBE_MIN_INTERVAL`] of a finished probe of the same target gets that result.
+#[derive(Debug, Default)]
+pub struct ProbeGate {
+    state: Mutex<GateState>,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    running: bool,
+    last: Option<CachedProbe>,
+}
+
+#[derive(Debug)]
+struct CachedProbe {
+    at: Instant,
+    target: Option<String>,
+    body: Value,
+}
+
+/// Clears `running` when the probe ends, including by panic.
+struct Running<'a>(&'a ProbeGate);
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.lock().running = false;
+    }
+}
+
+impl ProbeGate {
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Serve `target` from the last result, refuse while another probe runs, or run `probe` and
+    /// remember its result. An error response is returned as it is and not remembered.
+    fn run(
+        &self,
+        target: Option<&str>,
+        probe: impl FnOnce() -> Result<Value, HttpResponse>,
+    ) -> HttpResponse {
+        // The same normalisation `select` applies, so `Vault` and `vault ` share a result.
+        let key = target
+            .map(|t| t.trim().to_ascii_lowercase())
+            .filter(|t| !t.is_empty());
+        {
+            let mut state = self.lock();
+            if let Some(last) = &state.last
+                && last.target == key
+                && last.at.elapsed() < PROBE_MIN_INTERVAL
+            {
+                return HttpResponse::json(200, last.body.clone());
+            }
+            if state.running {
+                return HttpResponse::json(
+                    429,
+                    json!({ "error": "a probe is already running; retry shortly" }),
+                )
+                .with_header("Retry-After", "1");
+            }
+            state.running = true;
+        }
+        let _running = Running(self);
+        match probe() {
+            Ok(body) => {
+                self.lock().last = Some(CachedProbe {
+                    at: Instant::now(),
+                    target: key,
+                    body: body.clone(),
+                });
+                HttpResponse::json(200, body)
+            }
+            Err(resp) => resp,
+        }
+    }
+}
+
+/// Metadata of the vault's secrets, read without the master key: nothing is decrypted, so the
+/// key file is neither read nor created, and a missing vault file reads as empty. (`Vault::open`
+/// only needs a key to seal and open secret values.)
+fn vault_metadata(home_override: Option<&Path>) -> Result<Vec<VaultSecretMetadata>, String> {
+    Vault::open(resolve_vault_path(home_override), [0u8; MASTER_KEY_LEN])
+        .map(|v| v.list())
+        .map_err(|e| e.to_string())
+}
+
 fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpResponse> {
     // Snapshot under the store guard, then drop it before any filesystem or network probing.
     let snapshot = match state.open_store() {
@@ -602,9 +730,7 @@ fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpResponse> {
         &snapshot,
         state.config.home_override.as_deref(),
     );
-    let vault = Vault::open_default(state.config.home_override.as_deref())
-        .map(|v| v.list())
-        .map_err(|e| e.to_string());
+    let vault = vault_metadata(state.config.home_override.as_deref());
     Ok(ProbeInputs {
         path_env: std::env::var("PATH").unwrap_or_default(),
         home,
@@ -616,21 +742,21 @@ fn gather_inputs(state: &HubState) -> Result<ProbeInputs, HttpResponse> {
 }
 
 fn run_probe(state: &HubState, target: Option<&str>) -> HttpResponse {
-    let inputs = match gather_inputs(state) {
-        Ok(inputs) => inputs,
-        Err(resp) => return resp,
-    };
-    match build_matrix(&inputs, target) {
-        Ok(matrix) => HttpResponse::json(
-            200,
-            serde_json::to_value(&matrix).unwrap_or_else(|_| json!({})),
-        ),
-        Err(error) => HttpResponse::json(400, json!({ "error": error })),
-    }
+    state.probe_gate.run(target, || {
+        let inputs = gather_inputs(state)?;
+        match build_matrix(&inputs, target) {
+            Ok(matrix) => Ok(serde_json::to_value(&matrix).unwrap_or_else(|_| json!({}))),
+            Err(error) => Err(HttpResponse::json(400, json!({ "error": error }))),
+        }
+    })
 }
 
-/// `GET /api/v1/runtimes/matrix`: probe every runtime.
-pub fn handle_get_matrix(state: &HubState) -> HttpResponse {
+/// `GET /api/v1/runtimes/matrix`: probe every runtime. Owner only, like the POST: a probe spawns
+/// `<binary> --version` for binaries found on the hub's PATH.
+pub fn handle_get_matrix(state: &HubState, authority: &HubAuthority) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(403, json!({ "error": "owner authority required" }));
+    }
     run_probe(state, None)
 }
 
@@ -878,6 +1004,90 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(1400));
         assert!(!marker.exists(), "grandchild survived the group kill");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_kills_a_grandchild_left_behind_by_a_normal_exit() {
+        let dir = TempDir::new().unwrap();
+        let marker = dir.path().join("grandchild-alive");
+        // The script exits at once, but its background child would touch the marker after 1s.
+        let body = format!("(sleep 1; touch '{}') &\necho v1", marker.display());
+        let p = write_script(dir.path(), "wrapper", &body);
+        assert_eq!(run_version(&p, Duration::from_secs(2)).unwrap(), "v1");
+        std::thread::sleep(Duration::from_millis(1400));
+        assert!(!marker.exists(), "grandchild survived the group kill");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn noticing_an_exit_does_not_reap_the_leader() {
+        let mut child = Command::new("true").spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !exited_unreaped(&mut child).unwrap() {
+            assert!(Instant::now() < deadline, "child never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Still waitable: its pid is not free for reuse until `wait` below.
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn the_probe_gate_refuses_a_concurrent_probe_and_reuses_a_fresh_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = ProbeGate::default();
+        let calls = AtomicUsize::new(0);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let (gate, calls) = (&gate, &calls);
+            let first = scope.spawn(move || {
+                gate.run(Some("cli"), move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                    Ok(json!({ "n": 1 }))
+                })
+            });
+            started_rx.recv().unwrap();
+            // A second probe while the first runs spawns nothing.
+            let second = gate.run(Some("cli"), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({ "n": 2 }))
+            });
+            assert_eq!(second.status, 429);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap().status, 200);
+        });
+        // A fresh result for the same target (however spelled) is served again.
+        let again = gate.run(Some(" CLI "), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "n": 3 }))
+        });
+        assert_eq!(again.status, 200);
+        assert_eq!(again.json_value().unwrap(), json!({ "n": 1 }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Another target probes. An error is returned as it is and is not remembered.
+        let other = gate.run(Some("vault"), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(HttpResponse::json(400, json!({ "error": "no" })))
+        });
+        assert_eq!(other.status, 400);
+        let retry = gate.run(Some("vault"), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({ "n": 4 }))
+        });
+        assert_eq!(retry.json_value().unwrap(), json!({ "n": 4 }));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn reading_vault_metadata_creates_neither_a_key_nor_a_vault_file() {
+        let home = TempDir::new().unwrap();
+        assert!(vault_metadata(Some(home.path())).unwrap().is_empty());
+        assert!(!fl_gate::resolve_master_key_path(Some(home.path())).exists());
+        assert!(!resolve_vault_path(Some(home.path())).exists());
     }
 
     #[cfg(unix)]

@@ -32,6 +32,15 @@ const ARCHIVE_EXTS: &[&str] = &[
 /// Most content revisions kept per artifact; older ones lose their snapshot and their row.
 pub(crate) const MAX_VERSIONS_PER_ARTIFACT: usize = 50;
 
+/// Most registry entries a file may be registered into on demand (`register_and_record_version`).
+/// The listing paths register what a session produced and prune what is gone; a route anyone
+/// holding a token can call must not grow the registry without bound.
+pub(crate) const MAX_REGISTRY_ENTRIES: usize = 2000;
+
+/// Most snapshot bytes kept under `<root>/versions/` across every artifact. A revision that
+/// would pass it is recorded (digest, size) but its bytes are not stored.
+const MAX_VERSION_STORE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Largest file `record_version` reads to hash it. A revision above `MAX_ARCHIVE_BYTES` is
 /// recorded (digest, size) but its bytes are not stored.
 const MAX_VERSION_HASH_BYTES: u64 = 16 * 1024 * 1024;
@@ -283,16 +292,44 @@ pub(crate) fn record_version(
     canonical: &Path,
     recheck: &dyn Fn(&Path) -> bool,
 ) -> io::Result<bool> {
+    record_version_inner(root, canonical, None, recheck)
+}
+
+/// [`record_version`] for a file that may not be registered yet: `entry` joins the registry once
+/// the file has passed the open, vetting, regular-file and size checks, so a refused file leaves
+/// no entry behind. Fails with `ErrorKind::QuotaExceeded` when the registry already holds
+/// `MAX_REGISTRY_ENTRIES` entries.
+pub(crate) fn register_and_record_version(
+    root: &Path,
+    canonical: &Path,
+    entry: ArtifactEntry,
+    recheck: &dyn Fn(&Path) -> bool,
+) -> io::Result<bool> {
+    record_version_inner(root, canonical, Some(entry), recheck)
+}
+
+fn registry_full() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::QuotaExceeded,
+        "the artifact registry is full",
+    )
+}
+
+fn record_version_inner(
+    root: &Path,
+    canonical: &Path,
+    register: Option<ArtifactEntry>,
+    recheck: &dyn Fn(&Path) -> bool,
+) -> io::Result<bool> {
     let canon_str = canonical.to_string_lossy().to_string();
     let latest = with_registry(root, |reg| {
-        reg.entries
-            .iter()
-            .find(|e| e.canonical_path == canon_str)
-            .map(|e| e.versions.last().map(|v| (v.size_bytes, v.source_mtime_ms)))
-    });
-    let Some(latest) = latest else {
-        return Err(io::Error::other("artifact is not in the registry"));
-    };
+        match reg.entries.iter().find(|e| e.canonical_path == canon_str) {
+            Some(e) => Ok(e.versions.last().map(|v| (v.size_bytes, v.source_mtime_ms))),
+            None if register.is_none() => Err(io::Error::other("artifact is not in the registry")),
+            None if reg.entries.len() >= MAX_REGISTRY_ENTRIES => Err(registry_full()),
+            None => Ok(None),
+        }
+    })?;
     let src = open_nofollow(canonical)?;
     #[cfg(target_os = "linux")]
     if !recheck(&resolved_path_of(&src)?) {
@@ -318,22 +355,41 @@ pub(crate) fn record_version(
     }
     let digest = sha256_hex(&bytes);
     let size = bytes.len() as u64;
-    let store = size <= MAX_ARCHIVE_BYTES;
+    let fits = size <= MAX_ARCHIVE_BYTES;
 
-    let added = with_registry(root, |reg| {
-        let Some(entry) = reg
+    with_registry(root, |reg| {
+        let at = match reg
             .entries
-            .iter_mut()
-            .find(|e| e.canonical_path == canon_str)
-        else {
-            return false;
+            .iter()
+            .position(|e| e.canonical_path == canon_str)
+        {
+            Some(at) => at,
+            None => {
+                let Some(new) = register else {
+                    return Ok(false);
+                };
+                if reg.entries.len() >= MAX_REGISTRY_ENTRIES {
+                    return Err(registry_full());
+                }
+                reg.entries.push(new);
+                reg.entries.len() - 1
+            }
         };
+        let stored: u64 = reg
+            .entries
+            .iter()
+            .flat_map(|e| &e.versions)
+            .filter(|v| v.snapshot_path.is_some())
+            .map(|v| v.size_bytes)
+            .sum();
+        let store = fits && stored.saturating_add(size) <= MAX_VERSION_STORE_BYTES;
+        let entry = &mut reg.entries[at];
         if let Some(last) = entry.versions.last_mut()
             && last.sha256 == digest
         {
             // Touched but not changed: remember the new stamp so the next scan skips it.
             last.source_mtime_ms = mtime;
-            return false;
+            return Ok(false);
         }
         let version = entry.versions.last().map_or(1, |v| v.version + 1);
         let snapshot_path = store.then(|| {
@@ -357,9 +413,8 @@ pub(crate) fn record_version(
             let old = entry.versions.remove(0);
             remove_snapshot(&managed_dir(root), &old);
         }
-        true
-    });
-    Ok(added)
+        Ok(true)
+    })
 }
 
 /// The bytes of revision `version` of the entry for `canon`, read from its stored snapshot. The
@@ -433,11 +488,14 @@ pub(crate) fn valid_managed_path(managed_dir: &Path, managed_path: &str) -> Opti
 
 /// Whether the hub keeps an archived copy of this file.
 pub(crate) fn is_archivable(path: &Path, size_bytes: u64) -> bool {
-    size_bytes <= MAX_ARCHIVE_BYTES
-        && path
-            .extension()
-            .and_then(|s| s.to_str())
-            .is_some_and(|ext| ARCHIVE_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
+    size_bytes <= MAX_ARCHIVE_BYTES && has_archive_ext(path)
+}
+
+/// Whether `path` has one of the user-facing extensions the artifact store keeps.
+pub(crate) fn has_archive_ext(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ARCHIVE_EXTS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
 /// A file name safe to join onto the managed dir: no separators, no leading dot, bounded length.
@@ -616,6 +674,20 @@ const MAX_SHEETS: usize = 32;
 const MAX_SHEET_ROWS: usize = 2000;
 const MAX_SHEET_COLS: usize = 100;
 const MAX_SLIDES: usize = 256;
+/// Largest XML part the tokenizer reads; a longer part is cut here and the preview is marked
+/// truncated.
+const MAX_XML_PART_BYTES: usize = 16 * 1024 * 1024;
+/// Most tokens one XML part yields (16 MiB of `<p/>` would be 5M); the walk then stops.
+const MAX_XML_TOKENS: usize = 1_000_000;
+/// Most text bytes (plus a small per-item charge) one preview may hold across every sheet, slide
+/// and block; the preview stops there and is marked truncated.
+const MAX_OFFICE_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+/// Longest paragraph or slide text kept; a longer one ends in an ellipsis.
+const MAX_OFFICE_TEXT_BYTES: usize = 64 * 1024;
+/// Longest cell or shared string kept, so one string cannot be repeated by many cells.
+const MAX_OFFICE_CELL_BYTES: usize = 4 * 1024;
+/// Bytes charged against the output budget for each item, on top of its text (JSON framing).
+const OFFICE_ITEM_OVERHEAD: usize = 16;
 
 /// Why an office file could not be previewed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -816,7 +888,8 @@ fn decode_entities(s: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let Some(semi) = rest.find(';').filter(|j| *j <= 10) else {
+        // Only the next 11 bytes can hold the `;`: a scan of the whole rest per `&` is quadratic.
+        let Some(semi) = rest.bytes().take(11).position(|b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -850,28 +923,62 @@ fn decode_entities(s: &str) -> String {
     out
 }
 
-/// Tokenize XML text. Comments, processing instructions and DOCTYPE are skipped; only the five
-/// predefined entities and numeric references are expanded, so no entity can blow up.
-fn xml_tokens(xml: &str) -> Vec<Xml> {
-    let mut out = Vec::new();
-    let mut rest = xml;
-    while !rest.is_empty() {
-        let Some(lt) = rest.find('<') else {
-            out.push(Xml::Text(decode_entities(rest)));
-            break;
-        };
-        if lt > 0 {
-            out.push(Xml::Text(decode_entities(&rest[..lt])));
+/// Lazy tokenizer over XML text (see [`xml_tokens`]).
+struct XmlTokens<'a> {
+    rest: &'a str,
+    /// The tag that followed a text token, held until the text is handed out.
+    pending: Option<Xml>,
+    emitted: usize,
+    truncated: bool,
+}
+
+impl XmlTokens<'_> {
+    /// Whether the input was cut at the part size cap or the walk stopped at the token cap.
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    fn advance(&mut self) -> Option<Xml> {
+        if let Some(tok) = self.pending.take() {
+            return Some(tok);
         }
-        rest = &rest[lt..];
+        loop {
+            let rest = self.rest;
+            if rest.is_empty() {
+                return None;
+            }
+            let Some(lt) = rest.find('<') else {
+                self.rest = "";
+                return Some(Xml::Text(decode_entities(rest)));
+            };
+            let text = (lt > 0).then(|| Xml::Text(decode_entities(&rest[..lt])));
+            let rest = &rest[lt..];
+            let (tag, after) = Self::tag(rest);
+            self.rest = after;
+            match (text, tag) {
+                (Some(text), tag) => {
+                    self.pending = tag;
+                    return Some(text);
+                }
+                (None, Some(tag)) => return Some(tag),
+                (None, None) => {}
+            }
+        }
+    }
+
+    /// The token at the start of `rest` (which begins with `<`), if it is one, and the text
+    /// after it. An unterminated tag ends the input.
+    fn tag(rest: &str) -> (Option<Xml>, &str) {
         if let Some(body) = rest.strip_prefix("<![CDATA[") {
             let end = body.find("]]>").unwrap_or(body.len());
-            out.push(Xml::Text(body[..end].to_string()));
-            rest = body.get(end + 3..).unwrap_or("");
+            (
+                Some(Xml::Text(body[..end].to_string())),
+                body.get(end + 3..).unwrap_or(""),
+            )
         } else if let Some(body) = rest.strip_prefix("<!--") {
-            rest = body.find("-->").map_or("", |i| &body[i + 3..]);
+            (None, body.find("-->").map_or("", |i| &body[i + 3..]))
         } else if rest.starts_with("<?") || rest.starts_with("<!") {
-            rest = rest.find('>').map_or("", |i| &rest[i + 1..]);
+            (None, rest.find('>').map_or("", |i| &rest[i + 1..]))
         } else {
             // A tag; `>` inside a quoted attribute value does not end it.
             let mut quote = None;
@@ -887,26 +994,106 @@ fn xml_tokens(xml: &str) -> Vec<Xml> {
                     _ => {}
                 }
             }
-            let Some(end) = end else { break };
+            let Some(end) = end else {
+                return (None, "");
+            };
             let inner = &rest[1..end];
-            rest = &rest[end + 1..];
-            if let Some(name) = inner.strip_prefix('/') {
-                out.push(Xml::End(local_name(name.trim()).to_string()));
+            let after = &rest[end + 1..];
+            let tok = if let Some(name) = inner.strip_prefix('/') {
+                Xml::End(local_name(name.trim()).to_string())
             } else {
                 let empty = inner.ends_with('/');
                 let inner = inner.trim_end_matches('/');
                 let (name, attrs) = inner
                     .split_once(|c: char| c.is_whitespace())
                     .unwrap_or((inner, ""));
-                out.push(Xml::Start {
+                Xml::Start {
                     name: local_name(name).to_string(),
                     attrs: attrs.to_string(),
                     empty,
-                });
-            }
+                }
+            };
+            (Some(tok), after)
         }
     }
-    out
+}
+
+impl Iterator for XmlTokens<'_> {
+    type Item = Xml;
+
+    fn next(&mut self) -> Option<Xml> {
+        if self.emitted >= MAX_XML_TOKENS {
+            self.truncated |= self.pending.is_some() || !self.rest.is_empty();
+            return None;
+        }
+        let tok = self.advance()?;
+        self.emitted += 1;
+        Some(tok)
+    }
+}
+
+/// Tokenize XML text, lazily. Comments, processing instructions and DOCTYPE are skipped; only
+/// the five predefined entities and numeric references are expanded, so no entity can blow up.
+/// Input past `MAX_XML_PART_BYTES` is ignored and the walk ends after `MAX_XML_TOKENS` tokens;
+/// either sets [`XmlTokens::truncated`].
+fn xml_tokens(xml: &str) -> XmlTokens<'_> {
+    let mut xml = xml;
+    let mut truncated = false;
+    if xml.len() > MAX_XML_PART_BYTES {
+        let mut cut = MAX_XML_PART_BYTES;
+        while !xml.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        xml = &xml[..cut];
+        truncated = true;
+    }
+    XmlTokens {
+        rest: xml,
+        pending: None,
+        emitted: 0,
+        truncated,
+    }
+}
+
+/// `s` cut to at most `cap` bytes on a char boundary, ending in an ellipsis when cut.
+fn clip_text(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let mut cut = cap.saturating_sub('\u{2026}'.len_utf8());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}\u{2026}", &s[..cut])
+}
+
+/// What is left of a preview's output allowance, shared by every sheet, slide and block of one
+/// file so a repeated or huge string cannot multiply into a huge response.
+struct TextBudget {
+    left: usize,
+    exhausted: bool,
+}
+
+impl TextBudget {
+    fn new() -> Self {
+        Self {
+            left: MAX_OFFICE_OUTPUT_BYTES,
+            exhausted: false,
+        }
+    }
+
+    /// `s` clipped to `cap` and charged to the budget. `None` once the budget cannot cover it;
+    /// every later call then also returns `None`.
+    fn take(&mut self, s: &str, cap: usize) -> Option<String> {
+        let text = clip_text(s, cap);
+        let cost = text.len() + OFFICE_ITEM_OVERHEAD;
+        if self.exhausted || cost > self.left {
+            self.exhausted = true;
+            return None;
+        }
+        self.left -= cost;
+        Some(text)
+    }
 }
 
 /// The value of attribute `key` (compared by local name) in a raw attribute string.
@@ -969,7 +1156,7 @@ fn heading_level(style: &str) -> Option<u8> {
 }
 
 /// `word/document.xml` into ordered blocks: headings, paragraphs and tables.
-fn docx_blocks(xml: &str) -> (Vec<Value>, bool) {
+fn docx_blocks(xml: &str, budget: &mut TextBudget) -> (Vec<Value>, bool) {
     let mut blocks: Vec<Value> = Vec::new();
     let mut truncated = false;
     let mut tbl_depth = 0usize;
@@ -980,7 +1167,8 @@ fn docx_blocks(xml: &str) -> (Vec<Value>, bool) {
     let mut style = String::new();
     let mut in_para = false;
     let mut in_text = false;
-    for tok in xml_tokens(xml) {
+    let mut toks = xml_tokens(xml);
+    for tok in &mut toks {
         match tok {
             Xml::Start { name, attrs, empty } => match name.as_str() {
                 "tbl" => {
@@ -1019,14 +1207,27 @@ fn docx_blocks(xml: &str) -> (Vec<Value>, bool) {
                     } else if !text.is_empty() {
                         if blocks.len() >= MAX_DOCX_BLOCKS {
                             truncated = true;
-                        } else if let Some(level) = heading_level(&style) {
-                            blocks.push(json!({ "type": "heading", "level": level, "text": text }));
                         } else {
-                            blocks.push(json!({ "type": "paragraph", "text": text }));
+                            let Some(text) = budget.take(&text, MAX_OFFICE_TEXT_BYTES) else {
+                                break;
+                            };
+                            if let Some(level) = heading_level(&style) {
+                                blocks.push(
+                                    json!({ "type": "heading", "level": level, "text": text }),
+                                );
+                            } else {
+                                blocks.push(json!({ "type": "paragraph", "text": text }));
+                            }
                         }
                     }
                 }
-                "tc" if tbl_depth == 1 => row.push(std::mem::take(&mut cell)),
+                "tc" if tbl_depth == 1 => {
+                    let Some(text) = budget.take(&cell, MAX_OFFICE_CELL_BYTES) else {
+                        break;
+                    };
+                    cell.clear();
+                    row.push(text);
+                }
                 "tr" if tbl_depth == 1 => {
                     if rows.len() < MAX_SHEET_ROWS {
                         rows.push(std::mem::take(&mut row));
@@ -1050,15 +1251,17 @@ fn docx_blocks(xml: &str) -> (Vec<Value>, bool) {
             },
         }
     }
-    (blocks, truncated)
+    (blocks, truncated || toks.truncated() || budget.exhausted)
 }
 
-/// `xl/sharedStrings.xml` into the string table.
-fn shared_strings(xml: &str) -> Vec<String> {
+/// `xl/sharedStrings.xml` into the string table, each string clipped to `MAX_OFFICE_CELL_BYTES`.
+/// The flag is whether the part was cut short.
+fn shared_strings(xml: &str) -> (Vec<String>, bool) {
     let mut out = Vec::new();
     let mut cur = String::new();
     let (mut in_si, mut in_t, mut in_phonetic) = (false, false, false);
-    for tok in xml_tokens(xml) {
+    let mut toks = xml_tokens(xml);
+    for tok in &mut toks {
         match tok {
             Xml::Start { name, empty, .. } => match name.as_str() {
                 "si" => {
@@ -1073,14 +1276,15 @@ fn shared_strings(xml: &str) -> Vec<String> {
                 "t" if in_si && !in_phonetic && !empty => in_t = true,
                 _ => {}
             },
-            Xml::Text(t) if in_t => cur.push_str(&t),
+            // Past the cap the rest of the string would only be clipped away.
+            Xml::Text(t) if in_t && cur.len() <= MAX_OFFICE_CELL_BYTES => cur.push_str(&t),
             Xml::Text(_) => {}
             Xml::End(name) => match name.as_str() {
                 "t" => in_t = false,
                 "rPh" => in_phonetic = false,
                 "si" => {
                     in_si = false;
-                    out.push(std::mem::take(&mut cur));
+                    out.push(clip_text(&cur, MAX_OFFICE_CELL_BYTES));
                 }
                 _ => {}
             },
@@ -1089,7 +1293,7 @@ fn shared_strings(xml: &str) -> Vec<String> {
             break;
         }
     }
-    out
+    (out, toks.truncated())
 }
 
 /// Zero-based column of a cell reference such as `AB12`.
@@ -1111,7 +1315,7 @@ fn column_index(cell_ref: &str) -> Option<usize> {
 }
 
 /// One worksheet into a dense grid (bounded by the sheet row and column caps).
-fn sheet_grid(xml: &str, strings: &[String]) -> (Vec<Vec<String>>, bool) {
+fn sheet_grid(xml: &str, strings: &[String], budget: &mut TextBudget) -> (Vec<Vec<String>>, bool) {
     let mut grid: Vec<Vec<String>> = Vec::new();
     let mut truncated = false;
     let mut row_idx = 0usize;
@@ -1121,7 +1325,8 @@ fn sheet_grid(xml: &str, strings: &[String]) -> (Vec<Vec<String>>, bool) {
     let mut cell_type = String::new();
     let mut value = String::new();
     let (mut in_cell, mut in_v, mut in_t) = (false, false, false);
-    for tok in xml_tokens(xml) {
+    let mut toks = xml_tokens(xml);
+    for tok in &mut toks {
         match tok {
             Xml::Start { name, attrs, empty } => match name.as_str() {
                 "row" => {
@@ -1144,22 +1349,30 @@ fn sheet_grid(xml: &str, strings: &[String]) -> (Vec<Vec<String>>, bool) {
                 "t" if in_cell && !empty => in_t = true,
                 _ => {}
             },
-            Xml::Text(t) if in_v || in_t => value.push_str(&t),
+            Xml::Text(t) if (in_v || in_t) && value.len() <= MAX_OFFICE_CELL_BYTES => {
+                value.push_str(&t)
+            }
             Xml::Text(_) => {}
             Xml::End(name) => match name.as_str() {
                 "v" => in_v = false,
                 "t" => in_t = false,
                 "c" if in_cell => {
                     in_cell = false;
-                    let text = match cell_type.as_str() {
+                    let text: &str = match cell_type.as_str() {
                         "s" => value
                             .trim()
                             .parse::<usize>()
                             .ok()
-                            .and_then(|i| strings.get(i).cloned())
-                            .unwrap_or_default(),
-                        "b" => if value.trim() == "1" { "TRUE" } else { "FALSE" }.to_string(),
-                        _ => value.clone(),
+                            .and_then(|i| strings.get(i))
+                            .map_or("", String::as_str),
+                        "b" => {
+                            if value.trim() == "1" {
+                                "TRUE"
+                            } else {
+                                "FALSE"
+                            }
+                        }
+                        _ => &value,
                     };
                     if text.is_empty() {
                         continue;
@@ -1168,6 +1381,9 @@ fn sheet_grid(xml: &str, strings: &[String]) -> (Vec<Vec<String>>, bool) {
                         truncated = true;
                         continue;
                     }
+                    let Some(text) = budget.take(text, MAX_OFFICE_CELL_BYTES) else {
+                        break;
+                    };
                     if grid.len() <= row_idx {
                         grid.resize_with(row_idx + 1, Vec::new);
                     }
@@ -1181,13 +1397,12 @@ fn sheet_grid(xml: &str, strings: &[String]) -> (Vec<Vec<String>>, bool) {
             },
         }
     }
-    (grid, truncated)
+    (grid, truncated || toks.truncated() || budget.exhausted)
 }
 
 /// Id to target pairs of a `.rels` part.
 fn relationships(xml: &str) -> Vec<(String, String, String)> {
     xml_tokens(xml)
-        .into_iter()
         .filter_map(|t| match t {
             Xml::Start { name, attrs, .. } if name == "Relationship" => Some((
                 xml_attr(&attrs, "Id")?,
@@ -1219,7 +1434,7 @@ fn resolve_target(base_dir: &str, target: &str) -> String {
 }
 
 fn xlsx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeError> {
-    let strings = read_utf8(zip, "xl/sharedStrings.xml", budget)?
+    let (strings, strings_cut) = read_utf8(zip, "xl/sharedStrings.xml", budget)?
         .map(|x| shared_strings(&x))
         .unwrap_or_default();
     let workbook = read_utf8(zip, "xl/workbook.xml", budget)?.unwrap_or_default();
@@ -1227,7 +1442,6 @@ fn xlsx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
         .map(|x| relationships(&x))
         .unwrap_or_default();
     let declared: Vec<(String, Option<String>)> = xml_tokens(&workbook)
-        .into_iter()
         .filter_map(|t| match t {
             Xml::Start { name, attrs, .. } if name == "sheet" => Some((
                 xml_attr(&attrs, "name").unwrap_or_default(),
@@ -1238,7 +1452,8 @@ fn xlsx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
         .collect();
     let ordinal = numbered_parts(zip, "xl/worksheets/", "sheet");
     let mut sheets = Vec::new();
-    let mut any_truncated = declared.len() > MAX_SHEETS;
+    let mut text = TextBudget::new();
+    let mut any_truncated = declared.len() > MAX_SHEETS || strings_cut;
     // Sheets named by the workbook, with their part found by relationship, else by position.
     let count = if declared.is_empty() {
         ordinal.len()
@@ -1246,6 +1461,10 @@ fn xlsx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
         declared.len()
     };
     for i in 0..count.min(MAX_SHEETS) {
+        if text.exhausted {
+            any_truncated = true;
+            break;
+        }
         let (name, rid) = declared
             .get(i)
             .cloned()
@@ -1260,7 +1479,7 @@ fn xlsx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
             .or_else(|| ordinal.get(i).map(|(_, p)| p.clone()));
         let (rows, truncated) = match part {
             Some(p) => read_utf8(zip, &p, budget)?
-                .map(|x| sheet_grid(&x, &strings))
+                .map(|x| sheet_grid(&x, &strings, &mut text))
                 .unwrap_or_default(),
             None => (Vec::new(), false),
         };
@@ -1277,9 +1496,12 @@ fn xlsx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
     Ok(json!({ "kind": "xlsx", "sheets": sheets, "truncated": any_truncated }))
 }
 
+/// A text shape: its placeholder type and paragraph texts.
+type SlideShape = (Option<String>, Vec<String>);
+
 /// Text shapes of a slide or notes part: placeholder type plus paragraph texts. Paragraphs
 /// outside any shape (table frames) come back as shapes with no placeholder.
-fn slide_shapes(xml: &str) -> Vec<(Option<String>, Vec<String>)> {
+fn slide_shapes(xml: &str, budget: &mut TextBudget) -> (Vec<SlideShape>, bool) {
     let mut shapes = Vec::new();
     let mut sp_depth = 0usize;
     let mut ph: Option<String> = None;
@@ -1287,7 +1509,8 @@ fn slide_shapes(xml: &str) -> Vec<(Option<String>, Vec<String>)> {
     let mut loose: Vec<String> = Vec::new();
     let mut para = String::new();
     let (mut in_p, mut in_t) = (false, false);
-    for tok in xml_tokens(xml) {
+    let mut toks = xml_tokens(xml);
+    for tok in &mut toks {
         match tok {
             Xml::Start { name, attrs, empty } => match name.as_str() {
                 "sp" => {
@@ -1314,6 +1537,9 @@ fn slide_shapes(xml: &str) -> Vec<(Option<String>, Vec<String>)> {
                     in_p = false;
                     let text = para.trim().to_string();
                     if !text.is_empty() {
+                        let Some(text) = budget.take(&text, MAX_OFFICE_TEXT_BYTES) else {
+                            break;
+                        };
                         if sp_depth > 0 { &mut paras } else { &mut loose }.push(text);
                     }
                 }
@@ -1330,17 +1556,25 @@ fn slide_shapes(xml: &str) -> Vec<(Option<String>, Vec<String>)> {
     if !loose.is_empty() {
         shapes.push((None, loose));
     }
-    shapes
+    (shapes, toks.truncated() || budget.exhausted)
 }
 
 fn pptx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeError> {
     let slide_parts = numbered_parts(zip, "ppt/slides/", "slide");
     let mut slides = Vec::new();
+    let mut text = TextBudget::new();
+    let mut cut = slide_parts.len() > MAX_SLIDES;
     for (n, part) in slide_parts.iter().take(MAX_SLIDES) {
+        if text.exhausted {
+            cut = true;
+            break;
+        }
         let xml = read_utf8(zip, part, budget)?.unwrap_or_default();
         let mut title = String::new();
         let mut bullets: Vec<String> = Vec::new();
-        for (ph, paras) in slide_shapes(&xml) {
+        let (shapes, shapes_cut) = slide_shapes(&xml, &mut text);
+        cut |= shapes_cut;
+        for (ph, paras) in shapes {
             match ph.as_deref() {
                 Some("title" | "ctrTitle") => {
                     if title.is_empty() {
@@ -1364,7 +1598,9 @@ fn pptx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
             .unwrap_or_else(|| format!("ppt/notesSlides/notesSlide{n}.xml"));
         let notes = read_utf8(zip, &notes_part, budget)?
             .map(|x| {
-                slide_shapes(&x)
+                let (shapes, notes_cut) = slide_shapes(&x, &mut text);
+                cut |= notes_cut;
+                shapes
                     .into_iter()
                     .filter(|(ph, _)| ph.as_deref() == Some("body"))
                     .flat_map(|(_, paras)| paras)
@@ -1382,7 +1618,7 @@ fn pptx_preview(zip: &ZipArchive<'_>, budget: &mut u64) -> Result<Value, OfficeE
     Ok(json!({
         "kind": "pptx",
         "slides": slides,
-        "truncated": slide_parts.len() > MAX_SLIDES,
+        "truncated": cut,
     }))
 }
 
@@ -1396,7 +1632,7 @@ pub(crate) fn office_preview(ext: &str, data: &[u8]) -> Result<Value, OfficeErro
             let Some(xml) = read_utf8(&zip, "word/document.xml", &mut budget)? else {
                 return oerr("not a Word document: word/document.xml is missing");
             };
-            let (blocks, truncated) = docx_blocks(&xml);
+            let (blocks, truncated) = docx_blocks(&xml, &mut TextBudget::new());
             Ok(json!({ "kind": "docx", "blocks": blocks, "truncated": truncated }))
         }
         "xlsx" => {
@@ -1837,6 +2073,71 @@ mod tests {
     }
 
     #[test]
+    fn registering_on_demand_happens_after_vetting_and_stops_at_the_entry_cap() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        let file = tmp.path().join("a.md");
+        fs::write(&file, "one").unwrap();
+        let canon = fs::canonicalize(&file).unwrap();
+        // A file that fails vetting leaves no entry behind.
+        assert!(
+            register_and_record_version(&root, &canon, entry(&canon, None), &|_| false).is_err()
+        );
+        assert!(Registry::load(&root).entries.is_empty());
+        // One that passes is registered and recorded in the same step.
+        assert!(
+            register_and_record_version(&root, &canon, entry(&canon, None), &|_| true).unwrap()
+        );
+        assert_eq!(versions_of(&root, &canon).len(), 1);
+        // A full registry refuses a new entry, before the file is even read.
+        with_registry(&root, |reg| {
+            for i in 0..MAX_REGISTRY_ENTRIES {
+                reg.upsert(entry(Path::new(&format!("/gone/{i}.md")), None));
+            }
+        });
+        let other = tmp.path().join("b.md");
+        fs::write(&other, "two").unwrap();
+        let other = fs::canonicalize(&other).unwrap();
+        let err =
+            register_and_record_version(&root, &other, entry(&other, None), &|_| true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::QuotaExceeded);
+        assert_eq!(
+            Registry::load(&root).entries.len(),
+            MAX_REGISTRY_ENTRIES + 1
+        );
+        // A registered file is still recorded.
+        fs::write(&file, "one more").unwrap();
+        assert!(record_version(&root, &canon, &|_| true).unwrap());
+    }
+
+    #[test]
+    fn a_revision_past_the_total_snapshot_cap_is_recorded_without_its_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let root = data_root(tmp.path());
+        // Another artifact already accounts for nearly all the allowed snapshot bytes.
+        with_registry(&root, |reg| {
+            let mut full = entry(Path::new("/gone/big.pdf"), None);
+            full.versions.push(ArtifactVersion {
+                version: 1,
+                sha256: "0".repeat(64),
+                size_bytes: MAX_VERSION_STORE_BYTES - 2,
+                recorded_at_ms: 1,
+                source_mtime_ms: 1,
+                snapshot_path: Some("/gone/v1".into()),
+            });
+            reg.upsert(full);
+        });
+        let file = tmp.path().join("a.md");
+        fs::write(&file, "three").unwrap();
+        let canon = fs::canonicalize(&file).unwrap();
+        registered(&root, &canon);
+        assert!(record_version(&root, &canon, &|_| true).unwrap());
+        let v = versions_of(&root, &canon);
+        assert_eq!((v.len(), v[0].size_bytes, v[0].sha256.len()), (1, 5, 64));
+        assert_eq!(v[0].snapshot_path, None);
+    }
+
+    #[test]
     fn versions_survive_an_upsert_and_are_trimmed_to_the_cap() {
         let tmp = TempDir::new().unwrap();
         let root = data_root(tmp.path());
@@ -2265,10 +2566,116 @@ mod tests {
     }
 
     #[test]
+    fn a_huge_shared_string_repeated_by_many_cells_gives_a_bounded_preview() {
+        // One 1 MiB string, referenced by 100k cells: uncapped, that is 100 GB of output.
+        let big = "x".repeat(1024 * 1024);
+        let shared = format!("<sst><si><t>{big}</t></si></sst>");
+        let mut sheet = String::from("<worksheet><sheetData>");
+        for _ in 0..1000 {
+            sheet.push_str("<row>");
+            sheet.push_str(&"<c t=\"s\"><v>0</v></c>".repeat(100));
+            sheet.push_str("</row>");
+        }
+        sheet.push_str("</sheetData></worksheet>");
+        let workbook = r#"<workbook><sheets><sheet name="One" sheetId="1"/></sheets></workbook>"#;
+        let zip = build_zip(
+            &[
+                ("xl/workbook.xml", workbook.as_bytes()),
+                ("xl/sharedStrings.xml", shared.as_bytes()),
+                ("xl/worksheets/sheet1.xml", sheet.as_bytes()),
+            ],
+            true,
+        );
+        let p = office_preview("xlsx", &zip).unwrap();
+        let size = serde_json::to_string(&p).unwrap().len();
+        assert!(size < 4 * 1024 * 1024, "{size} bytes of preview");
+        assert_eq!(p["truncated"], true);
+        assert_eq!(p["sheets"][0]["truncated"], true);
+        let cell = p["sheets"][0]["rows"][0][0].as_str().unwrap();
+        assert!(cell.len() <= MAX_OFFICE_CELL_BYTES && cell.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn docx_and_pptx_text_is_bounded_by_the_shared_output_budget() {
+        let para = "y".repeat(32 * 1024);
+        let docx = format!(
+            "<w:document><w:body>{}</w:body></w:document>",
+            format!("<w:p><w:r><w:t>{para}</w:t></w:r></w:p>").repeat(200)
+        );
+        let zip = build_zip(&[("word/document.xml", docx.as_bytes())], true);
+        let p = office_preview("docx", &zip).unwrap();
+        assert!(serde_json::to_string(&p).unwrap().len() < 4 * 1024 * 1024);
+        assert_eq!(p["truncated"], true);
+
+        let slide = format!(
+            "<p:sld><p:sp><p:txBody>{}</p:txBody></p:sp></p:sld>",
+            format!("<a:p><a:r><a:t>{para}</a:t></a:r></a:p>").repeat(200)
+        );
+        let zip = build_zip(
+            &[
+                ("ppt/presentation.xml", b"<p/>"),
+                ("ppt/slides/slide1.xml", slide.as_bytes()),
+            ],
+            true,
+        );
+        let p = office_preview("pptx", &zip).unwrap();
+        assert!(serde_json::to_string(&p).unwrap().len() < 4 * 1024 * 1024);
+        assert_eq!(p["truncated"], true);
+    }
+
+    #[test]
+    fn xml_tokens_stop_at_the_token_cap_and_the_part_cap() {
+        let over = "<p/>".repeat(MAX_XML_TOKENS + 10);
+        let mut toks = xml_tokens(&over);
+        assert_eq!((&mut toks).count(), MAX_XML_TOKENS);
+        assert!(toks.truncated());
+        // Exactly at the cap is not truncated.
+        let at_cap = "<p/>".repeat(MAX_XML_TOKENS);
+        let mut exact = xml_tokens(&at_cap);
+        assert_eq!((&mut exact).count(), MAX_XML_TOKENS);
+        assert!(!exact.truncated());
+        // A part past the size cap is cut there, on a char boundary.
+        let long = format!("{}\u{e9}", "a".repeat(MAX_XML_PART_BYTES - 1));
+        let mut cut = xml_tokens(&long);
+        let Some(Xml::Text(t)) = cut.next() else {
+            panic!("expected one text token");
+        };
+        assert_eq!(t.len(), MAX_XML_PART_BYTES - 1);
+        assert!(cut.truncated());
+
+        // End to end: a part of empty paragraphs past the token cap is flagged truncated.
+        let docx = format!("<w:body>{}</w:body>", "<w:p/>".repeat(MAX_XML_TOKENS + 10));
+        let zip = build_zip(&[("word/document.xml", docx.as_bytes())], true);
+        assert_eq!(office_preview("docx", &zip).unwrap()["truncated"], true);
+    }
+
+    #[test]
+    fn decode_entities_is_linear_on_ampersands_without_a_semicolon() {
+        let amps = "&".repeat(1024 * 1024);
+        let start = std::time::Instant::now();
+        assert_eq!(decode_entities(&amps), amps);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+        // Behaviour is unchanged for real, unknown and over-long references.
+        assert_eq!(
+            decode_entities("a &amp; b &lt;&#65;&#x42;&gt; &bogus; & ; &toolongentity;"),
+            "a & b <AB> &bogus; & ; &toolongentity;"
+        );
+        assert_eq!(
+            decode_entities("&\u{e9}&\u{e9};&#xZZ;"),
+            "&\u{e9}&\u{e9};&#xZZ;"
+        );
+    }
+
+    #[test]
     fn xml_tokenizer_handles_cdata_comments_quotes_and_entities() {
         let toks = xml_tokens(
             r#"<?xml version="1.0"?><!DOCTYPE x><!-- <a> --><a:b k="x>y" j='1'>t &lt;&unknown;&#xZZ; <![CDATA[<raw>]]></a:b><c/>"#,
-        );
+        )
+        .collect::<Vec<_>>();
         assert_eq!(
             toks[0],
             Xml::Start {
