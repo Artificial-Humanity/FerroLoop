@@ -74,6 +74,7 @@ use crate::auth::{
     HubAuthority, constant_time_eq, extract_bearer_token, extract_session_cookie,
     format_logout_set_cookie, format_session_set_cookie, sha256_hex,
 };
+use crate::cloud_adapters;
 use crate::discovery::{
     DiscoveryStoreSnapshot, discover_route_sessions_without_model_info,
     discover_sessions_from_snapshot, list_git_worktrees, read_session_context_usage_from_snapshot,
@@ -519,6 +520,8 @@ pub fn handle_http_request(state: &HubState, req: &HttpRequest) -> HttpResponse 
         ("POST", "/api/v1/records") => records::handle_post_record(state, &authority, req),
         ("GET", "/api/v1/settings") => handle_get_settings(state),
         ("PUT", "/api/v1/settings") => handle_put_settings(state, &authority, req),
+        ("GET", "/api/v1/cloud/adapters") => handle_get_cloud_adapters(state),
+        ("PUT", "/api/v1/cloud/adapters") => handle_put_cloud_adapters(state, &authority, req),
         ("GET", "/api/v1/gate/secrets") => handle_get_gate_secrets(state),
         ("POST", "/api/v1/gate/secrets") => handle_post_gate_secret(state, &authority, req),
         ("GET", "/api/v1/gate/connectors") => handle_get_gate_connectors(state),
@@ -3289,6 +3292,69 @@ fn handle_put_settings(
         Err(settings::UpdateError::Io(e)) => HttpResponse::json(
             500,
             json!({ "error": format!("could not save settings: {e}") }),
+        ),
+    }
+}
+
+/// `GET /api/v1/cloud/adapters` (Records 52 and 53): the saved cloud adapter config, or the
+/// defaults. A saved file that cannot be used is a 500, never a silent reset.
+fn handle_get_cloud_adapters(state: &HubState) -> HttpResponse {
+    let Some(home) = hub_home_dir(state) else {
+        return HttpResponse::json(200, json!(cloud_adapters::CloudAdaptersConfig::default()));
+    };
+    match cloud_adapters::load(&home) {
+        Ok(config) => HttpResponse::json(200, json!(config)),
+        Err(cloud_adapters::Unreadable) => {
+            HttpResponse::json(500, json!({ "error": cloud_adapters::UNREADABLE_MESSAGE }))
+        }
+    }
+}
+
+/// `PUT /api/v1/cloud/adapters`: merge a full or partial body into the saved config and
+/// validate the merged result. Owner only, checked before any file access. Broadcasts
+/// `cloud_adapters.updated` on the `cloud_adapters` channel.
+fn handle_put_cloud_adapters(
+    state: &HubState,
+    authority: &HubAuthority,
+    req: &HttpRequest,
+) -> HttpResponse {
+    if !authority.is_owner() {
+        return HttpResponse::json(
+            403,
+            json!({ "error": "only Owner authority may change cloud adapter settings" }),
+        );
+    }
+    let body = match json_object_body(req) {
+        Ok(body) => body,
+        Err(resp) => return resp,
+    };
+    let patch: cloud_adapters::CloudAdaptersPatch = match serde_json::from_value(body) {
+        Ok(patch) => patch,
+        Err(e) => {
+            return HttpResponse::json(
+                400,
+                json!({ "error": format!("invalid cloud adapter settings: {e}") }),
+            );
+        }
+    };
+    let Some(home) = hub_home_dir(state) else {
+        return HttpResponse::json(500, json!({ "error": "home directory unavailable" }));
+    };
+    match cloud_adapters::update(&home, patch) {
+        Ok(updated) => {
+            let data = json!(updated);
+            state.broadcast("cloud_adapters", "cloud_adapters.updated", data.clone());
+            HttpResponse::json(200, data)
+        }
+        Err(cloud_adapters::UpdateError::Invalid(msg)) => {
+            HttpResponse::json(400, json!({ "error": msg }))
+        }
+        Err(cloud_adapters::UpdateError::Unreadable) => {
+            HttpResponse::json(500, json!({ "error": cloud_adapters::UNREADABLE_MESSAGE }))
+        }
+        Err(cloud_adapters::UpdateError::Io(_)) => HttpResponse::json(
+            500,
+            json!({ "error": "could not save cloud adapter settings" }),
         ),
     }
 }

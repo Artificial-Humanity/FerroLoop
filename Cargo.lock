@@ -454,6 +454,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "ureq",
  "uuid",
  "walkdir",
 ]

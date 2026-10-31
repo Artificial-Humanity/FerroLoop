@@ -5,6 +5,7 @@
 pub mod api;
 mod artifacts;
 pub mod auth;
+pub mod cloud_adapters;
 pub mod commands;
 mod direct_quota;
 pub mod discovery;
@@ -5970,5 +5971,275 @@ default_target = "wire:felicity"
         assert_eq!(frame.event, "settings.updated");
         assert_eq!(frame.data, resp.json_value().unwrap());
         assert_eq!(frame.data["theme_preference"], "light");
+    }
+
+    // --- Records 52 and 53: cloud adapter settings -------------------------------------------
+
+    const CLOUD_URL: &str = "/api/v1/cloud/adapters";
+
+    fn cloud_file(tmp: &TempDir) -> std::path::PathBuf {
+        tmp.path().join(".config/fl/cloud-adapters.json")
+    }
+
+    fn default_cloud_json() -> Value {
+        json!({
+            "store_sync": {
+                "provider": "none",
+                "sync_mode": "local_cache",
+                "endpoint_url": "",
+                "enabled": false,
+            },
+            "gate_cloud": {
+                "registry_provider": "none",
+                "relay_endpoint_url": "",
+                "secret_manager_enabled": false,
+                "model_armor_enabled": false,
+                "endpoint_url": "",
+                "enabled": false,
+            },
+        })
+    }
+
+    #[test]
+    fn cloud_adapters_get_returns_defaults_for_any_authenticated_caller() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let unauth = handle_http_request(&state, &HttpRequest::new("GET", CLOUD_URL));
+        assert_eq!(unauth.status, 401);
+        for token in [OWNER, PEER] {
+            let resp = call(&state, "GET", CLOUD_URL, token, &json!({}));
+            assert_eq!(resp.status, 200, "{}", error_text(&resp));
+            assert_eq!(resp.json_value().unwrap(), default_cloud_json());
+        }
+        assert!(!cloud_file(&tmp).exists(), "reading never writes the file");
+    }
+
+    #[test]
+    fn cloud_adapters_put_is_owner_only_and_a_peer_touches_no_file() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let peer = call(
+            &state,
+            "PUT",
+            CLOUD_URL,
+            PEER,
+            &json!({ "store_sync": { "enabled": true } }),
+        );
+        assert_eq!(peer.status, 403, "{}", error_text(&peer));
+        // The gate runs before anything else: a Peer's malformed body is a 403, not a 400, and
+        // neither the file nor its directory appears.
+        let peer_bad = handle_http_request(
+            &state,
+            &HttpRequest::new("PUT", CLOUD_URL)
+                .with_header("Authorization", format!("Bearer {PEER}"))
+                .with_body(b"{ nope".to_vec()),
+        );
+        assert_eq!(peer_bad.status, 403);
+        assert!(!cloud_file(&tmp).exists());
+        assert!(!tmp.path().join(".config/fl").exists());
+        // And it never reaches a damaged file either.
+        fs::create_dir_all(cloud_file(&tmp).parent().unwrap()).unwrap();
+        fs::write(cloud_file(&tmp), "{ damaged").unwrap();
+        let again = call(&state, "PUT", CLOUD_URL, PEER, &json!({}));
+        assert_eq!(again.status, 403);
+        assert_eq!(fs::read(cloud_file(&tmp)).unwrap(), b"{ damaged");
+    }
+
+    #[test]
+    fn cloud_adapters_put_merges_partials_persists_and_honours_the_alias() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let resp = call(
+            &state,
+            "PUT",
+            CLOUD_URL,
+            OWNER,
+            &json!({ "store_sync": { "provider": "gcp", "endpoint_url": "https://sync.example.com/v1" } }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        let mut expected = default_cloud_json();
+        expected["store_sync"]["provider"] = json!("gcp");
+        expected["store_sync"]["endpoint_url"] = json!("https://sync.example.com/v1");
+        assert_eq!(resp.json_value().unwrap(), expected);
+
+        // The `gate_registry` alias is read; the answer and the file say `gate_cloud`.
+        let resp = call(
+            &state,
+            "PUT",
+            CLOUD_URL,
+            OWNER,
+            &json!({
+                "gate_registry": { "registry_provider": "aws", "relay_endpoint_url": "http://127.0.0.1:8099/r" },
+                "store_sync": { "sync_mode": "cloud_pre_cache", "enabled": true },
+            }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        expected["gate_cloud"]["registry_provider"] = json!("aws");
+        expected["gate_cloud"]["relay_endpoint_url"] = json!("http://127.0.0.1:8099/r");
+        expected["store_sync"]["sync_mode"] = json!("cloud_pre_cache");
+        expected["store_sync"]["enabled"] = json!(true);
+        assert_eq!(resp.json_value().unwrap(), expected);
+        let resp = call(
+            &state,
+            "PUT",
+            CLOUD_URL,
+            OWNER,
+            &json!({ "gate_cloud": { "model_armor_enabled": true, "endpoint_url": "https://registry.example.com", "enabled": true } }),
+        );
+        assert_eq!(resp.status, 200, "{}", error_text(&resp));
+        expected["gate_cloud"]["model_armor_enabled"] = json!(true);
+        expected["gate_cloud"]["endpoint_url"] = json!("https://registry.example.com");
+        expected["gate_cloud"]["enabled"] = json!(true);
+        assert_eq!(resp.json_value().unwrap(), expected);
+        // An empty body changes nothing.
+        let resp = call(&state, "PUT", CLOUD_URL, OWNER, &json!({}));
+        assert_eq!(resp.json_value().unwrap(), expected);
+
+        // Persisted across a fresh hub, readable by a Peer, 0600 on disk, `gate_cloud` only.
+        let reloaded = test_hub_state(&tmp);
+        let resp = call(&reloaded, "GET", CLOUD_URL, PEER, &json!({}));
+        assert_eq!(resp.json_value().unwrap(), expected);
+        let on_disk: Value = serde_json::from_slice(&fs::read(cloud_file(&tmp)).unwrap()).unwrap();
+        assert_eq!(on_disk, expected);
+        let mode = fs::metadata(cloud_file(&tmp)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn cloud_adapters_put_rejects_bad_bodies_without_changing_anything() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let seed = call(
+            &state,
+            "PUT",
+            CLOUD_URL,
+            OWNER,
+            &json!({ "store_sync": { "provider": "azure" } }),
+        );
+        assert_eq!(seed.status, 200);
+        let before = fs::read(cloud_file(&tmp)).unwrap();
+        for bad in [
+            json!({ "colour": "red" }),
+            json!({ "store_sync": { "bogus": true } }),
+            json!({ "gate_cloud": { "bogus": true } }),
+            json!({ "gate_cloud": {}, "gate_registry": {} }),
+            json!({ "store_sync": { "provider": "ibm" } }),
+            json!({ "store_sync": { "provider": 3 } }),
+            json!({ "store_sync": { "sync_mode": "write_sometimes" } }),
+            json!({ "gate_cloud": { "registry_provider": "GCP" } }),
+            json!({ "store_sync": { "enabled": "yes" } }),
+            json!({ "store_sync": { "endpoint_url": "http://example.com" } }),
+            json!({ "store_sync": { "endpoint_url": "https://169.254.169.254/latest" } }),
+            json!({ "store_sync": { "endpoint_url": "https://user:pw@example.com" } }),
+            json!({ "gate_cloud": { "relay_endpoint_url": "https://10.0.0.5" } }),
+            json!({ "gate_cloud": { "endpoint_url": "https://0x7f000001" } }),
+            json!({ "gate_cloud": { "endpoint_url": "https://example.com/#x" } }),
+            // A valid field beside an invalid one is not applied.
+            json!({ "store_sync": { "enabled": true }, "gate_cloud": { "endpoint_url": "ftp://x" } }),
+        ] {
+            let resp = call(&state, "PUT", CLOUD_URL, OWNER, &bad);
+            assert_eq!(resp.status, 400, "{bad}: {}", error_text(&resp));
+            assert!(!error_text(&resp).is_empty(), "{bad}");
+            assert_eq!(fs::read(cloud_file(&tmp)).unwrap(), before, "{bad}");
+        }
+        let bad_json = handle_http_request(
+            &state,
+            &HttpRequest::new("PUT", CLOUD_URL)
+                .with_header("Authorization", format!("Bearer {OWNER}"))
+                .with_body(b"{ nope".to_vec()),
+        );
+        assert_eq!(bad_json.status, 400);
+        let not_object = handle_http_request(
+            &state,
+            &HttpRequest::new("PUT", CLOUD_URL)
+                .with_header("Authorization", format!("Bearer {OWNER}"))
+                .with_body(b"[1]".to_vec()),
+        );
+        assert_eq!(not_object.status, 400);
+        assert_eq!(fs::read(cloud_file(&tmp)).unwrap(), before);
+        // Clearing a URL, and a loopback http URL, are fine.
+        for ok in [
+            json!({ "store_sync": { "endpoint_url": "" } }),
+            json!({ "store_sync": { "endpoint_url": "http://localhost:8080" } }),
+            json!({ "store_sync": { "endpoint_url": "http://[::1]:8080/x" } }),
+        ] {
+            assert_eq!(
+                call(&state, "PUT", CLOUD_URL, OWNER, &ok).status,
+                200,
+                "{ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_adapters_a_damaged_file_is_a_500_and_stays_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let path = cloud_file(&tmp);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for damaged in [
+            &b"{ not json"[..],
+            br#"{"store_sync":{"enabled":"yes"}}"#,
+            br#"{"store_sync":{"endpoint_url":"https://10.0.0.5"}}"#,
+        ] {
+            fs::write(&path, damaged).unwrap();
+            for token in [OWNER, PEER] {
+                let resp = call(&state, "GET", CLOUD_URL, token, &json!({}));
+                assert_eq!(resp.status, 500);
+                let msg = error_text(&resp);
+                assert_eq!(msg, cloud_adapters::UNREADABLE_MESSAGE);
+                assert!(
+                    !msg.contains(tmp.path().to_str().unwrap()),
+                    "no path in the message"
+                );
+            }
+            let put = call(
+                &state,
+                "PUT",
+                CLOUD_URL,
+                OWNER,
+                &json!({ "store_sync": { "enabled": true } }),
+            );
+            assert_eq!(put.status, 500);
+            assert_eq!(error_text(&put), cloud_adapters::UNREADABLE_MESSAGE);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                damaged,
+                "never reset or overwritten"
+            );
+        }
+        // A body that does not parse is a 400 whatever the file holds.
+        let put = call(&state, "PUT", CLOUD_URL, OWNER, &json!({ "colour": 1 }));
+        assert_eq!(put.status, 400);
+    }
+
+    #[test]
+    fn cloud_adapters_put_broadcasts_and_a_refused_one_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let mut rx = state.subscribe();
+        let refused = [
+            (PEER, json!({ "store_sync": { "enabled": true } })),
+            (OWNER, json!({ "store_sync": { "provider": "bad" } })),
+        ];
+        for (token, body) in refused {
+            let resp = call(&state, "PUT", CLOUD_URL, token, &body);
+            assert!(resp.status == 403 || resp.status == 400);
+        }
+        assert!(rx.try_recv().is_err(), "a refused PUT must not broadcast");
+        let resp = call(
+            &state,
+            "PUT",
+            CLOUD_URL,
+            OWNER,
+            &json!({ "gate_cloud": { "secret_manager_enabled": true } }),
+        );
+        assert_eq!(resp.status, 200);
+        let frame = rx.try_recv().expect("cloud_adapters.updated frame");
+        assert_eq!(frame.channel, "cloud_adapters");
+        assert_eq!(frame.event, "cloud_adapters.updated");
+        assert_eq!(frame.data, resp.json_value().unwrap());
+        assert_eq!(frame.data["gate_cloud"]["secret_manager_enabled"], true);
     }
 }
