@@ -8,6 +8,7 @@
 //! project's records in a store nobody chose.
 
 use anyhow::{Context, Result, bail};
+use fl_core::pr_policy::DEFAULT_REVIEWER_APP_LOGINS;
 use fl_core::state::{StateScope, validate_slug};
 use fl_core::telemetry::{AdapterKind, RateCard};
 use fl_exec::state_sync::StateSyncTarget;
@@ -160,6 +161,40 @@ pub enum Credential {
 pub struct GithubApp {
     pub app_id: u64,
     pub private_key: PathBuf,
+    /// GitHub logins whose reviews may carry an `fl-review` agent marker, normally the Reviewer
+    /// App's `<slug>[bot]`. A marker from any other login counts for nothing, so an outsider
+    /// cannot claim to be an agent. `None` (key absent) means
+    /// [`DEFAULT_REVIEWER_APP_LOGINS`]; `[]` means no agent review counts. Read it through
+    /// [`reviewer_logins`], which also covers a config with no `[github]` table.
+    #[serde(default)]
+    pub reviewer_logins: Option<Vec<String>>,
+}
+
+/// The logins whose reviews may carry an agent marker (`[github] reviewer_logins`), or
+/// [`DEFAULT_REVIEWER_APP_LOGINS`] when the table or the key is absent. `verify-ci` can run on a
+/// machine with no App credentials, so a missing `[github]` is not an error.
+pub fn reviewer_logins(app: Option<&GithubApp>) -> Vec<String> {
+    match app.and_then(|a| a.reviewer_logins.as_ref()) {
+        Some(logins) => logins.clone(),
+        None => DEFAULT_REVIEWER_APP_LOGINS
+            .iter()
+            .map(|l| (*l).to_string())
+            .collect(),
+    }
+}
+
+/// Whether `login` is a GitHub login, or an App's `<slug>[bot]`: letters, digits and `-`, then an
+/// optional trailing `[bot]`, at most 64 bytes in all.
+fn is_github_login(login: &str) -> bool {
+    let name = match login.len().checked_sub(5) {
+        Some(at) if login.is_char_boundary(at) && login[at..].eq_ignore_ascii_case("[bot]") => {
+            &login[..at]
+        }
+        _ => login,
+    };
+    login.len() <= 64
+        && !name.is_empty()
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// `[[mcp]]`: this machine's switches for one project's MCP catalog (MCP
@@ -504,14 +539,25 @@ pub fn load(path: Option<&Path>) -> Result<Config> {
             );
         }
     }
-    if let Some(app) = &file.github
-        && !app.private_key.is_absolute()
-    {
-        bail!(
-            "{}: `private_key` must be an absolute path (got `{}`)",
-            path.display(),
-            app.private_key.display()
-        );
+    if let Some(app) = &mut file.github {
+        if !app.private_key.is_absolute() {
+            bail!(
+                "{}: `private_key` must be an absolute path (got `{}`)",
+                path.display(),
+                app.private_key.display()
+            );
+        }
+        for login in app.reviewer_logins.iter_mut().flatten() {
+            *login = login.trim().to_string();
+            if !is_github_login(login) {
+                bail!(
+                    "{}: `github.reviewer_logins` entry `{login}` is not a GitHub login; use \
+                     letters, digits and `-` (at most 64 characters), with an optional trailing \
+                     `[bot]`, for example `ferroloop-test[bot]`",
+                    path.display()
+                );
+            }
+        }
     }
     for m in &file.mcp {
         if !m.root.is_absolute() {
@@ -813,6 +859,78 @@ mod tests {
         );
         let cfg = load_text("[github]\napp_id = 1\nprivate_key = \"/k/key.pem\"\n").unwrap();
         assert_eq!(cfg.github.unwrap().app_id, 1);
+    }
+
+    const GITHUB_TABLE: &str = "[github]\napp_id = 1\nprivate_key = \"/k/key.pem\"\n";
+
+    fn logins_of(text: &str) -> Vec<String> {
+        reviewer_logins(load_text(text).unwrap().github.as_ref())
+    }
+
+    #[test]
+    fn reviewer_logins_default_to_the_reviewer_app_login() {
+        let default = vec!["ferroloop-test[bot]".to_string()];
+        // No `[github]` table at all (verify-ci on a machine with no App credentials).
+        assert_eq!(logins_of(""), default);
+        // A `[github]` table without the key keeps working and takes the default.
+        assert_eq!(logins_of(GITHUB_TABLE), default);
+        assert_eq!(reviewer_logins(None), default);
+    }
+
+    #[test]
+    fn reviewer_logins_can_be_replaced_or_emptied() {
+        let with = |list: &str| format!("{GITHUB_TABLE}reviewer_logins = {list}\n");
+        assert_eq!(
+            logins_of(&with(
+                "[\"other-app[bot]\", \" Second[BOT] \", \"human-1\"]"
+            )),
+            ["other-app[bot]", "Second[BOT]", "human-1"]
+        );
+        // An empty list is deliberate: no agent review counts.
+        assert_eq!(logins_of(&with("[]")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_invalid_reviewer_login_is_refused_naming_the_field() {
+        let long = format!("{}[bot]", "a".repeat(60));
+        for bad in [
+            "",
+            "   ",
+            "[bot]",
+            "has space",
+            "under_score",
+            "dot.ted",
+            "slash/y",
+            "name[bot",
+            "name[bot]x",
+            "name[bot][bot]",
+            "na[me]",
+            "caf\u{e9}",
+            long.as_str(),
+        ] {
+            let text = format!("{GITHUB_TABLE}reviewer_logins = [\"ok[bot]\", {bad:?}]\n");
+            let err = load_text(&text).expect_err(bad);
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("`github.reviewer_logins` entry"),
+                "{bad}: {msg}"
+            );
+        }
+        // A 64-byte login is the longest allowed.
+        let max = format!("{}[bot]", "a".repeat(59));
+        assert_eq!(max.len(), 64);
+        let text = format!("{GITHUB_TABLE}reviewer_logins = [{max:?}]\n");
+        assert_eq!(logins_of(&text), [max]);
+        // Not a list of strings.
+        assert!(load_text(&format!("{GITHUB_TABLE}reviewer_logins = \"x[bot]\"\n")).is_err());
+    }
+
+    #[test]
+    fn the_github_table_still_refuses_an_unknown_key() {
+        let err = load_text(&format!("{GITHUB_TABLE}reviewer_login = [\"x\"]\n")).unwrap_err();
+        assert!(format!("{err:#}").contains("reviewer_login"), "{err:#}");
+        // `app_id` and `private_key` stay required.
+        assert!(load_text("[github]\nreviewer_logins = [\"x[bot]\"]\n").is_err());
     }
 
     #[test]

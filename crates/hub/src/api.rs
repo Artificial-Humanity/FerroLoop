@@ -3564,7 +3564,13 @@ fn handle_dynamic_api_routes(
                 return handle_post_pr_review(&store, authority, number, req);
             }
             ("POST", "merge") => {
-                return handle_post_pr_merge(&store, authority, number, req);
+                return handle_post_pr_merge(
+                    &store,
+                    authority,
+                    &state.config.reviewer_logins,
+                    number,
+                    req,
+                );
             }
             _ => {}
         }
@@ -5076,6 +5082,7 @@ fn handle_post_pr_review(
 fn handle_post_pr_merge(
     store: &RedbStore,
     authority: &HubAuthority,
+    reviewer_logins: &[String],
     number: u64,
     req: &HttpRequest,
 ) -> HttpResponse {
@@ -5142,6 +5149,7 @@ fn handle_post_pr_merge(
             &payload.reviews,
             &agents,
             DEFAULT_OWNER_LOGIN,
+            reviewer_logins,
         ) {
             return HttpResponse::json(
                 403,
