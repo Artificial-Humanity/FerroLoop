@@ -237,16 +237,125 @@ export function normalizeCloudAdaptersConfig(
 export const DEFAULT_TOKEN_STORAGE_KEY = "fl_hub_session_token";
 export const PASSKEY_KEYSTORE_STORAGE_KEY = "fl_hub_passkey_keystore";
 export const LAST_PASSKEY_ID_STORAGE_KEY = "fl_hub_last_passkey_credential_id";
+export const PASSKEY_IDB_DATABASE_NAME = "fl_hub_passkey_idb";
+export const PASSKEY_IDB_STORE_NAME = "keys";
 
 export interface StoredClientPasskey {
   credential_id: string;
+  label?: string;
   public_key_b64: string;
-  private_jwk: JsonWebKey;
+  private_jwk?: JsonWebKey;
   sign_count: number;
+  created_at_ms?: number;
 }
 
 const inMemoryPasskeyStore = new Map<string, StoredClientPasskey>();
+const inMemoryPasskeyCryptoKeys = new Map<string, CryptoKey>();
 let inMemoryLastPasskeyId: string | null = null;
+
+function hasIndexedDbSupport(): boolean {
+  return (
+    typeof globalThis.indexedDB !== "undefined" &&
+    globalThis.indexedDB !== null &&
+    typeof globalThis.indexedDB.open === "function"
+  );
+}
+
+function openPasskeyIdb(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    try {
+      const req = globalThis.indexedDB.open(PASSKEY_IDB_DATABASE_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(PASSKEY_IDB_STORE_NAME)) {
+          db.createObjectStore(PASSKEY_IDB_STORE_NAME);
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error ?? new Error("Failed to open passkey IndexedDB"));
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+async function putPasskeyInIdb(
+  credentialId: string,
+  privateKey: CryptoKey,
+): Promise<boolean> {
+  inMemoryPasskeyCryptoKeys.set(credentialId, privateKey);
+  if (!hasIndexedDbSupport()) {
+    return false;
+  }
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openPasskeyIdb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db!.transaction(PASSKEY_IDB_STORE_NAME, "readwrite");
+      const store = tx.objectStore(PASSKEY_IDB_STORE_NAME);
+      const putReq =
+        store.keyPath === "credential_id"
+          ? store.put({ credential_id: credentialId, privateKey })
+          : store.put(privateKey, credentialId);
+      putReq.onsuccess = () => resolve();
+      putReq.onerror = () =>
+        reject(putReq.error ?? new Error("Failed to store passkey in IndexedDB"));
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // Ignore close errors
+    }
+  }
+}
+
+async function getPasskeyFromIdb(credentialId: string): Promise<CryptoKey | null> {
+  if (!hasIndexedDbSupport()) {
+    return inMemoryPasskeyCryptoKeys.get(credentialId) ?? null;
+  }
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openPasskeyIdb();
+    const raw = await new Promise<unknown>((resolve, reject) => {
+      const tx = db!.transaction(PASSKEY_IDB_STORE_NAME, "readonly");
+      const store = tx.objectStore(PASSKEY_IDB_STORE_NAME);
+      const getReq = store.get(credentialId);
+      getReq.onsuccess = () => resolve(getReq.result);
+      getReq.onerror = () =>
+        reject(getReq.error ?? new Error("Failed to read passkey from IndexedDB"));
+    });
+    if (!raw || typeof raw !== "object") {
+      return inMemoryPasskeyCryptoKeys.get(credentialId) ?? null;
+    }
+    if (
+      "type" in (raw as CryptoKey) &&
+      typeof (raw as CryptoKey).type === "string" &&
+      "extractable" in (raw as CryptoKey)
+    ) {
+      return raw as CryptoKey;
+    }
+    if (
+      "privateKey" in (raw as Record<string, unknown>) &&
+      (raw as { privateKey?: unknown }).privateKey &&
+      typeof (raw as { privateKey?: unknown }).privateKey === "object"
+    ) {
+      return (raw as { privateKey: CryptoKey }).privateKey;
+    }
+    return inMemoryPasskeyCryptoKeys.get(credentialId) ?? null;
+  } catch {
+    return inMemoryPasskeyCryptoKeys.get(credentialId) ?? null;
+  } finally {
+    try {
+      db?.close();
+    } catch {
+      // Ignore close errors
+    }
+  }
+}
 
 export function bytesToBase64Url(bytes: Uint8Array): string {
   let binary = "";
@@ -324,26 +433,32 @@ function readStoredPasskeyMap(): Record<string, StoredClientPasskey> {
         const parsed: unknown = JSON.parse(raw);
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
           for (const [k, v] of Object.entries(parsed)) {
-            // Own entries only, and only ones shaped like a stored key.
-            if (
-              k !== "__proto__" &&
-              v &&
-              typeof v === "object" &&
-              typeof (v as StoredClientPasskey).private_jwk === "object" &&
-              (v as StoredClientPasskey).private_jwk !== null
-            ) {
-              // The map is keyed by credential id, so an entry that does not carry its own id
-              // (or carries a non-string) takes the key it is filed under. Without this the
-              // login would send no `credential_id` and `saveStoredPasskey` would file the
-              // entry under "undefined".
-              const entry = v as StoredClientPasskey;
-              merged[k] = {
-                ...entry,
-                credential_id:
-                  typeof entry.credential_id === "string" && entry.credential_id
-                    ? entry.credential_id
-                    : k,
-              };
+            // Own entries only, and only ones shaped like a stored key (either public metadata
+            // backed by an IndexedDB CryptoKey, or legacy/fallback JWK entries).
+            if (k !== "__proto__" && v && typeof v === "object") {
+              const candidate = v as StoredClientPasskey;
+              const hasValidJwk =
+                typeof candidate.private_jwk === "object" &&
+                candidate.private_jwk !== null;
+              const hasPublicMetadata =
+                candidate.private_jwk === undefined &&
+                typeof candidate.public_key_b64 === "string" &&
+                candidate.public_key_b64.length > 0 &&
+                typeof candidate.sign_count === "number";
+              if (hasValidJwk || hasPublicMetadata) {
+                // The map is keyed by credential id, so an entry that does not carry its own id
+                // (or carries a non-string) takes the key it is filed under. Without this the
+                // login would send no `credential_id` and `saveStoredPasskey` would file the
+                // entry under "undefined".
+                merged[k] = {
+                  ...candidate,
+                  credential_id:
+                    typeof candidate.credential_id === "string" &&
+                    candidate.credential_id
+                      ? candidate.credential_id
+                      : k,
+                };
+              }
             }
           }
         }
@@ -445,12 +560,21 @@ export function resolvePasskeyOrigin(baseUrl: string): {
 export class HubApiError extends Error {
   public readonly status: number;
   public readonly detail?: string;
+  public readonly requires_totp?: boolean;
 
-  constructor(status: number, message: string, detail?: string) {
+  constructor(
+    status: number,
+    message: string,
+    detail?: string,
+    requiresTotp?: boolean,
+  ) {
     super(message);
     this.name = "HubApiError";
     this.status = status;
     this.detail = detail;
+    if (requiresTotp !== undefined) {
+      this.requires_totp = requiresTotp;
+    }
   }
 }
 
@@ -549,7 +673,11 @@ export class HubApiClient {
         (typeof parsed?.error === "string" && parsed.error) ||
         `HTTP ${response.status}`;
       const detail = typeof parsed?.detail === "string" ? parsed.detail : undefined;
-      throw new HubApiError(response.status, errMsg, detail);
+      const requiresTotp =
+        typeof parsed?.requires_totp === "boolean"
+          ? parsed.requires_totp
+          : undefined;
+      throw new HubApiError(response.status, errMsg, detail, requiresTotp);
     }
 
     return (parsed ?? ({} as unknown)) as T;
@@ -1232,106 +1360,156 @@ export class HubApiClient {
     );
   }
 
-  public async loginWithPasskey(req: {
-    credential_id: string;
-    assertion?: string;
-    client_data_json_b64?: string;
-    authenticator_data_b64?: string;
-    signature_b64?: string;
-  }): Promise<{
+  public async loginWithPasskey(
+    reqOrCredentialId?:
+      | {
+          credential_id?: string;
+          totp_code?: string;
+          assertion?: string;
+          client_data_json_b64?: string;
+          authenticator_data_b64?: string;
+          signature_b64?: string;
+        }
+      | string,
+    totpCode?: string,
+  ): Promise<{
     ok: boolean;
+    requires_totp?: boolean;
     authority?: HubAuthority;
     session_token?: string;
   }> {
-    let payload: Record<string, unknown> = { mode: "passkey", ...req };
+    const reqObj =
+      typeof reqOrCredentialId === "string"
+        ? { credential_id: reqOrCredentialId }
+        : (reqOrCredentialId ?? {});
+    const resolvedCredentialId =
+      typeof reqObj.credential_id === "string" && reqObj.credential_id.trim()
+        ? reqObj.credential_id.trim()
+        : getLastRegisteredPasskeyId();
+    const resolvedTotp = (totpCode ?? reqObj.totp_code ?? "").trim();
+
+    let payload: Record<string, unknown> = {
+      mode: "passkey",
+      ...reqObj,
+      credential_id: resolvedCredentialId,
+      ...(resolvedTotp ? { totp_code: resolvedTotp } : {}),
+    };
 
     if (
-      (!req.signature_b64 ||
-        !req.client_data_json_b64 ||
-        !req.authenticator_data_b64) &&
+      (!reqObj.signature_b64 ||
+        !reqObj.client_data_json_b64 ||
+        !reqObj.authenticator_data_b64) &&
       typeof globalThis.crypto !== "undefined" &&
       globalThis.crypto?.subtle
     ) {
       const store = readStoredPasskeyMap();
       const stored =
-        store[req.credential_id] ??
+        store[resolvedCredentialId] ??
         (inMemoryLastPasskeyId ? store[inMemoryLastPasskeyId] : undefined);
 
-      if (stored?.private_jwk) {
-        const challengeRes = await this.requestPasskeyChallenge();
-        const challenge = challengeRes.challenge;
+      if (stored) {
+        let privateKey = await getPasskeyFromIdb(stored.credential_id);
+        let backedByIdb = privateKey !== null;
 
-        const { origin, hostname } = resolvePasskeyOrigin(this.baseUrl);
+        if (
+          !privateKey &&
+          stored.private_jwk &&
+          typeof stored.private_jwk === "object"
+        ) {
+          privateKey = await globalThis.crypto.subtle.importKey(
+            "jwk",
+            stored.private_jwk,
+            { name: "ECDSA", namedCurve: "P-256" },
+            false,
+            ["sign"],
+          );
+          if (hasIndexedDbSupport()) {
+            backedByIdb = await putPasskeyInIdb(
+              stored.credential_id,
+              privateKey,
+            );
+          }
+        }
 
-        const clientDataJson = JSON.stringify({
-          type: "webauthn.get",
-          challenge,
-          origin,
-          crossOrigin: false,
-        });
-        const encoder = new TextEncoder();
-        const clientDataBytes = encoder.encode(clientDataJson);
+        if (privateKey) {
+          const challengeRes = await this.requestPasskeyChallenge();
+          const challenge = challengeRes.challenge;
 
-        const rpIdHash = new Uint8Array(
-          await globalThis.crypto.subtle.digest(
-            "SHA-256",
-            encoder.encode(hostname),
-          ),
-        );
-        const nextCount = (stored.sign_count || 0) + 1;
-        saveStoredPasskey({
-          ...stored,
-          sign_count: nextCount,
-        });
+          const { origin, hostname } = resolvePasskeyOrigin(this.baseUrl);
 
-        const authenticatorData = new Uint8Array(37);
-        authenticatorData.set(rpIdHash.subarray(0, 32), 0);
-        authenticatorData[32] = 0x01; // UP (User Present) flag
-        authenticatorData[33] = (nextCount >>> 24) & 0xff;
-        authenticatorData[34] = (nextCount >>> 16) & 0xff;
-        authenticatorData[35] = (nextCount >>> 8) & 0xff;
-        authenticatorData[36] = nextCount & 0xff;
+          const clientDataJson = JSON.stringify({
+            type: "webauthn.get",
+            challenge,
+            origin,
+            crossOrigin: false,
+          });
+          const encoder = new TextEncoder();
+          const clientDataBytes = encoder.encode(clientDataJson);
 
-        const clientDataHash = new Uint8Array(
-          await globalThis.crypto.subtle.digest("SHA-256", clientDataBytes),
-        );
+          const rpIdHash = new Uint8Array(
+            await globalThis.crypto.subtle.digest(
+              "SHA-256",
+              encoder.encode(hostname),
+            ),
+          );
+          const nextCount = (stored.sign_count || 0) + 1;
+          if (backedByIdb) {
+            const { private_jwk: _omit, ...publicMeta } = stored;
+            saveStoredPasskey({
+              ...publicMeta,
+              sign_count: nextCount,
+            });
+          } else {
+            saveStoredPasskey({
+              ...stored,
+              sign_count: nextCount,
+            });
+          }
 
-        const signedData = new Uint8Array(
-          authenticatorData.length + clientDataHash.length,
-        );
-        signedData.set(authenticatorData, 0);
-        signedData.set(clientDataHash, authenticatorData.length);
+          const authenticatorData = new Uint8Array(37);
+          authenticatorData.set(rpIdHash.subarray(0, 32), 0);
+          authenticatorData[32] = 0x01; // UP (User Present) flag
+          authenticatorData[33] = (nextCount >>> 24) & 0xff;
+          authenticatorData[34] = (nextCount >>> 16) & 0xff;
+          authenticatorData[35] = (nextCount >>> 8) & 0xff;
+          authenticatorData[36] = nextCount & 0xff;
 
-        const privateKey = await globalThis.crypto.subtle.importKey(
-          "jwk",
-          stored.private_jwk,
-          { name: "ECDSA", namedCurve: "P-256" },
-          false,
-          ["sign"],
-        );
-        const p1363Sig = new Uint8Array(
-          await globalThis.crypto.subtle.sign(
-            { name: "ECDSA", hash: "SHA-256" },
-            privateKey,
-            signedData,
-          ),
-        );
-        const derSig = p1363ToDer(p1363Sig);
+          const clientDataHash = new Uint8Array(
+            await globalThis.crypto.subtle.digest("SHA-256", clientDataBytes),
+          );
 
-        payload = {
-          mode: "passkey",
-          // The credential whose key signed, which is not `req.credential_id` when that one is
-          // unknown here and the newest key stood in for it.
-          credential_id: stored.credential_id,
-          client_data_json_b64: bytesToBase64Url(clientDataBytes),
-          authenticator_data_b64: bytesToBase64Url(authenticatorData),
-          signature_b64: bytesToBase64Url(derSig),
-        };
+          const signedData = new Uint8Array(
+            authenticatorData.length + clientDataHash.length,
+          );
+          signedData.set(authenticatorData, 0);
+          signedData.set(clientDataHash, authenticatorData.length);
+
+          const p1363Sig = new Uint8Array(
+            await globalThis.crypto.subtle.sign(
+              { name: "ECDSA", hash: "SHA-256" },
+              privateKey,
+              signedData,
+            ),
+          );
+          const derSig = p1363ToDer(p1363Sig);
+
+          payload = {
+            mode: "passkey",
+            // The credential whose key signed, which is not `req.credential_id` when that one is
+            // unknown here and the newest key stood in for it.
+            credential_id: stored.credential_id,
+            client_data_json_b64: bytesToBase64Url(clientDataBytes),
+            authenticator_data_b64: bytesToBase64Url(authenticatorData),
+            signature_b64: bytesToBase64Url(derSig),
+            ...(resolvedTotp ? { totp_code: resolvedTotp } : {}),
+          };
+        }
       }
     }
 
     const res = await this.request<{
       ok: boolean;
+      requires_totp?: boolean;
       authority?: HubAuthority;
       session_token?: string;
     }>("/api/v1/auth/login", {
@@ -1395,30 +1573,61 @@ export class HubApiClient {
   }): Promise<{ ok: boolean }> {
     let publicKeyB64 = req.public_key_b64;
     let generated: StoredClientPasskey | null = null;
+    let generatedPrivateKey: CryptoKey | null = null;
     if (
       !publicKeyB64 &&
       typeof globalThis.crypto !== "undefined" &&
       globalThis.crypto?.subtle
     ) {
+      let useIdb = false;
+      if (hasIndexedDbSupport()) {
+        try {
+          const probeDb = await openPasskeyIdb();
+          if (probeDb) {
+            useIdb = true;
+            try {
+              probeDb.close();
+            } catch {
+              // Ignore close errors
+            }
+          }
+        } catch {
+          useIdb = false;
+        }
+      }
+
       const keyPair = await globalThis.crypto.subtle.generateKey(
         { name: "ECDSA", namedCurve: "P-256" },
-        true,
+        !useIdb,
         ["sign", "verify"],
       );
       const rawPub = new Uint8Array(
         await globalThis.crypto.subtle.exportKey("raw", keyPair.publicKey),
       );
       publicKeyB64 = bytesToBase64Url(rawPub);
-      const privateJwk = await globalThis.crypto.subtle.exportKey(
-        "jwk",
-        keyPair.privateKey,
-      );
-      generated = {
-        credential_id: req.credential_id,
-        public_key_b64: publicKeyB64,
-        private_jwk: privateJwk,
-        sign_count: 0,
-      };
+      if (useIdb) {
+        generatedPrivateKey = keyPair.privateKey;
+        generated = {
+          credential_id: req.credential_id,
+          label: req.label,
+          public_key_b64: publicKeyB64,
+          sign_count: 0,
+          created_at_ms: Date.now(),
+        };
+      } else {
+        const privateJwk = await globalThis.crypto.subtle.exportKey(
+          "jwk",
+          keyPair.privateKey,
+        );
+        generated = {
+          credential_id: req.credential_id,
+          label: req.label,
+          public_key_b64: publicKeyB64,
+          private_jwk: privateJwk,
+          sign_count: 0,
+          created_at_ms: Date.now(),
+        };
+      }
     }
     const res = await this.request<{ ok: boolean }>(
       "/api/v1/auth/passkey/register",
@@ -1439,7 +1648,18 @@ export class HubApiClient {
     // registration (duplicate id, bad origin) would leave an orphan key, and make it the
     // "last registered" passkey that sign-in then offers.
     if (generated) {
-      saveStoredPasskey(generated);
+      let canSaveMetadata = !generatedPrivateKey;
+      if (generatedPrivateKey) {
+        const storedInIdb = await putPasskeyInIdb(
+          req.credential_id,
+          generatedPrivateKey,
+        );
+        canSaveMetadata =
+          storedInIdb || inMemoryPasskeyCryptoKeys.has(req.credential_id);
+      }
+      if (canSaveMetadata) {
+        saveStoredPasskey(generated);
+      }
     }
     return res;
   }
