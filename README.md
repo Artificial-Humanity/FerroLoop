@@ -163,10 +163,26 @@ A store holds hub pairing codes, session hashes and other records, so it is priv
 Unix user. A store file `fl` creates is mode `0600`, and a store directory `fl` creates is mode
 `0700` (only the innermost directory that `fl` makes; the directories above it, such as
 `~/.local/share`, keep the default mode), whatever your umask is. `fl` never changes the mode of
-a file or directory that already exists. If an existing store file or its directory can be
-reached by your group or by other users, `fl` prints one warning per path per run on stderr with
-the fix, and still opens the store: run `chmod 600 <store file>` and `chmod 700 <directory>`
-yourself. The warning skips a directory with the sticky bit (such as `/tmp`).
+a file or directory that already exists.
+
+If an existing store is open to other users, `fl` still opens it and prints a warning with the
+fix. The warning is for a person at a terminal: `fl` prints it only when stderr is a terminal,
+so hooks, MCP servers, scripts and CI stay quiet. `fl hub serve` is the exception: it records
+the warning in the service log on every start, terminal or not. Each path is warned about once
+per process. To silence it everywhere, including the hub, set `FL_QUIET_STORE_PERMS=1` (any
+non-empty value except `0`).
+
+* A store file with a group or other permission bit is reported: `chmod 600 <store file>`.
+* Its directory is reported only when the file is loose as well, or when your group or other
+  users can write in the directory: `chmod 700 <directory>`. A directory that others can only
+  enter or list, around a `0600` file, is not a finding, because they cannot read the file
+  through it. A directory with the sticky bit (such as `/tmp`), the current directory and its
+  parents are never reported.
+
+A store configured inside a repository's `.fl/` directory makes a `.fl` that `fl` creates mode
+`0700`, so other local users lose access to the tracked files in that directory (the manifest,
+the MCP catalog). Git does not track directory modes, so a checkout elsewhere is unaffected; to
+share the directory on this machine, `chmod 755 .fl` yourself.
 
 ---
 

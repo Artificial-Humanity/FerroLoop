@@ -2205,7 +2205,8 @@ mod tests {
         assert_eq!(mode(&hub_store), 0o600);
         assert_eq!(mode(hub_store.parent().unwrap()), 0o700);
 
-        // The per-project open path, which only ever opens a file that exists.
+        // The per-project open path: `open_with_retries` creates the missing file itself, with
+        // the same private mode.
         let second = tmp.path().join("projects").join("two.redb");
         drop(
             state

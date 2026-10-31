@@ -13,12 +13,22 @@
 //!   `chmod` for you: the store may be shared on purpose, and a surprise mode change is worse than
 //!   a reminder.
 //!
+//! The report is for a person, so it is quiet by default: it prints only when stderr is a
+//! terminal, which keeps hooks, MCP servers, scripts, CI and tests free of it. `fl hub serve`
+//! calls [`warn_always`] once at start, so the service log still records a loose store.
+//! `FL_QUIET_STORE_PERMS=1` (any non-empty value except `0`) silences both. The file is reported
+//! when it has a group or other bit; its directory only when the file is loose too, or when
+//! others can write in it (and it is not sticky), because a `0600` file is not readable through a
+//! `0755` directory.
+//!
 //! Non-unix targets have no mode bits to set or read, so they behave as before.
 
 use std::collections::BTreeSet;
 use std::io;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -90,9 +100,72 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<bool> {
 /// Paths already warned about in this process.
 static WARNED: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 
+/// Set by [`warn_always`]: the process is a service whose stderr is a log, not a terminal.
+static ALWAYS: AtomicBool = AtomicBool::new(false);
+
+/// The environment variable that silences the warning, `fl hub serve`'s included.
+pub const QUIET_ENV: &str = "FL_QUIET_STORE_PERMS";
+
 /// Warnings printed so far, kept only under test so a test can count them without parsing stderr.
 #[cfg(test)]
 pub(crate) static EMITTED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+thread_local! {
+    /// What a test thread says stderr is: the real stream is a terminal when a person runs the
+    /// tests, and a test must not depend on that.
+    pub(crate) static TEST_TTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Print the store warning on every start of this process, terminal or not, until the process
+/// ends. `fl hub serve` calls it before it opens a store, so the service log records a loose
+/// store; the once-per-path dedupe still applies, so it is once per start. `FL_QUIET_STORE_PERMS`
+/// still silences it.
+pub fn warn_always() {
+    ALWAYS.store(true, Ordering::Relaxed);
+}
+
+/// Whether `value` of `FL_QUIET_STORE_PERMS` asks for quiet: any non-empty value except `0`.
+fn quiet_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// When a warning may print, and where the process stands. The decision is data so a test can
+/// state it without a real terminal, environment or working directory.
+#[derive(Debug, Clone)]
+pub(crate) struct Policy {
+    /// [`warn_always`] was called.
+    pub always: bool,
+    /// Stderr is a terminal.
+    pub stderr_is_terminal: bool,
+    /// `FL_QUIET_STORE_PERMS` asks for quiet.
+    pub quiet: bool,
+    /// The current directory, when known; a directory advice never names it or an ancestor.
+    pub cwd: Option<PathBuf>,
+}
+
+impl Policy {
+    /// The policy of this process now.
+    pub(crate) fn current() -> Self {
+        #[cfg(test)]
+        let tty = TEST_TTY.with(|t| t.get());
+        #[cfg(not(test))]
+        let tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+        Policy {
+            always: ALWAYS.load(Ordering::Relaxed),
+            stderr_is_terminal: tty,
+            // A test's outcome must not depend on the developer's own environment.
+            quiet: !cfg!(test) && quiet_value(std::env::var_os(QUIET_ENV).as_deref()),
+            cwd: std::env::current_dir().ok(),
+        }
+    }
+
+    /// Whether any warning may print: never when quiet; otherwise when `always` or stderr is a
+    /// terminal.
+    pub(crate) fn emits(&self) -> bool {
+        !self.quiet && (self.always || self.stderr_is_terminal)
+    }
+}
 
 /// Claim `path` in `seen`: true the first time, false after, and false once the set is full.
 /// Poison-tolerant: a panic elsewhere must not turn into a missing warning or a second panic.
@@ -106,41 +179,99 @@ fn claim(seen: &Mutex<BTreeSet<PathBuf>>, path: &Path) -> bool {
     true
 }
 
-/// The warnings an existing store at `store` earns, each one only for a path `seen` has not
-/// claimed yet. A path that cannot be read earns none: a stat error is not a finding. The text
-/// names the path, its mode and the fix; it never holds store contents.
-pub(crate) fn loose_warnings(store: &Path, seen: &Mutex<BTreeSet<PathBuf>>) -> Vec<String> {
+/// The directory that holds `store`, as a path that names one directory from anywhere: an
+/// absolute parent as given; a relative one made absolute (canonical, else as given). `None` when
+/// that still leaves a relative path, or when the directory is the working directory or one of its
+/// ancestors: `chmod 700 .` or a chmod of a directory the person is working under is not advice
+/// to print.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn nameable_dir(store: &Path, cwd: Option<&Path>) -> Option<PathBuf> {
+    let parent = match store.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let dir = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf())
+    };
+    if !dir.is_absolute() {
+        return None;
+    }
+    if let Some(cwd) = cwd {
+        let canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        if cwd.starts_with(&dir) || canon.starts_with(&dir) {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+/// The warnings an existing store at `store` earns under `policy`, each one only for a path `seen`
+/// has not claimed yet (a policy that does not emit claims nothing). A path that cannot be read
+/// earns none: a stat error is not a finding. The text names the path, its mode and the fix; it
+/// never holds store contents. Pure but for the stat calls: it prints nothing.
+///
+/// * The file is reported when it has a group or other bit.
+/// * Its directory is reported only when the file is loose too, or when the directory is group or
+///   other writable, and never when it is sticky (`/tmp`, shared by design) or cannot be named
+///   (see `nameable_dir`).
+pub(crate) fn loose_warnings(
+    store: &Path,
+    seen: &Mutex<BTreeSet<PathBuf>>,
+    policy: &Policy,
+) -> Vec<String> {
     #[cfg(unix)]
     {
+        if !policy.emits() {
+            return Vec::new();
+        }
         let mut out = Vec::new();
+        // A relative store path is relative to the working directory: name it in full, so the
+        // advice (and a service log) reads the same from anywhere.
+        let shown = match (store.is_absolute(), policy.cwd.as_deref()) {
+            (false, Some(cwd)) => cwd.join(store),
+            _ => store.to_path_buf(),
+        };
         // `metadata` follows a symlink: the mode that matters is the file that holds the data.
-        if let Ok(meta) = std::fs::metadata(store)
-            && meta.is_file()
-            && meta.mode() & 0o077 != 0
-            && claim(seen, store)
-        {
+        let Ok(file) = std::fs::metadata(&shown) else {
+            return out;
+        };
+        if !file.is_file() {
+            return out;
+        }
+        let file_loose = file.mode() & 0o077 != 0;
+        if file_loose && claim(seen, &shown) {
             out.push(format!(
                 "warning: the store {} is mode {:03o}, so other users can read it; \
                  fix it with: chmod 600 {}",
-                store.display(),
-                meta.mode() & 0o777,
-                store.display()
+                shown.display(),
+                file.mode() & 0o777,
+                shown.display()
             ));
         }
-        let dir = match store.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p,
-            _ => Path::new("."),
+        let Some(dir) = nameable_dir(&shown, policy.cwd.as_deref()) else {
+            return out;
         };
+        let Ok(meta) = std::fs::metadata(&dir) else {
+            return out;
+        };
+        let reachable = meta.mode() & 0o077 != 0;
+        let writable = meta.mode() & 0o022 != 0;
         // A sticky directory (`/tmp`) is shared by design: its owner is not this store's.
-        if let Ok(meta) = std::fs::metadata(dir)
-            && meta.is_dir()
-            && meta.mode() & 0o077 != 0
+        if meta.is_dir()
             && meta.mode() & 0o1000 == 0
-            && claim(seen, dir)
+            && ((file_loose && reachable) || writable)
+            && claim(seen, &dir)
         {
+            let why = if file_loose {
+                "so other users can reach it"
+            } else {
+                "so other users can replace the store in it"
+            };
             out.push(format!(
-                "warning: the directory {} holds a store and is mode {:03o}, so other users can \
-                 reach it; if only your own data lives there, fix it with: chmod 700 {}",
+                "warning: the directory {} holds a store and is mode {:03o}, {why}; \
+                 if only your own data lives there, fix it with: chmod 700 {}",
                 dir.display(),
                 meta.mode() & 0o777,
                 dir.display()
@@ -150,19 +281,31 @@ pub(crate) fn loose_warnings(store: &Path, seen: &Mutex<BTreeSet<PathBuf>>) -> V
     }
     #[cfg(not(unix))]
     {
-        let _ = (store, seen);
+        let _ = (store, seen, policy);
         Vec::new()
     }
 }
 
-/// Print, to stderr, one warning per path per process for a store at `store` that other users
-/// can reach (file mode, or its directory's mode, has a group or other bit). Never changes a
-/// mode, never fails and never panics.
+/// Write `text` and a newline to `w`, ignoring any error: a closed pipe (EPIPE) or a full disk on
+/// stderr must not turn a reminder into a panic or a failed command.
+fn write_line(w: &mut dyn Write, text: &str) {
+    let _ = writeln!(w, "{text}");
+}
+
+/// Print, to stderr, one warning per path per process for a store at `store` that other users can
+/// reach, as `loose_warnings` decides: only when stderr is a terminal, or always after
+/// [`warn_always`], and never under `FL_QUIET_STORE_PERMS`. Never changes a mode, never fails and
+/// never panics, even when stderr is a closed pipe.
 pub fn warn_if_loose(store: &Path) {
-    for text in loose_warnings(store, &WARNED) {
-        eprintln!("{text}");
+    for text in loose_warnings(store, &WARNED, &Policy::current()) {
+        // Under test the line is recorded, not written, so a run in a terminal stays clean.
         #[cfg(test)]
-        EMITTED.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+        {
+            write_line(&mut std::io::sink(), &text);
+            EMITTED.lock().unwrap_or_else(|e| e.into_inner()).push(text);
+        }
+        #[cfg(not(test))]
+        write_line(&mut std::io::stderr(), &text);
     }
 }
 
@@ -195,6 +338,31 @@ mod tests {
             .collect()
     }
 
+    /// A policy that prints: a terminal, no opt-out, no working directory.
+    fn tty() -> Policy {
+        Policy {
+            always: false,
+            stderr_is_terminal: true,
+            quiet: false,
+            cwd: None,
+        }
+    }
+
+    fn fresh() -> Mutex<BTreeSet<PathBuf>> {
+        Mutex::new(BTreeSet::new())
+    }
+
+    /// A store file at `dir/name` with `file_mode`, in a directory made `dir_mode`.
+    fn store_at(tmp: &Path, dir_mode: u32, file_mode: u32) -> PathBuf {
+        let dir = tmp.join("d");
+        std::fs::create_dir(&dir).unwrap();
+        set_mode(&dir, dir_mode);
+        let path = dir.join("s.redb");
+        std::fs::write(&path, b"").unwrap();
+        set_mode(&path, file_mode);
+        path
+    }
+
     /// The work of the umask test. It runs in a child process that `sh` started under `umask 0`,
     /// because the umask is per process and a test thread must not change it for the others.
     fn new_store_in_a_fresh_dir() {
@@ -217,9 +385,11 @@ mod tests {
         const CHILD: &str = "FL_STORE_PRIVATE_UMASK_CHILD";
         if std::env::var_os(CHILD).is_some() {
             // Proof the child really runs permissive: a plain create would be 0666 here.
-            let probe = TempDir::new().unwrap().keep().join("probe");
+            let probe_dir = TempDir::new().unwrap();
+            let probe = probe_dir.path().join("probe");
             drop(std::fs::File::create(&probe).unwrap());
             assert_eq!(mode(&probe), 0o666, "the child must run under umask 0");
+            drop(probe_dir);
             new_store_in_a_fresh_dir();
             return;
         }
@@ -231,11 +401,16 @@ mod tests {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),
-            "child failed:\n{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
+            "child failed:\n{stdout}\n{}",
             String::from_utf8_lossy(&out.stderr)
+        );
+        // A filter that matched no test also exits 0: the child must have run exactly this one.
+        assert!(
+            stdout.contains("1 passed"),
+            "the child did not run the test:\n{stdout}"
         );
     }
 
@@ -286,6 +461,7 @@ mod tests {
 
     #[test]
     fn an_existing_loose_store_is_warned_about_once_and_never_chmodded() {
+        TEST_TTY.with(|t| t.set(true));
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("old");
         std::fs::create_dir(&dir).unwrap();
@@ -320,7 +496,105 @@ mod tests {
     }
 
     #[test]
+    fn nothing_is_printed_when_stderr_is_not_a_terminal() {
+        // The open path, with the thread's stderr a pipe or file (the default under test).
+        TEST_TTY.with(|t| t.set(false));
+        let tmp = TempDir::new().unwrap();
+        let path = store_at(tmp.path(), 0o755, 0o644);
+        drop(redb::Database::create(&path).unwrap());
+        set_mode(&path, 0o644);
+        drop(RedbStore::open(&path).unwrap());
+        assert!(emitted_for(tmp.path()).is_empty());
+
+        // The pure function: not a terminal, nothing; a terminal, the same store warns. The silent
+        // call claims nothing, so it does not eat the later warning.
+        let seen = fresh();
+        let mut pol = tty();
+        pol.stderr_is_terminal = false;
+        assert!(loose_warnings(&path, &seen, &pol).is_empty());
+        assert_eq!(loose_warnings(&path, &seen, &tty()).len(), 2);
+    }
+
+    #[test]
+    fn the_hub_serve_mode_prints_without_a_terminal_once_per_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = store_at(tmp.path(), 0o755, 0o644);
+        let seen = fresh();
+        let mut pol = tty();
+        pol.stderr_is_terminal = false;
+        assert!(loose_warnings(&path, &seen, &pol).is_empty());
+        pol.always = true;
+        assert_eq!(loose_warnings(&path, &seen, &pol).len(), 2);
+        assert!(
+            loose_warnings(&path, &seen, &pol).is_empty(),
+            "once per path"
+        );
+    }
+
+    #[test]
+    fn the_opt_out_silences_both_modes() {
+        let tmp = TempDir::new().unwrap();
+        let path = store_at(tmp.path(), 0o755, 0o644);
+        let mut pol = tty();
+        pol.quiet = true;
+        assert!(loose_warnings(&path, &fresh(), &pol).is_empty());
+        pol.always = true;
+        assert!(loose_warnings(&path, &fresh(), &pol).is_empty());
+
+        // Any non-empty value except 0.
+        use std::ffi::OsStr;
+        assert!(quiet_value(Some(OsStr::new("1"))));
+        assert!(quiet_value(Some(OsStr::new("yes"))));
+        assert!(!quiet_value(Some(OsStr::new("0"))));
+        assert!(!quiet_value(Some(OsStr::new(""))));
+        assert!(!quiet_value(None));
+    }
+
+    #[test]
+    fn a_loose_file_alone_warns_about_the_file_only() {
+        let tmp = TempDir::new().unwrap();
+        let path = store_at(tmp.path(), 0o700, 0o640);
+        let w = loose_warnings(&path, &fresh(), &tty());
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("chmod 600"), "{w:?}");
+    }
+
+    #[test]
+    fn an_open_directory_around_a_private_file_is_silent() {
+        let tmp = TempDir::new().unwrap();
+        let path = store_at(tmp.path(), 0o755, 0o600);
+        assert!(loose_warnings(&path, &fresh(), &tty()).is_empty());
+    }
+
+    #[test]
+    fn a_directory_others_can_write_in_warns_even_around_a_private_file() {
+        let tmp = TempDir::new().unwrap();
+        for dir_mode in [0o775, 0o757, 0o777] {
+            let sub = tempfile::tempdir_in(tmp.path()).unwrap();
+            let path = store_at(sub.path(), dir_mode, 0o600);
+            let w = loose_warnings(&path, &fresh(), &tty());
+            assert_eq!(w.len(), 1, "{dir_mode:o}: {w:?}");
+            assert!(w[0].contains("chmod 700"), "{w:?}");
+            assert!(w[0].contains("replace the store"), "{w:?}");
+        }
+    }
+
+    #[test]
+    fn a_sticky_directory_is_never_called_loose() {
+        let tmp = TempDir::new().unwrap();
+        // Sticky and world-writable, like /tmp, around a private file and around a loose one.
+        let path = store_at(tmp.path(), 0o1777, 0o600);
+        assert!(loose_warnings(&path, &fresh(), &tty()).is_empty());
+        let sub = tempfile::tempdir_in(tmp.path()).unwrap();
+        let loose = store_at(sub.path(), 0o1777, 0o644);
+        let w = loose_warnings(&loose, &fresh(), &tty());
+        assert_eq!(w.len(), 1, "only the file: {w:?}");
+        assert!(w[0].contains("chmod 600"));
+    }
+
+    #[test]
     fn a_private_store_earns_no_warning() {
+        TEST_TTY.with(|t| t.set(true));
         let tmp = TempDir::new().unwrap();
         let dir = tmp.path().join("fl");
         create_private_dir_all(&dir).unwrap();
@@ -331,30 +605,93 @@ mod tests {
     }
 
     #[test]
-    fn the_warning_dedupes_per_path_stays_bounded_and_survives_poison() {
+    fn a_relative_store_path_never_earns_chmod_700_dot() {
         let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("d");
-        std::fs::create_dir(&dir).unwrap();
-        set_mode(&dir, 0o755);
-        let path = dir.join("s.redb");
-        std::fs::write(&path, b"").unwrap();
-        set_mode(&path, 0o664);
-        let seen = Mutex::new(BTreeSet::new());
+        let cwd = tmp.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        set_mode(&cwd, 0o755);
+        let file = cwd.join("store.redb");
+        std::fs::write(&file, b"").unwrap();
+        set_mode(&file, 0o644);
+        let mut pol = tty();
+        pol.cwd = Some(cwd.clone());
 
-        assert_eq!(loose_warnings(&path, &seen).len(), 2);
+        // `--db store.redb`: the file is reported by its absolute path; the directory is the
+        // working directory, so there is no directory advice at all.
+        let w = loose_warnings(Path::new("store.redb"), &fresh(), &pol);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains(&format!("chmod 600 {}", file.display())),
+            "{w:?}"
+        );
+        assert!(w.iter().all(|t| !t.contains("chmod 700")));
+
+        // An ancestor of the working directory is not advised either.
+        let deep = cwd.join("a").join("b");
+        std::fs::create_dir_all(&deep).unwrap();
+        pol.cwd = Some(deep);
+        let w = loose_warnings(&file, &fresh(), &pol);
+        assert!(w.iter().all(|t| !t.contains("chmod 700")), "{w:?}");
+
+        // A relative store in a subdirectory of the working directory (here the absolute form,
+        // since resolving a relative one reads the process's own directory) names the directory
+        // in full, never `.`.
+        let sub = cwd.join("data");
+        std::fs::create_dir(&sub).unwrap();
+        set_mode(&sub, 0o755);
+        let inner = sub.join("s.redb");
+        std::fs::write(&inner, b"").unwrap();
+        set_mode(&inner, 0o644);
+        let mut pol = tty();
+        pol.cwd = Some(cwd);
+        let w = loose_warnings(&inner, &fresh(), &pol);
+        let dir_w = w.iter().find(|t| t.contains("chmod 700")).unwrap();
+        assert!(dir_w.contains(&format!("chmod 700 {}", sub.display())));
+        assert!(!dir_w.contains("chmod 700 ."), "{dir_w}");
+    }
+
+    #[test]
+    fn a_dir_that_cannot_be_named_gets_no_advice() {
+        // A relative parent that does not exist cannot be resolved: no `chmod 700 sub`.
         assert_eq!(
-            loose_warnings(&path, &seen).len(),
+            nameable_dir(Path::new("no-such-dir-xyz/s.redb"), None),
+            None
+        );
+        // The working directory and its ancestors are not named; a sibling is.
+        let store = Path::new("/x/y/s.redb");
+        assert_eq!(nameable_dir(store, Some(Path::new("/x/y"))), None);
+        assert_eq!(nameable_dir(store, Some(Path::new("/x/y/z"))), None);
+        assert_eq!(
+            nameable_dir(store, Some(Path::new("/x/q"))),
+            Some(PathBuf::from("/x/y"))
+        );
+        assert_eq!(
+            nameable_dir(store, None),
+            Some(PathBuf::from("/x/y")),
+            "no known working directory: named as given"
+        );
+    }
+
+    #[test]
+    fn the_dedupe_stays_bounded_and_survives_poison() {
+        let tmp = TempDir::new().unwrap();
+        let path = store_at(tmp.path(), 0o755, 0o664);
+        let seen = fresh();
+
+        assert_eq!(loose_warnings(&path, &seen, &tty()).len(), 2);
+        assert_eq!(
+            loose_warnings(&path, &seen, &tty()).len(),
             0,
             "one warning per path"
         );
         // A second store in the same directory: the directory is not repeated.
-        let other = dir.join("t.redb");
+        let other = path.with_file_name("t.redb");
         std::fs::write(&other, b"").unwrap();
         set_mode(&other, 0o600);
-        assert_eq!(loose_warnings(&other, &seen).len(), 0);
+        assert_eq!(loose_warnings(&other, &seen, &tty()).len(), 0);
 
         // A stat error is no warning, and no panic.
-        assert!(loose_warnings(&tmp.path().join("missing/x.redb"), &seen).is_empty());
+        assert!(loose_warnings(&tmp.path().join("missing/x.redb"), &seen, &tty()).is_empty());
 
         // The set is bounded: a full one warns about nothing new.
         let full = Mutex::new(
@@ -362,7 +699,7 @@ mod tests {
                 .map(|i| PathBuf::from(format!("/p/{i}")))
                 .collect(),
         );
-        assert!(loose_warnings(&path, &full).is_empty());
+        assert!(loose_warnings(&path, &full, &tty()).is_empty());
 
         // A poisoned set still works.
         let poisoned = Arc::new(Mutex::new(BTreeSet::new()));
@@ -373,19 +710,69 @@ mod tests {
         })
         .join();
         assert!(poisoned.is_poisoned());
-        assert_eq!(loose_warnings(&path, &poisoned).len(), 2);
+        assert_eq!(loose_warnings(&path, &poisoned, &tty()).len(), 2);
     }
 
     #[test]
-    fn a_sticky_shared_directory_is_not_called_loose() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("tmp-like");
-        std::fs::create_dir(&dir).unwrap();
-        set_mode(&dir, 0o1777);
-        let path = dir.join("s.redb");
-        std::fs::write(&path, b"").unwrap();
-        set_mode(&path, 0o600);
-        assert!(loose_warnings(&path, &Mutex::new(BTreeSet::new())).is_empty());
+    fn a_closed_stderr_pipe_cannot_panic_the_warning() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+        }
+        write_line(&mut Broken, "warning: x");
+        let mut ok = Vec::new();
+        write_line(&mut ok, "warning: x");
+        assert_eq!(ok, b"warning: x\n");
+    }
+
+    #[test]
+    fn warn_always_makes_the_open_path_print_without_a_terminal() {
+        // The setter is process-global, so it runs in a child process like the umask test.
+        const CHILD: &str = "FL_STORE_PRIVATE_ALWAYS_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            TEST_TTY.with(|t| t.set(false));
+            let tmp = TempDir::new().unwrap();
+            let path = store_at(tmp.path(), 0o755, 0o644);
+            drop(redb::Database::create(&path).unwrap());
+            set_mode(&path, 0o644);
+            drop(RedbStore::open(&path).unwrap());
+            assert!(emitted_for(tmp.path()).is_empty(), "silent before the call");
+            warn_always();
+            let two = tmp.path().join("two");
+            std::fs::create_dir(&two).unwrap();
+            let path2 = store_at(&two, 0o755, 0o644);
+            drop(redb::Database::create(&path2).unwrap());
+            set_mode(&path2, 0o644);
+            drop(RedbStore::open(&path2).unwrap());
+            drop(RedbStore::open(&path2).unwrap());
+            assert_eq!(emitted_for(tmp.path()).len(), 2, "file and dir, once");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "private::tests::warn_always_makes_the_open_path_print_without_a_terminal",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child did not run:\n{stdout}"
+        );
     }
 
     #[test]
@@ -434,6 +821,7 @@ mod tests {
 
     #[test]
     fn a_symlink_at_the_store_path_is_followed_by_redb_and_chmodded_by_nobody() {
+        TEST_TTY.with(|t| t.set(true));
         let tmp = TempDir::new().unwrap();
         let real = tmp.path().join("real.redb");
         drop(redb::Database::create(&real).unwrap());

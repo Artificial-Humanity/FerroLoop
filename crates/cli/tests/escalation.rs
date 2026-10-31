@@ -9,17 +9,6 @@ use std::fs;
 use std::path::Path;
 use std::process::Command as Sys;
 
-/// A scratch directory only its owner can enter. A store `fl` makes inside a directory others can
-/// enter earns a loose-permissions warning on stderr (`fl_store::private`), which these tests
-/// would read as noise; `tempfile::tempdir` uses the umask, which is 0775 or 0755.
-fn private_tempdir() -> tempfile::TempDir {
-    use std::os::unix::fs::PermissionsExt;
-    tempfile::Builder::new()
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()
-        .unwrap()
-}
-
 fn git(dir: &Path, args: &[&str]) {
     let out = Sys::new("git")
         .args(args)
@@ -76,7 +65,7 @@ struct R {
 /// A git working tree with `src/a.rs`, whose project's config entry
 /// carries `tracker` — [`BOUND`], or "" for none.
 fn world(tracker: &str) -> R {
-    let home = private_tempdir();
+    let home = tempfile::tempdir().unwrap();
     let repo = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q"]);
     git(repo.path(), &["config", "user.email", "t@example.com"]);
@@ -1131,7 +1120,7 @@ fn a_marked_records_move_is_refused_before_the_import_check() {
     g.routed();
     g.gated("todo", "doing", "true");
     g.ok(&["manifest", "export", "--project", "1"]);
-    let other = private_tempdir();
+    let other = tempfile::tempdir().unwrap();
     g.configure(other.path(), BOUND);
     let at = |args: &[&str]| g.fl_at(other.path()).args(args).output().unwrap();
     assert!(at(&["manifest", "import"]).status.success());

@@ -46,8 +46,8 @@ Every command below passes `--db <path>` explicitly so the walkthrough doesn't t
 whatever store you already have. In real use you can skip it: `fl` falls back to
 `$FL_DB`, then an XDG data directory, creating whichever directory it lands on. A store file
 it creates is mode `0600` and a directory it creates is `0700`; an existing store or directory is
-never changed, only warned about when others can reach it (see "Where the store lives" in the
-README).
+never changed, only warned about at a terminal when others can reach it (see "Where the store
+lives" in the README).
 
 ```
 $ fl --help
@@ -89,7 +89,7 @@ A project is a git working tree. The tool refuses anything that isn't one, becau
 gate's provenance is a commit — there has to be a HEAD to stamp it against.
 
 ```
-$ mkdir -p -m 700 /tmp/gs-demo && mkdir -p /tmp/gs-demo/project && cd /tmp/gs-demo/project
+$ mkdir -p /tmp/gs-demo/project && cd /tmp/gs-demo/project
 $ git init -q
 $ git config user.email "you@example.com"
 $ git config user.name "You"
