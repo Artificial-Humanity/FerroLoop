@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { HubApiClient } from "../api/client";
+import { HubApiClient, generatePasskeyCredentialId } from "../api/client";
 import {
   DEFAULT_CLOUD_ADAPTERS_CONFIG,
   DEFAULT_HUB_SETTINGS,
@@ -280,7 +280,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       const client = apiClient ?? new HubApiClient();
       const label = passkeyLabel.trim() || "Operator Passkey";
       await client.registerPasskey({
-        credential_id: `passkey-${Date.now()}`,
+        credential_id: generatePasskeyCredentialId(),
         label,
       });
       setPasskeyRegistered(true);

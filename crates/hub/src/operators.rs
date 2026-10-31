@@ -33,7 +33,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::{hmac, pbkdf2, signature};
+use ring::{agreement, hmac, pbkdf2, signature};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -87,6 +87,10 @@ const HASH_LEN: usize = 32;
 static PBKDF2_ALG: pbkdf2::Algorithm = pbkdf2::PBKDF2_HMAC_SHA256;
 
 const TOTP_SECRET_BYTES: usize = 20;
+/// RFC 4226 section 4 (R6): a shared secret is at least 128 bits. A stored secret below this
+/// (an empty one above all: HMAC accepts an empty key, so its codes are computable by anyone)
+/// never verifies.
+const MIN_TOTP_SECRET_BYTES: usize = 16;
 const TOTP_STEP_SECS: u64 = 30;
 const TOTP_DIGITS: u32 = 6;
 const TOTP_ISSUER: &str = "FerroLoop";
@@ -484,7 +488,10 @@ fn hotp(secret: &[u8], counter: u64, digits: u32) -> u32 {
 /// than `last_step`. Every candidate is compared in constant time with no early exit.
 fn verify_totp(secret: &[u8], code: &str, now_secs: u64, last_step: Option<u64>) -> Option<u64> {
     let code = code.trim();
-    if code.len() != TOTP_DIGITS as usize || !code.bytes().all(|b| b.is_ascii_digit()) {
+    if secret.len() < MIN_TOTP_SECRET_BYTES
+        || code.len() != TOTP_DIGITS as usize
+        || !code.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     let current = now_secs / TOTP_STEP_SECS;
@@ -996,8 +1003,18 @@ fn parse_body<T: serde::de::DeserializeOwned>(map: Map<String, Value>) -> Result
     })
 }
 
+/// `op-` and 16 lowercase hex digits: the shape of an operator id.
+fn looks_like_operator_id(raw: &str) -> bool {
+    raw.strip_prefix("op-").is_some_and(|hex| {
+        hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
 fn valid_username(raw: &str) -> bool {
-    (MIN_USERNAME_LEN..=MAX_USERNAME_LEN).contains(&raw.len())
+    // A username shaped like an id would make `DELETE /operators/<it>` ambiguous: ids are
+    // matched before names.
+    !looks_like_operator_id(raw)
+        && (MIN_USERNAME_LEN..=MAX_USERNAME_LEN).contains(&raw.len())
         && raw
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
@@ -1007,8 +1024,10 @@ fn valid_text(raw: &str, max_chars: usize) -> bool {
     raw.chars().count() <= max_chars && !raw.chars().any(char::is_control)
 }
 
+/// HMAC zero-pads a key shorter than its block, so PBKDF2 hashes `pw` and `pw\0` (and `pw\0\0`)
+/// alike. A NUL is therefore refused in a password rather than silently ignored at its tail.
 fn valid_password(raw: &str) -> bool {
-    (MIN_PASSWORD_CHARS..=MAX_PASSWORD_CHARS).contains(&raw.chars().count())
+    (MIN_PASSWORD_CHARS..=MAX_PASSWORD_CHARS).contains(&raw.chars().count()) && !raw.contains('\0')
 }
 
 fn valid_credential_id(raw: &str) -> bool {
@@ -1121,7 +1140,22 @@ fn origin_of_request(req: &HttpRequest) -> Option<PinnedOrigin> {
 /// key is not accepted. Returns the canonical base64url form.
 fn normalize_public_key(raw: &str) -> Option<String> {
     let bytes = decode_b64_flexible(raw)?;
-    (bytes.len() == 65 && bytes[0] == 0x04).then(|| URL_SAFE_NO_PAD.encode(bytes))
+    (bytes.len() == 65 && bytes[0] == 0x04 && is_on_p256_curve(&bytes))
+        .then(|| URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// True when `point` is a valid uncompressed P-256 point: both coordinates below the field prime
+/// and the point on the curve. ring parses a peer key for ECDH with exactly that check (SEC 1
+/// section 3.2.2.1), and exposes no other way to ask, so a throwaway agreement is the test. Without
+/// it a malformed key registers and then fails every login, with nothing to say why.
+fn is_on_p256_curve(point: &[u8]) -> bool {
+    let rng = SystemRandom::new();
+    let Ok(ephemeral) = agreement::EphemeralPrivateKey::generate(&agreement::ECDH_P256, &rng)
+    else {
+        return false;
+    };
+    let peer = agreement::UnparsedPublicKey::new(&agreement::ECDH_P256, point);
+    agreement::agree_ephemeral(ephemeral, &peer, |_| ()).is_ok()
 }
 
 #[derive(Deserialize)]
@@ -1331,6 +1365,10 @@ fn login_token(state: &HubState, token: &str) -> HttpResponse {
     }
 }
 
+/// The throttle key shared by every login name that is not a valid username. It holds `:`, which
+/// `valid_username` refuses, so no real operator can have a login that lands in this bucket.
+const INVALID_USERNAME_THROTTLE_KEY: &str = "login-invalid:name";
+
 fn login_password(state: &HubState, login: PasswordLogin) -> HttpResponse {
     let username = login.username.trim();
     if username.len() > MAX_USERNAME_LEN
@@ -1342,7 +1380,22 @@ fn login_password(state: &HubState, login: PasswordLogin) -> HttpResponse {
     {
         return error_json(400, "a login field is too long");
     }
-    let key = username.to_ascii_lowercase();
+    if login.password.contains('\0') {
+        // No password is stored with a NUL (see `valid_password`), and one that ends in NULs would
+        // otherwise verify as the password without them.
+        return invalid_credentials();
+    }
+    let name = username.to_ascii_lowercase();
+    // The throttle shares one map between login names and the hub's own keys (`passkey:<id>`,
+    // `totp-verify:<name>`). A real username never holds `:` or a control character, so a name
+    // that does is charged to one shared bucket instead of the internal key it spells: otherwise
+    // an anonymous caller could lock a victim's TOTP enrolment by "logging in" as
+    // `totp-verify:<victim>`. The bucket's own key holds a `:`, so no valid username spells it.
+    let key = if name.contains(':') || name.chars().any(char::is_control) {
+        INVALID_USERNAME_THROTTLE_KEY.to_string()
+    } else {
+        name.clone()
+    };
     let home = match home_or_500(state) {
         Ok(home) => home,
         Err(resp) => return resp,
@@ -1359,7 +1412,7 @@ fn login_password(state: &HubState, login: PasswordLogin) -> HttpResponse {
     let owner_login = state.auth.owner_login().to_string();
     let found = locked(&home, &owner_login, |file| {
         Ok((
-            file.find_username(&key).map(|i| file.operators[i].clone()),
+            file.find_username(&name).map(|i| file.operators[i].clone()),
             false,
         ))
     });
@@ -5411,5 +5464,562 @@ mod tests {
             .map(|o| o.username.clone())
             .collect();
         assert_eq!(names, ["racer", "newcomer"]);
+    }
+
+    // --- Wave C audit regressions (2026-10-30) ------------------------------------------------
+
+    #[test]
+    fn totp_refuses_a_secret_below_128_bits() {
+        let now = 1_111_111_111u64;
+        let step = now / 30;
+        for secret in [&[][..], &[0x42u8; 15][..]] {
+            let code = format!("{:06}", hotp(secret, step, 6));
+            assert_eq!(
+                verify_totp(secret, &code, now, None),
+                None,
+                "{} bytes",
+                secret.len()
+            );
+        }
+        let ok = [0x42u8; 16];
+        let code = format!("{:06}", hotp(&ok, step, 6));
+        assert_eq!(verify_totp(&ok, &code, now, None), Some(step));
+    }
+
+    #[test]
+    fn a_tampered_empty_totp_secret_does_not_let_a_password_alone_in() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        create_operator(&state, "hollow", "owner", Some(PASSWORD));
+        let mut file = stored(&tmp);
+        let i = file.find_username("hollow").unwrap();
+        file.operators[i].totp_secret_base32 = Some(String::new());
+        file.operators[i].totp_enabled = true;
+        write_file(tmp.path(), &file, false).unwrap();
+        // HMAC accepts an empty key, so anyone can compute this code.
+        let code = format!("{:06}", hotp(&[], now_unix_secs() / TOTP_STEP_SECS, 6));
+        let resp = login(
+            &state,
+            &json!({ "mode": "password", "username": "hollow", "password": PASSWORD, "totp_code": code }),
+        );
+        assert!(is_invalid_credentials(&resp), "{}", body_text(&resp));
+    }
+
+    #[test]
+    fn base32_decoding_is_strict_about_alphabet_and_padding_position() {
+        for bad in [
+            "A=A",
+            "MZXW6===YTBOI",
+            "MZXW6\n",
+            "MZXW6\t",
+            "０",
+            "MZXW6\0",
+        ] {
+            assert!(base32_decode(bad).is_none(), "{bad:?}");
+        }
+        // Padding only ever trails.
+        assert_eq!(base32_decode("MY======").unwrap(), b"f");
+        assert_eq!(base32_decode("my").unwrap(), b"f");
+        // Only padding decodes to an empty secret; `verify_totp` refuses such a secret.
+        assert_eq!(base32_decode("=").unwrap(), b"");
+    }
+
+    #[test]
+    fn an_anonymous_login_cannot_charge_the_internal_totp_verify_or_passkey_keys() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        // The token owner's own TOTP verification key is `totp-verify:lmcfarlin`.
+        for _ in 0..8 {
+            password_login(&state, "totp-verify:lmcfarlin", PASSWORD);
+        }
+        // The bucket those names share is locked ...
+        assert_eq!(
+            password_login(&state, "totp-verify:lmcfarlin", PASSWORD).status,
+            429
+        );
+        // ... but the internal key was never charged.
+        let resp = owner(
+            &state,
+            "POST",
+            "/api/v1/auth/totp/verify",
+            &json!({ "code": "000000" }),
+        );
+        assert_ne!(resp.status, 429, "{}", body_text(&resp));
+        // Nor was a passkey key, and real names are untouched.
+        for _ in 0..8 {
+            password_login(&state, "passkey:abcdefghijklmnop", PASSWORD);
+        }
+        let mut t = state.login_guard.throttle();
+        assert_eq!(
+            t.retry_after("passkey:abcdefghijklmnop", Instant::now()),
+            None
+        );
+        drop(t);
+        create_operator(&state, "bystander", "owner", Some(PASSWORD));
+        assert_eq!(password_login(&state, "bystander", PASSWORD).status, 200);
+    }
+
+    #[test]
+    fn the_invalid_name_bucket_cannot_be_spelled_by_a_real_operator() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        // `invalid-username` is a valid username (lowercase letters and `-`).
+        assert_eq!(
+            create_operator(&state, "invalid-username", "owner", Some(PASSWORD)).status,
+            201
+        );
+        for _ in 0..8 {
+            password_login(&state, "a:b", PASSWORD);
+        }
+        // The invalid names are locked ...
+        assert_eq!(password_login(&state, "a:b", PASSWORD).status, 429);
+        // ... but the operator that happens to be named like the old bucket is not.
+        assert_eq!(
+            password_login(&state, "invalid-username", "wrong-password").status,
+            401
+        );
+        assert_eq!(
+            password_login(&state, "invalid-username", PASSWORD).status,
+            200
+        );
+    }
+
+    #[test]
+    fn control_characters_in_a_login_name_share_the_invalid_bucket() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        for _ in 0..6 {
+            password_login(&state, "bad\u{1}name", PASSWORD);
+        }
+        assert_eq!(
+            password_login(&state, "other\u{2}name", PASSWORD).status,
+            429
+        );
+        assert!(
+            state
+                .login_guard
+                .throttle()
+                .retry_after("bad\u{1}name", Instant::now())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_username_shaped_like_an_operator_id_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        for name in ["op-0123456789abcdef", "op-ffffffffffffffff"] {
+            let resp = create_operator(&state, name, "viewer", None);
+            assert_eq!(resp.status, 400, "{name}: {}", body_text(&resp));
+        }
+        // Near misses are ordinary names.
+        for name in [
+            "op-0123456789abcde",
+            "op-0123456789abcdeg",
+            "op-0123456789abcdef0",
+            "op-0123456789ABCDEF",
+        ] {
+            let resp = create_operator(&state, name, "viewer", None);
+            assert!(matches!(resp.status, 201 | 400), "{name}: {}", resp.status);
+        }
+        assert_eq!(
+            create_operator(&state, "op-0123456789abcde", "viewer", None).status,
+            200
+        );
+        // Deleting by a real id still hits the id's own operator.
+        let id = json_of(&create_operator(&state, "victim", "viewer", None))["operator"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(looks_like_operator_id(&id));
+        assert_eq!(
+            owner(
+                &state,
+                "DELETE",
+                &format!("/api/v1/auth/operators/{id}"),
+                &json!({})
+            )
+            .status,
+            200
+        );
+        assert!(stored(&tmp).find_username("victim").is_none());
+    }
+
+    #[test]
+    fn registration_refuses_points_that_are_not_on_the_p256_curve() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let (_, good) = new_keypair();
+        let cred = |n: u8| format!("credential-for-test-{n:04}");
+        let register = |n: u8, key: &[u8]| {
+            owner(
+                &state,
+                "POST",
+                "/api/v1/auth/passkey/register",
+                &json!({ "credential_id": cred(n), "label": "k", "public_key_b64": URL_SAFE_NO_PAD.encode(key) }),
+            )
+        };
+        assert_eq!(register(1, &good).status, 200);
+        let mut off_curve = good.clone();
+        off_curve[64] ^= 1;
+        let mut zeros = vec![0u8; 65];
+        zeros[0] = 0x04;
+        let mut ones = vec![0xffu8; 65];
+        ones[0] = 0x04;
+        // x or y at or above the field prime p.
+        let mut prime = vec![0u8; 65];
+        prime[0] = 0x04;
+        prime[1..33].copy_from_slice(&good[1..33]);
+        prime[33..65].copy_from_slice(
+            &hex_decode("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+                .unwrap(),
+        );
+        // Compressed and hybrid encodings, and a wrong length.
+        let mut compressed = good[..33].to_vec();
+        compressed[0] = 0x02;
+        let mut hybrid = good.clone();
+        hybrid[0] = 0x06;
+        for (n, what, key) in [
+            (2u8, "one bit off the curve", &off_curve),
+            (3, "all zeros", &zeros),
+            (4, "all ones", &ones),
+            (5, "y equal to the prime", &prime),
+            (6, "compressed", &compressed),
+            (7, "hybrid", &hybrid),
+            (8, "truncated", &good[..64].to_vec()),
+            (9, "extended", &[good.as_slice(), &[0]].concat()),
+        ] {
+            let resp = register(n, key);
+            assert_eq!(resp.status, 400, "{what}: {}", body_text(&resp));
+        }
+        assert_eq!(
+            stored(&tmp).operators[0].passkeys.len(),
+            1,
+            "only the valid key was stored"
+        );
+    }
+
+    #[test]
+    fn a_der_signature_must_be_strict_der() {
+        let split = |sig: &[u8]| -> (Vec<u8>, Vec<u8>) {
+            assert_eq!((sig[0], sig[2]), (0x30, 0x02));
+            let rl = sig[3] as usize;
+            let r = sig[4..4 + rl].to_vec();
+            assert_eq!(sig[4 + rl], 0x02);
+            let sl = sig[5 + rl] as usize;
+            (r, sig[6 + rl..6 + rl + sl].to_vec())
+        };
+        let der = |r: &[u8], s: &[u8]| -> Vec<u8> {
+            let mut body = vec![0x02, r.len() as u8];
+            body.extend_from_slice(r);
+            body.extend_from_slice(&[0x02, s.len() as u8]);
+            body.extend_from_slice(s);
+            let mut out = vec![0x30, body.len() as u8];
+            out.extend_from_slice(&body);
+            out
+        };
+        let unpad = |v: &[u8]| -> Vec<u8> {
+            let start = v.iter().position(|&b| b != 0).unwrap_or(v.len() - 1);
+            let mut out = vec![0u8; 32 - (v.len() - start)];
+            out.extend_from_slice(&v[start..]);
+            out
+        };
+        type Mutation<'a> = (&'static str, Box<dyn Fn(&[u8]) -> Vec<u8> + 'a>);
+        let mutations: Vec<Mutation> = vec![
+            ("trailing byte", Box::new(|sig| [sig, &[0]].concat())),
+            ("truncated", Box::new(|sig| sig[..sig.len() - 1].to_vec())),
+            ("one byte", Box::new(|_| vec![0x30])),
+            (
+                "long-form sequence length",
+                Box::new(|sig| [&[0x30, 0x81, sig[1]][..], &sig[2..]].concat()),
+            ),
+            (
+                "indefinite length",
+                Box::new(|sig| [&[0x30, 0x80][..], &sig[2..], &[0, 0]].concat()),
+            ),
+            (
+                "non-minimal r",
+                Box::new(move |sig| {
+                    let (r, s) = split(sig);
+                    der(&[&[0u8][..], &r].concat(), &s)
+                }),
+            ),
+            (
+                "negative r",
+                Box::new(move |sig| {
+                    let (r, s) = split(sig);
+                    let mut r = unpad(&r);
+                    r[0] |= 0x80;
+                    der(&r, &s)
+                }),
+            ),
+            (
+                "zero r and s",
+                Box::new(|_| vec![0x30, 6, 2, 1, 0, 2, 1, 0]),
+            ),
+            (
+                "raw r||s (what WebCrypto emits)",
+                Box::new(move |sig| {
+                    let (r, s) = split(sig);
+                    [unpad(&r), unpad(&s)].concat()
+                }),
+            ),
+            (
+                "r and s swapped",
+                Box::new(move |sig| {
+                    let (r, s) = split(sig);
+                    der(&s, &r)
+                }),
+            ),
+            (
+                "wrong tag for the sequence",
+                Box::new(|sig| [&[0x31][..], &sig[1..]].concat()),
+            ),
+        ];
+        let fx = fx("owner");
+        for (what, mutate) in &mutations {
+            fx.state.login_guard.throttle().clear(&fx.username);
+            let o = opts(&fx.state, 1);
+            let (cd, ad, sig) = assertion_parts(&fx.key, &o);
+            let resp = login(
+                &fx.state,
+                &assertion_body(&fx.cred, &(cd, ad, mutate(&sig))),
+            );
+            assert!(
+                is_invalid_credentials(&resp),
+                "{what}: {} {}",
+                resp.status,
+                body_text(&resp)
+            );
+        }
+        // An unmangled signature over the very same inputs still works: the refusals above were
+        // about the encoding, and none of them spent the counter.
+        fx.state.login_guard.throttle().clear(&fx.username);
+        assert_eq!(passkey_login(&fx, &opts(&fx.state, 1)).status, 200);
+    }
+
+    #[test]
+    fn an_empty_or_garbage_signature_field_is_the_plain_401() {
+        let fx = fx("owner");
+        for sig in [
+            "",
+            "=",
+            "!!!",
+            "AAAA",
+            "A",
+            &"A".repeat(MAX_ASSERTION_FIELD_LEN + 1),
+        ] {
+            fx.state.login_guard.throttle().clear(&fx.username);
+            let o = opts(&fx.state, 1);
+            let (cd, ad, _) = assertion_parts(&fx.key, &o);
+            let mut body = assertion_body(&fx.cred, &(cd, ad, Vec::new()));
+            body["signature_b64"] = json!(sig);
+            assert!(is_invalid_credentials(&login(&fx.state, &body)), "{sig:?}");
+        }
+    }
+
+    #[test]
+    fn a_counter_that_reaches_u32_max_ends_the_credentials_logins() {
+        // Characterises a known limit (audit LOW-6): the strict-increase rule has no wrap rule,
+        // so a credential that has seen u32::MAX never logs in again. The fix is to re-register.
+        let fx = fx("owner");
+        assert_eq!(passkey_login(&fx, &opts(&fx.state, u32::MAX)).status, 200);
+        fx.state.login_guard.throttle().clear(&fx.username);
+        for count in [0, 1, u32::MAX] {
+            let resp = passkey_login(&fx, &opts(&fx.state, count));
+            assert!(is_invalid_credentials(&resp), "count {count}");
+            fx.state.login_guard.throttle().clear(&fx.username);
+        }
+    }
+
+    #[test]
+    fn two_assertions_with_the_same_counter_cannot_both_log_in() {
+        let fx = fx("owner");
+        let bodies: Vec<Value> = (0..6)
+            .map(|_| assertion_body(&fx.cred, &assertion_parts(&fx.key, &opts(&fx.state, 7))))
+            .collect();
+        let wins = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for body in &bodies {
+                scope.spawn(|| {
+                    if login(&fx.state, body).status == 200 {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            wins.load(Ordering::SeqCst),
+            1,
+            "a counter value is spent once"
+        );
+        let file = stored(&fx._tmp);
+        let (i, j) = file.find_credential(&fx.cred).unwrap();
+        assert_eq!(file.operators[i].passkeys[j].sign_count, 7);
+    }
+
+    #[test]
+    fn one_challenge_can_log_in_only_one_of_many_racing_assertions() {
+        let fx = fx("owner");
+        let o = opts(&fx.state, 3);
+        let body = assertion_body(&fx.cred, &assertion_parts(&fx.key, &o));
+        let wins = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    if login(&fx.state, &body).status == 200 {
+                        wins.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(wins.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn origin_parsing_rejects_lookalike_loopback_hosts_and_smuggled_parts() {
+        for raw in [
+            "http://localhost.evil.com",
+            "http://127.0.0.1.nip.io",
+            "http://127.0.0.2",
+            "http://0.0.0.0",
+            "http://[::2]",
+            "http://example.com",
+            "https://user@host.example",
+            "https://user:pw@host.example",
+            "https://host.example/",
+            "https://host.example/path",
+            "https://host.example?x=1",
+            "https://host.example#f",
+            "https://host .example",
+            "https://host.example:",
+            "https://host.example:80a",
+            "https://host.example:123456",
+            "https://:443",
+            "https://[]",
+            "https://[::1",
+            "ftp://host.example",
+            "//host.example",
+            "host.example",
+            "",
+        ] {
+            assert_eq!(parse_origin(raw), None, "{raw:?}");
+        }
+        // A default port folds away; any other port, and a non-canonical one, is kept as written.
+        assert_eq!(
+            parse_origin("HTTPS://Host.Example:443").unwrap().origin,
+            "https://host.example"
+        );
+        assert_eq!(
+            parse_origin("http://[::1]:80").unwrap().origin,
+            "http://[::1]"
+        );
+        assert_eq!(
+            parse_origin("https://host.example:8443").unwrap().origin,
+            "https://host.example:8443"
+        );
+        assert_ne!(
+            parse_origin("https://host.example:0443").unwrap().origin,
+            parse_origin("https://host.example").unwrap().origin,
+            "a leading-zero port is not the default port"
+        );
+        // The relying-party id is the host name alone.
+        assert_eq!(
+            parse_origin("https://host.example:8443").unwrap().rp_id,
+            "host.example"
+        );
+        assert_eq!(parse_origin("http://[::1]:3000").unwrap().rp_id, "[::1]");
+    }
+
+    #[test]
+    fn password_hashing_pins_the_salt_and_cost_it_stores() {
+        let (hash_a, salt_a, n_a) = hash_password(PASSWORD).unwrap();
+        let (hash_b, salt_b, _) = hash_password(PASSWORD).unwrap();
+        assert_ne!(salt_a, salt_b);
+        assert_ne!(
+            hash_a, hash_b,
+            "same password, different salt, different hash"
+        );
+        // The stored salt decodes to exactly SALT_LEN bytes and the cost is the stored count.
+        assert_eq!(hex_decode(&salt_a).unwrap().len(), SALT_LEN);
+        assert_eq!(n_a, PBKDF2_ITERATIONS);
+        // Case and surrounding whitespace are part of a password.
+        let mut op = seed_file("x").unwrap().operators.remove(0);
+        op.password_hash_hex = Some(hash_a);
+        op.password_salt_hex = Some(salt_a);
+        op.password_iterations = Some(n_a);
+        for wrong in [
+            PASSWORD.to_uppercase(),
+            format!(" {PASSWORD}"),
+            format!("{PASSWORD} "),
+        ] {
+            assert!(!verify_password(&op, &wrong), "{wrong:?}");
+        }
+        // HMAC zero-pads a short key, so trailing NULs do not change a PBKDF2 result. The API
+        // edge refuses them (see `valid_password`) instead of relying on the hash to.
+        assert!(verify_password(&op, &format!("{PASSWORD}\0")));
+        assert!(!valid_password(&format!("{PASSWORD}\0")));
+        assert!(valid_password(PASSWORD));
+        // A salt or hash that is not even-length hex, or has the wrong length, never verifies.
+        for broken in ["", "zz", "abc", "é"] {
+            let mut bad = op.clone();
+            bad.password_salt_hex = Some(broken.to_string());
+            assert!(!verify_password(&bad, PASSWORD), "{broken:?}");
+            let mut bad = op.clone();
+            bad.password_hash_hex = Some(broken.to_string());
+            assert!(!verify_password(&bad, PASSWORD), "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn the_operator_file_survives_concurrent_writers_without_losing_an_update() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        assert_eq!(
+            create_operator(&state, "seedhold", "viewer", None).status,
+            201
+        );
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let state = &state;
+                scope.spawn(move || {
+                    for n in 0..5 {
+                        let resp = create_operator(state, &format!("w{t}-{n}"), "viewer", None);
+                        assert_eq!(resp.status, 201, "{}", body_text(&resp));
+                    }
+                });
+            }
+        });
+        let file = stored(&tmp);
+        assert_eq!(
+            file.operators.len(),
+            1 + 1 + 40,
+            "the seeded owner, seedhold and every writer's 5"
+        );
+        assert!(file.is_consistent());
+        assert_eq!(mode_of(&file_path(&tmp)), 0o600);
+        let leftovers = fs::read_dir(file_path(&tmp).parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn a_password_with_a_nul_is_refused_when_set_and_when_used() {
+        let tmp = TempDir::new().unwrap();
+        let state = state(&tmp);
+        let resp = create_operator(&state, "nully", "owner", Some("correct horse\u{0}"));
+        assert_eq!(resp.status, 400, "{}", body_text(&resp));
+        assert_eq!(
+            create_operator(&state, "nully", "owner", Some(PASSWORD)).status,
+            201
+        );
+        assert_eq!(password_login(&state, "nully", PASSWORD).status, 200);
+        let before = evaluated(&state);
+        let resp = password_login(&state, "nully", &format!("{PASSWORD}\u{0}"));
+        assert!(is_invalid_credentials(&resp), "{}", body_text(&resp));
+        assert_eq!(evaluated(&state), before, "refused before any hashing");
     }
 }

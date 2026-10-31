@@ -41,7 +41,7 @@ pub use auth::{
     SESSION_COOKIE_NAME, constant_time_eq, extract_bearer_token, extract_session_cookie,
     format_logout_set_cookie, format_session_set_cookie, generate_hex_token,
     mint_pairing_code_in_store, pairing_state_slug, resolve_owner_token, resolve_peer_token,
-    session_state_slug, sha256_hex,
+    session_state_slug, sha256_hex, try_generate_hex_token,
 };
 pub use discovery::{
     DiscoveredSessionSummary, QuotaWindowUsage, SessionContextUsage, SessionQuotaUsage,
