@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import type { HubApiClient } from "../api/client";
 import type {
   ArchitectureResponse,
@@ -74,6 +74,15 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
   const [actionError, setActionError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [copiedC4, setCopiedC4] = useState<boolean>(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   const handleStartRun = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -157,7 +166,13 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
         await navigator.clipboard.writeText(dsl);
       }
       setCopiedC4(true);
-      setTimeout(() => setCopiedC4(false), 1800);
+      if (copyTimerRef.current !== null) {
+        clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = setTimeout(() => {
+        setCopiedC4(false);
+        copyTimerRef.current = null;
+      }, 1800);
     } catch {
       setCopiedC4(false);
     }
@@ -535,7 +550,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                     color: "var(--text-muted)",
                   }}
                 >
-                  Components ({archModel.components.length}) & Edges ({archModel.edges.length})
+                  Components ({(archModel.components ?? []).length}) & Edges ({(archModel.edges ?? []).length})
                 </div>
 
                 <div style={{ overflowX: "auto" }}>
@@ -549,7 +564,7 @@ export const HubDrawer: React.FC<HubDrawerProps> = ({
                       </tr>
                     </thead>
                     <tbody>
-                      {archModel.components.map((comp) => (
+                      {(archModel.components ?? []).map((comp) => (
                         <tr
                           key={comp.id}
                           style={{ borderBottom: "1px solid var(--border-subtle)" }}

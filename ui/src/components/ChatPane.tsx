@@ -458,7 +458,30 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   // still belongs to the agent/session they were started for.
   const currentTargetRef = React.useRef<string>(targetSessionOrAgent);
   currentTargetRef.current = targetSessionOrAgent;
-  const [submitting, setSubmitting] = React.useState<boolean>(false);
+  const [submittingByTarget, setSubmittingByTarget] = React.useState<
+    Record<string, number>
+  >({});
+  const submitting = Boolean(
+    targetSessionOrAgent && (submittingByTarget[targetSessionOrAgent] ?? 0) > 0,
+  );
+  const beginTargetSubmitting = React.useCallback((targetKey: string) => {
+    if (!targetKey) return;
+    setSubmittingByTarget((prev) => ({
+      ...prev,
+      [targetKey]: (prev[targetKey] ?? 0) + 1,
+    }));
+  }, []);
+  const endTargetSubmitting = React.useCallback((targetKey: string) => {
+    if (!targetKey) return;
+    setSubmittingByTarget((prev) => {
+      const nextCount = (prev[targetKey] ?? 0) - 1;
+      if (nextCount <= 0) {
+        const { [targetKey]: _removed, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [targetKey]: nextCount };
+    });
+  }, []);
   const [submitError, setSubmitError] = React.useState<string | null>(null);
 
   const scrollContainerRef = React.useRef<HTMLDivElement | null>(null);
@@ -700,6 +723,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!targetSessionOrAgent || interrupting) {
       return;
     }
+    const submittedTarget = targetSessionOrAgent;
     disarmInterrupt();
     setInterrupting(true);
     setCompactFeedback(null);
@@ -708,19 +732,25 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (onInterruptSession) {
         await onInterruptSession();
       } else if (apiClient) {
-        await apiClient.interruptSession(targetSessionOrAgent);
-        setInternalIsBusy(false);
+        await apiClient.interruptSession(submittedTarget);
+        if (currentTargetRef.current === submittedTarget) {
+          setInternalIsBusy(false);
+        }
         if (onRefresh) {
           onRefresh();
         }
       } else {
         throw new Error("No session route is configured for interrupt.");
       }
-      setCompactFeedback("Stopped session");
+      if (currentTargetRef.current === submittedTarget) {
+        setCompactFeedback("Stopped session");
+      }
     } catch (err) {
-      setSubmitError(
-        err instanceof Error ? err.message : "Failed to interrupt session",
-      );
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(
+          err instanceof Error ? err.message : "Failed to interrupt session",
+        );
+      }
     } finally {
       setInterrupting(false);
     }
@@ -902,6 +932,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!targetSessionOrAgent || decommissioning) {
       return;
     }
+    const submittedTarget = targetSessionOrAgent;
     setDecommissioning(true);
     setCompactFeedback(null);
     setSubmitError(null);
@@ -909,13 +940,15 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (onDecommissionSession) {
         await onDecommissionSession(mode);
       } else if (apiClient) {
-        await apiClient.decommissionSession(targetSessionOrAgent, mode);
-        if (mode === "teardown") {
-          setInternalTurns([]);
-          setInternalQueue([]);
-          setInternalIsBusy(false);
-        } else if (turns === undefined) {
-          void fetchTranscript();
+        await apiClient.decommissionSession(submittedTarget, mode);
+        if (currentTargetRef.current === submittedTarget) {
+          if (mode === "teardown") {
+            setInternalTurns([]);
+            setInternalQueue([]);
+            setInternalIsBusy(false);
+          } else if (turns === undefined) {
+            void fetchTranscript();
+          }
         }
         if (onRefresh) {
           onRefresh();
@@ -924,13 +957,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         throw new Error("No session route is configured for decommissioning.");
       }
       handleCloseDecommissionModal();
-      setCompactFeedback(
-        mode === "prepare" ? "Prepared decommission" : "Tore down session",
-      );
+      if (currentTargetRef.current === submittedTarget) {
+        setCompactFeedback(
+          mode === "prepare" ? "Prepared decommission" : "Tore down session",
+        );
+      }
     } catch (err) {
-      setSubmitError(
-        err instanceof Error ? err.message : `Failed to ${mode} session`,
-      );
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(
+          err instanceof Error ? err.message : `Failed to ${mode} session`,
+        );
+      }
       handleCloseDecommissionModal();
     } finally {
       setDecommissioning(false);
@@ -941,6 +978,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!canCompact) {
       return;
     }
+    const submittedTarget = targetSessionOrAgent;
     setCompacting(true);
     setCompactFeedback(null);
     setSubmitError(null);
@@ -957,38 +995,44 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     const payload: PromptRequest = { prompt: "/compact", send_now: true };
     try {
       if (onSendPrompt) {
-        await onSendPrompt(targetSessionOrAgent, payload);
+        await onSendPrompt(submittedTarget, payload);
       } else if (apiClient) {
-        const res = await apiClient.sendSessionPrompt(targetSessionOrAgent, payload);
-        if (Array.isArray(res.queue)) {
-          setInternalQueue(res.queue);
+        const res = await apiClient.sendSessionPrompt(submittedTarget, payload);
+        if (currentTargetRef.current === submittedTarget) {
+          if (Array.isArray(res.queue)) {
+            setInternalQueue(res.queue);
+          }
+          if (typeof res.is_busy === "boolean") {
+            setInternalIsBusy(res.is_busy);
+          }
+          if (!res.queued && res.status !== "queued") {
+            const content = res.effective_body || payload.prompt;
+            setInternalTurns((prev) => [
+              ...prev,
+              {
+                index: prev.length,
+                role: "user",
+                content,
+                thinking: null,
+                tool_calls: [],
+                created_at: new Date().toISOString(),
+              },
+            ]);
+          }
+          void fetchTranscript();
         }
-        if (typeof res.is_busy === "boolean") {
-          setInternalIsBusy(res.is_busy);
-        }
-        if (!res.queued && res.status !== "queued") {
-          const content = res.effective_body || payload.prompt;
-          setInternalTurns((prev) => [
-            ...prev,
-            {
-              index: prev.length,
-              role: "user",
-              content,
-              thinking: null,
-              tool_calls: [],
-              created_at: new Date().toISOString(),
-            },
-          ]);
-        }
-        void fetchTranscript();
       } else {
         throw new Error("No message route is configured for this session.");
       }
-      setCompactFeedback("Sent /compact");
-      scrollToBottom("smooth");
-      requestAnimationFrame(() => scrollToBottom("smooth"));
+      if (currentTargetRef.current === submittedTarget) {
+        setCompactFeedback("Sent /compact");
+        scrollToBottom("smooth");
+        requestAnimationFrame(() => scrollToBottom("smooth"));
+      }
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to send /compact");
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(err instanceof Error ? err.message : "Failed to send /compact");
+      }
     } finally {
       setCompacting(false);
     }
@@ -1060,15 +1104,23 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setInternalError(null);
     try {
       const response = await apiClient.getSessionTranscript(targetId);
-      setInternalTurns(response.turns ?? []);
-      setInternalIsBusy(Boolean(response.is_busy));
-      setInternalQueue(response.queue ?? []);
-      setInternalContextUsage(response.context_usage ?? null);
-      setInternalQuotaUsage(response.quota_usage ?? null);
+      if (currentTargetRef.current === targetId) {
+        setInternalTurns(response.turns ?? []);
+        setInternalIsBusy(Boolean(response.is_busy));
+        setInternalQueue(response.queue ?? []);
+        setInternalContextUsage(response.context_usage ?? null);
+        setInternalQuotaUsage(response.quota_usage ?? null);
+      }
     } catch (err) {
-      setInternalError(err instanceof Error ? err.message : "Failed to load transcript");
+      if (currentTargetRef.current === targetId) {
+        setInternalError(
+          err instanceof Error ? err.message : "Failed to load transcript",
+        );
+      }
     } finally {
-      setInternalLoading(false);
+      if (currentTargetRef.current === targetId) {
+        setInternalLoading(false);
+      }
     }
   }, [apiClient, turns, sessionId, agentName]);
 
@@ -1196,40 +1248,50 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const handleSendQueuedNow = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
+    const submittedTarget = targetSessionOrAgent;
     try {
       if (onSendQueuedNow) {
         await onSendQueuedNow(promptId);
       } else if (apiClient) {
-        const res = await apiClient.sendQueuedPromptNow(targetSessionOrAgent, promptId);
-        if (Array.isArray(res.queue)) {
-          setInternalQueue(res.queue);
-        }
-        if (typeof res.is_busy === "boolean") {
-          setInternalIsBusy(res.is_busy);
-        }
-        const content = res.effective_body || res.prompt;
-        if (content) {
-          setInternalTurns((prev) => [
-            ...prev,
-            {
-              index: prev.length,
-              role: "user",
-              content,
-              thinking: null,
-              tool_calls: [],
-              created_at: new Date().toISOString(),
-            },
-          ]);
+        const res = await apiClient.sendQueuedPromptNow(submittedTarget, promptId);
+        if (currentTargetRef.current === submittedTarget) {
+          if (Array.isArray(res.queue)) {
+            setInternalQueue(res.queue);
+          }
+          if (typeof res.is_busy === "boolean") {
+            setInternalIsBusy(res.is_busy);
+          }
+          const content = res.effective_body || res.prompt;
+          if (content) {
+            setInternalTurns((prev) => [
+              ...prev,
+              {
+                index: prev.length,
+                role: "user",
+                content,
+                thinking: null,
+                tool_calls: [],
+                created_at: new Date().toISOString(),
+              },
+            ]);
+          }
         }
       }
-      scrollToBottom("smooth");
+      if (currentTargetRef.current === submittedTarget) {
+        scrollToBottom("smooth");
+      }
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to send queued message");
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(
+          err instanceof Error ? err.message : "Failed to send queued message",
+        );
+      }
     }
   };
 
   const handleCancelQueued = async (promptId: string) => {
     if (!targetSessionOrAgent) return;
+    const submittedTarget = targetSessionOrAgent;
     if (editingQueueId === promptId) {
       setEditingQueueId(null);
       setEditingQueueText("");
@@ -1238,44 +1300,65 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       if (onCancelQueued) {
         await onCancelQueued(promptId);
       } else if (apiClient) {
-        const res = await apiClient.cancelQueuedPrompt(targetSessionOrAgent, promptId);
-        if (Array.isArray(res.queue)) {
-          setInternalQueue(res.queue);
-        }
-        if (typeof res.is_busy === "boolean") {
-          setInternalIsBusy(res.is_busy);
+        const res = await apiClient.cancelQueuedPrompt(submittedTarget, promptId);
+        if (currentTargetRef.current === submittedTarget) {
+          if (Array.isArray(res.queue)) {
+            setInternalQueue(res.queue);
+          }
+          if (typeof res.is_busy === "boolean") {
+            setInternalIsBusy(res.is_busy);
+          }
         }
       }
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to cancel queued message");
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(
+          err instanceof Error ? err.message : "Failed to cancel queued message",
+        );
+      }
     }
   };
 
   const handleSaveEditedQueued = async (promptId: string) => {
     const trimmed = editingQueueText.trim();
     if (!targetSessionOrAgent || !trimmed) return;
+    const submittedTarget = targetSessionOrAgent;
     try {
       if (onUpdateQueued) {
         await onUpdateQueued(promptId, trimmed);
       } else if (apiClient) {
-        const res = await apiClient.updateQueuedPrompt(targetSessionOrAgent, promptId, trimmed);
-        if (Array.isArray(res.queue)) {
-          setInternalQueue(res.queue);
-        }
-        if (typeof res.is_busy === "boolean") {
-          setInternalIsBusy(res.is_busy);
+        const res = await apiClient.updateQueuedPrompt(
+          submittedTarget,
+          promptId,
+          trimmed,
+        );
+        if (currentTargetRef.current === submittedTarget) {
+          if (Array.isArray(res.queue)) {
+            setInternalQueue(res.queue);
+          }
+          if (typeof res.is_busy === "boolean") {
+            setInternalIsBusy(res.is_busy);
+          }
         }
       } else {
         setInternalQueue((prev) =>
           prev.map((item) =>
-            item.id === promptId ? { ...item, prompt: trimmed, effective_body: trimmed } : item,
+            item.id === promptId
+              ? { ...item, prompt: trimmed, effective_body: trimmed }
+              : item,
           ),
         );
       }
-      setEditingQueueId(null);
-      setEditingQueueText("");
+      if (currentTargetRef.current === submittedTarget) {
+        setEditingQueueId(null);
+        setEditingQueueText("");
+      }
     } catch (err) {
-      setSubmitError(err instanceof Error ? err.message : "Failed to update queued message");
+      if (currentTargetRef.current === submittedTarget) {
+        setSubmitError(
+          err instanceof Error ? err.message : "Failed to update queued message",
+        );
+      }
     }
   };
 
@@ -1299,42 +1382,45 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     };
 
     const submittedTarget = targetSessionOrAgent;
-    setSubmitting(true);
+    beginTargetSubmitting(submittedTarget);
     setSubmitError(null);
     try {
       let wasQueued = false;
       if (onSendPrompt) {
-        const res = (await onSendPrompt(targetSessionOrAgent, payload)) as
+        const res = (await onSendPrompt(submittedTarget, payload)) as
           | PromptResponse
           | undefined;
         if (res && (res.queued || res.status === "queued")) {
           wasQueued = true;
         }
       } else if (apiClient) {
-        const res = await apiClient.sendSessionPrompt(targetSessionOrAgent, payload);
-        if (Array.isArray(res.queue)) {
-          setInternalQueue(res.queue);
-        }
-        if (typeof res.is_busy === "boolean") {
-          setInternalIsBusy(res.is_busy);
-        }
+        const res = await apiClient.sendSessionPrompt(submittedTarget, payload);
         if (res.queued || res.status === "queued") {
           wasQueued = true;
-        } else {
-          const content = res.effective_body || payload.prompt;
-          setInternalTurns((prev) => [
-            ...prev,
-            {
-              index: prev.length,
-              role: "user",
-              content,
-              thinking: null,
-              tool_calls: [],
-              created_at: new Date().toISOString(),
-            },
-          ]);
         }
-        await fetchTranscript();
+        if (currentTargetRef.current === submittedTarget) {
+          if (Array.isArray(res.queue)) {
+            setInternalQueue(res.queue);
+          }
+          if (typeof res.is_busy === "boolean") {
+            setInternalIsBusy(res.is_busy);
+          }
+          if (!wasQueued) {
+            const content = res.effective_body || payload.prompt;
+            setInternalTurns((prev) => [
+              ...prev,
+              {
+                index: prev.length,
+                role: "user",
+                content,
+                thinking: null,
+                tool_calls: [],
+                created_at: new Date().toISOString(),
+              },
+            ]);
+          }
+          await fetchTranscript();
+        }
       }
       clearSessionDraft(submittedTarget);
       // The operator may have switched agents while the request was in
@@ -1354,7 +1440,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
         setSubmitError(err instanceof Error ? err.message : "Failed to send message");
       }
     } finally {
-      setSubmitting(false);
+      endTargetSubmitting(submittedTarget);
     }
   };
 

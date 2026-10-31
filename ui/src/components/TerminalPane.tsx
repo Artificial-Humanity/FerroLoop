@@ -78,6 +78,9 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const processedFrameCountRef = useRef<number>(0);
+  const prevFirstFrameRef = useRef<HubWsFrame | undefined>(undefined);
+  const prevSessionForFramesRef = useRef<string>(effectiveSessionId);
 
   const [outputLog, setOutputLog] = useState<string>("");
   const [commandInput, setCommandInput] = useState<string>("");
@@ -87,25 +90,28 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
     rows: 28,
   });
 
-  const emitTerminalEvent = useCallback(
-    (event: string, data: unknown) => {
-      if (onSendTerminalFrame) {
-        onSendTerminalFrame(event, data);
-        return;
+  const onSendTerminalFrameRef = useRef(onSendTerminalFrame);
+  onSendTerminalFrameRef.current = onSendTerminalFrame;
+  const wsClientRef = useRef(wsClient);
+  wsClientRef.current = wsClient;
+
+  const emitTerminalEvent = useCallback((event: string, data: unknown) => {
+    if (onSendTerminalFrameRef.current) {
+      onSendTerminalFrameRef.current(event, data);
+      return;
+    }
+    const client = wsClientRef.current;
+    if (client) {
+      // Only `open` may wait for a connection. Input, resize and close are
+      // meaningful on the live shell alone; replaying buffered keystrokes
+      // into a later shell would execute stale commands.
+      if (event === "open") {
+        client.sendFrame("terminal", event, data);
+      } else {
+        client.sendFrame("terminal", event, data, { queueWhenDisconnected: false });
       }
-      if (wsClient) {
-        // Only `open` may wait for a connection. Input, resize and close are
-        // meaningful on the live shell alone; replaying buffered keystrokes
-        // into a later shell would execute stale commands.
-        if (event === "open") {
-          wsClient.sendFrame("terminal", event, data);
-        } else {
-          wsClient.sendFrame("terminal", event, data, { queueWhenDisconnected: false });
-        }
-      }
-    },
-    [onSendTerminalFrame, wsClient],
-  );
+    }
+  }, []);
 
   const handleIncomingFrame = useCallback(
     (frame: HubWsFrame) => {
@@ -181,17 +187,6 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       }
     });
   }, [isOwner, wsClient]);
-
-  // Process prop-supplied terminalFrames if provided
-  useEffect(() => {
-    if (!isOwner || !terminalFrames || terminalFrames.length === 0) {
-      return;
-    }
-    const latest = terminalFrames[terminalFrames.length - 1];
-    if (latest) {
-      handleIncomingFrame(latest);
-    }
-  }, [isOwner, terminalFrames, handleIncomingFrame]);
 
   // Mount xterm.js and open shell session when Owner
   useEffect(() => {
@@ -303,6 +298,35 @@ export const TerminalPane: React.FC<TerminalPaneProps> = ({
       fitAddonRef.current = null;
     };
   }, [isOwner, effectiveSessionId, effectiveCwd, emitTerminalEvent]);
+
+  // Process all new prop-supplied terminalFrames in order (O-4)
+  useEffect(() => {
+    if (prevSessionForFramesRef.current !== effectiveSessionId) {
+      processedFrameCountRef.current = 0;
+      prevFirstFrameRef.current = undefined;
+      prevSessionForFramesRef.current = effectiveSessionId;
+    }
+    if (!isOwner || !terminalFrames || terminalFrames.length === 0) {
+      processedFrameCountRef.current = 0;
+      prevFirstFrameRef.current = undefined;
+      return;
+    }
+    if (
+      terminalFrames.length < processedFrameCountRef.current ||
+      (processedFrameCountRef.current > 0 &&
+        terminalFrames[0] !== prevFirstFrameRef.current)
+    ) {
+      processedFrameCountRef.current = 0;
+    }
+    for (let i = processedFrameCountRef.current; i < terminalFrames.length; i += 1) {
+      const frame = terminalFrames[i];
+      if (frame) {
+        handleIncomingFrame(frame);
+      }
+    }
+    processedFrameCountRef.current = terminalFrames.length;
+    prevFirstFrameRef.current = terminalFrames[0];
+  }, [isOwner, effectiveSessionId, terminalFrames, handleIncomingFrame]);
 
   const handleReconnect = () => {
     if (!isOwner) {
