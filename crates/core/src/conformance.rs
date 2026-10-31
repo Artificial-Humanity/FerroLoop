@@ -2593,6 +2593,75 @@ pub fn message_store<S: MessageStore + AgentRegistry + Catalog + Handles, G>(
     run_suite("message-store", MESSAGE_STORE_CASES, cases, make);
 }
 
+/// A cursor at `u64::MAX` reads nothing from each of the four logs, whatever the
+/// store holds: it is "after the last", never an overflow of `cursor + 1`. The
+/// store is given one row in every log first, so a store that returns early
+/// for an empty table does not pass by that alone.
+pub fn a_cursor_at_u64_max_reads_nothing<S>(s: &S)
+where
+    S: StateStore + AgentRegistry + MessageStore + Catalog + Handles,
+{
+    use crate::ferrowire::{MessageKind, MessageUrgency, SendWireArgs, WireAddress};
+
+    s.register_agent(crate::agent::RegisterAgentArgs {
+        display_name: "Ferris".into(),
+        email: None,
+        project: "ferroloop".into(),
+        role: crate::agent::AgentRole::Lead,
+        extra_areas: vec![],
+        create_area: true,
+        replace: false,
+        at: At::from_unix_millis(5),
+        by: "owner".into(),
+    })
+    .unwrap();
+    s.upsert_state(crate::state::UpsertStateArgs {
+        scope: crate::state::StateScope::Workspace,
+        slug: "cursor-rule".into(),
+        sensitivity: crate::state::SensitivityPatch::Inherit,
+        payload: crate::state::StatePayload::Memory(crate::state::MemoryEntry {
+            category: crate::state::MemoryCategory::Rule,
+            basis: crate::state::MemoryBasis::Ruling,
+            lifecycle: crate::state::MemoryLifecycle::Active,
+            superseded_by: None,
+            pinned: false,
+            summary: "s".into(),
+            body: "b".into(),
+        }),
+        at: At::from_unix_millis(6),
+        by: "jarvis".into(),
+    })
+    .unwrap();
+    s.send_wire(SendWireArgs {
+        id: None,
+        sender_id: None,
+        sender_name: "jarvis".into(),
+        sender_host: None,
+        to: WireAddress::AgentName("ferris".into()),
+        kind: MessageKind::Mail,
+        urgency: MessageUrgency::Normal,
+        durable: false,
+        subject: "s".into(),
+        body: "b".into(),
+        reply_to: None,
+        thread_id: None,
+        deadline_at: None,
+        at: At::from_unix_millis(10),
+    })
+    .unwrap();
+    // Each log holds a row, and a cursor before it reads it.
+    assert!(!s.registry_events_after(0).unwrap().is_empty());
+    assert!(!s.state_revisions_after(0).unwrap().is_empty());
+    assert!(!s.wire_messages_after(0).unwrap().is_empty());
+    assert!(!s.wire_receipts_after(0).unwrap().is_empty());
+    for cursor in [u64::MAX, u64::MAX - 1] {
+        assert!(s.registry_events_after(cursor).unwrap().is_empty());
+        assert!(s.state_revisions_after(cursor).unwrap().is_empty());
+        assert!(s.wire_messages_after(cursor).unwrap().is_empty());
+        assert!(s.wire_receipts_after(cursor).unwrap().is_empty());
+    }
+}
+
 pub fn workflow_store<S: WorkflowStore + Catalog + Handles, G>(make: impl Fn() -> (S, G)) {
     let cases: &[fn(&S)] = &[
         workflow_def_upserts_resolves_by_slug_and_handle_and_validates_graph::<S>,

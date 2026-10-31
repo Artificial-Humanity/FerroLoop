@@ -1660,8 +1660,9 @@ impl GithubTracker {
         // post nothing, losing the record.
         let note = json!({"body": format!(
             "`fl github repair`: the fl labels and the open/closed status were rewritten from \
-             fl's record (state `{}`) by {by}.",
-            meta.state
+             fl's record (state `{}`) by {}.",
+            meta.state,
+            crate::ledger::render::escape_capped(by, 200)
         )});
         let comment_failed = match self.client.send(
             Method::Post,
@@ -4299,6 +4300,22 @@ mod tests {
             "{:?}",
             issue.comments
         );
+    }
+
+    #[test]
+    fn repair_comment_does_not_ping_the_name_it_was_given() {
+        let fake = FakeGithub::start("acme/widgets");
+        let t = open(&fake);
+        let r = t.add_record(&p(), "t").unwrap();
+        fake.web_edit(1, |i| i.labels = vec!["bug".into()]);
+        t.repair(r.iri(), "@some-org/team").unwrap();
+        let issue = fake.issue(1);
+        let note = issue
+            .comments
+            .iter()
+            .find(|c| c.contains("fl github repair"))
+            .unwrap();
+        assert!(!note.contains(" @some-org/team"), "{note}");
     }
 
     #[test]

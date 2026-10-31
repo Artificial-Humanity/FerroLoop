@@ -521,7 +521,7 @@ impl Build<'_> {
                 _ => ("uvx", Vec::new(), format!("{}=={version}", p.identifier)),
             }
         };
-        for a in &p.runtime_arguments {
+        for (i, a) in p.runtime_arguments.iter().enumerate() {
             if docker && a.kind == ArgumentKind::Positional {
                 return refuse(
                     format!(
@@ -532,9 +532,33 @@ impl Build<'_> {
                     by_hand(n),
                 );
             }
-            args.extend(self.argument(a, docker)?);
+            // `argument` goes first so its own refusals (a secret, an unknown
+            // type) keep their wording; the list below is checked whatever it
+            // returns, an optional argument that is left out included.
+            let words = self.argument(a, docker)?;
+            if let Some(why) = runtime_argument_problem(a, docker) {
+                return refuse(
+                    format!(
+                        "its runtime argument {} {why}, so fl cannot tell what the line \
+                         would run",
+                        describe_runtime_argument(a, i)
+                    ),
+                    by_hand(n),
+                );
+            }
+            args.extend(words);
         }
         for v in &p.environment_variables {
+            if let Some(why) = env_name_problem(&v.name) {
+                return refuse(
+                    format!(
+                        "its environment variable `{}` {why}, so the line could fetch or run \
+                         something other than the pinned package",
+                        printable(&v.name)
+                    ),
+                    by_hand(n),
+                );
+            }
             if self.variable(v)? && docker {
                 args.extend(["-e".to_string(), v.name.clone()]);
             }
@@ -573,6 +597,12 @@ impl Build<'_> {
                     "its argument `{label}` is of type `{}`, an argument type fl does not know",
                     printable(kind)
                 ),
+                by_hand(n),
+            );
+        }
+        if a.kind == ArgumentKind::Named && a.name.as_deref().is_none_or(str::is_empty) {
+            return refuse(
+                format!("its named argument `{label}` has no name, so fl cannot pass it"),
                 by_hand(n),
             );
         }
@@ -806,13 +836,132 @@ fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
+/// Flags a registry's `npx`/`uvx` runtime argument may carry, as boolean flags
+/// in exactly this spelling and nothing else. They change how the runner talks
+/// or caches, never which package it runs or where it fetches it from. Any
+/// other runtime argument is refused: a list of known-bad options cannot be
+/// complete (`--package=x`, `-pevil`, `-i url`, a value that a "boolean" flag
+/// does not take and so leaves as the package to run, ...).
+const RUNTIME_FLAGS: &[&str] = &[
+    "-y",
+    "--yes",
+    "--no-update-notifier",
+    "--prefer-offline",
+    "--quiet",
+];
+
+/// Flags a registry's `docker run` runtime argument may carry as booleans.
+/// `-e NAME=value` and `-p 127.0.0.1:port:port` are the only valued ones, see
+/// `runtime_argument_problem`. Anything else (`--privileged`, `-v`,
+/// `--mount`, `--entrypoint`, `--network`, `--cap-add`, `--device`, `--pid`,
+/// `--user`, `--security-opt`, ...) changes what the container may do to the
+/// machine and is refused.
+const DOCKER_FLAGS: &[&str] = &["-i", "--rm"];
+
+/// Why a runtime argument is not one fl will write into the line, or `None`
+/// when it is on the list. The reason never holds the argument's value: a
+/// value may name a secret.
+fn runtime_argument_problem(a: &Argument, docker: bool) -> Option<&'static str> {
+    let template = a.value.as_deref().or(a.default.as_deref());
+    match &a.kind {
+        // `argument` refuses a type it does not know.
+        ArgumentKind::Other(_) => None,
+        ArgumentKind::Positional if docker => Some("is positional"),
+        ArgumentKind::Positional => match template {
+            Some(v) if RUNTIME_FLAGS.contains(&v) => None,
+            Some(_) => Some("is not one of the plain flags fl allows before the package"),
+            None => Some("has no value to check"),
+        },
+        ArgumentKind::Named => {
+            let name = a.name.as_deref().unwrap_or("");
+            let boolean = a.format.as_deref() == Some("boolean")
+                && template.is_none_or(|t| matches!(t, "true" | "false"));
+            let flags = if docker { DOCKER_FLAGS } else { RUNTIME_FLAGS };
+            if flags.contains(&name) {
+                return (!boolean).then_some("is a flag that takes no value, given one");
+            }
+            if docker && matches!(name, "-e" | "--env") {
+                let ok = template.is_some_and(|t| {
+                    t.split_once('=')
+                        .is_some_and(|(n, _)| is_env_name(n) && env_name_problem(n).is_none())
+                });
+                return (!ok).then_some("is not `NAME=value` with a safe variable name");
+            }
+            if docker && matches!(name, "-p" | "--publish") {
+                return (!template.is_some_and(is_loopback_port)).then_some(
+                    "does not publish a port on 127.0.0.1 only (`127.0.0.1:<port>:<port>`)",
+                );
+            }
+            Some("is not an option fl allows here")
+        }
+    }
+}
+
+/// `127.0.0.1:<port>:<port>`, the one form of `docker -p` fl writes: a port
+/// published for this machine alone.
+fn is_loopback_port(v: &str) -> bool {
+    let port = |p: &str| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit());
+    let Some(rest) = v.strip_prefix("127.0.0.1:") else {
+        return false;
+    };
+    let rest = rest
+        .strip_suffix("/tcp")
+        .or_else(|| rest.strip_suffix("/udp"))
+        .unwrap_or(rest);
+    rest.split_once(':')
+        .is_some_and(|(host, container)| port(host) && port(container))
+}
+
+/// Names of a registry's environment variables fl will not set: they change
+/// where a runner fetches from, what it loads, or what `PATH`/`HOME` resolve
+/// to, without touching the argument list. Compared without case.
+const ENV_PREFIXES: &[&str] = &[
+    "npm_", "npx_", "node_", "uv_", "pip_", "python", "ld_", "dyld_", "docker_", "xdg_", "ssl_",
+];
+const ENV_NAMES: &[&str] = &[
+    "path",
+    "home",
+    "userprofile",
+    "appdata",
+    "shell",
+    "ifs",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "requests_ca_bundle",
+    "curl_ca_bundle",
+];
+
+fn env_name_problem(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    (ENV_NAMES.contains(&lower.as_str()) || ENV_PREFIXES.iter().any(|p| lower.starts_with(p)))
+        .then_some("is one that changes how a package is fetched or run")
+}
+
+/// Where a message points at a runtime argument: its name when it has one
+/// (cut at a `=`, which starts an attached value), else its place in the
+/// list. Never its value.
+fn describe_runtime_argument(a: &Argument, index: usize) -> String {
+    match (&a.kind, a.name.as_deref()) {
+        (ArgumentKind::Named, Some(name)) if !name.is_empty() => {
+            format!("`{}`", printable(name.split('=').next().unwrap_or(name)))
+        }
+        _ => format!("number {} (without a name)", index + 1),
+    }
+}
+
 /// An argument as a message shows it: a named one's flag and template, a
 /// positional's hint or template.
 fn label(a: &Argument) -> String {
     let template = a.value.as_deref().or(a.default.as_deref());
     let text = match (&a.kind, &a.name, template) {
-        (ArgumentKind::Positional, ..) | (_, None, _) => (a.value_hint.as_deref().or(template))
+        (ArgumentKind::Positional, ..) => (a.value_hint.as_deref().or(template))
             .unwrap_or("a positional argument")
+            .to_string(),
+        // No name to show, and its value may be secret: the hint only.
+        (_, None, _) => (a.value_hint.as_deref())
+            .unwrap_or("an unnamed argument")
             .to_string(),
         (_, Some(name), Some(t)) => format!("{name} {t}"),
         (_, Some(name), None) => name.clone(),
@@ -1757,6 +1906,252 @@ mod tests {
             let msg = err.unwrap_err().to_string();
             assert!(msg.contains("a shape fl cannot record"), "{value}: {msg}");
         }
+    }
+
+    fn freeze_package(package: Value) -> Result<Frozen, McpError> {
+        freeze(
+            &response(sample(json!([package]), json!([]))),
+            &named("sample"),
+        )
+    }
+
+    #[test]
+    fn a_runtime_argument_cannot_displace_the_pinned_package() {
+        let bypasses = [
+            // A positional word that starts with `-` is still an option.
+            json!({ "type": "positional", "value": "--package=evil" }),
+            json!({ "type": "positional", "value": "--from=evil" }),
+            json!({ "type": "positional", "value": "--index-url=https://evil.example" }),
+            json!({ "type": "positional", "value": "--registry=https://evil.example" }),
+            json!({ "type": "positional", "value": "-pevil" }),
+            json!({ "type": "positional", "value": "--@scope:registry=https://evil.example" }),
+            json!({ "type": "positional", "value": "--userconfig=/tmp/rc" }),
+            json!({ "type": "positional", "value": "--prefix=/tmp/x" }),
+            json!({ "type": "positional", "value": "--node-options=--require=/tmp/x.js" }),
+            json!({ "type": "positional", "value": "--directory=/tmp/x" }),
+            json!({ "type": "positional", "value": "--project=/tmp/x" }),
+            json!({ "type": "positional", "value": "evil" }),
+            // Spelled other than exactly: no case folding, no `=value`.
+            json!({ "type": "positional", "value": "--PACKAGE=evil" }),
+            json!({ "type": "positional", "value": "-Y" }),
+            json!({ "type": "positional", "value": "--yes=evil" }),
+            json!({ "type": "positional", "value": " -y" }),
+            // A valueHint-only placeholder has nothing to check.
+            json!({ "type": "positional", "valueHint": "package" }),
+            json!({ "type": "positional", "valueHint": "package", "isRequired": true }),
+            // Named, harmless name, a value the flag does not take: the value
+            // becomes the package to run.
+            json!({ "type": "named", "name": "--prefer-offline", "value": "evil" }),
+            json!({ "type": "named", "name": "--prefer-offline", "value": "evil",
+                    "format": "boolean" }),
+            json!({ "type": "named", "name": "--prefer-offline", "value": "{p}",
+                    "format": "boolean", "variables": { "p": { "default": "evil" } } }),
+            json!({ "type": "named", "name": "-y", "value": "evil" }),
+            // Named, an option that names a package, an index or a config.
+            json!({ "type": "named", "name": "--from", "value": "evil" }),
+            json!({ "type": "named", "name": "--from=evil" }),
+            json!({ "type": "named", "name": "-p", "value": "evil" }),
+            json!({ "type": "named", "name": "-pevil" }),
+            json!({ "type": "named", "name": "--package", "value": "evil" }),
+            json!({ "type": "named", "name": "--index-url", "value": "https://evil.example" }),
+            json!({ "type": "named", "name": "--INDEX-URL", "value": "https://evil.example" }),
+            json!({ "type": "named", "name": "--Registry", "value": "https://evil.example" }),
+            json!({ "type": "named", "name": "-i", "value": "https://evil.example" }),
+            json!({ "type": "named", "name": "-w", "value": "evil" }),
+            json!({ "type": "named", "name": "--@scope:registry", "value": "https://e.example" }),
+            json!({ "type": "named", "name": "--userconfig", "value": "/tmp/rc" }),
+            json!({ "type": "named", "name": "--prefix", "value": "/tmp/x" }),
+            json!({ "type": "named", "name": "--node-options", "value": "--require=x" }),
+            json!({ "type": "named", "name": "--directory", "value": "/tmp/x" }),
+            json!({ "type": "named", "name": "--project", "value": "/tmp/x" }),
+            // Named with no name, optional or not.
+            json!({ "type": "named" }),
+            json!({ "type": "named", "value": "evil" }),
+            json!({ "type": "named", "isRequired": true, "value": "evil" }),
+        ];
+        for arg in bypasses {
+            for package in [
+                npm(json!({ "runtimeArguments": [arg.clone()] })),
+                with(
+                    json!({ "registryType": "pypi", "identifier": "sample-mcp",
+                            "version": "1.0.0", "transport": { "type": "stdio" } }),
+                    json!({ "runtimeArguments": [arg.clone()] }),
+                ),
+            ] {
+                let err = freeze_package(package).expect_err(&format!("{arg} must be refused"));
+                let msg = err.to_string();
+                // An argument with no name, or a required one with nothing to
+                // pass, is refused by the argument's own rule before the list
+                // is read.
+                let known = msg.contains("its runtime argument")
+                    || msg.contains("has no value")
+                    || msg.contains("has no name");
+                assert!(known, "{arg}: {msg}");
+                if let Some(value) = arg["value"].as_str() {
+                    assert!(!msg.contains(value), "a value in: {msg}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_flags_on_the_runtime_list_still_freeze() {
+        let package = npm(json!({
+            "runtimeArguments": [
+                { "type": "positional", "value": "--yes" },
+                { "type": "positional", "value": "--no-update-notifier" },
+                { "type": "positional", "default": "-y" },
+                { "type": "named", "name": "--prefer-offline", "value": "true",
+                  "format": "boolean" },
+                { "type": "named", "name": "--quiet", "default": "true", "format": "boolean" },
+                { "type": "named", "name": "-y", "format": "boolean" },
+                { "type": "named", "name": "--quiet", "value": "false", "format": "boolean" }
+            ]
+        }));
+        let args = [
+            "-y",
+            "--yes",
+            "--no-update-notifier",
+            "-y",
+            "--prefer-offline",
+            "--quiet",
+            "@example/sample-mcp@1.0.0",
+        ];
+        let frozen = freeze_package(package).unwrap();
+        assert_eq!(frozen.server.args, Some(strings(&args)));
+    }
+
+    #[test]
+    fn a_docker_runtime_argument_is_refused_unless_it_is_on_the_list() {
+        let bypasses = [
+            json!({ "type": "named", "name": "--privileged" }),
+            json!({ "type": "named", "name": "--privileged", "format": "boolean",
+                    "value": "true" }),
+            json!({ "type": "named", "name": "-v", "value": "/:/host" }),
+            json!({ "type": "named", "name": "--volume", "value": "/:/host" }),
+            json!({ "type": "named", "name": "--mount", "value": "type=bind,src=/,dst=/h" }),
+            json!({ "type": "named", "name": "--entrypoint", "value": "/bin/sh" }),
+            json!({ "type": "named", "name": "--network=host" }),
+            json!({ "type": "named", "name": "--network", "value": "host" }),
+            json!({ "type": "named", "name": "--cap-add", "value": "SYS_ADMIN" }),
+            json!({ "type": "named", "name": "--device", "value": "/dev/mem" }),
+            json!({ "type": "named", "name": "--pid", "value": "host" }),
+            json!({ "type": "named", "name": "--user", "value": "0" }),
+            json!({ "type": "named", "name": "--security-opt", "value": "seccomp=unconfined" }),
+            json!({ "type": "named", "name": "--PRIVILEGED" }),
+            json!({ "type": "named", "name": "--rm", "value": "evil" }),
+            json!({ "type": "named", "name": "-i", "value": "evil", "format": "boolean" }),
+            // `-e NAME` passes the host's own variable into the container.
+            json!({ "type": "named", "name": "-e", "value": "AWS_SECRET_ACCESS_KEY" }),
+            json!({ "type": "named", "name": "-e", "value": "PATH=/tmp" }),
+            json!({ "type": "named", "name": "--env", "value": "LD_PRELOAD=/tmp/x.so" }),
+            // `-p` outside the loopback shape publishes to the network.
+            json!({ "type": "named", "name": "-p", "value": "8085:8085" }),
+            json!({ "type": "named", "name": "-p", "value": "0.0.0.0:8085:8085" }),
+            json!({ "type": "named", "name": "--publish", "value": "127.0.0.1:x:8085" }),
+            json!({ "type": "named", "name": "-p", "value": "127.0.0.1:8085:8085 -v" }),
+            json!({ "type": "positional", "value": "--privileged" }),
+        ];
+        for arg in bypasses {
+            let package = oci(json!({ "runtimeArguments": [arg.clone()] }));
+            let err = freeze(
+                &response(sample(json!([package]), json!([]))),
+                &routed("sample", Route::Oci),
+            )
+            .expect_err(&format!("{arg} must be refused"));
+            let msg = err.to_string();
+            assert!(msg.contains("runtime argument"), "{arg}: {msg}");
+            assert!(!msg.contains("/host") && !msg.contains("AWS_"), "{msg}");
+        }
+        // What the shipped entries use still freezes.
+        let package = oci(json!({
+            "runtimeArguments": [
+                { "type": "named", "name": "-i", "format": "boolean", "value": "true" },
+                { "type": "named", "name": "--rm", "format": "boolean", "value": "true" },
+                { "type": "named", "name": "-p", "value": "127.0.0.1:8085:8085/tcp" },
+                { "type": "named", "name": "--env", "value": "SAMPLE_PORT=8085" }
+            ]
+        }));
+        let frozen = freeze(
+            &response(sample(json!([package]), json!([]))),
+            &routed("sample", Route::Oci),
+        )
+        .unwrap();
+        let args = [
+            "run",
+            "-i",
+            "--rm",
+            "-i",
+            "--rm",
+            "-p",
+            "127.0.0.1:8085:8085/tcp",
+            "--env",
+            "SAMPLE_PORT=8085",
+            "ghcr.io/example/sample-mcp:1.0.0",
+        ];
+        assert_eq!(frozen.server.args, Some(strings(&args)));
+    }
+
+    #[test]
+    fn a_registry_environment_variable_that_repoints_the_fetch_is_refused() {
+        for name in [
+            "npm_config_registry",
+            "NPM_CONFIG_REGISTRY",
+            "npm_config_userconfig",
+            "UV_INDEX_URL",
+            "uv_default_index",
+            "PIP_INDEX_URL",
+            "NODE_OPTIONS",
+            "NODE_PATH",
+            "node_options",
+            "PATH",
+            "Path",
+            "LD_PRELOAD",
+            "LD_LIBRARY_PATH",
+            "DYLD_INSERT_LIBRARIES",
+            "PYTHONPATH",
+            "PYTHONSTARTUP",
+            "HOME",
+            "DOCKER_HOST",
+            "XDG_CONFIG_HOME",
+            "HTTPS_PROXY",
+            "SSL_CERT_FILE",
+        ] {
+            for secret in [false, true] {
+                let package = npm(json!({
+                    "environmentVariables": [
+                        { "name": name, "value": "https://evil.example/", "isSecret": secret }
+                    ]
+                }));
+                let err = freeze_package(package).expect_err(name);
+                let msg = err.to_string();
+                assert!(msg.contains(&format!("`{name}`")), "{name}: {msg}");
+                assert!(!msg.contains("evil"), "a value in: {msg}");
+            }
+        }
+        // Their look-alikes and the ordinary names stay.
+        let package = npm(json!({
+            "environmentVariables": [
+                { "name": "SAMPLE_HOME", "value": "x" },
+                { "name": "MY_PATH", "value": "x" },
+                { "name": "API_KEY", "isSecret": true, "isRequired": true },
+                { "name": "NPMX", "value": "x" }
+            ]
+        }));
+        freeze_package(package).unwrap();
+    }
+
+    #[test]
+    fn a_named_argument_without_a_name_is_refused_not_passed_as_an_empty_word() {
+        let package = npm(json!({
+            "packageArguments": [{ "type": "named", "value": "v" }]
+        }));
+        let err = freeze(
+            &response(sample(json!([package]), json!([]))),
+            &named("sample"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("has no name"), "{err}");
     }
 
     // MCP spec §3.2 step 4: how each argument is passed.

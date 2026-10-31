@@ -33,6 +33,13 @@ use crate::cmd::state::StateEnv;
 
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
 
+/// The prune cutoff: `days` before `now_ms`. `days` comes from the config or
+/// the command line, so the multiplication saturates: a wrapped product would
+/// put the cutoff near `now` and prune everything acknowledged.
+fn retention_cutoff_ms(now_ms: u64, days: u64) -> u64 {
+    now_ms.saturating_sub(days.saturating_mul(86_400_000))
+}
+
 pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -849,7 +856,7 @@ pub fn run(env: &StateEnv<'_>, cmd: WireCmd) -> Result<i32, (i32, String)> {
             let days = older_than_days
                 .or_else(|| env.cfg.wire.as_ref().and_then(|w| w.retention_days))
                 .unwrap_or(DEFAULT_RETENTION_DAYS);
-            let cutoff_ms = now_millis().saturating_sub(days * 86_400_000);
+            let cutoff_ms = retention_cutoff_ms(now_millis(), days);
             let before = At::from_unix_millis(cutoff_ms);
             let store = env
                 .open_for_scope(Some(&StateScope::Workspace))
@@ -1437,6 +1444,20 @@ pub fn inbox_item_to_json(item: &WireInboxItem) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retention_cutoff_saturates_instead_of_wrapping() {
+        assert_eq!(super::retention_cutoff_ms(1_000, u64::MAX), 0);
+        // 213503982335 days * 86_400_000 wraps u64 to a tiny value.
+        assert_eq!(
+            super::retention_cutoff_ms(5_000_000_000, 213_503_982_335),
+            0
+        );
+        assert_eq!(
+            super::retention_cutoff_ms(200_000_000, 1),
+            200_000_000 - 86_400_000
+        );
+    }
+
     use super::*;
     use crate::config::{Config, WireConfig};
     use fl_core::agent::{AgentRole, RegisterAgentArgs};

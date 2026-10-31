@@ -137,7 +137,15 @@ impl Registry {
             encode(version)
         );
         let asked = (version != "latest").then_some(version);
-        self.get(&path, Some((name, asked)))
+        let got: ServerResponse = self.get(&path, Some((name, asked)))?;
+        if let Some(problem) = answer_mismatch(name, asked, &got) {
+            return Err(McpError::Registry {
+                registry: self.base.clone(),
+                request: format!("GET {path}"),
+                problem,
+            });
+        }
+        Ok(got)
     }
 
     /// One GET, judged in this order: the transport, a redirect, an HTML
@@ -467,6 +475,26 @@ impl From<String> for Status {
     }
 }
 
+/// What is wrong when `got` is not the server (and exact version, when one
+/// was asked for) that was requested. Freeze records the answer's own name and
+/// version, so an answer for another server would be pinned under the name the
+/// user typed.
+fn answer_mismatch(name: &str, version: Option<&str>, got: &ServerResponse) -> Option<String> {
+    if got.server.name != name {
+        return Some(format!(
+            "answered with the server `{}`, not the `{name}` that was asked for",
+            got.server.name
+        ));
+    }
+    match version {
+        Some(v) if got.server.version != v => Some(format!(
+            "answered with version `{}` of `{name}`, not the `{v}` that was asked for",
+            got.server.version
+        )),
+        _ => None,
+    }
+}
+
 /// A server's `server.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ServerJson {
@@ -663,12 +691,76 @@ pub struct Remote {
 
 #[cfg(test)]
 mod tests {
+    fn response(name: &str, version: &str) -> ServerResponse {
+        serde_json::from_value(serde_json::json!({
+            "server": { "name": name, "version": version },
+            "_meta": { "io.modelcontextprotocol.registry/official":
+                { "status": "active", "isLatest": true } }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn an_answer_for_another_server_or_version_is_refused() {
+        let got = response("io.b/y", "9.9.9");
+        assert!(
+            answer_mismatch("io.a/x", Some("1.0.0"), &got)
+                .unwrap()
+                .contains("io.b/y")
+        );
+        let got = response("io.a/x", "9.9.9");
+        assert!(
+            answer_mismatch("io.a/x", Some("1.0.0"), &got)
+                .unwrap()
+                .contains("9.9.9")
+        );
+        assert_eq!(answer_mismatch("io.a/x", Some("9.9.9"), &got), None);
+        // `latest` names no version to compare.
+        assert_eq!(answer_mismatch("io.a/x", None, &got), None);
+    }
+
     use super::*;
     use crate::McpError;
     use crate::fake::{self, FakeRegistry};
 
     fn client(fake: &FakeRegistry) -> Registry {
         Registry::new(&fake.url()).unwrap()
+    }
+
+    /// The `version` call itself refuses an answer for another server or
+    /// version, not only the helper it asks.
+    #[test]
+    fn version_refuses_an_answer_for_another_server_or_version() {
+        let fake = FakeRegistry::start();
+        let published = |name: &str, version: &str| {
+            let state = fake.state();
+            let found = state
+                .entries
+                .iter()
+                .find(|e| e["server"]["name"] == name && e["server"]["version"] == version);
+            found.expect("a published fixture").clone()
+        };
+        let weather = published(fake::WEATHER, "0.4.1");
+        let other = published(fake::NOTES, "1.1.0");
+        let notes = published(fake::NOTES, "1.2.0");
+        let reg = client(&fake);
+
+        // Another server's answer under the requested name.
+        fake.state().answer_next = Some(weather);
+        let err = reg.version(fake::NOTES, "latest").unwrap_err();
+        assert!(matches!(err, McpError::Registry { .. }), "{err:?}");
+        assert!(err.to_string().contains(fake::WEATHER), "{err}");
+
+        // Another version's answer to an exact request.
+        fake.state().answer_next = Some(other);
+        let err = reg.version(fake::NOTES, "1.2.0").unwrap_err();
+        assert!(matches!(err, McpError::Registry { .. }), "{err:?}");
+        assert!(err.to_string().contains("1.1.0"), "{err}");
+
+        // The matching answer is returned.
+        fake.state().answer_next = Some(notes);
+        let got = reg.version(fake::NOTES, "1.2.0").unwrap();
+        assert_eq!(got.server.name, fake::NOTES);
     }
 
     fn names(servers: &[Summary]) -> Vec<&str> {

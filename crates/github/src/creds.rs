@@ -7,7 +7,7 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use fl_core::StoreError;
 use ring::rand::SystemRandom;
 use ring::signature::{RSA_PKCS1_SHA256, RsaKeyPair};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -194,7 +194,19 @@ impl AppCredentials {
                 ))
             })?;
         let url = format!("{}/app/installations/{id}/access_tokens", self.api);
-        let made = send(&self.agent, Method::Post, &url, &jwt, None, &self.api, true)?;
+        // Ask for a token for this one repository: without a body GitHub
+        // grants every repository the installation can reach.
+        let only_this =
+            json!({"repositories": [self.repo.rsplit('/').next().unwrap_or(&self.repo)]});
+        let made = send(
+            &self.agent,
+            Method::Post,
+            &url,
+            &jwt,
+            Some(&only_this),
+            &self.api,
+            true,
+        )?;
         let token = (made.status == 201)
             .then(|| made.body.get("token").and_then(Value::as_str))
             .flatten()
@@ -360,6 +372,18 @@ mod tests {
         assert_eq!(app.token().unwrap(), crate::fake::INSTALLATION_TOKEN);
         assert_eq!(app.token().unwrap(), crate::fake::INSTALLATION_TOKEN);
         assert_eq!(fake.state().token_requests, 1);
+    }
+
+    #[test]
+    fn the_installation_token_is_requested_for_the_one_repository() {
+        let fake = FakeGithub::start("acme/widgets");
+        let app =
+            AppCredentials::new(&fake.url(), 42, &throwaway_key(true), "acme/widgets").unwrap();
+        app.token().unwrap();
+        let bodies = fake.state().token_bodies.clone();
+        assert_eq!(bodies.len(), 1);
+        let sent: Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(sent, json!({"repositories": ["widgets"]}));
     }
 
     #[test]

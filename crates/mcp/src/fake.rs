@@ -80,6 +80,9 @@ pub struct State {
     /// The next request answers 500 with `application/problem+json`, as the
     /// real registry once did. One-shot.
     pub problem_500_next: bool,
+    /// The next request answers 200 with this body whatever it asked for, as
+    /// a registry that answers for another server or version would. One-shot.
+    pub answer_next: Option<Value>,
     /// `GET /v0.1/servers` ignores `search` and lists every server, as a
     /// registry without the parameter would. A setting; off by default.
     pub ignores_search: bool,
@@ -222,6 +225,9 @@ fn route(s: &mut State, url: &str) -> Answer {
             location: Some(location),
             encoding: None,
         };
+    }
+    if let Some(body) = s.answer_next.take() {
+        return Answer::json(200, body);
     }
     if std::mem::take(&mut s.html_502_next) {
         return Answer {

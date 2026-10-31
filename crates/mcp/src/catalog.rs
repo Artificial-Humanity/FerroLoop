@@ -642,10 +642,40 @@ impl Editor {
             path: self.path.clone(),
             cause: e.to_string(),
         };
-        if let Some(dir) = self.path.parent() {
-            std::fs::create_dir_all(dir).map_err(io)?;
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir).map_err(io)?;
+        // The catalog is the only copy of every committed server: it is
+        // replaced whole by a rename, never truncated in place, so a crash or
+        // a full disk leaves the old file. A link is refused, not written
+        // through: the write would land wherever it points.
+        let existing = match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io(std::io::Error::other(
+                    "it is a symbolic link, and fl does not write through one",
+                )));
+            }
+            Ok(meta) => Some(meta.permissions()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io(e)),
+        };
+        let mut builder = tempfile::Builder::new();
+        builder.prefix(".mcp.toml-");
+        // The catalog is committed and shared with the team, so a new file
+        // gets what `File::create` would give it (`0666` less the umask), as
+        // the vendor files do, not a temp file's private `0600`.
+        if existing.is_none()
+            && let Some(mode) = crate::sync::new_file_mode()
+        {
+            builder.permissions(mode);
         }
-        std::fs::write(&self.path, self.text()).map_err(io)
+        let mut temp = builder.tempfile_in(dir).map_err(io)?;
+        std::io::Write::write_all(&mut temp, self.text().as_bytes()).map_err(io)?;
+        if let Some(mode) = existing {
+            std::fs::set_permissions(temp.path(), mode).map_err(io)?;
+        }
+        temp.as_file().sync_all().map_err(io)?;
+        temp.persist(&self.path).map_err(|e| io(e.error))?;
+        Ok(())
     }
 
     /// Adds `[server.<name>]` after every other entry.
@@ -838,6 +868,75 @@ fn dotted<'a>(values: impl Iterator<Item = (&'a String, Value)>) -> Item {
 
 #[cfg(test)]
 mod tests {
+    /// A rename replaces the file whole. A second hard link to the old file
+    /// still reads the old bytes afterwards; a truncate-and-write would have
+    /// changed them under it.
+    #[cfg(unix)]
+    #[test]
+    fn save_replaces_the_file_whole_instead_of_truncating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut editor = Editor::open(dir.path()).unwrap();
+        editor.save().unwrap();
+        let path = Catalog::path(dir.path());
+        let before = std::fs::read_to_string(&path).unwrap();
+        let alias = dir.path().join("alias.toml");
+        std::fs::hard_link(&path, &alias).unwrap();
+        editor.doc["registry"] = toml_edit::value("https://registry.example.com");
+        editor.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&alias).unwrap(), before);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("registry.example.com")
+        );
+        let stray: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(stray.len(), 1, "temp file left behind: {stray:?}");
+    }
+
+    /// The catalog is committed and shared: a new one is `0666` less the
+    /// umask, what `File::create` gives (the umask cannot be read without
+    /// `unsafe`, so a plain file made beside it stands for it), not the
+    /// private `0600` of a temp file.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_catalog_gets_the_default_file_mode_not_a_private_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        std::fs::File::create(&plain).unwrap();
+        Editor::open(dir.path()).unwrap().save().unwrap();
+        let path = Catalog::path(dir.path());
+        assert_eq!(mode(&path), mode(&plain));
+        // An existing file keeps its own mode.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        Editor::open(dir.path()).unwrap().save().unwrap();
+        assert_eq!(mode(&path), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_does_not_write_through_a_symlinked_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target.toml");
+        std::fs::write(&target, "untouched").unwrap();
+        let path = Catalog::path(dir.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        let editor = Editor {
+            path: path.clone(),
+            doc: DocumentMut::new(),
+            existed: false,
+            catalog: Catalog::default(),
+        };
+        assert!(editor.save().is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    }
+
     use super::*;
     use crate::McpError;
 

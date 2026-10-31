@@ -827,7 +827,13 @@ impl MessageStore for RedbStore {
             Err(e) => return Err(backend(e)),
         };
         let mut out = Vec::new();
-        for row in log.range((after_seq + 1)..).map_err(backend)? {
+        for row in log
+            .range((
+                std::ops::Bound::Excluded(after_seq),
+                std::ops::Bound::Unbounded,
+            ))
+            .map_err(backend)?
+        {
             let (k, v) = row.map_err(backend)?;
             if let Some(msg_guard) = messages.get(v.value()).map_err(backend)? {
                 let msg: WireMessage = serde_json::from_str(msg_guard.value()).map_err(decode)?;
@@ -853,7 +859,13 @@ impl MessageStore for RedbStore {
             Err(e) => return Err(backend(e)),
         };
         let mut out = Vec::new();
-        for row in log.range((after_seq + 1)..).map_err(backend)? {
+        for row in log
+            .range((
+                std::ops::Bound::Excluded(after_seq),
+                std::ops::Bound::Unbounded,
+            ))
+            .map_err(backend)?
+        {
             let (k, v) = row.map_err(backend)?;
             let rcpt: DeliveryReceipt = serde_json::from_str(v.value()).map_err(decode)?;
             if messages

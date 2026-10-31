@@ -649,7 +649,16 @@ pub fn parse_issue_url(id: &Iri) -> Option<(String, u64)> {
     let [owner, repo, "issues", n] = parts.as_slice() else {
         return None;
     };
-    if owner.is_empty() || repo.is_empty() {
+    // The name is spliced into API paths (`/repos/{owner}/{repo}`): only what
+    // GitHub names are made of, and never `.` or `..`.
+    let name_ok = |p: &str| {
+        !p.is_empty()
+            && p != "."
+            && p != ".."
+            && p.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    if !name_ok(owner) || !name_ok(repo) {
         return None;
     }
     Some((format!("{owner}/{repo}"), n.parse().ok()?))
@@ -661,6 +670,21 @@ pub fn is_issue_url(id: &Iri) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_issue_url_with_a_traversing_or_odd_repo_name_is_not_an_issue_url() {
+        for bad in [
+            "https://github.com/../x/issues/1",
+            "https://github.com/a/../issues/1",
+            "https://github.com/a/b%3Fq/issues/1",
+            "https://github.com/a/b?x/issues/1",
+        ] {
+            let iri = Iri::parse(bad).unwrap();
+            assert_eq!(parse_issue_url(&iri), None, "{bad}");
+        }
+        let ok = Iri::parse("https://github.com/acme/wid-gets.rs/issues/7").unwrap();
+        assert_eq!(parse_issue_url(&ok), Some(("acme/wid-gets.rs".into(), 7)));
+    }
+
     use super::*;
     use fl_core::ids::seq_iri;
 

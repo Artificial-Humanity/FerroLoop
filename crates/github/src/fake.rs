@@ -135,6 +135,8 @@ pub struct State {
     pub next_event: u64,
     pub installations: BTreeMap<String, u64>,
     pub token_requests: u64,
+    /// The body of every installation-token request, in order.
+    pub token_bodies: Vec<String>,
     /// "METHOD /path?query" of every request, in order.
     pub requests: Vec<String>,
     /// Largest page the fake serves, whatever `per_page` asks. 0 = 100.
@@ -1511,6 +1513,7 @@ pub(crate) fn route(s: &mut State, method: &str, url: &str, auth: &str, body: &s
         }
         ("POST", ["app", "installations", _, "access_tokens"]) => {
             s.token_requests += 1;
+            s.token_bodies.push(body.to_string());
             answer(
                 201,
                 json!({"token": INSTALLATION_TOKEN, "expires_at": "2099-01-01T00:00:00Z"}),

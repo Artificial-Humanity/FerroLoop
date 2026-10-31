@@ -904,7 +904,10 @@ impl AgentRegistry for RedbStore {
             Err(e) => return Err(backend(e)),
         };
         let mut out = Vec::new();
-        for row in events.range((seq + 1)..).map_err(backend)? {
+        for row in events
+            .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
+            .map_err(backend)?
+        {
             let (k, v) = row.map_err(backend)?;
             let ev: RegistryEvent = serde_json::from_str(v.value()).map_err(decode)?;
             out.push((k.value(), ev));
@@ -1448,7 +1451,10 @@ impl StateStore for RedbStore {
             Err(e) => return Err(backend(e)),
         };
         let mut out = Vec::new();
-        for row in revs.range((seq + 1)..).map_err(backend)? {
+        for row in revs
+            .range((std::ops::Bound::Excluded(seq), std::ops::Bound::Unbounded))
+            .map_err(backend)?
+        {
             let (k, v) = row.map_err(backend)?;
             let rev: StateRevision = serde_json::from_str(v.value()).map_err(decode)?;
             out.push((k.value(), rev));

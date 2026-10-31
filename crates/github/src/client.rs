@@ -145,28 +145,7 @@ impl Client {
     /// Every page of a list, and how many requests it took. ⚠ A failure on
     /// ANY page is an error, never a short list (spec §3.7).
     pub fn get_all_paged(&self, path: &str) -> Result<(Vec<Value>, usize), StoreError> {
-        let mut out = Vec::new();
-        let mut next = Some(path.to_string());
-        let mut pages = 0usize;
-        while let Some(page) = next {
-            pages += 1;
-            let reply = self.send(Method::Get, &page, None)?;
-            if reply.status != 200 {
-                return Err(StoreError::Backend(format!(
-                    "GitHub answered {} to a page of {path}. A list with a missing page is \
-                     not a list; retry",
-                    reply.status
-                )));
-            }
-            let Value::Array(items) = reply.body else {
-                return Err(StoreError::Backend(format!(
-                    "GitHub answered a page of {path} with something that is not a list"
-                )));
-            };
-            out.extend(items);
-            next = reply.link_next;
-        }
-        Ok((out, pages))
+        collect_pages(path, |page| self.send(Method::Get, page, None))
     }
 
     /// Every page of a list. ⚠ A failure on ANY page is an error, never a
@@ -562,6 +541,49 @@ fn reset_time(
     "an unknown time".into()
 }
 
+/// The most pages one list may take. At 100 items a page that is 100,000
+/// items, far past anything a project holds; a `Link` chain longer than this
+/// is a broken or hostile server, not a big list.
+pub(crate) const MAX_PAGES: usize = 1000;
+
+/// Follow `rel="next"` from `path` through `fetch` until the list ends. ⚠ A
+/// failure on ANY page is an error, never a short list; so is a `next` that
+/// names a page already read (a cycle) or a chain past [`MAX_PAGES`].
+pub(crate) fn collect_pages(
+    path: &str,
+    mut fetch: impl FnMut(&str) -> Result<Reply, StoreError>,
+) -> Result<(Vec<Value>, usize), StoreError> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut next = Some(path.to_string());
+    let mut pages = 0usize;
+    while let Some(page) = next {
+        if !seen.insert(page.clone()) || pages >= MAX_PAGES {
+            return Err(StoreError::Backend(format!(
+                "GitHub's pages of {path} never end (a repeated or over-long `next` link); \
+                 refusing to build a list from them"
+            )));
+        }
+        pages += 1;
+        let reply = fetch(&page)?;
+        if reply.status != 200 {
+            return Err(StoreError::Backend(format!(
+                "GitHub answered {} to a page of {path}. A list with a missing page is \
+                 not a list; retry",
+                reply.status
+            )));
+        }
+        let Value::Array(items) = reply.body else {
+            return Err(StoreError::Backend(format!(
+                "GitHub answered a page of {path} with something that is not a list"
+            )));
+        };
+        out.extend(items);
+        next = reply.link_next;
+    }
+    Ok((out, pages))
+}
+
 /// The `rel="next"` URL of a `Link` header, if any.
 fn next_link(header: &str) -> Option<String> {
     header.split(',').find_map(|part| {
@@ -599,6 +621,52 @@ mod tests {
             next_link(r#"<https://api.github.com/x?page=1>; rel="prev""#),
             None
         );
+    }
+
+    fn page(next: Option<&str>) -> Reply {
+        Reply {
+            status: 200,
+            body: serde_json::json!([1]),
+            location: None,
+            accepted_permissions: None,
+            link_next: next.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_next_link_that_cycles_is_an_error_not_an_endless_list() {
+        let mut calls = 0;
+        let err = collect_pages("/x", |_| {
+            calls += 1;
+            Ok(page(Some("/x?page=2")))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("never end"), "{err}");
+        assert!(calls <= 3, "stopped after {calls} requests");
+    }
+
+    #[test]
+    fn a_chain_of_pages_past_the_cap_is_an_error() {
+        let mut n = 0;
+        let err = collect_pages("/x", |_| {
+            n += 1;
+            Ok(page(Some(&format!("/x?page={}", n + 1))))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("never end"), "{err}");
+        assert_eq!(n, MAX_PAGES);
+    }
+
+    #[test]
+    fn a_finite_chain_collects_every_page() {
+        let (items, pages) = collect_pages("/x", |p| {
+            Ok(match p {
+                "/x" => page(Some("/x?page=2")),
+                _ => page(None),
+            })
+        })
+        .unwrap();
+        assert_eq!((items.len(), pages), (2, 2));
     }
 
     #[test]
