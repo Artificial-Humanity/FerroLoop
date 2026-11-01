@@ -433,8 +433,8 @@ fn a_reader_never_sees_a_mixed_state_while_writers_commit() {
                                 Ok((txn.base().last_seq, a.unwrap_or(0)))
                             })
                             .unwrap();
-                        assert!(seen.0 >= last.0, "last_seq went back: {last:?} -> {seen:?}");
-                        assert!(seen.1 >= last.1, "a pair went back: {last:?} -> {seen:?}");
+                        // Not monotonic: a torn slot read falls back to the
+                        // other, older slot, which is still a whole state.
                         last = seen;
                         reads += 1;
                     }

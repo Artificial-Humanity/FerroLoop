@@ -25,6 +25,12 @@
 //!   makes a change of size durable. Neither makes a directory entry durable.
 //! - **Directory entries** (create, `rename`, `link`, `unlink`) not yet
 //!   followed by a `sync_dir` of their directory: each kept or dropped.
+//! - **`flock`** is an exclusive lock per file, held by one description at a
+//!   time: [`ContainerIo::lock_exclusive`] waits for it, as `flock(LOCK_EX)`
+//!   does across processes. A lock is not on disk: it is no cut point and a
+//!   cut leaves nothing of it. Taking and releasing it are logged apart from
+//!   the trace ([`SimFs::lock_events`]), each with its place in the trace, so
+//!   a test can check which operations ran under it.
 //!
 //! Each pending operation's fate is independent of the others, so the model
 //! includes a later write surviving while an earlier one is lost: there is no
@@ -40,8 +46,7 @@
 //!   only as a prefix.
 //! - A file whose size grew but whose new bytes read as zeros or stale data
 //!   (`data=writeback`): a dropped write leaves no trace in the size.
-//! - Locks. `flock` is not modelled ([`ContainerIo::lock_fd`] is `None`), so
-//!   the harness is one process.
+//! - Locks that a crashed process still holds: every lock is gone at a cut.
 //! - Directories themselves. Every directory exists; `create_store_file`
 //!   does not make or sync a missing parent.
 //! - Open handles across a cut. A survivor image is reopened from its names;
@@ -53,9 +58,9 @@ use fl_core::StoreError;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io;
-use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// The sector size a write can tear at.
 pub(super) const SECTOR: u64 = 512;
@@ -79,6 +84,8 @@ pub(super) enum IoOp {
     SyncData { ino: usize },
     SyncAll { ino: usize },
     SyncDir { dir: PathBuf },
+    Lock { ino: usize },
+    Unlock { ino: usize },
     Rename { from: PathBuf, to: PathBuf },
     Link { from: PathBuf, to: PathBuf },
     Unlink { path: PathBuf },
@@ -98,6 +105,8 @@ impl fmt::Display for IoOp {
             IoOp::SyncData { ino } => write!(f, "sync_data ino{ino}"),
             IoOp::SyncAll { ino } => write!(f, "sync_all ino{ino}"),
             IoOp::SyncDir { dir } => write!(f, "sync_dir {}", dir.display()),
+            IoOp::Lock { ino } => write!(f, "lock ino{ino}"),
+            IoOp::Unlock { ino } => write!(f, "unlock ino{ino}"),
             IoOp::Rename { from, to } => write!(f, "rename {} -> {}", from.display(), to.display()),
             IoOp::Link { from, to } => write!(f, "link {} -> {}", from.display(), to.display()),
             IoOp::Unlink { path } => write!(f, "unlink {}", path.display()),
@@ -206,10 +215,17 @@ struct Sim {
     pending_dir: Vec<DirOp>,
     inodes: Vec<Inode>,
     trace: Vec<IoOp>,
+    /// `(trace length then, IoOp::Lock or IoOp::Unlock)`, in order.
+    lock_events: Vec<(usize, IoOp)>,
     /// Operations allowed before the cut. `None` never cuts.
     budget: Option<usize>,
     cut: bool,
+    /// The next operation this matches fails once, with nothing applied and
+    /// nothing recorded, and power stays on: a transient I/O error.
+    fail_next: Option<FailWhen>,
 }
+
+type FailWhen = Box<dyn FnMut(&IoOp) -> bool + Send>;
 
 impl Sim {
     /// Record `op`, or fail it when power is (now) cut.
@@ -222,9 +238,22 @@ impl Sim {
                 "simulated power cut (refused {op})"
             )));
         }
+        if let Some(when) = self.fail_next.as_mut()
+            && when(&op)
+        {
+            self.fail_next = None;
+            return Err(io::Error::other(format!("simulated I/O error ({op})")));
+        }
         self.trace.push(op);
         Ok(())
     }
+}
+
+/// Which description holds each file's lock.
+#[derive(Default)]
+struct Locks {
+    held: Mutex<BTreeMap<usize, usize>>,
+    freed: Condvar,
 }
 
 /// The files and names a cut leaves, or that a test starts from. Inode
@@ -289,7 +318,11 @@ impl Pending {
 #[derive(Clone, Default)]
 pub(super) struct SimFs {
     sim: Arc<Mutex<Sim>>,
+    locks: Arc<Locks>,
 }
+
+/// Numbers each simulated description, for its lock.
+static NEXT_DESCRIPTION: AtomicUsize = AtomicUsize::new(0);
 
 impl SimFs {
     /// A disk holding `image`, all of it durable, that cuts power after
@@ -313,6 +346,26 @@ impl SimFs {
         };
         Self {
             sim: Arc::new(Mutex::new(sim)),
+            locks: Arc::default(),
+        }
+    }
+
+    /// The next operation `when` matches fails once (see `Sim::fail_next`).
+    pub(super) fn fail_next(&self, when: impl FnMut(&IoOp) -> bool + Send + 'static) {
+        self.lock().fail_next = Some(Box::new(when));
+    }
+
+    /// What a cut now would leave if every pending operation were lost: the
+    /// durable image alone.
+    pub(super) fn durable_image(&self) -> Image {
+        let sim = self.lock();
+        Image {
+            names: sim.durable_names.clone(),
+            inodes: sim
+                .inodes
+                .iter()
+                .map(|inode| inode.durable.clone())
+                .collect(),
         }
     }
 
@@ -325,6 +378,18 @@ impl SimFs {
     /// Every operation done so far, in order.
     pub(super) fn trace(&self) -> Vec<IoOp> {
         self.lock().trace.clone()
+    }
+
+    /// Every lock taken and released so far, each with the number of trace
+    /// operations before it.
+    pub(super) fn lock_events(&self) -> Vec<(usize, IoOp)> {
+        self.lock().lock_events.clone()
+    }
+
+    fn log_lock(&self, event: IoOp) {
+        let mut sim = self.lock();
+        let at = sim.trace.len();
+        sim.lock_events.push((at, event));
     }
 
     /// Whether power has been cut.
@@ -427,6 +492,7 @@ impl SimFs {
             fs: self.clone(),
             ino,
             writable,
+            description: NEXT_DESCRIPTION.fetch_add(1, Ordering::Relaxed),
         })
     }
 }
@@ -552,6 +618,7 @@ struct SimFile {
     fs: SimFs,
     ino: usize,
     writable: bool,
+    description: usize,
 }
 
 impl SimFile {
@@ -643,8 +710,39 @@ impl ContainerIo for SimFile {
         Ok(())
     }
 
-    fn lock_fd(&self) -> Option<RawFd> {
-        None
+    fn lock_exclusive(&self) -> io::Result<()> {
+        let locks = &self.fs.locks;
+        let mut held = locks
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while held
+            .get(&self.ino)
+            .is_some_and(|holder| *holder != self.description)
+        {
+            held = locks
+                .freed
+                .wait(held)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        // Logged once held, in the order the locks were taken.
+        held.insert(self.ino, self.description);
+        self.fs.log_lock(IoOp::Lock { ino: self.ino });
+        Ok(())
+    }
+
+    fn unlock(&self) {
+        let locks = &self.fs.locks;
+        let mut held = locks
+            .held
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if held.get(&self.ino) != Some(&self.description) {
+            return;
+        }
+        self.fs.log_lock(IoOp::Unlock { ino: self.ino });
+        held.remove(&self.ino);
+        locks.freed.notify_all();
     }
 }
 

@@ -5,6 +5,7 @@ mod columnar;
 mod compat;
 mod container_io;
 mod doc;
+mod group;
 mod layout;
 mod manifest_ops;
 mod migrate;
@@ -30,6 +31,8 @@ mod tests_cow;
 #[cfg(test)]
 mod tests_crash;
 #[cfg(test)]
+mod tests_group;
+#[cfg(test)]
 mod tests_track0;
 #[cfg(test)]
 mod tests_verify;
@@ -37,6 +40,7 @@ mod tests_verify;
 use container_io::{ContainerFs, ContainerIo, RealFs};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
+use group::Staged;
 pub use layout::Op;
 use layout::{
     HEADER_BYTES, KNOWN_INCOMPAT, SLOT_LEN, SlotRead, Superblock, backend, corrupt,
@@ -59,7 +63,6 @@ pub use state::MqRecord;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::os::unix::io::RawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -71,46 +74,22 @@ pub use verify::{
     PER_ITEM_SAMPLE, ParityReport, TableParity, migrate_verified, verify_redb_vs_ferrostore,
 };
 
-const LOCK_EX: i32 = 2;
-const LOCK_UN: i32 = 8;
-
-// libc `flock`. No extra crate: the process already links libc.
-unsafe extern "C" {
-    fn flock(fd: i32, op: i32) -> i32;
+/// Holds the exclusive `flock` of one container description until dropped.
+struct FlockGuard<'a> {
+    file: &'a dyn ContainerIo,
 }
 
-/// `None` holds no lock: a file with no descriptor (the crash harness's
-/// simulated disk) is not locked.
-struct FlockGuard {
-    fd: Option<RawFd>,
-}
-
-impl FlockGuard {
-    fn acquire(fd: Option<RawFd>) -> Result<Self, StoreError> {
-        let Some(fd) = fd else {
-            return Ok(Self { fd: None });
-        };
-        // SAFETY: `fd` is an open file descriptor owned by the caller. `LOCK_EX`
-        // waits until this description holds the advisory lock, or returns -1.
-        let rc = unsafe { flock(fd, LOCK_EX) };
-        if rc != 0 {
-            let err = io::Error::last_os_error();
-            return Err(backend(format!("exclusive flock failed: {err}")));
-        }
-        Ok(Self { fd: Some(fd) })
+impl<'a> FlockGuard<'a> {
+    fn acquire(file: &'a dyn ContainerIo) -> Result<Self, StoreError> {
+        file.lock_exclusive()
+            .map_err(|err| backend(format!("exclusive flock failed: {err}")))?;
+        Ok(Self { file })
     }
 }
 
-impl Drop for FlockGuard {
+impl Drop for FlockGuard<'_> {
     fn drop(&mut self) {
-        let Some(fd) = self.fd else {
-            return;
-        };
-        // SAFETY: the descriptor stays open until after this guard is dropped.
-        // `LOCK_UN` releases the advisory lock held by that description.
-        unsafe {
-            flock(fd, LOCK_UN);
-        }
+        self.file.unlock();
     }
 }
 
@@ -148,10 +127,11 @@ struct Committed {
     ops: Vec<Op>,
 }
 
+/// How a compare-and-swap commit went.
 enum SeqCommit {
     Lost,
     Same,
-    Wrote(Committed),
+    Wrote,
 }
 
 /// The two descriptions of one `.fls` file. Production holds `File`s; the
@@ -167,6 +147,16 @@ struct Disk {
     /// The last state this handle loaded or committed (spec §4.1). The mutex
     /// is held only to clone, take or swap the `Arc`, never across file I/O.
     cache: Mutex<Option<Arc<DiskCache>>>,
+    /// Writers queued for group commit (spec §4.3).
+    group: group::Group,
+}
+
+/// What a publish changed, for [`Disk::install_commit`].
+enum Change {
+    /// One commit's overlay, staged over the base state, at this sequence.
+    Overlay(Overlay, u64),
+    /// The base state with every change of the publish already applied.
+    State(Arc<DocState>),
 }
 
 /// One loaded state and the superblock it is the state of. Never changed in
@@ -226,32 +216,56 @@ impl Disk {
         Ok((index, fresh))
     }
 
-    /// Install the state a commit through `write` just published as
-    /// `new_sb`: `base` (what the commit refreshed to) with `overlay` applied
-    /// at `seq`. Nothing is read back. Called with the write mutex and the
+    /// Install the state a publish through `write` just made as `new_sb`:
+    /// `base` (what the writer refreshed to, or its last publish) with
+    /// `change`. Nothing is read back. Called with the write mutex and the
     /// flock still held, so the next writer in this process starts from it.
+    /// Returns the entry, which a group goes on from (spec §4.3).
     ///
     /// When the cache still holds `base`, the entry is taken out under the
     /// cache mutex and changed in place: with no reader holding its state,
-    /// that is O(ops) (spec §4.2). Readers wait on the mutex for that apply,
-    /// never for I/O, and never see an empty cache.
-    fn install_commit(&self, base: Arc<DiskCache>, new_sb: Superblock, overlay: Overlay, seq: u64) {
+    /// an overlay applies in O(ops) (spec §4.2). Readers wait on the mutex
+    /// for that apply, never for I/O, and never see an empty cache.
+    fn install_commit(
+        &self,
+        base: Arc<DiskCache>,
+        new_sb: Superblock,
+        change: Change,
+    ) -> Arc<DiskCache> {
         // The base WAL ended torn (published bytes no full frame covers): the
-        // new frame follows those bytes, so leave the next refresh to load
-        // the file and report it.
-        if base.wal_applied != base.sb.wal_length {
-            return;
-        }
+        // new frames follow those bytes, so the cache is left for the next
+        // refresh, which loads the file and reports it.
+        let torn = base.wal_applied != base.sb.wal_length;
+        let wal_applied = if torn {
+            base.wal_applied
+        } else {
+            new_sb.wal_length
+        };
         let mut slot = lock_mutex(&self.cache);
-        if slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &base)) {
+        if !torn && slot.as_ref().is_some_and(|held| Arc::ptr_eq(held, &base)) {
             *slot = None;
         }
-        let mut entry = Arc::try_unwrap(base).unwrap_or_else(|shared| (*shared).clone());
-        publish_overlay(&mut entry.state, overlay, seq);
-        entry.file_id = self.write_id;
-        entry.sb = new_sb;
-        entry.wal_applied = new_sb.wal_length;
-        install_newer(&mut slot, Arc::new(entry));
+        let state = match change {
+            Change::Overlay(overlay, seq) => {
+                let mut state = match Arc::try_unwrap(base) {
+                    Ok(entry) => entry.state,
+                    Err(shared) => Arc::clone(&shared.state),
+                };
+                publish_overlay(&mut state, overlay, seq);
+                state
+            }
+            Change::State(state) => state,
+        };
+        let entry = Arc::new(DiskCache {
+            file_id: self.write_id,
+            sb: new_sb,
+            state,
+            wal_applied,
+        });
+        if !torn {
+            install_newer(&mut slot, Arc::clone(&entry));
+        }
+        entry
     }
 
     /// Install a checkpoint's result: the same state, a new superblock.
@@ -468,6 +482,8 @@ pub struct FerroStore {
     /// Process memory only. Not part of the `.fls` file.
     sync: Mutex<SyncSlot>,
     /// Taken before `last_seq` advances. Held until that batch is registered.
+    /// A group commit's leader holds it for the whole group and registers its
+    /// members one by one, in sequence order (spec §4.3).
     commit_gate: Mutex<()>,
     /// Paired with `sync`. Wakes `sync_flush` when `notify_in_flight` clears.
     sync_cv: Condvar,
@@ -550,6 +566,7 @@ impl FerroStore {
                 read,
                 read_id,
                 cache: Mutex::new(Some(Arc::new(seed))),
+                group: group::Group::default(),
             }),
             path.display().to_string(),
         ))
@@ -1372,16 +1389,20 @@ impl FerroStore {
                 Ok(true)
             }
             Inner::Disk(disk) => {
-                let registered = {
-                    let _gate = lock_mutex(&self.commit_gate);
-                    match commit_if_seq_disk(disk, expected_seq, ops)? {
-                        SeqCommit::Lost => return Ok(false),
-                        SeqCommit::Same => return Ok(true),
-                        SeqCommit::Wrote(committed) => self.register_committed(&committed, silent),
+                // The expected sequence is checked against the group's
+                // running state at this member's turn (spec §4.3).
+                let (outcome, _) = self.group_write(disk, silent, |state| {
+                    if state.last_seq != expected_seq {
+                        return Ok((SeqCommit::Lost, None));
                     }
-                };
-                self.deliver_owned(registered)?;
-                Ok(true)
+                    if ops.is_empty() {
+                        return Ok((SeqCommit::Same, None));
+                    }
+                    let (overlay, _) = stage_ops(&state, ops)?;
+                    let ops = ops.to_vec();
+                    Ok((SeqCommit::Wrote, Some(Staged { ops, overlay })))
+                })?;
+                Ok(!matches!(outcome, SeqCommit::Lost))
             }
             Inner::Remote(remote) => {
                 if ops.is_empty() {
@@ -1411,13 +1432,17 @@ impl FerroStore {
 
     /// Run `body` in a transaction: an overlay on the current state.
     ///
-    /// Memory holds the document mutex for the whole call. Disk takes `LOCK_EX`,
-    /// refreshes its cached state (spec §4.1: the slots, then only WAL frames
-    /// another handle added), then builds the transaction over that state. `Ok` with at least one op appends one WAL frame (`seq = last_seq + 1`)
-    /// and publishes one superblock. `Err` or an empty op list writes nothing.
-    /// A remote handle compare-and-swaps those ops and runs `body` again when
-    /// `last_seq` changed. The body may run more than once only on a remote handle.
-    /// The sync adapter runs after that lock and the commit gate are released.
+    /// Memory holds the document mutex for the whole call. Disk joins a group
+    /// commit (spec §4.3): its leader takes `LOCK_EX` and refreshes the cached
+    /// state (spec §4.1: the slots, then only WAL frames another handle
+    /// added), and `body` runs, on this thread, over that state with the
+    /// commits of the group's earlier members. `Ok` with at least one op
+    /// appends one WAL frame (`seq = last_seq + 1`), published with the
+    /// group's superblock. `Err` or an empty op list writes nothing. A remote
+    /// handle compare-and-swaps those ops and runs `body` again when
+    /// `last_seq` changed. The body may run more than once only on a remote
+    /// handle. The sync adapter runs after the slot is synced and the locks
+    /// and the commit gate are released.
     fn with_write<T>(
         &self,
         body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
@@ -1490,19 +1515,16 @@ impl FerroStore {
                 self.deliver_owned(registered)?;
                 Ok((result, seq))
             }
-            Inner::Disk(disk) => {
-                let (result, seq, registered) = {
-                    let _gate = lock_mutex(&self.commit_gate);
-                    let (result, committed) = with_write_disk(disk, body)?;
-                    let seq = committed.as_ref().map(|committed| committed.seq);
-                    let registered = committed
-                        .as_ref()
-                        .and_then(|committed| self.register_committed(committed, false));
-                    (result, seq, registered)
-                };
-                self.deliver_owned(registered)?;
-                Ok((result, seq))
-            }
+            Inner::Disk(disk) => self.group_write(disk, false, |state| {
+                let mut txn = Txn::new(state);
+                let result = body(&mut txn)?;
+                // The overlay was checked op by op as it was staged: once the
+                // frame is published it is applied to the cached state, and
+                // nothing is re-read. `finish` drops the hold on the state.
+                let (ops, overlay) = txn.finish()?;
+                let staged = (!ops.is_empty()).then_some(Staged { ops, overlay });
+                Ok((result, staged))
+            }),
         }
     }
 
@@ -1562,12 +1584,12 @@ impl FerroStore {
                 Ok(extra)
             }
             Inner::Disk(disk) => {
-                let (extra, registered) = {
-                    let _gate = lock_mutex(&self.commit_gate);
-                    let (extra, committed) = commit_disk(disk, build)?;
-                    (extra, self.register_committed(&committed, silent))
-                };
-                self.deliver_owned(registered)?;
+                let (extra, _) = self.group_write(disk, silent, |state| {
+                    let (op, extra) = build(&state)?;
+                    let (overlay, _) = stage_ops(&state, std::slice::from_ref(&op))?;
+                    let ops = vec![op];
+                    Ok((extra, Some(Staged { ops, overlay })))
+                })?;
                 Ok(extra)
             }
         }
@@ -1600,6 +1622,12 @@ impl FerroStore {
     ///
     /// Holds the commit gate, then the document lock, then the sync mutex.
     /// A commit releases the document lock before taking the sync mutex.
+    ///
+    /// On disk this does not join a group (spec §4.3): its sync-idle check
+    /// and its `synced_seq` move are one step with its commit, under the sync
+    /// mutex, and a group registers its earlier members only after its slot
+    /// sync, so inside a group the check would read idle too early. The
+    /// commit gate keeps it apart from every group.
     fn install_fetched_doc(
         &self,
         collection: &str,
@@ -1657,7 +1685,7 @@ impl FerroStore {
             }
             Inner::Disk(disk) => {
                 let file = lock_mutex(&disk.write);
-                let _locked = FlockGuard::acquire(file.lock_fd())?;
+                let _locked = FlockGuard::acquire(&**file)?;
                 let (index, base) = disk.refresh(&**file, disk.write_id)?;
                 let state = &base.state;
                 let mut sync = lock_mutex(&self.sync);
@@ -1674,8 +1702,9 @@ impl FerroStore {
                 };
                 let (overlay, seq) = stage_ops(state, std::slice::from_ref(&op))?;
                 let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
-                disk.install_commit(base, new_sb, overlay, seq);
+                if let Some(new_sb) = publish_frames(&**file, index, &base.sb, &[frame])? {
+                    disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
+                }
                 if sync.is_idle() && seq > sync.synced_seq {
                     sync.synced_seq = seq;
                 }
@@ -1739,46 +1768,30 @@ impl FerroStore {
                 })
             }
             Inner::Disk(disk) => {
-                let (seq, registered) = {
-                    let _gate = lock_mutex(&self.commit_gate);
-                    let committed = {
-                        let file = lock_mutex(&disk.write);
-                        let _locked = FlockGuard::acquire(file.lock_fd())?;
-                        let (index, base) = disk.refresh(&**file, disk.write_id)?;
-                        if let Some(existing) = base.state.docs.get(&key.0, &key.1).cloned() {
-                            return Ok(IfAbsent {
-                                wrote: false,
-                                doc: existing,
-                                store_seq: None,
-                            });
-                        }
-                        let op = Op::Put {
-                            collection: key.0,
-                            id: key.1,
-                            doc: doc.clone(),
-                        };
-                        let (overlay, seq) = stage_ops(&base.state, std::slice::from_ref(&op))?;
-                        let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                        let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
-                        disk.install_commit(base, new_sb, overlay, seq);
-                        (seq, op)
+                let (existing, seq) = self.group_write(disk, silent, |state| {
+                    if let Some(existing) = state.docs.get(&key.0, &key.1).cloned() {
+                        return Ok((Some(existing), None));
+                    }
+                    let op = Op::Put {
+                        collection: key.0,
+                        id: key.1,
+                        doc: doc.clone(),
                     };
-                    (
-                        committed.0,
-                        self.register_committed(
-                            &Committed {
-                                seq: committed.0,
-                                ops: vec![committed.1],
-                            },
-                            silent,
-                        ),
-                    )
-                };
-                self.deliver_owned(registered)?;
-                Ok(IfAbsent {
-                    wrote: true,
-                    doc: doc.clone(),
-                    store_seq: Some(seq),
+                    let (overlay, _) = stage_ops(&state, std::slice::from_ref(&op))?;
+                    let ops = vec![op];
+                    Ok((None, Some(Staged { ops, overlay })))
+                })?;
+                Ok(match existing {
+                    Some(existing) => IfAbsent {
+                        wrote: false,
+                        doc: existing,
+                        store_seq: None,
+                    },
+                    None => IfAbsent {
+                        wrote: true,
+                        doc: doc.clone(),
+                        store_seq: seq,
+                    },
                 })
             }
         }
@@ -1867,6 +1880,18 @@ impl FerroStore {
         committed: &Committed,
         silent: bool,
     ) -> Option<(Arc<dyn SyncAdapter>, SyncBatch)> {
+        self.register_committed_for(committed, silent, std::thread::current().id())
+    }
+
+    /// [`Self::register_committed`] for a commit whose `on_commit` runs on
+    /// `owner`: a group's leader registers each member's commit, and the
+    /// member sends it (spec §4.3).
+    fn register_committed_for(
+        &self,
+        committed: &Committed,
+        silent: bool,
+        owner: ThreadId,
+    ) -> Option<(Arc<dyn SyncAdapter>, SyncBatch)> {
         if committed.ops.is_empty() {
             return None;
         }
@@ -1889,7 +1914,7 @@ impl FerroStore {
                     None
                 } else {
                     slot.notify_in_flight = true;
-                    slot.notify_owner = Some(std::thread::current().id());
+                    slot.notify_owner = Some(owner);
                     Some((adapter, batch))
                 }
             }
@@ -2135,6 +2160,10 @@ fn admit_inbound<'a>(
     Ok(Some(op))
 }
 
+/// Disk: alone, not in a group (spec §4.3). The peer fixes every batch's
+/// sequence, and the batches publish as one unit (one `sync_data` for all
+/// their frames, one slot), checked with the sync-idle test under the commit
+/// gate, which keeps them apart from every group.
 fn publish_sync_batches(
     inner: &Inner,
     batches: &[SyncBatch],
@@ -2151,7 +2180,7 @@ fn publish_sync_batches(
         }
         Inner::Disk(disk) => {
             let file = lock_mutex(&disk.write);
-            let _locked = FlockGuard::acquire(file.lock_fd())?;
+            let _locked = FlockGuard::acquire(&**file)?;
             let (index, base) = disk.refresh(&**file, disk.write_id)?;
             let (overlay, seq, prepared) = prepare_sync_batches(&base.state, batches)?;
             let mut frames = Vec::with_capacity(prepared.len());
@@ -2159,7 +2188,7 @@ fn publish_sync_batches(
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
             if let Some(new_sb) = publish_frames(&**file, index, &base.sb, &frames)? {
-                disk.install_commit(base, new_sb, overlay, seq);
+                disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
             }
             Ok((seq, prepared))
         }
@@ -2229,69 +2258,12 @@ fn file_uri_path(rest: &str) -> String {
     rest.to_string()
 }
 
-fn commit_if_seq_disk(disk: &Disk, expected_seq: u64, ops: &[Op]) -> Result<SeqCommit, StoreError> {
-    let file = lock_mutex(&disk.write);
-    let _locked = FlockGuard::acquire(file.lock_fd())?;
-    let (index, base) = disk.refresh(&**file, disk.write_id)?;
-    if base.state.last_seq != expected_seq {
-        return Ok(SeqCommit::Lost);
-    }
-    if ops.is_empty() {
-        return Ok(SeqCommit::Same);
-    }
-    let (overlay, seq) = stage_ops(&base.state, ops)?;
-    let frame = encode_frame(seq, ops)?;
-    let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
-    disk.install_commit(base, new_sb, overlay, seq);
-    Ok(SeqCommit::Wrote(Committed {
-        seq,
-        ops: ops.to_vec(),
-    }))
-}
-
-fn with_write_disk<T>(
-    disk: &Disk,
-    mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
-) -> Result<(T, Option<Committed>), StoreError> {
-    let file = lock_mutex(&disk.write);
-    let _locked = FlockGuard::acquire(file.lock_fd())?;
-    let (index, base) = disk.refresh(&**file, disk.write_id)?;
-    let seq_base = base.state.last_seq;
-    let mut txn = Txn::new(Arc::clone(&base.state));
-    let result = body(&mut txn)?;
-    // The overlay was checked op by op as it was staged: once the frame is
-    // published it is applied to the cached state, and nothing is re-read.
-    let (ops, overlay) = txn.finish()?;
-    if ops.is_empty() {
-        return Ok((result, None));
-    }
-    let seq = seq_base
-        .checked_add(1)
-        .ok_or_else(|| backend("transaction sequence overflow"))?;
-    let frame = encode_frame(seq, &ops)?;
-    let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
-    disk.install_commit(base, new_sb, overlay, seq);
-    Ok((result, Some(Committed { seq, ops })))
-}
-
-fn commit_disk<T>(
-    disk: &Disk,
-    build: impl FnOnce(&DocState) -> Result<(Op, T), StoreError>,
-) -> Result<(T, Committed), StoreError> {
-    let file = lock_mutex(&disk.write);
-    let _locked = FlockGuard::acquire(file.lock_fd())?;
-    let (index, base) = disk.refresh(&**file, disk.write_id)?;
-    let (op, extra) = build(&base.state)?;
-    let (overlay, seq) = stage_ops(&base.state, std::slice::from_ref(&op))?;
-    let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-    let new_sb = append_frame(&**file, index, &base.sb, &frame)?;
-    disk.install_commit(base, new_sb, overlay, seq);
-    Ok((extra, Committed { seq, ops: vec![op] }))
-}
-
-/// Write every frame at the current WAL end, then publish one superblock,
-/// which is returned. No frames: nothing is written and `None`.
-/// A failure before `write_slot` leaves the previous superblock current.
+/// Write every frame at the current WAL end, one `write_at` each, make them
+/// durable with one `sync_data`, then write the other slot and `sync_data`
+/// it (spec §4.3). Returns the superblock now published. No frames: nothing
+/// is written and `None`. A failure before the slot write leaves the previous
+/// superblock current; from the slot write on, either may be current.
+/// The caller holds the `flock` for the whole call.
 fn publish_frames(
     file: &dyn ContainerIo,
     index: usize,
@@ -2301,28 +2273,31 @@ fn publish_frames(
     if frames.is_empty() {
         return Ok(None);
     }
-    let mut bytes = Vec::new();
-    for frame in frames {
-        bytes.extend_from_slice(frame);
-    }
-    let added = u64::try_from(bytes.len()).map_err(|_| backend("wal frame exceeds u64"))?;
-    let at = sb
+    let mut at = sb
         .wal_offset
         .checked_add(sb.wal_length)
         .ok_or_else(|| backend("wal offset overflow"))?;
-    if at.checked_add(added).is_none() {
-        return Err(backend("wal offset overflow"));
+    let mut wal_length = sb.wal_length;
+    let mut writes = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let len = u64::try_from(frame.len()).map_err(|_| backend("wal frame exceeds u64"))?;
+        writes.push((frame, at));
+        at = at
+            .checked_add(len)
+            .ok_or_else(|| backend("wal offset overflow"))?;
+        wal_length = wal_length
+            .checked_add(len)
+            .ok_or_else(|| backend("wal length overflow"))?;
     }
-    let wal_length = sb
-        .wal_length
-        .checked_add(added)
-        .ok_or_else(|| backend("wal length overflow"))?;
     let epoch = sb
         .epoch
         .checked_add(1)
         .ok_or_else(|| backend("epoch overflow"))?;
-    file.write_at(&bytes, at).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
+    for (frame, offset) in writes {
+        file.write_at(frame, offset).map_err(io_err)?;
+    }
+    // `fdatasync` also makes the longer file size durable.
+    file.sync_data().map_err(io_err)?;
     let new_sb = Superblock {
         epoch,
         snapshot_offset: sb.snapshot_offset,
@@ -2332,13 +2307,16 @@ fn publish_frames(
         snapshot_seq: sb.snapshot_seq,
     };
     write_slot(file, index ^ 1, &new_sb)?;
-    file.sync_all().map_err(io_err)?;
+    file.sync_data().map_err(io_err)?;
     Ok(Some(new_sb))
 }
 
+/// Runs alone, not in a group (spec §4.3): it writes a new snapshot and
+/// starts an empty WAL, so there is nothing to batch. The write mutex keeps it
+/// apart from every group.
 fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     let file = lock_mutex(&disk.write);
-    let _locked = FlockGuard::acquire(file.lock_fd())?;
+    let _locked = FlockGuard::acquire(&**file)?;
     let (index, base) = disk.refresh(&**file, disk.write_id)?;
     let (sb, state) = (base.sb, &*base.state);
     let blob = if !state.vectors.is_empty() {
@@ -2351,7 +2329,8 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
     let offset = allocate_extent(&**file, &sb, blob_len)?;
     file.write_at(&blob, offset).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
+    // Data and the file size: `fdatasync` (spec §4.3).
+    file.sync_data().map_err(io_err)?;
     let new_sb = Superblock {
         epoch: sb
             .epoch
@@ -2366,7 +2345,7 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
         snapshot_seq: state.last_seq,
     };
     write_slot(&**file, index ^ 1, &new_sb)?;
-    file.sync_all().map_err(io_err)?;
+    file.sync_data().map_err(io_err)?;
     disk.install_checkpoint(&base, new_sb);
     Ok(())
 }
@@ -2383,38 +2362,6 @@ fn allocate_extent(file: &dyn ContainerIo, sb: &Superblock, len: u64) -> Result<
         return Err(backend("extent offset overflow"));
     }
     Ok(offset)
-}
-
-fn append_frame(
-    file: &dyn ContainerIo,
-    index: usize,
-    sb: &Superblock,
-    frame: &[u8],
-) -> Result<Superblock, StoreError> {
-    let frame_len = u64::try_from(frame.len()).map_err(|_| backend("wal frame exceeds u64"))?;
-    let at = sb
-        .wal_offset
-        .checked_add(sb.wal_length)
-        .ok_or_else(|| backend("wal offset overflow"))?;
-    file.write_at(frame, at).map_err(io_err)?;
-    file.sync_all().map_err(io_err)?;
-    let new_sb = Superblock {
-        epoch: sb
-            .epoch
-            .checked_add(1)
-            .ok_or_else(|| backend("epoch overflow"))?,
-        snapshot_offset: sb.snapshot_offset,
-        snapshot_length: sb.snapshot_length,
-        wal_offset: sb.wal_offset,
-        wal_length: sb
-            .wal_length
-            .checked_add(frame_len)
-            .ok_or_else(|| backend("wal length overflow"))?,
-        snapshot_seq: sb.snapshot_seq,
-    };
-    write_slot(file, index ^ 1, &new_sb)?;
-    file.sync_all().map_err(io_err)?;
-    Ok(new_sb)
 }
 
 /// The documents a new store starts with: its schema version, the newest on
@@ -2435,6 +2382,7 @@ fn init_empty(file: &dyn ContainerIo) -> Result<(), StoreError> {
     let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
     file.set_len(HEADER_BYTES).map_err(io_err)?;
     file.write_at(&blob, HEADER_BYTES).map_err(io_err)?;
+    // First use of a new file, after a `set_len`: the whole inode, `fsync`.
     file.sync_all().map_err(io_err)?;
     let sb = Superblock {
         epoch: 1,
@@ -2513,7 +2461,7 @@ fn ensure_superblock(file: &dyn ContainerIo) -> Result<bool, StoreError> {
     if parsed_superblock(file)?.is_some() {
         return Ok(false);
     }
-    let _locked = FlockGuard::acquire(file.lock_fd())?;
+    let _locked = FlockGuard::acquire(file)?;
     if parsed_superblock(file)?.is_some() {
         return Ok(false);
     }

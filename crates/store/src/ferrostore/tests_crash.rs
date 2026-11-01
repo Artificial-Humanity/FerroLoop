@@ -26,7 +26,13 @@
 //!      with its exact content, and an unacknowledged one is all there or
 //!      not there at all;
 //!    - a state past the starting one is published in a format-2 slot;
-//!    - one more commit after recovery lands, and reads back after a reopen.
+//!    - one more commit after recovery lands, and reads back after a reopen;
+//!    - a cut inside the group commit of step 5 leaves the whole group or
+//!      none of it, and acknowledges all three writers or none.
+//! 5. **Reference-run checks:** every container write and sync runs under the
+//!    file's `flock`, which is not released between a write and the slot sync
+//!    that publishes it ([`check_locks`]); and when an operation is
+//!    acknowledged, nothing it wrote is still unsynced.
 //!
 //! # Extending it
 //!
@@ -35,7 +41,7 @@
 //!   needed. Compaction (§5) has its marked place in [`WORKLOAD`].
 //! - **A new kind of I/O op:** a method on `ContainerIo`/`ContainerFs`, an
 //!   [`IoOp`] variant, and its fates in `SimFs::pending` (`crash_sim`).
-//! - **Group commit (§4.3):** see [`three_writers`].
+//! - **Group commit (§4.3):** [`three_writers`] makes one real group.
 
 use super::container_io::{ContainerFs, RealFs};
 use super::crash_sim::{Image, IoOp, SimFs, fate_vectors};
@@ -46,14 +52,15 @@ use super::layout::{
 use super::state::DocState;
 use super::vector::VectorCollection;
 use super::{
-    ColumnDef, ColumnType, ColumnValue, FerroStore, VectorMetric, VectorStorage, new_store_docs,
+    ColumnDef, ColumnType, ColumnValue, FerroStore, VectorMetric, VectorStorage, lock_mutex,
+    new_store_docs,
 };
 use fl_core::StoreError;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 /// Where the simulated store lives.
@@ -142,6 +149,9 @@ struct Ctx<'a> {
     fs: &'a dyn ContainerFs,
     path: &'a Path,
     images: Mutex<Vec<Image>>,
+    /// Reference run: operations acknowledged while some of their writes
+    /// were not yet durable.
+    unsynced_acks: Mutex<Vec<String>>,
     labels: Mutex<Vec<String>>,
     started: AtomicUsize,
     acked: AtomicUsize,
@@ -155,6 +165,7 @@ impl<'a> Ctx<'a> {
             fs,
             path,
             images: Mutex::new(Vec::new()),
+            unsynced_acks: Mutex::new(Vec::new()),
             labels: Mutex::new(Vec::new()),
             started: AtomicUsize::new(0),
             acked: AtomicUsize::new(0),
@@ -178,7 +189,11 @@ impl<'a> Ctx<'a> {
             Ok(value) => {
                 self.acked.fetch_add(1, Ordering::SeqCst);
                 if let Some(fs) = self.record {
-                    lock(&self.images).push(fs.live_image());
+                    let live = fs.live_image();
+                    if fs.durable_image() != live {
+                        lock(&self.unsynced_acks).push(label.to_string());
+                    }
+                    lock(&self.images).push(live);
                 }
                 Ok(value)
             }
@@ -358,29 +373,47 @@ fn checkpoint(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
     ctx.op("checkpoint", || store.checkpoint())
 }
 
-/// Spec §3.5 step 5, "a group commit of three writers". Group commit is
-/// Track 1 (§4.3) and does not exist yet, so today three threads each make
-/// one commit in turn: each is joined before the next starts, so the op
-/// order, and with it every cut point, is the same in every run.
+/// Spec §3.5 step 5, "a group commit of three writers" (§4.3). Three
+/// threads are released together by a barrier while this thread holds the
+/// commit gate, so the first to queue leads and waits on the gate; the gate
+/// is let go once all three are queued, and the leader takes the three as
+/// one group.
 ///
-/// When §4.3 lands, spawn all three before joining any (behind a barrier), so
-/// they queue into one group. The checks need no change: a recovered state
-/// may be any prefix from the acknowledged count to the started count, and
-/// each writer's commit stays all-or-nothing. The cut runs then need the
-/// group's op order to be deterministic, or the trace-prefix check relaxed.
+/// Which thread queues first, and so the member order, still varies from
+/// run to run. The cut runs need the reference run's exact op trace, and get
+/// it: the three frames have the same length (`w0`/`w1`/`w2`, one digit
+/// each), and the leader does every container op, so the trace does not
+/// depend on the order; the trace-prefix check is not relaxed. The checks
+/// need no change either: the three acknowledgements all come after the
+/// slot sync and all record the same image, so `states` holds the whole
+/// group three times and any part of it matches no state.
 fn three_writers(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    let start = Barrier::new(3);
     std::thread::scope(|scope| {
-        for writer in 0..3 {
-            let handle = scope.spawn(move || {
-                ctx.op(&format!("writer {writer}"), || {
-                    store.put_doc("writers", &format!("w{writer}"), &json!({"writer": writer}))
+        let gate = lock_mutex(&store.commit_gate);
+        let writers: Vec<_> = (0..3)
+            .map(|writer| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    ctx.op(&format!("writer {writer}"), || {
+                        store.put_doc("writers", &format!("w{writer}"), &json!({"writer": writer}))
+                    })
                 })
-            });
-            handle
+            })
+            .collect();
+        store.wait_until_queued(3);
+        drop(gate);
+        let mut first = Ok(());
+        for writer in writers {
+            let result = writer
                 .join()
-                .map_err(|_| backend("writer thread panicked"))??;
+                .map_err(|_| backend("writer thread panicked"))?;
+            if first.is_ok() {
+                first = result;
+            }
         }
-        Ok(())
+        first
     })
 }
 
@@ -515,6 +548,8 @@ struct Reference {
     labels: Vec<String>,
     /// `states[k]`: the state after `k` acknowledged operations.
     states: Vec<Logical>,
+    /// `g` when step 5 runs: the three writers are operations `g..g + 3`.
+    group: Option<usize>,
 }
 
 /// Open `image` on a fresh simulated disk and read its state.
@@ -545,12 +580,108 @@ fn reference(scenario: &Scenario) -> Reference {
             scenario.name
         );
     }
+    let unsynced = lock(&ctx.unsynced_acks).clone();
+    assert!(
+        unsynced.is_empty(),
+        "{}: acknowledged with writes not yet durable: {unsynced:?}",
+        scenario.name
+    );
+    let trace = fs.trace();
+    if let Err(why) = check_locks(&trace, &fs.lock_events()) {
+        panic!("{}: {why}", scenario.name);
+    }
     let labels = lock(&ctx.labels).clone();
+    let group = labels.iter().position(|label| label.starts_with("writer "));
+    if let Some(g) = group {
+        let (before, whole) = (&states[g], &states[g + 3]);
+        assert!(
+            states[g + 1] == *whole && states[g + 2] == *whole && whole != before,
+            "{}: the three writers were not acknowledged together, as one group",
+            scenario.name
+        );
+    }
     Reference {
-        trace: fs.trace(),
+        trace,
         labels,
         states,
+        group,
     }
+}
+
+/// A write to one of the two superblock slots.
+fn is_slot_write(op: &IoOp) -> bool {
+    matches!(op, IoOp::Write { offset, len, .. }
+        if *len == SLOT_LEN as u64 && (*offset == 0 || *offset == SLOT_LEN as u64))
+}
+
+/// Spec §4.3: every write and sync of a container runs under the file's
+/// `flock`, and the lock is not released between a write and the slot sync
+/// that publishes it (a frame, a snapshot or a slot written but not yet
+/// published). `events` are the trace positions of each lock and unlock.
+fn check_locks(trace: &[IoOp], events: &[(usize, IoOp)]) -> Result<(), String> {
+    #[derive(Default)]
+    struct File {
+        held: bool,
+        /// A data write since the last published slot.
+        unpublished: bool,
+        /// A slot write not yet synced.
+        slot: bool,
+    }
+    let mut files: BTreeMap<usize, File> = BTreeMap::new();
+    let mut events = events.iter().peekable();
+    for at in 0..=trace.len() {
+        while let Some((_, event)) = events.next_if(|(when, _)| *when == at) {
+            match event {
+                IoOp::Lock { ino } => files.entry(*ino).or_default().held = true,
+                IoOp::Unlock { ino } => {
+                    let file = files.entry(*ino).or_default();
+                    if file.unpublished || file.slot {
+                        return Err(format!(
+                            "the flock of ino{ino} was released at op #{at} with a write not \
+                             yet published by a synced slot"
+                        ));
+                    }
+                    file.held = false;
+                }
+                other => return Err(format!("{other} is not a lock event")),
+            }
+        }
+        let Some(op) = trace.get(at) else { break };
+        let ino = match op {
+            IoOp::Write { ino, .. }
+            | IoOp::SetLen { ino, .. }
+            | IoOp::SyncData { ino }
+            | IoOp::SyncAll { ino } => *ino,
+            _ => continue,
+        };
+        let file = files.entry(ino).or_default();
+        if !file.held {
+            return Err(format!("op #{at} `{op}` ran without the file's flock"));
+        }
+        match op {
+            IoOp::SyncData { .. } | IoOp::SyncAll { .. } if file.slot => {
+                file.slot = false;
+                file.unpublished = false;
+            }
+            _ if is_slot_write(op) => file.slot = true,
+            IoOp::Write { .. } | IoOp::SetLen { .. } => file.unpublished = true,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Where step 5's publish is in `trace`: three frame writes, their
+/// `sync_data`, the slot write and its `sync_data`. The index of the first.
+fn group_publish(trace: &[IoOp]) -> Option<usize> {
+    trace.windows(6).position(|ops| {
+        ops[..3]
+            .iter()
+            .all(|op| matches!(op, IoOp::Write { .. }) && !is_slot_write(op))
+            && matches!(ops[3], IoOp::SyncData { .. })
+            && is_slot_write(&ops[4])
+            && matches!(ops[5], IoOp::SyncData { .. })
+    })
 }
 
 /// The two slots of a container image, where present.
@@ -627,7 +758,7 @@ fn check_recovery(
     acked: usize,
     started: usize,
     image: &Image,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let path = Path::new(STORE);
     let first_use = scenario.new_file() && acked == 0;
     match image.file(path) {
@@ -695,6 +826,36 @@ fn check_recovery(
             want.summary()
         ));
     }
+    Ok(matched)
+}
+
+/// A cut inside step 5's group: all three writers acknowledged or none, and
+/// the state the whole group or none of it.
+fn check_group(
+    reference: &Reference,
+    acked: usize,
+    started: usize,
+    matched: usize,
+) -> Result<(), String> {
+    let Some(g) = reference.group else {
+        return Ok(());
+    };
+    if started <= g || started > g + 3 {
+        return Ok(());
+    }
+    if acked != g && acked != g + 3 {
+        return Err(format!(
+            "{} of the group's 3 writers were acknowledged at a cut inside the group",
+            acked - g
+        ));
+    }
+    let state = &reference.states[matched];
+    if *state != reference.states[g] && *state != reference.states[g + 3] {
+        return Err("a cut inside the group left part of the group".into());
+    }
+    if acked == g + 3 && *state != reference.states[g + 3] {
+        return Err("the group was acknowledged and is not all there".into());
+    }
     Ok(())
 }
 
@@ -751,7 +912,9 @@ fn run_scenario(scenario: &Scenario) -> Report {
             report.cases += 1;
             report.torn_cases += usize::from(fate.iter().any(|fate| *fate >= 2));
             let image = fs.survivor(&pending, fate);
-            if let Err(why) = check_recovery(scenario, &reference, acked, started, &image) {
+            let checked = check_recovery(scenario, &reference, acked, started, &image)
+                .and_then(|matched| check_group(&reference, acked, started, matched));
+            if let Err(why) = checked {
                 report.failed_cases += 1;
                 if report.failures.len() < 6 {
                     report.failures.push(describe_failure(
@@ -877,6 +1040,21 @@ fn every_cut_of_the_new_store_workload_recovers_to_an_acknowledged_prefix() {
     let report = run_scenario(&scenario);
     assert_floors(&report, 100);
     assert_clean(&scenario, &report, start.elapsed());
+    // The cuts inside step 5 that §4.3 names exist, so the loop above tried
+    // each: between the frames, after their sync, between the slot write and
+    // its sync, and after it.
+    let trace = reference(&scenario).trace;
+    let at = group_publish(&trace).expect("step 5 publishes three frames with one slot");
+    println!(
+        "group publish at ops #{at}..#{}: cuts after frame 1 (#{}), frame 2 (#{}), the \
+         frames' sync (#{}), the slot write (#{}), the slot sync (#{})",
+        at + 5,
+        at + 1,
+        at + 2,
+        at + 4,
+        at + 5,
+        at + 6
+    );
 }
 
 #[test]
