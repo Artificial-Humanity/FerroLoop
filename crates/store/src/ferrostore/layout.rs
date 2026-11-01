@@ -47,8 +47,68 @@ pub(super) fn corrupt(detail: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(format!("corrupt ferrostore data: {detail}"))
 }
 
-/// CRC-32/ISO-HDLC (poly `0xEDB88320`, init and xorout `0xFFFFFFFF`).
+/// CRC-32/ISO-HDLC (poly `0xEDB88320`, init and xorout `0xFFFFFFFF`), eight bytes per
+/// step ("slicing by 8"): the same value as the bit-at-a-time loop, several times faster.
+/// Open checks it over the whole snapshot, so its speed is part of the open time.
 pub(super) fn crc32(data: &[u8]) -> u32 {
+    let t = &CRC_TABLES;
+    let mut crc = 0xFFFF_FFFFu32;
+    let (words, tail) = data.as_chunks::<8>();
+    for word in words {
+        let lo = crc ^ u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        let hi = u32::from_le_bytes([word[4], word[5], word[6], word[7]]);
+        crc = t[7][(lo & 0xff) as usize]
+            ^ t[6][((lo >> 8) & 0xff) as usize]
+            ^ t[5][((lo >> 16) & 0xff) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xff) as usize]
+            ^ t[2][((hi >> 8) & 0xff) as usize]
+            ^ t[1][((hi >> 16) & 0xff) as usize]
+            ^ t[0][(hi >> 24) as usize];
+    }
+    for &byte in tail {
+        crc = (crc >> 8) ^ t[0][((crc ^ u32::from(byte)) & 0xff) as usize];
+    }
+    !crc
+}
+
+/// `CRC_TABLES[0][b]`: the CRC register after feeding byte `b` into zero;
+/// `CRC_TABLES[k][b]`: the same, followed by `k` zero bytes.
+const CRC_TABLES: [[u32; 256]; 8] = crc_tables();
+
+const fn crc_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut crc = byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        tables[0][byte] = crc;
+        byte += 1;
+    }
+    let mut byte = 0;
+    while byte < 256 {
+        let mut k = 1;
+        while k < 8 {
+            let prev = tables[k - 1][byte];
+            tables[k][byte] = (prev >> 8) ^ tables[0][(prev & 0xff) as usize];
+            k += 1;
+        }
+        byte += 1;
+    }
+    tables
+}
+
+/// The bit-at-a-time CRC-32 the table version must equal.
+#[cfg(test)]
+pub(super) fn crc32_bitwise(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &byte in data {
         crc ^= u32::from(byte);
@@ -457,7 +517,7 @@ pub(super) fn encode_snapshot_v3(
         return Err(backend("snapshot has no vector collections"));
     }
     for (name, collection) in vectors {
-        vector::validate_graph(name, collection)?;
+        vector::validate_graph_full(name, collection)?;
     }
     let mut body = Vec::new();
     body.extend_from_slice(SNAP_MAGIC);
@@ -551,7 +611,17 @@ fn write_vector_collection(
     Ok(())
 }
 
+/// Checks one decoded vector collection; [`decode_snapshot`] passes [`vector::validate_graph`].
+type GraphCheck = fn(&str, &VectorCollection) -> Result<(), StoreError>;
+
+/// Decode a snapshot blob. Each vector collection passes [`vector::validate_graph`], the
+/// structural checks; the neighbor order check is [`vector::validate_graph_full`]'s, which
+/// [`encode_snapshot_v3`] runs before writing (see `validate_graph` for why open skips it).
 pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
+    decode_snapshot_with(buf, vector::validate_graph)
+}
+
+fn decode_snapshot_with(buf: &[u8], check_graph: GraphCheck) -> Result<Snapshot, StoreError> {
     if buf.len() < 4 {
         return Err(corrupt("snapshot is shorter than its crc"));
     }
@@ -607,7 +677,7 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
     }
     let mut vectors = Vectors::new();
     if version == SNAPSHOT_VERSION_VECTOR {
-        vectors = decode_vector_collections(&mut cur)?;
+        vectors = decode_vector_collections(&mut cur, check_graph)?;
     }
     cur.finish()?;
     Ok(Snapshot {
@@ -662,7 +732,10 @@ fn decode_column_tables(cur: &mut Cur<'_>, require_nonempty: bool) -> Result<Tab
     Ok(tables)
 }
 
-fn decode_vector_collections(cur: &mut Cur<'_>) -> Result<Vectors, StoreError> {
+fn decode_vector_collections(
+    cur: &mut Cur<'_>,
+    check_graph: GraphCheck,
+) -> Result<Vectors, StoreError> {
     let collection_count = cur.u32()?;
     if collection_count == 0 {
         return Err(corrupt("snapshot has no vector collections"));
@@ -744,7 +817,7 @@ fn decode_vector_collections(cur: &mut Cur<'_>) -> Result<Vectors, StoreError> {
             vectors,
             entry,
         };
-        vector::validate_graph(&name, &collection)?;
+        check_graph(&name, &collection)?;
         collections.insert(name, Arc::new(collection));
     }
     Ok(collections)
@@ -1005,3 +1078,7 @@ fn u64_at(buf: &[u8], offset: usize) -> Option<u64> {
     arr.copy_from_slice(bytes);
     Some(u64::from_le_bytes(arr))
 }
+
+#[cfg(test)]
+#[path = "tests_open_bench.rs"]
+mod tests_open_bench;
