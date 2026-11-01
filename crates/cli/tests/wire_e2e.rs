@@ -578,3 +578,223 @@ fn mcp_server_exposes_and_executes_all_ferrowire_tools() {
     drop(stdin);
     let _ = child.wait();
 }
+
+#[test]
+fn agent_msg_register_and_unregister_update_the_workspace_registry_from_a_subdirectory() {
+    let env = TestEnv::new();
+    let agent_msg_bin = env.symlink_bin("agent-msg");
+    let sub = env.work_dir.join("ProjectA").join("src");
+    std::fs::create_dir_all(&sub).unwrap();
+    let registry = env.work_dir.join(".agents/REGISTRY.md");
+
+    for (name, proj, role) in [("Ferris", "ferroloop", "lead"), ("Kayla", "kaggle", "lead")] {
+        let out = env
+            .cmd_for(&agent_msg_bin)
+            .current_dir(&sub)
+            .args(["register", name, "--project", proj, "--role", role])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let md = std::fs::read_to_string(&registry).unwrap();
+    assert!(
+        md.contains("**Ferris**") && md.contains("**Kayla**"),
+        "{md}"
+    );
+    assert!(
+        !sub.join(".agents").exists(),
+        "no registry may be created in the subdirectory"
+    );
+
+    let out = env
+        .cmd_for(&agent_msg_bin)
+        .current_dir(&sub)
+        .args(["unregister", "kayla"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let md = std::fs::read_to_string(&registry).unwrap();
+    assert!(md.contains("**Ferris**"), "{md}");
+    assert!(
+        !md.contains("**Kayla**"),
+        "a retired agent must leave the active table: {md}"
+    );
+}
+
+#[test]
+fn agent_msg_read_defaults_to_unread_and_all_includes_acknowledged() {
+    let env = TestEnv::new();
+    let agent_msg_bin = env.symlink_bin("agent-msg");
+    for (name, proj) in [("Ferris", "ferroloop"), ("Kayla", "kaggle")] {
+        assert!(
+            env.cmd_for(&agent_msg_bin)
+                .args(["register", name, "--project", proj, "--role", "lead"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    assert!(
+        env.fl()
+            .args([
+                "wire",
+                "send",
+                "kayla",
+                "Unread default",
+                "body",
+                "--from",
+                "ferris"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let read = |args: &[&str]| {
+        let out = env
+            .cmd_for(&agent_msg_bin)
+            .env("AGENT_PERSONA", "kayla")
+            .arg("read")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(read(&["--ack"]).contains("Unread default"));
+    assert!(
+        !read(&[]).contains("Unread default"),
+        "an acknowledged message is not unread"
+    );
+    assert!(read(&["--all"]).contains("Unread default"));
+    assert!(
+        !read(&["--all", "--unread-only"]).contains("Unread default"),
+        "--unread-only wins over --all"
+    );
+}
+
+#[test]
+fn agent_msg_hydrate_runs_agent_hydrate_and_forwards_its_exit_status() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new();
+    let agent_msg_bin = env.symlink_bin("agent-msg");
+    let bindir = env.root.join("fake-bin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let args_out = env.root.join("hydrate.args");
+    let script = bindir.join("agent-hydrate");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$*\" > \"{}\"\nexit 7\n",
+            args_out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bindir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let out = env
+        .cmd_for(&agent_msg_bin)
+        .env("PATH", path)
+        .args(["hydrate", "Kayla", "--replace"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&args_out).unwrap().trim(),
+        "Kayla --replace"
+    );
+}
+
+#[test]
+fn agent_msg_register_replace_keeps_an_existing_lab_manager_and_never_raises_anyone() {
+    let env = TestEnv::new();
+    let agent_msg_bin = env.symlink_bin("agent-msg");
+    let register = |name: &str, project: &str, role: &str, extra: Option<&str>, replace: bool| {
+        let mut cmd = env.cmd_for(&agent_msg_bin);
+        cmd.args(["register", name, "--project", project, "--role", role]);
+        if let Some(extra) = extra {
+            cmd.args(["--extra-areas", extra]);
+        }
+        if replace {
+            cmd.arg("--replace");
+        }
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    let roster = || -> Value {
+        let out = env
+            .cmd_for(&agent_msg_bin)
+            .args(["roster", "--json"])
+            .output()
+            .unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let find = |roster: &Value, key: &str| -> Value {
+        roster
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name_key"] == key)
+            .unwrap_or_else(|| panic!("{key} missing from {roster}"))
+            .clone()
+    };
+
+    register("Manager", "lab", "lab_manager", Some("agents,notes"), false);
+    register("Worker", "other", "assistant", None, false);
+    // A reforge-style re-registration as lead.
+    register("Manager", "lab", "lead", None, true);
+    register("Worker", "other", "lead", None, true);
+
+    let r = roster();
+    let manager = find(&r, "manager");
+    assert_eq!(manager["role"], "lab_manager", "{manager}");
+    assert_eq!(
+        manager["extra_areas"],
+        serde_json::json!(["agents", "notes"])
+    );
+    // Only an existing lab manager is preserved: asking for lead raises nobody, and the name
+    // is irrelevant.
+    assert_eq!(find(&r, "worker")["role"], "lead");
+
+    // A retired lab manager holds no role: unregister, then a lead --replace comes back as lead.
+    let out = env
+        .cmd_for(&agent_msg_bin)
+        .args(["unregister", "manager"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    register("Manager", "lab", "lead", None, true);
+    let r = roster();
+    let manager = find(&r, "manager");
+    assert_eq!(manager["role"], "lead", "{manager}");
+    assert_eq!(manager["extra_areas"], serde_json::json!([]), "{manager}");
+}

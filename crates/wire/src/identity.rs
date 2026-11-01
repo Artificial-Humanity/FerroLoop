@@ -436,6 +436,25 @@ impl RouteTable {
         self.entries.get(&norm)
     }
 
+    /// `true` when `other` holds the same personas with the same routes, ignoring `updated_at`
+    /// (discovery restamps every live Claude route on each scan).
+    pub fn same_routes(&self, other: &Self) -> bool {
+        self.entries.len() == other.entries.len()
+            && self
+                .entries
+                .iter()
+                .all(|(k, e)| other.entries.get(k).is_some_and(|o| o.route == e.route))
+    }
+
+    /// Rescan the host's session files and report whether the route held for `persona` changed
+    /// (appeared, vanished, or differs). A push that failed uses it to learn that the session was
+    /// replaced since the last scan.
+    pub fn refresh_persona(&mut self, persona: &str, home_override: Option<&Path>, at: At) -> bool {
+        let before = self.get(persona).map(|e| e.route.clone());
+        self.discover_routes(home_override, at);
+        self.get(persona).map(|e| e.route.clone()) != before
+    }
+
     /// Passively discover Claude, Antigravity, Codex, Meta Muse, and xAI Grok routes from vendor session files.
     pub fn discover_routes(&mut self, home_override: Option<&Path>, at: At) {
         if home_override.is_none()
@@ -2743,6 +2762,53 @@ mod tests {
                 session_id,
                 ..
             }) if session_id == "wendy-session-uuid"
+        ));
+    }
+
+    #[test]
+    fn refresh_persona_reports_a_new_or_replaced_session_only_when_the_route_changed() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let sessions = home.join(".claude").join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let write_session = |pid: u32| {
+            fs::write(
+                sessions.join(format!("{pid}.json")),
+                serde_json::json!({
+                    "name": "Wendy",
+                    "nameSource": "user",
+                    "sessionId": format!("sess-{pid}"),
+                    "messagingSocketPath": home.join(format!("{pid}.sock")),
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        let at = |ms| At::from_unix_millis(ms);
+        let mut table = RouteTable::default();
+
+        assert!(
+            !table.refresh_persona("wendy", Some(home), at(10)),
+            "nothing to find yet"
+        );
+        write_session(111);
+        assert!(
+            table.refresh_persona("wendy", Some(home), at(20)),
+            "a new session appears"
+        );
+        assert!(
+            !table.refresh_persona("wendy", Some(home), at(30)),
+            "same route: unchanged"
+        );
+        fs::remove_file(sessions.join("111.json")).unwrap();
+        write_session(222);
+        assert!(
+            table.refresh_persona("wendy", Some(home), at(40)),
+            "a replaced session"
+        );
+        assert!(matches!(
+            table.get("wendy").map(|e| &e.route),
+            Some(VendorRoute::Claude { pid: 222, .. })
         ));
     }
 

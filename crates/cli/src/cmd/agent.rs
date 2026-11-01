@@ -392,6 +392,62 @@ fn lifecycle_failure(e: LifecycleError) -> (i32, String) {
     (code, e.to_string())
 }
 
+/// The role and extra areas a `register --replace` should store.
+///
+/// A replace keeps what the existing record already holds, and never raises anyone:
+/// - an existing `LabManager` asked to re-register as `Lead` stays `LabManager` (a reforge's
+///   `register --role lead --replace` must not drop the lab manager's authority);
+/// - when no extra areas were given (`extras_given == false`), the existing record's are kept.
+///
+/// With no existing record, or without `replace`, the request is used as given. Only an
+/// `Active` existing record counts: a retired record holds no role, so it is treated like no
+/// record (`unregister X` then `register X --role lead --replace` comes back as `lead`). The name
+/// is never consulted: only a role the store already granted is preserved.
+///
+/// The existing record is read in a separate read transaction from the `register_agent` write,
+/// so a role changed in between can be written back. It can only restore a role that name held a
+/// moment earlier, never raise anyone.
+pub fn preserve_on_replace(
+    existing: Option<&AgentRecord>,
+    replace: bool,
+    requested_role: AgentRole,
+    requested_extras: Vec<String>,
+    extras_given: bool,
+) -> (AgentRole, Vec<String>) {
+    let Some(existing) = existing.filter(|e| replace && e.status == AgentStatus::Active) else {
+        return (requested_role, requested_extras);
+    };
+    let role = if existing.role == AgentRole::LabManager && requested_role == AgentRole::Lead {
+        AgentRole::LabManager
+    } else {
+        requested_role
+    };
+    let extras = if extras_given {
+        requested_extras
+    } else {
+        existing.extra_areas.clone()
+    };
+    (role, extras)
+}
+
+/// Re-render the workspace `.agents/REGISTRY.md` from `store`, found by walking up from `start`
+/// through its ancestors, so a command run in any project subdirectory updates the workspace's
+/// file rather than looking for `./.agents/REGISTRY.md`. Returns the file written, or `None`
+/// when no ancestor holds one (nothing is created) or the roster could not be read or written.
+pub fn sync_registry_markdown<S: AgentRegistry>(store: &S, start: &Path) -> Option<PathBuf> {
+    // A relative `start` such as `.` has no ancestors to walk; resolve it first.
+    let start = std::fs::canonicalize(start).unwrap_or_else(|_| start.to_path_buf());
+    let candidate = start
+        .ancestors()
+        .map(|dir| dir.join(".agents").join("REGISTRY.md"))
+        .find(|path| path.is_file())?;
+    let areas = store.list_areas().ok()?;
+    let agents = store.list_agents(None, true).ok()?;
+    let md = render_registry_markdown(&areas, &agents);
+    write_atomic_non_symlink(&candidate, md.as_bytes()).ok()?;
+    Some(candidate)
+}
+
 pub fn run<S: AgentRegistry + Handles + StateStore>(
     store: &S,
     cmd: AgentCmd,
@@ -806,6 +862,81 @@ mod tests {
                     .contains("refusing to write under symlinked directory")
             );
         }
+    }
+
+    fn record(role: AgentRole, extras: &[&str]) -> AgentRecord {
+        AgentRecord {
+            id: AgentId(fl_core::ids::seq_iri(1)),
+            name_key: "synthetic".into(),
+            display_name: "Synthetic".into(),
+            email: "synthetic@example.test".into(),
+            project: "lab".into(),
+            role,
+            extra_areas: extras.iter().map(|s| (*s).to_string()).collect(),
+            status: AgentStatus::Active,
+            updated_at: At::from_unix_millis(1),
+            by: "synthetic".into(),
+        }
+    }
+
+    #[test]
+    fn replace_keeps_a_lab_manager_and_its_extra_areas_but_never_raises_anyone() {
+        let lm = record(AgentRole::LabManager, &["agents", "notes"]);
+        // `register --role lead --replace` over a lab manager keeps the role and, with no
+        // `--extra-areas`, the areas.
+        assert_eq!(
+            preserve_on_replace(Some(&lm), true, AgentRole::Lead, vec![], false),
+            (
+                AgentRole::LabManager,
+                vec!["agents".to_string(), "notes".to_string()]
+            )
+        );
+        // Explicit extra areas win.
+        assert_eq!(
+            preserve_on_replace(Some(&lm), true, AgentRole::Lead, vec!["x".into()], true),
+            (AgentRole::LabManager, vec!["x".to_string()])
+        );
+        // Only a Lead request is held at LabManager; other roles are taken as asked.
+        assert_eq!(
+            preserve_on_replace(Some(&lm), true, AgentRole::Assistant, vec![], true).0,
+            AgentRole::Assistant
+        );
+        // No elevation: a lead, assistant or no record never becomes LabManager, whatever the name.
+        for existing in [
+            Some(record(AgentRole::Lead, &[])),
+            Some(record(AgentRole::Assistant, &[])),
+            None,
+        ] {
+            assert_eq!(
+                preserve_on_replace(existing.as_ref(), true, AgentRole::Lead, vec![], false).0,
+                AgentRole::Lead
+            );
+        }
+        // A retired record holds no role: a Lead request comes back as Lead with the requested
+        // extras.
+        let retired = AgentRecord {
+            status: AgentStatus::Retired,
+            ..record(AgentRole::LabManager, &["agents", "notes"])
+        };
+        assert_eq!(
+            preserve_on_replace(
+                Some(&retired),
+                true,
+                AgentRole::Lead,
+                vec!["x".into()],
+                true
+            ),
+            (AgentRole::Lead, vec!["x".to_string()])
+        );
+        assert_eq!(
+            preserve_on_replace(Some(&retired), true, AgentRole::Lead, vec![], false),
+            (AgentRole::Lead, vec![])
+        );
+        // Without --replace nothing is preserved.
+        assert_eq!(
+            preserve_on_replace(Some(&lm), false, AgentRole::Lead, vec![], false),
+            (AgentRole::Lead, vec![])
+        );
     }
 
     #[test]

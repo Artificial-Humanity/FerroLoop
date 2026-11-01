@@ -48,44 +48,7 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             socket_path,
             key_path,
             ..
-        } => {
-            if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
-                return Err(format!("claude pid {pid} is no longer running"));
-            }
-            let (kpath, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref())?;
-            let peer_token = key_json
-                .get("peerToken")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
-
-            let mut stream = UnixStream::connect(socket_path).map_err(|e| {
-                format!(
-                    "failed to connect to claude socket {}: {e}",
-                    socket_path.display()
-                )
-            })?;
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-
-            let auth_frame = serde_json::json!({
-                "type": "auth",
-                "token": peer_token,
-            });
-            let user_frame = serde_json::json!({
-                "type": "user",
-                "from": msg.sender_name,
-                "priority": "next",
-                "message": {
-                    "role": "user",
-                    "content": format_push_message(msg),
-                }
-            });
-            let payload = format!("{auth_frame}\n{user_frame}\n");
-            stream
-                .write_all(payload.as_bytes())
-                .and_then(|()| stream.flush())
-                .map_err(|e| format!("failed to write to claude socket: {e}"))?;
-            Ok(())
-        }
+        } => dispatch_to_claude(*pid, socket_path, key_path.as_deref(), msg),
         VendorRoute::Agy {
             conversation_id,
             ls_address,
@@ -167,6 +130,216 @@ pub fn dispatch_to_route(route: &VendorRoute, msg: &WireMessage) -> Result<(), S
             Ok(())
         }
     }
+}
+
+/// Push `msg` to a live Claude Code session.
+///
+/// The session's messaging socket is tried first. When it is not usable (no path, a socket file
+/// that is gone, a refused connection, a write error or no peer token), the message is pasted
+/// into the session's tmux pane instead, but only while the session reports itself idle, so a
+/// paste never lands in the middle of a turn. When neither works the error says why, the receipt
+/// stays `Pending`, and the next hook or retry delivers it.
+///
+/// Known limits: a successful socket write counts as delivered without reading any reply from the
+/// session, and a tmux paste into an idle prompt may merge with a half-typed draft the operator
+/// left there.
+fn dispatch_to_claude(
+    pid: u32,
+    socket_path: &Path,
+    key_path: Option<&Path>,
+    msg: &WireMessage,
+) -> Result<(), String> {
+    if pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
+        return Err(format!("claude pid {pid} is no longer running"));
+    }
+    let socket_err = match push_claude_socket(pid, socket_path, key_path, msg) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    match push_claude_tmux(pid, socket_path, key_path, msg) {
+        Ok(()) => Ok(()),
+        Err(tmux_err) => Err(format!("{socket_err}; tmux fallback: {tmux_err}")),
+    }
+}
+
+fn push_claude_socket(
+    pid: u32,
+    socket_path: &Path,
+    key_path: Option<&Path>,
+    msg: &WireMessage,
+) -> Result<(), String> {
+    if socket_path.as_os_str().is_empty() {
+        return Err("claude route has no messaging socket".to_string());
+    }
+    if !socket_path.exists() {
+        return Err(format!(
+            "claude socket {} does not exist",
+            socket_path.display()
+        ));
+    }
+    let (kpath, key_json) = read_claude_key(pid, socket_path, key_path)?;
+    let peer_token = key_json
+        .get("peerToken")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("missing `peerToken` in {}", kpath.display()))?;
+
+    let mut stream = UnixStream::connect(socket_path).map_err(|e| {
+        format!(
+            "failed to connect to claude socket {}: {e}",
+            socket_path.display()
+        )
+    })?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    let auth_frame = serde_json::json!({
+        "type": "auth",
+        "token": peer_token,
+    });
+    let user_frame = serde_json::json!({
+        "type": "user",
+        "from": msg.sender_name,
+        "priority": "next",
+        "message": {
+            "role": "user",
+            "content": format_push_message(msg),
+        }
+    });
+    let payload = format!("{auth_frame}\n{user_frame}\n");
+    stream
+        .write_all(payload.as_bytes())
+        .and_then(|()| stream.flush())
+        .map_err(|e| format!("failed to write to claude socket: {e}"))
+}
+
+/// The `<pid>.json` session record Claude Code keeps next to the session key files, parsed.
+fn read_claude_session_record(pid: u32, key_path: Option<&Path>) -> Option<serde_json::Value> {
+    let dir = key_path
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude").join("sessions"))
+        })?;
+    let raw = fs::read_to_string(dir.join(format!("{pid}.json"))).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// `true` when the session record says Claude is waiting for input. An absent or unreadable
+/// record, or any other status, is "not idle": pasting into a busy turn would interleave the
+/// message with whatever is being typed or run.
+fn claude_session_idle(record: Option<&serde_json::Value>) -> bool {
+    record
+        .and_then(|r| r.get("status"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("idle"))
+}
+
+/// Drop every control character except `\n` and `\t` from text that a peer controls, so a pasted
+/// message cannot carry ESC (and with it a bracketed-paste terminator or any other escape
+/// sequence), CR, Ctrl-C, Ctrl-U or any other key that the receiving prompt would act on.
+fn sanitize_for_paste(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
+
+/// Paste `msg` into the tmux pane of a Claude session, while the session is idle.
+///
+/// With a real `pid` the pane is the one whose process tree holds that pid
+/// ([`tmux_pane_for_pid`]); a pane recorded in the key or session record is never trusted on its
+/// own, because pane ids restart after a tmux server restart and a session under another tmux
+/// server maps to an unrelated `%N`. A recorded pane is used only when it equals the process-tree
+/// result, and when the process-tree lookup finds nothing the paste is refused. Only `pid == 0`
+/// (tests and hand-registered routes) falls back to the recorded pane.
+///
+/// The text is sanitised and pasted as a bracketed paste, so embedded newlines do not submit
+/// anything and the single trailing Enter does.
+fn push_claude_tmux(
+    pid: u32,
+    socket_path: &Path,
+    key_path: Option<&Path>,
+    msg: &WireMessage,
+) -> Result<(), String> {
+    let record = read_claude_session_record(pid, key_path);
+    let pane = claude_live_pane(pid, record.as_ref(), || {
+        read_claude_key(pid, socket_path, key_path)
+            .ok()
+            .map(|(_, v)| v)
+    })
+    .ok_or_else(|| {
+        if pid != 0 {
+            format!("no tmux pane holds claude pid {pid}")
+        } else {
+            "no live tmux pane for this session".to_string()
+        }
+    })?;
+    if !claude_session_idle(record.as_ref()) {
+        return Err(format!(
+            "session in pane {pane} is not idle; leaving the message pending"
+        ));
+    }
+    deliver_via_tmux_paste_opts(&pane, &sanitize_for_paste(&format_push_message(msg)), true)
+}
+
+/// The live tmux pane (`%<n>`) a Claude session runs in.
+///
+/// With a real `pid` the pane is the one whose process tree holds that pid
+/// ([`tmux_pane_for_pid`]); a recorded pane is never trusted on its own, because pane ids restart
+/// after a tmux server restart and a session under another tmux server maps to an unrelated
+/// `%N`. Only `pid == 0` (tests and hand-registered routes) reads the recorded `tmux` field, from
+/// the session key file and then the `<pid>.json` record. Claude Code writes the field to the
+/// record, not to the key file.
+fn claude_live_pane(
+    pid: u32,
+    record: Option<&serde_json::Value>,
+    key_json: impl FnOnce() -> Option<serde_json::Value>,
+) -> Option<String> {
+    if pid != 0 {
+        return tmux_pane_for_pid(pid);
+    }
+    key_json()
+        .as_ref()
+        .and_then(claude_live_tmux_pane)
+        .or_else(|| record.and_then(claude_live_tmux_pane))
+}
+
+/// The pid of `pid`'s parent process, read from `/proc/<pid>/stat`.
+fn parent_pid(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` is parenthesised and may hold spaces or parens; the fields after the last `)` are
+    // fixed: state, then ppid.
+    let rest = &stat[stat.rfind(')')? + 1..];
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The tmux pane (`%<n>`) whose process tree holds `pid`, found from `tmux list-panes -a` and the
+/// parent chain of `pid`. `None` when tmux is absent, no pane matches, or the chain is cut.
+pub(crate) fn tmux_pane_for_pid(pid: u32) -> Option<String> {
+    let out = Command::new(tmux_bin())
+        .args(["list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let panes: Vec<(String, u32)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (id, pane_pid) = line.split_once(' ')?;
+            id.strip_prefix('%')?;
+            Some((id.to_string(), pane_pid.trim().parse().ok()?))
+        })
+        .collect();
+    let mut cur = pid;
+    // A bounded walk: a process tree is never this deep, and a cycle cannot loop forever.
+    for _ in 0..64 {
+        if let Some((id, _)) = panes.iter().find(|(_, pane_pid)| *pane_pid == cur) {
+            return Some(id.clone());
+        }
+        cur = parent_pid(cur).filter(|p| *p > 1)?;
+    }
+    None
 }
 
 /// Serialises tests that point `FL_WIRE_CODEX_BIN` (process-global) at a fake `codex`.
@@ -1253,7 +1426,7 @@ pub fn run_interrupt(plan: &InterruptPlan) -> Result<(), String> {
     }
 }
 
-fn tmux_bin() -> PathBuf {
+pub(crate) fn tmux_bin() -> PathBuf {
     std::env::var_os("FL_WIRE_TMUX_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("tmux"))
@@ -1272,6 +1445,14 @@ fn tmux_target_alive(target: &str) -> bool {
 }
 
 fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
+    deliver_via_tmux_paste_opts(target, text, false)
+}
+
+/// Paste `text` into `target` and press Enter. With `bracketed`, the paste is a tmux bracketed
+/// paste (`paste-buffer -p`), so the pane's application receives the newlines as pasted text
+/// rather than as Enter presses, and a failed Enter clears the prompt line (`C-u`) so a retry
+/// does not paste the message a second time.
+fn deliver_via_tmux_paste_opts(target: &str, text: &str, bracketed: bool) -> Result<(), String> {
     let tmux = tmux_bin();
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1302,8 +1483,13 @@ fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
         return Err(format!("tmux load-buffer exited with {load_status}"));
     }
 
+    let mut paste_args = vec!["paste-buffer", "-d", "-b", &buf_name];
+    if bracketed {
+        paste_args.push("-p");
+    }
+    paste_args.extend(["-t", target]);
     let paste_status = Command::new(&tmux)
-        .args(["paste-buffer", "-d", "-b", &buf_name, "-t", target])
+        .args(&paste_args)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
@@ -1329,6 +1515,13 @@ fn deliver_via_tmux_paste(target: &str, text: &str) -> Result<(), String> {
         .status()
         .map_err(|e| format!("failed to spawn tmux send-keys: {e}"))?;
     if !enter_status.success() {
+        if bracketed {
+            let _ = Command::new(&tmux)
+                .args(["send-keys", "-t", target, "C-u"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
         return Err(format!("tmux send-keys exited with {enter_status}"));
     }
 
@@ -1414,9 +1607,9 @@ fn read_claude_key(
     Ok((kpath, key_json))
 }
 
-/// The live tmux pane id (`%<n>`) a Claude route's session key file names, or `None` for any
-/// other vendor, a stopped process, an unreadable key file, or a pane that is not alive.
-/// An interrupt of a session the hub does not host uses it as the pane to send `Escape` to.
+/// The pane from [`claude_live_pane`], or `None` for any other vendor, a stopped process, or a
+/// pane that is not alive/found. The interrupt of a session the hub does not host uses it as the
+/// pane to send `Escape` to.
 pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
     let VendorRoute::Claude {
         pid,
@@ -1430,8 +1623,12 @@ pub fn claude_route_live_pane(route: &VendorRoute) -> Option<String> {
     if *pid != 0 && !Path::new(&format!("/proc/{pid}")).exists() {
         return None;
     }
-    let (_, key_json) = read_claude_key(*pid, socket_path, key_path.as_deref()).ok()?;
-    claude_live_tmux_pane(&key_json)
+    let record = read_claude_session_record(*pid, key_path.as_deref());
+    claude_live_pane(*pid, record.as_ref(), || {
+        read_claude_key(*pid, socket_path, key_path.as_deref())
+            .ok()
+            .map(|(_, v)| v)
+    })
 }
 
 pub fn dispatch_operator_prompt_to_route(
@@ -1456,7 +1653,11 @@ pub fn dispatch_operator_prompt_to_route(
             // an owner sender may take this path: it must stay out of reach of any caller
             // that is merely authenticated as a peer.
             if is_owner_sender(sender_name)
-                && let Some(pane) = claude_live_tmux_pane(&key_json)
+                && let Some(pane) = claude_live_pane(
+                    *pid,
+                    read_claude_session_record(*pid, key_path.as_deref()).as_ref(),
+                    || Some(key_json.clone()),
+                )
             {
                 return deliver_via_tmux_paste(&pane, &prefixed_operator_body(sender_name, body));
             }
@@ -1596,7 +1797,17 @@ pub fn dispatch_message_for_store<S: MessageStore>(
         let Some(entry) = routes.get(&rcpt.recipient_name).cloned() else {
             continue;
         };
-        let target_status = match dispatch_to_route(&entry.route, msg) {
+        let mut pushed = dispatch_to_route(&entry.route, msg);
+        if pushed.is_err() {
+            // The session may have restarted since the scan above (a new pid, socket or pane).
+            // Rescan for this persona, and push once more only when its route changed.
+            if routes.refresh_persona(&rcpt.recipient_name, home_override, now.clone())
+                && let Some(fresh) = routes.get(&rcpt.recipient_name).cloned()
+            {
+                pushed = dispatch_to_route(&fresh.route, msg);
+            }
+        }
+        let target_status = match pushed {
             Ok(()) => DeliveryStatus::Acked,
             Err(_) => DeliveryStatus::Pending,
         };
@@ -2020,6 +2231,424 @@ mod tests {
             },
             listener,
         )
+    }
+
+    /// A one-message store and its receipt for `to`, for the Claude fallback tests.
+    fn claude_fallback_msg(store: &MemStore, to: &str) -> WireMessage {
+        claude_fallback_msg_with(store, to, "fallback", "fallback body")
+    }
+
+    fn claude_fallback_msg_with(
+        store: &MemStore,
+        to: &str,
+        subject: &str,
+        body: &str,
+    ) -> WireMessage {
+        store
+            .send_wire(SendWireArgs {
+                id: None,
+                sender_id: None,
+                sender_name: "synthetic-sender".into(),
+                sender_host: None,
+                to: WireAddress::AgentName(to.into()),
+                kind: MessageKind::Mail,
+                urgency: MessageUrgency::Normal,
+                durable: false,
+                subject: subject.into(),
+                body: body.into(),
+                reply_to: None,
+                thread_id: None,
+                deadline_at: None,
+                at: At::from_unix_millis(10),
+            })
+            .unwrap()
+            .0
+    }
+
+    /// A Claude route whose socket is `socket`, with a key file and a `0.json` session record
+    /// (`status`, `tmux`) beside it.
+    fn claude_route_with_record(
+        dir: &Path,
+        socket: PathBuf,
+        status: &str,
+        tmux: &str,
+    ) -> VendorRoute {
+        let key_path = dir.join("0.key");
+        fs::write(&key_path, r#"{"peerToken":"tok-t"}"#).unwrap();
+        fs::write(
+            dir.join("0.json"),
+            serde_json::json!({ "status": status, "tmux": tmux }).to_string(),
+        )
+        .unwrap();
+        VendorRoute::Claude {
+            pid: 0,
+            session_id: "s-fb".into(),
+            socket_path: socket,
+            key_path: Some(key_path),
+        }
+    }
+
+    fn dispatch_one(
+        route: VendorRoute,
+        dir: &Path,
+        store: &MemStore,
+        msg: &WireMessage,
+    ) -> DeliveryReceipt {
+        let mut routes = RouteTable::default();
+        routes.upsert("synthetic-recipient-c", route, At::from_unix_millis(10));
+        let updated = dispatch_message_for_store(
+            store,
+            &mut routes,
+            Some(dir),
+            msg,
+            At::from_unix_millis(20),
+        );
+        assert_eq!(updated.len(), 1);
+        updated.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn claude_without_a_usable_socket_falls_back_to_tmux_paste_when_idle() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        // An empty path, a path that is not there, and a socket file nobody listens on.
+        for case in ["empty", "missing", "refused"] {
+            let tmp = TempDir::new().unwrap();
+            let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+            let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+            let socket = match case {
+                "empty" => PathBuf::new(),
+                "missing" => tmp.path().join("gone.sock"),
+                _ => {
+                    let path = tmp.path().join("refused.sock");
+                    drop(UnixListener::bind(&path).unwrap());
+                    path
+                }
+            };
+            let route = claude_route_with_record(tmp.path(), socket, "idle", "Wendy:@6.%12");
+            let store = MemStore::default();
+            let msg = claude_fallback_msg(&store, "synthetic-recipient-c");
+
+            let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
+            assert_eq!(rcpt.status, DeliveryStatus::Acked, "{case}");
+            let cmds = fs::read_to_string(&tmux_out).unwrap();
+            assert!(cmds.contains("paste-buffer -d -b"), "{case}: {cmds}");
+            assert!(cmds.contains("-t %12"), "{case}: {cmds}");
+            let pasted = fs::read_to_string(&tmux_stdin).unwrap();
+            assert!(pasted.contains("fallback body"), "{case}: {pasted}");
+            assert!(pasted.contains("synthetic-sender"), "{case}: {pasted}");
+        }
+    }
+
+    #[test]
+    fn claude_fallback_leaves_the_message_pending_while_the_session_is_busy() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let route = claude_route_with_record(
+            tmp.path(),
+            tmp.path().join("gone.sock"),
+            "busy",
+            "Wendy:@6.%12",
+        );
+        let store = MemStore::default();
+        let msg = claude_fallback_msg(&store, "synthetic-recipient-c");
+
+        let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
+        // Pending (not Acked, not Delivered): the Stop / PostToolUse hook and the retry loop
+        // still see it as unread and deliver it when the turn ends.
+        assert_eq!(rcpt.status, DeliveryStatus::Pending);
+        assert_eq!(rcpt.attempts, 1);
+        let cmds = fs::read_to_string(&tmux_out).unwrap_or_default();
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+        let unread = store
+            .list_wire_inbox(&fl_core::ferrowire::WireFilter {
+                recipient: Some("synthetic-recipient-c".into()),
+                unread_only: true,
+                thread_id: None,
+                correlation_id: None,
+                limit: None,
+            })
+            .unwrap();
+        assert_eq!(unread.len(), 1, "a pending message must stay unread");
+    }
+
+    #[test]
+    fn claude_fallback_without_a_live_pane_stays_pending() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), false);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let route = claude_route_with_record(
+            tmp.path(),
+            tmp.path().join("gone.sock"),
+            "idle",
+            "Wendy:@6.%12",
+        );
+        let store = MemStore::default();
+        let msg = claude_fallback_msg(&store, "synthetic-recipient-c");
+
+        let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
+        assert_eq!(rcpt.status, DeliveryStatus::Pending);
+        let cmds = fs::read_to_string(&tmux_out).unwrap_or_default();
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+    }
+
+    /// A fake tmux whose `list-panes` reports `panes` (`%id pid` lines), `display-message`
+    /// answers `%12`, `load-buffer` stores stdin, and `send-keys ... Enter` fails when
+    /// `enter_fails` is set. Returns (binary, command log, stdin copy).
+    fn write_fake_tmux_panes(
+        dir: &Path,
+        panes: &str,
+        enter_fails: bool,
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let out = dir.join("tmux.out");
+        let stdin_out = dir.join("tmux.stdin");
+        let bin = dir.join("fake-tmux-panes.sh");
+        let enter = if enter_fails { "exit 1" } else { "exit 0" };
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\ncase \"$1\" in\n  display-message) echo \"%12\" ;;\n  list-panes) printf '%s\\n' '{}' ;;\n  load-buffer) cat > \"{}\" ;;\n  send-keys) case \"$*\" in *Enter) {enter} ;; esac ;;\nesac\n",
+                out.display(),
+                panes,
+                stdin_out.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        (bin, out, stdin_out)
+    }
+
+    #[test]
+    fn claude_fallback_paste_is_sanitised_and_bracketed() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let route = claude_route_with_record(
+            tmp.path(),
+            tmp.path().join("gone.sock"),
+            "idle",
+            "Wendy:@6.%12",
+        );
+        let store = MemStore::default();
+        let msg = claude_fallback_msg_with(
+            &store,
+            "synthetic-recipient-c",
+            "subj\x1b[2J\x15ect",
+            "first\r\n!rm -rf x\n\x1b[201~/exit\x03\x15\tkept\x7f",
+        );
+
+        let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
+        assert_eq!(rcpt.status, DeliveryStatus::Acked);
+        let pasted = fs::read_to_string(&tmux_stdin).unwrap();
+        assert!(
+            pasted
+                .chars()
+                .all(|c| c == '\n' || c == '\t' || !c.is_control()),
+            "control bytes reached the pane: {pasted:?}"
+        );
+        assert!(pasted.contains("\n!rm -rf x\n"), "{pasted:?}");
+        assert!(pasted.contains("\tkept"), "{pasted:?}");
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("paste-buffer -d -b"), "{cmds}");
+        assert!(cmds.contains(" -p "), "paste must be bracketed: {cmds}");
+        assert!(cmds.contains("send-keys -t %12 Enter"), "{cmds}");
+    }
+
+    #[test]
+    fn claude_fallback_enter_failure_clears_the_line_and_stays_pending() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux_panes(tmp.path(), "", true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let route = claude_route_with_record(
+            tmp.path(),
+            tmp.path().join("gone.sock"),
+            "idle",
+            "Wendy:@6.%12",
+        );
+        let store = MemStore::default();
+        let msg = claude_fallback_msg(&store, "synthetic-recipient-c");
+
+        let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
+        assert_eq!(rcpt.status, DeliveryStatus::Pending);
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("paste-buffer"), "{cmds}");
+        assert!(cmds.contains("send-keys -t %12 C-u"), "{cmds}");
+    }
+
+    #[test]
+    fn claude_fallback_with_a_real_pid_uses_only_the_process_tree_pane() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        // The pane process is this test process; the claude pid is its child.
+        let panes = format!("%3 1\n%7 {}", std::process::id());
+        let run = |tmp: &Path, panes: &str, status: &str, tmux_field: &str| {
+            let (tmux_bin, tmux_out, _) = write_fake_tmux_panes(tmp, panes, false);
+            let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+            let key_path = tmp.join("pid.key");
+            fs::write(&key_path, r#"{"peerToken":"tok-t"}"#).unwrap();
+            fs::write(
+                tmp.join(format!("{pid}.json")),
+                serde_json::json!({ "status": status, "tmux": tmux_field }).to_string(),
+            )
+            .unwrap();
+            let route = VendorRoute::Claude {
+                pid,
+                session_id: "s-pid".into(),
+                socket_path: tmp.join("gone.sock"),
+                key_path: Some(key_path),
+            };
+            let store = MemStore::default();
+            let msg = claude_fallback_msg(&store, "synthetic-recipient-c");
+            let rcpt = dispatch_one(route, tmp, &store, &msg);
+            (
+                rcpt.status,
+                fs::read_to_string(&tmux_out).unwrap_or_default(),
+            )
+        };
+
+        // Idle: pasted into the process-tree pane %7, never the recorded %12.
+        let tmp = TempDir::new().unwrap();
+        let (status, cmds) = run(tmp.path(), &panes, "idle", "Wendy:@6.%12");
+        assert_eq!(status, DeliveryStatus::Acked, "{cmds}");
+        assert!(cmds.contains("paste-buffer -d -b"), "{cmds}");
+        assert!(cmds.contains("-t %7"), "{cmds}");
+        assert!(!cmds.contains("-t %12"), "recorded pane used: {cmds}");
+
+        // Busy: the idle gate still holds on this branch.
+        let tmp = TempDir::new().unwrap();
+        let (status, cmds) = run(tmp.path(), &panes, "busy", "Wendy:@6.%12");
+        assert_eq!(status, DeliveryStatus::Pending);
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+
+        // The process tree holds no pane: nothing is pasted, even though the record names one.
+        let tmp = TempDir::new().unwrap();
+        let (status, cmds) = run(tmp.path(), "%3 1", "idle", "Wendy:@6.%12");
+        assert_eq!(status, DeliveryStatus::Pending);
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn claude_live_socket_is_used_and_tmux_is_left_alone() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux(tmp.path(), true);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let sock = tmp.path().join("live.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let reader = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::io::BufReader::new(stream)
+                .lines()
+                .take(2)
+                .map(|l| l.unwrap())
+                .collect::<Vec<_>>()
+        });
+        let route = claude_route_with_record(tmp.path(), sock, "idle", "Wendy:@6.%12");
+        let store = MemStore::default();
+        let msg = claude_fallback_msg(&store, "synthetic-recipient-c");
+
+        let rcpt = dispatch_one(route, tmp.path(), &store, &msg);
+        assert_eq!(rcpt.status, DeliveryStatus::Acked);
+        assert_eq!(reader.join().unwrap().len(), 2);
+        let cmds = fs::read_to_string(&tmux_out).unwrap_or_default();
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+    }
+
+    #[test]
+    fn owner_prompt_and_interrupt_pane_come_from_the_process_tree_not_the_key_file() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        // The pane process is this test process; the claude pid is its child. The key file
+        // names a different pane (%12), as a stale or foreign-server record would.
+        let panes = format!("%3 1\n%7 {}", std::process::id());
+        let (tmux_bin, tmux_out, tmux_stdin) = write_fake_tmux_panes(tmp.path(), &panes, false);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let key_path = tmp.path().join("pid.key");
+        fs::write(&key_path, r#"{"peerToken":"tok-t","tmux":"Wendy:@6.%12"}"#).unwrap();
+        let route = VendorRoute::Claude {
+            pid: child.id(),
+            session_id: "s-owner".into(),
+            socket_path: tmp.path().join("gone.sock"),
+            key_path: Some(key_path),
+        };
+
+        let live = claude_route_live_pane(&route);
+        let sent = dispatch_operator_prompt_to_route(&route, "owner", "Check the queue");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(live.as_deref(), Some("%7"));
+        sent.unwrap();
+        let cmds = fs::read_to_string(&tmux_out).unwrap();
+        assert!(cmds.contains("send-keys -t %7 Enter"), "{cmds}");
+        assert!(!cmds.contains("%12 Enter"), "{cmds}");
+        assert!(
+            fs::read_to_string(&tmux_stdin)
+                .unwrap()
+                .contains("Check the queue")
+        );
+    }
+
+    #[test]
+    fn owner_prompt_pane_with_a_real_pid_in_no_pane_is_not_pasted() {
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let (tmux_bin, tmux_out, _) = write_fake_tmux_panes(tmp.path(), "%3 1", false);
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &tmux_bin);
+        let key_path = tmp.path().join("pid.key");
+        fs::write(&key_path, r#"{"peerToken":"tok-t","tmux":"Wendy:@6.%12"}"#).unwrap();
+        let route = VendorRoute::Claude {
+            pid: child.id(),
+            session_id: "s-owner".into(),
+            socket_path: tmp.path().join("gone.sock"),
+            key_path: Some(key_path),
+        };
+        let live = claude_route_live_pane(&route);
+        let sent = dispatch_operator_prompt_to_route(&route, "owner", "hello");
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert_eq!(live, None);
+        assert!(sent.is_err(), "no pane and no socket: nothing is delivered");
+        let cmds = fs::read_to_string(&tmux_out).unwrap_or_default();
+        assert!(!cmds.contains("paste-buffer"), "{cmds}");
+    }
+
+    #[test]
+    fn tmux_pane_for_pid_matches_the_pane_that_holds_an_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let _tmux_lock = TMUX_ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let tmp = TempDir::new().unwrap();
+        let bin = tmp.path().join("fake-tmux.sh");
+        // The pane process is this test process; the queried pid is its child.
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = list-panes ]; then\n  echo '%3 1'\n  echo '%7 {}'\nfi\n",
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let _env = EnvGuard::set("FL_WIRE_TMUX_BIN", &bin);
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        let found = tmux_pane_for_pid(child.id());
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(found.as_deref(), Some("%7"));
+        assert_eq!(tmux_pane_for_pid(u32::MAX - 1), None);
     }
 
     fn socket_frames(listener: &UnixListener) -> Option<Vec<String>> {

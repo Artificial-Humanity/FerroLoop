@@ -439,8 +439,15 @@ where
             msg,
             now,
         );
-        // Discovery inside the dispatch also prunes dead routes; carry those removals back.
-        lock(&self.routes).merge_dispatch_result(&base, working);
+        // Discovery inside the dispatch also learns replaced sessions and prunes dead routes;
+        // carry both back, and persist them so a restart starts from the refreshed table.
+        let changed = !working.same_routes(&base);
+        let mut live = lock(&self.routes);
+        live.merge_dispatch_result(&base, working);
+        if changed {
+            let _ = live.save(self.config.routes_path.as_deref());
+        }
+        drop(live);
         for rcpt in updated {
             self.notify_subscribers_receipt(&rcpt);
             self.broadcast_to_peers(None, &PeerFrame::ReceiptUpdate { receipt: rcpt });
