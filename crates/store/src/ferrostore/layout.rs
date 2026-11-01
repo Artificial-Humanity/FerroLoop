@@ -3,6 +3,7 @@
 use super::columnar::{
     ColumnDef, ColumnTable, check_new_table, type_from_tag, type_tag, validate_row_group,
 };
+use super::state::{Collection, Docs, Tables, Vectors};
 use super::vector::{
     self, VectorCollection, VectorMetric, VectorRecord, VectorStorage, metric_from_tag, metric_tag,
     storage_from_tag, storage_tag,
@@ -10,6 +11,7 @@ use super::vector::{
 use fl_core::StoreError;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub(super) const SLOT_LEN: usize = 4096;
 pub(super) const HEADER_BYTES: u64 = 8192;
@@ -374,15 +376,12 @@ fn write_lp(buf: &mut Vec<u8>, bytes: &[u8]) -> Result<(), StoreError> {
 
 pub(super) struct Snapshot {
     pub(super) seq: u64,
-    pub(super) docs: BTreeMap<(String, String), Value>,
-    pub(super) tables: BTreeMap<String, ColumnTable>,
-    pub(super) vectors: BTreeMap<String, VectorCollection>,
+    pub(super) docs: Docs,
+    pub(super) tables: Tables,
+    pub(super) vectors: Vectors,
 }
 
-pub(super) fn encode_snapshot(
-    seq: u64,
-    docs: &BTreeMap<(String, String), Value>,
-) -> Result<Vec<u8>, StoreError> {
+pub(super) fn encode_snapshot(seq: u64, docs: &Docs) -> Result<Vec<u8>, StoreError> {
     let mut body = Vec::new();
     body.extend_from_slice(SNAP_MAGIC);
     body.extend_from_slice(&SNAPSHOT_VERSION_DOCS.to_le_bytes());
@@ -390,7 +389,7 @@ pub(super) fn encode_snapshot(
     let count =
         u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
     body.extend_from_slice(&count.to_le_bytes());
-    for ((collection, id), doc) in docs {
+    for (collection, id, doc) in docs.iter() {
         write_lp(&mut body, collection.as_bytes())?;
         write_lp(&mut body, id.as_bytes())?;
         let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
@@ -406,8 +405,8 @@ pub(super) fn encode_snapshot(
 /// via [`encode_snapshot`], which is byte-identical to a document-only snapshot.
 pub(super) fn encode_snapshot_v2(
     seq: u64,
-    docs: &BTreeMap<(String, String), Value>,
-    tables: &BTreeMap<String, ColumnTable>,
+    docs: &Docs,
+    tables: &Tables,
 ) -> Result<Vec<u8>, StoreError> {
     let mut body = Vec::new();
     body.extend_from_slice(SNAP_MAGIC);
@@ -416,7 +415,7 @@ pub(super) fn encode_snapshot_v2(
     let count =
         u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
     body.extend_from_slice(&count.to_le_bytes());
-    for ((collection, id), doc) in docs {
+    for (collection, id, doc) in docs.iter() {
         write_lp(&mut body, collection.as_bytes())?;
         write_lp(&mut body, id.as_bytes())?;
         let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
@@ -450,9 +449,9 @@ pub(super) fn encode_snapshot_v2(
 /// (`table_count` may be 0), then one or more vector collections.
 pub(super) fn encode_snapshot_v3(
     seq: u64,
-    docs: &BTreeMap<(String, String), Value>,
-    tables: &BTreeMap<String, ColumnTable>,
-    vectors: &BTreeMap<String, VectorCollection>,
+    docs: &Docs,
+    tables: &Tables,
+    vectors: &Vectors,
 ) -> Result<Vec<u8>, StoreError> {
     if vectors.is_empty() {
         return Err(backend("snapshot has no vector collections"));
@@ -467,7 +466,7 @@ pub(super) fn encode_snapshot_v3(
     let count =
         u32::try_from(docs.len()).map_err(|_| backend("snapshot has too many documents"))?;
     body.extend_from_slice(&count.to_le_bytes());
-    for ((collection, id), doc) in docs {
+    for (collection, id, doc) in docs.iter() {
         write_lp(&mut body, collection.as_bytes())?;
         write_lp(&mut body, id.as_bytes())?;
         let raw = serde_json::to_vec(doc).map_err(|err| backend(format!("json encode: {err}")))?;
@@ -585,22 +584,28 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
     if usize::try_from(count).unwrap_or(usize::MAX) > cur.remaining() {
         return Err(corrupt("snapshot count exceeds the blob"));
     }
-    let mut docs = BTreeMap::new();
+    let mut nested: BTreeMap<String, Collection> = BTreeMap::new();
     for _ in 0..count {
         let collection = cur.lp_str()?;
         let id = cur.lp_str()?;
         let raw = cur.lp()?;
         let doc =
             serde_json::from_slice(raw).map_err(|_| corrupt("snapshot document is not json"))?;
-        if docs.insert((collection, id), doc).is_some() {
+        if nested
+            .entry(collection)
+            .or_default()
+            .insert(id, Arc::new(doc))
+            .is_some()
+        {
             return Err(corrupt("snapshot repeats a document id"));
         }
     }
-    let mut tables = BTreeMap::new();
+    let docs = Docs::from_nested(nested);
+    let mut tables = Tables::new();
     if version == SNAPSHOT_VERSION_COLUMNAR || version == SNAPSHOT_VERSION_VECTOR {
         tables = decode_column_tables(&mut cur, version == SNAPSHOT_VERSION_COLUMNAR)?;
     }
-    let mut vectors = BTreeMap::new();
+    let mut vectors = Vectors::new();
     if version == SNAPSHOT_VERSION_VECTOR {
         vectors = decode_vector_collections(&mut cur)?;
     }
@@ -613,10 +618,7 @@ pub(super) fn decode_snapshot(buf: &[u8]) -> Result<Snapshot, StoreError> {
     })
 }
 
-fn decode_column_tables(
-    cur: &mut Cur<'_>,
-    require_nonempty: bool,
-) -> Result<BTreeMap<String, ColumnTable>, StoreError> {
+fn decode_column_tables(cur: &mut Cur<'_>, require_nonempty: bool) -> Result<Tables, StoreError> {
     let table_count = cur.u32()?;
     if require_nonempty && table_count == 0 {
         return Err(corrupt("snapshot has no column tables"));
@@ -651,18 +653,16 @@ fn decode_column_tables(
         if tables.contains_key(&name) {
             return Err(corrupt(format!("snapshot repeats column table `{name}`")));
         }
-        check_new_table(&tables, &name, &columns)?;
+        check_new_table(false, &name, &columns)?;
         for group in &groups {
             validate_row_group(&columns, group)?;
         }
-        tables.insert(name, ColumnTable { columns, groups });
+        tables.insert(name, Arc::new(ColumnTable { columns, groups }));
     }
     Ok(tables)
 }
 
-fn decode_vector_collections(
-    cur: &mut Cur<'_>,
-) -> Result<BTreeMap<String, VectorCollection>, StoreError> {
+fn decode_vector_collections(cur: &mut Cur<'_>) -> Result<Vectors, StoreError> {
     let collection_count = cur.u32()?;
     if collection_count == 0 {
         return Err(corrupt("snapshot has no vector collections"));
@@ -745,7 +745,7 @@ fn decode_vector_collections(
             entry,
         };
         vector::validate_graph(&name, &collection)?;
-        collections.insert(name, collection);
+        collections.insert(name, Arc::new(collection));
     }
     Ok(collections)
 }
@@ -764,9 +764,21 @@ fn read_metadata(cur: &mut Cur<'_>) -> Result<Option<Value>, StoreError> {
     }
 }
 
+/// Decoded WAL frames: `(seq, ops)` in file order.
+pub(super) type WalFrames = Vec<(u64, Vec<Op>)>;
+
 /// Decode committed WAL bytes. A torn tail is dropped; a bad CRC with a
 /// following complete frame is corruption.
-pub(super) fn decode_wal(buf: &[u8]) -> Result<Vec<(u64, Vec<Op>)>, StoreError> {
+#[cfg(test)]
+pub(super) fn decode_wal(buf: &[u8]) -> Result<WalFrames, StoreError> {
+    Ok(decode_wal_prefix(buf)?.0)
+}
+
+/// [`decode_wal`], and how many bytes of `buf` its frames cover: the end of
+/// the last whole frame. Bytes past it are the torn tail that was dropped.
+/// Decoding from a frame boundary decodes the same frames as decoding the
+/// whole buffer, so a tail can be decoded on its own (spec §4.1).
+pub(super) fn decode_wal_prefix(buf: &[u8]) -> Result<(WalFrames, u64), StoreError> {
     let mut offset = 0usize;
     let mut frames = Vec::new();
     while offset < buf.len() {
@@ -801,7 +813,8 @@ pub(super) fn decode_wal(buf: &[u8]) -> Result<Vec<(u64, Vec<Op>)>, StoreError> 
         frames.push(decode_payload(payload)?);
         offset = payload_end;
     }
-    Ok(frames)
+    let consumed = u64::try_from(offset).map_err(|_| corrupt("wal length exceeds u64"))?;
+    Ok((frames, consumed))
 }
 
 fn frame_fits(buf: &[u8], offset: usize) -> bool {

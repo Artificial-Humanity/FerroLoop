@@ -14,7 +14,7 @@
 use fl_core::StoreError;
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 
@@ -24,21 +24,33 @@ pub(super) trait ContainerIo: Send + Sync {
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()>;
     /// Fill all of `buf` from `offset` (`pread`, repeated until done).
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()>;
-    /// `fdatasync`. The engine of spec §4.3 uses it for frames and slots.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "first caller: §4.3 group commit")
-    )]
+    /// `fdatasync`: the bytes written and the file size. Frames, snapshots
+    /// and slot writes use it (spec §4.3).
     fn sync_data(&self) -> io::Result<()>;
-    /// `fsync`.
+    /// `fsync`: also the rest of the inode's metadata. Only first-use init,
+    /// which sets the length of a new file, uses it.
     fn sync_all(&self) -> io::Result<()>;
     /// The file's length (`fstat`).
     fn len(&self) -> io::Result<u64>;
     /// `ftruncate`.
     fn set_len(&self, len: u64) -> io::Result<()>;
-    /// The descriptor `flock` takes, or `None` for a file with no descriptor
-    /// (the simulated disk, which does not model locks).
-    fn lock_fd(&self) -> Option<RawFd>;
+    /// `(dev, ino)` of the open file (`fstat`): which file this description
+    /// reads, so a cache filled through it is not trusted for another file.
+    fn file_id(&self) -> io::Result<(u64, u64)>;
+    /// `flock(LOCK_EX)`: wait until this description holds the file's
+    /// exclusive advisory lock.
+    fn lock_exclusive(&self) -> io::Result<()>;
+    /// `flock(LOCK_UN)`. Releasing cannot usefully fail: a lock this
+    /// description does not hold is not held.
+    fn unlock(&self);
+}
+
+const LOCK_EX: i32 = 2;
+const LOCK_UN: i32 = 8;
+
+// libc `flock`. No extra crate: the process already links libc.
+unsafe extern "C" {
+    fn flock(fd: i32, op: i32) -> i32;
 }
 
 impl ContainerIo for File {
@@ -66,8 +78,27 @@ impl ContainerIo for File {
         File::set_len(self, len)
     }
 
-    fn lock_fd(&self) -> Option<RawFd> {
-        Some(self.as_raw_fd())
+    fn file_id(&self) -> io::Result<(u64, u64)> {
+        let meta = self.metadata()?;
+        Ok((meta.dev(), meta.ino()))
+    }
+
+    fn lock_exclusive(&self) -> io::Result<()> {
+        let fd: RawFd = self.as_raw_fd();
+        // SAFETY: `fd` is this open file's descriptor. `LOCK_EX` waits until
+        // this description holds the advisory lock, or returns -1.
+        if unsafe { flock(fd, LOCK_EX) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn unlock(&self) {
+        // SAFETY: the descriptor is open for the life of `self`. `LOCK_UN`
+        // releases the advisory lock held by this description.
+        unsafe {
+            flock(self.as_raw_fd(), LOCK_UN);
+        }
     }
 }
 

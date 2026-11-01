@@ -4,11 +4,13 @@
 //! the dequantized `f32` values, accumulated in `f64`.
 
 use super::columnar::check_name;
+use super::state::Vectors;
 use fl_core::StoreError;
 use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashSet};
+use std::sync::Arc;
 
 const MAX_VECTOR_BYTES: u32 = 8 * 1024 * 1024;
 const MAX_LEVEL: u8 = 16;
@@ -489,7 +491,9 @@ fn cmp_distance_then_id(
 }
 
 /// Highest level, then lowest id. `max_by` treats a lower id as greater.
-fn canonical_entry(vectors: &BTreeMap<String, VectorRecord>) -> Option<String> {
+/// The snapshot stores this entry and `validate_graph` requires it; an upsert
+/// keeps it with `VectorCollection::admit_entry` instead of a rescan.
+pub(super) fn canonical_entry(vectors: &BTreeMap<String, VectorRecord>) -> Option<String> {
     vectors
         .iter()
         .max_by(|(id_a, rec_a), (id_b, rec_b)| {
@@ -606,7 +610,7 @@ impl VectorCollection {
         for layer in (0..=usize::from(top)).rev() {
             self.link_layer(&id, &query, &mut eps, layer)?;
         }
-        self.recompute_entry();
+        self.admit_entry(&id, level);
         Ok(())
     }
 
@@ -652,7 +656,11 @@ impl VectorCollection {
         for (layer, nids) in neighbors.iter().enumerate() {
             self.repair_layer(nids, layer)?;
         }
-        self.recompute_entry();
+        // Removing any node but the entry leaves the entry canonical: it still has the highest
+        // level and, at that level, the lowest id. Removing the entry itself rescans, O(n).
+        if self.entry.as_deref() == Some(id) {
+            self.recompute_entry();
+        }
         Ok(())
     }
 
@@ -873,6 +881,26 @@ impl VectorCollection {
 
     fn recompute_entry(&mut self) {
         self.entry = canonical_entry(&self.vectors);
+    }
+
+    /// Keep the entry canonical after `id`, at `level`, was inserted, in O(1): `id` takes the
+    /// entry when its level is higher, or equal with a lower id ([`canonical_entry`]'s order).
+    /// The entry before the insert was canonical for the other nodes, so the result is the
+    /// canonical entry of all of them. An entry that is not live (never so in a collection that
+    /// passed `validate_graph` or was built by these ops) falls back to the rescan.
+    fn admit_entry(&mut self, id: &str, level: u8) {
+        let held = self
+            .entry
+            .as_deref()
+            .and_then(|entry| self.vectors.get(entry).map(|rec| (entry, rec.level)));
+        match held {
+            Some((entry, entry_level)) => {
+                if level > entry_level || (level == entry_level && id < entry) {
+                    self.entry = Some(id.to_string());
+                }
+            }
+            None => self.recompute_entry(),
+        }
     }
 
     fn link_layer(
@@ -1384,7 +1412,7 @@ pub(super) fn parse_values(value: &Value) -> Result<Vec<f32>, StoreError> {
     Ok(out)
 }
 
-pub(super) fn vectors_json(collections: &BTreeMap<String, VectorCollection>) -> Value {
+pub(super) fn vectors_json(collections: &Vectors) -> Value {
     Value::Array(
         collections
             .iter()
@@ -1434,9 +1462,7 @@ fn collection_json(name: &str, col: &VectorCollection) -> Value {
     })
 }
 
-pub(super) fn parse_vectors(
-    value: &Value,
-) -> Result<BTreeMap<String, VectorCollection>, StoreError> {
+pub(super) fn parse_vectors(value: &Value) -> Result<Vectors, StoreError> {
     let items = value
         .as_array()
         .ok_or_else(|| backend("vectors is not an array"))?;
@@ -1449,7 +1475,7 @@ pub(super) fn parse_vectors(
             .to_string();
         let col = parse_collection(item)?;
         validate_graph(&name, &col)?;
-        if collections.insert(name.clone(), col).is_some() {
+        if collections.insert(name.clone(), Arc::new(col)).is_some() {
             return Err(backend(format!("duplicate vector collection `{name}`")));
         }
     }
@@ -1738,6 +1764,52 @@ mod tests {
         let mut out = col.vectors[id].neighbors[0].clone();
         out.sort();
         out
+    }
+
+    /// The entry an upsert keeps incrementally is the one a rescan finds, after every step of
+    /// random upserts (new ids and replacements) and deletes (the entry's included). `m = 2`
+    /// spreads the levels, so the entry moves often; a small id pool makes replacements and
+    /// deletes of the entry common.
+    #[test]
+    fn the_incremental_entry_is_always_the_canonical_entry() {
+        let mut entry_deletes = 0;
+        let mut moved_by_upsert = 0;
+        for seed in 1..=40u64 {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let mut next = move || {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x
+            };
+            let mut col = VectorCollection::empty(3, VectorStorage::F32, VectorMetric::L2, 2, 8, 8);
+            for step in 0..150 {
+                let id = format!("n{}", next() % 48);
+                if next() % 4 == 0 {
+                    if col.entry.as_deref() == Some(id.as_str()) {
+                        entry_deletes += 1;
+                    }
+                    col.delete_id(&id).unwrap();
+                } else {
+                    let values: Vec<f32> = (0..3).map(|_| (next() % 1000) as f32 / 100.0).collect();
+                    let bytes = quantize(VectorStorage::F32, &values).unwrap();
+                    let before = col.entry.clone();
+                    col.upsert(id, bytes, None).unwrap();
+                    if before.is_some() && col.entry != before {
+                        moved_by_upsert += 1;
+                    }
+                }
+                assert_eq!(
+                    col.entry,
+                    canonical_entry(&col.vectors),
+                    "seed {seed}, step {step}"
+                );
+            }
+            validate_graph("v", &col).unwrap();
+        }
+        // The two paths the incremental rule must get right were both taken.
+        assert!(entry_deletes > 0, "no delete of the entry");
+        assert!(moved_by_upsert > 0, "no upsert moved the entry");
     }
 
     /// Review follow-up to audit S-2: `ensure_edge` used to make room on `a` (evicting a link on

@@ -698,11 +698,15 @@ mod reserved {
         let mut state = DocState::default();
         if let Some(version) = version {
             state.docs.insert(
-                ("__meta".to_string(), "schema_version".to_string()),
-                json!(version),
+                "__meta".to_string(),
+                "schema_version".to_string(),
+                json!(version).into(),
             );
         }
-        FerroStore::assemble(Inner::Memory(Mutex::new(state)), "mem://".to_string())
+        FerroStore::assemble(
+            Inner::Memory(Mutex::new(state.into())),
+            "mem://".to_string(),
+        )
     }
 
     fn put(collection: &str, id: &str, doc: Value) -> SyncOp {
@@ -727,11 +731,7 @@ mod reserved {
     }
 
     fn has(store: &FerroStore, collection: &str, id: &str) -> bool {
-        store
-            .read_state()
-            .unwrap()
-            .docs
-            .contains_key(&(collection.to_string(), id.to_string()))
+        store.read_state().unwrap().docs.contains(collection, id)
     }
 
     #[test]
@@ -917,13 +917,11 @@ mod reserved {
             assert_eq!(store.format_version().unwrap(), Some(FORMAT_WITH_WORKFLOW));
             let reserved: Vec<_> = state
                 .docs
-                .keys()
-                .filter(|(collection, _)| collection.starts_with("__"))
+                .iter()
+                .filter(|(collection, _, _)| collection.starts_with("__"))
+                .map(|(collection, id, _)| (collection.as_str(), id.as_str()))
                 .collect();
-            assert_eq!(
-                reserved,
-                vec![&("__meta".to_string(), "schema_version".to_string())]
-            );
+            assert_eq!(reserved, vec![("__meta", "schema_version")]);
             assert!(has(&store, "docs", "a"));
         }
     }

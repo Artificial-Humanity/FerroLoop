@@ -32,11 +32,13 @@ macro_rules! copy_rows {
 pub fn migrate_redb_to_ferrostore(redb: &RedbStore, ferro: &FerroStore) -> Result<(), StoreError> {
     ferro.with_write(|txn| {
         // A new store's own schema document is not data: it is overwritten below.
+        // The body has staged nothing yet, so the base is the whole view.
         let holds_data = txn
+            .base()
             .docs
-            .keys()
-            .any(|(collection, _)| collection != doc::SCHEMA_COLLECTION);
-        if holds_data || !txn.tables.is_empty() || !txn.vectors.is_empty() {
+            .collections()
+            .any(|collection| collection != doc::SCHEMA_COLLECTION);
+        if holds_data || txn.has_tables() || txn.has_vectors() {
             return Err(backend(
                 "refusing to migrate into a FerroStore that already holds a document, a column table, or a vector collection",
             ));

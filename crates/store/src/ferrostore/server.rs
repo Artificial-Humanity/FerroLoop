@@ -6,14 +6,14 @@
 
 use super::columnar;
 use super::layout::{Op, backend};
-use super::state::DocState;
+use super::state::{DocState, Docs, Tables, Vectors};
 use super::vector;
 use super::{FerroStore, MqRecord, SyncBatch, lock_mutex};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
 use fl_core::iri::Iri;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
@@ -710,6 +710,9 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
             store.delete_vector(param_str(params, "collection")?, param_str(params, "id")?)?;
             Ok(Value::Null)
         }
+        "has_vector_collection" => Ok(Value::Bool(
+            store.has_vector_collection(param_str(params, "name")?)?,
+        )),
         "get_vector" => {
             match store.get_vector(param_str(params, "collection")?, param_str(params, "id")?)? {
                 Some((values, metadata)) => vector::vector_get_json(&values, &metadata),
@@ -764,7 +767,7 @@ fn dispatch(store: &FerroStore, method: &str, params: &Value) -> Result<Value, S
                 )?,
             )?,
         ),
-        "read_state" => Ok(doc_state_value(&store.read_state()?)),
+        "read_state" => Ok(doc_state_value(&*store.read_state()?)),
         "commit_ops" => {
             let expected_seq = param_u64(params, "expected_seq")?;
             let ops = parse_ops(
@@ -800,10 +803,56 @@ fn send_result(
 ) -> Result<(), StoreError> {
     let body = match result {
         Ok(result) => json!({"id": id, "ok": true, "result": result}),
-        Err(err) => json!({"id": id, "ok": false, "error": err.to_string()}),
+        Err(err) => error_value(id, &err),
     };
     let mut stream = lock_mutex(write);
     stream.write_value(&body)
+}
+
+/// A failure response. `error` is always the error's message. An
+/// [`StoreError::Undelivered`] also carries `kind`, `seq` and `cause` (the
+/// cause's own message, as it reads), so the client rebuilds it: the commit
+/// is durable on the server, and a client that read it as a plain failure
+/// would retry it and apply it twice. A [`StoreError::Backend`] cause also
+/// carries its detail as `cause_backend`, so it is rebuilt as that kind.
+pub(super) fn error_value(id: u64, err: &StoreError) -> Value {
+    let mut body = json!({"id": id, "ok": false, "error": err.to_string()});
+    if let StoreError::Undelivered { seq, cause } = err {
+        body["kind"] = json!("undelivered");
+        body["seq"] = json!(seq);
+        body["cause"] = json!(cause.to_string());
+        if let StoreError::Backend(detail) = &**cause {
+            body["cause_backend"] = json!(detail);
+        }
+    }
+    body
+}
+
+/// The error a failure response names: [`StoreError::Undelivered`] for a
+/// structured one ([`error_value`]), whose message is the server's, and
+/// otherwise the server's message as [`StoreError::Backend`]. The cause is
+/// a [`StoreError::Backend`] when the server's was, and otherwise
+/// [`StoreError::Relayed`] with the server's words.
+pub(super) fn response_error(frame: &Value) -> StoreError {
+    if frame.get("kind").and_then(Value::as_str) == Some("undelivered")
+        && let Some(seq) = frame.get("seq").and_then(Value::as_u64)
+        && let Some(cause) = frame.get("cause").and_then(Value::as_str)
+    {
+        let cause = match frame.get("cause_backend").and_then(Value::as_str) {
+            Some(detail) => StoreError::Backend(detail.to_string()),
+            None => StoreError::Relayed(cause.to_string()),
+        };
+        return StoreError::Undelivered {
+            seq,
+            cause: Box::new(cause),
+        };
+    }
+    backend(
+        frame
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("FerroStore request failed"),
+    )
 }
 
 fn record_value(record: MqRecord) -> Value {
@@ -875,7 +924,7 @@ fn doc_state_value(state: &DocState) -> Value {
     let docs = state
         .docs
         .iter()
-        .map(|((collection, id), doc)| {
+        .map(|(collection, id, doc)| {
             json!({
                 "collection": collection,
                 "id": id,
@@ -900,7 +949,7 @@ fn parse_doc_state(value: &Value) -> Result<DocState, StoreError> {
         .get("docs")
         .and_then(Value::as_array)
         .ok_or_else(|| backend("read_state result is missing docs"))?;
-    let mut docs = BTreeMap::new();
+    let mut docs = Docs::default();
     for item in items {
         let collection = param_str(item, "collection")?.to_string();
         let id = param_str(item, "id")?.to_string();
@@ -908,14 +957,14 @@ fn parse_doc_state(value: &Value) -> Result<DocState, StoreError> {
             .get("doc")
             .cloned()
             .ok_or_else(|| backend("read_state doc is missing doc"))?;
-        docs.insert((collection, id), doc);
+        docs.insert(collection, id, Arc::new(doc));
     }
     let tables = match value.get("tables") {
-        None => BTreeMap::new(),
+        None => Tables::new(),
         Some(tables) => columnar::parse_tables(tables)?,
     };
     let vectors = match value.get("vectors") {
-        None => BTreeMap::new(),
+        None => Vectors::new(),
         Some(vectors) => vector::parse_vectors(vectors)?,
     };
     Ok(DocState {
@@ -1228,7 +1277,7 @@ fn read_frame(stream: &mut UnixStream) -> Result<Value, StoreError> {
 
 struct RemoteShared {
     write: Mutex<Box<dyn JsonIo>>,
-    pending: Mutex<HashMap<u64, Sender<Result<Value, String>>>>,
+    pending: Mutex<HashMap<u64, Sender<Result<Value, StoreError>>>>,
     next_id: AtomicU64,
     subs: Mutex<HashMap<String, Vec<Arc<Sender<MqRecord>>>>>,
 }
@@ -1258,8 +1307,7 @@ impl RemoteClient {
             }
         }
         match rx.recv_timeout(CALL_TIMEOUT) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(message)) => Err(backend(message)),
+            Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 lock_mutex(&self.shared.pending).remove(&id);
                 Err(backend("timed out waiting for the FerroStore server"))
@@ -1493,11 +1541,7 @@ fn reader_loop(mut stream: Box<dyn JsonIo>, shared: Arc<RemoteShared>) {
                 let outcome = if frame.get("ok").and_then(Value::as_bool) == Some(true) {
                     Ok(frame.get("result").cloned().unwrap_or(Value::Null))
                 } else {
-                    let message = frame
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("FerroStore request failed");
-                    Err(message.to_string())
+                    Err(response_error(&frame))
                 };
                 if let Some(sender) = lock_mutex(&shared.pending).remove(&id) {
                     let _ = sender.send(outcome);
@@ -1590,7 +1634,7 @@ fn parse_record(value: &Value) -> Result<MqRecord, StoreError> {
 fn fail_pending(shared: &RemoteShared, message: &str) {
     let pending = std::mem::take(&mut *lock_mutex(&shared.pending));
     for (_, sender) in pending {
-        let _ = sender.send(Err(message.to_string()));
+        let _ = sender.send(Err(backend(message)));
     }
 }
 
@@ -1641,28 +1685,26 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut tables = BTreeMap::new();
+        let mut tables = Tables::new();
         tables.insert(
             "t".into(),
             ColumnTable {
                 columns: columns.clone(),
                 groups: vec![blob.clone()],
-            },
+            }
+            .into(),
         );
-        let mut docs = BTreeMap::new();
-        docs.insert(("c".into(), "id".into()), Value::Null);
+        let mut docs = Docs::default();
+        docs.insert("c".into(), "id".into(), Value::Null.into());
         let state = DocState {
             docs,
             tables,
-            vectors: BTreeMap::new(),
+            vectors: Vectors::new(),
             last_seq: 4,
         };
         let parsed = parse_doc_state(&doc_state_value(&state)).unwrap();
         assert_eq!(parsed.last_seq, 4);
-        assert_eq!(
-            parsed.docs.get(&("c".into(), "id".into())),
-            Some(&Value::Null)
-        );
+        assert_eq!(parsed.docs.get("c", "id"), Some(&Value::Null));
         assert_eq!(parsed.tables.get("t").unwrap().groups, vec![blob.clone()]);
         assert_eq!(parsed.tables.get("t").unwrap().columns, columns);
 
