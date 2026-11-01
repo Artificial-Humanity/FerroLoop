@@ -324,7 +324,10 @@ impl Disk {
     ///
     /// So a handle's reads never go back: each returns the cache it started
     /// from or a later state, and the cache only moves forward
-    /// ([`install_newer`]).
+    /// ([`install_newer`]). The one exception is documented on [`Poison`]:
+    /// once a failed publish poisons the handle, the cache is set back to the
+    /// last acknowledged epoch E ([`Self::settle_failed_publish`]), so a
+    /// reader that once returned the unacknowledged E+1 may afterwards see E.
     ///
     /// A poisoned handle (see [`Poison`]) reads only its cache: after a failed
     /// sync the page cache may not match the disk.
@@ -416,6 +419,82 @@ impl Disk {
         if newer {
             *slot = Some(Arc::new(acknowledged.clone()));
         }
+    }
+
+    /// Every publish of frames through `write`, from `base` (the state the
+    /// slot `index` names) into the other slot: the one way a commit, a
+    /// group chunk, a cache fill or an applied sync batch reaches the file.
+    /// On any failure it runs [`Self::settle_failed_publish`] with `base`, so
+    /// no call site can leave a reader's unacknowledged epoch in the cache of
+    /// a poisoned handle (see [`Poison`]). The caller holds the write mutex
+    /// and the `flock`.
+    fn publish_or_settle(
+        &self,
+        file: &dyn ContainerIo,
+        index: usize,
+        base: &DiskCache,
+        frames: &[Vec<u8>],
+    ) -> Result<Option<Superblock>, StoreError> {
+        /// Write every frame at the current WAL end, one `write_at` each, make them
+        /// durable with one `sync_data`, then write the other slot and `sync_data`
+        /// it (spec §4.3). Returns the superblock now published. No frames: nothing
+        /// is written and `None`. A failure before the slot write leaves the previous
+        /// superblock current; from the slot write on, either may be current.
+        /// The caller holds the `flock` for the whole call. A poisoned handle
+        /// writes nothing; a failed sync poisons it (see [`Poison`]). Nested
+        /// here so that no publish can skip the settle around it.
+        fn publish_frames(
+            file: &dyn ContainerIo,
+            poison: &Poison,
+            index: usize,
+            sb: &Superblock,
+            frames: &[Vec<u8>],
+        ) -> Result<Option<Superblock>, StoreError> {
+            if frames.is_empty() {
+                return Ok(None);
+            }
+            poison.check()?;
+            let mut at = sb
+                .wal_offset
+                .checked_add(sb.wal_length)
+                .ok_or_else(|| backend("wal offset overflow"))?;
+            let mut wal_length = sb.wal_length;
+            let mut writes = Vec::with_capacity(frames.len());
+            for frame in frames {
+                let len =
+                    u64::try_from(frame.len()).map_err(|_| backend("wal frame exceeds u64"))?;
+                writes.push((frame, at));
+                at = at
+                    .checked_add(len)
+                    .ok_or_else(|| backend("wal offset overflow"))?;
+                wal_length = wal_length
+                    .checked_add(len)
+                    .ok_or_else(|| backend("wal length overflow"))?;
+            }
+            let epoch = sb
+                .epoch
+                .checked_add(1)
+                .ok_or_else(|| backend("epoch overflow"))?;
+            for (frame, offset) in writes {
+                file.write_at(frame, offset).map_err(io_err)?;
+            }
+            // `fdatasync` also makes the longer file size durable.
+            poison.sync_data(file)?;
+            let new_sb = Superblock {
+                epoch,
+                snapshot_offset: sb.snapshot_offset,
+                snapshot_length: sb.snapshot_length,
+                wal_offset: sb.wal_offset,
+                wal_length,
+                snapshot_seq: sb.snapshot_seq,
+            };
+            write_slot(file, index ^ 1, &new_sb)?;
+            poison.sync_data(file)?;
+            Ok(Some(new_sb))
+        }
+
+        publish_frames(file, &self.poison, index, &base.sb, frames)
+            .inspect_err(|_| self.settle_failed_publish(base))
     }
 
     /// Install the state a publish through `write` just made as `new_sb`:
@@ -2111,9 +2190,7 @@ impl FerroStore {
                     };
                     let (overlay, seq) = stage_ops(state, std::slice::from_ref(&op))?;
                     let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                    let published =
-                        publish_frames(&**file, &disk.poison, index, &base.sb, &[frame])
-                            .inspect_err(|_| disk.settle_failed_publish(&base))?;
+                    let published = disk.publish_or_settle(&**file, index, &base, &[frame])?;
                     let due = match published {
                         Some(new_sb) => {
                             let done =
@@ -2687,7 +2764,7 @@ fn publish_sync_batches(
             for batch in &prepared {
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
-            let due = match publish_frames(&**file, &disk.poison, index, &base.sb, &frames)? {
+            let due = match disk.publish_or_settle(&**file, index, &base, &frames)? {
                 Some(new_sb) => {
                     let done = disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
                     checkpoint_due(disk, &done)
@@ -2760,62 +2837,6 @@ fn file_uri_path(rest: &str) -> String {
         return "/".to_string();
     }
     rest.to_string()
-}
-
-/// Write every frame at the current WAL end, one `write_at` each, make them
-/// durable with one `sync_data`, then write the other slot and `sync_data`
-/// it (spec §4.3). Returns the superblock now published. No frames: nothing
-/// is written and `None`. A failure before the slot write leaves the previous
-/// superblock current; from the slot write on, either may be current.
-/// The caller holds the `flock` for the whole call. A poisoned handle
-/// writes nothing; a failed sync poisons it (see [`Poison`]).
-fn publish_frames(
-    file: &dyn ContainerIo,
-    poison: &Poison,
-    index: usize,
-    sb: &Superblock,
-    frames: &[Vec<u8>],
-) -> Result<Option<Superblock>, StoreError> {
-    if frames.is_empty() {
-        return Ok(None);
-    }
-    poison.check()?;
-    let mut at = sb
-        .wal_offset
-        .checked_add(sb.wal_length)
-        .ok_or_else(|| backend("wal offset overflow"))?;
-    let mut wal_length = sb.wal_length;
-    let mut writes = Vec::with_capacity(frames.len());
-    for frame in frames {
-        let len = u64::try_from(frame.len()).map_err(|_| backend("wal frame exceeds u64"))?;
-        writes.push((frame, at));
-        at = at
-            .checked_add(len)
-            .ok_or_else(|| backend("wal offset overflow"))?;
-        wal_length = wal_length
-            .checked_add(len)
-            .ok_or_else(|| backend("wal length overflow"))?;
-    }
-    let epoch = sb
-        .epoch
-        .checked_add(1)
-        .ok_or_else(|| backend("epoch overflow"))?;
-    for (frame, offset) in writes {
-        file.write_at(frame, offset).map_err(io_err)?;
-    }
-    // `fdatasync` also makes the longer file size durable.
-    poison.sync_data(file)?;
-    let new_sb = Superblock {
-        epoch,
-        snapshot_offset: sb.snapshot_offset,
-        snapshot_length: sb.snapshot_length,
-        wal_offset: sb.wal_offset,
-        wal_length,
-        snapshot_seq: sb.snapshot_seq,
-    };
-    write_slot(file, index ^ 1, &new_sb)?;
-    poison.sync_data(file)?;
-    Ok(Some(new_sb))
 }
 
 /// Runs alone, not in a group (spec §4.3): it writes a new snapshot and

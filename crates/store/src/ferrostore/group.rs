@@ -52,7 +52,7 @@ use super::layout::{Op, backend, encode_frame};
 use super::state::{DocState, Overlay, publish_overlay};
 use super::{
     Change, Committed, Disk, DiskCache, FerroStore, FlockGuard, Registered, auto_checkpoint,
-    checkpoint_due, lock_mutex, publish_frames, wait_mutex,
+    checkpoint_due, lock_mutex, wait_mutex,
 };
 use fl_core::StoreError;
 use std::any::Any;
@@ -490,14 +490,8 @@ impl FerroStore {
         pending: &mut Pending,
         lead: &mut Leadership<'_>,
     ) -> Result<Running, StoreError> {
-        let published = publish_frames(
-            file,
-            &disk.poison,
-            running.index,
-            &running.base.sb,
-            &pending.frames,
-        )
-        .inspect_err(|_| disk.settle_failed_publish(&running.base))?;
+        let published =
+            disk.publish_or_settle(file, running.index, &running.base, &pending.frames)?;
         if let Some(new_sb) = published {
             let change = running
                 .take_change()

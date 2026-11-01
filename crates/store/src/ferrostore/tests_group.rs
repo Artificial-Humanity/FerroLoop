@@ -745,12 +745,14 @@ fn a_checkpoint_whose_slot_sync_fails_poisons_the_handle() {
     failed_checkpoint(2);
 }
 
-/// A lock-free read that loads the slots after a publish's slot write and
+/// A lock-free read that loads the slots after `publish`'s slot write and
 /// before that slot's sync fails reads the unacknowledged epoch for its own
 /// call, but the handle keeps none of it: once poisoned, every read serves
-/// the last state whose syncs all returned.
-#[test]
-fn a_read_between_the_slot_write_and_its_failed_sync_is_not_kept_once_poisoned() {
+/// the last state whose syncs all returned. `publish` writes `f/new = 1` at
+/// the next sequence, with one frame sync and one slot sync.
+fn a_read_between_a_failed_slot_sync_is_not_kept(
+    publish: impl FnOnce(&FerroStore, u64) -> Result<(), StoreError>,
+) {
     let fs = SimFs::default();
     let store = Arc::new(open(&fs));
     store.put_doc("f", "before", &json!(0)).unwrap();
@@ -781,7 +783,7 @@ fn a_read_between_the_slot_write_and_its_failed_sync_is_not_kept_once_poisoned()
             },
         );
     }
-    let err = store.put_doc("f", "new", &json!(1)).unwrap_err();
+    let err = publish(&store, base + 1).unwrap_err();
     assert!(err.to_string().contains("simulated I/O error"), "{err}");
     let read = lock_mutex(&mid)
         .take()
@@ -798,6 +800,29 @@ fn a_read_between_the_slot_write_and_its_failed_sync_is_not_kept_once_poisoned()
     );
     assert_eq!(store.get_doc("f", "new").unwrap(), None);
     assert_poisoned(&fs, &store);
+}
+
+#[test]
+fn a_read_between_the_slot_write_and_its_failed_sync_is_not_kept_once_poisoned() {
+    a_read_between_a_failed_slot_sync_is_not_kept(|store, _| store.put_doc("f", "new", &json!(1)));
+}
+
+/// The same through an inbound sync batch, which publishes on its own path
+/// (not in a group).
+#[test]
+fn a_read_between_a_sync_batch_slot_write_and_its_failed_sync_is_not_kept_once_poisoned() {
+    a_read_between_a_failed_slot_sync_is_not_kept(|store, seq| {
+        store
+            .apply_inbound(vec![SyncBatch {
+                seq,
+                ops: vec![SyncOp::PutDoc {
+                    collection: "f".into(),
+                    id: "new".into(),
+                    doc: json!(1),
+                }],
+            }])
+            .map(drop)
+    });
 }
 
 /// A `LocalCache` adapter that holds every document it is asked for.
