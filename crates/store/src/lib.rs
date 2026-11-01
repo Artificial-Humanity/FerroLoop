@@ -509,6 +509,44 @@ fn routed_store_is_taken() -> StoreError {
     )
 }
 
+/// Why `path` could not be opened, when a FerroStore migration made it
+/// read-only: the open was refused for permission and the file has no owner
+/// write bit, the mode `migrate_verified` leaves a migrated `.redb` in.
+/// `None` for any other failure.
+fn frozen_by_migration(path: &Path, err: &redb::DatabaseError) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let redb::DatabaseError::Storage(redb::StorageError::Io(io)) = err else {
+        return None;
+    };
+    if io.kind() != std::io::ErrorKind::PermissionDenied {
+        return None;
+    }
+    let mode = std::fs::metadata(path).ok()?.permissions().mode();
+    if mode & 0o200 != 0 {
+        return None;
+    }
+    let fls = physical_path(path, BackendKind::Ferro);
+    let fls_shown = private::shown_path(&fls);
+    let found = if fls.exists() {
+        "it exists"
+    } else {
+        "it does not exist"
+    };
+    let rollback = match private::quoted_path(path) {
+        Some(quoted) => format!("run: chmod 600 {quoted}"),
+        None => "run chmod 600 on it yourself; its name contains characters that cannot be \
+                 pasted safely"
+            .to_string(),
+    };
+    Some(format!(
+        "{io}: {redb} is read-only (mode {mode:o}), as a FerroStore migration leaves it once it \
+         has moved the store to {fls_shown} ({found}). Use the FerroStore engine: open \
+         {fls_shown}, or set {BACKEND_ENV}=ferro. To roll back to redb instead, {rollback}",
+        mode = mode & 0o7777,
+        redb = private::shown_path(path),
+    ))
+}
+
 impl RedbStore {
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         Self::open_with_retries(path, 200)
@@ -537,9 +575,10 @@ impl RedbStore {
                     std::thread::sleep(std::time::Duration::from_millis(15));
                 }
                 Err(e) => {
+                    let cause = frozen_by_migration(path, &e).unwrap_or_else(|| e.to_string());
                     return Err(StoreError::Unreachable {
                         store: label.clone(),
-                        cause: e.to_string(),
+                        cause,
                     });
                 }
             }

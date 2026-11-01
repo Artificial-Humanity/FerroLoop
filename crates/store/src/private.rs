@@ -273,7 +273,7 @@ fn shell_quote(s: &str) -> String {
 
 /// `path` as a shell word, or `None` when it cannot be pasted safely: not valid UTF-8 (the text
 /// would name a different path), or holding a character [`unsafe_char`] rejects.
-fn quoted_path(path: &Path) -> Option<String> {
+pub(crate) fn quoted_path(path: &Path) -> Option<String> {
     let s = path.to_str()?;
     (!s.chars().any(unsafe_char)).then(|| shell_quote(s))
 }
@@ -291,7 +291,7 @@ fn fix_clause(chmod: &str, path: &Path, lead: &str) -> String {
 
 /// `path` for the text of a warning: as is when it is safe to print, else debug-escaped (quoted,
 /// control characters and bytes that are not UTF-8 written as escapes).
-fn shown_path(path: &Path) -> String {
+pub(crate) fn shown_path(path: &Path) -> String {
     match quoted_path(path) {
         Some(_) => path.display().to_string(),
         None => format!("{path:?}"),
