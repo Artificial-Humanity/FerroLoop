@@ -9,8 +9,9 @@ use fl_core::Catalog;
 use fl_store::cli::{CompactReport, Wording};
 use fl_store::{
     AnyStore, BackendKind, ColumnDef, ColumnFilter, ColumnPredicate, ColumnType, ColumnValue,
-    FerroStore, FerroStoreServer, StoreOptions, VectorMetric, VectorStorage, choose_backend,
-    default_socket_path_for_store, ferro_stats_at, open_store_with, physical_path,
+    FerroStore, FerroStoreServer, StoreOptions, Unmigrated, VectorMetric, VectorStorage,
+    choose_backend, default_socket_path_for_store, ferro_stats_at, migrate_locked, open_redb,
+    open_store_with, physical_path,
 };
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -353,6 +354,67 @@ fn a_stale_socket_with_no_listener_falls_back_to_the_file() {
     assert!(!store.is_remote());
     assert_everything(&store, &project);
     assert!(sock.exists());
+}
+
+/// A store whose `<file>.sock` cannot fit `sun_path` (108 bytes with the NUL)
+/// can have no server: `AnyStore` opens the file embedded.
+#[test]
+fn a_store_whose_socket_path_is_too_long_opens_the_file_embedded() {
+    let dir = tempfile::tempdir().unwrap();
+    let deep = dir.path().join("d".repeat(120));
+    std::fs::create_dir(&deep).unwrap();
+    let fls = deep.join("fl.fls");
+    assert!(default_socket_path_for_store(&fls).as_os_str().len() >= 108);
+
+    let store = open(&fls);
+    assert!(!store.is_remote());
+    let project = write_everything(&store);
+    drop(store);
+    assert!(fls.exists());
+    let store = open(&fls);
+    assert!(!store.is_remote());
+    assert_everything(&store, &project);
+}
+
+/// A server answers at the socket of a `.fls` that does not exist (the file
+/// was deleted under it), beside a lone `.redb`. A migration would write a
+/// new `.fls` that the server never sees, while every open connects to the
+/// server: both migrations refuse, and no `.fls` is made.
+#[test]
+fn a_migration_refuses_while_a_server_serves_the_missing_fls() {
+    let dir = short_dir();
+    let redb = dir.path().join("fl.redb");
+    let fls = dir.path().join("fl.fls");
+    let sock = default_socket_path_for_store(&fls);
+    drop(
+        open_redb(&redb)
+            .unwrap()
+            .add_project("/srv/lone-redb")
+            .unwrap(),
+    );
+    let server = FerroStoreServer::bind_unix(&sock, FerroStore::in_memory()).unwrap();
+
+    let migrate = StoreOptions {
+        backend: Some(BackendKind::Ferro),
+        unmigrated: Unmigrated::Migrate,
+        retries: 0,
+    };
+    for err in [
+        open_store_with(&redb, &migrate).err().unwrap(),
+        migrate_locked(&redb, &fls).unwrap_err(),
+    ] {
+        let text = err.to_string();
+        assert!(text.contains(&sock.display().to_string()), "{text}");
+        assert!(text.contains("does not exist"), "{text}");
+        assert!(text.contains("stop"), "{text}");
+        assert!(!fls.exists(), "{} was created", fls.display());
+    }
+
+    // With the server stopped, the same open migrates.
+    drop(server);
+    let store = open_store_with(&redb, &migrate).unwrap();
+    assert!(!store.is_remote());
+    assert!(fls.exists());
 }
 
 /// What a long-lived remote handle (the wire daemon's, an MCP server's) does

@@ -471,8 +471,35 @@ pub fn migrate_locked(redb: &Path, fls: &Path) -> Result<crate::migrate::ParityR
             ))
         })?
         .expect("created");
+    refuse_if_served_without_file(fls)?;
     forget_fallback(fls);
     crate::migrate::migrate_verified(redb, fls)
+}
+
+/// Refuse to migrate into `fls` when it does not exist but a server answers
+/// at its socket ([`crate::default_socket_path_for_store`]): the file was
+/// deleted under a running server. A migration would write a new `fls` that
+/// the server never sees, while every open connects to the server. A refused
+/// or absent socket, or one too long for `sun_path`, is no server.
+fn refuse_if_served_without_file(fls: &Path) -> Result<(), StoreError> {
+    if present(fls) {
+        return Ok(());
+    }
+    let sock = crate::default_socket_path_for_store(fls);
+    if !crate::ferrostore::socket_path_fits(&sock) {
+        return Ok(());
+    }
+    match std::os::unix::net::UnixStream::connect(&sock) {
+        Ok(_) => Err(backend(format!(
+            "a FerroStore server at {} is serving a store whose file {} does not exist: \
+             stop that server before migrating, or the migration would write a {} that \
+             the server never sees",
+            sock.display(),
+            fls.display(),
+            fls.display()
+        ))),
+        Err(_) => Ok(()),
+    }
 }
 
 // ---- opening a ferro selection ----------------------------------------------
@@ -591,7 +618,9 @@ fn redb_engine(
 /// verified migration under the [`MigrationLock`]:
 ///
 /// 1. the lock is taken (waiting for any other process that holds it);
-/// 2. a `.fls` that exists now is opened (someone else migrated);
+/// 2. a `.fls` that exists now is opened (someone else migrated); a server
+///    that answers at the socket of the missing `.fls` is refused
+///    ([`refuse_if_served_without_file`]);
 /// 3. the redb is probed, once: held by a process outside this lock (a hub still
 ///    on redb) -> the store opens on the redb engine instead, and no `.fls` is
 ///    made, so that every process that cannot migrate agrees on one engine;
@@ -676,6 +705,7 @@ fn open_ferro(
         drop(lock);
         return open_fls(physical);
     }
+    refuse_if_served_without_file(physical)?;
     // Ask once: a process still holding the redb must not wait out a
     // migration's own 3 s of retries. (Dropped at once; the migration opens it
     // again, with this lock still held.)
