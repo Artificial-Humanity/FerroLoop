@@ -2706,6 +2706,40 @@ fn stats_under_db_says_it_covers_the_local_store_only() {
         .stdout(contains("because --db (or $FL_DB) names the store"));
 }
 
+// ⚠ `--summary` totals come from the columnar table, which cannot see GitHub: with a GitHub
+// ledger involved the totals are the rows' and the source says so.
+#[test]
+fn stats_summary_with_a_github_ledger_uses_rows_and_says_so() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .args(["attempt", "1", "--budget-usd-micros", "0"])
+        .assert()
+        .code(1);
+    let out = w
+        .fl()
+        .args(["stats", "--project", "1", "--summary", "--json"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["source"], "rows");
+    assert_eq!(v["attempts"], 1);
+}
+
+#[test]
+fn stats_summary_under_db_keeps_the_local_only_note_and_uses_rows() {
+    let w = World::new();
+    w.ready();
+    w.fl()
+        .arg("--db")
+        .arg(w.one.store())
+        .args(["stats", "--project", "1", "--summary"])
+        .assert()
+        .success()
+        .stdout(contains("because --db (or $FL_DB) names the store").and(contains("source: rows")));
+}
+
 #[test]
 fn stats_without_the_ledger_key_on_a_store_that_records_one_says_so() {
     let w = World::new();

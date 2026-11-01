@@ -12,7 +12,7 @@ use super::doc::{self, key_u64, pair, pair_u64, triple};
 use super::{FerroStore, Txn};
 use crate::{RedbStore, backend, decode};
 use fl_core::StoreError;
-use redb::{ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{ReadableTable, TableDefinition};
 use serde_json::Value;
 
 macro_rules! copy_rows {
