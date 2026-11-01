@@ -1,7 +1,7 @@
 //! `fl store`: look at, and tend, the engine file behind a store.
 //!
 //! Only what the engines do today is here. Not yet present, because each
-//! needs engine work that has not landed: `compact`, `bench` and `serve`.
+//! needs engine work that has not landed: `bench` and `serve`.
 //!
 //! No command creates a store: a path that names nothing is reported
 //! (`status`) or refused (`checkpoint`, `migrate`, `verify`), never opened.
@@ -42,6 +42,15 @@ pub enum Cmd {
     },
     /// Fold a FerroStore write-ahead log into the store file. redb has none.
     Checkpoint,
+    /// Rewrite a FerroStore as one snapshot and an empty log, giving back the
+    /// space earlier checkpoints left dead; prints the file and dead bytes
+    /// before and after. Applies to the `.fls` engine only: on redb it says so
+    /// and does nothing. Never creates or migrates a store.
+    Compact {
+        /// Print one JSON object instead of text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Copy the bound `.redb` store into a new `.fls`, verified; the `.redb` is
     /// kept, read-only (0400). Exit 1 when the copy does not verify.
     Migrate {
@@ -80,6 +89,7 @@ pub fn run(path: &Path, cmd: Cmd) -> Result<i32> {
     match cmd {
         Cmd::Status { json } => status(path, json),
         Cmd::Checkpoint => checkpoint(path),
+        Cmd::Compact { json } => compact(path, json),
         Cmd::Migrate { dry_run, json } => migrate(path, dry_run, json),
         Cmd::Verify { json } => verify(path, json),
     }
@@ -116,6 +126,18 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
         }
     };
 
+    // FerroStore knows which bytes of its file are live and which an earlier
+    // checkpoint left dead; redb does not say, and a missing store has none.
+    // Opened with `FerroStore::open` on the physical file, so status never
+    // migrates a redb or creates a store.
+    let (live_bytes, dead_bytes, sizes_note) = match (kind, exists) {
+        (BackendKind::Ferro, true) => match ferro_sizes(&physical) {
+            Ok((live, dead)) => (Some(live), Some(dead), None),
+            Err(e) => (None, None, Some(format!("could not read them: {e}"))),
+        },
+        _ => (None, None, None),
+    };
+
     if json_out {
         let mut out = json!({
             "engine": kind.as_str(),
@@ -124,6 +146,8 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
             "exists": exists,
             "size_bytes": size,
             "format_version": format_version,
+            "live_bytes": live_bytes,
+            "dead_bytes": dead_bytes,
         });
         if redb_beside {
             out["redb_beside_ferro"] = json!(true);
@@ -138,6 +162,18 @@ fn status(path: &Path, json_out: bool) -> Result<i32> {
     match size {
         Some(n) => println!("size:           {n} bytes"),
         None => println!("size:           -"),
+    }
+    if kind == BackendKind::Ferro && exists {
+        match (live_bytes, dead_bytes) {
+            (Some(live), Some(dead)) => {
+                println!("live:           {live} bytes");
+                println!("dead:           {dead} bytes (`fl store compact` gives them back)");
+            }
+            _ => println!(
+                "live/dead:      - ({})",
+                sizes_note.as_deref().unwrap_or("unavailable")
+            ),
+        }
     }
     let shown = match &format_version {
         Value::Number(n) => n.to_string(),
@@ -179,6 +215,74 @@ fn checkpoint(path: &Path) -> Result<i32> {
     };
     ferro.checkpoint()?;
     println!("checkpointed {}", physical.display());
+    Ok(0)
+}
+
+/// `(live, dead)` bytes of the existing FerroStore file `physical`.
+fn ferro_sizes(physical: &Path) -> Result<(u64, u64)> {
+    let stats = FerroStore::open(physical)?.stats()?;
+    Ok((stats.live_bytes, stats.dead_bytes))
+}
+
+/// `fl store compact`. Mirrors `checkpoint`: redb is reported and left alone,
+/// a missing `.fls` is refused (a lone `.redb` is not migrated just to be
+/// compacted), and the physical file is the one opened.
+fn compact(path: &Path, json_out: bool) -> Result<i32> {
+    let kind = engine(path)?;
+    let physical = physical_path(path, kind);
+    if kind == BackendKind::Redb {
+        let msg = "compaction applies to the FerroStore (.fls) engine only; \
+                   redb is not compacted, nothing to do";
+        if json_out {
+            let out = json!({
+                "command": "compact",
+                "engine": kind.as_str(),
+                "physical_path": physical.display().to_string(),
+                "compacted": false,
+                "reason": msg,
+            });
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        } else {
+            println!("{msg}");
+        }
+        return Ok(0);
+    }
+    if !physical.exists() {
+        bail!(
+            "no store at {}; `fl store compact` does not create one",
+            physical.display()
+        );
+    }
+    let store = fl_store::open_store(path)?;
+    if store.as_ferro().is_none() {
+        bail!("the store at {} is not a FerroStore", physical.display());
+    }
+    let before = store.stats()?;
+    store.compact()?;
+    let after = store.stats()?;
+    if json_out {
+        let size = |s: &fl_store::AnyStats| {
+            json!({
+                "file_bytes": s.file_bytes,
+                "live_bytes": s.live_bytes,
+                "dead_bytes": s.dead_bytes,
+            })
+        };
+        let out = json!({
+            "command": "compact",
+            "engine": kind.as_str(),
+            "physical_path": physical.display().to_string(),
+            "compacted": true,
+            "before": size(&before),
+            "after": size(&after),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(0);
+    }
+    let dead = |s: &fl_store::AnyStats| s.dead_bytes.map_or_else(|| "-".into(), |d| d.to_string());
+    println!("compacted {}", physical.display());
+    println!("file bytes: {} -> {}", before.file_bytes, after.file_bytes);
+    println!("dead bytes: {} -> {}", dead(&before), dead(&after));
     Ok(0)
 }
 
