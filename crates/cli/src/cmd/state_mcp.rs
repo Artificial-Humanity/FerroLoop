@@ -459,14 +459,16 @@ fn open_workflow_store(
             return Ok(primary);
         }
         let ws_path = env.cfg.workspace_state_store(env.default_store);
-        if ws_path != primary_path && fl_store::store_exists(&ws_path) {
+        if !crate::same_store(&ws_path, &primary_path) && fl_store::store_exists(&ws_path) {
             let other = fl_store::open_store(&ws_path).map_err(|e| e.to_string())?;
             if other.owns(&iri).map_err(|e| e.to_string())? {
                 return Ok(other);
             }
         }
         for entry in &env.cfg.projects {
-            if entry.store == primary_path || !fl_store::store_exists(&entry.store) {
+            if crate::same_store(&entry.store, &primary_path)
+                || !fl_store::store_exists(&entry.store)
+            {
                 continue;
             }
             let other = fl_store::open_store(&entry.store).map_err(|e| e.to_string())?;
@@ -1709,6 +1711,54 @@ fn tool_definitions() -> Value {
 mod tests {
     use super::*;
     use fl_core::MemStore;
+
+    /// Two paths that name one store open once: the primary store is held (a redb file opens
+    /// once per process), so a second open of an alias of it would fail after the retries.
+    /// Symlinks stand in for the `.redb`/`.fls` alias, which needs the process environment.
+    #[test]
+    fn open_workflow_store_does_not_reopen_the_primary_through_an_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("proj.redb");
+        let alias = dir.path().join("alias.redb");
+        fl_store::open_redb(&primary).unwrap();
+        std::os::unix::fs::symlink(&primary, &alias).unwrap();
+
+        let cfg = crate::config::Config {
+            projects: vec![
+                crate::config::Entry {
+                    name: Some("proj".into()),
+                    root: dir.path().join("proj"),
+                    store: primary.clone(),
+                    tracker: None,
+                    state: None,
+                },
+                crate::config::Entry {
+                    name: Some("other".into()),
+                    root: dir.path().join("other"),
+                    store: alias.clone(),
+                    tracker: None,
+                    state: None,
+                },
+            ],
+            ..crate::config::Config::default()
+        };
+        // The workspace store is an alias of the project store too.
+        let env = StateEnv {
+            explicit_db: None,
+            default_store: &alias,
+            cfg: &cfg,
+            cwd: dir.path(),
+        };
+        let started = std::time::Instant::now();
+        let store = open_workflow_store(
+            &env,
+            Some("proj"),
+            Some("https://github.com/acme/widgets/issues/1"),
+        )
+        .expect("an alias of the primary is not opened again");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(store.label(), primary.display().to_string());
+    }
 
     fn seeded_entries() -> Vec<StateEntry> {
         let store = MemStore::default();
