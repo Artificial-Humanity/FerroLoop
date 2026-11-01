@@ -338,8 +338,9 @@ impl MigrationLock {
     }
 
     /// Take the lock for the store whose `.fls` is `physical`, creating the lock
-    /// file if need be, and wait at most `wait` for its holder (`Duration::ZERO`
-    /// tries once). The lock is held until the returned value is dropped.
+    /// file if need be, and wait about `wait` for its holder (a non-zero wait can
+    /// overshoot by up to one poll interval, 25 ms; `Duration::ZERO` is exactly
+    /// one attempt). The lock is held until the returned value is dropped.
     ///
     /// For a caller outside this module that creates a `.fls` (the
     /// `ferrostore` binary's `put` and `serve`): it excludes a migration of the
@@ -2346,9 +2347,13 @@ mod tests {
             .expect("the lock is held");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut, "{err}");
         assert!(err.to_string().contains(&lock_path.display().to_string()));
-        assert!(
-            MigrationLock::acquire_for(&fls, false, std::time::Duration::ZERO).is_err(),
-            "the engine's own acquire must see this holder"
+        let engine_err = MigrationLock::acquire_for(&fls, false, std::time::Duration::ZERO)
+            .err()
+            .expect("the engine's own acquire must see this holder");
+        assert_eq!(
+            engine_err.kind(),
+            std::io::ErrorKind::TimedOut,
+            "{engine_err}"
         );
 
         // Released: taken again, and the file is left in place.
