@@ -373,13 +373,25 @@ pub(crate) enum UpdateError {
     Invalid(String),
     /// The merged settings could not be written.
     Io(io::Error),
+    /// The stored file is unreadable or holds an invalid `attachment_retention_days`, and the
+    /// patch does not set it. Writing would silently reset retention to the default and turn
+    /// automatic deletion back on. Carries the reason; nothing was written.
+    Damaged(String),
 }
 
 /// Merge `patch` into the saved settings and persist the result, under one lock.
+///
+/// Refuses with [`UpdateError::Damaged`] when the stored file is damaged (see
+/// [`load_attachment_retention_strict`]) and the patch does not set `attachment_retention_days`:
+/// the lenient [`load`] would otherwise rewrite the file with retention `7`. A patch that sets
+/// it explicitly repairs the file; the other fields still come from the lenient load.
 pub(crate) fn update(home: &Path, patch: SettingsPatch) -> Result<Settings, UpdateError> {
     let _guard = SETTINGS_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if patch.attachment_retention_days.is_none() {
+        load_attachment_retention_strict(home).map_err(UpdateError::Damaged)?;
+    }
     let next = load(home).merged(patch).map_err(UpdateError::Invalid)?;
     save(home, &next).map_err(UpdateError::Io)?;
     Ok(next)
@@ -737,5 +749,42 @@ mod tests {
         let loaded = load(tmp.path());
         assert_eq!(loaded.theme_preference, Theme::Dark);
         assert!(loaded.notifications.sound_enabled);
+    }
+
+    #[test]
+    fn update_refuses_a_damaged_file_unless_the_patch_repairs_retention() {
+        let patch = |v: Value| serde_json::from_value::<SettingsPatch>(v).unwrap();
+        let tz = || patch(json!({ "timezone": "Europe/Paris" }));
+        for stored in [
+            &b"{ not json"[..],
+            b"[7]",
+            br#"{"attachment_retention_days":1000}"#,
+            br#"{"attachment_retention_days":"0"}"#,
+            br#"{"attachment_retention_days":null}"#,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let path = settings_path(tmp.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, stored).unwrap();
+            let Err(UpdateError::Damaged(why)) = update(tmp.path(), tz()) else {
+                panic!("{stored:?} was not refused");
+            };
+            assert!(!why.is_empty());
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                stored,
+                "file must not change"
+            );
+
+            let fixed =
+                update(tmp.path(), patch(json!({ "attachment_retention_days": 0 }))).unwrap();
+            assert_eq!(fixed.attachment_retention_days, 0);
+            assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(0));
+            assert!(update(tmp.path(), tz()).is_ok());
+            assert_eq!(load_attachment_retention_strict(tmp.path()), Ok(0));
+        }
+        let tmp = TempDir::new().unwrap();
+        let out = update(tmp.path(), tz()).unwrap();
+        assert_eq!(out.attachment_retention_days, 7);
     }
 }

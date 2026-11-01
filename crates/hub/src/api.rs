@@ -3795,6 +3795,15 @@ fn handle_put_settings(
         Err(settings::UpdateError::Invalid(msg)) => {
             HttpResponse::json(400, json!({ "error": msg }))
         }
+        Err(settings::UpdateError::Damaged(why)) => HttpResponse::json(
+            409,
+            json!({
+                "error": format!(
+                    "the stored settings file is damaged ({why}); include \
+                     attachment_retention_days explicitly to repair it"
+                )
+            }),
+        ),
         Err(settings::UpdateError::Io(e)) => HttpResponse::json(
             500,
             json!({ "error": format!("could not save settings: {e}") }),

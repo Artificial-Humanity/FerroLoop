@@ -7248,6 +7248,72 @@ default_target = "wire:felicity"
     }
 
     #[test]
+    fn settings_put_refuses_a_damaged_file_unless_retention_is_set_explicitly() {
+        let url = "/api/v1/settings";
+        for stored in [
+            &b"\x00garbage"[..],
+            b"[7]",
+            br#"{"attachment_retention_days":1000}"#,
+            br#"{"attachment_retention_days":"0"}"#,
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let state = test_hub_state(&tmp);
+            let path = settings::settings_path(tmp.path());
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, stored).unwrap();
+
+            let resp = call(
+                &state,
+                "PUT",
+                url,
+                OWNER,
+                &json!({ "timezone": "Europe/Paris" }),
+            );
+            assert_eq!(resp.status, 409, "{stored:?}");
+            let msg = error_text(&resp);
+            assert!(
+                msg.contains("the stored settings file is damaged")
+                    && msg.contains("include attachment_retention_days explicitly to repair it"),
+                "{msg}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), stored, "file must be unchanged");
+
+            let resp = call(
+                &state,
+                "PUT",
+                url,
+                OWNER,
+                &json!({ "attachment_retention_days": 0 }),
+            );
+            assert_eq!(resp.status, 200, "{}", error_text(&resp));
+            let on_disk: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(on_disk["attachment_retention_days"], 0);
+            let resp = call(
+                &state,
+                "PUT",
+                url,
+                OWNER,
+                &json!({ "timezone": "Europe/Paris" }),
+            );
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.json_value().unwrap()["attachment_retention_days"], 0);
+        }
+
+        // No file at all: unchanged behaviour, retention 7.
+        let tmp = TempDir::new().unwrap();
+        let state = test_hub_state(&tmp);
+        let resp = call(
+            &state,
+            "PUT",
+            url,
+            OWNER,
+            &json!({ "timezone": "Europe/Paris" }),
+        );
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.json_value().unwrap()["attachment_retention_days"], 7);
+    }
+
+    #[test]
     fn settings_put_broadcasts_settings_updated_and_a_refused_one_does_not() {
         let tmp = TempDir::new().unwrap();
         let state = test_hub_state(&tmp);
