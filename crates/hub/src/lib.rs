@@ -2,6 +2,7 @@
 //! (`HubAuthority::Owner` vs. `HubAuthority::Peer`), host session/worktree/architecture
 //! discovery, static `FerroDeck` serving, and `/api/v1/*` REST API (spec §2–§4).
 
+mod agents;
 pub mod api;
 mod artifacts;
 pub mod auth;
