@@ -308,11 +308,11 @@ export interface RecastAgentRequest {
   extra_areas?: string[];
   create_area?: boolean;
   replace_lead?: boolean;
-  dry_run?: boolean;
 }
 
 export interface RecastAgentResponse {
   agent?: AgentRecord;
+  retired_lead?: AgentRecord;
   before?: AgentRecord;
   after?: AgentRecord;
   retires_lead?: string | null;
