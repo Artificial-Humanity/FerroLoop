@@ -1,8 +1,8 @@
-//! Spec §4.5: the bounded remote compare-and-swap retry, and write bodies
-//! free of side effects.
+//! Spec §4.5: the bounded retry of a remote commit, and write bodies free
+//! of side effects.
 //!
-//! The retry hook (`retry::hook`) sees each remote compare-and-swap attempt
-//! before it is sent and may lose it, as a commit by another writer would.
+//! The retry hook (`retry::hook`) sees each remote commit attempt before it
+//! is sent and may lose it, as a commit by another writer would.
 
 use super::retry::{BACKOFF_CAP, BACKOFF_FIRST, Backoff, Cas, REMOTE_ATTEMPTS, hook};
 use super::{FerroStore, FerroStoreServer};
@@ -120,7 +120,7 @@ fn a_remote_write_that_loses_every_attempt_is_a_conflict_after_eight() {
         let got = lose_every_attempt(served.uri.clone(), write);
         assert!(got.conflict, "{name}: {}", got.error);
         assert!(
-            got.error.contains("8 compare-and-swap attempts"),
+            got.error.contains("8 commit attempts"),
             "{name}: {}",
             got.error
         );

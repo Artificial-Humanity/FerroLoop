@@ -1,4 +1,4 @@
-//! Bounded retry of a remote compare-and-swap write (spec §4.5).
+//! Bounded retry of a remote validated commit (spec §4.5, §6.1).
 //!
 //! A remote handle runs a write body over a read session on the server, then
 //! sends its ops with its read set (spec §6.1). When another writer changed
@@ -15,7 +15,7 @@ use std::panic::Location;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-/// The most compare-and-swap attempts of one remote write.
+/// The most commit attempts of one remote write.
 pub(super) const REMOTE_ATTEMPTS: u32 = 8;
 /// The shortest wait after a lost attempt.
 pub(super) const BACKOFF_FIRST: Duration = Duration::from_millis(5);
@@ -118,7 +118,7 @@ pub(super) mod hook {
         }
     }
 
-    /// Run `hook` before every remote compare-and-swap attempt this thread
+    /// Run `hook` before every remote commit attempt this thread
     /// makes; `true` loses the attempt. `waits` false skips the backoff
     /// sleeps.
     pub(in super::super) fn install(

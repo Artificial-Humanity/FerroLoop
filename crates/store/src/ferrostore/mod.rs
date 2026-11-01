@@ -233,7 +233,7 @@ enum Registered {
     Queued(u64),
 }
 
-/// A remote compare-and-swap the server committed
+/// A remote commit the server made
 /// ([`FerroStore::commit_remote`]).
 struct RemoteCommit {
     seq: u64,
@@ -2630,8 +2630,8 @@ impl FerroStore {
         StoreError::Conflict {
             id,
             detail: format!(
-                "{} compare-and-swap attempts each lost to a commit by another writer, and this \
-                 write committed nothing",
+                "{} commit attempts each lost to a commit by another writer that changed what \
+                 this write read, and this write committed nothing",
                 retry::REMOTE_ATTEMPTS
             ),
         }
