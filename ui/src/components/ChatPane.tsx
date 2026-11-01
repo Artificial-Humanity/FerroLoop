@@ -1939,16 +1939,31 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               <button
                 type="button"
                 data-testid="since-last-prompt-jump-btn"
+                className="fd-badge"
                 onClick={() => scrollToTurnIndex(sinceLastPrompt.promptTurnIndex)}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.borderColor = "var(--border-accent)";
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.borderColor = "var(--border-subtle)";
+                }}
+                onFocus={(e) => {
+                  e.currentTarget.style.borderColor = "var(--border-accent)";
+                }}
+                onBlur={(e) => {
+                  e.currentTarget.style.borderColor = "var(--border-subtle)";
+                }}
                 style={{
-                  background: "transparent",
-                  border: "none",
-                  padding: "2px 0",
+                  background: "var(--bg-elevated)",
+                  border: "1px solid var(--border-subtle)",
+                  borderRadius: "var(--radius-sm, 4px)",
+                  padding: "2px 8px",
                   cursor: "pointer",
                   textAlign: "left",
                   fontFamily: "inherit",
-                  flex: 1,
-                  minWidth: "120px",
+                  maxWidth: "100%",
+                  minWidth: 0,
+                  overflow: "hidden",
                 }}
                 title={`Jump to your prompt at turn #${sinceLastPrompt.promptTurnIndex}`}
               >

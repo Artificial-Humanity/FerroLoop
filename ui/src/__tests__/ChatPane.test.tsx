@@ -1433,6 +1433,20 @@ describe("Resizable chat composer (Record 57)", () => {
     expect(bar).toBeInTheDocument();
     expect(bar).not.toHaveTextContent(/Your last message/i);
     expect(bar).not.toHaveTextContent(/Jump to prompt/i);
+    const jumpBtn = screen.getByTestId("since-last-prompt-jump-btn");
+    expect(jumpBtn).toHaveClass("fd-badge");
+    expect(jumpBtn.style.border).toBe("1px solid var(--border-subtle)");
+    expect(jumpBtn.style.background).toBe("var(--bg-elevated)");
+    expect(jumpBtn.style.borderRadius).toBe("var(--radius-sm, 4px)");
+    expect(jumpBtn.style.padding).toBe("2px 8px");
+    expect(jumpBtn.style.maxWidth).toBe("100%");
+    expect(jumpBtn.style.overflow).toBe("hidden");
+    expect(jumpBtn.style.flex).toBe("");
+    fireEvent.mouseEnter(jumpBtn);
+    expect(jumpBtn.style.borderColor).toBe("var(--border-accent)");
+    fireEvent.mouseLeave(jumpBtn);
+    expect(jumpBtn.style.borderColor).toBe("var(--border-subtle)");
+
     const promptTextEl = screen.getByTestId("since-last-prompt-text");
     expect(promptTextEl).toHaveTextContent(
       "Update SettingsModal.tsx with the 3-tab layout and run UI tests.",
