@@ -54,9 +54,9 @@ views: 26 compared, 1 differ
 time: <T>s
 --- stderr
 mismatches:
-  meta: redb 1 rows <HASH12>, ferro 1 rows <HASH12>
-  ids: redb 2 rows <HASH12>, ferro 3 rows <HASH12>
-  handles: redb 2 rows <HASH12>, ferro 3 rows <HASH12>
-  handle_of: redb 2 rows <HASH12>, ferro 3 rows <HASH12>
-  projects: redb 2 rows <HASH12>, ferro 3 rows <HASH12>
-  Catalog::list_projects: redb 2 rows <HASH12>, ferro 3 rows <HASH12>
+  meta: redb 1 rows <HASH12#1>, ferro 1 rows <HASH12#2>
+  ids: redb 2 rows <HASH12#3>, ferro 3 rows <HASH12#4>
+  handles: redb 2 rows <HASH12#5>, ferro 3 rows <HASH12#6>
+  handle_of: redb 2 rows <HASH12#7>, ferro 3 rows <HASH12#8>
+  projects: redb 2 rows <HASH12#9>, ferro 3 rows <HASH12#10>
+  Catalog::list_projects: redb 2 rows <HASH12#11>, ferro 3 rows <HASH12#12>

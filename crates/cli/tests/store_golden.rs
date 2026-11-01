@@ -8,9 +8,10 @@
 //! * the sandbox directory → `<DIR>`;
 //! * the time a command took → `<T>` (`time: <T>` in text, `"elapsed_ms": <T>`
 //!   in JSON);
-//! * a table hash → `<HASH>` (64 hex digits in JSON) or `<HASH12>` (the 12
-//!   digits of a mismatch line): ids are minted from the clock, so a table that
-//!   holds one hashes differently on every run. Only a well-formed hash is
+//! * a table hash → `<HASH#n>` (64 hex digits in JSON) or `<HASH12#n>` (the 12
+//!   digits of a mismatch line), `n` counting the distinct hashes of one output
+//!   in order of first appearance, so equal hashes stay equal: ids are minted
+//!   from the clock, so a table that holds one hashes differently on every run. Only a well-formed hash is
 //!   replaced, so a hash printed in another form still fails the comparison;
 //! * a minted id → `urn:uuid:<UUID>` (the views compared are named by project
 //!   id).
@@ -100,7 +101,7 @@ impl Sandbox {
         let file = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/golden/store")
             .join(format!("{name}.txt"));
-        if std::env::var_os("FL_BLESS_GOLDEN").is_some() {
+        if std::env::var("FL_BLESS_GOLDEN").is_ok_and(|v| v == "1") {
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, &got).unwrap();
             return;
@@ -118,9 +119,10 @@ impl Sandbox {
     fn normalise(&self, text: &str) -> String {
         let root = self.root.path().display().to_string();
         let text = text.replace(&root, "<DIR>");
+        let mut hashes = Hashes::default();
         let mut out = String::new();
         for line in text.split_inclusive('\n') {
-            out.push_str(&normalise_line(line));
+            out.push_str(&normalise_line(line, &mut hashes));
         }
         out
     }
@@ -172,7 +174,31 @@ fn uuids(line: &str) -> String {
     out
 }
 
-fn normalise_line(line: &str) -> String {
+/// The distinct hashes of one output, in order of first appearance, so a
+/// golden keeps which hashes are equal (`<HASH#1>` twice) and which are not.
+#[derive(Default)]
+struct Hashes {
+    full: Vec<String>,
+    short: Vec<String>,
+}
+
+impl Hashes {
+    /// `<HASH#n>` for a 64-digit hash, `<HASH12#n>` for a 12-digit one.
+    fn placeholder(&mut self, hash: &str) -> String {
+        let (seen, label) = if hash.len() == 64 {
+            (&mut self.full, "HASH")
+        } else {
+            (&mut self.short, "HASH12")
+        };
+        let n = seen.iter().position(|h| h == hash).unwrap_or_else(|| {
+            seen.push(hash.to_string());
+            seen.len() - 1
+        });
+        format!("<{label}#{}>", n + 1)
+    }
+}
+
+fn normalise_line(line: &str, hashes: &mut Hashes) -> String {
     let line = &uuids(line);
     if let Some(l) = time_after(line, "time: ", "s\n") {
         return l;
@@ -190,7 +216,12 @@ fn normalise_line(line: &str) -> String {
             if let Some(len) = line[start..].find('"')
                 && is_hash(&line[start..start + len], 64)
             {
-                return format!("{}<HASH>{}", &line[..start], &line[start + len..]);
+                return format!(
+                    "{}{}{}",
+                    &line[..start],
+                    hashes.placeholder(&line[start..start + len]),
+                    &line[start + len..]
+                );
             }
         }
     }
@@ -202,7 +233,7 @@ fn normalise_line(line: &str) -> String {
             .map(|w| {
                 let bare = w.trim_end_matches(',');
                 if is_hash(bare, 12) {
-                    w.replacen(bare, "<HASH12>", 1)
+                    w.replacen(bare, &hashes.placeholder(bare), 1)
                 } else {
                     w.to_string()
                 }

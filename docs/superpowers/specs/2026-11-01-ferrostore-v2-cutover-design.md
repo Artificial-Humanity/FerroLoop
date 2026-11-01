@@ -406,7 +406,7 @@ A failed authentication closes the connection after a fixed delay. It says nothi
 
 ## 7. The standalone `ferrostore` binary
 
-**Where it lives.** `crates/store/src/bin/ferrostore.rs` is a thin argument parser over a library module, `fl_store::ferrostore::cli`. `fl store <cmd>` in `crates/cli` calls the same module, so the two never drift.
+**Where it lives.** `crates/store/src/bin/ferrostore.rs` is a thin argument parser over a library module, `fl_store::cli`. `fl store <cmd>` in `crates/cli` calls the same module, so the two never drift.
 
 | Command | What it does |
 |---|---|
