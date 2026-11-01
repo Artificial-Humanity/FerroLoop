@@ -2677,6 +2677,7 @@ fn is_forbidden_artifact_path(path: &Path) -> bool {
                 || seg == "vault.key"
                 || seg == "gate-audit.jsonl"
                 || seg.ends_with(".redb")
+                // Denied whatever the selected engine: a `.fls` is a store file.
                 || seg.ends_with(".fls")
             {
                 return true;
@@ -6226,6 +6227,13 @@ mod tests {
     use super::*;
     use fl_core::at::At;
     use fl_core::ids::{RevisionId, StateId, seq_iri};
+
+    #[test]
+    fn store_files_are_forbidden_artifact_paths_whatever_the_engine() {
+        assert!(is_forbidden_artifact_path(Path::new("/w/data/foo.fls")));
+        assert!(is_forbidden_artifact_path(Path::new("/w/data/foo.redb")));
+        assert!(!is_forbidden_artifact_path(Path::new("/w/data/notes.md")));
+    }
 
     fn memory_entry(n: u64, slug: &str, body: &str, sensitive: bool) -> StateEntry {
         StateEntry {

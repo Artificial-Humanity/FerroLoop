@@ -75,17 +75,10 @@ pub(crate) fn normalize_project(raw: Option<&str>) -> Result<String, &'static st
     Ok(slug)
 }
 
-/// The file the selected engine keeps the store named `logical` in: `logical` itself for redb,
-/// its sibling `.fls` for FerroStore. The hub names a project store by its logical `<slug>.redb`
-/// path and passes that to `fl_store::open_store`; only a check of the file itself needs this.
-fn physical_store_file(logical: &Path) -> PathBuf {
-    physical_store_file_with(
-        logical,
-        std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
-    )
-}
-
-/// [`physical_store_file`] with the value of `FL_STORE_BACKEND` passed in.
+/// The file the engine `env` (the `FL_STORE_BACKEND` value) selects keeps the store named
+/// `logical` in: `logical` itself for redb, its sibling `.fls` for FerroStore. The hub names a
+/// project store by its logical `<slug>.redb` path and passes that to `fl_store::open_store`;
+/// only a check of the file itself needs this.
 fn physical_store_file_with(logical: &Path, env: Option<&str>) -> PathBuf {
     match fl_store::choose_backend(logical, env) {
         Ok(kind) => fl_store::physical_path(logical, kind),
@@ -93,11 +86,7 @@ fn physical_store_file_with(logical: &Path, env: Option<&str>) -> PathBuf {
     }
 }
 
-/// The extension a per-project store file has under the selected engine.
-fn project_store_extension() -> String {
-    store_extension_with(std::env::var(fl_store::BACKEND_ENV).ok().as_deref())
-}
-
+/// The extension a per-project store file has under the engine `env` selects.
 fn store_extension_with(env: Option<&str>) -> String {
     physical_store_file_with(Path::new("x.redb"), env)
         .extension()
@@ -109,15 +98,45 @@ fn store_extension_with(env: Option<&str>) -> String {
 /// The logical path of the per-project store (`<slug>.redb`) when its physical file exists as a
 /// plain file. A symlink or anything else that is not a regular file is refused, so the slug
 /// cannot be used to reach another path.
+///
+/// Under the FerroStore engine a project that still has only its `<slug>.redb` (not yet
+/// migrated) is an error, not `None`: `None` sends the request to the hub store, which would
+/// take a write meant for the project.
 fn project_redb(home: &Path, slug: &str) -> Result<Option<PathBuf>, HttpResponse> {
+    project_redb_with(
+        home,
+        slug,
+        std::env::var(fl_store::BACKEND_ENV).ok().as_deref(),
+    )
+}
+
+/// [`project_redb`] with the value of `FL_STORE_BACKEND` passed in.
+fn project_redb_with(
+    home: &Path,
+    slug: &str,
+    env: Option<&str>,
+) -> Result<Option<PathBuf>, HttpResponse> {
     let path = projects_dir(home).join(format!("{slug}.redb"));
-    match fs::symlink_metadata(physical_store_file(&path)) {
+    let physical = physical_store_file_with(&path, env);
+    match fs::symlink_metadata(&physical) {
         Ok(meta) if meta.file_type().is_symlink() => Err(bad_request(
             "the project store is a symlink, which is refused",
         )),
         Ok(meta) if meta.is_file() => Ok(Some(path)),
         Ok(_) => Err(bad_request("the project store is not a regular file")),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let unmigrated =
+                physical != path && fs::symlink_metadata(&path).is_ok_and(|m| m.is_file());
+            if unmigrated {
+                Err(error_json(
+                    409,
+                    "the project's store is a redb file that has not been migrated to the ferro \
+                     engine; migrate it or set the engine to redb",
+                ))
+            } else {
+                Ok(None)
+            }
+        }
         Err(_) => Err(store_unavailable()),
     }
 }
@@ -183,12 +202,17 @@ fn open_project_store<'a>(
 /// Every project this hub can show: each `<slug>.redb` beside the hub store (not `fl.redb`, not
 /// a symlink, only well-formed lowercase slugs), plus the default. Reads at most 200 entries.
 pub(crate) fn available_projects(home: Option<&Path>) -> Vec<String> {
+    available_projects_with(home, std::env::var(fl_store::BACKEND_ENV).ok().as_deref())
+}
+
+/// [`available_projects`] with the value of `FL_STORE_BACKEND` passed in.
+fn available_projects_with(home: Option<&Path>, env: Option<&str>) -> Vec<String> {
     let mut found = BTreeSet::new();
     found.insert(DEFAULT_PROJECT.to_string());
     let Some(entries) = home.and_then(|h| fs::read_dir(projects_dir(h)).ok()) else {
         return found.into_iter().collect();
     };
-    let suffix = format!(".{}", project_store_extension());
+    let suffix = format!(".{}", store_extension_with(env));
     for entry in entries.take(MAX_PROJECT_SCAN).flatten() {
         // `DirEntry::file_type` does not follow symlinks.
         if !entry.file_type().is_ok_and(|t| t.is_file()) {
@@ -742,6 +766,77 @@ mod tests {
         assert_eq!(store_extension_with(Some("ferro")), "fls");
         // A bad engine name falls back to the logical path; the open reports the error.
         assert_eq!(physical_store_file_with(logical, Some("sqlite")), logical);
+    }
+
+    #[test]
+    fn project_redb_follows_the_engine_and_refuses_an_unmigrated_project() {
+        let tmp = TempDir::new().unwrap();
+        let dir = fl_dir(&tmp);
+        let home = tmp.path();
+        // Only `foo.fls`: ferro finds it (by its logical path), redb does not.
+        fs::write(dir.join("foo.fls"), b"x").unwrap();
+        assert_eq!(
+            project_redb_with(home, "foo", Some("ferro")).unwrap(),
+            Some(dir.join("foo.redb"))
+        );
+        assert_eq!(project_redb_with(home, "foo", None).unwrap(), None);
+        assert_eq!(project_redb_with(home, "foo", Some("redb")).unwrap(), None);
+
+        // Only `bar.redb`: redb finds it; ferro refuses rather than fall back to the hub store.
+        fs::write(dir.join("bar.redb"), b"x").unwrap();
+        assert_eq!(
+            project_redb_with(home, "bar", None).unwrap(),
+            Some(dir.join("bar.redb"))
+        );
+        let err = project_redb_with(home, "bar", Some("ferro")).unwrap_err();
+        assert_eq!(err.status, 409);
+        assert!(String::from_utf8_lossy(&err.body).contains("not been migrated"));
+        // Neither file: ferro still falls back (no project by that name).
+        assert_eq!(project_redb_with(home, "baz", Some("ferro")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_symlinked_ferro_project_store_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let dir = fl_dir(&tmp);
+        let target = tmp.path().join("target.fls");
+        fs::write(&target, b"x").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("link.fls")).unwrap();
+        let err = project_redb_with(tmp.path(), "link", Some("ferro")).unwrap_err();
+        assert_eq!(err.status, 400);
+        // Under redb the `.fls` link is not a store at all.
+        assert_eq!(project_redb_with(tmp.path(), "link", None).unwrap(), None);
+    }
+
+    #[test]
+    fn available_projects_follows_the_engine() {
+        let tmp = TempDir::new().unwrap();
+        let dir = fl_dir(&tmp);
+        fs::write(dir.join("foo.fls"), b"x").unwrap();
+        fs::write(dir.join("old.redb"), b"x").unwrap();
+        fs::write(dir.join("fl.fls"), b"x").unwrap();
+        let home = Some(tmp.path());
+        assert_eq!(
+            available_projects_with(home, Some("ferro")),
+            vec!["ferroloop", "foo"]
+        );
+        assert_eq!(
+            available_projects_with(home, None),
+            vec!["ferroloop", "old"]
+        );
+    }
+
+    #[test]
+    fn available_projects_reads_a_bounded_number_of_entries_under_ferro() {
+        let tmp = TempDir::new().unwrap();
+        let dir = fl_dir(&tmp);
+        for i in 0..(MAX_PROJECT_SCAN + 50) {
+            fs::write(dir.join(format!("p{i:04}.fls")), b"x").unwrap();
+        }
+        let found = available_projects_with(Some(tmp.path()), Some("ferro"));
+        assert!(found.len() > 1, "{}", found.len());
+        assert!(found.len() <= MAX_PROJECT_SCAN + 1, "{}", found.len());
+        assert!(found.contains(&"ferroloop".to_string()));
     }
 
     /// A store at `path` holding one project and one record per `(title, state)`.
