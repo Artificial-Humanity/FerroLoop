@@ -86,6 +86,21 @@ pub fn ranked_result_json(query: &str, ranked: &RankedHits) -> serde_json::Value
     out
 }
 
+/// The stderr line that tells an operator why a search fell back to BM25, or
+/// `None` when it did not. It carries the engine's own error, which is kept out
+/// of the JSON output on purpose. One line, whatever the error holds.
+pub fn index_unavailable_line(ranked: &RankedHits) -> Option<String> {
+    if ranked.mode != SearchMode::Bm25 {
+        return None;
+    }
+    let cause = ranked.cause.as_deref()?;
+    let one_line: Vec<&str> = cause.split_whitespace().collect();
+    Some(format!(
+        "fl: knowledge index unavailable: {}",
+        one_line.join(" ")
+    ))
+}
+
 /// One-line plain-text rendering of a search hit for the CLI.
 pub fn format_search_hit(hit: &StateSearchHit) -> String {
     let snippet: String = hit
@@ -1121,6 +1136,9 @@ pub fn run(env: &StateEnv<'_>, cmd: StateCmd) -> Result<(), String> {
                 effective_limit,
             );
             let hits = &ranked.hits;
+            if let Some(line) = index_unavailable_line(&ranked) {
+                eprintln!("{line}");
+            }
             if json {
                 let out = ranked_result_json(&query, &ranked);
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
@@ -1837,6 +1855,7 @@ mod tests {
             total_hits: 0,
             mode: SearchMode::Bm25,
             note: None,
+            cause: None,
         };
         assert_eq!(
             ranked_result_json("q", &plain),
@@ -1854,6 +1873,36 @@ mod tests {
         let value = ranked_result_json("q", &fell_back);
         assert_eq!(value["note"], "why");
         assert!(value.get("mode").is_none());
+    }
+
+    #[test]
+    fn the_cause_goes_to_stderr_only_when_bm25_answered_after_a_failure() {
+        let plain = RankedHits {
+            hits: Vec::new(),
+            total_hits: 0,
+            mode: SearchMode::Bm25,
+            note: None,
+            cause: None,
+        };
+        assert_eq!(index_unavailable_line(&plain), None);
+        let failed = RankedHits {
+            note: Some("why".into()),
+            cause: Some("backend: disk\non fire".into()),
+            ..plain.clone()
+        };
+        assert_eq!(
+            index_unavailable_line(&failed).as_deref(),
+            Some("fl: knowledge index unavailable: backend: disk on fire")
+        );
+        // The JSON never carries the cause.
+        let json = ranked_result_json("q", &failed).to_string();
+        assert!(!json.contains("disk"), "{json}");
+        // A knowledge answer has nothing to report even if a cause were set.
+        let knowledge = RankedHits {
+            mode: SearchMode::Knowledge,
+            ..failed
+        };
+        assert_eq!(index_unavailable_line(&knowledge), None);
     }
 
     #[test]

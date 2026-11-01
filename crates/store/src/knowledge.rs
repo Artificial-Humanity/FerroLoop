@@ -31,6 +31,17 @@
 //! became sensitive is deleted on the next [`IndexPolicy::Sync`] search.
 //! Vector hits for them are also dropped at read time.
 //!
+//! That cleanup works from the index document, so the document is written
+//! *ahead* of the vectors: before a batch is upserted its ids are listed with
+//! a placeholder revision, and the real revisions replace them afterwards. A
+//! crash, an error part-way or a concurrent writer therefore leaves a
+//! committed vector listed, never orphaned. As a second line, a sensitive
+//! entry the document does not list is probed once and its vector deleted if
+//! one exists. FerroStore has no compare-and-swap on a document, so two
+//! processes syncing at once can still overwrite each other's document; the
+//! merge on write narrows that window and the placeholder and the probe cover
+//! what it leaves.
+//!
 //! The caller decides which entries may be shown: only ids in the `entries`
 //! slice are ever returned, however much the store holds. A failure on the
 //! FerroStore path never fails the search; it falls back to BM25 and sets a
@@ -72,8 +83,17 @@ const FALLBACK_NOTE: &str = "knowledge index unavailable; ranked with BM25";
 /// Document collection holding one id -> revision index per vector collection.
 /// It stores hashes only, never entry text.
 const INDEX_DOC_COLLECTION: &str = "state_vec_index";
-/// Start of the engine's error for a missing vector collection.
+/// Start of the engine's error for a missing vector collection. This is the
+/// local engine's wording. A Remote engine may word it differently; its
+/// missing-collection error is then not recognised, the search fails over to
+/// BM25 and the real cause is kept in [`RankedHits::cause`].
 const MISSING_COLLECTION: &str = "no vector collection";
+/// Index-document `rev` meaning "a vector may exist for this id, its revision
+/// is unknown". Outside the 53-bit range of [`stamp`], so no entry hashes to it.
+const PENDING_REV: u64 = 1 << 53;
+/// Index-document `rev` meaning "this entry is not indexable and was probed:
+/// it has no vector". Also outside the range of [`stamp`].
+const CLEAN_REV: u64 = (1 << 53) + 2;
 
 /// Which ranker produced a result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +136,9 @@ pub struct RankedHits {
     pub mode: SearchMode,
     /// Set when the knowledge path failed and BM25 answered instead.
     pub note: Option<String>,
+    /// The engine's own error behind `note`, for diagnosis. It is never part of
+    /// any JSON output: callers show it on stderr at most.
+    pub cause: Option<String>,
 }
 
 /// What an indexing pass did.
@@ -150,6 +173,7 @@ fn bm25_ranked(all: Vec<StateSearchHit>, limit: usize) -> RankedHits {
         total_hits,
         mode: SearchMode::Bm25,
         note: None,
+        cause: None,
     }
 }
 
@@ -250,9 +274,10 @@ pub(crate) fn rank_with_stats(
     ) {
         Ok(Some(ranked)) => (ranked, stats),
         Ok(None) => (bm25_ranked(lexical, limit), stats),
-        Err(_) => {
+        Err(err) => {
             let mut ranked = bm25_ranked(lexical, limit);
             ranked.note = Some(FALLBACK_NOTE.to_string());
+            ranked.cause = Some(err.to_string());
             (ranked, stats)
         }
     }
@@ -291,6 +316,7 @@ fn rank_knowledge(
             total_hits: 0,
             mode: SearchMode::Knowledge,
             note: None,
+            cause: None,
         }));
     }
     let collection = vector_collection_name(embedder);
@@ -362,6 +388,7 @@ fn rank_knowledge(
         total_hits,
         mode: SearchMode::Knowledge,
         note: None,
+        cause: None,
     }))
 }
 
@@ -415,8 +442,16 @@ fn nearest<'a>(
 /// vectors. One read of the index document says which entries are current; an
 /// entry whose recorded `rev` and `space` match is left alone. An entry that
 /// is now sensitive loses its vector. A zero vector (text with no features)
-/// is not stored. The vectors are written before the index document, so an
-/// interrupted pass only repeats work.
+/// is not stored.
+///
+/// The index document is written *before* the vectors it describes: ids about
+/// to be upserted, or deleted without being listed, are first recorded with
+/// [`PENDING_REV`]. After the writes their real state replaces the
+/// placeholder, and that final write happens on the error path too (what
+/// succeeded is finalised, what did not keeps its placeholder, then the first
+/// error is returned). A placeholder is re-upserted or deleted by the next
+/// sync. A sensitive entry the document does not list is probed once with
+/// `get_vector` and recorded as [`CLEAN_REV`], so the probe is not repeated.
 pub(crate) fn sync_index(
     ferro: &FerroStore,
     embedder: &dyn Embedder,
@@ -425,17 +460,32 @@ pub(crate) fn sync_index(
     budget: usize,
 ) -> Result<IndexStats, StoreError> {
     let space = stamp(&embedder.space_id());
-    let mut index = IndexDoc::load(ferro, collection, space)?;
+    let index = IndexDoc::load(ferro, collection, space)?;
     let mut stats = IndexStats::default();
-    let mut ready = false;
-    let mut changed = false;
+    // Plan: nothing is written here.
+    let mut deletes: Vec<&str> = Vec::new();
+    let mut upserts: Vec<(&str, u64, Vec<f32>)> = Vec::new();
+    let mut changes: HashMap<String, u64> = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
     for entry in entries {
         let id = entry.id.as_str();
+        if !seen.insert(id) {
+            continue;
+        }
         if !indexable(entry) {
-            if index.revs.remove(id).is_some() {
-                ferro.delete_vector(collection, id)?;
-                stats.deleted += 1;
-                changed = true;
+            match index.revs.get(id) {
+                Some(&CLEAN_REV) => {}
+                Some(_) => deletes.push(id),
+                None => {
+                    // Not listed: a vector from before the entry turned
+                    // sensitive may still exist (lost update, crash).
+                    if missing_as_none(ferro.get_vector(collection, id))?.is_some() {
+                        changes.insert(id.to_string(), PENDING_REV);
+                        deletes.push(id);
+                    } else {
+                        changes.insert(id.to_string(), CLEAN_REV);
+                    }
+                }
             }
             continue;
         }
@@ -443,7 +493,7 @@ pub(crate) fn sync_index(
         if index.revs.get(id) == Some(&rev) {
             continue;
         }
-        if stats.written >= budget {
+        if upserts.len() >= budget {
             stats.pending += 1;
             continue;
         }
@@ -451,24 +501,67 @@ pub(crate) fn sync_index(
         if is_zero(&values) {
             continue;
         }
-        if !ready {
-            ensure_vector_collection(ferro, embedder, collection)?;
-            ready = true;
+        upserts.push((id, rev, values));
+    }
+    if deletes.is_empty() && upserts.is_empty() {
+        if !changes.is_empty() {
+            IndexDoc::update(ferro, collection, space, &changes)?;
         }
-        let meta = json!({ "rev": rev, "space": space });
-        ferro.upsert_vector(collection, id, &values, Some(&meta))?;
-        index.revs.insert(id.to_string(), rev);
-        stats.written += 1;
-        changed = true;
+        return Ok(stats);
     }
-    if changed {
-        index.store(ferro, collection, space)?;
+
+    // Record intent first. Ids the document already lists stay listed.
+    if !upserts.is_empty() {
+        ensure_vector_collection(ferro, embedder, collection)?;
     }
-    Ok(stats)
+    for (id, _, _) in &upserts {
+        if !index.revs.contains_key(*id) || index.revs.get(*id) == Some(&CLEAN_REV) {
+            changes.insert((*id).to_string(), PENDING_REV);
+        }
+    }
+    if changes.values().any(|rev| *rev == PENDING_REV) {
+        IndexDoc::update(ferro, collection, space, &changes)?;
+    }
+
+    // Write. Stop at the first error but still finalise what succeeded.
+    let mut failure: Option<StoreError> = None;
+    for id in deletes {
+        match ferro.delete_vector(collection, id) {
+            Ok(()) => {
+                changes.insert(id.to_string(), CLEAN_REV);
+                stats.deleted += 1;
+            }
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        }
+    }
+    if failure.is_none() {
+        for (id, rev, values) in &upserts {
+            let meta = json!({ "rev": rev, "space": space });
+            match ferro.upsert_vector(collection, id, values, Some(&meta)) {
+                Ok(()) => {
+                    changes.insert((*id).to_string(), *rev);
+                    stats.written += 1;
+                }
+                Err(err) => {
+                    failure = Some(err);
+                    break;
+                }
+            }
+        }
+    }
+    let finalised = IndexDoc::update(ferro, collection, space, &changes);
+    match (failure, finalised) {
+        (Some(err), _) | (None, Err(err)) => Err(err),
+        (None, Ok(())) => Ok(stats),
+    }
 }
 
 /// Entry id -> `rev` of the vector indexed for it, in one document per
-/// collection. Holds hashes only.
+/// collection. Holds hashes only. Two values are not revisions: see
+/// [`PENDING_REV`] and [`CLEAN_REV`].
 struct IndexDoc {
     revs: HashMap<String, u64>,
 }
@@ -487,6 +580,25 @@ impl IndexDoc {
             }
         }
         Ok(Self { revs })
+    }
+
+    /// Read the freshest document, apply `changes` to it and write it back.
+    /// Ids this call did not touch keep whatever another writer recorded, so a
+    /// writer holding an older snapshot does not erase them. FerroStore has no
+    /// compare-and-swap on a document: a write landing between the read and
+    /// the write here is still lost. The placeholder written ahead of the
+    /// vectors and the probe in [`sync_index`] cover that remainder.
+    fn update(
+        ferro: &FerroStore,
+        collection: &str,
+        space: u64,
+        changes: &HashMap<String, u64>,
+    ) -> Result<(), StoreError> {
+        let mut fresh = Self::load(ferro, collection, space)?;
+        for (id, rev) in changes {
+            fresh.revs.insert(id.clone(), *rev);
+        }
+        fresh.store(ferro, collection, space)
     }
 
     fn store(&self, ferro: &FerroStore, collection: &str, space: u64) -> Result<(), StoreError> {
@@ -925,8 +1037,8 @@ mod tests {
         let updated = put(
             &store,
             "lunch-notes",
-            "meeting notes about tokenizer",
-            "Swapped the tokenizer vocabulary for the offsite.",
+            "tokenizer vocabulary",
+            "tokenizer vocabulary swap",
             9_000,
         );
         assert_ne!(updated.head_revision, before.head_revision);
@@ -942,8 +1054,8 @@ mod tests {
         // An entry that becomes sensitive loses its vector; nothing is written.
         let mut s = spec(
             "lunch-notes",
-            "meeting notes about tokenizer",
-            "Swapped the tokenizer vocabulary for the offsite.",
+            "tokenizer vocabulary",
+            "tokenizer vocabulary swap",
             9_100,
         );
         s.sensitive = true;
@@ -955,17 +1067,58 @@ mod tests {
                 .is_some()
         );
         entries = store.list_state(None, None).unwrap();
-        let (_, stats) = run(&store, SYNC, &entries, "tokenizer");
+        // Before any sync the stale vector is still in the store. A read-only
+        // typo query that matches it by similarity alone (about 0.47 against
+        // the summary, over the 0.25 bar, no word in common) must not return
+        // the entry: only the read-time filter stands between them.
+        let (typo, stats) = run(
+            &store,
+            IndexPolicy::ReadOnly,
+            &entries,
+            "tokenizr vocabulry",
+        );
+        assert_eq!(stats, IndexStats::default());
+        assert!(
+            typo.hits.iter().all(|h| h.entry.slug != "lunch-notes"),
+            "read-only leaked a sensitive entry: {:?}",
+            slugs(&typo)
+        );
+        assert!(
+            ferro
+                .get_vector(&col, flipped.id.as_str())
+                .unwrap()
+                .is_some(),
+            "read-only must not delete"
+        );
+        // A zero-budget sync writes nothing new, still removes the vector, and
+        // does not return the entry either.
+        let (typo, stats) = run(
+            &store,
+            IndexPolicy::Sync { budget: 0 },
+            &entries,
+            "tokenizr vocabulry",
+        );
         assert_eq!((stats.written, stats.deleted), (0, 1));
+        assert!(
+            typo.hits.iter().all(|h| h.entry.slug != "lunch-notes"),
+            "{:?}",
+            slugs(&typo)
+        );
         assert!(
             ferro
                 .get_vector(&col, flipped.id.as_str())
                 .unwrap()
                 .is_none()
         );
-        // Even a read-only search cannot find it through a typo.
-        let (typo, _) = run(&store, IndexPolicy::ReadOnly, &entries, "tokenzer");
+        let (typo, _) = run(
+            &store,
+            IndexPolicy::ReadOnly,
+            &entries,
+            "tokenizr vocabulry",
+        );
         assert!(typo.hits.is_empty(), "{:?}", slugs(&typo));
+        let (_, again) = run(&store, SYNC, &entries, "tokenizer");
+        assert_eq!(again, IndexStats::default());
     }
 
     #[test]
@@ -982,6 +1135,27 @@ mod tests {
         assert_eq!((second.written, second.pending), (1, 0));
         let (_, third) = run(&store, policy, &entries, "build cache");
         assert_eq!(third, IndexStats::default());
+    }
+
+    type VectorRow = Option<(Vec<f32>, Option<Value>)>;
+
+    /// The index document and the stored vector of each id: all that a
+    /// search could change in the store.
+    fn index_snapshot(
+        ferro: &FerroStore,
+        col: &str,
+        ids: &[&str],
+    ) -> (Option<Value>, Vec<VectorRow>) {
+        let doc = ferro.get_doc(INDEX_DOC_COLLECTION, col).unwrap();
+        let rows = ids
+            .iter()
+            .map(|id| {
+                missing_as_none(ferro.get_vector(col, id))
+                    .unwrap()
+                    .flatten()
+            })
+            .collect();
+        (doc, rows)
     }
 
     #[test]
@@ -1006,9 +1180,13 @@ mod tests {
         // and still writes nothing.
         let (_, synced) = run(&store, SYNC, &entries, "cache");
         assert_eq!(synced.written, 4);
+        let ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        let synced_state = index_snapshot(ferro, &col, &ids);
+        assert!(synced_state.0.is_some() && synced_state.1.iter().all(Option::is_some));
         let (stem, stats) = run(&store, IndexPolicy::ReadOnly, &entries, "checkpointing");
         assert_eq!(stats, IndexStats::default());
         assert_eq!(slugs(&stem).first(), Some(&"build-cache"));
+        assert_eq!(index_snapshot(ferro, &col, &ids), synced_state);
 
         // A changed entry is not re-indexed by read-only; its new words are
         // still found lexically.
@@ -1020,9 +1198,12 @@ mod tests {
             9_000,
         );
         let entries = store.list_state(None, None).unwrap();
+        let before = index_snapshot(ferro, &col, &ids);
         let (r, stats) = run(&store, IndexPolicy::ReadOnly, &entries, "zanzibar");
         assert_eq!(stats, IndexStats::default());
         assert_eq!(slugs(&r), vec!["gpu-queue"]);
+        // The changed entry's document and vector are byte-for-byte as before.
+        assert_eq!(index_snapshot(ferro, &col, &ids), before);
         let (_, resync) = run(&store, SYNC, &entries, "zanzibar");
         assert_eq!(resync.written, 1);
     }
@@ -1084,11 +1265,14 @@ mod tests {
             5,
         );
         assert_eq!(ranked.mode, SearchMode::Bm25);
-        // No engine text in the note.
+        // No engine text in the note; the real error is kept apart in `cause`.
         assert_eq!(
             ranked.note.as_deref(),
             Some("knowledge index unavailable; ranked with BM25")
         );
+        let cause = ranked.cause.as_deref().expect("cause kept");
+        assert!(cause.contains("vector values have length"), "{cause}");
+        assert!(!ranked.note.as_deref().unwrap().contains(cause));
         let bm25 = rank_bm25(&entries, "build cache", None, None, 5);
         assert_eq!(ranked.hits, bm25.hits);
         assert_eq!(ranked.total_hits, bm25.total_hits);
@@ -1137,6 +1321,18 @@ mod tests {
         let bad = ferro.get_vector(&col, "").unwrap_err();
         assert!(!is_missing_collection(&bad), "{bad}");
         assert!(missing_as_none(Err::<(), _>(bad)).is_err());
+        // A Remote engine may word a missing collection differently. Such an
+        // error is not recognised as missing: the search falls back with the
+        // cause kept (see `a_failing_ferro_path_...`), it is never an empty
+        // vector leg.
+        for other in [
+            "collection `state_vec_x` not found",
+            "unknown vector collection state_vec_x",
+        ] {
+            let err = StoreError::Backend(other.into());
+            assert!(!is_missing_collection(&err), "{other}");
+            assert!(missing_as_none(Err::<(), _>(err)).is_err());
+        }
         assert!(missing_as_none(Err::<(), _>(StoreError::Backend("disk on fire".into()))).is_err());
         assert_eq!(
             missing_as_none(Err::<(), _>(StoreError::Backend(
@@ -1174,7 +1370,247 @@ mod tests {
             );
             assert_eq!(r.mode, SearchMode::Bm25, "{policy:?}");
             assert!(r.note.is_some(), "{policy:?}");
+            assert!(r.cause.is_some(), "{policy:?}");
             assert_eq!(slugs(&r).first(), Some(&"build-cache"));
+        }
+    }
+
+    /// Embeds like the default embedder, in the same space, but returns a
+    /// vector of the wrong length for the `fail_at`th call (1-based), so that
+    /// one `upsert_vector` is refused by the engine. Calls made outside a
+    /// counted window are not counted.
+    struct FlakyEmbedder {
+        inner: HashingEmbedder,
+        calls: std::cell::Cell<usize>,
+        fail_at: usize,
+    }
+
+    impl FlakyEmbedder {
+        fn new(fail_at: usize) -> Self {
+            Self {
+                inner: HashingEmbedder::default(),
+                calls: std::cell::Cell::new(0),
+                fail_at,
+            }
+        }
+    }
+
+    impl Embedder for FlakyEmbedder {
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn embed(&self, text: &str) -> Vec<f32> {
+            self.calls.set(self.calls.get() + 1);
+            if self.calls.get() == self.fail_at {
+                return vec![0.5; 3];
+            }
+            self.inner.embed(text)
+        }
+        fn space_id(&self) -> String {
+            self.inner.space_id()
+        }
+    }
+
+    fn refs(entries: &[StateEntry]) -> Vec<&StateEntry> {
+        entries.iter().collect()
+    }
+
+    fn flip_sensitive(store: &AnyStore, entry: &StateEntry) -> StateEntry {
+        let StatePayload::Memory(m) = &entry.payload else {
+            panic!("memory fixture");
+        };
+        let mut s = spec(&entry.slug, &m.summary, &m.body, 50_000);
+        s.sensitive = true;
+        put_spec(store, s)
+    }
+
+    #[test]
+    fn an_upsert_error_midway_still_lists_every_committed_vector() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = seed(&store);
+        let ferro = store.as_ferro().unwrap();
+        let col = vector_collection_name(default_embedder());
+
+        // Entries 1 and 2 commit, the 3rd upsert is refused, the 4th is not tried.
+        let flaky = FlakyEmbedder::new(3);
+        let err = sync_index(ferro, &flaky, &col, &refs(&entries), 100).unwrap_err();
+        assert!(
+            err.to_string().contains("vector values have length"),
+            "{err}"
+        );
+
+        let doc = IndexDoc::load(ferro, &col, stamp(&flaky.space_id())).unwrap();
+        let mut committed = Vec::new();
+        for e in &entries {
+            let has_vector = ferro.get_vector(&col, e.id.as_str()).unwrap().is_some();
+            if has_vector {
+                committed.push(e.clone());
+            }
+            // Every vector in the store is listed; so is every one that was
+            // planned but did not commit (placeholder).
+            assert!(doc.revs.contains_key(e.id.as_str()), "{} unlisted", e.slug);
+        }
+        assert_eq!(committed.len(), 2);
+        let real = doc
+            .revs
+            .values()
+            .filter(|r| **r != PENDING_REV && **r != CLEAN_REV)
+            .count();
+        assert_eq!(real, 2, "committed ones are finalised, the rest pending");
+
+        // One committed entry now turns sensitive: the next Sync removes its
+        // vector even though the failed pass never finished.
+        let flipped = flip_sensitive(&store, &committed[0]);
+        let entries = store.list_state(None, None).unwrap();
+        let (_, stats) = run(&store, SYNC, &entries, "build cache");
+        assert!(stats.deleted >= 1, "{stats:?}");
+        assert!(
+            ferro
+                .get_vector(&col, flipped.id.as_str())
+                .unwrap()
+                .is_none(),
+            "a lossy copy of a sensitive entry stayed at rest"
+        );
+        // The pending ones were re-upserted: the index is whole again.
+        for e in entries.iter().filter(|e| indexable(e)) {
+            assert!(ferro.get_vector(&col, e.id.as_str()).unwrap().is_some());
+        }
+        let (_, quiet) = run(&store, SYNC, &entries, "build cache");
+        assert_eq!(quiet, IndexStats::default());
+    }
+
+    #[test]
+    fn a_sensitive_entry_missing_from_the_index_doc_is_probed_and_cleaned_on_sync() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = seed(&store);
+        let ferro = store.as_ferro().unwrap();
+        let col = vector_collection_name(default_embedder());
+        let space = stamp(&default_embedder().space_id());
+        run(&store, SYNC, &entries, "build cache");
+
+        // A lost update: the document no longer lists any vector.
+        ferro
+            .put_doc(
+                INDEX_DOC_COLLECTION,
+                &col,
+                &json!({ "space": space, "revs": {} }),
+            )
+            .unwrap();
+        let flipped = flip_sensitive(
+            &store,
+            entries.iter().find(|e| e.slug == "gpu-queue").unwrap(),
+        );
+        let entries = store.list_state(None, None).unwrap();
+        assert!(
+            ferro
+                .get_vector(&col, flipped.id.as_str())
+                .unwrap()
+                .is_some()
+        );
+
+        // Read-only never probes or deletes.
+        let before = index_snapshot(ferro, &col, &[flipped.id.as_str()]);
+        run(&store, IndexPolicy::ReadOnly, &entries, "gpu queue");
+        assert_eq!(index_snapshot(ferro, &col, &[flipped.id.as_str()]), before);
+
+        let (_, stats) = run(&store, SYNC, &entries, "gpu queue");
+        assert_eq!(stats.deleted, 1, "{stats:?}");
+        assert!(
+            ferro
+                .get_vector(&col, flipped.id.as_str())
+                .unwrap()
+                .is_none()
+        );
+        // The probe is recorded, so it is not repeated.
+        let doc = IndexDoc::load(ferro, &col, space).unwrap();
+        assert_eq!(doc.revs.get(flipped.id.as_str()), Some(&CLEAN_REV));
+        let (_, again) = run(&store, SYNC, &entries, "gpu queue");
+        assert_eq!(again, IndexStats::default());
+    }
+
+    #[test]
+    fn the_index_doc_update_merges_instead_of_overwriting_another_writer() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let ferro = store.as_ferro().unwrap();
+        let col = "state_vec_merge";
+        let space = 7;
+        let one = |id: &str, rev: u64| HashMap::from([(id.to_string(), rev)]);
+
+        // Writer A snapshots an empty doc; writer B then records its ids.
+        let stale = IndexDoc::load(ferro, col, space).unwrap();
+        assert!(stale.revs.is_empty());
+        IndexDoc::update(ferro, col, space, &one("from-b", 11)).unwrap();
+        // A stores from its stale snapshot.
+        IndexDoc::update(ferro, col, space, &one("from-a", 22)).unwrap();
+        let merged = IndexDoc::load(ferro, col, space).unwrap();
+        assert_eq!(merged.revs.get("from-a"), Some(&22));
+        assert_eq!(merged.revs.get("from-b"), Some(&11));
+        // The stale snapshot written back whole would have lost B: that is
+        // what `update` exists to avoid.
+        let mut lossy = stale;
+        lossy.revs.insert("from-a".into(), 22);
+        lossy.store(ferro, col, space).unwrap();
+        assert!(
+            !IndexDoc::load(ferro, col, space)
+                .unwrap()
+                .revs
+                .contains_key("from-b")
+        );
+    }
+
+    /// Writes another writer's id into the index document while a sync is
+    /// between reading the document and writing it.
+    struct InterleavingEmbedder<'a> {
+        inner: HashingEmbedder,
+        ferro: &'a FerroStore,
+        collection: String,
+        space: u64,
+        done: std::cell::Cell<bool>,
+    }
+
+    impl Embedder for InterleavingEmbedder<'_> {
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+        fn embed(&self, text: &str) -> Vec<f32> {
+            if !self.done.replace(true) {
+                let other = HashMap::from([("other-writer".to_string(), 99u64)]);
+                IndexDoc::update(self.ferro, &self.collection, self.space, &other).unwrap();
+            }
+            self.inner.embed(text)
+        }
+        fn space_id(&self) -> String {
+            self.inner.space_id()
+        }
+    }
+
+    #[test]
+    fn a_concurrent_writer_between_load_and_store_is_not_erased_by_a_sync() {
+        let d = TempDir::new().unwrap();
+        let store = open_ferro(&d);
+        let entries = seed(&store);
+        let ferro = store.as_ferro().unwrap();
+        let col = vector_collection_name(default_embedder());
+        let space = stamp(&default_embedder().space_id());
+        let embedder = InterleavingEmbedder {
+            inner: HashingEmbedder::default(),
+            ferro,
+            collection: col.clone(),
+            space,
+            done: std::cell::Cell::new(false),
+        };
+        let stats = sync_index(ferro, &embedder, &col, &refs(&entries), 100).unwrap();
+        assert_eq!(stats.written, 4);
+        let doc = IndexDoc::load(ferro, &col, space).unwrap();
+        assert_eq!(doc.revs.get("other-writer"), Some(&99));
+        for e in &entries {
+            assert_eq!(
+                doc.revs.get(e.id.as_str()),
+                Some(&stamp(e.head_revision.as_str()))
+            );
         }
     }
 
