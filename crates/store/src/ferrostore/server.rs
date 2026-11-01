@@ -203,23 +203,15 @@ impl FerroStoreServer {
         })
     }
 
-    /// Listen on TCP, speak RFC 6455, and serve `store`. `127.0.0.1:0` must bind an ephemeral port.
-    ///
-    /// `auth` must hold a PSK, a token file, or both: a TCP server without
-    /// authentication is refused before it binds. A connection with a valid
-    /// bearer token holds that token's scope; one that passes the PSK
-    /// challenge-response holds `admin` (spec §6.2).
-    ///
-    /// With TLS ([`ServerAuth::with_tls_files`]) this serves `wss://` on any
-    /// address. Without it, plain `ws://` binds only a loopback address, or
-    /// an address of an interface named in [`ServerAuth::allow_plaintext_on`];
-    /// every other address, `0.0.0.0` and `::` always, is refused before it is
-    /// bound (spec §6.3).
-    pub fn bind_tcp(
+    /// The checks [`Self::bind_tcp`] makes before it binds, with no store
+    /// needed: `auth` holds a method, and every address `addr` resolves to
+    /// may be bound under it (spec §6.3). Each address, with the interface a
+    /// plaintext listener on it must be pinned to. A caller that would create
+    /// a store to serve runs this first, so a refused bind creates nothing.
+    pub(crate) fn check_tcp_bind(
         addr: impl ToSocketAddrs,
-        store: FerroStore,
-        auth: ServerAuth,
-    ) -> Result<Self, StoreError> {
+        auth: &ServerAuth,
+    ) -> Result<Vec<(SocketAddr, Option<String>)>, StoreError> {
         if !auth.any_method() {
             return Err(backend(
                 "bind_tcp needs authentication: configure a PSK, a token file, or both \
@@ -238,6 +230,27 @@ impl FerroStoreServer {
             let device = auth.check_bind(addr)?;
             checked.push((addr, device));
         }
+        Ok(checked)
+    }
+
+    /// Listen on TCP, speak RFC 6455, and serve `store`. `127.0.0.1:0` must bind an ephemeral port.
+    ///
+    /// `auth` must hold a PSK, a token file, or both: a TCP server without
+    /// authentication is refused before it binds. A connection with a valid
+    /// bearer token holds that token's scope; one that passes the PSK
+    /// challenge-response holds `admin` (spec §6.2).
+    ///
+    /// With TLS ([`ServerAuth::with_tls_files`]) this serves `wss://` on any
+    /// address. Without it, plain `ws://` binds only a loopback address, or
+    /// an address of an interface named in [`ServerAuth::allow_plaintext_on`];
+    /// every other address, `0.0.0.0` and `::` always, is refused before it is
+    /// bound (spec §6.3).
+    pub fn bind_tcp(
+        addr: impl ToSocketAddrs,
+        store: FerroStore,
+        auth: ServerAuth,
+    ) -> Result<Self, StoreError> {
+        let checked = Self::check_tcp_bind(addr, &auth)?;
         // As `TcpListener::bind` does: the first address that binds. A
         // plaintext bind on a named interface's address is pinned to that
         // interface (`SO_BINDTODEVICE`), or not made at all.

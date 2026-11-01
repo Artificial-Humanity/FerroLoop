@@ -9,6 +9,7 @@ mod compat;
 mod container_io;
 mod doc;
 mod group;
+mod inspect;
 mod layout;
 mod manifest_ops;
 mod migrate;
@@ -84,6 +85,10 @@ pub use columnar::{
     GateRunRollup, ZoneMap,
 };
 pub use compact::{AUTO_COMPACT_BYTES, StoreStats};
+pub use inspect::{
+    CollectionReport, ColumnTableReport, Contents, Inspection, SlotReport, SuperblockReport,
+    VectorCollectionReport, inspect_at,
+};
 pub use migrate::migrate_redb_to_ferrostore;
 pub use server::FerroStoreServer;
 pub use state::MqRecord;
