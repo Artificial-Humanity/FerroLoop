@@ -6,6 +6,8 @@ import { dispatchOpenArtifact, MermaidDiagram, RichMarkdown } from "./RichMarkdo
 import { ThinkingBlock } from "./ThinkingBlock";
 import { ToolCallBlock } from "./ToolCallBlock";
 
+export const EXPAND_TURN_EVENT = "ferrodeck:expand-turn";
+
 export interface TurnCardProps {
   turn: TranscriptTurn;
   agentDisplayName?: string;
@@ -14,6 +16,11 @@ export interface TurnCardProps {
   onOpenArtifact?: (pathOrUrl: string) => void;
   /** Consecutive tool-output turns attached to this assistant tool-call turn. */
   attachedToolOutputs?: TranscriptTurn[];
+  /**
+   * When true (default), internal work (Thinking + ToolCalls + attachedToolOutputs)
+   * on a directed-assistant prose turn is collapsed into a single "Internal work" row.
+   */
+  encapsulateInternalWork?: boolean;
 }
 
 export function summarizeToolOutputContent(raw: string): string {
@@ -286,6 +293,7 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   isActive = false,
   onOpenArtifact,
   attachedToolOutputs,
+  encapsulateInternalWork = true,
 }) => {
   const roleNormalized = (turn.role || "assistant").toLowerCase();
   const trimmedStart = turn.content.trimStart();
@@ -340,10 +348,28 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   const [expandedAttachedToolOutputs, setExpandedAttachedToolOutputs] = React.useState<
     Record<number, boolean>
   >({});
+  const [internalWorkExpanded, setInternalWorkExpanded] = React.useState(false);
   const [wireExpanded, setWireExpanded] = React.useState(false);
   const activeTimeZone = useActiveTimeZone();
   const [systemExpanded, setSystemExpanded] = React.useState(false);
   const [expandedCodeBlocks, setExpandedCodeBlocks] = React.useState<Record<number, boolean>>({});
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = (event: Event) => {
+      const custom = event as CustomEvent<{ turnIndex?: number }>;
+      const targetIdx = custom.detail?.turnIndex;
+      if (targetIdx === undefined) return;
+      if (
+        targetIdx === turn.index ||
+        (attachedToolOutputs ?? []).some((o) => o.index === targetIdx)
+      ) {
+        setInternalWorkExpanded(true);
+      }
+    };
+    window.addEventListener(EXPAND_TURN_EVENT, handler);
+    return () => window.removeEventListener(EXPAND_TURN_EVENT, handler);
+  }, [turn.index, attachedToolOutputs]);
 
   const roleLabel = isUser
     ? "Operator"
@@ -409,6 +435,29 @@ export const TurnCard: React.FC<TurnCardProps> = ({
   const segments = React.useMemo(() => splitTurnContent(cleanedContent), [cleanedContent]);
   const hasThinking = Boolean(turn.thinking && turn.thinking.trim().length > 0);
   const toolCalls = turn.tool_calls ?? [];
+  const attachedOutputsCount = attachedToolOutputs?.length ?? 0;
+  const hasInternalWork =
+    hasThinking || toolCalls.length > 0 || attachedOutputsCount > 0;
+  const shouldEncapsulateInternalWork =
+    encapsulateInternalWork && isDirectedAssistant && hasInternalWork;
+
+  const internalWorkSummary = React.useMemo(() => {
+    const parts: string[] = [];
+    if (hasThinking) {
+      parts.push("1 thinking");
+    }
+    if (toolCalls.length > 0) {
+      parts.push(
+        `${toolCalls.length} ${toolCalls.length === 1 ? "tool call" : "tool calls"}`,
+      );
+    }
+    if (attachedOutputsCount > 0) {
+      parts.push(
+        `${attachedOutputsCount} ${attachedOutputsCount === 1 ? "output" : "outputs"}`,
+      );
+    }
+    return `Internal work · ${parts.join(" · ")}`;
+  }, [hasThinking, toolCalls.length, attachedOutputsCount]);
 
   const toolOutputSummary = React.useMemo(() => {
     if (!isToolOutput) return "";
@@ -485,116 +534,304 @@ export const TurnCard: React.FC<TurnCardProps> = ({
         )}
       </header>
 
-      {hasThinking && turn.thinking && (
-        <ThinkingBlock thinking={turn.thinking} isActive={isActive} />
-      )}
-
-      {(toolCalls.length > 0 ||
-        (attachedToolOutputs && attachedToolOutputs.length > 0)) && (
+      {shouldEncapsulateInternalWork ? (
         <div
-          data-testid={`turn-tools-${turn.index}`}
-          style={{ display: "flex", flexDirection: "column", gap: "4px" }}
+          data-testid={`turn-internal-work-${turn.index}`}
+          style={{
+            borderRadius: "var(--radius-sm)",
+            border: "1px solid var(--border-subtle)",
+            backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
+            overflow: "hidden",
+          }}
         >
-          {toolCalls.map((tool, idx) => (
-            <ToolCallBlock
-              key={`${tool.name}-${idx}`}
-              tool={tool}
-              index={idx}
-            />
-          ))}
-
-          {attachedToolOutputs && attachedToolOutputs.length > 0 && (
-            <div
-              data-testid={`turn-attached-tool-outputs-${turn.index}`}
-              style={{ display: "flex", flexDirection: "column", gap: "4px" }}
+          <button
+            type="button"
+            data-testid={`turn-internal-work-toggle-${turn.index}`}
+            aria-expanded={internalWorkExpanded}
+            onClick={() => setInternalWorkExpanded((prev) => !prev)}
+            style={{
+              width: "100%",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "8px",
+              padding: "6px 10px",
+              background: "transparent",
+              border: "none",
+              color: "var(--text-secondary)",
+              cursor: "pointer",
+              fontSize: "11px",
+              textAlign: "left",
+            }}
+          >
+            <span
+              className="fd-mono"
+              style={{ display: "flex", alignItems: "center", gap: "6px", minWidth: 0 }}
             >
-              {attachedToolOutputs.map((outTurn) => {
-                const { cleanedContent: outCleaned } = extractTurnAttachments(
-                  outTurn.content,
-                  { stripAgyWrapper: false },
-                );
-                const outText = outCleaned || outTurn.content || "";
-                const outSummary = summarizeToolOutputContent(outText);
-                const outExpanded = Boolean(expandedAttachedToolOutputs[outTurn.index]);
-                return (
-                  <div
-                    key={`attached-tool-output-${outTurn.index}`}
-                    data-testid={`turn-content-${outTurn.index}`}
-                    style={{
-                      borderRadius: "var(--radius-sm)",
-                      border: "1px solid var(--border-subtle)",
-                      backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
-                      overflow: "hidden",
-                    }}
-                  >
-                    <button
-                      type="button"
-                      data-testid={`turn-tool-output-toggle-${outTurn.index}`}
-                      aria-expanded={outExpanded}
-                      onClick={() =>
-                        setExpandedAttachedToolOutputs((prev) => ({
-                          ...prev,
-                          [outTurn.index]: !prev[outTurn.index],
-                        }))
-                      }
-                      style={{
-                        width: "100%",
-                        display: "flex",
-                        alignItems: "center",
-                        justifyContent: "space-between",
-                        gap: "8px",
-                        padding: "6px 10px",
-                        background: "transparent",
-                        border: "none",
-                        color: "var(--text-secondary)",
-                        cursor: "pointer",
-                        fontSize: "11px",
-                        textAlign: "left",
-                      }}
-                    >
-                      <span
-                        className="fd-mono"
-                        style={{ display: "flex", alignItems: "center", gap: "6px" }}
-                      >
-                        <span
-                          data-testid={`turn-tool-output-arrow-${outTurn.index}`}
-                          style={{ color: "var(--status-warn, #F59E0B)" }}
-                        >
-                          {outExpanded ? "▼" : "▶"}
-                        </span>
-                        <span>{outSummary}</span>
-                      </span>
-                      <span style={{ color: "var(--text-dim)", fontSize: "11px" }}>
-                        {outExpanded ? "Hide output" : "Show output"}
-                      </span>
-                    </button>
+              <span style={{ color: "var(--accent-primary)" }}>
+                {internalWorkExpanded ? "▾" : "▸"}
+              </span>
+              {isActive && hasThinking && !internalWorkExpanded && (
+                <span
+                  className="fd-thinking-dot"
+                  data-testid="thinking-activity-dot"
+                  aria-hidden="true"
+                />
+              )}
+              <span
+                style={{
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                {internalWorkSummary}
+              </span>
+            </span>
+            <span style={{ color: "var(--text-dim)", fontSize: "11px", flexShrink: 0 }}>
+              {internalWorkExpanded ? "Hide steps" : "Show steps"}
+            </span>
+          </button>
 
-                    {outExpanded && (
-                      <pre
-                        className="fd-mono"
-                        style={{
-                          margin: 0,
-                          padding: "10px 12px",
-                          borderTop: "1px solid var(--border-subtle)",
-                          backgroundColor: "var(--bg-input)",
-                          fontSize: "11.5px",
-                          lineHeight: 1.45,
-                          color: "var(--text-primary)",
-                          whiteSpace: "pre-wrap",
-                          wordBreak: "break-word",
-                          maxHeight: "340px",
-                          overflowY: "auto",
-                        }}
-                      >
-                        {outText}
-                      </pre>
-                    )}
-                  </div>
-                );
-              })}
+          {internalWorkExpanded && (
+            <div
+              data-testid={`turn-internal-work-body-${turn.index}`}
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+                padding: "8px 10px",
+                borderTop: "1px solid var(--border-subtle)",
+              }}
+            >
+              {hasThinking && turn.thinking && (
+                <ThinkingBlock thinking={turn.thinking} isActive={isActive} />
+              )}
+
+              {(toolCalls.length > 0 ||
+                (attachedToolOutputs && attachedToolOutputs.length > 0)) && (
+                <div
+                  data-testid={`turn-tools-${turn.index}`}
+                  style={{ display: "flex", flexDirection: "column", gap: "4px" }}
+                >
+                  {toolCalls.map((tool, idx) => (
+                    <ToolCallBlock
+                      key={`${tool.name}-${idx}`}
+                      tool={tool}
+                      index={idx}
+                    />
+                  ))}
+
+                  {attachedToolOutputs && attachedToolOutputs.length > 0 && (
+                    <div
+                      data-testid={`turn-attached-tool-outputs-${turn.index}`}
+                      style={{ display: "flex", flexDirection: "column", gap: "4px" }}
+                    >
+                      {attachedToolOutputs.map((outTurn) => {
+                        const { cleanedContent: outCleaned } = extractTurnAttachments(
+                          outTurn.content,
+                          { stripAgyWrapper: false },
+                        );
+                        const outText = outCleaned || outTurn.content || "";
+                        const outSummary = summarizeToolOutputContent(outText);
+                        const outExpanded = Boolean(expandedAttachedToolOutputs[outTurn.index]);
+                        return (
+                          <div
+                            key={`attached-tool-output-${outTurn.index}`}
+                            data-testid={`turn-content-${outTurn.index}`}
+                            style={{
+                              borderRadius: "var(--radius-sm)",
+                              border: "1px solid var(--border-subtle)",
+                              backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
+                              overflow: "hidden",
+                            }}
+                          >
+                            <button
+                              type="button"
+                              data-testid={`turn-tool-output-toggle-${outTurn.index}`}
+                              aria-expanded={outExpanded}
+                              onClick={() =>
+                                setExpandedAttachedToolOutputs((prev) => ({
+                                  ...prev,
+                                  [outTurn.index]: !prev[outTurn.index],
+                                }))
+                              }
+                              style={{
+                                width: "100%",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "space-between",
+                                gap: "8px",
+                                padding: "6px 10px",
+                                background: "transparent",
+                                border: "none",
+                                color: "var(--text-secondary)",
+                                cursor: "pointer",
+                                fontSize: "11px",
+                                textAlign: "left",
+                              }}
+                            >
+                              <span
+                                className="fd-mono"
+                                style={{ display: "flex", alignItems: "center", gap: "6px" }}
+                              >
+                                <span
+                                  data-testid={`turn-tool-output-arrow-${outTurn.index}`}
+                                  style={{ color: "var(--status-warn, #F59E0B)" }}
+                                >
+                                  {outExpanded ? "▼" : "▶"}
+                                </span>
+                                <span>{outSummary}</span>
+                              </span>
+                              <span style={{ color: "var(--text-dim)", fontSize: "11px" }}>
+                                {outExpanded ? "Hide output" : "Show output"}
+                              </span>
+                            </button>
+
+                            {outExpanded && (
+                              <pre
+                                className="fd-mono"
+                                style={{
+                                  margin: 0,
+                                  padding: "10px 12px",
+                                  borderTop: "1px solid var(--border-subtle)",
+                                  backgroundColor: "var(--bg-input)",
+                                  fontSize: "11.5px",
+                                  lineHeight: 1.45,
+                                  color: "var(--text-primary)",
+                                  whiteSpace: "pre-wrap",
+                                  wordBreak: "break-word",
+                                  maxHeight: "340px",
+                                  overflowY: "auto",
+                                }}
+                              >
+                                {outText}
+                              </pre>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>
+      ) : (
+        <>
+          {hasThinking && turn.thinking && (
+            <ThinkingBlock thinking={turn.thinking} isActive={isActive} />
+          )}
+
+          {(toolCalls.length > 0 ||
+            (attachedToolOutputs && attachedToolOutputs.length > 0)) && (
+            <div
+              data-testid={`turn-tools-${turn.index}`}
+              style={{ display: "flex", flexDirection: "column", gap: "4px" }}
+            >
+              {toolCalls.map((tool, idx) => (
+                <ToolCallBlock
+                  key={`${tool.name}-${idx}`}
+                  tool={tool}
+                  index={idx}
+                />
+              ))}
+
+              {attachedToolOutputs && attachedToolOutputs.length > 0 && (
+                <div
+                  data-testid={`turn-attached-tool-outputs-${turn.index}`}
+                  style={{ display: "flex", flexDirection: "column", gap: "4px" }}
+                >
+                  {attachedToolOutputs.map((outTurn) => {
+                    const { cleanedContent: outCleaned } = extractTurnAttachments(
+                      outTurn.content,
+                      { stripAgyWrapper: false },
+                    );
+                    const outText = outCleaned || outTurn.content || "";
+                    const outSummary = summarizeToolOutputContent(outText);
+                    const outExpanded = Boolean(expandedAttachedToolOutputs[outTurn.index]);
+                    return (
+                      <div
+                        key={`attached-tool-output-${outTurn.index}`}
+                        data-testid={`turn-content-${outTurn.index}`}
+                        style={{
+                          borderRadius: "var(--radius-sm)",
+                          border: "1px solid var(--border-subtle)",
+                          backgroundColor: "var(--subcard-bg, var(--bg-elevated))",
+                          overflow: "hidden",
+                        }}
+                      >
+                        <button
+                          type="button"
+                          data-testid={`turn-tool-output-toggle-${outTurn.index}`}
+                          aria-expanded={outExpanded}
+                          onClick={() =>
+                            setExpandedAttachedToolOutputs((prev) => ({
+                              ...prev,
+                              [outTurn.index]: !prev[outTurn.index],
+                            }))
+                          }
+                          style={{
+                            width: "100%",
+                            display: "flex",
+                            alignItems: "center",
+                            justifyContent: "space-between",
+                            gap: "8px",
+                            padding: "6px 10px",
+                            background: "transparent",
+                            border: "none",
+                            color: "var(--text-secondary)",
+                            cursor: "pointer",
+                            fontSize: "11px",
+                            textAlign: "left",
+                          }}
+                        >
+                          <span
+                            className="fd-mono"
+                            style={{ display: "flex", alignItems: "center", gap: "6px" }}
+                          >
+                            <span
+                              data-testid={`turn-tool-output-arrow-${outTurn.index}`}
+                              style={{ color: "var(--status-warn, #F59E0B)" }}
+                            >
+                              {outExpanded ? "▼" : "▶"}
+                            </span>
+                            <span>{outSummary}</span>
+                          </span>
+                          <span style={{ color: "var(--text-dim)", fontSize: "11px" }}>
+                            {outExpanded ? "Hide output" : "Show output"}
+                          </span>
+                        </button>
+
+                        {outExpanded && (
+                          <pre
+                            className="fd-mono"
+                            style={{
+                              margin: 0,
+                              padding: "10px 12px",
+                              borderTop: "1px solid var(--border-subtle)",
+                              backgroundColor: "var(--bg-input)",
+                              fontSize: "11.5px",
+                              lineHeight: 1.45,
+                              color: "var(--text-primary)",
+                              whiteSpace: "pre-wrap",
+                              wordBreak: "break-word",
+                              maxHeight: "340px",
+                              overflowY: "auto",
+                            }}
+                          >
+                            {outText}
+                          </pre>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </>
       )}
 
       {isWire && segments.length > 0 && (

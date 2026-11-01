@@ -425,6 +425,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     useState<SessionQuotaUsage | null>(null);
   const optimisticPromptRef = useRef<OptimisticPrompt | null>(null);
   const refreshInFlightRef = useRef<boolean>(false);
+  const tornDownTargetsRef = useRef<Set<string>>(new Set());
   const pairInFlightRef = useRef<Promise<AuthSessionResponse> | null>(null);
   const [lastSeenAssistantTurnIndex, setLastSeenAssistantTurnIndex] =
     useState<Record<string, number>>(readInitialLastSeenAssistantTurn);
@@ -499,6 +500,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     if (tab === "chat") {
       setSplitView(false);
       setActiveTab("chat");
+      void refreshSessionsAndTranscriptRef.current();
       return;
     }
     if (splitView && secondaryTab === tab) {
@@ -509,6 +511,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       setActiveTab(tab);
       setSplitView(true);
     }
+    void refreshSessionsAndTranscriptRef.current();
   };
 
   const refreshWireAndRoster = useCallback(async () => {
@@ -588,15 +591,26 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         const requestedAgentKey = requestedAgentName.trim().toLowerCase();
         const requestedSessionId = selectedSessionIdRef.current;
         const sessRes = await apiClient.getSessions().catch(() => null);
-        const list = sessRes?.sessions ?? [];
+        const rawList = sessRes?.sessions ?? [];
+        const list = rawList.filter(
+          (s) =>
+            !tornDownTargetsRef.current.has(s.id.toLowerCase()) &&
+            !tornDownTargetsRef.current.has((s.persona ?? "").toLowerCase()),
+        );
         if (sessRes) {
           setSessions(list);
         }
         await scanBackgroundTranscripts(list);
-        const targetId =
+        const rawTargetId =
           sessionOverride === null
             ? null
             : (sessionOverride ?? requestedSessionId ?? requestedAgentName);
+        const targetId =
+          rawTargetId &&
+          !tornDownTargetsRef.current.has(rawTargetId.trim().toLowerCase()) &&
+          !tornDownTargetsRef.current.has(requestedAgentKey)
+            ? rawTargetId
+            : null;
         if (targetId) {
           const trRes = await apiClient.getSessionTranscript(targetId).catch(() => null);
           if (trRes) {
@@ -764,9 +778,17 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         sessionsRes?.sessions?.find((s) => (s.persona ?? "").toLowerCase() === initialKey)?.id ??
         agentsRes?.routes?.find((r) => (r.persona ?? "").toLowerCase() === initialKey)?.id ??
         initialAgentName;
-      if (matchedSessionId) {
+      if (
+        matchedSessionId &&
+        !tornDownTargetsRef.current.has(matchedSessionId.trim().toLowerCase()) &&
+        !tornDownTargetsRef.current.has(initialKey)
+      ) {
         const trRes = await apiClient.getSessionTranscript(matchedSessionId).catch(() => null);
-        if (trRes) {
+        if (
+          trRes &&
+          !tornDownTargetsRef.current.has(matchedSessionId.trim().toLowerCase()) &&
+          !tornDownTargetsRef.current.has(initialKey)
+        ) {
           recordTranscript(initialAgentName, trRes.turns ?? []);
           if (
             selectedAgentNameRef.current.trim().toLowerCase() === initialKey &&
@@ -953,7 +975,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
   useEffect(() => {
     const nextAgentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
     const targetId = activeSession?.id || selectedAgent?.name_key;
-    if (!targetId) {
+    if (
+      !targetId ||
+      tornDownTargetsRef.current.has(targetId.trim().toLowerCase()) ||
+      (nextAgentKey && tornDownTargetsRef.current.has(nextAgentKey))
+    ) {
       prevLoadedAgentKeyRef.current = nextAgentKey;
       setTranscriptTurns([]);
       setSessionQueue([]);
@@ -1019,6 +1045,32 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     }, transcriptPollIntervalMs(isSessionBusy));
     return () => clearInterval(intervalId);
   }, [authority, activeTab, splitView, isSessionBusy, refreshSessionsAndTranscript]);
+
+  // Re-fetch /api/v1/sessions and active transcript when returning focus or visibility
+  // to FerroDeck (e.g. after changing model in a vendor CLI or the Claude app).
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    const handleWindowFocus = () => {
+      void refreshSessionsAndTranscript();
+    };
+    const handleVisibilityChange = () => {
+      if (typeof document !== "undefined" && !document.hidden) {
+        void refreshSessionsAndTranscript();
+      }
+    };
+    window.addEventListener("focus", handleWindowFocus);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+    }
+    return () => {
+      window.removeEventListener("focus", handleWindowFocus);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+      }
+    };
+  }, [refreshSessionsAndTranscript]);
 
   // Transcripts keyed by owning agent (background scans + recorded active
   // loads). Keying by owner avoids crediting one agent with another's turns
@@ -1233,11 +1285,16 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
 
   const handleSpinUpSession = async (req: SpinUpSessionRequest) => {
     const res = await apiClient.spinUpSession(req);
+    if (req.persona) {
+      tornDownTargetsRef.current.delete(req.persona.trim().toLowerCase());
+    }
     if (res.persona) {
+      tornDownTargetsRef.current.delete(res.persona.trim().toLowerCase());
       selectedAgentNameRef.current = res.persona;
       setSelectedAgentName(res.persona);
     }
     if (res.session_id) {
+      tornDownTargetsRef.current.delete(res.session_id.trim().toLowerCase());
       selectedSessionIdRef.current = res.session_id;
       setSelectedSessionId(res.session_id);
     }
@@ -1253,8 +1310,28 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     if (!targetId) {
       throw new Error("No active session selected to decommission.");
     }
+    if (mode === "teardown") {
+      tornDownTargetsRef.current.add(targetId.trim().toLowerCase());
+      if (activeSession?.id) {
+        tornDownTargetsRef.current.add(activeSession.id.trim().toLowerCase());
+      }
+      if (selectedAgent?.name_key) {
+        tornDownTargetsRef.current.add(
+          selectedAgent.name_key.trim().toLowerCase(),
+        );
+      }
+    }
     const res = await apiClient.decommissionSession(targetId, mode);
     if (mode === "teardown") {
+      const agentKey = (selectedAgent?.name_key ?? "").trim().toLowerCase();
+      if (agentKey) {
+        delete backgroundTranscriptsRef.current[agentKey];
+        setBackgroundTranscripts((prev) => {
+          const next = { ...prev };
+          delete next[agentKey];
+          return next;
+        });
+      }
       setSelectedSessionId(null);
       selectedSessionIdRef.current = null;
       setTranscriptTurns([]);
@@ -1497,11 +1574,38 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     [nodes],
   );
 
+  const mergedRoutes = useMemo<DiscoveredSessionSummary[]>(() => {
+    if (sessions.length === 0) return routes;
+    if (routes.length === 0) return sessions;
+    const matchedSessionIds = new Set<string>();
+    const overlaid = routes.map((route) => {
+      const routePersona = (route.persona ?? "").trim().toLowerCase();
+      const fresh = sessions.find(
+        (s) =>
+          s.id === route.id ||
+          (routePersona && (s.persona ?? "").trim().toLowerCase() === routePersona),
+      );
+      if (fresh) {
+        matchedSessionIds.add(fresh.id);
+        return fresh;
+      }
+      return route;
+    });
+    for (const s of sessions) {
+      if (!matchedSessionIds.has(s.id)) {
+        overlaid.push(s);
+      }
+    }
+    return overlaid;
+  }, [routes, sessions]);
+
   const handleOpenAgentSettingsFor = useCallback(
     (nameKey?: string) => {
+      let switchedAgent = false;
       if (nameKey) {
         const nextKey = nameKey.trim().toLowerCase();
         if (nextKey !== selectedAgentNameRef.current.trim().toLowerCase()) {
+          switchedAgent = true;
           selectedAgentNameRef.current = nameKey;
           selectedSessionIdRef.current = null;
           setTranscriptTurns(backgroundTranscriptsRef.current[nextKey] ?? []);
@@ -1517,8 +1621,11 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
         setActiveTab("chat");
       }
       setAgentSettingsOpen(true);
+      if (switchedAgent) {
+        void refreshSessionsAndTranscript();
+      }
     },
-    [splitView, activeTab],
+    [splitView, activeTab, refreshSessionsAndTranscript],
   );
 
   const handleToggleSplitView = useCallback(() => {
@@ -1533,7 +1640,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
     <div className="fd-cockpit" data-testid="ferrodeck-cockpit">
       <RosterSidebar
         agents={agents}
-        routes={routes}
+        routes={mergedRoutes}
         liveness={liveness}
         unreadByAgent={unreadByAgent}
         unreadSeverityByAgent={unreadSeverityByAgent}
@@ -1552,6 +1659,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
           setSelectedAgentName(nameKey);
           setSelectedSessionId(null);
           setMobileRosterOpen(false);
+          void refreshSessionsAndTranscript();
         }}
         onOpenAgentSettings={(nameKey) => handleOpenAgentSettingsFor(nameKey)}
         onOpenProjectSettings={(project) => {
@@ -1577,7 +1685,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
       <div className="fd-main">
         <ContextHeader
           selectedAgent={selectedAgent}
-          sessions={sessions.length > 0 ? sessions : routes}
+          sessions={mergedRoutes}
           selectedSessionId={activeSession?.id ?? null}
           onSelectSession={(sessionId) => {
             if (sessionId !== selectedSessionIdRef.current) {
@@ -1589,6 +1697,7 @@ export const App: React.FC<AppProps> = ({ apiClient: propApiClient, wsClient: pr
               setSessionQuotaUsage(null);
             }
             setSelectedSessionId(sessionId);
+            void refreshSessionsAndTranscript(sessionId);
           }}
           activeTab={activeTab}
           onSelectTab={handleSelectTab}

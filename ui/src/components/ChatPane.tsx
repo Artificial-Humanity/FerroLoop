@@ -17,11 +17,12 @@ import {
   type SlashCommandEntry,
   type TranscriptTurn,
 } from "../types/api";
-import { useActiveTimeZone } from "../lib/datetime";
+import { formatTimestamp, useActiveTimeZone } from "../lib/datetime";
 import { AgentSettingsModal } from "./AgentSettingsModal";
 import { dispatchOpenHelp, type HelpTopicId } from "./HelpDrawer";
 import { ThinkingBlock } from "./ThinkingBlock";
 import {
+  EXPAND_TURN_EVENT,
   extractTurnAttachments,
   isOperatorUserTurn,
   isPureToolOutputTurn,
@@ -215,6 +216,352 @@ export function coalesceTurnsWithToolOutputs(
   }
   return groups;
 }
+
+export function isIntermediateAssistantWorkGroup(
+  group: CoalescedTurnGroup,
+): boolean {
+  const roleNormalized = (group.turn.role || "assistant").toLowerCase();
+  if (roleNormalized !== "assistant") {
+    return false;
+  }
+  if (isPureToolOutputTurn(group.turn) || isWireTurn(group.turn)) {
+    return false;
+  }
+  const { cleanedContent, attachments } = extractTurnAttachments(
+    group.turn.content || "",
+    { stripAgyWrapper: false },
+  );
+  if (cleanedContent.trim().length > 0 || attachments.length > 0) {
+    return false;
+  }
+  const hasThinking = Boolean(
+    group.turn.thinking && group.turn.thinking.trim().length > 0,
+  );
+  const hasToolCalls = (group.turn.tool_calls?.length ?? 0) > 0;
+  const hasAttachedOutputs = group.attachedToolOutputs.length > 0;
+  return hasThinking || hasToolCalls || hasAttachedOutputs;
+}
+
+export type StreamRenderItem =
+  | { kind: "single"; group: CoalescedTurnGroup }
+  | { kind: "work-run"; groups: CoalescedTurnGroup[] };
+
+export function groupConsecutiveWorkRuns(
+  groups: CoalescedTurnGroup[],
+): StreamRenderItem[] {
+  const items: StreamRenderItem[] = [];
+  for (const group of groups) {
+    if (isIntermediateAssistantWorkGroup(group)) {
+      const prev = items[items.length - 1];
+      if (prev && prev.kind === "work-run") {
+        prev.groups.push(group);
+      } else {
+        items.push({ kind: "work-run", groups: [group] });
+      }
+    } else {
+      items.push({ kind: "single", group });
+    }
+  }
+  return items;
+}
+
+export interface EncapsulatedWorkBlockProps {
+  groups: CoalescedTurnGroup[];
+  agentDisplayName?: string;
+  isLastActive?: boolean;
+  onOpenArtifact?: (pathOrUrl: string) => void;
+}
+
+export const EncapsulatedWorkBlock: React.FC<EncapsulatedWorkBlockProps> = ({
+  groups,
+  agentDisplayName,
+  isLastActive = false,
+  onOpenArtifact,
+}) => {
+  const [expanded, setExpanded] = React.useState(false);
+  const activeTimeZone = useActiveTimeZone();
+
+  const allTurnIndices = React.useMemo(() => {
+    const indices: number[] = [];
+    for (const g of groups) {
+      indices.push(g.turn.index);
+      for (const out of g.attachedToolOutputs) {
+        indices.push(out.index);
+      }
+    }
+    return indices;
+  }, [groups]);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const handler = (event: Event) => {
+      const custom = event as CustomEvent<{ turnIndex?: number }>;
+      const targetIdx = custom.detail?.turnIndex;
+      if (targetIdx !== undefined && allTurnIndices.includes(targetIdx)) {
+        setExpanded(true);
+      }
+    };
+    window.addEventListener(EXPAND_TURN_EVENT, handler);
+    return () => window.removeEventListener(EXPAND_TURN_EVENT, handler);
+  }, [allTurnIndices]);
+
+  const firstIndex = groups[0]?.turn.index ?? 0;
+  const lastIndex = groups[groups.length - 1]?.turn.index ?? firstIndex;
+  const rangeLabel =
+    firstIndex === lastIndex ? `#${firstIndex}` : `#${firstIndex}–#${lastIndex}`;
+
+  const latestCreatedAt = React.useMemo(() => {
+    for (let i = groups.length - 1; i >= 0; i--) {
+      const g = groups[i];
+      for (let j = g.attachedToolOutputs.length - 1; j >= 0; j--) {
+        if (g.attachedToolOutputs[j].created_at) {
+          return g.attachedToolOutputs[j].created_at;
+        }
+      }
+      if (g.turn.created_at) {
+        return g.turn.created_at;
+      }
+    }
+    return undefined;
+  }, [groups]);
+
+  const {
+    stepCount,
+    thinkingCount,
+    totalToolCalls,
+    uniqueToolNames,
+    totalOutputs,
+    summaryText,
+  } = React.useMemo(() => {
+    const stepCnt = groups.length;
+    let thinkCnt = 0;
+    let toolCnt = 0;
+    let outCnt = 0;
+    const names: string[] = [];
+    for (const g of groups) {
+      if (g.turn.thinking && g.turn.thinking.trim().length > 0) {
+        thinkCnt += 1;
+      }
+      for (const tc of g.turn.tool_calls ?? []) {
+        toolCnt += 1;
+        const name = tc.name || "tool";
+        if (!names.includes(name)) {
+          names.push(name);
+        }
+      }
+      outCnt += g.attachedToolOutputs.length;
+    }
+
+    const parts: string[] = [
+      `${stepCnt} ${stepCnt === 1 ? "step" : "steps"}`,
+    ];
+    if (thinkCnt > 0 && toolCnt === 0 && outCnt === 0) {
+      parts.push(`${thinkCnt} thinking`);
+    }
+    if (toolCnt > 0) {
+      const shown = names.slice(0, 3).join(", ");
+      const extra = names.length > 3 ? `, +${names.length - 3}` : "";
+      parts.push(
+        `${toolCnt} ${toolCnt === 1 ? "tool call" : "tool calls"}${
+          shown ? ` (${shown}${extra})` : ""
+        }`,
+      );
+    }
+    if (outCnt > 0) {
+      parts.push(`${outCnt} ${outCnt === 1 ? "output" : "outputs"}`);
+    }
+    return {
+      stepCount: stepCnt,
+      thinkingCount: thinkCnt,
+      totalToolCalls: toolCnt,
+      uniqueToolNames: names,
+      totalOutputs: outCnt,
+      summaryText: parts.join(" · "),
+    };
+  }, [groups]);
+
+  const lastGroupHasThinking = Boolean(
+    groups[groups.length - 1]?.turn.thinking?.trim(),
+  );
+
+  return (
+    <article
+      className="fd-card"
+      data-testid="encapsulated-work-block"
+      data-turn-indices={allTurnIndices.join(",")}
+      style={{
+        borderColor: "var(--border-subtle)",
+        backgroundColor: "var(--bg-surface)",
+        display: "flex",
+        flexDirection: "column",
+        gap: expanded ? "8px" : "0",
+        padding: expanded ? undefined : "6px 12px",
+      }}
+    >
+      <button
+        type="button"
+        data-testid="encapsulated-work-toggle"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((prev) => !prev)}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: "8px",
+          padding: "2px 0",
+          background: "transparent",
+          border: "none",
+          color: "var(--text-secondary)",
+          cursor: "pointer",
+          fontSize: "11.5px",
+          textAlign: "left",
+          flexWrap: "wrap",
+        }}
+      >
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "8px",
+            minWidth: 0,
+            flex: 1,
+          }}
+        >
+          <span
+            className="fd-mono"
+            style={{ color: "var(--accent-primary)", flexShrink: 0 }}
+          >
+            {expanded ? "▾" : "▸"}
+          </span>
+          {isLastActive && lastGroupHasThinking && !expanded && (
+            <span
+              className="fd-thinking-dot"
+              data-testid="thinking-activity-dot"
+              aria-hidden="true"
+            />
+          )}
+          <span
+            className="fd-badge"
+            style={{
+              backgroundColor: "var(--bg-elevated)",
+              borderColor: "var(--border-subtle)",
+              color: "var(--text-primary)",
+              flexShrink: 0,
+            }}
+          >
+            {agentDisplayName || "Assistant"}
+          </span>
+          <span
+            className="fd-mono"
+            data-testid="encapsulated-work-range"
+            style={{ fontSize: "11px", color: "var(--text-dim)", flexShrink: 0 }}
+          >
+            {rangeLabel}
+          </span>
+          <span
+            className="fd-mono"
+            data-testid="encapsulated-work-summary"
+            style={{
+              fontSize: "11px",
+              color: "var(--text-secondary)",
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+            title={
+              uniqueToolNames.length > 0
+                ? `${stepCount} steps · tools: ${uniqueToolNames.join(", ")}`
+                : undefined
+            }
+          >
+            {summaryText}
+          </span>
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            flexShrink: 0,
+          }}
+        >
+          {thinkingCount > 0 && (
+            <span
+              className="fd-badge fd-mono"
+              style={{ fontSize: "10px", padding: "1px 6px" }}
+            >
+              {thinkingCount} thinking
+            </span>
+          )}
+          {totalToolCalls > 0 && (
+            <span
+              className="fd-badge fd-mono"
+              style={{
+                fontSize: "10px",
+                padding: "1px 6px",
+                color: "var(--status-warn, #F59E0B)",
+              }}
+            >
+              {totalToolCalls} {totalToolCalls === 1 ? "tool" : "tools"}
+            </span>
+          )}
+          {totalOutputs > 0 && (
+            <span
+              className="fd-badge fd-mono"
+              style={{ fontSize: "10px", padding: "1px 6px" }}
+            >
+              {totalOutputs} {totalOutputs === 1 ? "output" : "outputs"}
+            </span>
+          )}
+          {latestCreatedAt && (
+            <time
+              dateTime={latestCreatedAt}
+              title={latestCreatedAt}
+              className="fd-mono"
+              style={{ fontSize: "11px", color: "var(--text-dim)" }}
+            >
+              {formatTimestamp(latestCreatedAt, activeTimeZone)}
+            </time>
+          )}
+          <span style={{ color: "var(--text-dim)", fontSize: "11px" }}>
+            {expanded ? "Hide steps" : "Show steps"}
+          </span>
+        </div>
+      </button>
+
+      {expanded && (
+        <div
+          data-testid="encapsulated-work-body"
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: "8px",
+            paddingTop: "6px",
+            borderTop: "1px solid var(--border-subtle)",
+          }}
+        >
+          {groups.map((group, gIdx) => (
+            <TurnCard
+              key={`${group.turn.index}-${group.turn.created_at ?? ""}`}
+              turn={group.turn}
+              attachedToolOutputs={group.attachedToolOutputs}
+              agentDisplayName={agentDisplayName}
+              encapsulateInternalWork={false}
+              isActive={
+                isLastActive &&
+                gIdx === groups.length - 1 &&
+                group.attachedToolOutputs.length === 0
+              }
+              onOpenArtifact={onOpenArtifact}
+            />
+          ))}
+        </div>
+      )}
+    </article>
+  );
+};
 
 export function getVendorModelOptions(
   adapter?: string | null,
@@ -1372,12 +1719,26 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const scrollToTurnIndex = React.useCallback(
     (turnIndex: number) => {
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent(EXPAND_TURN_EVENT, { detail: { turnIndex } }),
+        );
+      }
       const container = scrollContainerRef.current;
       const tryScroll = () => {
         const root = container ?? document;
-        const card = root.querySelector<HTMLElement>(
-          `[data-testid="turn-card-${turnIndex}"]`,
-        );
+        const card =
+          root.querySelector<HTMLElement>(
+            `[data-testid="turn-card-${turnIndex}"]`,
+          ) ??
+          Array.from(
+            root.querySelectorAll<HTMLElement>("[data-turn-indices]"),
+          ).find((el) =>
+            (el.getAttribute("data-turn-indices") || "")
+              .split(",")
+              .includes(String(turnIndex)),
+          ) ??
+          null;
         if (card) {
           if (typeof card.scrollIntoView === "function") {
             card.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -2341,20 +2702,37 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 </button>
               </div>
             )}
-            {coalesceTurnsWithToolOutputs(displayedTurns).map((group, idx, arr) => (
-              <TurnCard
-                key={`${group.turn.index}-${group.turn.created_at ?? ""}`}
-                turn={group.turn}
-                attachedToolOutputs={group.attachedToolOutputs}
-                agentDisplayName={agentDisplayName ?? agentName ?? undefined}
-                isActive={
-                  effectiveIsBusy &&
-                  idx === arr.length - 1 &&
-                  group.attachedToolOutputs.length === 0
+            {groupConsecutiveWorkRuns(coalesceTurnsWithToolOutputs(displayedTurns)).map(
+              (item, idx, arr) => {
+                const isLastItem = idx === arr.length - 1;
+                if (item.kind === "work-run") {
+                  return (
+                    <EncapsulatedWorkBlock
+                      key={`work-run-${item.groups[0].turn.index}-${item.groups[item.groups.length - 1].turn.index}`}
+                      groups={item.groups}
+                      agentDisplayName={agentDisplayName ?? agentName ?? undefined}
+                      isLastActive={effectiveIsBusy && isLastItem}
+                      onOpenArtifact={onOpenArtifact}
+                    />
+                  );
                 }
-                onOpenArtifact={onOpenArtifact}
-              />
-            ))}
+                const group = item.group;
+                return (
+                  <TurnCard
+                    key={`${group.turn.index}-${group.turn.created_at ?? ""}`}
+                    turn={group.turn}
+                    attachedToolOutputs={group.attachedToolOutputs}
+                    agentDisplayName={agentDisplayName ?? agentName ?? undefined}
+                    isActive={
+                      effectiveIsBusy &&
+                      isLastItem &&
+                      group.attachedToolOutputs.length === 0
+                    }
+                    onOpenArtifact={onOpenArtifact}
+                  />
+                );
+              },
+            )}
           </>
         )}
 

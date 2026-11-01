@@ -78,7 +78,14 @@ describe("ChatPane", () => {
       />,
     );
 
-    // Collapsed by default
+    // Directed prose turn encapsulates internal work (1 thinking + 1 tool call) collapsed by default
+    const internalToggle = screen.getByTestId("turn-internal-work-toggle-1");
+    expect(internalToggle).toHaveAttribute("aria-expanded", "false");
+    expect(internalToggle).toHaveTextContent("Internal work · 1 thinking · 1 tool call");
+    fireEvent.click(internalToggle);
+    expect(internalToggle).toHaveAttribute("aria-expanded", "true");
+
+    // ThinkingBlock inside is collapsed by default
     const toggleBtn = screen.getByRole("button", { name: /Thinking\.\.\./i });
     expect(toggleBtn).toHaveAttribute("aria-expanded", "false");
     expect(
@@ -111,6 +118,8 @@ describe("ChatPane", () => {
         onSendPrompt={vi.fn()}
       />,
     );
+
+    fireEvent.click(screen.getByTestId("turn-internal-work-toggle-1"));
 
     const toolBtn = screen.getByRole("button", { name: /run_command/i });
     expect(toolBtn).toHaveAttribute("aria-expanded", "false");
@@ -480,6 +489,20 @@ describe("ChatPane", () => {
       />,
     );
 
+    // Intermediate work turn is encapsulated into a collapsed encapsulated-work-block by default
+    const workBlock = screen.getByTestId("encapsulated-work-block");
+    expect(workBlock).toHaveAttribute("data-turn-indices", "912,913");
+    const workToggle = screen.getByTestId("encapsulated-work-toggle");
+    expect(workToggle).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByTestId("encapsulated-work-range")).toHaveTextContent("#912");
+    expect(screen.getByTestId("encapsulated-work-summary")).toHaveTextContent(
+      "1 step · 1 tool call (read_file) · 1 output",
+    );
+
+    // Expand the encapsulated work block to inspect turn-card-912
+    fireEvent.click(workToggle);
+    expect(workToggle).toHaveAttribute("aria-expanded", "true");
+
     // Only a single TurnCard (turn-card-912) is rendered; turn 913 is encapsulated inside it
     const assistantCard = screen.getByTestId("turn-card-912");
     expect(assistantCard).toBeInTheDocument();
@@ -505,6 +528,108 @@ describe("ChatPane", () => {
     fireEvent.click(outputToggle);
     expect(outputToggle).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText(/Showing lines 1-125 of 1631/)).toBeInTheDocument();
+  });
+
+  it("encapsulates consecutive intermediate thinking/tool/output turns (#2051–#2058) into a single collapsed work block", () => {
+    const multiStepWorkTurns: TranscriptTurn[] = [
+      {
+        index: 2051,
+        role: "assistant",
+        content: "",
+        thinking: "Inspecting hub discovery and App.tsx.",
+        tool_calls: [
+          { name: "read_file", arguments: { Path: "ui/src/App.tsx" } },
+          { name: "run_command", arguments: { CommandLine: "git status" } },
+        ],
+        created_at: "2026-11-01T23:03:23Z",
+      },
+      {
+        index: 2052,
+        role: "tool",
+        content: "Created At: 2026-11-01T23:03:23Z\nline 2\nline 3",
+        thinking: null,
+        tool_calls: [],
+      },
+      {
+        index: 2053,
+        role: "tool",
+        content:
+          "Created At: 2026-11-01T23:03:24Z\nCommand exited with code 0\nline 3\nline 4\nline 5\nline 6",
+        thinking: null,
+        tool_calls: [],
+      },
+      {
+        index: 2054,
+        role: "assistant",
+        content: "",
+        thinking: "Running test suite.\nChecking output.",
+        tool_calls: [{ name: "run_command", arguments: { CommandLine: "cargo test" } }],
+        created_at: "2026-11-01T23:03:37Z",
+      },
+      {
+        index: 2055,
+        role: "tool",
+        content: "Created At: 2026-11-01T23:03:38Z\nCommand exited with code 0",
+        thinking: null,
+        tool_calls: [],
+      },
+      {
+        index: 2056,
+        role: "assistant",
+        content: "",
+        thinking: "Reading ChatPane.tsx.",
+        tool_calls: [{ name: "read_file", arguments: { Path: "ui/src/components/ChatPane.tsx" } }],
+        created_at: "2026-11-01T23:04:01Z",
+      },
+      {
+        index: 2057,
+        role: "tool",
+        content: "Created At: 2026-11-01T23:04:02Z\nShowing lines 1-90",
+        thinking: null,
+        tool_calls: [],
+      },
+      {
+        index: 2058,
+        role: "assistant",
+        content: "",
+        thinking: "Checking branch status.",
+        tool_calls: [{ name: "run_command", arguments: { CommandLine: "git diff" } }],
+        created_at: "2026-11-01T23:04:22Z",
+      },
+      {
+        index: 2059,
+        role: "tool",
+        content: "Created At: 2026-11-01T23:04:23Z\nCommand exited with code 0",
+        thinking: null,
+        tool_calls: [],
+      },
+    ];
+
+    render(
+      <ChatPane
+        agentName="ferris"
+        agentDisplayName="Ferris"
+        adapter="antigravity"
+        sessionId="sess-ferris-01"
+        turns={multiStepWorkTurns}
+        onSendPrompt={vi.fn()}
+      />,
+    );
+
+    const blocks = screen.getAllByTestId("encapsulated-work-block");
+    expect(blocks.length).toBe(1);
+    expect(screen.getByTestId("encapsulated-work-range")).toHaveTextContent("#2051–#2058");
+    expect(screen.getByTestId("encapsulated-work-summary")).toHaveTextContent(
+      "4 steps · 5 tool calls (read_file, run_command) · 5 outputs",
+    );
+    expect(screen.queryByTestId("turn-card-2051")).toBeNull();
+    expect(screen.queryByTestId("turn-card-2058")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("encapsulated-work-toggle"));
+    expect(screen.getByTestId("turn-card-2051")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-card-2054")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-card-2056")).toBeInTheDocument();
+    expect(screen.getByTestId("turn-card-2058")).toBeInTheDocument();
   });
 
   it("renders Queued Prompts bar and dispatches Send Now or Remove actions", async () => {

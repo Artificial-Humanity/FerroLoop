@@ -256,4 +256,120 @@ describe("SpinUpAgentModal", () => {
 
     unmount();
   });
+
+  it("re-fetches /api/v1/sessions on window focus, visibilitychange, and agent switch so vendor CLI model changes update RosterSidebar immediately", async () => {
+    let currentModel = "claude-opus-5-5";
+    let sessionsFetchCount = 0;
+
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+
+      if (url.includes("/api/v1/auth/session")) {
+        return json({
+          authenticated: true,
+          authority: { tier: "owner", login: "lmcfarlin" },
+        });
+      }
+      if (url.endsWith("/api/v1/agents")) {
+        return json({
+          agents: [
+            {
+              name_key: "ferris",
+              display_name: "Ferris",
+              project: "FerroLoop",
+              role: "lead",
+            },
+            {
+              name_key: "felix",
+              display_name: "Felix",
+              project: "FerroLoop",
+              role: "ui-developer",
+            },
+          ],
+          routes: [
+            {
+              id: "sess-ferris-live",
+              persona: "ferris",
+              adapter: "claude",
+              model: "claude-opus-5-5",
+              status: "running",
+            },
+          ],
+        });
+      }
+      if (url.endsWith("/api/v1/sessions")) {
+        sessionsFetchCount += 1;
+        return json({
+          sessions: [
+            {
+              id: "sess-ferris-live",
+              persona: "ferris",
+              adapter: "claude",
+              model: currentModel,
+              status: "running",
+            },
+          ],
+        });
+      }
+      return json({});
+    });
+
+    const apiClient = new HubApiClient({
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+    });
+    const wsStub = {
+      setToken: vi.fn(),
+      connect: vi.fn(),
+      disconnect: vi.fn(),
+      onStatusChange: () => () => {},
+      subscribe: () => () => {},
+    } as unknown as HubWsClient;
+
+    const { unmount } = render(<App apiClient={apiClient} wsClient={wsStub} />);
+
+    await waitFor(() => {
+      expect(sessionsFetchCount).toBeGreaterThanOrEqual(1);
+    });
+
+    fireEvent.click(screen.getByTestId("agent-settings-btn-ferris"));
+    expect(await screen.findByTestId("chat-active-model-badge")).toHaveTextContent(
+      /claude · claude-opus-5-5/i,
+    );
+
+    // Simulate user changing model in Claude CLI to claude-sonnet-5-5 and focusing FerroDeck window
+    currentModel = "claude-sonnet-5-5";
+    fireEvent(window, new Event("focus"));
+
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        /claude · claude-sonnet-5-5/i,
+      );
+      expect(
+        (screen.getByTestId("session-model-select") as HTMLSelectElement).value,
+      ).toBe("claude-sonnet-5-5");
+    });
+
+    // Simulate switching agent in RosterSidebar after another model change
+    currentModel = "claude-haiku-4-5";
+    const beforeSwitchCount = sessionsFetchCount;
+    fireEvent.click(screen.getByTestId("agent-row-felix"));
+
+    await waitFor(() => {
+      expect(sessionsFetchCount).toBeGreaterThan(beforeSwitchCount);
+    });
+
+    fireEvent.click(screen.getByTestId("agent-row-ferris"));
+    await waitFor(() => {
+      expect(screen.getByTestId("chat-active-model-badge")).toHaveTextContent(
+        /claude · claude-haiku-4-5/i,
+      );
+    });
+
+    unmount();
+  });
 });
