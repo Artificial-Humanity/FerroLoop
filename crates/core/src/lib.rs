@@ -102,7 +102,7 @@ pub use state::{
     HandoffEntry, MemoryBasis, MemoryCategory, MemoryEntry, MemoryLifecycle, MergeMode,
     RuntimeEntry, SensitivityPatch, StateConcern, StateConflict, StateEntry, StateError,
     StatePayload, StateRevision, StateScope, StateSearchHit, StateSyncCursor, UpsertStateArgs,
-    estimate_tokens, search_state_entries, validate_slug, validate_summary,
+    estimate_tokens, rank_weight, search_state_entries, validate_slug, validate_summary,
 };
 pub use store::{
     AgentRegistry, Bindings, Catalog, CatalogChecked, Handles, KindRouted, Ledger, MessageStore,
