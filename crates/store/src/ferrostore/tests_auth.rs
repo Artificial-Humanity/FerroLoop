@@ -1038,6 +1038,25 @@ fn closed_within(stream: &mut TcpStream, within: Duration) -> bool {
     false
 }
 
+/// [`closed_within`] for a Unix stream.
+fn closed_within_unix(stream: &mut UnixStream, within: Duration) -> bool {
+    stream
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
+    let started = Instant::now();
+    let mut buf = [0u8; 256];
+    while started.elapsed() < within {
+        match stream.read(&mut buf) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
 /// A peer that sends one byte at a time, each well inside the per-read
 /// timeout, is cut off at the total handshake deadline.
 #[test]
@@ -1183,31 +1202,37 @@ fn the_129th_concurrent_unauthenticated_connection_is_refused() {
     let late = ws_client(addr);
     assert_eq!(late.get_doc("docs", "b").unwrap(), Some(json!(2)));
 
-    // The same cap on a Unix socket, lowered: the extra peer gets no
-    // challenge, only the close.
+    // The cap does not apply to a Unix socket (only its owner can connect):
+    // with it lowered, more than the cap of silent peers are all served (each
+    // gets its challenge), none is refused, and each still has the deadline.
     let dir = tempfile::tempdir().unwrap();
     let sock = dir.path().join("s.sock");
     let unix =
         FerroStoreServer::bind_unix_with(&sock, FerroStore::in_memory(), psk_auth()).unwrap();
     unix.set_max_handshakes(2);
-    let held: Vec<UnixStream> = (0..2)
+    let mut held: Vec<UnixStream> = (0..2 + 5)
         .map(|_| UnixStream::connect(&sock).unwrap())
         .collect();
-    wait_handshakes(&unix, 2);
-    let mut extra = UnixStream::connect(&sock).unwrap();
-    extra
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    let mut buf = [0u8; 16];
-    assert_eq!(
-        extra.read(&mut buf).unwrap(),
-        0,
-        "the extra peer was served"
-    );
-    assert_eq!(unix.handshakes_refused(), 1);
+    wait_handshakes(&unix, held.len());
+    for stream in held.iter_mut() {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (challenge, _) = read_frame(stream, ws::MAX_PAYLOAD).unwrap();
+        assert_eq!(challenge["auth"], "challenge", "a Unix peer was refused");
+    }
+    assert_eq!(unix.handshakes_refused(), 0);
     drop(held);
     wait_handshakes(&unix, 0);
     FerroStore::connect_with(&format!("unix://{}", sock.display()), &psk_options()).unwrap();
+
+    // The Unix deadline holds: a silent peer is shut down past it.
+    unix.set_handshake_deadline(Duration::from_millis(100));
+    let mut slow = UnixStream::connect(&sock).unwrap();
+    assert!(
+        closed_within_unix(&mut slow, Duration::from_secs(3)),
+        "a silent Unix peer was held past the deadline"
+    );
 }
 
 // ---- per-principal quotas and request ids ----------------------------------------

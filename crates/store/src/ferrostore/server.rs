@@ -40,6 +40,12 @@ const ACCEPT_PAUSE: Duration = Duration::from_millis(20);
 /// Forwarders wake on this interval so a closed connection can join them.
 const FORWARD_PAUSE: Duration = Duration::from_millis(50);
 
+/// A connection that is authenticating.
+struct Handshake {
+    deadline: Instant,
+    tcp: bool,
+}
+
 struct ServerState {
     store: Arc<FerroStore>,
     shutdown: AtomicBool,
@@ -54,10 +60,11 @@ struct ServerState {
     /// The uid a Unix peer must have: this process's effective uid.
     own_uid: u32,
     /// The connections still authenticating, and the instant each must be
-    /// done by (spec §6.2). The accept loop shuts down one past its
-    /// deadline, and refuses a connection while this holds
-    /// [`auth::MAX_HANDSHAKES`].
-    handshakes: Mutex<HashMap<u64, Instant>>,
+    /// done by (spec §6.2), and whether it is a TCP one. The accept loop
+    /// shuts down one past its deadline, and refuses a TCP connection while
+    /// this holds [`auth::MAX_HANDSHAKES`] TCP ones; a Unix connection is
+    /// never counted against that cap.
+    handshakes: Mutex<HashMap<u64, Handshake>>,
     /// [`auth::HANDSHAKE_DEADLINE`] in milliseconds; a test lowers it.
     handshake_deadline_ms: AtomicU64,
     /// [`auth::MAX_HANDSHAKES`]; a test lowers it.
@@ -495,9 +502,9 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
                     break;
                 }
                 let id = state.next_conn.fetch_add(1, Ordering::Relaxed);
-                if !begin_handshake(&state, id) {
-                    // Too many connections authenticating: closed before
-                    // anything is read or any thread started for it.
+                if !begin_handshake(&state, id, matches!(accepted.peer, Peer::Tcp)) {
+                    // Too many TCP connections authenticating: closed
+                    // before anything is read or any thread started for it.
                     #[cfg(test)]
                     state.handshakes_refused.fetch_add(1, Ordering::SeqCst);
                     accepted.watch.shutdown_both();
@@ -532,14 +539,25 @@ fn accept_loop(mut poll: impl FnMut() -> AcceptPoll, state: Arc<ServerState>) {
 }
 
 /// Register connection `id` as authenticating, due by the deadline from
-/// now. `false`: [`auth::MAX_HANDSHAKES`] are authenticating already.
-fn begin_handshake(state: &ServerState, id: u64) -> bool {
+/// now. `false`: a TCP connection while [`auth::MAX_HANDSHAKES`] TCP
+/// connections are authenticating already. A Unix connection (only its
+/// owner can connect) always gets a slot, and has the deadline.
+fn begin_handshake(state: &ServerState, id: u64, tcp: bool) -> bool {
     let deadline = Duration::from_millis(state.handshake_deadline_ms.load(Ordering::SeqCst));
     let mut pending = lock_mutex(&state.handshakes);
-    if pending.len() >= state.max_handshakes.load(Ordering::SeqCst) {
-        return false;
+    if tcp {
+        let in_flight = pending.values().filter(|h| h.tcp).count();
+        if in_flight >= state.max_handshakes.load(Ordering::SeqCst) {
+            return false;
+        }
     }
-    pending.insert(id, Instant::now() + deadline);
+    pending.insert(
+        id,
+        Handshake {
+            deadline: Instant::now() + deadline,
+            tcp,
+        },
+    );
     true
 }
 
@@ -554,7 +572,7 @@ fn reap_handshakes(state: &ServerState) {
         let mut pending = lock_mutex(&state.handshakes);
         let expired: Vec<u64> = pending
             .iter()
-            .filter(|(_, deadline)| now >= **deadline)
+            .filter(|(_, handshake)| now >= handshake.deadline)
             .map(|(id, _)| *id)
             .collect();
         for id in &expired {

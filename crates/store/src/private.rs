@@ -100,7 +100,10 @@ pub(crate) fn create_private_file(path: &Path) -> io::Result<bool> {
 /// The bytes of the secret file at `path` (a PSK, a token file), at most `max` of them. Refused,
 /// with the `chmod` that fixes it, when the file is not a regular file or its group or others have
 /// any permission bit: a secret others can read is no secret, and one they can write is not ours.
-/// The mode is read from the opened file, so the bytes read are the file that was checked.
+/// Refused too when its owner is neither this process's effective uid nor root (a root-owned
+/// secret mount works): another user's file is not ours to trust, whatever its mode.
+/// The mode and the owner are read from the opened file, so the bytes read are the file that was
+/// checked.
 ///
 /// A symlink is followed and its TARGET is checked: the checks run on the opened descriptor
 /// (`fstat`), so they apply to the final file with no window between check and read, and a
@@ -128,6 +131,9 @@ pub(crate) fn read_secret_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
     }
     #[cfg(unix)]
     {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        owner_allowed(meta.uid(), euid, path)?;
         let mode = meta.mode() & 0o777;
         if mode & 0o077 != 0 {
             return Err(io::Error::new(
@@ -154,6 +160,22 @@ pub(crate) fn read_secret_file(path: &Path, max: u64) -> io::Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
+}
+
+/// Whether a secret file owned by `owner` may be read by a process whose effective uid is `euid`:
+/// its own files and root's. The error never holds the file's contents.
+#[cfg(unix)]
+fn owner_allowed(owner: u32, euid: u32, path: &Path) -> io::Result<()> {
+    if owner == euid || owner == 0 {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "{} is owned by uid {owner}, not by this process's uid {euid} or root; refused",
+            shown_path(path)
+        ),
+    ))
 }
 
 /// Paths already warned about in this process.
@@ -515,6 +537,33 @@ mod secret_file_tests {
         let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
         // SAFETY: `c_path` is a valid NUL-terminated path.
         assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn owner_decision_accepts_own_and_root_and_refuses_others() {
+        let path = Path::new("/run/secrets/psk");
+        assert!(owner_allowed(1000, 1000, path).is_ok());
+        assert!(owner_allowed(0, 1000, path).is_ok(), "root-owned mount");
+        assert!(owner_allowed(0, 0, path).is_ok());
+        assert!(
+            owner_allowed(1000, 0, path).is_err(),
+            "root trusts only its own"
+        );
+        let err = owner_allowed(1001, 1000, path).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let text = err.to_string();
+        assert!(text.contains("/run/secrets/psk"), "{text}");
+        assert!(
+            text.contains("uid 1001") && text.contains("uid 1000"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_current_users_private_file_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = secret(dir.path(), "psk", 0o600);
+        assert_eq!(read_within(file).unwrap(), b"secret");
     }
 
     #[test]

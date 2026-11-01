@@ -42,9 +42,10 @@ pub(super) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// its `ok`, however its bytes trickle in: the server shuts down one still
 /// authenticating past it (spec §6.2).
 pub(super) const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
-/// The most connections a server lets authenticate at once. One accepted
-/// past it is closed at once, before anything is read from it; connections
-/// that have authenticated are not counted.
+/// The most TCP connections a server lets authenticate at once. A TCP one
+/// accepted past it is closed at once, before anything is read from it;
+/// connections that have authenticated, and Unix connections, are not
+/// counted.
 pub(super) const MAX_HANDSHAKES: usize = 128;
 /// The largest frame either side reads before the connection has
 /// authenticated: every handshake frame is far smaller. The length a frame
