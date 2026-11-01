@@ -44,7 +44,7 @@ In addition to the guides above, `fl --help` documents the full command surface:
 
 These stay at the repository root and are not duplicated here:
 
-* [README.md](../README.md) — what FerroLoop is, and how to build it.
+* [README.md](../README.md) — what FerroLoop is, the Ferro Suite, and how to build it.
 * [AGENTS.md](../AGENTS.md) — working rules, stack matrix, and conventions.
 * [WORKFLOW.md](../WORKFLOW.md) — branching, review, and landing on `main`.
 * [PERSONA.md](../PERSONA.md) — the developer persona.
