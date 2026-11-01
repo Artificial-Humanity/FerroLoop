@@ -252,8 +252,9 @@ describe("Compact Context button", () => {
       />,
     );
 
-    expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/Context:/);
+    expect(screen.queryByTestId("context-level-meter")).toBeNull();
     fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/Context:/);
     const btn = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
     expect(btn).toBeDisabled();
     expect(btn.title).toMatch(/50%/);
@@ -297,8 +298,8 @@ describe("Compact Context button", () => {
       />,
     );
 
-    expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/51%/);
     fireEvent.click(screen.getByTestId("chat-agent-settings-btn"));
+    expect(screen.getByTestId("context-level-meter")).toHaveTextContent(/51%/);
     const btn = screen.getByTestId("compact-context-btn") as HTMLButtonElement;
     expect(btn).not.toBeDisabled();
 
