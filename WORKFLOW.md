@@ -31,8 +31,10 @@ Follow [AGENTS.md](AGENTS.md) for repository rules.
      `DEFAULT_PROTECTED_PATTERNS` in [crates/core/src/pr_policy.rs](crates/core/src/pr_policy.rs):
      instruction files, `.github/`, `.agents/`, `.fl/manifest.json`), carries a commit
      without a `Co-authored-by:` trailer, is co-authored by the Lab Manager, or has a
-     co-author who is not registered as an active agent. `fl github pr` enforces this;
-     no GitHub workflow requests the owner's review.
+     co-author who is not registered as an active agent.
+     [.github/workflows/request-admin-review.yml](.github/workflows/request-admin-review.yml)
+     also requests the owner's review for the protected-path, missing-trailer and Lab
+     Manager co-author cases; it cannot see the agent registry.
 5. An agent reviewer records its verdict with `fl github pr review`. The review is posted
    by the Reviewer GitHub App (`<slug>[bot]`) with an `fl-review` marker, because the
    machine account cannot approve a pull request it opened. The command needs the App's
