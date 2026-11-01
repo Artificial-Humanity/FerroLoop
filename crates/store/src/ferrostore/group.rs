@@ -21,7 +21,13 @@
 //! with the sync adapter, under the commit gate and in sequence order. After
 //! the leader has released the `flock`, the write mutex and the gate, it wakes
 //! every member with its own result: the member then calls `on_commit` on its
-//! own thread, and the next queued writer, if any, leads.
+//! own thread, and the next queued writer, if any, leads. In `WriteThrough`
+//! only the first member's batch finds the adapter idle; every later member
+//! drains the queue, oldest first, until its own batch is sent, so each
+//! member returns only once its own batch is delivered.
+//!
+//! A sync that fails poisons the handle (`Poison`): the group fails, and
+//! every later write and checkpoint on the handle is refused.
 //!
 //! **A publish that fails** (any write or sync) fails every member it carries
 //! and every member not yet run, and nothing of it is acknowledged or put in
@@ -33,10 +39,9 @@
 use super::container_io::ContainerIo;
 use super::layout::{Op, backend, encode_frame};
 use super::state::{DocState, Overlay, publish_overlay};
-use super::sync::{SyncAdapter, SyncBatch};
 use super::{
-    Change, Committed, Disk, DiskCache, FerroStore, FlockGuard, lock_mutex, publish_frames,
-    wait_mutex,
+    Change, Committed, Disk, DiskCache, FerroStore, FlockGuard, Registered, lock_mutex,
+    publish_frames, wait_mutex,
 };
 use fl_core::StoreError;
 use std::any::Any;
@@ -56,14 +61,12 @@ pub(super) struct Staged {
     pub(super) overlay: Overlay,
 }
 
-/// A batch registered for the member to send with `on_commit`.
-type Delivery = Option<(Arc<dyn SyncAdapter>, SyncBatch)>;
-
 /// A member's result once its group is done.
 struct Acked {
     /// `None` when the body wrote nothing.
     seq: Option<u64>,
-    delivery: Delivery,
+    /// What the member sends, or drains to, on its own thread.
+    delivery: Registered,
 }
 
 /// Where one member is. The member and the leader both wait on the member's
@@ -258,7 +261,8 @@ impl FerroStore {
     /// value and what it staged; `None` writes nothing. `Ok` carries the
     /// value and the sequence the commit took. A commit is registered with
     /// the sync adapter after its slot sync; its `on_commit` runs on this
-    /// thread, after the group's locks are released.
+    /// thread, after the group's locks are released, and in `WriteThrough`
+    /// this returns only once that batch is sent (`deliver_owned`).
     pub(super) fn group_write<T>(
         &self,
         disk: &Disk,
@@ -342,8 +346,11 @@ impl FerroStore {
         };
         let _gate = lock_mutex(&self.commit_gate);
         let file = lock_mutex(&disk.write);
-        let locked = FlockGuard::acquire(&**file)
-            .and_then(|flock| Ok((flock, disk.refresh(&**file, disk.write_id)?)));
+        // A poisoned handle runs no body: the whole group is refused.
+        let locked = disk.poison.check().and_then(|()| {
+            let flock = FlockGuard::acquire(&**file)?;
+            Ok((flock, disk.refresh(&**file, disk.write_id)?))
+        });
         lead.members = disk.group.take();
         lead.results = lead.members.iter().map(|_| None).collect();
         debug_assert!(
@@ -440,9 +447,13 @@ impl FerroStore {
         pending: &mut Pending,
         lead: &mut Leadership<'_>,
     ) -> Result<Running, StoreError> {
-        if let Some(new_sb) =
-            publish_frames(file, running.index, &running.base.sb, &pending.frames)?
-        {
+        if let Some(new_sb) = publish_frames(
+            file,
+            &disk.poison,
+            running.index,
+            &running.base.sb,
+            &pending.frames,
+        )? {
             let change = running
                 .take_change()
                 .ok_or_else(|| backend("a publish with frames has no change"))?;
@@ -460,7 +471,7 @@ impl FerroStore {
         for pos in pending.readers.drain(..) {
             lead.results[pos] = Some(Ok(Acked {
                 seq: None,
-                delivery: None,
+                delivery: Registered::Nothing,
             }));
         }
         pending.frames.clear();

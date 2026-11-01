@@ -223,9 +223,14 @@ struct Sim {
     /// The next operation this matches fails once, with nothing applied and
     /// nothing recorded, and power stays on: a transient I/O error.
     fail_next: Option<FailWhen>,
+    /// The next read this matches runs the action once it is done, on the
+    /// reading thread, with the disk unlocked: another handle's I/O can land
+    /// between two reads of one refresh.
+    after_read: Option<(FailWhen, AfterRead)>,
 }
 
 type FailWhen = Box<dyn FnMut(&IoOp) -> bool + Send>;
+type AfterRead = Box<dyn FnOnce() + Send>;
 
 impl Sim {
     /// Record `op`, or fail it when power is (now) cut.
@@ -353,6 +358,16 @@ impl SimFs {
     /// The next operation `when` matches fails once (see `Sim::fail_next`).
     pub(super) fn fail_next(&self, when: impl FnMut(&IoOp) -> bool + Send + 'static) {
         self.lock().fail_next = Some(Box::new(when));
+    }
+
+    /// Once the next read `when` matches is done, run `then` on the reading
+    /// thread before that read returns (see `Sim::after_read`).
+    pub(super) fn after_next_read(
+        &self,
+        when: impl FnMut(&IoOp) -> bool + Send + 'static,
+        then: impl FnOnce() + Send + 'static,
+    ) {
+        self.lock().after_read = Some((Box::new(when), Box::new(then)));
     }
 
     /// What a cut now would leave if every pending operation were lost: the
@@ -660,22 +675,34 @@ impl ContainerIo for SimFile {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
-        let mut sim = self.fs.lock();
-        sim.step(IoOp::Read {
+        let op = IoOp::Read {
             ino: self.ino,
             offset,
             len: buf.len() as u64,
-        })?;
-        let live = &sim.inodes[self.ino].live;
-        let start = offset as usize;
-        let end = start + buf.len();
-        if end > live.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "failed to fill whole buffer",
-            ));
+        };
+        let then = {
+            let mut sim = self.fs.lock();
+            sim.step(op.clone())?;
+            let live = &sim.inodes[self.ino].live;
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > live.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            buf.copy_from_slice(&live[start..end]);
+            let fire = sim.after_read.as_mut().is_some_and(|(when, _)| when(&op));
+            if fire {
+                sim.after_read.take().map(|(_, then)| then)
+            } else {
+                None
+            }
+        };
+        if let Some(then) = then {
+            then();
         }
-        buf.copy_from_slice(&live[start..end]);
         Ok(())
     }
 

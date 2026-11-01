@@ -65,6 +65,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
@@ -127,6 +128,24 @@ struct Committed {
     ops: Vec<Op>,
 }
 
+/// What registering a commit with the sync adapter leaves its committer to
+/// do once every store lock is released ([`FerroStore::deliver_owned`]).
+#[derive(Default)]
+enum Registered {
+    /// Nothing: a silent commit, no adapter, or a mode that leaves the batch
+    /// queued for `sync_flush`.
+    #[default]
+    Nothing,
+    /// `WriteThrough` with nothing queued or in flight: the committer owns
+    /// the notify (`notify_in_flight` is set for its thread) and sends the
+    /// batch itself.
+    Owned(Arc<dyn SyncAdapter>, SyncBatch),
+    /// `WriteThrough` behind a queued batch or a notify in flight: the batch
+    /// was queued at this sequence, and the committer drains the queue until
+    /// it is sent.
+    Queued(u64),
+}
+
 /// How a compare-and-swap commit went.
 enum SeqCommit {
     Lost,
@@ -149,6 +168,56 @@ struct Disk {
     cache: Mutex<Option<Arc<DiskCache>>>,
     /// Writers queued for group commit (spec §4.3).
     group: group::Group,
+    /// Set by a failed sync of a publish or a checkpoint.
+    poison: Poison,
+}
+
+/// Set once a `sync_data` of a publish or a checkpoint failed on this handle.
+///
+/// After a failed `fsync` Linux may mark the dirty pages clean without having
+/// written them (fsyncgate): the page cache can then show the other slot at
+/// the new epoch while the disk still holds the slot before it, and the next
+/// publish would overwrite the only durable copy of the last acknowledged
+/// epoch. So every later write and checkpoint on the handle is refused until
+/// the store is reopened. Reads go on, from the cache only: it holds the last
+/// state whose syncs all returned, and the file's page cache is no longer
+/// trusted.
+struct Poison {
+    set: AtomicBool,
+    path: String,
+}
+
+impl Poison {
+    fn new(path: &Path) -> Self {
+        Self {
+            set: AtomicBool::new(false),
+            path: path.display().to_string(),
+        }
+    }
+
+    fn is_set(&self) -> bool {
+        self.set.load(Ordering::Acquire)
+    }
+
+    /// `Err` once a sync has failed: the write must not start.
+    fn check(&self) -> Result<(), StoreError> {
+        if self.is_set() {
+            return Err(backend(format!(
+                "FerroStore handle poisoned after a failed fsync at {}: reopen the store",
+                self.path
+            )));
+        }
+        Ok(())
+    }
+
+    /// `file.sync_data()`, setting the poison when it fails. The failing call
+    /// itself reports the I/O error.
+    fn sync_data(&self, file: &dyn ContainerIo) -> Result<(), StoreError> {
+        file.sync_data().map_err(|err| {
+            self.set.store(true, Ordering::Release);
+            io_err(err)
+        })
+    }
 }
 
 /// What a publish changed, for [`Disk::install_commit`].
@@ -174,19 +243,9 @@ struct DiskCache {
 
 impl Disk {
     /// The current state through `file` (spec §4.1), and the index of the
-    /// slot it was published in. Reads the two slots, then:
-    ///
-    /// - the same file and the same superblock as the cache: the cached
-    ///   state, with no other I/O;
-    /// - the same snapshot extent and WAL offset with a longer WAL: only the
-    ///   new WAL bytes are read and applied, copy-on-write, to the cached
-    ///   state;
-    /// - anything else: a full load of the snapshot and the WAL.
-    ///
-    /// Every byte read lies inside the extents of the one superblock just
-    /// read, so a reader needs no lock: a torn slot read falls back to the
-    /// other, older slot, and gives an older, consistent state. The result
-    /// is never newer than that superblock.
+    /// slot it was published in, for a writer: the caller holds the `flock`,
+    /// so the slots cannot change under the read and name the newest state.
+    /// Reads the two slots, then [`Self::advance`]s the cache to them.
     fn refresh(
         &self,
         file: &dyn ContainerIo,
@@ -197,9 +256,72 @@ impl Disk {
         // difference, before the cache is trusted.
         let cached = lock_mutex(&self.cache).clone();
         let (index, sb) = latest_superblock(file)?;
+        debug_assert!(
+            cached
+                .as_ref()
+                .is_none_or(|held| held.file_id != file_id || held.sb.epoch <= sb.epoch),
+            "under the flock the slots named an epoch older than the cache"
+        );
+        Ok((index, self.advance(file, file_id, cached, sb)?))
+    }
+
+    /// The current state for a reader, which takes no lock (spec §4.1).
+    ///
+    /// The two slots are read one after the other, so a slot write can land
+    /// between them: the reader reads slot 0, another handle publishes into
+    /// slot 0 and starts a write of slot 1, and the reader's slot 1 read is
+    /// torn. It then falls back to the slot 0 it read first, which can be
+    /// older than a state this handle already holds. That older state is
+    /// never returned: when the cache holds a state of the same file at a
+    /// later epoch, the cache is the answer. It is a whole published state,
+    /// and its extents are still valid, because no extent is reused before
+    /// §5 compaction. §5 must keep this true: it swaps the file, which the
+    /// identity check catches, and never reuses an extent of the live inode.
+    ///
+    /// So a handle's reads never go back: each returns the cache it started
+    /// from or a later state, and the cache only moves forward
+    /// ([`install_newer`]).
+    ///
+    /// A poisoned handle (see [`Poison`]) reads only its cache: after a failed
+    /// sync the page cache may not match the disk.
+    fn refresh_read(&self) -> Result<Arc<DiskCache>, StoreError> {
+        let cached = lock_mutex(&self.cache).clone();
+        if self.poison.is_set()
+            && let Some(cached) = cached
+        {
+            return Ok(cached);
+        }
+        let (_, sb) = latest_superblock(&*self.read)?;
+        if let Some(held) = &cached
+            && held.file_id == self.read_id
+            && held.sb.epoch > sb.epoch
+        {
+            return Ok(Arc::clone(held));
+        }
+        self.advance(&*self.read, self.read_id, cached, sb)
+    }
+
+    /// The state `sb`, read through `file`, from `cached`:
+    ///
+    /// - the same file and the same superblock as the cache: the cached
+    ///   state, with no other I/O;
+    /// - the same snapshot extent and WAL offset with a longer WAL: only the
+    ///   new WAL bytes are read and applied, copy-on-write, to the cached
+    ///   state;
+    /// - anything else: a full load of the snapshot and the WAL.
+    ///
+    /// Every byte read lies inside the extents of `sb`, so a reader needs no
+    /// lock. The result is never newer than `sb`.
+    fn advance(
+        &self,
+        file: &dyn ContainerIo,
+        file_id: (u64, u64),
+        cached: Option<Arc<DiskCache>>,
+        sb: Superblock,
+    ) -> Result<Arc<DiskCache>, StoreError> {
         let fresh = match cached {
             Some(cached) if cached.file_id == file_id && cached.sb == sb => {
-                return Ok((index, cached));
+                return Ok(cached);
             }
             Some(cached) if cached.file_id == file_id && tail_follows(&cached, &sb) => {
                 // Any doubt about the tail is settled by the full load, which
@@ -213,7 +335,7 @@ impl Disk {
         };
         let fresh = Arc::new(fresh);
         install_newer(&mut lock_mutex(&self.cache), Arc::clone(&fresh));
-        Ok((index, fresh))
+        Ok(fresh)
     }
 
     /// Install the state a publish through `write` just made as `new_sb`:
@@ -567,6 +689,7 @@ impl FerroStore {
                 read_id,
                 cache: Mutex::new(Some(Arc::new(seed))),
                 group: group::Group::default(),
+                poison: Poison::new(path),
             }),
             path.display().to_string(),
         ))
@@ -1340,9 +1463,7 @@ impl FerroStore {
     fn read_state(&self) -> Result<Arc<DocState>, StoreError> {
         match &self.inner {
             Inner::Memory(state) => Ok(Arc::clone(&lock_mutex(state))),
-            Inner::Disk(disk) => Ok(Arc::clone(
-                &disk.refresh(&*disk.read, disk.read_id)?.1.state,
-            )),
+            Inner::Disk(disk) => Ok(Arc::clone(&disk.refresh_read()?.state)),
             Inner::Remote(remote) => Ok(Arc::new(remote.read_state()?)),
         }
     }
@@ -1507,9 +1628,9 @@ impl FerroStore {
                         (result, committed)
                     };
                     let seq = committed.as_ref().map(|committed| committed.seq);
-                    let registered = committed
-                        .as_ref()
-                        .and_then(|committed| self.register_committed(committed, false));
+                    let registered = committed.as_ref().map_or(Registered::Nothing, |committed| {
+                        self.register_committed(committed, false)
+                    });
                     (result, seq, registered)
                 };
                 self.deliver_owned(registered)?;
@@ -1685,6 +1806,7 @@ impl FerroStore {
             }
             Inner::Disk(disk) => {
                 let file = lock_mutex(&disk.write);
+                disk.poison.check()?;
                 let _locked = FlockGuard::acquire(&**file)?;
                 let (index, base) = disk.refresh(&**file, disk.write_id)?;
                 let state = &base.state;
@@ -1702,7 +1824,9 @@ impl FerroStore {
                 };
                 let (overlay, seq) = stage_ops(state, std::slice::from_ref(&op))?;
                 let frame = encode_frame(seq, std::slice::from_ref(&op))?;
-                if let Some(new_sb) = publish_frames(&**file, index, &base.sb, &[frame])? {
+                if let Some(new_sb) =
+                    publish_frames(&**file, &disk.poison, index, &base.sb, &[frame])?
+                {
                     disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
                 }
                 if sync.is_idle() && seq > sync.synced_seq {
@@ -1875,11 +1999,7 @@ impl FerroStore {
     }
 
     /// Caller holds the commit gate and no document lock. Does not call `on_commit`.
-    fn register_committed(
-        &self,
-        committed: &Committed,
-        silent: bool,
-    ) -> Option<(Arc<dyn SyncAdapter>, SyncBatch)> {
+    fn register_committed(&self, committed: &Committed, silent: bool) -> Registered {
         self.register_committed_for(committed, silent, std::thread::current().id())
     }
 
@@ -1891,9 +2011,9 @@ impl FerroStore {
         committed: &Committed,
         silent: bool,
         owner: ThreadId,
-    ) -> Option<(Arc<dyn SyncAdapter>, SyncBatch)> {
+    ) -> Registered {
         if committed.ops.is_empty() {
-            return None;
+            return Registered::Nothing;
         }
         let batch = SyncBatch {
             seq: committed.seq,
@@ -1904,25 +2024,28 @@ impl FerroStore {
             if slot.is_idle() && batch.seq > slot.synced_seq {
                 slot.synced_seq = batch.seq;
             }
-            return None;
+            return Registered::Nothing;
         }
-        let adapter = slot.adapter.clone()?;
+        let Some(adapter) = slot.adapter.clone() else {
+            return Registered::Nothing;
+        };
         match slot.mode {
             Some(SyncMode::WriteThrough) => {
                 if !slot.is_idle() {
+                    let seq = batch.seq;
                     slot.pending.push(batch);
-                    None
+                    Registered::Queued(seq)
                 } else {
                     slot.notify_in_flight = true;
                     slot.notify_owner = Some(owner);
-                    Some((adapter, batch))
+                    Registered::Owned(adapter, batch)
                 }
             }
             Some(SyncMode::WriteBehind | SyncMode::LocalCache | SyncMode::CloudPreCache) => {
                 slot.pending.push(batch);
-                None
+                Registered::Nothing
             }
-            None => None,
+            None => Registered::Nothing,
         }
     }
 
@@ -1953,14 +2076,21 @@ impl FerroStore {
         }
     }
 
-    /// Call `on_commit` after the commit gate has been released.
-    /// Later pending batches stay queued for `sync_flush`.
-    fn deliver_owned(
-        &self,
-        owned: Option<(Arc<dyn SyncAdapter>, SyncBatch)>,
-    ) -> Result<(), StoreError> {
-        let Some((adapter, batch)) = owned else {
-            return Ok(());
+    /// Send what [`Self::register_committed`] left, once the commit gate and
+    /// every other store lock are released. In `WriteThrough` this returns
+    /// `Ok` only once the commit's own batch is sent: `on_commit` returned
+    /// `Ok` for it and `synced_seq` is at least its sequence.
+    ///
+    /// An owned batch is sent here. A queued one is drained to: see
+    /// [`Self::drain_through`]. A failed `on_commit` returns the adapter's
+    /// error and leaves the batch at the front of the queue: the commit is
+    /// durable and not yet sent. Later pending batches of other commits stay
+    /// queued for their own committers or `sync_flush`.
+    fn deliver_owned(&self, registered: Registered) -> Result<(), StoreError> {
+        let (adapter, batch) = match registered {
+            Registered::Nothing => return Ok(()),
+            Registered::Queued(seq) => return self.drain_through(seq),
+            Registered::Owned(adapter, batch) => (adapter, batch),
         };
         let result = self.call_on_commit(&adapter, &batch);
         let mut slot = lock_mutex(&self.sync);
@@ -1982,6 +2112,27 @@ impl FerroStore {
         }
         self.sync_cv.notify_all();
         Ok(())
+    }
+
+    /// Send queued batches, oldest first, with [`Self::sync_flush`] (which
+    /// waits out another thread's notify), until `synced_seq` reaches `seq`.
+    ///
+    /// A commit made inside this thread's own `on_commit` cannot be sent
+    /// until that call returns: it stays queued and this returns `Ok`, as it
+    /// did before group commit, and as `sync_flush` returns there.
+    fn drain_through(&self, seq: u64) -> Result<(), StoreError> {
+        loop {
+            {
+                let slot = lock_mutex(&self.sync);
+                if slot.synced_seq >= seq {
+                    return Ok(());
+                }
+                if slot.notify_in_flight && slot.notify_owner == Some(std::thread::current().id()) {
+                    return Ok(());
+                }
+            }
+            self.sync_flush()?;
+        }
     }
 
     fn notify(&self, topic: &str, record: &MqRecord) {
@@ -2180,6 +2331,7 @@ fn publish_sync_batches(
         }
         Inner::Disk(disk) => {
             let file = lock_mutex(&disk.write);
+            disk.poison.check()?;
             let _locked = FlockGuard::acquire(&**file)?;
             let (index, base) = disk.refresh(&**file, disk.write_id)?;
             let (overlay, seq, prepared) = prepare_sync_batches(&base.state, batches)?;
@@ -2187,7 +2339,7 @@ fn publish_sync_batches(
             for batch in &prepared {
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
-            if let Some(new_sb) = publish_frames(&**file, index, &base.sb, &frames)? {
+            if let Some(new_sb) = publish_frames(&**file, &disk.poison, index, &base.sb, &frames)? {
                 disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
             }
             Ok((seq, prepared))
@@ -2263,9 +2415,11 @@ fn file_uri_path(rest: &str) -> String {
 /// it (spec §4.3). Returns the superblock now published. No frames: nothing
 /// is written and `None`. A failure before the slot write leaves the previous
 /// superblock current; from the slot write on, either may be current.
-/// The caller holds the `flock` for the whole call.
+/// The caller holds the `flock` for the whole call. A poisoned handle
+/// writes nothing; a failed sync poisons it (see [`Poison`]).
 fn publish_frames(
     file: &dyn ContainerIo,
+    poison: &Poison,
     index: usize,
     sb: &Superblock,
     frames: &[Vec<u8>],
@@ -2273,6 +2427,7 @@ fn publish_frames(
     if frames.is_empty() {
         return Ok(None);
     }
+    poison.check()?;
     let mut at = sb
         .wal_offset
         .checked_add(sb.wal_length)
@@ -2297,7 +2452,7 @@ fn publish_frames(
         file.write_at(frame, offset).map_err(io_err)?;
     }
     // `fdatasync` also makes the longer file size durable.
-    file.sync_data().map_err(io_err)?;
+    poison.sync_data(file)?;
     let new_sb = Superblock {
         epoch,
         snapshot_offset: sb.snapshot_offset,
@@ -2307,7 +2462,7 @@ fn publish_frames(
         snapshot_seq: sb.snapshot_seq,
     };
     write_slot(file, index ^ 1, &new_sb)?;
-    file.sync_data().map_err(io_err)?;
+    poison.sync_data(file)?;
     Ok(Some(new_sb))
 }
 
@@ -2316,6 +2471,7 @@ fn publish_frames(
 /// apart from every group.
 fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     let file = lock_mutex(&disk.write);
+    disk.poison.check()?;
     let _locked = FlockGuard::acquire(&**file)?;
     let (index, base) = disk.refresh(&**file, disk.write_id)?;
     let (sb, state) = (base.sb, &*base.state);
@@ -2330,7 +2486,7 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     let offset = allocate_extent(&**file, &sb, blob_len)?;
     file.write_at(&blob, offset).map_err(io_err)?;
     // Data and the file size: `fdatasync` (spec §4.3).
-    file.sync_data().map_err(io_err)?;
+    disk.poison.sync_data(&**file)?;
     let new_sb = Superblock {
         epoch: sb
             .epoch
@@ -2345,7 +2501,7 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
         snapshot_seq: state.last_seq,
     };
     write_slot(&**file, index ^ 1, &new_sb)?;
-    file.sync_data().map_err(io_err)?;
+    disk.poison.sync_data(&**file)?;
     disk.install_checkpoint(&base, new_sb);
     Ok(())
 }

@@ -205,6 +205,90 @@ impl SyncAdapter for Recorder {
     }
 }
 
+/// The sequences `recorder` has been sent, in order.
+fn sent(recorder: &Recorder) -> Vec<u64> {
+    lock_mutex(&recorder.batches)
+        .iter()
+        .map(|batch| batch.seq)
+        .collect()
+}
+
+/// A store on a fresh simulated disk with a recorder attached in `mode`.
+fn recorded_store(mode: SyncMode) -> (SimFs, FerroStore, Arc<Recorder>) {
+    let fs = SimFs::default();
+    let store = open(&fs);
+    let recorder = Recorder::new(Some(fs.clone()));
+    store
+        .attach_sync_adapter(mode, Arc::clone(&recorder) as Arc<dyn SyncAdapter>)
+        .unwrap();
+    (fs, store, recorder)
+}
+
+/// Three writers queued as one group. Each returns its sequence and the
+/// sequences the recorder had been sent when its commit returned.
+fn three_member_group(store: &FerroStore, recorder: &Recorder) -> Vec<(u64, Vec<u64>)> {
+    let writers: Vec<Writer<'_, (u64, Vec<u64>)>> = (0..3)
+        .map(|n| {
+            Box::new(move || {
+                let seq = put(store, "wt", &format!("{n}"), json!(n));
+                (seq, sent(recorder))
+            }) as Writer<'_, (u64, Vec<u64>)>
+        })
+        .collect();
+    one_group(store, writers)
+        .into_iter()
+        .map(|joined| joined.unwrap())
+        .collect()
+}
+
+#[test]
+fn every_write_through_member_of_a_group_returns_with_its_own_batch_sent() {
+    let (fs, store, recorder) = recorded_store(SyncMode::WriteThrough);
+    let base = store.read_state().unwrap().last_seq;
+    let mark = fs.trace().len();
+    let members = three_member_group(&store, &recorder);
+    assert_eq!(publishes(&fs.trace()[mark..]).len(), 1, "one group");
+    for (seq, seen) in &members {
+        assert!(
+            seen.contains(seq),
+            "member {seq} returned before its batch was sent: {seen:?}"
+        );
+    }
+    assert!(!store.has_pending_sync(), "a batch is still queued");
+    assert_eq!(sent(&recorder), vec![base + 1, base + 2, base + 3]);
+    assert_eq!(store.synced_seq(), base + 3);
+    assert_eq!(*lock_mutex(&recorder.early), Vec::<u64>::new());
+}
+
+#[test]
+fn a_write_through_commit_after_a_group_is_sent_before_it_returns() {
+    let (_fs, store, recorder) = recorded_store(SyncMode::WriteThrough);
+    let base = store.read_state().unwrap().last_seq;
+    three_member_group(&store, &recorder);
+    let seq = put(&store, "wt", "later", json!("later"));
+    assert_eq!(seq, base + 4);
+    assert_eq!(
+        sent(&recorder),
+        vec![base + 1, base + 2, base + 3, base + 4],
+        "the commit after the group returned before its batch was sent"
+    );
+    assert!(!store.has_pending_sync());
+    assert_eq!(store.synced_seq(), base + 4);
+}
+
+#[test]
+fn write_behind_members_of_a_group_stay_queued_until_a_flush() {
+    let (_fs, store, recorder) = recorded_store(SyncMode::WriteBehind);
+    let base = store.read_state().unwrap().last_seq;
+    for (_, seen) in three_member_group(&store, &recorder) {
+        assert_eq!(seen, Vec::<u64>::new(), "WriteBehind sent on commit");
+    }
+    assert!(store.has_pending_sync());
+    assert_eq!(store.sync_flush().unwrap(), base + 3);
+    assert_eq!(sent(&recorder), vec![base + 1, base + 2, base + 3]);
+    assert!(!store.has_pending_sync());
+}
+
 /// 8 threads x 25 commits on one handle, with a `WriteThrough` recorder,
 /// and 25 commits on a second handle in parallel.
 fn hammer(fs: &dyn ContainerFs, path: &Path, durable: Option<SimFs>) {
@@ -224,13 +308,18 @@ fn hammer(fs: &dyn ContainerFs, path: &Path, durable: Option<SimFs>) {
     let (ones, twos) = std::thread::scope(|scope| {
         let ones: Vec<_> = (0..THREADS)
             .map(|t| {
-                let (one, start) = (&one, &start);
+                let (one, start, recorder) = (&one, &start, &recorder);
                 scope.spawn(move || {
                     start.wait();
                     (0..EACH)
                         .map(|i| {
                             let id = format!("{t}-{i}");
-                            (put(one, "one", &id, json!({"t": t, "i": i})), id)
+                            let seq = put(one, "one", &id, json!({"t": t, "i": i}));
+                            assert!(
+                                sent(recorder).contains(&seq),
+                                "WriteThrough commit {seq} returned before its batch was sent"
+                            );
+                            (seq, id)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -264,8 +353,7 @@ fn hammer(fs: &dyn ContainerFs, path: &Path, durable: Option<SimFs>) {
     );
 
     // The stream: every commit of handle one, once, in sequence order, each
-    // its own member's op. Batches a notify in flight left queued go out now.
-    one.sync_flush().unwrap();
+    // its own member's op, all sent before their commits returned: no flush.
     assert!(!one.has_pending_sync());
     let batches = lock_mutex(&recorder.batches).clone();
     let sent: Vec<u64> = batches.iter().map(|batch| batch.seq).collect();
@@ -514,9 +602,56 @@ fn one_publish_carries_at_most_4_mib_of_frames_and_a_larger_frame_goes_alone() {
     assert_eq!(again.get_doc("big", "d").unwrap(), Some(json!("small")));
 }
 
+const POISONED: &str =
+    "FerroStore handle poisoned after a failed fsync at /sim/store.fls: reopen the store";
+
+/// Every write and checkpoint on `store` is refused as poisoned, before any
+/// write reaches the disk. Reads still answer, from the cache.
+fn assert_poisoned(fs: &SimFs, store: &FerroStore) {
+    let mark = fs.trace().len();
+    let refused = [
+        store.put_doc("f", "refused", &json!(1)).unwrap_err(),
+        store
+            .with_write(|txn| {
+                txn.put("f", "refused", json!(2));
+                Ok(())
+            })
+            .unwrap_err(),
+        store.checkpoint().unwrap_err(),
+    ];
+    for err in refused {
+        assert!(err.to_string().contains(POISONED), "{err}");
+    }
+    assert!(
+        !fs.trace()[mark..]
+            .iter()
+            .any(|op| matches!(op, IoOp::Write { .. } | IoOp::SyncData { .. })),
+        "a poisoned handle wrote"
+    );
+    assert_eq!(store.get_doc("f", "before").unwrap(), Some(json!(0)));
+    assert_eq!(store.get_doc("f", "refused").unwrap(), None);
+}
+
+/// A fresh open of `fs` works: it reads `before` and takes a commit and a
+/// checkpoint. Returns the docs `0..n` it reads and its sequence.
+fn reopen_works(fs: &SimFs, n: usize) -> (Vec<Option<serde_json::Value>>, u64) {
+    let reopened = open(fs);
+    let docs = (0..n)
+        .map(|i| reopened.get_doc("f", &format!("{i}")).unwrap())
+        .collect::<Vec<_>>();
+    let seq = reopened.read_state().unwrap().last_seq;
+    assert_eq!(reopened.get_doc("f", "before").unwrap(), Some(json!(0)));
+    reopened.put_doc("f", "after", &json!(9)).unwrap();
+    reopened.checkpoint().unwrap();
+    let after = open(fs);
+    assert_eq!(after.read_state().unwrap().last_seq, seq + 1);
+    assert_eq!(after.get_doc("f", "after").unwrap(), Some(json!(9)));
+    (docs, seq)
+}
+
 /// A group whose publish fails at the `nth` `sync_data` after the group
-/// starts: every member gets an error, and the handle goes on cleanly.
-/// Returns the state the handle and a reopen read afterwards.
+/// starts: every member gets the error and the handle is poisoned. Returns
+/// what a reopen reads, and the sequences before the group and after it.
 fn failed_group(nth: usize) -> (Vec<Option<serde_json::Value>>, u64, u64) {
     let fs = SimFs::default();
     let store = open(&fs);
@@ -543,23 +678,17 @@ fn failed_group(nth: usize) -> (Vec<Option<serde_json::Value>>, u64, u64) {
         let err = joined.unwrap().unwrap_err();
         assert!(err.to_string().contains("simulated I/O error"), "{err}");
     }
-    let docs = |store: &FerroStore| {
-        (0..3)
-            .map(|n| store.get_doc("f", &format!("{n}")).unwrap())
-            .collect::<Vec<_>>()
-    };
-    let here = docs(&store);
-    let reopened = open(&fs);
-    assert_eq!(docs(&reopened), here, "the handle and a reopen agree");
-    let seq = store.read_state().unwrap().last_seq;
-    assert_eq!(reopened.read_state().unwrap().last_seq, seq);
-    // The next commit lands right after whatever the file names.
-    store.put_doc("f", "after", &json!(9)).unwrap();
-    let after = open(&fs);
-    assert_eq!(after.read_state().unwrap().last_seq, seq + 1);
-    assert_eq!(after.get_doc("f", "after").unwrap(), Some(json!(9)));
-    assert_eq!(after.get_doc("f", "before").unwrap(), Some(json!(0)));
-    (here, base, seq)
+    assert_poisoned(&fs, &store);
+    // The handle still reads the last state it acknowledged.
+    assert_eq!(store.read_state().unwrap().last_seq, base);
+    let (docs, seq) = reopen_works(&fs, 3);
+    let none = vec![None, None, None];
+    let all = vec![Some(json!(0)), Some(json!(1)), Some(json!(2))];
+    assert!(
+        (docs == none && seq == base) || (docs == all && seq == base + 3),
+        "a reopen read part of the group: {docs:?} at {seq}"
+    );
+    (docs, base, seq)
 }
 
 #[test]
@@ -576,4 +705,39 @@ fn a_group_whose_slot_sync_fails_fails_every_member_and_leaves_all_of_it_or_none
     let (docs, base, seq) = failed_group(2);
     assert_eq!(docs, vec![Some(json!(0)), Some(json!(1)), Some(json!(2))]);
     assert_eq!(seq, base + 3);
+}
+
+/// A checkpoint whose `nth` `sync_data` fails (1: the snapshot, 2: the slot)
+/// errors and poisons the handle; a reopen reads every commit.
+fn failed_checkpoint(nth: usize) {
+    let fs = SimFs::default();
+    let store = open(&fs);
+    store.put_doc("f", "before", &json!(0)).unwrap();
+    for i in 0..3 {
+        store.put_doc("f", &format!("{i}"), &json!(i)).unwrap();
+    }
+    let base = store.read_state().unwrap().last_seq;
+    let mut seen = 0;
+    fs.fail_next(move |op| {
+        if matches!(op, IoOp::SyncData { .. }) {
+            seen += 1;
+        }
+        seen == nth
+    });
+    let err = store.checkpoint().unwrap_err();
+    assert!(err.to_string().contains("simulated I/O error"), "{err}");
+    assert_poisoned(&fs, &store);
+    let (docs, seq) = reopen_works(&fs, 3);
+    assert_eq!(docs, vec![Some(json!(0)), Some(json!(1)), Some(json!(2))]);
+    assert_eq!(seq, base);
+}
+
+#[test]
+fn a_checkpoint_whose_snapshot_sync_fails_poisons_the_handle() {
+    failed_checkpoint(1);
+}
+
+#[test]
+fn a_checkpoint_whose_slot_sync_fails_poisons_the_handle() {
+    failed_checkpoint(2);
 }

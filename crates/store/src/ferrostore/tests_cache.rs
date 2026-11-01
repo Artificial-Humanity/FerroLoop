@@ -32,6 +32,20 @@ fn live_sb(fs: &SimFs) -> Superblock {
     best.unwrap()
 }
 
+/// The live bytes of superblock slot `index`, read without an operation.
+fn slot_bytes(fs: &SimFs, index: usize) -> Vec<u8> {
+    let image = fs.live_image();
+    let bytes = image.file(Path::new(STORE)).unwrap();
+    bytes[index * SLOT_LEN..(index + 1) * SLOT_LEN].to_vec()
+}
+
+fn slot_epoch(fs: &SimFs, index: usize) -> Option<u64> {
+    match parse_superblock(&slot_bytes(fs, index)) {
+        SlotRead::Valid(sb) => Some(sb.epoch),
+        _ => None,
+    }
+}
+
 /// Every `(offset, len)` read since trace position `mark`.
 fn reads_since(fs: &SimFs, mark: usize) -> Vec<(u64, u64)> {
     fs.trace()[mark..]
@@ -320,6 +334,84 @@ fn a_cache_read_through_another_file_is_not_trusted() {
     assert!(extent_reads_since(&fs, mark).is_empty());
 }
 
+/// The interleaving a lock-free reader can meet: it reads slot 0 (`E - 1`);
+/// another handle publishes `E + 1` into slot 0 and starts `E + 2` into slot
+/// 1; the reader's slot 1 read is torn, so the slots it read name `E - 1`.
+/// The reader's cache already holds `E`, its own commit: it must return that,
+/// not go back to `E - 1`, and must not load the file for it.
+#[test]
+fn a_reader_whose_second_slot_read_is_torn_keeps_its_newer_cached_state() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let fs = SimFs::default();
+    let reader = open(&fs);
+    reader.put_doc("c", "k", &json!(1)).unwrap();
+    let held = live_sb(&fs);
+    assert_eq!(slot_epoch(&fs, 1), Some(held.epoch), "E is in slot 1");
+    assert_eq!(
+        slot_epoch(&fs, 0),
+        Some(held.epoch - 1),
+        "E - 1 is in slot 0"
+    );
+    let want = reader.read_state().unwrap().last_seq;
+    let other = Arc::new(open(&fs));
+    let fired = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(std::sync::Mutex::new(Vec::new()));
+    {
+        let (sim, other, fired, finished) = (
+            fs.clone(),
+            Arc::clone(&other),
+            Arc::clone(&fired),
+            Arc::clone(&finished),
+        );
+        fs.after_next_read(
+            |op| matches!(op, IoOp::Read { offset: 0, len, .. } if *len == SLOT_LEN as u64),
+            move || {
+                let old = slot_bytes(&sim, 1);
+                other.put_doc("c", "k", &json!(2)).unwrap();
+                assert_eq!(slot_epoch(&sim, 0), Some(held.epoch + 1));
+                other.put_doc("c", "k", &json!(3)).unwrap();
+                let new = slot_bytes(&sim, 1);
+                assert_eq!(slot_epoch(&sim, 1), Some(held.epoch + 2));
+                // The slot 1 write, partly done: what a concurrent read sees.
+                // The new header and checksum, the old fields after them.
+                let mut torn = old.clone();
+                torn[..24].copy_from_slice(&new[..24]);
+                assert!(matches!(parse_superblock(&torn), SlotRead::Invalid));
+                let raw = sim.open_rw(Path::new(STORE)).unwrap();
+                raw.write_at(&torn, SLOT_LEN as u64).unwrap();
+                *finished.lock().unwrap() = new;
+                fired.store(true, Ordering::SeqCst);
+            },
+        );
+    }
+    let mark = fs.trace().len();
+    let state = reader.read_state().unwrap();
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the interleaving did not happen"
+    );
+    assert_eq!(
+        state.last_seq, want,
+        "the reader went back past the commit it made"
+    );
+    assert_eq!(state.docs.get("c", "k"), Some(&json!(1)));
+    assert_eq!(
+        extent_reads_since(&fs, mark),
+        Vec::<(u64, u64)>::new(),
+        "the reader loaded the older state"
+    );
+    // The slot write completes: the next read moves on to `E + 2`.
+    let new = finished.lock().unwrap().clone();
+    fs.open_rw(Path::new(STORE))
+        .unwrap()
+        .write_at(&new, SLOT_LEN as u64)
+        .unwrap();
+    let state = reader.read_state().unwrap();
+    assert_eq!(state.last_seq, want + 2);
+    assert_eq!(state.docs.get("c", "k"), Some(&json!(3)));
+}
+
 // ---- concurrency on real files ---------------------------------------------------
 
 fn counter(store: &FerroStore) -> u64 {
@@ -433,8 +525,8 @@ fn a_reader_never_sees_a_mixed_state_while_writers_commit() {
                                 Ok((txn.base().last_seq, a.unwrap_or(0)))
                             })
                             .unwrap();
-                        // Not monotonic: a torn slot read falls back to the
-                        // other, older slot, which is still a whole state.
+                        assert!(seen.0 >= last.0, "last_seq went back: {last:?} -> {seen:?}");
+                        assert!(seen.1 >= last.1, "a pair went back: {last:?} -> {seen:?}");
                         last = seen;
                         reads += 1;
                     }
