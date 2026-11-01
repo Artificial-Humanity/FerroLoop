@@ -9,6 +9,7 @@ mod group;
 mod layout;
 mod manifest_ops;
 mod migrate;
+mod retry;
 mod server;
 mod state;
 mod sync;
@@ -28,11 +29,17 @@ mod tests;
 #[cfg(test)]
 mod tests_cache;
 #[cfg(test)]
+mod tests_checkpoint;
+#[cfg(test)]
 mod tests_cow;
 #[cfg(test)]
 mod tests_crash;
 #[cfg(test)]
 mod tests_group;
+#[cfg(test)]
+mod tests_reentry;
+#[cfg(test)]
+mod tests_retry;
 #[cfg(test)]
 mod tests_track0;
 #[cfg(test)]
@@ -43,6 +50,7 @@ mod tests_verify;
 use container_io::{ContainerFs, ContainerIo, RealFs};
 use fl_core::StoreError;
 use fl_core::ids::{GateId, ProjectId};
+use fl_core::iri::Iri;
 use group::Staged;
 pub use layout::Op;
 use layout::{
@@ -68,7 +76,7 @@ use std::fs::File;
 use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::ThreadId;
@@ -174,7 +182,20 @@ struct Disk {
     group: group::Group,
     /// Set by a failed sync of a publish or a checkpoint.
     poison: Poison,
+    /// [`AUTO_CHECKPOINT_BYTES`], lowered by a test so a small workload
+    /// crosses it.
+    #[cfg(test)]
+    auto_checkpoint_floor: std::sync::atomic::AtomicU64,
 }
+
+/// The WAL length a commit's auto-checkpoint (spec §4.4) never fires at or
+/// below: after a commit publishes, still under the `flock`, the writer
+/// checkpoints when the WAL is longer than `max(snapshot_length, this)`. The
+/// snapshot term keeps the work of checkpoints linear in the bytes written:
+/// a checkpoint, which costs O(state), runs only after at least as many
+/// WAL bytes as the snapshot holds. The floor keeps a small store from
+/// checkpointing every few commits. A reopen replays at most that much WAL.
+pub(super) const AUTO_CHECKPOINT_BYTES: u64 = 4 << 20;
 
 /// Set once a `sync_data` of a publish or a checkpoint failed on this handle.
 ///
@@ -392,6 +413,16 @@ impl Disk {
             install_newer(&mut slot, Arc::clone(&entry));
         }
         entry
+    }
+
+    /// The WAL length an auto-checkpoint never fires at or below
+    /// ([`AUTO_CHECKPOINT_BYTES`]; a test may lower it).
+    fn auto_checkpoint_floor(&self) -> u64 {
+        #[cfg(test)]
+        let floor = self.auto_checkpoint_floor.load(Ordering::Relaxed);
+        #[cfg(not(test))]
+        let floor = AUTO_CHECKPOINT_BYTES;
+        floor
     }
 
     /// Install a checkpoint's result: the same state, a new superblock.
@@ -613,6 +644,30 @@ pub struct FerroStore {
     commit_gate: Mutex<()>,
     /// Paired with `sync`. Wakes `sync_flush` when `notify_in_flight` clears.
     sync_cv: Condvar,
+    /// The threads running a write body on this handle right now: a call
+    /// from one of them is refused ([`Self::refuse_reentry`]). More than
+    /// one only on a remote handle, whose bodies take no lock.
+    body_threads: Mutex<Vec<ThreadId>>,
+    /// `body_threads.len()`, read without the mutex: a thread only ever
+    /// needs to see its own entries, which its own writes make visible.
+    bodies: AtomicUsize,
+}
+
+/// Marks the current thread as running a write body on one handle until
+/// dropped: on return, on `Err` and on unwind alike.
+struct BodyGuard<'a> {
+    store: &'a FerroStore,
+}
+
+impl Drop for BodyGuard<'_> {
+    fn drop(&mut self) {
+        let me = std::thread::current().id();
+        let mut threads = lock_mutex(&self.store.body_threads);
+        if let Some(at) = threads.iter().position(|thread| *thread == me) {
+            threads.swap_remove(at);
+            self.store.bodies.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }
 
 impl FerroStore {
@@ -624,7 +679,36 @@ impl FerroStore {
             sync: Mutex::new(SyncSlot::default()),
             commit_gate: Mutex::new(()),
             sync_cv: Condvar::new(),
+            body_threads: Mutex::new(Vec::new()),
+            bodies: AtomicUsize::new(0),
         }
+    }
+
+    /// The current thread runs a write body on this handle until the guard
+    /// is dropped.
+    fn enter_body(&self) -> BodyGuard<'_> {
+        lock_mutex(&self.body_threads).push(std::thread::current().id());
+        self.bodies.fetch_add(1, Ordering::Relaxed);
+        BodyGuard { store: self }
+    }
+
+    /// `Err` when the current thread is running a write body on this
+    /// handle. Such a call would wait for the lock its own body holds
+    /// (`mem://`: any call; `file://`: a write), read the committed state
+    /// without the body's own writes (`file://` and remote reads), or commit
+    /// apart from the body (a remote write). Every public entry point checks
+    /// this before it takes a lock. Another thread is never refused.
+    fn refuse_reentry(&self) -> Result<(), StoreError> {
+        if self.bodies.load(Ordering::Relaxed) == 0 {
+            return Ok(());
+        }
+        let me = std::thread::current().id();
+        if lock_mutex(&self.body_threads).contains(&me) {
+            return Err(backend(
+                "FerroStore called from inside its own transaction body",
+            ));
+        }
+        Ok(())
     }
 
     /// Empty in-memory store at the newest schema version. `checkpoint`
@@ -694,6 +778,8 @@ impl FerroStore {
                 cache: Mutex::new(Some(Arc::new(seed))),
                 group: group::Group::default(),
                 poison: Poison::new(path),
+                #[cfg(test)]
+                auto_checkpoint_floor: std::sync::atomic::AtomicU64::new(AUTO_CHECKPOINT_BYTES),
             }),
             path.display().to_string(),
         ))
@@ -754,7 +840,23 @@ impl FerroStore {
         self.with_read(doc::schema_version)
     }
 
+    /// Lower (or raise) this disk handle's auto-checkpoint floor
+    /// ([`AUTO_CHECKPOINT_BYTES`]), so a small test workload crosses it.
+    /// `u64::MAX` turns auto-checkpoints off.
+    #[cfg(test)]
+    pub(super) fn set_auto_checkpoint_floor(&self, bytes: u64) {
+        let Inner::Disk(disk) = &self.inner else {
+            panic!("auto-checkpoint is a disk handle's");
+        };
+        disk.auto_checkpoint_floor.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Write a snapshot of the current state and start an empty WAL (spec
+    /// §4.4), so a later open replays nothing. A commit also does this on
+    /// its own once the WAL is longer than `max(snapshot_length, 4 MiB)`.
+    /// `mem://` writes nothing.
     pub fn checkpoint(&self) -> Result<(), StoreError> {
+        self.refuse_reentry()?;
         match &self.inner {
             Inner::Remote(remote) => remote.call_unit("checkpoint", json!({})),
             Inner::Memory(_) => Ok(()),
@@ -808,6 +910,7 @@ impl FerroStore {
     }
 
     pub fn get_doc(&self, collection: &str, id: &str) -> Result<Option<Value>, StoreError> {
+        self.refuse_reentry()?;
         let remote_miss = if let Inner::Remote(remote) = &self.inner {
             match remote.call_option("get_doc", json!({"collection": collection, "id": id}))? {
                 Some(doc) => return Ok(Some(doc)),
@@ -846,6 +949,7 @@ impl FerroStore {
         field: &str,
         value: &str,
     ) -> Result<Vec<String>, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             return remote.call_strings(
                 "query_by_field",
@@ -862,6 +966,7 @@ impl FerroStore {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             return remote.call_pairs(
                 "search_bm25",
@@ -893,6 +998,7 @@ impl FerroStore {
         name: &str,
         filters: &[ColumnFilter],
     ) -> Result<ColumnScan, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             let mut encoded = Vec::with_capacity(filters.len());
             for filter in filters {
@@ -916,6 +1022,7 @@ impl FerroStore {
 
     /// Sum attempt ledger rows through an in-memory columnar scan. `None` is every attempt.
     pub fn attempt_rollup(&self, project: Option<&ProjectId>) -> Result<AttemptRollup, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             let project = match project {
                 Some(id) => Value::String(id.as_str().to_string()),
@@ -930,6 +1037,7 @@ impl FerroStore {
 
     /// Sum gate-run ledger rows through an in-memory columnar scan. `None` is every run.
     pub fn gate_run_rollup(&self, gate: Option<&GateId>) -> Result<GateRunRollup, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             let gate = match gate {
                 Some(id) => Value::String(id.as_str().to_string()),
@@ -972,6 +1080,7 @@ impl FerroStore {
     /// the collection and commits nothing. A document collection of the same
     /// name does not count.
     pub fn has_vector_collection(&self, name: &str) -> Result<bool, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             return remote
                 .call("has_vector_collection", json!({"name": name}))?
@@ -1030,6 +1139,7 @@ impl FerroStore {
         collection: &str,
         id: &str,
     ) -> Result<Option<(Vec<f32>, Option<Value>)>, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             return vector::parse_get(
                 &remote.call("get_vector", json!({"collection": collection, "id": id}))?,
@@ -1047,6 +1157,7 @@ impl FerroStore {
         limit: usize,
         ef: Option<u32>,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.refuse_reentry()?;
         if let Some(adapter) = self.attached_adapter()
             && let Some(hits) = cloud_hits(adapter.search_vectors(collection, values, limit, ef))
         {
@@ -1082,6 +1193,7 @@ impl FerroStore {
         limit: usize,
         fusion: Fusion,
     ) -> Result<Vec<(String, f64)>, StoreError> {
+        self.refuse_reentry()?;
         if let Some(adapter) = self.attached_adapter()
             && let Some(hits) = cloud_hits(adapter.search_hybrid(
                 doc_collection,
@@ -1136,6 +1248,7 @@ impl FerroStore {
         limit: usize,
         fusion: Fusion,
     ) -> Result<Vec<KnowledgeHit>, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             return vector::parse_knowledge(&remote.call(
                 "search_knowledge",
@@ -1180,6 +1293,7 @@ impl FerroStore {
         key: &str,
         payload: &Value,
     ) -> Result<(u64, u64), StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             let registered = {
                 let _gate = lock_mutex(&self.commit_gate);
@@ -1240,6 +1354,7 @@ impl FerroStore {
         group: &str,
         limit: usize,
     ) -> Result<Vec<MqRecord>, StoreError> {
+        self.refuse_reentry()?;
         if let Inner::Remote(remote) = &self.inner {
             return remote.call_records(
                 "poll_mq_group",
@@ -1402,6 +1517,7 @@ impl FerroStore {
 
     /// Apply `pull_since(last_seq)` with sync suppressed.
     pub fn sync_pull(&self) -> Result<u64, StoreError> {
+        self.refuse_reentry()?;
         let adapter = self.require_sync_adapter()?;
         self.require_sync_idle()?;
         let last = self.read_state()?.last_seq;
@@ -1411,6 +1527,7 @@ impl FerroStore {
 
     /// Apply `prewarm` batches with sync suppressed.
     pub fn sync_prewarm(&self, collections: &[&str]) -> Result<u64, StoreError> {
+        self.refuse_reentry()?;
         let adapter = self.require_sync_adapter()?;
         self.require_sync_idle()?;
         let batches = adapter.prewarm(collections)?;
@@ -1429,6 +1546,7 @@ impl FerroStore {
     /// one, refreshed without a lock (spec §4.1): a later commit replaces it
     /// and leaves this one as it was.
     fn read_state(&self) -> Result<Arc<DocState>, StoreError> {
+        self.refuse_reentry()?;
         match &self.inner {
             Inner::Memory(state) => Ok(Arc::clone(&lock_mutex(state))),
             Inner::Disk(disk) => Ok(Arc::clone(&disk.refresh_read()?.state)),
@@ -1453,6 +1571,7 @@ impl FerroStore {
         ops: &[Op],
         silent: bool,
     ) -> Result<bool, StoreError> {
+        self.refuse_reentry()?;
         match &self.inner {
             Inner::Memory(slot) => {
                 let registered = {
@@ -1529,9 +1648,18 @@ impl FerroStore {
     /// appends one WAL frame (`seq = last_seq + 1`), published with the
     /// group's superblock. `Err` or an empty op list writes nothing. A remote
     /// handle compare-and-swaps those ops and runs `body` again when
-    /// `last_seq` changed. The body may run more than once only on a remote
-    /// handle. The sync adapter runs after the slot is synced and the locks
-    /// and the commit gate are released.
+    /// `last_seq` changed, at most [`retry::REMOTE_ATTEMPTS`] times in all,
+    /// with a jittered backoff between attempts; then it is
+    /// [`StoreError::Conflict`] (spec §4.5). The body may run more than once
+    /// only on a remote handle, so it must be free of side effects. On disk,
+    /// a commit that leaves the WAL past the threshold auto-checkpoints
+    /// (spec §4.4, [`AUTO_CHECKPOINT_BYTES`]). The sync adapter runs after the
+    /// slot is synced, on the committing thread, with none of this thread's
+    /// locks or the commit gate held.
+    ///
+    /// While `body` runs, every call this thread makes on this handle is
+    /// refused ([`Self::refuse_reentry`]).
+    #[track_caller]
     fn with_write<T>(
         &self,
         body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
@@ -1541,45 +1669,36 @@ impl FerroStore {
 
     /// Like [`Self::with_write`]. The sequence was taken before the document
     /// mutex or disk flock was released. `None` means the body wrote no ops.
+    #[track_caller]
     fn with_write_outcome<T>(
         &self,
         mut body: impl FnMut(&mut Txn) -> Result<T, StoreError>,
     ) -> Result<(T, Option<u64>), StoreError> {
+        self.refuse_reentry()?;
+        let caller = std::panic::Location::caller();
         match &self.inner {
-            Inner::Remote(remote) => loop {
-                let state = Arc::new(remote.read_state()?);
-                let seq_base = state.last_seq;
-                let mut txn = Txn::new(state);
-                let result = body(&mut txn)?;
-                let (ops, _) = txn.finish()?;
-                if ops.is_empty() {
-                    return Ok((result, None));
-                }
-                let committed = {
-                    let _gate = lock_mutex(&self.commit_gate);
-                    if !remote.commit_ops(seq_base, &ops, false)? {
-                        None
-                    } else {
-                        let seq = seq_base
-                            .checked_add(1)
-                            .ok_or_else(|| backend("transaction sequence overflow"))?;
-                        let committed = Committed { seq, ops };
-                        let registered = self.register_committed(&committed, false);
-                        Some((result, seq, registered))
+            Inner::Remote(remote) => {
+                let mut backoff = retry::Backoff::new();
+                for attempt in 1..=retry::REMOTE_ATTEMPTS {
+                    if attempt > 1 {
+                        backoff.wait(attempt - 1);
                     }
-                };
-                if let Some((result, seq, registered)) = committed {
-                    self.deliver_owned(registered)?;
-                    return Ok((result, Some(seq)));
+                    if let Some(done) = self.remote_attempt(remote, caller, attempt, &mut body)? {
+                        return Ok(done);
+                    }
                 }
-            },
+                Err(self.remote_conflict())
+            }
             Inner::Memory(slot) => {
                 let (result, seq, registered) = {
                     let _gate = lock_mutex(&self.commit_gate);
                     let (result, committed) = {
                         let mut state = lock_mutex(slot);
                         let mut txn = Txn::new(Arc::clone(&state));
-                        let result = body(&mut txn)?;
+                        let result = {
+                            let _body = self.enter_body();
+                            body(&mut txn)
+                        }?;
                         // Ends the transaction's hold on the base: with no
                         // reader holding it either, the commit is in place.
                         let (ops, overlay) = txn.finish()?;
@@ -1606,7 +1725,12 @@ impl FerroStore {
             }
             Inner::Disk(disk) => self.group_write(disk, false, |state| {
                 let mut txn = Txn::new(state);
-                let result = body(&mut txn)?;
+                // On the thread running the body: in a group, the member's
+                // own thread at its turn (spec §4.3).
+                let result = {
+                    let _body = self.enter_body();
+                    body(&mut txn)
+                }?;
                 // The overlay was checked op by op as it was staged: once the
                 // frame is published it is applied to the cached state, and
                 // nothing is re-read. `finish` drops the hold on the state.
@@ -1617,20 +1741,101 @@ impl FerroStore {
         }
     }
 
+    /// One attempt of a remote write (spec §4.5): run `body` against the
+    /// server's state and compare-and-swap its ops. `None` when another
+    /// writer committed first: nothing was written and the caller may try
+    /// again. `Err` from the body, or from the server, ends the write.
+    fn remote_attempt<T>(
+        &self,
+        remote: &server::RemoteClient,
+        caller: &'static std::panic::Location<'static>,
+        attempt: u32,
+        body: &mut impl FnMut(&mut Txn) -> Result<T, StoreError>,
+    ) -> Result<Option<(T, Option<u64>)>, StoreError> {
+        let state = Arc::new(remote.read_state()?);
+        let seq_base = state.last_seq;
+        let mut txn = Txn::new(Arc::clone(&state));
+        let result = {
+            let _body = self.enter_body();
+            body(&mut txn)
+        }?;
+        let (ops, _) = txn.finish()?;
+        if ops.is_empty() {
+            return Ok(Some((result, None)));
+        }
+        let forced = retry::forced_loss(&retry::Cas {
+            caller,
+            attempt,
+            base: &state,
+            ops: &ops,
+        });
+        let committed = {
+            let _gate = lock_mutex(&self.commit_gate);
+            if forced || !remote.commit_ops(seq_base, &ops, false)? {
+                None
+            } else {
+                let seq = seq_base
+                    .checked_add(1)
+                    .ok_or_else(|| backend("transaction sequence overflow"))?;
+                let committed = Committed { seq, ops };
+                let registered = self.register_committed(&committed, false);
+                Some((result, seq, registered))
+            }
+        };
+        match committed {
+            Some((result, seq, registered)) => {
+                self.deliver_owned(registered)?;
+                Ok(Some((result, Some(seq))))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// The error of a remote write whose every attempt lost (spec §4.5).
+    fn remote_conflict(&self) -> StoreError {
+        let id = Iri::parse(&self.label)
+            .or_else(|_| Iri::parse(&format!("unix://{}", self.label)))
+            .unwrap_or_else(|_| Iri::parse("urn:ferrostore:remote").expect("a valid IRI"));
+        StoreError::Conflict {
+            id,
+            detail: format!(
+                "{} compare-and-swap attempts each lost to a commit by another writer, and this \
+                 write committed nothing",
+                retry::REMOTE_ATTEMPTS
+            ),
+        }
+    }
+
+    #[track_caller]
     fn commit<T>(
         &self,
         build: impl FnOnce(&DocState) -> Result<(Op, T), StoreError>,
         silent: bool,
     ) -> Result<T, StoreError> {
+        self.refuse_reentry()?;
+        let caller = std::panic::Location::caller();
         match &self.inner {
             Inner::Remote(remote) => {
-                let state = remote.read_state()?;
+                let mut state = remote.read_state()?;
                 let (op, extra) = build(&state)?;
-                let mut expected = state.last_seq;
-                loop {
+                let mut backoff = retry::Backoff::new();
+                for attempt in 1..=retry::REMOTE_ATTEMPTS {
+                    if attempt > 1 {
+                        backoff.wait(attempt - 1);
+                        state = remote.read_state()?;
+                    }
+                    let expected = state.last_seq;
+                    let forced = retry::forced_loss(&retry::Cas {
+                        caller,
+                        attempt,
+                        base: &state,
+                        ops: std::slice::from_ref(&op),
+                    });
                     let registered = {
                         let _gate = lock_mutex(&self.commit_gate);
-                        if !remote.commit_ops(expected, std::slice::from_ref(&op), silent)? {
+                        if forced
+                            || !remote.commit_ops(expected, std::slice::from_ref(&op), silent)?
+                        {
                             None
                         } else {
                             let seq = expected
@@ -1649,8 +1854,8 @@ impl FerroStore {
                         self.deliver_owned(registered)?;
                         return Ok(extra);
                     }
-                    expected = remote.read_state()?.last_seq;
                 }
+                Err(self.remote_conflict())
             }
             Inner::Memory(slot) => {
                 let (extra, registered) = {
@@ -1723,6 +1928,7 @@ impl FerroStore {
         id: &str,
         fetched: Value,
     ) -> Result<Option<Value>, StoreError> {
+        self.refuse_reentry()?;
         let key = (collection.to_string(), id.to_string());
         let _gate = lock_mutex(&self.commit_gate);
         if let Inner::Remote(remote) = &self.inner {
@@ -1795,7 +2001,8 @@ impl FerroStore {
                 if let Some(new_sb) =
                     publish_frames(&**file, &disk.poison, index, &base.sb, &[frame])?
                 {
-                    disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
+                    let done = disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
+                    auto_checkpoint(disk, &**file, index ^ 1, &done);
                 }
                 if sync.is_idle() && seq > sync.synced_seq {
                     sync.synced_seq = seq;
@@ -1815,6 +2022,7 @@ impl FerroStore {
         doc: &Value,
         silent: bool,
     ) -> Result<IfAbsent, StoreError> {
+        self.refuse_reentry()?;
         doc::refuse_reserved(collection, "put_doc")?;
         let key = (collection.to_string(), id.to_string());
         match &self.inner {
@@ -1917,6 +2125,7 @@ impl FerroStore {
     /// `sync_flush`. The other modes leave the batches pending.
     /// The commit gate covers the idle check, the publish, and that registration.
     fn apply_sync_batches(&self, batches: Vec<SyncBatch>, silent: bool) -> Result<u64, StoreError> {
+        self.refuse_reentry()?;
         if batches.is_empty() {
             return Ok(self.synced_seq());
         }
@@ -2331,7 +2540,8 @@ fn publish_sync_batches(
                 frames.push(encode_frame(batch.seq, &batch.ops)?);
             }
             if let Some(new_sb) = publish_frames(&**file, &disk.poison, index, &base.sb, &frames)? {
-                disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
+                let done = disk.install_commit(base, new_sb, Change::Overlay(overlay, seq));
+                auto_checkpoint(disk, &**file, index ^ 1, &done);
             }
             Ok((seq, prepared))
         }
@@ -2465,6 +2675,47 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
     disk.poison.check()?;
     let _locked = FlockGuard::acquire(&**file)?;
     let (index, base) = disk.refresh(&**file, disk.write_id)?;
+    checkpoint_locked(disk, &**file, index, &base)
+}
+
+/// Spec §4.4: after a commit published `base` into slot `index`, with the
+/// write mutex and the `flock` still held, checkpoint when the WAL is longer
+/// than `max(snapshot_length, AUTO_CHECKPOINT_BYTES)`.
+///
+/// The commit is already durable and acknowledged, so a failed checkpoint
+/// does not fail it: the error goes to stderr, and the commit's caller gets
+/// its own result. A failed `sync_data` poisons the handle, as any failed
+/// sync does ([`Poison`]); any other failure leaves the file and the cache
+/// as they were, and the next commit past the threshold tries again. A base
+/// whose WAL ends torn is left to the next refresh, which reports it.
+fn auto_checkpoint(disk: &Disk, file: &dyn ContainerIo, index: usize, base: &DiskCache) {
+    if base.wal_applied != base.sb.wal_length
+        || base.sb.wal_length <= base.sb.snapshot_length.max(disk.auto_checkpoint_floor())
+    {
+        return;
+    }
+    if let Err(err) = checkpoint_locked(disk, file, index, base) {
+        #[cfg(not(test))]
+        eprintln!(
+            "warning: FerroStore auto-checkpoint of {} failed, and the commit before it is \
+             durable: {err}",
+            disk.poison.path
+        );
+        #[cfg(test)]
+        let _ = err;
+    }
+}
+
+/// Write a snapshot of `base` and publish it into the slot after `index`.
+/// The caller holds the write mutex and the `flock`, and `base` is the
+/// state the slot `index` names.
+fn checkpoint_locked(
+    disk: &Disk,
+    file: &dyn ContainerIo,
+    index: usize,
+    base: &DiskCache,
+) -> Result<(), StoreError> {
+    disk.poison.check()?;
     let (sb, state) = (base.sb, &*base.state);
     let blob = if !state.vectors.is_empty() {
         encode_snapshot_v3(state.last_seq, &state.docs, &state.tables, &state.vectors)?
@@ -2474,10 +2725,10 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
         encode_snapshot_v2(state.last_seq, &state.docs, &state.tables)?
     };
     let blob_len = u64::try_from(blob.len()).map_err(|_| backend("snapshot exceeds u64"))?;
-    let offset = allocate_extent(&**file, &sb, blob_len)?;
+    let offset = allocate_extent(file, &sb, blob_len)?;
     file.write_at(&blob, offset).map_err(io_err)?;
     // Data and the file size: `fdatasync` (spec §4.3).
-    disk.poison.sync_data(&**file)?;
+    disk.poison.sync_data(file)?;
     let new_sb = Superblock {
         epoch: sb
             .epoch
@@ -2491,9 +2742,9 @@ fn checkpoint_disk(disk: &Disk) -> Result<(), StoreError> {
         wal_length: 0,
         snapshot_seq: state.last_seq,
     };
-    write_slot(&**file, index ^ 1, &new_sb)?;
-    disk.poison.sync_data(&**file)?;
-    disk.install_checkpoint(&base, new_sb);
+    write_slot(file, index ^ 1, &new_sb)?;
+    disk.poison.sync_data(file)?;
+    disk.install_checkpoint(base, new_sb);
     Ok(())
 }
 

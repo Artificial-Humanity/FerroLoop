@@ -18,13 +18,22 @@
 //! would pass that, the frames so far are published first and the next frame
 //! starts the next publish, so a frame larger than the cap is published alone.
 //! Only once a publish's slot sync has returned are its members registered
-//! with the sync adapter, under the commit gate and in sequence order. After
-//! the leader has released the `flock`, the write mutex and the gate, it wakes
-//! every member with its own result: the member then calls `on_commit` on its
-//! own thread, and the next queued writer, if any, leads. In `WriteThrough`
+//! with the sync adapter, under the commit gate and in sequence order. The
+//! leader then wakes every member with its own result (before an
+//! auto-checkpoint, below, or after it has released the `flock`, the write
+//! mutex and the gate): the member then calls `on_commit` on its own thread.
+//! Once the locks are released the next queued writer, if any, leads. In `WriteThrough`
 //! only the first member's batch finds the adapter idle; every later member
 //! drains the queue, oldest first, until its own batch is sent, so each
 //! member returns only once its own batch is delivered.
+//!
+//! **Auto-checkpoint (spec §4.4).** When the group published and its WAL is
+//! now longer than `max(snapshot_length, AUTO_CHECKPOINT_BYTES)`, the leader
+//! first wakes every other member with its result (each commit is durable),
+//! then checkpoints with the `flock` still held, and only then releases the
+//! locks and hands the lead on. No member waits for the checkpoint but the
+//! leader itself, whose own result it does not change: a failed checkpoint
+//! is reported on stderr, and a failed sync in it poisons the handle.
 //!
 //! A sync that fails poisons the handle (`Poison`): the group fails, and
 //! every later write and checkpoint on the handle is refused.
@@ -40,8 +49,8 @@ use super::container_io::ContainerIo;
 use super::layout::{Op, backend, encode_frame};
 use super::state::{DocState, Overlay, publish_overlay};
 use super::{
-    Change, Committed, Disk, DiskCache, FerroStore, FlockGuard, Registered, lock_mutex,
-    publish_frames, wait_mutex,
+    Change, Committed, Disk, DiskCache, FerroStore, FlockGuard, Registered, auto_checkpoint,
+    lock_mutex, publish_frames, wait_mutex,
 };
 use fl_core::StoreError;
 use std::any::Any;
@@ -166,9 +175,31 @@ struct Leadership<'a> {
     group: &'a Group,
     members: Vec<Arc<Member>>,
     results: Vec<Option<Result<Acked, StoreError>>>,
+    /// Members already given their result ([`Self::acknowledge`]).
+    woken: Vec<bool>,
 }
 
 impl Leadership<'_> {
+    /// Wake every member but `me` that has its result, now: its commit is
+    /// durable. The leader goes on, with the locks, to the auto-checkpoint
+    /// (spec §4.4), which no member waits for.
+    fn acknowledge(&mut self, me: &Arc<Member>) {
+        for ((member, result), woken) in self
+            .members
+            .iter()
+            .zip(&mut self.results)
+            .zip(&mut self.woken)
+        {
+            if Arc::ptr_eq(member, me) || *woken {
+                continue;
+            }
+            if let Some(result) = result.take() {
+                member.set(Slot::Done(result));
+                *woken = true;
+            }
+        }
+    }
+
     /// Every member with no result yet gets `err`.
     fn fail_rest(&mut self, err: &StoreError) {
         for result in &mut self.results {
@@ -181,7 +212,11 @@ impl Leadership<'_> {
 
 impl Drop for Leadership<'_> {
     fn drop(&mut self) {
-        for (member, result) in self.members.iter().zip(&mut self.results) {
+        for ((member, result), woken) in self.members.iter().zip(&mut self.results).zip(&self.woken)
+        {
+            if *woken {
+                continue;
+            }
             let result = result.take().unwrap_or_else(|| {
                 Err(backend(
                     "the group's leader stopped before this commit was published",
@@ -198,6 +233,8 @@ impl Drop for Leadership<'_> {
 struct Running {
     index: usize,
     base: Arc<DiskCache>,
+    /// A publish of this group wrote frames: `base` is its state.
+    published: bool,
     /// The one committed overlay not yet applied to a state: a group of one
     /// committing member applies it to the cache in place (spec §4.2).
     first: Option<(Overlay, u64)>,
@@ -343,6 +380,7 @@ impl FerroStore {
             group: &disk.group,
             members: Vec::new(),
             results: Vec::new(),
+            woken: Vec::new(),
         };
         let _gate = lock_mutex(&self.commit_gate);
         let file = lock_mutex(&disk.write);
@@ -353,6 +391,7 @@ impl FerroStore {
         });
         lead.members = disk.group.take();
         lead.results = lead.members.iter().map(|_| None).collect();
+        lead.woken = vec![false; lead.members.len()];
         debug_assert!(
             lead.members
                 .first()
@@ -365,15 +404,26 @@ impl FerroStore {
                 let running = Running {
                     index,
                     base,
+                    published: false,
                     first: None,
                     state: None,
                 };
-                self.run_group(disk, &**file, &mut lead, me, own, running);
+                // Spec §4.4: each member is acknowledged once its commit is
+                // durable, before the checkpoint, which runs with the flock
+                // still held. A member woken here may go on at once: a read
+                // needs no lock, and a write queues for the next group.
+                if let Some(done) = self.run_group(disk, &**file, &mut lead, me, own, running)
+                    && done.published
+                {
+                    lead.acknowledge(me);
+                    auto_checkpoint(disk, &**file, done.index, &done.base);
+                }
             }
         }
     }
 
-    /// Every member's body in turn, then the publishes.
+    /// Every member's body in turn, then the publishes. The state the last
+    /// publish left, or `None` when a publish failed.
     fn run_group(
         &self,
         disk: &Disk,
@@ -382,7 +432,7 @@ impl FerroStore {
         me: &Arc<Member>,
         own: &mut dyn FnMut(Arc<DocState>) -> Result<Option<Staged>, StoreError>,
         mut running: Running,
-    ) {
+    ) -> Option<Running> {
         let mut pending = Pending::default();
         for pos in 0..lead.members.len() {
             let member = Arc::clone(&lead.members[pos]);
@@ -418,7 +468,10 @@ impl FerroStore {
             if !pending.frames.is_empty() && pending.bytes + frame.len() > GROUP_BYTES {
                 running = match self.publish(disk, file, running, &mut pending, lead) {
                     Ok(next) => next,
-                    Err(err) => return lead.fail_rest(&err),
+                    Err(err) => {
+                        lead.fail_rest(&err);
+                        return None;
+                    }
                 };
             }
             running.add(staged.overlay, seq);
@@ -432,8 +485,12 @@ impl FerroStore {
                 },
             ));
         }
-        if let Err(err) = self.publish(disk, file, running, &mut pending, lead) {
-            lead.fail_rest(&err);
+        match self.publish(disk, file, running, &mut pending, lead) {
+            Ok(done) => Some(done),
+            Err(err) => {
+                lead.fail_rest(&err);
+                None
+            }
         }
     }
 
@@ -459,6 +516,7 @@ impl FerroStore {
                 .ok_or_else(|| backend("a publish with frames has no change"))?;
             running.base = disk.install_commit(running.base, new_sb, change);
             running.index ^= 1;
+            running.published = true;
         }
         for (pos, committed) in pending.committed.drain(..) {
             let member = &lead.members[pos];

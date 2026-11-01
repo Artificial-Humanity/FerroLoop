@@ -167,9 +167,21 @@ impl FerroStore {
     /// when another writer committed first.
     ///
     /// **`body` must be free of side effects**: it may run more than once
-    /// (on a remote handle), and its writes are discarded on any error. It
-    /// must not call this store: on `mem://` and `file://` that deadlocks.
-    /// The sync adapter is called after the commit, as for any other write.
+    /// (on a remote handle, at most 8 times, after which the transaction is
+    /// [`StoreError::Conflict`] and commits nothing), and its writes are
+    /// discarded on any error. Only the last run's writes commit, and its
+    /// value is returned.
+    ///
+    /// **`body` reads and writes through its [`Transaction`] only.** A call
+    /// on this same store handle from inside `body`, on the thread running
+    /// it, is refused with `StoreError::Backend("FerroStore called from
+    /// inside its own transaction body")` and does nothing: it would wait for
+    /// the lock `body` runs under, read the state without `body`'s own
+    /// writes, or commit apart from them. The refusal goes back to `body`,
+    /// which decides: returned with `?`, the transaction commits nothing and
+    /// returns it; ignored, the transaction commits what `body` staged.
+    /// Another thread's call is not refused. The sync adapter is called
+    /// after the commit, as for any other write.
     pub fn transaction<T>(
         &self,
         mut body: impl FnMut(&mut Transaction<'_>) -> Result<T, StoreError>,

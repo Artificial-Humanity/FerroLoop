@@ -609,3 +609,60 @@ fn make_vectors_ignoring_delivery(store: &FerroStore) {
     }
     assert!(store.has_vector_collection("v").unwrap());
 }
+
+/// A served store whose own `WriteThrough` adapter refuses: the remote
+/// client gets the server's `Undelivered`, with its sequence, and the commit
+/// is durable on the server.
+#[test]
+fn a_remote_client_gets_the_servers_undelivered_with_its_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("s.sock");
+    let server =
+        FerroStoreServer::bind_unix(&sock, FerroStore::open(dir.path().join("s.fls")).unwrap())
+            .unwrap();
+    let flaky = Arc::new(Flaky::default());
+    server
+        .store()
+        .attach_sync_adapter(SyncMode::WriteThrough, Arc::clone(&flaky) as _)
+        .unwrap();
+    flaky.fail.store(true, Ordering::SeqCst);
+    let client = FerroStore::connect_uri(&format!("unix://{}", sock.display())).unwrap();
+    let base = last_seq(&client);
+
+    let err = client.put_doc("docs", "a", &json!(1)).unwrap_err();
+    let StoreError::Undelivered { seq, cause } = &err else {
+        panic!("put_doc: {err:?}");
+    };
+    assert_eq!(*seq, base + 1);
+    assert!(matches!(**cause, StoreError::Backend(_)), "{cause:?}");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "committed at seq {} (durable), not yet delivered to the sync adapter: \
+             backend failure: adapter is down",
+            base + 1
+        ),
+        "the same message as on the server"
+    );
+    assert_eq!(client.get_doc("docs", "a").unwrap(), Some(json!(1)));
+
+    let err = client
+        .transaction(|txn| txn.put_doc("docs", "b", &json!(2)))
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Undelivered { seq, .. } if seq == base + 2),
+        "transaction: {err:?}"
+    );
+    assert_eq!(client.get_doc("docs", "b").unwrap(), Some(json!(2)));
+    assert_eq!(last_seq(&client), base + 2, "each write applied once");
+
+    // Every other server error still arrives as the server's message.
+    let err = client.scan_column_table("missing", &[]).unwrap_err();
+    assert!(
+        matches!(&err, StoreError::Backend(msg) if msg == "backend failure: no column table `missing`"),
+        "{err:?}"
+    );
+
+    flaky.fail.store(false, Ordering::SeqCst);
+    assert_eq!(server.store().sync_flush().unwrap(), base + 2);
+}

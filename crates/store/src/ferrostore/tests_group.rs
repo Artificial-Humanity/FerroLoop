@@ -571,6 +571,9 @@ fn one_publish_carries_at_most_4_mib_of_frames_and_a_larger_frame_goes_alone() {
     const MIB: usize = 1 << 20;
     let fs = SimFs::default();
     let store = open(&fs);
+    // 8 MiB of WAL would pass the auto-checkpoint threshold (spec §4.4,
+    // `tests_checkpoint`): off here, so the trace is the publishes alone.
+    store.set_auto_checkpoint_floor(u64::MAX);
     let mark = fs.trace().len();
     let sized = |bytes: usize| json!("x".repeat(bytes));
     let s = &store;

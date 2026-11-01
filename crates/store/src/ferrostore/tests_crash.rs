@@ -264,6 +264,10 @@ const WORKLOAD: &[Step] = &[
         name: "7 commits after the checkpoint",
         run: tail,
     },
+    Step {
+        name: "8 a commit past the auto-checkpoint threshold",
+        run: auto_checkpoint,
+    },
 ];
 
 /// Spec §4.1: a handle that refreshes after another handle's commits (a
@@ -471,6 +475,39 @@ fn tail(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
     ctx.op("put notes/last", || {
         store.put_doc("notes", "last", &json!({"n": 5}))
     })
+}
+
+/// Spec §4.4: a commit whose WAL passes `max(snapshot_length, floor)`
+/// checkpoints inside its own lock. The floor is lowered to 0, so the
+/// threshold is the snapshot's length, and the commit is sized to pass it.
+/// Then one more commit, on the new snapshot: a cut inside the checkpoint
+/// leaves the first commit acknowledged, and this one refused.
+fn auto_checkpoint(ctx: &Ctx<'_>, store: &FerroStore) -> Result<(), StoreError> {
+    let snapshot = live_sb(store).snapshot_length;
+    store.set_auto_checkpoint_floor(0);
+    let big = "y".repeat(usize::try_from(snapshot).unwrap_or(0) + 600);
+    ctx.op("put notes/auto (checkpoints)", || {
+        store.put_doc("notes", "auto", &json!({"text": big}))
+    })?;
+    let sb = live_sb(store);
+    if sb.wal_length != 0 || sb.snapshot_length <= snapshot {
+        return Err(backend(format!(
+            "the commit past the threshold did not checkpoint: {sb:?}"
+        )));
+    }
+    ctx.op("put notes/after-auto", || {
+        store.put_doc("notes", "after-auto", &json!({"n": 6}))
+    })?;
+    store.set_auto_checkpoint_floor(super::AUTO_CHECKPOINT_BYTES);
+    Ok(())
+}
+
+/// The superblock of the state `store`'s cache holds.
+fn live_sb(store: &FerroStore) -> Superblock {
+    let super::Inner::Disk(disk) = &store.inner else {
+        panic!("the crash workload runs on disk");
+    };
+    lock_mutex(&disk.cache).as_ref().expect("a cached state").sb
 }
 
 // ---- scenarios ------------------------------------------------------------------

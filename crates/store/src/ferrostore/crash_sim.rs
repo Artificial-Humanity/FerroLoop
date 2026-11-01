@@ -215,6 +215,9 @@ struct Sim {
     pending_dir: Vec<DirOp>,
     inodes: Vec<Inode>,
     trace: Vec<IoOp>,
+    /// `(trace index, first bytes)` of every write, in order: what a write
+    /// was (a snapshot starts `FERRSNAP`), which [`IoOp::Write`] does not say.
+    write_heads: Vec<(usize, Vec<u8>)>,
     /// `(trace length then, IoOp::Lock or IoOp::Unlock)`, in order.
     lock_events: Vec<(usize, IoOp)>,
     /// Operations allowed before the cut. `None` never cuts.
@@ -393,6 +396,17 @@ impl SimFs {
     /// Every operation done so far, in order.
     pub(super) fn trace(&self) -> Vec<IoOp> {
         self.lock().trace.clone()
+    }
+
+    /// The trace index of every write so far whose bytes start with
+    /// `prefix` (at most 8 bytes).
+    pub(super) fn writes_starting_with(&self, prefix: &[u8]) -> Vec<usize> {
+        self.lock()
+            .write_heads
+            .iter()
+            .filter(|(_, head)| head.starts_with(prefix))
+            .map(|(at, _)| *at)
+            .collect()
     }
 
     /// Every lock taken and released so far, each with the number of trace
@@ -664,6 +678,8 @@ impl ContainerIo for SimFile {
             len: buf.len() as u64,
         })?;
         self.writable()?;
+        let at = sim.trace.len() - 1;
+        sim.write_heads.push((at, buf[..buf.len().min(8)].to_vec()));
         let op = DataOp::Write {
             offset,
             bytes: buf.to_vec(),

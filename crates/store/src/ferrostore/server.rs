@@ -803,10 +803,49 @@ fn send_result(
 ) -> Result<(), StoreError> {
     let body = match result {
         Ok(result) => json!({"id": id, "ok": true, "result": result}),
-        Err(err) => json!({"id": id, "ok": false, "error": err.to_string()}),
+        Err(err) => error_value(id, &err),
     };
     let mut stream = lock_mutex(write);
     stream.write_value(&body)
+}
+
+/// A failure response. `error` is always the error's message. An
+/// [`StoreError::Undelivered`] also carries `kind`, `seq` and `cause`, so
+/// the client rebuilds it: the commit is durable on the server, and a
+/// client that read it as a plain failure would retry it and apply it twice.
+fn error_value(id: u64, err: &StoreError) -> Value {
+    let mut body = json!({"id": id, "ok": false, "error": err.to_string()});
+    if let StoreError::Undelivered { seq, cause } = err {
+        let cause = match &**cause {
+            StoreError::Backend(detail) => detail.clone(),
+            other => other.to_string(),
+        };
+        body["kind"] = json!("undelivered");
+        body["seq"] = json!(seq);
+        body["cause"] = json!(cause);
+    }
+    body
+}
+
+/// The error a failure response names: [`StoreError::Undelivered`] for a
+/// structured one ([`error_value`]), and otherwise the server's message as
+/// [`StoreError::Backend`].
+fn response_error(frame: &Value) -> StoreError {
+    if frame.get("kind").and_then(Value::as_str) == Some("undelivered")
+        && let Some(seq) = frame.get("seq").and_then(Value::as_u64)
+        && let Some(cause) = frame.get("cause").and_then(Value::as_str)
+    {
+        return StoreError::Undelivered {
+            seq,
+            cause: Box::new(StoreError::Backend(cause.to_string())),
+        };
+    }
+    backend(
+        frame
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("FerroStore request failed"),
+    )
 }
 
 fn record_value(record: MqRecord) -> Value {
@@ -1231,7 +1270,7 @@ fn read_frame(stream: &mut UnixStream) -> Result<Value, StoreError> {
 
 struct RemoteShared {
     write: Mutex<Box<dyn JsonIo>>,
-    pending: Mutex<HashMap<u64, Sender<Result<Value, String>>>>,
+    pending: Mutex<HashMap<u64, Sender<Result<Value, StoreError>>>>,
     next_id: AtomicU64,
     subs: Mutex<HashMap<String, Vec<Arc<Sender<MqRecord>>>>>,
 }
@@ -1261,8 +1300,7 @@ impl RemoteClient {
             }
         }
         match rx.recv_timeout(CALL_TIMEOUT) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(message)) => Err(backend(message)),
+            Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
                 lock_mutex(&self.shared.pending).remove(&id);
                 Err(backend("timed out waiting for the FerroStore server"))
@@ -1496,11 +1534,7 @@ fn reader_loop(mut stream: Box<dyn JsonIo>, shared: Arc<RemoteShared>) {
                 let outcome = if frame.get("ok").and_then(Value::as_bool) == Some(true) {
                     Ok(frame.get("result").cloned().unwrap_or(Value::Null))
                 } else {
-                    let message = frame
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("FerroStore request failed");
-                    Err(message.to_string())
+                    Err(response_error(&frame))
                 };
                 if let Some(sender) = lock_mutex(&shared.pending).remove(&id) {
                     let _ = sender.send(outcome);
@@ -1593,7 +1627,7 @@ fn parse_record(value: &Value) -> Result<MqRecord, StoreError> {
 fn fail_pending(shared: &RemoteShared, message: &str) {
     let pending = std::mem::take(&mut *lock_mutex(&shared.pending));
     for (_, sender) in pending {
-        let _ = sender.send(Err(message.to_string()));
+        let _ = sender.send(Err(backend(message)));
     }
 }
 
