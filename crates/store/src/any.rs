@@ -104,7 +104,10 @@ pub enum Unmigrated {
     /// Open the `.redb` with the redb engine and migrate nothing. For the scans
     /// that open other configured stores only to ask [`AnyStore::owns`]: a
     /// read-only lookup must not migrate (and `chmod`) every project store.
-    /// Creates no file and takes no lock that does not exist already.
+    /// The store is opened read-only (writes through it fail; its bytes and
+    /// mtime stay as they were), creates no file and takes no lock file that
+    /// does not exist already. A redb that cannot be read that way (it needs
+    /// repair) is opened the ordinary way.
     UseRedb,
     /// Refuse, naming `fl store migrate`.
     Refuse,
@@ -140,8 +143,10 @@ pub fn open_store(path: &Path) -> Result<AnyStore, StoreError> {
 }
 
 /// Open the store named `path` only to look at it (to ask [`AnyStore::owns`]):
-/// a lone `.redb` under a ferro selection is read as redb, never migrated.
-/// See [`Unmigrated::UseRedb`] and [`store_exists`].
+/// a lone `.redb` under a ferro selection is read as redb, never migrated, and
+/// is opened read-only, so writing through the returned store fails. Open the
+/// store with [`open_store`] to work on it. See [`Unmigrated::UseRedb`] and
+/// [`store_exists`].
 pub fn open_store_for_scan(path: &Path) -> Result<AnyStore, StoreError> {
     open_store_with(
         path,
@@ -352,13 +357,29 @@ fn fls_if_present(physical: &Path, err: StoreError) -> Result<(Backend, String),
     }
 }
 
-/// How [`redb_engine`] takes the [`MigrationLock`].
+/// How [`redb_engine`] is used.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Locking {
-    /// Create the lock file if need be.
-    Create,
-    /// Only if the lock file exists already (a scan creates no file).
-    IfExists,
+enum Access {
+    /// The store a command works on: opened for writing, and the
+    /// [`MigrationLock`] file created if need be.
+    Use,
+    /// A store only asked `owns`: opened read-only (the file is not rewritten,
+    /// not even its mtime), and the lock taken only if its file exists already.
+    Scan,
+}
+
+/// Open the redb at `path`: for [`Access::Scan`] read-only, falling back to the
+/// ordinary open when the file cannot be read that way (it needs repair, or is
+/// not initialised yet), so a scan never sees less than an ordinary open does.
+fn open_redb_engine(path: &Path, retries: u32, access: Access) -> Result<RedbStore, StoreError> {
+    if access == Access::Scan {
+        match RedbStore::open_read_only(path, retries) {
+            Ok(store) => return Ok(store),
+            Err(err) if is_redb_busy(&err) => return Err(err),
+            Err(_) => {}
+        }
+    }
+    RedbStore::open_with_retries(path, retries)
 }
 
 /// Open the lone `.redb` at `path` with the redb engine, in a way that cannot
@@ -374,7 +395,7 @@ fn redb_engine(
     physical: &Path,
     retries: u32,
     mut held: Option<MigrationLock>,
-    locking: Locking,
+    access: Access,
 ) -> Result<(Backend, String), StoreError> {
     let label = path.display().to_string();
     let mut attempts = 0;
@@ -384,12 +405,12 @@ fn redb_engine(
             // A lock that cannot be taken (a directory or file this user may
             // not write) is treated as absent: nothing in this process can do
             // better, and the same directory refuses a migration.
-            None => MigrationLock::acquire(physical, locking == Locking::Create)
+            None => MigrationLock::acquire(physical, access == Access::Use)
                 .ok()
                 .flatten(),
         };
         let Some(lock) = lock else {
-            return match RedbStore::open_with_retries(path, retries) {
+            return match open_redb_engine(path, retries, access) {
                 Ok(store) => Ok((Backend::Redb(store), label)),
                 Err(err) => fls_if_present(physical, err),
             };
@@ -398,7 +419,7 @@ fn redb_engine(
             drop(lock);
             return open_fls(physical);
         }
-        match RedbStore::open_with_retries(path, 0) {
+        match open_redb_engine(path, 0, access) {
             Ok(store) => return Ok((Backend::Redb(store), label)),
             Err(err) if is_redb_busy(&err) && attempts < retries => {
                 drop(lock);
@@ -451,12 +472,12 @@ fn open_ferro(
         )));
     }
     if options.unmigrated == Unmigrated::UseRedb {
-        return redb_engine(path, physical, options.retries, None, Locking::IfExists);
+        return redb_engine(path, physical, options.retries, None, Access::Scan);
     }
 
     let key = memory_key(path);
     let stay = |held: Option<MigrationLock>| {
-        redb_engine(path, physical, options.retries, held, Locking::Create)
+        redb_engine(path, physical, options.retries, held, Access::Use)
     };
     if memory().unclean.contains(&key) {
         return stay(None);
@@ -1592,7 +1613,7 @@ mod tests {
         assert!(!is_redb_busy(&err), "{err}");
 
         // No .fls: the error is the caller's.
-        for locking in [Locking::Create, Locking::IfExists] {
+        for locking in [Access::Use, Access::Scan] {
             let err = redb_engine(&redb, &fls, 0, None, locking)
                 .err()
                 .expect("no .fls to fall back to");
@@ -1607,10 +1628,9 @@ mod tests {
         // A .fls: it is opened, whichever way the redb was reached. (The lock
         // is created by the first call, so `IfExists` takes it too.)
         drop(FerroStore::open(&fls).unwrap());
-        for locking in [Locking::Create, Locking::IfExists] {
-            let (backend, label) = redb_engine(&redb, &fls, 0, None, locking)
-                .ok()
-                .expect("the .fls is the store");
+        for locking in [Access::Use, Access::Scan] {
+            let (backend, label) =
+                redb_engine(&redb, &fls, 0, None, locking).expect("the .fls is the store");
             assert!(matches!(backend, Backend::Ferro(_)));
             assert!(label.ends_with("s.fls"), "{label}");
         }
@@ -1691,20 +1711,39 @@ mod tests {
             n
         };
         let listing = names(dir.path());
+        let bytes = std::fs::read(&redb).unwrap();
+        let mtime = std::fs::metadata(&redb).unwrap().modified().unwrap();
         let said = Lines::default();
         let store = open_store_sink(&redb, &ferro_opts(Unmigrated::UseRedb), &said.sink()).unwrap();
         assert_eq!(store.kind(), BackendKind::Redb);
         assert_populated(&store, &project, &gate, &record);
         assert!(store.owns(project.iri()).unwrap());
+        // Read-only: it cannot be written through.
+        let err = store.add_project("/not-written").expect_err("read-only");
+        assert!(err.to_string().contains("read-only"), "{err}");
         drop(store);
         assert_eq!(names(dir.path()), listing, "no file was created");
         assert!(said.all().is_empty(), "{:?}", said.all());
+        assert_eq!(std::fs::read(&redb).unwrap(), bytes, "bytes untouched");
+        assert_eq!(
+            std::fs::metadata(&redb).unwrap().modified().unwrap(),
+            mtime,
+            "mtime untouched"
+        );
         #[cfg(unix)]
         assert_eq!(mode(&redb), 0o600);
 
-        // The convenience is UseRedb under the process environment's engine.
-        // (It is only told apart from `open_store` under ferro; the engine here
-        // is forced by the options, so the same thing is asserted directly.)
+        // A redb that cannot be read read-only (here: no tables yet) is
+        // opened the ordinary way, as before.
+        let empty = dir.path().join("empty.redb");
+        std::fs::write(&empty, b"").unwrap();
+        let store = open_store_sink(&empty, &ferro_opts(Unmigrated::UseRedb), &|_| {}).unwrap();
+        assert_eq!(store.kind(), BackendKind::Redb);
+        assert!(store.list_projects().unwrap().is_empty());
+        drop(store);
+        assert!(!dir.path().join("empty.fls").exists());
+
+        // The convenience: UseRedb under the environment's engine (redb here).
         let store = open_store_for_scan(&redb).unwrap();
         assert_eq!(store.kind(), DEFAULT_BACKEND);
 

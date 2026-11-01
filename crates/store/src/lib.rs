@@ -14,6 +14,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 pub mod any;
+// `RedbStore::db` is a `Db` with its own `begin_read`, so the `redb::ReadableDatabase` import that
+// the migration code in this module needs to call `redb.db.begin_read()` is now unused there.
+#[allow(unused_imports)]
 pub mod ferrostore;
 pub mod ferrowire;
 pub mod knowledge;
@@ -193,8 +196,49 @@ const NEXT_RUN: &str = "next_run";
 const NEXT_ATTEMPT: &str = "next_attempt";
 
 pub struct RedbStore {
-    pub(crate) db: Database,
+    pub(crate) db: Db,
     pub(crate) label: String,
+}
+
+/// The redb database behind a [`RedbStore`]: opened for writing, or, for a
+/// store only read (see [`RedbStore::open_read_only`]), read-only. A read-only
+/// open does not rewrite the file (opening it for writing does: its pages and
+/// its mtime change), and refuses every write.
+pub(crate) enum Db {
+    Write(Database),
+    Read(redb::ReadOnlyDatabase),
+}
+
+/// Why a write transaction could not begin.
+#[derive(Debug)]
+pub(crate) enum BeginWriteError {
+    Redb(redb::TransactionError),
+    ReadOnly,
+}
+
+impl std::fmt::Display for BeginWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Redb(e) => e.fmt(f),
+            Self::ReadOnly => f.write_str("the store was opened read-only"),
+        }
+    }
+}
+
+impl Db {
+    pub(crate) fn begin_read(&self) -> Result<redb::ReadTransaction, redb::TransactionError> {
+        match self {
+            Self::Write(db) => db.begin_read(),
+            Self::Read(db) => db.begin_read(),
+        }
+    }
+
+    pub(crate) fn begin_write(&self) -> Result<redb::WriteTransaction, BeginWriteError> {
+        match self {
+            Self::Write(db) => db.begin_write().map_err(BeginWriteError::Redb),
+            Self::Read(_) => Err(BeginWriteError::ReadOnly),
+        }
+    }
 }
 
 /// What an import did, for the person who ran it.
@@ -624,7 +668,55 @@ impl RedbStore {
         // Only a report, and only after the open worked: a store others can reach is the owner's
         // to fix, and a stat error here is no reason to fail the open.
         private::warn_if_loose(path);
-        Ok(Self { db, label })
+        Ok(Self {
+            db: Db::Write(db),
+            label,
+        })
+    }
+
+    /// Open the redb file at `path` for reading only, waiting up to `retries`
+    /// times, 15 ms apart, for a process that holds it for writing. Nothing is
+    /// created, written or touched (not its bytes, not its mtime); every
+    /// write through the store fails. A file that is not an initialised store
+    /// of a known format, or that needs repair, is an error here (the
+    /// ordinary [`RedbStore::open`] decides what to do with it).
+    pub fn open_read_only(path: &Path, retries: u32) -> Result<Self, StoreError> {
+        let label = path.display().to_string();
+        let mut attempts = 0u32;
+        let db = loop {
+            match redb::ReadOnlyDatabase::open(path) {
+                Ok(db) => break db,
+                Err(e)
+                    if attempts < retries
+                        && (e.to_string().contains("Database already open")
+                            || e.to_string().contains("Cannot acquire lock")) =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                }
+                Err(e) => {
+                    return Err(StoreError::Unreachable {
+                        store: label,
+                        cause: e.to_string(),
+                    });
+                }
+            }
+        };
+        let found = {
+            let tx = db.begin_read().map_err(backend)?;
+            match tx.open_table(META) {
+                Ok(meta) => meta.get(FORMAT_KEY).map_err(backend)?.map(|v| v.value()),
+                Err(redb::TableError::TableDoesNotExist(_)) => {
+                    return Err(backend(format!("{label} is not an initialised store")));
+                }
+                Err(e) => return Err(backend(e)),
+            }
+        };
+        check_format(found)?;
+        Ok(Self {
+            db: Db::Read(db),
+            label,
+        })
     }
 
     fn create_tables(db: &Database) -> Result<(), StoreError> {
@@ -2279,7 +2371,7 @@ mod tests {
         // the real `GATES` definition itself and fail right there, before we
         // ever get to call `add_gate`.
         let store = RedbStore {
-            db,
+            db: Db::Write(db),
             label: path.display().to_string(),
         };
 
@@ -3434,5 +3526,44 @@ mod tests {
             reopened.handle_of(Kind::WorkflowRun, run.id.iri()).unwrap(),
             Some(1)
         );
+    }
+
+    #[test]
+    fn a_read_only_open_reads_without_touching_the_file_and_refuses_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.redb");
+        let project = {
+            let s = RedbStore::open(&path).unwrap();
+            s.add_project("/repo").unwrap()
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        {
+            let ro = RedbStore::open_read_only(&path, 0).unwrap();
+            assert!(ro.owns(project.iri()).unwrap());
+            assert_eq!(ro.get_project(&project).unwrap().unwrap().root, "/repo");
+            let err = ro.add_project("/other").expect_err("refused");
+            assert!(err.to_string().contains("read-only"), "{err}");
+            // Shared: a second reader is fine; a writer is not.
+            drop(RedbStore::open_read_only(&path, 0).unwrap());
+            let busy = RedbStore::open_with_retries(&path, 0).err().expect("held");
+            assert!(crate::is_redb_busy(&busy), "{busy}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        // Held for writing: a read-only open is busy, not a different error.
+        let writer = RedbStore::open(&path).unwrap();
+        let busy = RedbStore::open_read_only(&path, 0).err().expect("held");
+        assert!(crate::is_redb_busy(&busy), "{busy}");
+        drop(writer);
+        // Not a store: an error, and nothing created.
+        let missing = dir.path().join("missing.redb");
+        assert!(RedbStore::open_read_only(&missing, 0).is_err());
+        assert!(!missing.exists());
+        let empty = dir.path().join("empty.redb");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(RedbStore::open_read_only(&empty, 0).is_err());
+        assert_eq!(std::fs::metadata(&empty).unwrap().len(), 0);
     }
 }
